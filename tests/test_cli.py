@@ -7,16 +7,17 @@ from ase import Atoms
 from ase.io import read, write
 
 from linak.cli import _rewrite_implicit_csv_interactive, _rewrite_implicit_plot_csv, build_parser, main
-from linak.density import (
+from linak.analysis.density import (
     compute_density_profile,
     load_density_profile,
     load_density_profiles,
     save_density_profile,
 )
-from linak.hdf5_table import read_hdf5_frame
-from linak.msd import compute_msd, load_msd_profile, save_msd_profile
-from linak.plot_settings import read_plot_profile, write_plot_profile
-from linak.rdf import compute_rdf, save_rdf_profile
+from linak.storage.hdf5_table import read_hdf5_frame
+from linak.storage.hdf5_utils import read_linak_hdf5
+from linak.analysis.msd import compute_msd, load_msd_profile, save_msd_profile
+from linak.plot.plot_settings import read_plot_profile, write_plot_profile
+from linak.analysis.rdf import compute_rdf, save_rdf_profile
 
 
 def _write_xyz(path: Path) -> None:
@@ -997,7 +998,7 @@ def test_compute_msd_dry_run_resolves_input_metadata_without_reading_trajectory(
     def _raise_if_called(*_args, **_kwargs):
         raise AssertionError("read_trajectory should not be called during dry-run")
 
-    monkeypatch.setattr("linak.io.read_trajectory", _raise_if_called)
+    monkeypatch.setattr("linak.trajectory.io.read_trajectory", _raise_if_called)
 
     rc = main(
         [
@@ -1031,7 +1032,7 @@ def test_compute_density_dry_run_resolves_input_cell_without_reading_trajectory(
     def _raise_if_called(*_args, **_kwargs):
         raise AssertionError("read_trajectory should not be called during dry-run")
 
-    monkeypatch.setattr("linak.io.read_trajectory", _raise_if_called)
+    monkeypatch.setattr("linak.trajectory.io.read_trajectory", _raise_if_called)
 
     rc = main(
         [
@@ -1064,7 +1065,7 @@ def test_compute_rdf_dry_run_resolves_input_cell_without_reading_trajectory(
     def _raise_if_called(*_args, **_kwargs):
         raise AssertionError("read_trajectory should not be called during dry-run")
 
-    monkeypatch.setattr("linak.io.read_trajectory", _raise_if_called)
+    monkeypatch.setattr("linak.trajectory.io.read_trajectory", _raise_if_called)
 
     rc = main(
         [
@@ -1229,7 +1230,7 @@ def test_plot_density_multiple_files_overlays_with_source_labels(tmp_path, monke
         captured_labels.extend([item.species for item in profiles])
         return None
 
-    monkeypatch.setattr("linak.density.plot_density_profiles", _fake_plot_density_profiles)
+    monkeypatch.setattr("linak.analysis.density.plot_density_profiles", _fake_plot_density_profiles)
 
     rc = main(
         [
@@ -1471,7 +1472,7 @@ def test_plot_density_passes_x_mode_and_quantity_to_plotter(tmp_path, monkeypatc
         captured_kwargs["quantity"] = kwargs["quantity"]
         return None
 
-    monkeypatch.setattr("linak.density.plot_density_profiles", _fake_plot_density_profiles)
+    monkeypatch.setattr("linak.analysis.density.plot_density_profiles", _fake_plot_density_profiles)
 
     rc = main(
         [
@@ -1704,6 +1705,85 @@ def test_plot_density_gui_preview_renders_for_each_request(tmp_path, monkeypatch
     assert len(preview_calls) == 2
 
 
+def test_plot_density_gui_preview_uses_non_blocking_show(tmp_path, monkeypatch):
+    frame = Atoms(
+        "OO",
+        positions=[[0.0, 0.0, 0.10], [0.0, 0.0, 1.10]],
+        cell=[10.0, 10.0, 10.0],
+        pbc=True,
+    )
+    profile = compute_density_profile([frame], species="O", axis="z", bin_width=1.0)
+    source_h5 = tmp_path / "source_density.h5"
+    save_density_profile(profile, source_h5)
+
+    plot_calls: list[dict[str, object]] = []
+
+    def _fake_plot_density_profiles(_profiles, **kwargs):
+        plot_calls.append(kwargs)
+        return None
+
+    def _fake_gui_launcher(**kwargs):
+        kwargs["on_preview"]({})
+
+    monkeypatch.setattr("linak.analysis.density.plot_density_profiles", _fake_plot_density_profiles)
+    monkeypatch.setattr("linak.cli._open_plot_settings_gui", _fake_gui_launcher)
+
+    rc = main(
+        [
+            "--log-level",
+            "ERROR",
+            "plot",
+            "density",
+            str(source_h5),
+            "--gui",
+        ]
+    )
+
+    assert rc == 0
+    assert len(plot_calls) == 1
+    assert plot_calls[0]["show"] is True
+    assert plot_calls[0]["show_blocking"] is False
+
+
+def test_plot_density_gui_single_series_label_maps_to_line_label(tmp_path, monkeypatch):
+    frame = Atoms(
+        "OO",
+        positions=[[0.0, 0.0, 0.10], [0.0, 0.0, 1.10]],
+        cell=[10.0, 10.0, 10.0],
+        pbc=True,
+    )
+    profile = compute_density_profile([frame], species="O", axis="z", bin_width=1.0)
+    source_h5 = tmp_path / "source_density.h5"
+    save_density_profile(profile, source_h5)
+
+    plot_calls: list[dict[str, object]] = []
+
+    def _fake_plot_density_profile(_profile, **kwargs):
+        plot_calls.append(kwargs)
+        return None
+
+    def _fake_gui_launcher(**kwargs):
+        kwargs["on_preview"]({"series_labels": ["custom-series"]})
+
+    monkeypatch.setattr("linak.analysis.density.plot_density_profile", _fake_plot_density_profile)
+    monkeypatch.setattr("linak.cli._open_plot_settings_gui", _fake_gui_launcher)
+
+    rc = main(
+        [
+            "--log-level",
+            "ERROR",
+            "plot",
+            "density",
+            str(source_h5),
+            "--gui",
+        ]
+    )
+
+    assert rc == 0
+    assert len(plot_calls) == 1
+    assert plot_calls[0]["line_label"] == "custom-series"
+
+
 def test_compute_density_passes_surface_options_to_density_engine(tmp_path, monkeypatch):
     trajectory = tmp_path / "traj.xyz"
     _write_xyz(trajectory)
@@ -1731,8 +1811,8 @@ def test_compute_density_passes_surface_options_to_density_engine(tmp_path, monk
         )
         return [profile]
 
-    monkeypatch.setattr("linak.io.read_trajectory", _fake_read_trajectory)
-    monkeypatch.setattr("linak.density.compute_density_profiles", _fake_compute_density_profiles)
+    monkeypatch.setattr("linak.trajectory.io.read_trajectory", _fake_read_trajectory)
+    monkeypatch.setattr("linak.analysis.density.compute_density_profiles", _fake_compute_density_profiles)
 
     rc = main(
         [
@@ -1821,7 +1901,7 @@ def test_plot_msd_multiple_files_overlays_with_source_labels(tmp_path, monkeypat
         captured_labels.extend([item.species for item in profiles])
         return None
 
-    monkeypatch.setattr("linak.msd.plot_msd_profiles", _fake_plot_msd_profiles)
+    monkeypatch.setattr("linak.analysis.msd.plot_msd_profiles", _fake_plot_msd_profiles)
 
     rc = main(
         [
@@ -1886,7 +1966,7 @@ def test_plot_rdf_multiple_files_overlays_with_source_labels(tmp_path, monkeypat
         captured_labels.extend([f"{item.species_a}-{item.species_b}" for item in profiles])
         return None
 
-    monkeypatch.setattr("linak.rdf.plot_rdf_profiles", _fake_plot_rdf_profiles)
+    monkeypatch.setattr("linak.analysis.rdf.plot_rdf_profiles", _fake_plot_rdf_profiles)
 
     rc = main(
         [
@@ -1933,7 +2013,7 @@ def test_plot_rdf_rejects_trajectory_input(tmp_path, capsys):
 
 
 def test_compute_rdf_threads_option_is_forwarded(tmp_path, monkeypatch):
-    from linak.rdf import RDFProfile
+    from linak.analysis.rdf import RDFProfile
 
     captured: dict[str, int | None] = {}
     frame = Atoms(
@@ -1958,9 +2038,9 @@ def test_compute_rdf_threads_option_is_forwarded(tmp_path, monkeypatch):
         captured["threads"] = threads
         return profile
 
-    monkeypatch.setattr("linak.io.read_trajectory", _fake_read_trajectory)
-    monkeypatch.setattr("linak.rdf.compute_rdf", _fake_compute_rdf)
-    monkeypatch.setattr("linak.rdf.save_rdf_profile", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("linak.trajectory.io.read_trajectory", _fake_read_trajectory)
+    monkeypatch.setattr("linak.analysis.rdf.compute_rdf", _fake_compute_rdf)
+    monkeypatch.setattr("linak.analysis.rdf.save_rdf_profile", lambda *_args, **_kwargs: None)
 
     rc = main(
         [
@@ -2072,7 +2152,6 @@ def test_compute_msd_default_csv_is_next_to_input_not_cwd(tmp_path, monkeypatch)
     trajectory_dir.mkdir()
     work_dir.mkdir()
     monkeypatch.chdir(work_dir)
-    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / ".cache"))
 
     trajectory = trajectory_dir / "traj.xyz"
     frame0 = Atoms("O", positions=[[0.9, 0.0, 0.0]])
@@ -2103,7 +2182,6 @@ def test_compute_rdf_default_csv_is_next_to_input_not_cwd(tmp_path, monkeypatch)
     trajectory_dir.mkdir()
     work_dir.mkdir()
     monkeypatch.chdir(work_dir)
-    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / ".cache"))
 
     trajectory = trajectory_dir / "traj.xyz"
     frame = Atoms(
@@ -2157,6 +2235,36 @@ def test_compute_density_auto_detects_cell_for_volumetric_units(tmp_path, monkey
     assert rc == 0
     profile = load_density_profile(tmp_path / "traj_density_o_z.h5")
     assert profile.units == "g/Angstrom^3"
+
+
+def test_compute_density_writes_resolution_metadata_to_hdf5(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    trajectory = tmp_path / "traj.xyz"
+    _write_xyz(trajectory)
+    simulation_input = tmp_path / "input.inp"
+    simulation_input.write_text("ABC [angstrom] 10.0 10.0 10.0\n", encoding="utf-8")
+
+    rc = main(
+        [
+            "--log-level",
+            "ERROR",
+            "compute",
+            "density",
+            str(trajectory),
+            "--species",
+            "O",
+        ]
+    )
+
+    assert rc == 0
+    _datasets, metadata = read_linak_hdf5(
+        tmp_path / "traj_density_o_z.h5",
+        expected_analysis="density",
+    )
+    assert metadata["source_path"] == str(trajectory.resolve())
+    assert metadata["cell_source"].startswith("auto-detected")
+    assert metadata["input_path"] == str(simulation_input.resolve())
+    assert metadata["resolved_cell_angstrom"] == pytest.approx([10.0, 10.0, 10.0])
 
 
 def test_compute_density_supports_save_data_alias(tmp_path, monkeypatch):
@@ -2393,9 +2501,8 @@ def test_apply_pbc_overwrite_replaces_input_file(tmp_path):
     assert wrapped.positions[0, 2] == pytest.approx(0.5)
 
 
-def test_compute_msd_uses_cached_cell_after_initial_auto_detection(tmp_path, monkeypatch):
+def test_compute_msd_writes_resolution_metadata_to_hdf5(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / ".cache"))
     trajectory = tmp_path / "traj.xyz"
     frame0 = Atoms("O", positions=[[0.9, 0.0, 0.0]])
     frame1 = Atoms("O", positions=[[0.1, 0.0, 0.0]])
@@ -2411,7 +2518,7 @@ def test_compute_msd_uses_cached_cell_after_initial_auto_detection(tmp_path, mon
         encoding="utf-8",
     )
 
-    rc_first = main(
+    rc = main(
         [
             "--log-level",
             "ERROR",
@@ -2422,29 +2529,15 @@ def test_compute_msd_uses_cached_cell_after_initial_auto_detection(tmp_path, mon
             "O",
         ]
     )
-    assert rc_first == 0
-    assert (tmp_path / ".cache" / "linak" / "cells.json").exists()
-    assert not (tmp_path / ".linak-cache.json").exists()
-    first = load_msd_profile(tmp_path / "traj_msd_o.h5")
-    assert first.time_fs[1] == pytest.approx(2.5)
+    assert rc == 0
+    profile = load_msd_profile(tmp_path / "traj_msd_o.h5")
+    assert profile.time_fs[1] == pytest.approx(2.5)
 
-    (tmp_path / "input.inp").unlink()
-    rc_second = main(
-        [
-            "--log-level",
-            "ERROR",
-            "compute",
-            "msd",
-            str(trajectory),
-            "--species",
-            "O",
-            "--output",
-            str(tmp_path / "second.h5"),
-        ]
-    )
-    assert rc_second == 0
-    second = load_msd_profile(tmp_path / "second.h5")
-    assert second.time_fs[1] == pytest.approx(2.5)
+    _datasets, metadata = read_linak_hdf5(tmp_path / "traj_msd_o.h5", expected_analysis="msd")
+    assert metadata["source_path"] == str(trajectory.resolve())
+    assert metadata["timestep_source"].startswith("auto-detected")
+    assert metadata["frame_timestep_fs"] == pytest.approx(2.5)
+    assert metadata["resolved_cell_angstrom"] == pytest.approx([1.0, 1.0, 1.0])
 
 
 def test_compute_msd_from_lammps_dump_with_lmp_input(tmp_path, monkeypatch):
@@ -2513,6 +2606,43 @@ def test_compute_msd_from_lammps_input_source(tmp_path, monkeypatch):
     assert data.time_fs[1] == pytest.approx(10.0)
 
 
+def test_compute_rdf_writes_resolution_metadata_to_hdf5(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    trajectory = tmp_path / "traj.xyz"
+    frame = Atoms(
+        "OH",
+        positions=[[0.0, 0.0, 0.0], [0.9, 0.0, 0.0]],
+    )
+    write(trajectory, [frame], format="extxyz")
+    simulation_input = tmp_path / "input.inp"
+    simulation_input.write_text("ABC [angstrom] 10.0 10.0 10.0\n", encoding="utf-8")
+
+    rc = main(
+        [
+            "--log-level",
+            "ERROR",
+            "compute",
+            "rdf",
+            str(trajectory),
+            "--species-a",
+            "O",
+            "--species-b",
+            "H",
+            "--bin-width",
+            "0.2",
+            "--output",
+            str(tmp_path / "rdf_metadata.h5"),
+        ]
+    )
+    assert rc == 0
+
+    _datasets, metadata = read_linak_hdf5(tmp_path / "rdf_metadata.h5", expected_analysis="rdf")
+    assert metadata["source_path"] == str(trajectory.resolve())
+    assert metadata["cell_source"].startswith("auto-detected")
+    assert metadata["input_path"] == str(simulation_input.resolve())
+    assert metadata["resolved_cell_angstrom"] == pytest.approx([10.0, 10.0, 10.0])
+
+
 def test_apply_pbc_dump_default_output_uses_xyz_suffix(tmp_path):
     trajectory = tmp_path / "lammps.dump"
     _write_lammps_dump(trajectory, positions=[(1.2, -0.1, 0.5)])
@@ -2530,3 +2660,5 @@ def test_apply_pbc_dump_default_output_uses_xyz_suffix(tmp_path):
     assert rc == 0
     wrapped = read(tmp_path / "lammps_pbc.xyz")
     assert wrapped.positions[0, 0] == pytest.approx(0.2)
+
+

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Mapping
 from dataclasses import dataclass
 import logging
 import os
@@ -15,14 +16,14 @@ from ase.data import atomic_numbers
 from ase.geometry import get_distances
 from ase.neighborlist import neighbor_list
 
-from .hdf5_utils import (
+from ..storage.hdf5_utils import (
     is_hdf5_path,
     read_linak_hdf5_profiles,
     write_linak_hdf5,
 )
-from .plotting import DEFAULT_PLOT_STYLE, PlotStyle, plot_line_series, plot_multi_line_series
-from .progress import ProgressBar
-from .utils import ensure_positive
+from ..plot.plotting import DEFAULT_PLOT_STYLE, PlotStyle, plot_line_series, plot_multi_line_series
+from ..progress import ProgressBar
+from ..utils import ensure_positive
 
 LOGGER = logging.getLogger(__name__)
 _NEIGHBORLIST_DENSITY_THRESHOLD = 0.25
@@ -441,7 +442,12 @@ def _reconstruct_bin_edges_from_centers(bin_centers: np.ndarray, *, bin_width: f
     return left_edge + np.arange(bin_centers.size + 1, dtype=float) * bin_width
 
 
-def save_rdf_profile(profile: RDFProfile, output: str | Path) -> Path:
+def save_rdf_profile(
+    profile: RDFProfile,
+    output: str | Path,
+    *,
+    additional_metadata: Mapping[str, Any] | None = None,
+) -> Path:
     """Save RDF profile to LiNaK HDF5 and return written path."""
     bin_edges = np.asarray(profile.bin_edges, dtype=float)
     bin_centers = np.asarray(profile.bin_centers, dtype=float)
@@ -458,6 +464,20 @@ def save_rdf_profile(profile: RDFProfile, output: str | Path) -> Path:
         source_label=f"RDF profile '{profile.species_a}-{profile.species_b}'",
     )
 
+    metadata: dict[str, Any] = {
+        "species_a": profile.species_a,
+        "species_b": profile.species_b,
+        "n_frames": profile.n_frames,
+        "bin_width_A": bin_width,
+        "units": {
+            "bin_width_A": "Angstrom",
+            "bin_centers_A": "Angstrom",
+            "g_r": "dimensionless",
+        },
+    }
+    if additional_metadata:
+        metadata.update(dict(additional_metadata))
+
     output_path = write_linak_hdf5(
         output,
         analysis="rdf",
@@ -465,17 +485,7 @@ def save_rdf_profile(profile: RDFProfile, output: str | Path) -> Path:
             "bin_centers_A": profile.bin_centers,
             "g_r": profile.g_r,
         },
-        metadata={
-            "species_a": profile.species_a,
-            "species_b": profile.species_b,
-            "n_frames": profile.n_frames,
-            "bin_width_A": bin_width,
-            "units": {
-                "bin_width_A": "Angstrom",
-                "bin_centers_A": "Angstrom",
-                "g_r": "dimensionless",
-            },
-        },
+        metadata=metadata,
     )
     LOGGER.info("Saved RDF data to '%s'.", output_path)
     return output_path
@@ -572,6 +582,7 @@ def plot_rdf_profile(
     profile: RDFProfile,
     output: str | Path | None = None,
     show: bool = True,
+    show_blocking: bool = True,
     preferred_backend: str | None = None,
     style: PlotStyle = DEFAULT_PLOT_STYLE,
     title: str | None = None,
@@ -593,6 +604,9 @@ def plot_rdf_profile(
     legend_loc: str = "best",
     line_label: str | None = None,
     line_colors: list[str] | None = None,
+    series_enabled: list[bool] | None = None,
+    series_line_widths: list[float | None] | None = None,
+    series_markers: list[str | None] | None = None,
     capture_state: dict[str, Any] | None = None,
 ) -> Path | None:
     """Plot RDF profile using shared LiNaK plotting style."""
@@ -602,6 +616,13 @@ def plot_rdf_profile(
     resolved_line_color = None
     if line_colors:
         resolved_line_color = line_colors[0]
+    line_visible = True if not series_enabled else bool(series_enabled[0])
+    line_width_override = None
+    if series_line_widths:
+        line_width_override = series_line_widths[0]
+    line_marker = None
+    if series_markers:
+        line_marker = series_markers[0]
     return plot_line_series(
         profile.bin_centers,
         profile.g_r,
@@ -610,9 +631,13 @@ def plot_rdf_profile(
         y_label=y_label or "g(r)",
         output=output,
         show=show,
+        show_blocking=show_blocking,
         preferred_backend=preferred_backend,
         line_label=resolved_label,
         line_color=resolved_line_color,
+        line_width_override=line_width_override,
+        line_marker=line_marker,
+        line_visible=line_visible,
         style=style,
         x_scale=x_scale,
         y_scale=y_scale,
@@ -636,6 +661,7 @@ def plot_rdf_profiles(
     profiles: list[RDFProfile],
     output: str | Path | None = None,
     show: bool = True,
+    show_blocking: bool = True,
     preferred_backend: str | None = None,
     style: PlotStyle = DEFAULT_PLOT_STYLE,
     title: str | None = None,
@@ -657,6 +683,9 @@ def plot_rdf_profiles(
     legend_loc: str = "best",
     series_labels: list[str] | None = None,
     line_colors: list[str] | None = None,
+    series_enabled: list[bool] | None = None,
+    series_line_widths: list[float | None] | None = None,
+    series_markers: list[str | None] | None = None,
     capture_state: dict[str, Any] | None = None,
 ) -> Path | None:
     """Plot one or more RDF profiles."""
@@ -679,6 +708,7 @@ def plot_rdf_profiles(
             profiles[0],
             output=output,
             show=show,
+            show_blocking=show_blocking,
             preferred_backend=preferred_backend,
             style=style,
             title=title,
@@ -700,6 +730,9 @@ def plot_rdf_profiles(
             legend_loc=legend_loc,
             line_label=labels[0] if labels else None,
             line_colors=line_colors,
+            series_enabled=series_enabled,
+            series_line_widths=series_line_widths,
+            series_markers=series_markers,
             capture_state=capture_state,
         )
 
@@ -712,9 +745,13 @@ def plot_rdf_profiles(
         y_label=y_label or "g(r)",
         output=output,
         show=show,
+        show_blocking=show_blocking,
         preferred_backend=preferred_backend,
         style=style,
         line_colors=line_colors,
+        series_enabled=series_enabled,
+        series_line_widths=series_line_widths,
+        series_markers=series_markers,
         x_scale=x_scale,
         y_scale=y_scale,
         x_lim=x_lim,

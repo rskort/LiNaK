@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections import deque
 import logging
 from pathlib import Path
 
@@ -10,7 +9,7 @@ import numpy as np
 from ase import Atoms
 from ase.io import iread, write
 from ase.io.formats import UnknownFileTypeError
-from ase.io.lammpsrun import _parse_box_bound, lammps_data_to_ase_atoms
+from ase.io.lammpsrun import lammps_data_to_ase_atoms
 
 from .lammps import (
     extract_cell_from_lammps_input,
@@ -18,9 +17,52 @@ from .lammps import (
     resolve_dump_path_from_lammps_input,
 )
 
-from .progress import ProgressBar
+from ..progress import ProgressBar
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _parse_box_bound(line: str, box_rows: list[str]) -> tuple[np.ndarray, np.ndarray, tuple[bool, bool, bool]]:
+    """Parse a LAMMPS ``ITEM: BOX BOUNDS`` block."""
+    tilt_items = line.split()[3:]
+    celldata = np.loadtxt(box_rows, dtype=float, ndmin=2)
+    diagdisp = celldata[:, :2].reshape(6, 1).flatten()
+
+    if celldata.shape[1] > 2:
+        offdiag = celldata[:, 2].astype(float)
+        if len(tilt_items) >= 3:
+            sort_index = [tilt_items.index(item) for item in ("xy", "xz", "yz")]
+            offdiag = offdiag[sort_index]
+        xy, xz, yz = (float(value) for value in offdiag)
+    else:
+        xy, xz, yz = 0.0, 0.0, 0.0
+
+    xlo, xhi, ylo, yhi, zlo, zhi = (float(value) for value in diagdisp)
+    xlo_bound = xlo - min(0.0, xy, xz, xy + xz)
+    xhi_bound = xhi - max(0.0, xy, xz, xy + xz)
+    ylo_bound = ylo - min(0.0, yz)
+    yhi_bound = yhi - max(0.0, yz)
+    zlo_bound = zlo
+    zhi_bound = zhi
+
+    cell = np.array(
+        [
+            [xhi_bound - xlo_bound, 0.0, 0.0],
+            [xy, yhi_bound - ylo_bound, 0.0],
+            [xz, yz, zhi_bound - zlo_bound],
+        ],
+        dtype=float,
+    )
+    celldisp = np.array([xlo_bound, ylo_bound, zlo_bound], dtype=float)
+
+    if len(tilt_items) == 3:
+        pbc_items = tilt_items
+    elif len(tilt_items) > 3:
+        pbc_items = tilt_items[3:6]
+    else:
+        pbc_items = ["f", "f", "f"]
+    pbc = tuple("p" in item.lower() for item in pbc_items)
+    return cell, celldisp, pbc
 
 
 def _read_frames(path: Path, *, format: str | None = None) -> list[Atoms]:
@@ -68,7 +110,7 @@ def _read_lammps_dump_frames(path: Path) -> list[Atoms]:
                 cell_lines = [handle.readline() for _ in range(3)]
                 if any(not entry for entry in cell_lines):
                     raise ValueError(f"Incomplete LAMMPS dump '{path}': missing box bounds rows.")
-                cell, celldisp, pbc = _parse_box_bound(line, deque(cell_lines))
+                cell, celldisp, pbc = _parse_box_bound(line, cell_lines)
                 continue
 
             if line.startswith("ITEM: ATOMS"):
@@ -225,3 +267,5 @@ def write_trajectory(frames: list[Atoms], path: str | Path) -> Path:
         progress.update()
     LOGGER.info("Wrote %d frame(s) to '%s'.", len(frames), output_path)
     return output_path
+
+

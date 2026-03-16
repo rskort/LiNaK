@@ -3,7 +3,7 @@ import pytest
 import h5py
 from ase import Atoms
 
-from linak.msd import compute_msd, load_msd_profile, save_msd_profile
+from linak.analysis.msd import compute_msd, load_msd_profile, save_msd_profile
 
 
 def test_compute_msd_returns_expected_profile():
@@ -63,7 +63,7 @@ def test_compute_msd_uses_periodic_minimum_image_when_cell_is_present():
 
 
 def test_plot_msd_profiles_uses_multi_line_plot_for_multiple_profiles(monkeypatch):
-    from linak.msd import MSDProfile, plot_msd_profiles
+    from linak.analysis.msd import MSDProfile, plot_msd_profiles
 
     captured = {}
 
@@ -73,7 +73,7 @@ def test_plot_msd_profiles_uses_multi_line_plot_for_multiple_profiles(monkeypatc
         captured["labels"] = labels
         return None
 
-    monkeypatch.setattr("linak.msd.plot_multi_line_series", _fake_plot_multi_line_series)
+    monkeypatch.setattr("linak.analysis.msd.plot_multi_line_series", _fake_plot_multi_line_series)
 
     profile_a = MSDProfile(
         species="A",
@@ -92,3 +92,4 @@ def test_plot_msd_profiles_uses_multi_line_plot_for_multiple_profiles(monkeypatc
 
     plot_msd_profiles([profile_a, profile_b], show=False)
     assert captured["labels"] == ["A", "B"]
+

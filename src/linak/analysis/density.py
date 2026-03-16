@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 import logging
 from pathlib import Path
@@ -12,20 +13,20 @@ from ase import Atoms
 from ase.data import atomic_masses, atomic_numbers
 from ase.neighborlist import neighbor_list
 
-from .hdf5_utils import (
+from ..storage.hdf5_utils import (
     is_hdf5_path,
     read_linak_hdf5_profiles,
     write_linak_hdf5,
 )
-from .plotting import (
+from ..plot.plotting import (
     DEFAULT_PLOT_STYLE,
     PlotStyle,
     normalize_backend_name as normalize_backend_name,
     plot_line_series,
     plot_multi_line_series,
 )
-from .progress import ProgressBar
-from .utils import axis_to_index, ensure_positive
+from ..progress import ProgressBar
+from ..utils import axis_to_index, ensure_positive
 
 LOGGER = logging.getLogger(__name__)
 H2O_VALIDATION_STRIDE = 250
@@ -1216,7 +1217,12 @@ def _reconstruct_bin_edges_from_centers(bin_centers: np.ndarray, *, bin_width: f
     return left_edge + np.arange(bin_centers.size + 1, dtype=float) * bin_width
 
 
-def save_density_profile(profile: DensityProfile, output: str | Path) -> Path:
+def save_density_profile(
+    profile: DensityProfile,
+    output: str | Path,
+    *,
+    additional_metadata: Mapping[str, Any] | None = None,
+) -> Path:
     """Save a density profile to LiNaK HDF5 and return the written path."""
     bin_edges = np.asarray(profile.bin_edges, dtype=float)
     bin_centers = np.asarray(profile.bin_centers, dtype=float)
@@ -1233,6 +1239,27 @@ def save_density_profile(profile: DensityProfile, output: str | Path) -> Path:
         source_label=f"Density profile '{profile.species}'",
     )
 
+    metadata: dict[str, Any] = {
+        "axis": profile.axis,
+        "species": profile.species,
+        "units": profile.units,
+        "n_frames": profile.n_frames,
+        "number_density_units": profile.number_density_units,
+        "coordinate_mode": profile.coordinate_mode,
+        "surface_position": profile.surface_position,
+        "surface_position_std": profile.surface_position_std,
+        "bin_width_A": bin_width,
+        "units_map": {
+            "bin_width_A": "Angstrom",
+            "bin_centers_A": "Angstrom",
+            "counts_per_frame": "g",
+            "density": profile.units,
+            "number_density": profile.number_density_units,
+        },
+    }
+    if additional_metadata:
+        metadata.update(dict(additional_metadata))
+
     output_path = write_linak_hdf5(
         output,
         analysis="density",
@@ -1242,24 +1269,7 @@ def save_density_profile(profile: DensityProfile, output: str | Path) -> Path:
             "density": profile.density,
             "number_density": profile.number_density,
         },
-        metadata={
-            "axis": profile.axis,
-            "species": profile.species,
-            "units": profile.units,
-            "n_frames": profile.n_frames,
-            "number_density_units": profile.number_density_units,
-            "coordinate_mode": profile.coordinate_mode,
-            "surface_position": profile.surface_position,
-            "surface_position_std": profile.surface_position_std,
-            "bin_width_A": bin_width,
-            "units_map": {
-                "bin_width_A": "Angstrom",
-                "bin_centers_A": "Angstrom",
-                "counts_per_frame": "g",
-                "density": profile.units,
-                "number_density": profile.number_density_units,
-            },
-        },
+        metadata=metadata,
     )
     LOGGER.info("Saved density data to '%s'.", output_path)
     return output_path
@@ -1462,6 +1472,7 @@ def plot_density_profile(
     profile: DensityProfile,
     output: str | Path | None = None,
     show: bool = True,
+    show_blocking: bool = True,
     preferred_backend: str | None = None,
     style: PlotStyle = DEFAULT_PLOT_STYLE,
     x_mode: str = "distance",
@@ -1485,6 +1496,9 @@ def plot_density_profile(
     legend_loc: str = "best",
     line_label: str | None = None,
     line_colors: list[str] | None = None,
+    series_enabled: list[bool] | None = None,
+    series_line_widths: list[float | None] | None = None,
+    series_markers: list[str | None] | None = None,
     capture_state: dict[str, Any] | None = None,
 ) -> Path | None:
     """Plot and optionally save a density profile."""
@@ -1497,6 +1511,13 @@ def plot_density_profile(
     resolved_line_color = None
     if line_colors:
         resolved_line_color = line_colors[0]
+    line_visible = True if not series_enabled else bool(series_enabled[0])
+    line_width_override = None
+    if series_line_widths:
+        line_width_override = series_line_widths[0]
+    line_marker = None
+    if series_markers:
+        line_marker = series_markers[0]
 
     return plot_line_series(
         x_values,
@@ -1506,9 +1527,13 @@ def plot_density_profile(
         y_label=y_label or f"{y_label_prefix} ({units})",
         output=output,
         show=show,
+        show_blocking=show_blocking,
         preferred_backend=preferred_backend,
         line_label=resolved_line_label,
         line_color=resolved_line_color,
+        line_width_override=line_width_override,
+        line_marker=line_marker,
+        line_visible=line_visible,
         style=style,
         x_scale=x_scale,
         y_scale=y_scale,
@@ -1532,6 +1557,7 @@ def plot_density_profiles(
     profiles: list[DensityProfile],
     output: str | Path | None = None,
     show: bool = True,
+    show_blocking: bool = True,
     preferred_backend: str | None = None,
     style: PlotStyle = DEFAULT_PLOT_STYLE,
     x_mode: str = "distance",
@@ -1555,6 +1581,9 @@ def plot_density_profiles(
     legend_loc: str = "best",
     series_labels: list[str] | None = None,
     line_colors: list[str] | None = None,
+    series_enabled: list[bool] | None = None,
+    series_line_widths: list[float | None] | None = None,
+    series_markers: list[str | None] | None = None,
     capture_state: dict[str, Any] | None = None,
 ) -> Path | None:
     """Plot one or more density profiles."""
@@ -1577,6 +1606,7 @@ def plot_density_profiles(
             profiles[0],
             output=output,
             show=show,
+            show_blocking=show_blocking,
             preferred_backend=preferred_backend,
             style=style,
             x_mode=x_mode,
@@ -1600,6 +1630,9 @@ def plot_density_profiles(
             legend_loc=legend_loc,
             line_label=labels[0] if labels else None,
             line_colors=line_colors,
+            series_enabled=series_enabled,
+            series_line_widths=series_line_widths,
+            series_markers=series_markers,
             capture_state=capture_state,
         )
 
@@ -1629,9 +1662,13 @@ def plot_density_profiles(
         y_label=y_label or f"{y_label_prefix} ({display_units})",
         output=output,
         show=show,
+        show_blocking=show_blocking,
         preferred_backend=preferred_backend,
         style=style,
         line_colors=line_colors,
+        series_enabled=series_enabled,
+        series_line_widths=series_line_widths,
+        series_markers=series_markers,
         x_scale=x_scale,
         y_scale=y_scale,
         x_lim=x_lim,

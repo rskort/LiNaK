@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 import logging
 from pathlib import Path
@@ -11,14 +12,14 @@ import numpy as np
 from ase import Atoms
 from ase.geometry import find_mic
 
-from .hdf5_utils import (
+from ..storage.hdf5_utils import (
     is_hdf5_path,
     read_linak_hdf5_profiles,
     write_linak_hdf5,
 )
-from .plotting import DEFAULT_PLOT_STYLE, PlotStyle, plot_line_series, plot_multi_line_series
-from .progress import ProgressBar
-from .utils import ensure_positive
+from ..plot.plotting import DEFAULT_PLOT_STYLE, PlotStyle, plot_line_series, plot_multi_line_series
+from ..progress import ProgressBar
+from ..utils import ensure_positive
 
 LOGGER = logging.getLogger(__name__)
 
@@ -156,8 +157,25 @@ def compute_msd(
     )
 
 
-def save_msd_profile(profile: MSDProfile, output: str | Path) -> Path:
+def save_msd_profile(
+    profile: MSDProfile,
+    output: str | Path,
+    *,
+    additional_metadata: Mapping[str, Any] | None = None,
+) -> Path:
     """Save MSD profile to LiNaK HDF5 and return written path."""
+    metadata: dict[str, Any] = {
+        "species": profile.species,
+        "n_frames": profile.n_frames,
+        "units": {
+            "time_fs": "fs",
+            "time_ps": "ps",
+            "msd_A2": "Angstrom^2",
+        },
+    }
+    if additional_metadata:
+        metadata.update(dict(additional_metadata))
+
     output_path = write_linak_hdf5(
         output,
         analysis="msd",
@@ -166,15 +184,7 @@ def save_msd_profile(profile: MSDProfile, output: str | Path) -> Path:
             "time_ps": profile.time_ps,
             "msd_A2": profile.msd,
         },
-        metadata={
-            "species": profile.species,
-            "n_frames": profile.n_frames,
-            "units": {
-                "time_fs": "fs",
-                "time_ps": "ps",
-                "msd_A2": "Angstrom^2",
-            },
-        },
+        metadata=metadata,
     )
     LOGGER.info("Saved MSD data to '%s'.", output_path)
     return output_path
@@ -240,6 +250,7 @@ def plot_msd_profile(
     profile: MSDProfile,
     output: str | Path | None = None,
     show: bool = True,
+    show_blocking: bool = True,
     preferred_backend: str | None = None,
     style: PlotStyle = DEFAULT_PLOT_STYLE,
     title: str | None = None,
@@ -261,6 +272,9 @@ def plot_msd_profile(
     legend_loc: str = "best",
     line_label: str | None = None,
     line_colors: list[str] | None = None,
+    series_enabled: list[bool] | None = None,
+    series_line_widths: list[float | None] | None = None,
+    series_markers: list[str | None] | None = None,
     capture_state: dict[str, Any] | None = None,
 ) -> Path | None:
     """Plot MSD profile using shared LiNaK plotting style."""
@@ -270,6 +284,13 @@ def plot_msd_profile(
     resolved_line_color = None
     if line_colors:
         resolved_line_color = line_colors[0]
+    line_visible = True if not series_enabled else bool(series_enabled[0])
+    line_width_override = None
+    if series_line_widths:
+        line_width_override = series_line_widths[0]
+    line_marker = None
+    if series_markers:
+        line_marker = series_markers[0]
     return plot_line_series(
         profile.time_ps,
         profile.msd,
@@ -278,9 +299,13 @@ def plot_msd_profile(
         y_label=y_label or "MSD (Angstrom^2)",
         output=output,
         show=show,
+        show_blocking=show_blocking,
         preferred_backend=preferred_backend,
         line_label=resolved_label,
         line_color=resolved_line_color,
+        line_width_override=line_width_override,
+        line_marker=line_marker,
+        line_visible=line_visible,
         style=style,
         x_scale=x_scale,
         y_scale=y_scale,
@@ -304,6 +329,7 @@ def plot_msd_profiles(
     profiles: list[MSDProfile],
     output: str | Path | None = None,
     show: bool = True,
+    show_blocking: bool = True,
     preferred_backend: str | None = None,
     style: PlotStyle = DEFAULT_PLOT_STYLE,
     title: str | None = None,
@@ -325,6 +351,9 @@ def plot_msd_profiles(
     legend_loc: str = "best",
     series_labels: list[str] | None = None,
     line_colors: list[str] | None = None,
+    series_enabled: list[bool] | None = None,
+    series_line_widths: list[float | None] | None = None,
+    series_markers: list[str | None] | None = None,
     capture_state: dict[str, Any] | None = None,
 ) -> Path | None:
     """Plot one or more MSD profiles."""
@@ -347,6 +376,7 @@ def plot_msd_profiles(
             profiles[0],
             output=output,
             show=show,
+            show_blocking=show_blocking,
             preferred_backend=preferred_backend,
             style=style,
             title=title,
@@ -368,6 +398,9 @@ def plot_msd_profiles(
             legend_loc=legend_loc,
             line_label=labels[0] if labels else None,
             line_colors=line_colors,
+            series_enabled=series_enabled,
+            series_line_widths=series_line_widths,
+            series_markers=series_markers,
             capture_state=capture_state,
         )
 
@@ -380,9 +413,13 @@ def plot_msd_profiles(
         y_label=y_label or "MSD (Angstrom^2)",
         output=output,
         show=show,
+        show_blocking=show_blocking,
         preferred_backend=preferred_backend,
         style=style,
         line_colors=line_colors,
+        series_enabled=series_enabled,
+        series_line_widths=series_line_widths,
+        series_markers=series_markers,
         x_scale=x_scale,
         y_scale=y_scale,
         x_lim=x_lim,

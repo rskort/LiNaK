@@ -21,6 +21,12 @@ For development (includes lint, type-check, and test tools):
 pip install -e .[dev]
 ```
 
+For GUI plot controls (`--gui`, PySide6/Qt):
+
+```bash
+pip install -e .[gui]
+```
+
 ## Quick Start
 
 CLI quick example:
@@ -33,9 +39,9 @@ linak plot density density_o.h5 --no-show --output density_o.png
 Python API quick example:
 
 ```python
-from linak.io import read_trajectory
-from linak.density import compute_density_profile
-from linak.msd import compute_msd
+from linak.trajectory.io import read_trajectory
+from linak.analysis.density import compute_density_profile
+from linak.analysis.msd import compute_msd
 
 frames = read_trajectory("traj.xyz")
 density = compute_density_profile(frames, species="O", axis="z", bin_width=0.1)
@@ -157,10 +163,7 @@ For trajectory-based density/MSD/RDF analyses, LiNaK resolves PBC cell dimension
 2. `--input /path/to/input.inp` or `--input /path/to/input.lmp`
    (aliases: `--cp2k-input`, `--lammps-input`)
 3. auto-detected single simulation input (`.inp` or `.lmp`) in the trajectory directory
-4. global cache in `${XDG_CACHE_HOME:-~/.cache}/linak/cells.json`
-
-LiNaK updates the global cache whenever a non-cache source resolves a cell.
-If any available sources disagree (explicit, auto-detected, or cached), LiNaK logs a warning.
+If multiple available sources disagree (explicit vs input metadata), LiNaK logs a warning.
 
 By default, `compute` writes HDF5 output next to the input trajectory file.
 Use `-o/--output` (alias: `--save-data`) on each compute subcommand to override the destination.
@@ -180,11 +183,10 @@ For MSD, LiNaK resolves timestep in this order:
    - CP2K `.inp`: `TIMESTEP [fs] * &TRAJECTORY / &EACH / MD`
    - LAMMPS `.lmp`: `timestep * dump every` (converted to fs via `units`)
 4. auto-detected `.inp`/`.lmp` in the trajectory directory (same formulas)
-5. global cache in `${XDG_CACHE_HOME:-~/.cache}/linak/cells.json`
-6. fallback to `1.0 fs` if no source is available
+5. fallback to `1.0 fs` if no source is available
 
 LiNaK logs warnings when available timestep sources disagree.
-Resolved per-frame timestep values are written to the same global cache.
+Resolved cell/timestep provenance is written to output HDF5 metadata.
 
 ## Plot Commands (HDF5 Input Only)
 
@@ -314,30 +316,47 @@ linak --log-level DEBUG --log-file linak.log compute density traj.xyz
 
 LiNaK supports Python `>=3.9`.
 
-If you rely on interactive Tk plotting (`TkAgg`) on HPC systems, Python and Tk availability can be environment-dependent. The package works with Python `3.13.1`, but backend availability still depends on the local environment modules/libraries.
+Interactive plotting defaults to Qt (`QtAgg`) and GUI plot controls use PySide6.
+Backend availability remains environment-dependent on HPC systems.
 
 ## Package Layout
 
 ```text
 src/linak/
   __init__.py
+  resolution.py
   cli.py
-  compress.py
-  io.py
-  lammps.py
-  cell_cache.py
   progress.py
   pbc.py
-  density.py
-  msd.py
-  rdf.py
-  plotting.py
   utils.py
+  analysis/
+    __init__.py
+    density.py
+    msd.py
+    rdf.py
+    potential.py
+  trajectory/
+    __init__.py
+    io.py
+    lammps.py
+  plot/
+    __init__.py
+    plotting.py
+    plot_settings.py
+    plot_gui.py
+  storage/
+    __init__.py
+    hdf5_utils.py
+    hdf5_table.py
+    csv_tools.py
+    compress.py
 tests/
   test_cli.py
   test_density.py
-  test_cell_cache.py
+  test_resolution.py
+  test_io.py
   test_msd.py
   test_rdf.py
   test_pbc.py
 ```
+

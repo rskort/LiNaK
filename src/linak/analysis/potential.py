@@ -16,15 +16,15 @@ from typing import Any, Callable
 
 import numpy as np
 
-from . import __version__
-from .hdf5_utils import (
+from .. import __version__
+from ..storage.hdf5_utils import (
     LINAK_HDF5_FORMAT,
     LINAK_HDF5_VERSION,
     hdf5_string_dtype,
     require_h5py,
     resolve_hdf5_output_path,
 )
-from .progress import ProgressBar
+from ..progress import ProgressBar
 
 LOGGER = logging.getLogger(__name__)
 

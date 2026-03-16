@@ -12,7 +12,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from . import __version__
+from .. import __version__
 from .hdf5_utils import (
     LINAK_HDF5_FORMAT,
     LINAK_HDF5_VERSION,
@@ -334,3 +334,4 @@ def write_hdf5_frame(
             records.create_dataset(str(column), data=values, **kwargs)
 
     return output_path
+

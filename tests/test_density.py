@@ -6,7 +6,7 @@ from ase import Atoms
 from ase.constraints import FixAtoms
 import h5py
 
-from linak.density import (
+from linak.analysis.density import (
     available_element_species,
     compute_density_profiles,
     compute_density_profile,
@@ -575,7 +575,7 @@ def test_normalize_backend_name_suggests_on_typo():
 
 
 def test_plot_density_profile_defaults_to_distance_axis(monkeypatch):
-    from linak.density import DensityProfile, plot_density_profile
+    from linak.analysis.density import DensityProfile, plot_density_profile
 
     captured = {}
 
@@ -586,7 +586,7 @@ def test_plot_density_profile_defaults_to_distance_axis(monkeypatch):
         captured["y_label"] = kwargs["y_label"]
         return None
 
-    monkeypatch.setattr("linak.density.plot_line_series", _fake_plot_line_series)
+    monkeypatch.setattr("linak.analysis.density.plot_line_series", _fake_plot_line_series)
 
     profile = DensityProfile(
         axis="z",
@@ -608,7 +608,7 @@ def test_plot_density_profile_defaults_to_distance_axis(monkeypatch):
 
 
 def test_plot_density_profiles_use_g_per_cm3_without_si_scaling(monkeypatch):
-    from linak.density import DensityProfile, plot_density_profiles
+    from linak.analysis.density import DensityProfile, plot_density_profiles
 
     captured = {}
 
@@ -619,7 +619,7 @@ def test_plot_density_profiles_use_g_per_cm3_without_si_scaling(monkeypatch):
         captured["y_label"] = kwargs["y_label"]
         return None
 
-    monkeypatch.setattr("linak.density.plot_multi_line_series", _fake_plot_multi_line_series)
+    monkeypatch.setattr("linak.analysis.density.plot_multi_line_series", _fake_plot_multi_line_series)
 
     profile_a = DensityProfile(
         axis="z",
@@ -653,7 +653,7 @@ def test_plot_density_profiles_use_g_per_cm3_without_si_scaling(monkeypatch):
 
 
 def test_plot_density_profile_supports_number_density(monkeypatch):
-    from linak.density import DensityProfile, plot_density_profile
+    from linak.analysis.density import DensityProfile, plot_density_profile
 
     captured = {}
 
@@ -662,7 +662,7 @@ def test_plot_density_profile_supports_number_density(monkeypatch):
         captured["y_label"] = kwargs["y_label"]
         return None
 
-    monkeypatch.setattr("linak.density.plot_line_series", _fake_plot_line_series)
+    monkeypatch.setattr("linak.analysis.density.plot_line_series", _fake_plot_line_series)
     profile = DensityProfile(
         axis="z",
         species="O",
@@ -683,7 +683,7 @@ def test_plot_density_profile_supports_number_density(monkeypatch):
 
 
 def test_plot_line_series_keeps_explicit_y_limits_when_ticks_are_outside_range():
-    from linak.plotting import plot_line_series
+    from linak.plot.plotting import plot_line_series
 
     captured = {}
     plot_line_series(
@@ -699,3 +699,81 @@ def test_plot_line_series_keeps_explicit_y_limits_when_ticks_are_outside_range()
     )
 
     assert captured["y_lim"][0] == pytest.approx(0.0)
+
+
+def test_plot_line_series_non_blocking_show_keeps_figure_open(monkeypatch):
+    import matplotlib.pyplot as plt
+
+    from linak.plot import plotting as plotting_mod
+
+    show_blocks: list[bool | None] = []
+    pause_calls: list[float] = []
+    close_calls: list[object] = []
+
+    monkeypatch.setattr(plotting_mod, "configure_matplotlib_backend", lambda **_kwargs: "QtAgg")
+    monkeypatch.setattr(plotting_mod, "_import_pyplot", lambda: plt)
+    monkeypatch.setattr(plt, "show", lambda *args, **kwargs: show_blocks.append(kwargs.get("block")))
+    monkeypatch.setattr(plt, "pause", lambda value: pause_calls.append(float(value)))
+    monkeypatch.setattr(plt, "close", lambda *args, **_kwargs: close_calls.append(args[0] if args else None))
+
+    plotting_mod.plot_line_series(
+        np.array([0.0, 1.0, 2.0], dtype=float),
+        np.array([0.2, 0.6, 1.0], dtype=float),
+        title="demo",
+        x_label="x",
+        y_label="y",
+        show=True,
+        show_blocking=False,
+    )
+
+    assert show_blocks == [False]
+    assert pause_calls == [pytest.approx(0.001)]
+    assert close_calls == []
+
+
+def test_plot_line_series_blocking_show_closes_figure(monkeypatch):
+    import matplotlib.pyplot as plt
+
+    from linak.plot import plotting as plotting_mod
+
+    show_blocks: list[bool | None] = []
+    close_calls: list[object] = []
+
+    monkeypatch.setattr(plotting_mod, "configure_matplotlib_backend", lambda **_kwargs: "QtAgg")
+    monkeypatch.setattr(plotting_mod, "_import_pyplot", lambda: plt)
+    monkeypatch.setattr(plt, "show", lambda *args, **kwargs: show_blocks.append(kwargs.get("block")))
+    monkeypatch.setattr(plt, "close", lambda *args, **_kwargs: close_calls.append(args[0] if args else None))
+
+    plotting_mod.plot_line_series(
+        np.array([0.0, 1.0, 2.0], dtype=float),
+        np.array([0.2, 0.6, 1.0], dtype=float),
+        title="demo",
+        x_label="x",
+        y_label="y",
+        show=True,
+        show_blocking=True,
+    )
+
+    assert show_blocks == [True]
+    assert len(close_calls) == 1
+
+
+def test_plot_multi_line_series_hides_disabled_series_in_capture_state():
+    from linak.plot.plotting import plot_multi_line_series
+
+    captured = {}
+    plot_multi_line_series(
+        [np.array([0.0, 1.0], dtype=float), np.array([0.0, 1.0], dtype=float)],
+        [np.array([1.0, 2.0], dtype=float), np.array([2.0, 3.0], dtype=float)],
+        ["run-a", "run-b"],
+        title="demo",
+        x_label="x",
+        y_label="y",
+        show=False,
+        series_enabled=[False, True],
+        capture_state=captured,
+    )
+
+    assert captured["series_labels"] == ["run-b"]
+    assert len(captured["line_colors"]) == 1
+

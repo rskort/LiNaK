@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from linak.io import read_trajectory
+from linak.trajectory.io import read_trajectory
 
 
 def _write_lammps_dump(path: Path) -> None:
@@ -41,10 +41,11 @@ def test_read_trajectory_dump_does_not_depend_on_ase_iread(tmp_path, monkeypatch
     def _raise_if_called(*_args, **_kwargs):
         raise AssertionError("iread should not be called for .dump files")
 
-    monkeypatch.setattr("linak.io.iread", _raise_if_called)
+    monkeypatch.setattr("linak.trajectory.io.iread", _raise_if_called)
 
     frames = read_trajectory(dump_path)
 
     assert len(frames) == 2
     assert frames[0].info.get("timestep") == 0
     assert frames[1].info.get("timestep") == 10
+

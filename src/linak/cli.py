@@ -24,11 +24,11 @@ from ase import Atoms
 from . import __version__
 
 if TYPE_CHECKING:
-    from .plotting import PlotStyle
-    from .potential import PotentialComputationFailure, PotentialRecord
+    from .plot.plotting import PlotStyle
+    from .analysis.potential import PotentialComputationFailure, PotentialRecord
 
 LOGGER = logging.getLogger(__name__)
-DEFAULT_INTERACTIVE_BACKEND = "TkAgg"
+DEFAULT_INTERACTIVE_BACKEND = "QtAgg"
 _PROJECT_AUTHOR_LINE = re.compile(r'^\s*authors\s*=\s*\[\{\s*name\s*=\s*"([^"]+)"')
 _TABULAR_COMMAND = "hdf5"
 _TABULAR_COMMAND_ALIASES = ("hd","h5",)
@@ -106,6 +106,9 @@ _PLOT_SETTINGS_COMMON_KEYS = (
     "x_tick_rotation",
     "y_tick_rotation",
     "series_labels",
+    "series_enabled",
+    "series_line_widths",
+    "series_markers",
     "legend",
     "legend_title",
     "legend_loc",
@@ -357,8 +360,7 @@ def _preview_resolve_cell_without_trajectory_read(
     cell: tuple[float, float, float] | None,
     input_path: str | None,
 ) -> tuple[tuple[float, float, float] | None, str]:
-    """Resolve cell for dry-run using only explicit/input/auto/cache sources."""
-    from .cell_cache import load_cached_cell
+    """Resolve cell for dry-run using explicit, input, or auto-detected sources."""
     from .pbc import extract_cell_from_simulation_input, find_unique_simulation_input
 
     if cell is not None:
@@ -376,11 +378,7 @@ def _preview_resolve_cell_without_trajectory_read(
     except (FileNotFoundError, ValueError):
         pass
 
-    cached = load_cached_cell(trajectory_path)
-    if cached is not None:
-        return cached, "global cache"
-
-    return None, "unresolved from input/cache sources"
+    return None, "unresolved from input sources"
 
 
 def _preview_resolve_msd_timestep_without_trajectory_read(
@@ -390,7 +388,6 @@ def _preview_resolve_msd_timestep_without_trajectory_read(
     input_path: str | None,
 ) -> tuple[float, str]:
     """Resolve MSD timestep for dry-run without loading trajectory frames."""
-    from .cell_cache import load_cached_timestep_fs
     from .pbc import extract_frame_timestep_fs_from_simulation_input, find_unique_simulation_input
 
     if timestep_fs is not None:
@@ -409,10 +406,6 @@ def _preview_resolve_msd_timestep_without_trajectory_read(
         return frame_timestep_fs, f"auto-detected ({auto_input})"
     except (FileNotFoundError, ValueError):
         pass
-
-    cached = load_cached_timestep_fs(trajectory_path)
-    if cached is not None:
-        return cached, "global cache"
 
     return 1.0, "fallback default"
 
@@ -437,10 +430,10 @@ def _describe_cell_resolution_preview(
         return f"resolved {_format_cell_values(resolved_cell)} ({cell_source})"
     if include_trajectory_fallback_note:
         return (
-            "unresolved from input/cache sources; execution may still use "
+            "unresolved from input sources; execution may still use "
             "trajectory-embedded periodic cell after loading frames"
         )
-    return "unresolved from input/cache sources"
+    return "unresolved from input sources"
 
 
 def _summarize_source_resolution_previews(
@@ -685,7 +678,7 @@ def _is_hdf5_source(path: str | Path) -> bool:
 
 def _parse_backend(value: str) -> str:
     """Argparse type wrapper for backend normalization with useful errors."""
-    from .plotting import normalize_backend_name
+    from .plot.plotting import normalize_backend_name
 
     try:
         return normalize_backend_name(value)
@@ -1160,7 +1153,7 @@ def _apply_saved_plot_settings(
     profile_key: str,
     keys: tuple[str, ...],
 ) -> dict[str, Any] | None:
-    from .plot_settings import read_plot_profile
+    from .plot.plot_settings import read_plot_profile
 
     try:
         saved = read_plot_profile(source_path, profile_key)
@@ -1172,8 +1165,6 @@ def _apply_saved_plot_settings(
 
     for key in keys:
         if key not in saved:
-            continue
-        if not hasattr(args, key):
             continue
         if _runtime_option_was_provided(args, key):
             continue
@@ -1292,7 +1283,7 @@ def _copy_hdf5_for_plot_settings(
     profile_key: str,
     settings: dict[str, Any],
 ) -> Path:
-    from .plot_settings import write_plot_profile
+    from .plot.plot_settings import write_plot_profile
 
     default_target = source_path.with_name(f"{source_path.stem}_plot_settings{source_path.suffix}")
     prompt = f"Copy target path [default: {default_target}]: "
@@ -1316,7 +1307,7 @@ def _persist_plot_settings_with_resolution(
     existing_settings: dict[str, Any] | None,
     candidate_settings: dict[str, Any],
 ) -> None:
-    from .plot_settings import write_plot_profile
+    from .plot.plot_settings import write_plot_profile
 
     if existing_settings is None:
         write_plot_profile(source_path, profile_key, candidate_settings)
@@ -1393,7 +1384,7 @@ def _resolve_plot_profile_key(
     source_path: Path,
 ) -> str:
     if profile_token is None or profile_token == "auto":
-        from .plot_settings import read_hdf5_analysis
+        from .plot.plot_settings import read_hdf5_analysis
 
         return _profile_key_from_analysis(read_hdf5_analysis(source_path))
 
@@ -1448,7 +1439,7 @@ def _print_csv_preview_for_interactive(
     rows: int = 8,
     heading: str = "Preview before interactive selection",
 ) -> None:
-    from .csv_tools import format_frame_preview
+    from .storage.csv_tools import format_frame_preview
 
     print(f"{heading}: {source_path} (head {rows})")
     print(format_frame_preview(frame, rows=rows, tail=False, show_index=False))
@@ -1461,7 +1452,7 @@ def _load_csv_frame_from_source(
     group: str | None = None,
 ) -> tuple[Any, Path]:
     try:
-        from .hdf5_table import read_hdf5_frame
+        from .storage.hdf5_table import read_hdf5_frame
     except ModuleNotFoundError as exc:
         if exc.name in {"pandas", "h5py"}:
             raise ValueError(
@@ -1503,7 +1494,7 @@ def _print_hdf5_metadata_overview(frame: Any) -> None:
     if source_info is None:
         return
 
-    from .hdf5_table import format_hdf5_metadata_overview
+    from .storage.hdf5_table import format_hdf5_metadata_overview
 
     print(format_hdf5_metadata_overview(source_info))
     print("")
@@ -1845,7 +1836,7 @@ def _add_cell_resolution_options(parser: argparse.ArgumentParser) -> None:
         metavar="PATH",
         help=(
             "Path to simulation input file (.inp for CP2K, .lmp for LAMMPS). "
-            "Used if cache and auto input discovery fail."
+            "Used if automatic input discovery fails."
         ),
     )
 
@@ -1863,8 +1854,8 @@ def _resolve_and_apply_required_cell(
     cell: tuple[float, float, float] | None,
     input_path: str | None,
     analysis_name: str,
-) -> tuple[float, float, float]:
-    from .cell_cache import resolve_analysis_cell
+) -> tuple[tuple[float, float, float], str, str | None]:
+    from .resolution import resolve_analysis_cell
 
     has_trajectory_cell = _frames_have_usable_periodic_cell(frames)
     if cell is None and input_path is None and has_trajectory_cell:
@@ -1877,7 +1868,7 @@ def _resolve_and_apply_required_cell(
             resolved[1],
             resolved[2],
         )
-        return resolved
+        return resolved, "trajectory metadata", None
 
     try:
         resolved = resolve_analysis_cell(
@@ -1894,17 +1885,22 @@ def _resolve_and_apply_required_cell(
                 analysis_name,
                 exc,
             )
-            return resolved
+            return resolved, "trajectory metadata", None
         raise
+    resolved_cell = resolved.cell_angstrom
     LOGGER.info(
         "Using cell for %s analysis: A=%.6g, B=%.6g, C=%.6g Angstrom.",
         analysis_name,
-        resolved[0],
-        resolved[1],
-        resolved[2],
+        resolved_cell[0],
+        resolved_cell[1],
+        resolved_cell[2],
     )
-    _set_cell_on_frames(frames, resolved)
-    return resolved
+    _set_cell_on_frames(frames, resolved_cell)
+    return (
+        resolved_cell,
+        resolved.source,
+        str(resolved.input_path) if resolved.input_path is not None else None,
+    )
 
 
 def _maybe_apply_density_cell(
@@ -1913,9 +1909,9 @@ def _maybe_apply_density_cell(
     *,
     cell: tuple[float, float, float] | None,
     input_path: str | None,
-) -> tuple[float, float, float] | None:
+) -> tuple[tuple[float, float, float] | None, str, str | None]:
     """Try to resolve/apply a periodic cell for density; return None on fallback."""
-    from .cell_cache import resolve_analysis_cell
+    from .resolution import resolve_analysis_cell
 
     has_trajectory_cell = _frames_have_usable_periodic_cell(frames)
     if cell is None and input_path is None and has_trajectory_cell:
@@ -1927,7 +1923,7 @@ def _maybe_apply_density_cell(
             resolved[1],
             resolved[2],
         )
-        return resolved
+        return resolved, "trajectory metadata", None
 
     try:
         resolved = resolve_analysis_cell(
@@ -1943,21 +1939,26 @@ def _maybe_apply_density_cell(
                 "periodic cell already present in trajectory. %s",
                 exc,
             )
-            return resolved
+            return resolved, "trajectory metadata", None
         LOGGER.info(
             "No periodic cell resolved for density analysis; using linear density. %s",
             exc,
         )
-        return None
+        return None, "unresolved", None
 
+    resolved_cell = resolved.cell_angstrom
     LOGGER.info(
         "Using cell for density analysis: A=%.6g, B=%.6g, C=%.6g Angstrom.",
-        resolved[0],
-        resolved[1],
-        resolved[2],
+        resolved_cell[0],
+        resolved_cell[1],
+        resolved_cell[2],
     )
-    _set_cell_on_frames(frames, resolved)
-    return resolved
+    _set_cell_on_frames(frames, resolved_cell)
+    return (
+        resolved_cell,
+        resolved.source,
+        str(resolved.input_path) if resolved.input_path is not None else None,
+    )
 
 
 def _resolve_msd_timestep_fs(
@@ -1966,8 +1967,8 @@ def _resolve_msd_timestep_fs(
     timestep_fs: float | None,
     input_path: str | None,
     frames: list[Atoms] | None = None,
-) -> float:
-    from .cell_cache import resolve_analysis_timestep_fs
+) -> tuple[float, str, str | None, float | None, int | None]:
+    from .resolution import resolve_analysis_timestep_fs
 
     try:
         resolved = resolve_analysis_timestep_fs(
@@ -1976,8 +1977,14 @@ def _resolve_msd_timestep_fs(
             input_path=input_path,
             frames=frames,
         )
-        LOGGER.info("Using timestep for MSD analysis: %.6g fs.", resolved)
-        return resolved
+        LOGGER.info("Using timestep for MSD analysis: %.6g fs.", resolved.frame_timestep_fs)
+        return (
+            resolved.frame_timestep_fs,
+            resolved.source,
+            str(resolved.input_path) if resolved.input_path is not None else None,
+            resolved.md_timestep_fs,
+            resolved.trajectory_stride_md,
+        )
     except ValueError as exc:
         if timestep_fs is not None:
             raise
@@ -1985,7 +1992,7 @@ def _resolve_msd_timestep_fs(
             "No timestep resolved for MSD analysis; using default 1.0 fs. %s",
             exc,
         )
-        return 1.0
+        return 1.0, "fallback default", None, None, None
 
 
 def _resolve_combined_msd_timestep_fs(timesteps_by_source: list[tuple[str, float]]) -> float:
@@ -2006,7 +2013,7 @@ def _resolve_combined_msd_timestep_fs(timesteps_by_source: list[tuple[str, float
 
 
 def _build_plot_style(args: argparse.Namespace) -> PlotStyle:
-    from .plotting import with_style_overrides
+    from .plot.plotting import with_style_overrides
 
     figure_size = tuple(args.figsize) if args.figsize is not None else None
     return with_style_overrides(
@@ -2054,7 +2061,7 @@ def _default_multi_series_colors(count: int) -> list[str]:
         colors = []
 
     if not colors:
-        from .plotting import DEFAULT_PLOT_STYLE
+        from .plot.plotting import DEFAULT_PLOT_STYLE
 
         colors = [DEFAULT_PLOT_STYLE.line_color]
 
@@ -2066,7 +2073,7 @@ def _read_plot_profile_safe(
     *,
     profile_key: str,
 ) -> dict[str, Any] | None:
-    from .plot_settings import read_plot_profile
+    from .plot.plot_settings import read_plot_profile
 
     source_path = Path(source).expanduser().resolve()
     try:
@@ -2209,7 +2216,7 @@ def _persist_effective_series_settings(
     series_labels: list[str] | None,
     line_colors: list[str] | None,
 ) -> None:
-    from .plot_settings import read_plot_profile, write_plot_profile
+    from .plot.plot_settings import read_plot_profile, write_plot_profile
 
     existing = read_plot_profile(source_path, profile_key) or {}
     if not isinstance(existing, dict):
@@ -2311,6 +2318,21 @@ def _render_profile_plot(
     plotter: Callable[..., Path | None],
     plotter_kwargs: dict[str, Any] | None = None,
 ) -> tuple[Path | None, dict[str, Any]]:
+    from .plot.plotting import configure_matplotlib_backend
+
+    interactive_requested = bool(args.show or getattr(args, "gui", False))
+    if interactive_requested:
+        try:
+            configure_matplotlib_backend(
+                interactive=True,
+                preferred_backend=args.backend,
+            )
+        except RuntimeError:
+            if not args.show:
+                configure_matplotlib_backend(interactive=False, preferred_backend=args.backend)
+    else:
+        configure_matplotlib_backend(interactive=False, preferred_backend=args.backend)
+
     extra_kwargs = {} if plotter_kwargs is None else dict(plotter_kwargs)
     style = _build_plot_style(args)
     captured_state: dict[str, Any] = {}
@@ -2333,14 +2355,20 @@ def _render_profile_plot(
         "legend_title": args.legend_title,
         "legend_loc": args.legend_loc,
         "series_labels": args.series_labels,
+        "series_enabled": getattr(args, "series_enabled", None),
+        "series_line_widths": getattr(args, "series_line_widths", None),
+        "series_markers": getattr(args, "series_markers", None),
         "line_colors": args.line_colors,
+        "show_blocking": not bool(getattr(args, "gui", False)),
         "capture_state": captured_state,
     }
 
     def _render_with_options(show: bool, output: str | Path | None) -> Path | None:
         call_kwargs = dict(shared_kwargs)
         if not isinstance(profile, list):
-            call_kwargs.pop("series_labels", None)
+            labels = call_kwargs.pop("series_labels", None)
+            if isinstance(labels, list) and labels:
+                call_kwargs["line_label"] = str(labels[0])
         return plotter(
             profile,
             output=output,
@@ -2384,8 +2412,7 @@ def _collect_plot_settings_for_persistence(
 
 def _apply_gui_settings_to_args(args: argparse.Namespace, settings: dict[str, Any]) -> None:
     for key, value in settings.items():
-        if hasattr(args, key):
-            setattr(args, key, value)
+        setattr(args, key, value)
     if hasattr(args, "x_lim"):
         args.x_lim = None
     if hasattr(args, "y_lim"):
@@ -2400,7 +2427,7 @@ def _open_plot_settings_gui(
     on_save: Callable[[dict[str, Any]], str],
     on_save_figure: Callable[[dict[str, Any], str], str] | None = None,
 ) -> None:
-    from .plot_gui import launch_plot_settings_panel
+    from .plot.plot_gui import launch_plot_settings_panel
 
     launch_plot_settings_panel(
         title=title,
@@ -2425,6 +2452,7 @@ def _launch_profile_plot_gui(
     plotter_kwargs: dict[str, Any] | None = None,
 ) -> None:
     initial_settings = _collect_plot_settings_for_persistence(args, keys=setting_keys)
+    initial_settings["series_count"] = len(profile) if isinstance(profile, list) else 1
 
     def _preview(gui_settings: dict[str, Any]) -> None:
         preview_args = deepcopy(args)
@@ -2441,7 +2469,7 @@ def _launch_profile_plot_gui(
         )
 
     def _save(gui_settings: dict[str, Any]) -> str:
-        from .plot_settings import write_plot_profile
+        from .plot.plot_settings import write_plot_profile
 
         save_args = deepcopy(args)
         _apply_gui_settings_to_args(save_args, gui_settings)
@@ -2881,7 +2909,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Timestep between frames in fs "
-            "(default: auto from metadata or simulation input, then cache; fallback 1.0)"
+            "(default: auto from metadata or simulation input; fallback 1.0)"
         ),
     )
     _add_cell_resolution_options(compute_msd)
@@ -3116,7 +3144,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_dry_run_option(apply_pbc)
     apply_pbc.set_defaults(handler=_handle_apply_pbc)
 
-    from .compress import DROP_SECTION_CHOICES
+    from .storage.compress import DROP_SECTION_CHOICES
 
     apply_compress = apply_commands.add_parser(
         "compress",
@@ -3573,7 +3601,7 @@ def _handle_csv_plot_settings(args: argparse.Namespace) -> int:
         source_path=source_path,
     )
 
-    from .plot_settings import (
+    from .plot.plot_settings import (
         copy_plot_profile,
         delete_plot_profile,
         read_plot_profile,
@@ -3652,7 +3680,7 @@ def _handle_csv_info(args: argparse.Namespace) -> int:
     start = perf_counter()
     LOGGER.info("Starting HDF5 info.")
 
-    from .csv_tools import format_profiles_table, infer_numeric_columns, profile_columns
+    from .storage.csv_tools import format_profiles_table, infer_numeric_columns, profile_columns
 
     frame, source_path = _load_csv_frame(args)
     profiles = profile_columns(frame)
@@ -3676,7 +3704,7 @@ def _handle_csv_preview(args: argparse.Namespace) -> int:
     start = perf_counter()
     LOGGER.info("Starting HDF5 preview.")
 
-    from .csv_tools import format_frame_preview
+    from .storage.csv_tools import format_frame_preview
 
     frame, source_path = _load_csv_frame(args)
     preview = format_frame_preview(
@@ -3709,7 +3737,7 @@ def _handle_csv_get(args: argparse.Namespace) -> int:
     start = perf_counter()
     LOGGER.info("Starting HDF5 statistics.")
 
-    from .csv_tools import compute_column_statistics
+    from .storage.csv_tools import compute_column_statistics
 
     frame, source_path = _load_csv_frame(args)
     print(f"HDF5 file: {source_path}")
@@ -3753,8 +3781,8 @@ def _handle_csv_sort(args: argparse.Namespace) -> int:
     start = perf_counter()
     LOGGER.info("Starting HDF5 sort.")
 
-    from .csv_tools import sort_frame
-    from .hdf5_table import write_hdf5_frame
+    from .storage.csv_tools import sort_frame
+    from .storage.hdf5_table import write_hdf5_frame
 
     output_path = _resolve_csv_output_path(args, suffix="sorted")
     if args.dry_run:
@@ -3830,8 +3858,8 @@ def _handle_csv_filter(args: argparse.Namespace) -> int:
     start = perf_counter()
     LOGGER.info("Starting HDF5 filter.")
 
-    from .csv_tools import filter_frame
-    from .hdf5_table import write_hdf5_frame
+    from .storage.csv_tools import filter_frame
+    from .storage.hdf5_table import write_hdf5_frame
 
     output_path = _resolve_csv_output_path(args, suffix="filtered")
 
@@ -3880,8 +3908,8 @@ def _handle_csv_dedupe(args: argparse.Namespace) -> int:
     start = perf_counter()
     LOGGER.info("Starting HDF5 dedupe.")
 
-    from .csv_tools import deduplicate_frame
-    from .hdf5_table import write_hdf5_frame
+    from .storage.csv_tools import deduplicate_frame
+    from .storage.hdf5_table import write_hdf5_frame
 
     output_path = _resolve_csv_output_path(args, suffix="deduped")
 
@@ -3941,7 +3969,7 @@ def _handle_csv_combine(args: argparse.Namespace) -> int:
         setting_source_token=getattr(args, "settings_source", None),
     )
     if args.output:
-        from .hdf5_utils import resolve_hdf5_output_path
+        from .storage.hdf5_utils import resolve_hdf5_output_path
 
         output_path = resolve_hdf5_output_path(args.output)
     else:
@@ -3974,7 +4002,7 @@ def _handle_csv_combine(args: argparse.Namespace) -> int:
 
 
 def _resolve_plot_columns(args: argparse.Namespace, frame: Any) -> tuple[str | None, list[str]]:
-    from .csv_tools import infer_numeric_columns
+    from .storage.csv_tools import infer_numeric_columns
 
     numeric_columns = infer_numeric_columns(frame)
     kind = args.kind
@@ -4158,10 +4186,9 @@ def _render_csv_plot(
     x_column: str | None,
     y_columns: list[str],
 ) -> tuple[Path | None, dict[str, Any]]:
-    import matplotlib.pyplot as plt
     import pandas as pd
 
-    from .plotting import ensure_interactive_backend
+    from .plot.plotting import configure_matplotlib_backend
 
     style = _build_plot_style(args)
     source_paths = [source_path for _, source_path in frames_by_source]
@@ -4174,6 +4201,12 @@ def _render_csv_plot(
     multi_source = len(frames_by_source) > 1
 
     def _draw(show: bool, output: str | Path | None) -> tuple[Path | None, dict[str, Any]]:
+        active_backend = configure_matplotlib_backend(
+            interactive=show,
+            preferred_backend=args.backend,
+        )
+        import matplotlib.pyplot as plt
+
         with plt.rc_context({"font.family": style.font_family}):
             fig, ax = plt.subplots(figsize=style.figure_size)
             kind = args.kind
@@ -4353,10 +4386,9 @@ def _render_csv_plot(
                 LOGGER.info("Saved HDF5 plot to '%s'.", output_path)
 
             if show:
-                backend = ensure_interactive_backend(preferred_backend=args.backend)
                 LOGGER.info(
                     "Showing HDF5 plot using backend '%s'. Close the window to continue.",
-                    backend,
+                    active_backend,
                 )
                 plt.show()
 
@@ -4510,7 +4542,7 @@ def _handle_csv_interactive(args: argparse.Namespace) -> int:
     start = perf_counter()
     LOGGER.info("Starting HDF5 interactive assistant.")
 
-    from .csv_tools import format_frame_preview
+    from .storage.csv_tools import format_frame_preview
 
     frame, source_path = _load_csv_frame(args)
     print(f"Interactive HDF5 assistant for: {source_path}")
@@ -4717,7 +4749,7 @@ def _handle_csv_interactive(args: argparse.Namespace) -> int:
 
 
 def _detect_plot_analysis_from_hdf5_source(source: str | Path) -> str | None:
-    from .plot_settings import read_hdf5_analysis, read_plot_profiles
+    from .plot.plot_settings import read_hdf5_analysis, read_plot_profiles
 
     source_path = Path(source).expanduser().resolve()
     analysis = read_hdf5_analysis(source_path)
@@ -4789,7 +4821,7 @@ def _read_analysis_profile_payloads(
     sources: list[str],
     analysis: str,
 ) -> list[dict[str, Any]]:
-    from .hdf5_utils import read_linak_hdf5_profiles
+    from .storage.hdf5_utils import read_linak_hdf5_profiles
 
     payloads: list[dict[str, Any]] = []
     for source_index, source in enumerate(sources):
@@ -4818,8 +4850,8 @@ def _combine_analysis_hdf5_sources(
     output: str | Path | None,
     settings_source_path: Path | None,
 ) -> Path:
-    from .hdf5_utils import resolve_hdf5_output_path, write_linak_hdf5_profile_collection
-    from .plot_settings import copy_plot_profile
+    from .storage.hdf5_utils import resolve_hdf5_output_path, write_linak_hdf5_profile_collection
+    from .plot.plot_settings import copy_plot_profile
 
     payloads = _read_analysis_profile_payloads(sources=sources, analysis=analysis)
     if output is None:
@@ -4909,7 +4941,7 @@ def _handle_plot_density(args: argparse.Namespace) -> int:
         LOGGER.info("Density plotting dry run finished in %.2f s.", perf_counter() - start)
         return 0
 
-    from .density import (
+    from .analysis.density import (
         load_density_profiles,
         plot_density_profiles,
     )
@@ -5064,7 +5096,7 @@ def _handle_plot_msd(args: argparse.Namespace) -> int:
         LOGGER.info("MSD plotting dry run finished in %.2f s.", perf_counter() - start)
         return 0
 
-    from .msd import (
+    from .analysis.msd import (
         load_msd_profiles,
         plot_msd_profiles,
     )
@@ -5210,7 +5242,7 @@ def _handle_plot_rdf(args: argparse.Namespace) -> int:
         LOGGER.info("RDF plotting dry run finished in %.2f s.", perf_counter() - start)
         return 0
 
-    from .rdf import (
+    from .analysis.rdf import (
         load_rdf_profiles,
         plot_rdf_profiles,
     )
@@ -5365,11 +5397,12 @@ def _handle_compute_density(args: argparse.Namespace) -> int:
         LOGGER.info("Density compute dry run finished in %.2f s.", perf_counter() - start)
         return 0
 
-    from .density import compute_density_profiles, save_density_profile
-    from .io import read_trajectory
+    from .analysis.density import compute_density_profiles, save_density_profile
+    from .trajectory.io import read_trajectory
 
+    source_path = Path(args.trajectory).expanduser().resolve()
     frames = read_trajectory(args.trajectory)
-    _maybe_apply_density_cell(
+    resolved_cell, cell_source, cell_input_path = _maybe_apply_density_cell(
         frames,
         args.trajectory,
         cell=_normalize_cell_args(args),
@@ -5391,7 +5424,15 @@ def _handle_compute_density(args: argparse.Namespace) -> int:
         axis=args.axis,
     )
     for profile, output in zip(profiles, outputs):
-        save_density_profile(profile, output)
+        density_metadata: dict[str, Any] = {
+            "source_path": str(source_path),
+            "cell_source": cell_source,
+        }
+        if cell_input_path is not None:
+            density_metadata["input_path"] = cell_input_path
+        if resolved_cell is not None:
+            density_metadata["resolved_cell_angstrom"] = list(resolved_cell)
+        save_density_profile(profile, output, additional_metadata=density_metadata)
 
     LOGGER.info("Density compute finished in %.2f s.", perf_counter() - start)
     return 0
@@ -5426,7 +5467,7 @@ def _handle_compute_msd(args: argparse.Namespace) -> int:
 
         if resolved_cell is None:
             cell_preview = (
-                "unresolved from input/cache sources; execution may still use "
+                "unresolved from input sources; execution may still use "
                 "trajectory-embedded periodic cell after loading frames"
             )
         else:
@@ -5446,18 +5487,19 @@ def _handle_compute_msd(args: argparse.Namespace) -> int:
         LOGGER.info("MSD compute dry run finished in %.2f s.", perf_counter() - start)
         return 0
 
-    from .io import read_trajectory
-    from .msd import compute_msd, save_msd_profile
+    from .trajectory.io import read_trajectory
+    from .analysis.msd import compute_msd, save_msd_profile
 
+    source_path = Path(args.trajectory).expanduser().resolve()
     frames = read_trajectory(args.trajectory)
-    _resolve_and_apply_required_cell(
+    resolved_cell, cell_source, cell_input_path = _resolve_and_apply_required_cell(
         frames,
         args.trajectory,
         cell=_normalize_cell_args(args),
         input_path=args.input,
         analysis_name="MSD",
     )
-    timestep_fs = _resolve_msd_timestep_fs(
+    timestep_fs, timestep_source, timestep_input_path, md_timestep_fs, trajectory_stride_md = _resolve_msd_timestep_fs(
         args.trajectory,
         timestep_fs=args.timestep_fs,
         input_path=args.input,
@@ -5472,7 +5514,22 @@ def _handle_compute_msd(args: argparse.Namespace) -> int:
         args.trajectory,
         profile.species,
     )
-    save_msd_profile(profile, output)
+    msd_metadata: dict[str, Any] = {
+        "source_path": str(source_path),
+        "cell_source": cell_source,
+        "resolved_cell_angstrom": list(resolved_cell),
+        "timestep_source": timestep_source,
+        "frame_timestep_fs": float(timestep_fs),
+    }
+    if cell_input_path is not None:
+        msd_metadata["cell_input_path"] = cell_input_path
+    if timestep_input_path is not None:
+        msd_metadata["timestep_input_path"] = timestep_input_path
+    if md_timestep_fs is not None:
+        msd_metadata["md_timestep_fs"] = float(md_timestep_fs)
+    if trajectory_stride_md is not None:
+        msd_metadata["trajectory_stride_md"] = int(trajectory_stride_md)
+    save_msd_profile(profile, output, additional_metadata=msd_metadata)
 
     LOGGER.info("MSD compute finished in %.2f s.", perf_counter() - start)
     return 0
@@ -5496,7 +5553,7 @@ def _handle_compute_rdf(args: argparse.Namespace) -> int:
         )
         if resolved_cell is None:
             cell_preview = (
-                "unresolved from input/cache sources; execution may still use "
+                "unresolved from input sources; execution may still use "
                 "trajectory-embedded periodic cell after loading frames"
             )
             r_max_preview = (
@@ -5532,11 +5589,12 @@ def _handle_compute_rdf(args: argparse.Namespace) -> int:
         LOGGER.info("RDF compute dry run finished in %.2f s.", perf_counter() - start)
         return 0
 
-    from .io import read_trajectory
-    from .rdf import compute_rdf, save_rdf_profile
+    from .trajectory.io import read_trajectory
+    from .analysis.rdf import compute_rdf, save_rdf_profile
 
+    source_path = Path(args.trajectory).expanduser().resolve()
     frames = read_trajectory(args.trajectory)
-    _resolve_and_apply_required_cell(
+    resolved_cell, cell_source, cell_input_path = _resolve_and_apply_required_cell(
         frames,
         args.trajectory,
         cell=_normalize_cell_args(args),
@@ -5556,7 +5614,14 @@ def _handle_compute_rdf(args: argparse.Namespace) -> int:
         profile.species_a,
         profile.species_b,
     )
-    save_rdf_profile(profile, output)
+    rdf_metadata: dict[str, Any] = {
+        "source_path": str(source_path),
+        "cell_source": cell_source,
+        "resolved_cell_angstrom": list(resolved_cell),
+    }
+    if cell_input_path is not None:
+        rdf_metadata["input_path"] = cell_input_path
+    save_rdf_profile(profile, output, additional_metadata=rdf_metadata)
 
     LOGGER.info("RDF compute finished in %.2f s.", perf_counter() - start)
     return 0
@@ -5566,7 +5631,7 @@ def _handle_compute_potential(args: argparse.Namespace) -> int:
     start = perf_counter()
     LOGGER.info("Starting potential compute.")
 
-    from .potential import (
+    from .analysis.potential import (
         PotentialCsvAppender,
         PotentialConfig,
         compute_potential_records,
@@ -5597,7 +5662,7 @@ def _handle_compute_potential(args: argparse.Namespace) -> int:
 
     default_output = _default_potential_hdf5_output_for_sources(validated_sources)
     if args.output:
-        from .hdf5_utils import resolve_hdf5_output_path
+        from .storage.hdf5_utils import resolve_hdf5_output_path
 
         output_target = resolve_hdf5_output_path(args.output)
     else:
@@ -5788,7 +5853,7 @@ def _handle_apply_pbc(args: argparse.Namespace) -> int:
         LOGGER.info("PBC dry run finished in %.2f s.", perf_counter() - start)
         return 0
 
-    from .io import read_trajectory, write_trajectory
+    from .trajectory.io import read_trajectory, write_trajectory
     from .pbc import apply_pbc_to_frames, resolve_cell_dimensions
 
     frames = read_trajectory(args.trajectory)
@@ -5831,7 +5896,7 @@ def _handle_apply_compress(args: argparse.Namespace) -> int:
         source_label="CP2K output file",
     )
 
-    from .compress import (
+    from .storage.compress import (
         build_parser_options_from_drop_sections,
         compress_cp2k_output,
         default_backup_dir_for_input,
@@ -6027,3 +6092,4 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

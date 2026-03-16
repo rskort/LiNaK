@@ -10,7 +10,7 @@ from typing import Any
 
 import numpy as np
 
-from . import __version__
+from .. import __version__
 
 try:  # pragma: no cover - exercised in environments missing optional dependency.
     import h5py

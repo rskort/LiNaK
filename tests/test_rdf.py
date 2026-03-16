@@ -4,7 +4,7 @@ import pytest
 import h5py
 from ase import Atoms
 
-from linak.rdf import compute_rdf, load_rdf_profile, save_rdf_profile
+from linak.analysis.rdf import compute_rdf, load_rdf_profile, save_rdf_profile
 
 
 def test_compute_rdf_returns_expected_shape_and_values():
@@ -99,7 +99,7 @@ def test_load_rdf_profile_rejects_csv_input(tmp_path):
 
 
 def test_plot_rdf_profiles_uses_multi_line_plot_for_multiple_profiles(monkeypatch):
-    from linak.rdf import RDFProfile, plot_rdf_profiles
+    from linak.analysis.rdf import RDFProfile, plot_rdf_profiles
 
     captured = {}
 
@@ -109,7 +109,7 @@ def test_plot_rdf_profiles_uses_multi_line_plot_for_multiple_profiles(monkeypatc
         captured["labels"] = labels
         return None
 
-    monkeypatch.setattr("linak.rdf.plot_multi_line_series", _fake_plot_multi_line_series)
+    monkeypatch.setattr("linak.analysis.rdf.plot_multi_line_series", _fake_plot_multi_line_series)
 
     profile_a = RDFProfile(
         species_a="O",
@@ -130,3 +130,4 @@ def test_plot_rdf_profiles_uses_multi_line_plot_for_multiple_profiles(monkeypatc
 
     plot_rdf_profiles([profile_a, profile_b], show=False)
     assert captured["labels"] == ["O-H", "H-H"]
+

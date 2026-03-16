@@ -2,6 +2,7 @@
 __pycache__/
 *.py[cod]
 *$py.class
+.uv-cache/
 
 # Distribution / packaging
 build/
@@ -29,4 +30,6 @@ env/
 
 # Misc
 *.log
-activate.sh
+
+# Local data files
+data/

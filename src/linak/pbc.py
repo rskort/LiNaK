@@ -8,7 +8,7 @@ import re
 
 from ase import Atoms
 
-from .lammps import (
+from .trajectory.lammps import (
     extract_cell_from_lammps_input,
     extract_frame_timestep_fs_from_lammps_input,
 )
@@ -335,3 +335,4 @@ def apply_pbc_to_frames(
             progress.update()
 
     return wrapped_frames
+

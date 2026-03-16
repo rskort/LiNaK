@@ -9,7 +9,7 @@ from typing import Any
 
 import numpy as np
 
-from .hdf5_utils import decode_hdf5_string, hdf5_string_dtype, require_h5py
+from ..storage.hdf5_utils import decode_hdf5_string, hdf5_string_dtype, require_h5py
 
 _PRIVATE_GROUP = "_linak"
 _SETTINGS_GROUP = "plot_settings"
@@ -177,4 +177,3 @@ def copy_plot_profile(
             f"No plot-setting profile '{source_key}' found in '{source_path}'."
         )
     write_plot_profile(target, target_key or source_key, profile)
-

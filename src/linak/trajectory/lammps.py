@@ -8,7 +8,7 @@ from pathlib import Path
 import re
 import shlex
 
-from .utils import ensure_positive
+from ..utils import ensure_positive
 
 _FLOAT_PATTERN = r"[+-]?\d*\.?\d+(?:[eE][+-]?\d+)?"
 _LO_HI_PATTERN = re.compile(

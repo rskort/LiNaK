@@ -11,13 +11,12 @@ import sys
 from typing import Any
 
 import matplotlib
-import matplotlib.pyplot as plt
 import numpy as np
 
 LOGGER = logging.getLogger(__name__)
 
-DEFAULT_INTERACTIVE_BACKEND = "TkAgg"
-CANONICAL_INTERACTIVE_BACKENDS = ("TkAgg", "QtAgg", "GTK3Agg", "WXAgg", "MacOSX")
+DEFAULT_INTERACTIVE_BACKEND = "QtAgg"
+CANONICAL_INTERACTIVE_BACKENDS = ("QtAgg", "TkAgg", "GTK3Agg", "WXAgg", "MacOSX")
 BACKEND_ALIASES = {
     "tkagg": "TkAgg",
     "qtagg": "QtAgg",
@@ -38,6 +37,15 @@ INTERACTIVE_BACKENDS = {
     "webagg",
     "wxagg",
 }
+_BACKEND_CONFIGURED = False
+_CONFIGURED_BACKEND: str | None = None
+
+
+def _import_pyplot() -> Any:
+    # Import pyplot lazily to guarantee backend selection happens first.
+    import matplotlib.pyplot as plt
+
+    return plt
 
 
 @dataclass(frozen=True)
@@ -139,43 +147,66 @@ def _has_graphical_display() -> bool:
     return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
 
 
-def ensure_interactive_backend(preferred_backend: str | None = None) -> str:
-    """Ensure Matplotlib uses an interactive backend or raise RuntimeError."""
-    current = matplotlib.get_backend()
-    if _is_interactive_backend(current):
-        return current
+def configure_matplotlib_backend(
+    *,
+    interactive: bool,
+    preferred_backend: str | None = None,
+) -> str:
+    """Configure Matplotlib backend before pyplot import/figure creation."""
+    global _BACKEND_CONFIGURED, _CONFIGURED_BACKEND
 
-    LOGGER.info("Current Matplotlib backend '%s' is non-interactive.", current)
-    candidates = list(CANONICAL_INTERACTIVE_BACKENDS)
-    if preferred_backend:
-        preferred_backend = normalize_backend_name(preferred_backend)
-        candidates = [preferred_backend, *[c for c in candidates if c != preferred_backend]]
-    LOGGER.info("Trying interactive backends in order: %s", ", ".join(candidates))
+    if _BACKEND_CONFIGURED and _CONFIGURED_BACKEND is not None:
+        return _CONFIGURED_BACKEND
 
-    for i, candidate in enumerate(candidates):
-        try:
-            plt.switch_backend(candidate)
-            new_backend = matplotlib.get_backend()
-            if _is_interactive_backend(new_backend):
-                LOGGER.info("Using interactive Matplotlib backend '%s'.", new_backend)
-                return new_backend
-        except Exception as exc:  # pragma: no cover - environment dependent
-            if i == 0:
-                LOGGER.info("Could not activate preferred backend '%s': %s", candidate, exc)
-            else:
+    if interactive:
+        candidates = list(CANONICAL_INTERACTIVE_BACKENDS)
+        if preferred_backend:
+            normalized = normalize_backend_name(preferred_backend)
+            candidates = [normalized, *[c for c in candidates if c != normalized]]
+
+        if not _has_graphical_display():
+            raise RuntimeError(
+                "Interactive plotting requested but no graphical display is available. "
+                "Use X11/Wayland forwarding, or run with --no-show and --output."
+            )
+
+        last_error: Exception | None = None
+        for candidate in candidates:
+            try:
+                matplotlib.use(candidate, force=True)
+                active = matplotlib.get_backend()
+                if _is_interactive_backend(active):
+                    _BACKEND_CONFIGURED = True
+                    _CONFIGURED_BACKEND = active
+                    LOGGER.info("Configured Matplotlib backend '%s'.", active)
+                    return active
+            except Exception as exc:  # pragma: no cover - environment dependent
+                last_error = exc
                 LOGGER.debug("Could not activate backend '%s': %s", candidate, exc)
 
-    active = matplotlib.get_backend()
-    if not _has_graphical_display():
-        raise RuntimeError(
-            "Interactive plotting requested but no graphical display is available. "
-            "Use X11/Wayland forwarding, or run with --no-show and --output."
+        active = matplotlib.get_backend()
+        message = (
+            f"Interactive plotting requested, but active backend '{active}' is non-interactive. "
+            f"Attempted backends: {', '.join(candidates)}. "
+            "Install an interactive backend (Tk/Qt/GTK) or set MPLBACKEND accordingly."
         )
+        if last_error is not None:
+            message = f"{message} Last backend error: {last_error}"
+        raise RuntimeError(message)
 
-    raise RuntimeError(
-        f"Interactive plotting requested, but active backend '{active}' is non-interactive. "
-        f"Attempted backends: {', '.join(candidates)}. "
-        "Install an interactive backend (Tk/Qt/GTK) or set MPLBACKEND accordingly."
+    matplotlib.use("Agg", force=True)
+    active = matplotlib.get_backend()
+    _BACKEND_CONFIGURED = True
+    _CONFIGURED_BACKEND = active
+    LOGGER.info("Configured Matplotlib backend '%s'.", active)
+    return active
+
+
+def ensure_interactive_backend(preferred_backend: str | None = None) -> str:
+    """Backwards-compatible wrapper for interactive backend configuration."""
+    return configure_matplotlib_backend(
+        interactive=True,
+        preferred_backend=preferred_backend,
     )
 
 
@@ -250,9 +281,13 @@ def plot_line_series(
     y_label: str,
     output: str | Path | None = None,
     show: bool = True,
+    show_blocking: bool = True,
     preferred_backend: str | None = None,
     line_label: str | None = None,
     line_color: str | None = None,
+    line_width_override: float | None = None,
+    line_marker: str | None = None,
+    line_visible: bool = True,
     style: PlotStyle = DEFAULT_PLOT_STYLE,
     x_scale: str = "linear",
     y_scale: str = "linear",
@@ -271,14 +306,30 @@ def plot_line_series(
     capture_state: dict[str, Any] | None = None,
 ) -> Path | None:
     """Plot a single line using the shared LiNaK style."""
-    with plt.rc_context({"font.family": style.font_family}):
+    active_backend = configure_matplotlib_backend(
+        interactive=show,
+        preferred_backend=preferred_backend,
+    )
+    plt = _import_pyplot()
+    with plt.rc_context({"font.family": style.font_family, "text.parse_math": True}):
         fig, ax = plt.subplots(figsize=style.figure_size)
 
         color = line_color or style.line_color
-        marker = "o" if markers else ""
-        (line_artist,) = ax.plot(x, y, lw=style.line_width, color=color, label=line_label, marker=marker)
+        marker = ("o" if markers else "") if line_marker is None else str(line_marker)
+        line_artist = None
+        if line_visible:
+            (line_artist,) = ax.plot(
+                x,
+                y,
+                lw=style.line_width if line_width_override is None else float(line_width_override),
+                color=color,
+                label=line_label,
+                marker=marker,
+            )
 
-        should_show_legend = bool(line_label) if legend is None else bool(legend and line_label)
+        should_show_legend = bool(line_artist is not None and line_label) if legend is None else bool(
+            legend and line_artist is not None and line_label
+        )
         if should_show_legend:
             ax.legend(
                 fontsize=style.tick_font_size,
@@ -337,9 +388,9 @@ def plot_line_series(
         _capture_plot_state(
             ax=ax,
             style=style,
-            line_colors=[str(line_artist.get_color())],
-            line_labels=[str(line_label) if line_label else "series_1"],
-            line_markers=[str(line_artist.get_marker())],
+            line_colors=[str(line_artist.get_color())] if line_artist is not None else [],
+            line_labels=[str(line_label) if line_label else "series_1"] if line_artist is not None else [],
+            line_markers=[str(line_artist.get_marker())] if line_artist is not None else [],
             legend_loc=legend_loc,
             capture_state=capture_state,
         )
@@ -352,14 +403,23 @@ def plot_line_series(
             LOGGER.info("Saved plot to '%s'.", output_path)
 
         if show:
-            backend = ensure_interactive_backend(preferred_backend=preferred_backend)
-            LOGGER.info(
-                "Showing interactive plot window using backend '%s'. Close the window to continue.",
-                backend,
-            )
-            plt.show()
+            if show_blocking:
+                LOGGER.info(
+                    "Showing interactive plot window using backend '%s'. Close the window to continue.",
+                    active_backend,
+                )
+            else:
+                LOGGER.info(
+                    "Showing interactive plot window using backend '%s'.",
+                    active_backend,
+                )
+            plt.show(block=show_blocking)
+            if not show_blocking:
+                # Ensure the window is realized in GUI-preview mode.
+                plt.pause(0.001)
 
-        plt.close(fig)
+        if not (show and not show_blocking):
+            plt.close(fig)
         return output_path
 
 
@@ -373,9 +433,13 @@ def plot_multi_line_series(
     y_label: str,
     output: str | Path | None = None,
     show: bool = True,
+    show_blocking: bool = True,
     preferred_backend: str | None = None,
     style: PlotStyle = DEFAULT_PLOT_STYLE,
     line_colors: list[str] | None = None,
+    series_enabled: list[bool] | None = None,
+    series_line_widths: list[float | None] | None = None,
+    series_markers: list[str | None] | None = None,
     x_scale: str = "linear",
     y_scale: str = "linear",
     x_lim: tuple[float | None, float | None] | list[float | None] | None = None,
@@ -393,30 +457,59 @@ def plot_multi_line_series(
     capture_state: dict[str, Any] | None = None,
 ) -> Path | None:
     """Plot multiple line series in a single axes using the shared LiNaK style."""
+    active_backend = configure_matplotlib_backend(
+        interactive=show,
+        preferred_backend=preferred_backend,
+    )
+    plt = _import_pyplot()
     if not (len(x_series) == len(y_series) == len(labels)):
         raise ValueError("x_series, y_series, and labels must have equal lengths.")
     if not x_series:
         raise ValueError("At least one series is required for multi-line plotting.")
 
-    with plt.rc_context({"font.family": style.font_family}):
+    with plt.rc_context({"font.family": style.font_family, "text.parse_math": True}):
         fig, ax = plt.subplots(figsize=style.figure_size)
         rendered_colors: list[str] = []
         rendered_markers: list[str] = []
+        rendered_labels: list[str] = []
         if line_colors is not None and len(line_colors) != len(labels):
             raise ValueError(
                 "line_colors count must match the number of plotted series "
                 f"({len(labels)})."
             )
+        if series_enabled is not None and len(series_enabled) != len(labels):
+            raise ValueError(
+                "series_enabled count must match the number of plotted series "
+                f"({len(labels)})."
+            )
+        if series_line_widths is not None and len(series_line_widths) != len(labels):
+            raise ValueError(
+                "series_line_widths count must match the number of plotted series "
+                f"({len(labels)})."
+            )
+        if series_markers is not None and len(series_markers) != len(labels):
+            raise ValueError(
+                "series_markers count must match the number of plotted series "
+                f"({len(labels)})."
+            )
         for index, (x_values, y_values, label) in enumerate(zip(x_series, y_series, labels)):
+            if series_enabled is not None and not bool(series_enabled[index]):
+                continue
             kwargs: dict[str, Any] = {"lw": style.line_width, "label": label}
-            kwargs["marker"] = "o" if markers else ""
+            if series_line_widths is not None and series_line_widths[index] is not None:
+                kwargs["lw"] = float(series_line_widths[index])
+            marker_value = "o" if markers else ""
+            if series_markers is not None and series_markers[index] is not None:
+                marker_value = str(series_markers[index])
+            kwargs["marker"] = marker_value
             if line_colors is not None:
                 kwargs["color"] = line_colors[index]
             (artist,) = ax.plot(x_values, y_values, **kwargs)
             rendered_colors.append(str(artist.get_color()))
             rendered_markers.append(str(artist.get_marker()))
+            rendered_labels.append(str(label))
 
-        should_show_legend = len(labels) > 1 if legend is None else bool(legend)
+        should_show_legend = len(rendered_labels) > 1 if legend is None else bool(legend and rendered_labels)
         if should_show_legend:
             ax.legend(
                 fontsize=style.tick_font_size,
@@ -475,7 +568,7 @@ def plot_multi_line_series(
             ax=ax,
             style=style,
             line_colors=rendered_colors,
-            line_labels=[str(label) for label in labels],
+            line_labels=rendered_labels,
             line_markers=rendered_markers,
             legend_loc=legend_loc,
             capture_state=capture_state,
@@ -489,12 +582,21 @@ def plot_multi_line_series(
             LOGGER.info("Saved plot to '%s'.", output_path)
 
         if show:
-            backend = ensure_interactive_backend(preferred_backend=preferred_backend)
-            LOGGER.info(
-                "Showing interactive plot window using backend '%s'. Close the window to continue.",
-                backend,
-            )
-            plt.show()
+            if show_blocking:
+                LOGGER.info(
+                    "Showing interactive plot window using backend '%s'. Close the window to continue.",
+                    active_backend,
+                )
+            else:
+                LOGGER.info(
+                    "Showing interactive plot window using backend '%s'.",
+                    active_backend,
+                )
+            plt.show(block=show_blocking)
+            if not show_blocking:
+                # Ensure the window is realized in GUI-preview mode.
+                plt.pause(0.001)
 
-        plt.close(fig)
+        if not (show and not show_blocking):
+            plt.close(fig)
         return output_path
