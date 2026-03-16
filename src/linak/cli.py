@@ -1,0 +1,6029 @@
+"""Command-line interface for LiNaK."""
+
+from __future__ import annotations
+
+import argparse
+from copy import deepcopy
+from dataclasses import replace
+from datetime import datetime
+import json
+import logging
+from math import isclose
+import os
+from pathlib import Path
+import re
+import shutil
+import shlex
+import sys
+import textwrap
+from time import perf_counter
+from typing import Any, Callable, TYPE_CHECKING
+
+from ase import Atoms
+
+from . import __version__
+
+if TYPE_CHECKING:
+    from .plotting import PlotStyle
+    from .potential import PotentialComputationFailure, PotentialRecord
+
+LOGGER = logging.getLogger(__name__)
+DEFAULT_INTERACTIVE_BACKEND = "TkAgg"
+_PROJECT_AUTHOR_LINE = re.compile(r'^\s*authors\s*=\s*\[\{\s*name\s*=\s*"([^"]+)"')
+_TABULAR_COMMAND = "hdf5"
+_TABULAR_COMMAND_ALIASES = ("hd","h5",)
+_TABULAR_COMMAND_TOKENS = {_TABULAR_COMMAND, *_TABULAR_COMMAND_ALIASES}
+_PLOT_PROFILE_DENSITY = "plot:density"
+_PLOT_PROFILE_MSD = "plot:msd"
+_PLOT_PROFILE_RDF = "plot:rdf"
+_PLOT_PROFILE_TABLE = "plot:table"
+_ANALYSIS_TO_PROFILE_KEY = {
+    "density": _PLOT_PROFILE_DENSITY,
+    "msd": _PLOT_PROFILE_MSD,
+    "rdf": _PLOT_PROFILE_RDF,
+    "table": _PLOT_PROFILE_TABLE,
+}
+_PROFILE_KEY_TO_ANALYSIS = {value: key for key, value in _ANALYSIS_TO_PROFILE_KEY.items()}
+
+_PERSISTED_PLOT_SETTING_OPTION_FLAGS = {
+    "axis": ("--axis",),
+    "backend": ("--backend",),
+    "bins": ("--bins",),
+    "dpi": ("--dpi",),
+    "figsize": ("--figsize",),
+    "file_labels": ("--file-labels",),
+    "font_family": ("--font-family",),
+    "grid": ("--grid", "--no-grid"),
+    "grid_alpha": ("--grid-alpha",),
+    "grid_linestyle": ("--grid-linestyle",),
+    "grid_linewidth": ("--grid-linewidth",),
+    "group": ("--group",),
+    "kind": ("--kind",),
+    "label_font_size": ("--label-font-size",),
+    "legend": ("--legend", "--no-legend"),
+    "legend_loc": ("--legend-loc",),
+    "legend_title": ("--legend-title",),
+    "line_color": ("--line-color",),
+    "line_colors": ("--line-colors",),
+    "line_width": ("--line-width",),
+    "quantity": ("--quantity",),
+    "series_labels": ("--labels", "--series-labels"),
+    "species": ("--species",),
+    "species_a": ("--species-a",),
+    "species_b": ("--species-b",),
+    "tick_font_size": ("--tick-font-size",),
+    "title": ("--title",),
+    "title_visible": ("--title-mode",),
+    "title_font_size": ("--title-font-size",),
+    "x": ("--x",),
+    "x_label": ("--x-label",),
+    "x_lim": ("--x-min", "--x-max"),
+    "x_mode": ("--x-mode",),
+    "x_scale": ("--x-scale",),
+    "x_tick_rotation": ("--x-tick-rotation",),
+    "x_ticks": ("--x-ticks",),
+    "y": ("--y",),
+    "y_label": ("--y-label",),
+    "y_lim": ("--y-min", "--y-max"),
+    "y_scale": ("--y-scale",),
+    "y_tick_rotation": ("--y-tick-rotation",),
+    "y_ticks": ("--y-ticks",),
+    "ticks": ("--ticks",),
+    "markers": ("--markers",),
+}
+
+_PLOT_SETTINGS_COMMON_KEYS = (
+    "title",
+    "title_visible",
+    "x_label",
+    "y_label",
+    "x_scale",
+    "y_scale",
+    "x_lim",
+    "y_lim",
+    "x_ticks",
+    "y_ticks",
+    "x_tick_rotation",
+    "y_tick_rotation",
+    "series_labels",
+    "legend",
+    "legend_title",
+    "legend_loc",
+    "ticks",
+    "markers",
+    "figsize",
+    "dpi",
+    "font_family",
+    "title_font_size",
+    "label_font_size",
+    "tick_font_size",
+    "line_width",
+    "line_color",
+    "line_colors",
+    "grid",
+    "grid_linestyle",
+    "grid_linewidth",
+    "grid_alpha",
+)
+_PLOT_SETTINGS_DENSITY_KEYS = (
+    "species",
+    "axis",
+    "x_mode",
+    "quantity",
+    *_PLOT_SETTINGS_COMMON_KEYS,
+)
+_PLOT_SETTINGS_MSD_KEYS = (
+    "species",
+    *_PLOT_SETTINGS_COMMON_KEYS,
+)
+_PLOT_SETTINGS_RDF_KEYS = (
+    "species_a",
+    "species_b",
+    *_PLOT_SETTINGS_COMMON_KEYS,
+)
+_PLOT_SETTINGS_TABLE_KEYS = (
+    "kind",
+    "group",
+    "x",
+    "y",
+    "bins",
+    "file_labels",
+    *_PLOT_SETTINGS_COMMON_KEYS,
+)
+
+
+def _project_pyproject_path() -> Path:
+    return Path(__file__).resolve().parents[2] / "pyproject.toml"
+
+
+def _read_project_author(default: str = "Unknown") -> str:
+    path = _project_pyproject_path()
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return default
+    for line in lines:
+        match = _PROJECT_AUTHOR_LINE.match(line.strip())
+        if match:
+            return match.group(1)
+    return default
+
+
+def _read_project_version_date(default: str = "unknown") -> str:
+    path = _project_pyproject_path()
+    try:
+        modified = path.stat().st_mtime
+    except OSError:
+        return default
+    return datetime.fromtimestamp(modified).strftime("%Y-%m-%d")
+
+
+class _ProgressAwareStreamHandler(logging.StreamHandler):
+    """Ensure log lines do not collide with active terminal progress bars."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        from .progress import ProgressBar
+
+        ProgressBar.prepare_for_external_write(self.stream)
+        super().emit(record)
+
+
+class _LiNaKConsoleFormatter(logging.Formatter):
+    """Compact, branded formatter for terminal CLI logs."""
+
+    _COLOR_RESET = "\x1b[0m"
+    _LEVEL_COLORS = {
+        "DEBUG": "\x1b[38;5;244m",
+        "INFO": "\x1b[38;5;39m",
+        "WARNING": "\x1b[38;5;214m",
+        "ERROR": "\x1b[38;5;196m",
+        "CRITICAL": "\x1b[1;38;5;196m",
+    }
+    _LEVEL_LABELS = {
+        "DEBUG": "DBG",
+        "INFO": "INF",
+        "WARNING": "WRN",
+        "ERROR": "ERR",
+        "CRITICAL": "CRT",
+    }
+    _BRAND_COLOR = "\x1b[1;38;5;45m"
+    _TIME_COLOR = "\x1b[38;5;242m"
+    _SCOPE_COLOR = "\x1b[38;5;246m"
+
+    def __init__(self, *, use_color: bool) -> None:
+        super().__init__(datefmt="%H:%M:%S")
+        self.use_color = use_color
+
+    @staticmethod
+    def _short_name(logger_name: str) -> str:
+        normalized = logger_name[6:] if logger_name.startswith("linak.") else logger_name
+        return normalized.split(".")[-1]
+
+    def format(self, record: logging.LogRecord) -> str:
+        brand = "LiNaK"
+        timestamp = self.formatTime(record, self.datefmt)
+        level = self._LEVEL_LABELS.get(record.levelname, record.levelname[:3].upper())
+        scope = self._short_name(record.name)
+
+        if self.use_color:
+            brand = f"{self._BRAND_COLOR}{brand}{self._COLOR_RESET}"
+            timestamp = f"{self._TIME_COLOR}{timestamp}{self._COLOR_RESET}"
+            color = self._LEVEL_COLORS.get(record.levelname, "")
+            if color:
+                level = f"{color}{level}{self._COLOR_RESET}"
+            scope = f"{self._SCOPE_COLOR}{scope}{self._COLOR_RESET}"
+
+        message = record.getMessage()
+        if record.exc_info:
+            message = f"{message}\n{self.formatException(record.exc_info)}"
+        if record.stack_info:
+            message = f"{message}\n{self.formatStack(record.stack_info)}"
+        return f"{brand} {timestamp} {level} {scope}: {message}"
+
+
+def configure_logging(level: str = "INFO", log_file: str | None = None) -> None:
+    """Configure console and optional file logging."""
+    linak_level = getattr(logging, level.upper(), logging.INFO)
+    supports_color = (
+        bool(getattr(sys.stderr, "isatty", lambda: False)()) and "NO_COLOR" not in os.environ
+    )
+
+    console_handler = _ProgressAwareStreamHandler(sys.stderr)
+    console_handler.setFormatter(_LiNaKConsoleFormatter(use_color=supports_color))
+    handlers: list[logging.Handler] = [console_handler]
+
+    if log_file:
+        log_path = Path(log_file).expanduser().resolve()
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        file_handler = logging.FileHandler(log_path)
+        file_handler.setFormatter(
+            logging.Formatter(
+                fmt="LiNaK %(asctime)s %(levelname)s %(name)s: %(message)s",
+                datefmt="%Y-%m-%d %H:%M:%S",
+            )
+        )
+        handlers.append(file_handler)
+
+    logging.basicConfig(
+        level=logging.WARNING,
+        handlers=handlers,
+        force=True,
+    )
+    logging.getLogger("linak").setLevel(linak_level)
+
+
+def _add_dry_run_option(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "-n",
+        "--dry-run",
+        action="store_true",
+        help=(
+            "Preview planned actions and resolved output paths without reading/writing "
+            "trajectory data or running heavy analysis."
+        ),
+    )
+
+
+def _format_cli_invocation(argv: list[str]) -> str:
+    if not argv:
+        return "linak"
+    return "linak " + " ".join(shlex.quote(token) for token in argv)
+
+
+def _command_scope(args: argparse.Namespace) -> str:
+    parts: list[str] = []
+    for key in ("command", "plot_command", "compute_command", "apply_command", "csv_command"):
+        value = getattr(args, key, None)
+        if value:
+            parts.append(value)
+    return " ".join(parts) if parts else "unknown"
+
+
+def _log_run_banner(args: argparse.Namespace, argv: list[str]) -> None:
+    run_command = _format_cli_invocation(argv)
+    LOGGER.info(
+        "Session start | command=%s | mode=%s | args=%d",
+        _command_scope(args),
+        "dry-run" if getattr(args, "dry_run", False) else "execute",
+        len(argv),
+    )
+    LOGGER.debug("Run command (full): %s", run_command)
+
+
+def _log_dry_run_plan(title: str, lines: list[str]) -> None:
+    LOGGER.info("Dry-run plan for %s:", title)
+    for line in lines:
+        _log_wrapped_info(f"  - {line}")
+
+
+def _log_wrapped_info(message: str, *, width: int | None = None) -> None:
+    if width is None:
+        terminal_width = shutil.get_terminal_size(fallback=(120, 20)).columns
+        width = max(72, min(140, terminal_width - 20))
+
+    wrapped = textwrap.wrap(
+        message,
+        width=width,
+        break_long_words=True,
+        break_on_hyphens=False,
+    )
+    if not wrapped:
+        LOGGER.info("")
+        return
+    for chunk in wrapped:
+        LOGGER.info("%s", chunk)
+
+
+def _compact_path_for_log(path: str | Path, *, max_chars: int = 36) -> str:
+    text = str(path)
+    if len(text) <= max_chars:
+        return text
+    return "..." + text[-(max_chars - 3) :]
+
+
+def _describe_cell_resolution(
+    cell_arg: tuple[float, float, float] | None, input_path: str | None
+) -> str:
+    if cell_arg is not None:
+        return f"explicit --cell {cell_arg[0]:.6g} {cell_arg[1]:.6g} {cell_arg[2]:.6g}"
+    if input_path is not None:
+        return f"simulation input metadata from {Path(input_path).expanduser()}"
+    return "automatic trajectory/input discovery"
+
+
+def _preview_resolve_cell_without_trajectory_read(
+    trajectory: str | Path,
+    *,
+    cell: tuple[float, float, float] | None,
+    input_path: str | None,
+) -> tuple[tuple[float, float, float] | None, str]:
+    """Resolve cell for dry-run using only explicit/input/auto/cache sources."""
+    from .cell_cache import load_cached_cell
+    from .pbc import extract_cell_from_simulation_input, find_unique_simulation_input
+
+    if cell is not None:
+        return cell, "explicit --cell"
+
+    if input_path is not None:
+        resolved_input = Path(input_path).expanduser().resolve()
+        return extract_cell_from_simulation_input(resolved_input), f"explicit --input ({resolved_input})"
+
+    trajectory_path = Path(trajectory).expanduser().resolve()
+
+    try:
+        auto_input = find_unique_simulation_input(trajectory_path.parent)
+        return extract_cell_from_simulation_input(auto_input), f"auto-detected ({auto_input})"
+    except (FileNotFoundError, ValueError):
+        pass
+
+    cached = load_cached_cell(trajectory_path)
+    if cached is not None:
+        return cached, "global cache"
+
+    return None, "unresolved from input/cache sources"
+
+
+def _preview_resolve_msd_timestep_without_trajectory_read(
+    trajectory: str | Path,
+    *,
+    timestep_fs: float | None,
+    input_path: str | None,
+) -> tuple[float, str]:
+    """Resolve MSD timestep for dry-run without loading trajectory frames."""
+    from .cell_cache import load_cached_timestep_fs
+    from .pbc import extract_frame_timestep_fs_from_simulation_input, find_unique_simulation_input
+
+    if timestep_fs is not None:
+        return float(timestep_fs), "explicit --timestep-fs"
+
+    if input_path is not None:
+        resolved_input = Path(input_path).expanduser().resolve()
+        frame_timestep_fs, _, _ = extract_frame_timestep_fs_from_simulation_input(resolved_input)
+        return frame_timestep_fs, f"explicit --input ({resolved_input})"
+
+    trajectory_path = Path(trajectory).expanduser().resolve()
+
+    try:
+        auto_input = find_unique_simulation_input(trajectory_path.parent)
+        frame_timestep_fs, _, _ = extract_frame_timestep_fs_from_simulation_input(auto_input)
+        return frame_timestep_fs, f"auto-detected ({auto_input})"
+    except (FileNotFoundError, ValueError):
+        pass
+
+    cached = load_cached_timestep_fs(trajectory_path)
+    if cached is not None:
+        return cached, "global cache"
+
+    return 1.0, "fallback default"
+
+
+def _format_cell_values(cell: tuple[float, float, float]) -> str:
+    return f"{cell[0]:.6g} {cell[1]:.6g} {cell[2]:.6g} Angstrom"
+
+
+def _describe_cell_resolution_preview(
+    trajectory: str | Path,
+    *,
+    cell: tuple[float, float, float] | None,
+    input_path: str | None,
+    include_trajectory_fallback_note: bool = True,
+) -> str:
+    resolved_cell, cell_source = _preview_resolve_cell_without_trajectory_read(
+        trajectory,
+        cell=cell,
+        input_path=input_path,
+    )
+    if resolved_cell is not None:
+        return f"resolved {_format_cell_values(resolved_cell)} ({cell_source})"
+    if include_trajectory_fallback_note:
+        return (
+            "unresolved from input/cache sources; execution may still use "
+            "trajectory-embedded periodic cell after loading frames"
+        )
+    return "unresolved from input/cache sources"
+
+
+def _summarize_source_resolution_previews(
+    previews: list[str], *, limit: int = 3
+) -> str:
+    if len(previews) <= limit:
+        return "; ".join(previews)
+    head = "; ".join(previews[:limit])
+    return f"{head}; ... (+{len(previews) - limit} more)"
+
+
+def _summarize_sources(sources: list[str], *, limit: int = 4) -> str:
+    if len(sources) <= limit:
+        return ", ".join(sources)
+    preview = ", ".join(sources[:limit])
+    return f"{preview}, ... (+{len(sources) - limit} more)"
+
+
+def _sanitize_token(value: str) -> str:
+    """Convert free text into a deterministic filename-safe token."""
+    token = "".join(ch.lower() if ch.isalnum() else "_" for ch in value)
+    token = token.strip("_")
+    return token or "all"
+
+
+def _default_density_hdf5_output_path(source: str | Path, species: str, axis: str) -> Path:
+    source_path = Path(source).expanduser().resolve()
+    stem = source_path.stem or "trajectory"
+    return source_path.parent / f"{stem}_density_{_sanitize_token(species)}_{axis.lower()}.h5"
+
+
+def _density_hdf5_output_paths(
+    base_output: str | None,
+    source: str | Path,
+    profiles: list[Any],
+    *,
+    axis: str,
+) -> list[Path]:
+    if not profiles:
+        return []
+
+    if base_output is None:
+        return [
+            _default_density_hdf5_output_path(source, profile.species, axis) for profile in profiles
+        ]
+
+    base_path = Path(base_output).expanduser()
+    if len(profiles) == 1:
+        return [base_path if base_path.suffix else base_path.with_suffix(".h5")]
+
+    if base_path.suffix.lower() in {".h5", ".hdf5"}:
+        return [
+            base_path.with_name(
+                f"{base_path.stem}_{_sanitize_token(profile.species)}{base_path.suffix}"
+            )
+            for profile in profiles
+        ]
+
+    base_path.mkdir(parents=True, exist_ok=True)
+    return [
+        base_path / f"density_{_sanitize_token(profile.species)}_{axis.lower()}.h5"
+        for profile in profiles
+    ]
+
+
+def _normalize_source_values(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, (str, Path)):
+        return [str(value)]
+    return [str(path) for path in value]
+
+
+def _resolve_source_arguments(
+    *,
+    positional: Any,
+    files: Any,
+    source_label: str,
+    allow_multiple: bool,
+) -> list[str]:
+    positional_sources = _normalize_source_values(positional)
+    option_sources = _normalize_source_values(files)
+
+    if positional_sources and option_sources:
+        raise ValueError("Use either positional SOURCE arguments or -f/--files, not both.")
+
+    sources = option_sources or positional_sources
+    if not sources:
+        if allow_multiple:
+            raise ValueError(f"Provide at least one {source_label} via SOURCE or -f/--files.")
+        raise ValueError(f"Provide one {source_label} via SOURCE or -f/--files.")
+
+    if len(positional_sources) > 1:
+        raise ValueError("Use -f/--files when passing multiple input files.")
+
+    if not allow_multiple and len(sources) != 1:
+        raise ValueError(f"This command accepts exactly one {source_label}.")
+
+    return sources
+
+
+def _resolve_single_source_argument(
+    args: argparse.Namespace,
+    *,
+    positional_attr: str,
+    files_attr: str = "files",
+    source_label: str,
+) -> str:
+    sources = _resolve_source_arguments(
+        positional=getattr(args, positional_attr, None),
+        files=getattr(args, files_attr, None),
+        source_label=source_label,
+        allow_multiple=False,
+    )
+    source = sources[0]
+    setattr(args, positional_attr, source)
+    return source
+
+
+def _validate_hdf5_only_sources(sources: list[str], *, command_name: str) -> None:
+    non_hdf5 = [source for source in sources if not _is_hdf5_source(source)]
+    if not non_hdf5:
+        return
+    raise ValueError(
+        f"{command_name} only accepts HDF5 input (.h5/.hdf5). "
+        "Use `linak compute ...` to generate HDF5 from trajectories first. "
+        f"Non-HDF5 source(s): {_summarize_sources(non_hdf5)}"
+    )
+
+
+def _validate_csv_only_sources(sources: list[str], *, command_name: str) -> None:
+    non_hdf5 = [source for source in sources if not _is_hdf5_source(source)]
+    if not non_hdf5:
+        return
+    raise ValueError(
+        f"{command_name} only accepts HDF5 input (.h5/.hdf5). "
+        f"Non-HDF5 source(s): {_summarize_sources(non_hdf5)}"
+    )
+
+
+def _resolve_plot_sources(args: argparse.Namespace) -> list[str]:
+    return _resolve_source_arguments(
+        positional=getattr(args, "source", None),
+        files=getattr(args, "files", None),
+        source_label="input file",
+        allow_multiple=True,
+    )
+
+
+def _resolve_csv_plot_sources(args: argparse.Namespace) -> list[str]:
+    sources = _resolve_source_arguments(
+        positional=getattr(args, "source", None),
+        files=getattr(args, "files", None),
+        source_label="HDF5 input file",
+        allow_multiple=True,
+    )
+    _validate_csv_only_sources(sources, command_name=f"linak {_TABULAR_COMMAND} plot")
+    return sources
+
+
+def _default_msd_hdf5_output_path(source: str | Path, species: str) -> Path:
+    source_path = Path(source).expanduser().resolve()
+    stem = source_path.stem or "trajectory"
+    return source_path.parent / f"{stem}_msd_{_sanitize_token(species)}.h5"
+
+
+def _default_rdf_hdf5_output_path(source: str | Path, species_a: str, species_b: str) -> Path:
+    source_path = Path(source).expanduser().resolve()
+    stem = source_path.stem or "trajectory"
+    return (
+        source_path.parent
+        / f"{stem}_rdf_{_sanitize_token(species_a)}_{_sanitize_token(species_b)}.h5"
+    )
+
+
+def _default_potential_hdf5_output_path(source: str | Path) -> Path:
+    source_path = Path(source).expanduser().resolve()
+    stem = source_path.stem or source_path.name or "source"
+    for suffix in (
+        "-v_hartree-1_0",
+        "_v_hartree_1_0",
+        "-ELECTRON_DENSITY-1_0",
+        "_ELECTRON_DENSITY_1_0",
+    ):
+        if stem.endswith(suffix):
+            stem = stem[: -len(suffix)] or "source"
+            break
+    return source_path.parent / f"{stem}_potential.h5"
+
+
+def _default_potential_hdf5_output_for_sources(sources: list[str]) -> Path:
+    if len(sources) == 1:
+        return _default_potential_hdf5_output_path(sources[0])
+    return Path.cwd() / "linak_potential_summary.h5"
+
+
+def _default_combined_analysis_hdf5_path(sources: list[str], *, analysis: str) -> Path:
+    first_source = Path(sources[0]).expanduser().resolve()
+    if len(sources) == 1:
+        stem = first_source.stem or "profile"
+    else:
+        stem = f"{first_source.stem or 'profile'}_plus_{len(sources) - 1}"
+    return first_source.with_name(f"{stem}_{analysis}_combined.h5")
+
+
+def _unique_path_with_numeric_suffix(path: Path) -> Path:
+    if not path.exists():
+        return path
+    stem = path.stem
+    suffix = path.suffix
+    for index in range(1, 10000):
+        candidate = path.with_name(f"{stem}_{index}{suffix}")
+        if not candidate.exists():
+            return candidate
+    raise ValueError(f"Could not find available output filename for '{path}'.")
+
+
+def _default_plot_output_path(source: str | Path, analysis_name: str) -> Path:
+    stem = Path(source).stem or "profile"
+    return Path.cwd() / f"{stem}_{analysis_name.lower()}.png"
+
+
+def _default_pbc_output_path(trajectory: str | Path) -> Path:
+    input_path = Path(trajectory).expanduser().resolve()
+    if input_path.suffix.lower() in {".dump", ".lmp"}:
+        output_name = f"{input_path.stem}_pbc.xyz"
+        return input_path.with_name(output_name)
+    if input_path.suffix:
+        output_name = f"{input_path.stem}_pbc{input_path.suffix}"
+    else:
+        output_name = f"{input_path.name}_pbc"
+    return input_path.with_name(output_name)
+
+
+def _is_csv_source(path: str | Path) -> bool:
+    return _is_hdf5_source(path)
+
+
+def _is_hdf5_source(path: str | Path) -> bool:
+    return Path(path).suffix.lower() in {".h5", ".hdf5"}
+
+
+def _parse_backend(value: str) -> str:
+    """Argparse type wrapper for backend normalization with useful errors."""
+    from .plotting import normalize_backend_name
+
+    try:
+        return normalize_backend_name(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+def _normalize_cell_args(args: argparse.Namespace) -> tuple[float, float, float] | None:
+    return tuple(args.cell) if args.cell is not None else None
+
+
+def _frame_has_usable_periodic_cell(frame: Atoms) -> bool:
+    if not all(bool(value) for value in frame.get_pbc()):
+        return False
+    lengths = frame.cell.lengths()
+    if any(length <= 0.0 for length in lengths):
+        return False
+    return abs(float(frame.get_volume())) > 0.0
+
+
+def _frames_have_usable_periodic_cell(frames: list[Atoms]) -> bool:
+    return bool(frames) and all(_frame_has_usable_periodic_cell(frame) for frame in frames)
+
+
+def _cell_lengths_from_frame(frame: Atoms) -> tuple[float, float, float]:
+    raw_lengths = frame.cell.lengths()
+    lengths = (
+        float(raw_lengths[0]),
+        float(raw_lengths[1]),
+        float(raw_lengths[2]),
+    )
+    if any(value <= 0.0 for value in lengths):
+        raise ValueError("Trajectory frame has non-positive cell length(s).")
+    return lengths
+
+
+def _flatten_profiles_by_source(source_profiles: list[tuple[str, list[Any]]]) -> list[Any]:
+    flattened: list[Any] = []
+    for _, profiles in source_profiles:
+        flattened.extend(profiles)
+    return flattened
+
+
+def _positive_float(value: str) -> float:
+    parsed = float(value)
+    if parsed <= 0.0:
+        raise argparse.ArgumentTypeError(f"Expected a value > 0, got {value}.")
+    return parsed
+
+
+def _non_negative_float(value: str) -> float:
+    parsed = float(value)
+    if parsed < 0.0:
+        raise argparse.ArgumentTypeError(f"Expected a value >= 0, got {value}.")
+    return parsed
+
+
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError(f"Expected a value > 0, got {value}.")
+    return parsed
+
+
+def _add_csv_source_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "source",
+        nargs="?",
+        metavar="SOURCE",
+        help="Input HDF5 path (legacy positional form)",
+    )
+    parser.add_argument(
+        "-f",
+        "--files",
+        nargs="+",
+        metavar="PATH",
+        help="Input HDF5 file path(s). Use -f/--files even for one file; required for multiple.",
+    )
+    parser.add_argument(
+        "--group",
+        default=None,
+        help="Optional HDF5 group path to read tabular datasets from (default: auto; prefers /records).",
+    )
+
+
+def _add_csv_plot_source_options(parser: argparse.ArgumentParser) -> None:
+    input_group = parser.add_argument_group("Input files")
+    input_group.add_argument(
+        "source",
+        nargs="*",
+        metavar="SOURCE",
+        help="Input HDF5 file path(s) (legacy positional form; use -f/--files for multiple)",
+    )
+    input_group.add_argument(
+        "-f",
+        "--files",
+        nargs="+",
+        metavar="PATH",
+        help="Input HDF5 file path(s). Use -f/--files even for one file; required for multiple.",
+    )
+    input_group.add_argument(
+        "--group",
+        default=None,
+        help="Optional HDF5 group path to read tabular datasets from (default: auto; prefers /records).",
+    )
+
+
+def _add_csv_write_options(parser: argparse.ArgumentParser) -> None:
+    output_group = parser.add_mutually_exclusive_group()
+    output_group.add_argument(
+        "-o",
+        "--output",
+        help="Output HDF5 path (default: auto-generated next to input)",
+    )
+    output_group.add_argument(
+        "--inplace",
+        action="store_true",
+        help="Overwrite the input HDF5 file in place",
+    )
+
+
+def _add_csv_plot_options(parser: argparse.ArgumentParser) -> None:
+    parser.set_defaults(x_lim=None)
+    parser.set_defaults(y_lim=None)
+    render_group = parser.add_argument_group("Render and output")
+    render_group.add_argument(
+        "-o",
+        "--output",
+        help="Output image path (PNG, PDF, SVG, ...)",
+    )
+    render_group.add_argument(
+        "--show",
+        dest="show",
+        action="store_true",
+        default=True,
+        help="Show interactive plot window (default: enabled)",
+    )
+    render_group.add_argument(
+        "--no-show",
+        dest="show",
+        action="store_false",
+        help="Disable interactive plot window",
+    )
+    render_group.add_argument(
+        "--backend",
+        type=_parse_backend,
+        default=DEFAULT_INTERACTIVE_BACKEND,
+        metavar="BACKEND",
+        help=(
+            "Preferred Matplotlib backend when interactive plotting is enabled "
+            f"(default: {DEFAULT_INTERACTIVE_BACKEND})"
+        ),
+    )
+    render_group.add_argument(
+        "--settings-source",
+        metavar="PATH_OR_INDEX",
+        default=None,
+        help=(
+            "When plotting multiple input HDF5 files, select which source provides persisted "
+            "plot settings (default: first input). Accepts a 1-based index or one of the input paths."
+        ),
+    )
+
+    axis_group = parser.add_argument_group("Axes and title")
+    axis_group.add_argument(
+        "--title",
+        default=None,
+        help="Optional plot title (default: inferred from file and plot type)",
+    )
+    _add_toggle_state_argument(
+        axis_group,
+        flag="title-mode",
+        dest="title_visible",
+        feature_name="Title display",
+    )
+    axis_group.add_argument("--x-label", help="Custom x-axis label")
+    axis_group.add_argument("--y-label", help="Custom y-axis label")
+    axis_group.add_argument(
+        "--x-scale",
+        choices=["linear", "log", "symlog", "logit"],
+        default="linear",
+        help="X-axis scale (default: linear)",
+    )
+    axis_group.add_argument(
+        "--y-scale",
+        choices=["linear", "log", "symlog", "logit"],
+        default="linear",
+        help="Y-axis scale (default: linear)",
+    )
+    axis_group.add_argument("--x-min", type=float, metavar="XMIN", help="Lower x-axis limit")
+    axis_group.add_argument("--x-max", type=float, metavar="XMAX", help="Upper x-axis limit")
+    axis_group.add_argument("--y-min", type=float, metavar="YMIN", help="Lower y-axis limit")
+    axis_group.add_argument("--y-max", type=float, metavar="YMAX", help="Upper y-axis limit")
+    axis_group.add_argument(
+        "--x-ticks",
+        nargs="+",
+        type=float,
+        metavar="XTICK",
+        help="Explicit x-axis tick positions",
+    )
+    axis_group.add_argument(
+        "--y-ticks",
+        nargs="+",
+        type=float,
+        metavar="YTICK",
+        help="Explicit y-axis tick positions",
+    )
+    axis_group.add_argument(
+        "--x-tick-rotation",
+        type=float,
+        help="X-axis tick-label rotation in degrees",
+    )
+    axis_group.add_argument(
+        "--y-tick-rotation",
+        type=float,
+        help="Y-axis tick-label rotation in degrees",
+    )
+
+    legend_group = parser.add_argument_group("Series labels and legend")
+    legend_group.add_argument(
+        "--labels",
+        "--series-labels",
+        dest="series_labels",
+        nargs="+",
+        metavar="LABEL",
+        help=(
+            "Custom labels for plotted series. Count must match the number of rendered series "
+            "(used for legends, or box-plot tick labels)."
+        ),
+    )
+    legend_group.add_argument(
+        "--file-labels",
+        nargs="+",
+        metavar="LABEL",
+        help="Optional labels for each input file (used when plotting multiple HDF5 files).",
+    )
+    _add_toggle_state_argument(
+        legend_group,
+        flag="legend",
+        dest="legend",
+        feature_name="Legend display",
+    )
+    legend_group.add_argument(
+        "--no-legend",
+        dest="legend",
+        action="store_false",
+        help=argparse.SUPPRESS,
+    )
+    legend_group.add_argument(
+        "--legend-title",
+        help="Optional legend title",
+    )
+    legend_group.add_argument(
+        "--legend-loc",
+        default="best",
+        help="Matplotlib legend location (default: best)",
+    )
+
+    style_group = parser.add_argument_group("Figure style")
+    style_group.add_argument(
+        "--figsize",
+        nargs=2,
+        type=_positive_float,
+        metavar=("WIDTH", "HEIGHT"),
+        help="Figure size in inches (default: 7 4)",
+    )
+    style_group.add_argument(
+        "--dpi",
+        type=_positive_int,
+        help="Figure DPI when saving output (default: 200)",
+    )
+    style_group.add_argument(
+        "--font-family",
+        help="Matplotlib font family (default: DejaVu Sans)",
+    )
+    style_group.add_argument(
+        "--title-font-size",
+        type=_positive_int,
+        help="Title font size (default: 14)",
+    )
+    style_group.add_argument(
+        "--label-font-size",
+        type=_positive_int,
+        help="Axis label font size (default: 12)",
+    )
+    style_group.add_argument(
+        "--tick-font-size",
+        type=_positive_int,
+        help="Tick label font size (default: 10)",
+    )
+    style_group.add_argument(
+        "--line-width",
+        type=_positive_float,
+        help="Main line width (default: 2.0)",
+    )
+    style_group.add_argument("--line-color", help="Main line color (default: #1f77b4)")
+    style_group.add_argument(
+        "--line-colors",
+        nargs="+",
+        metavar="COLOR",
+        help="Per-series line colors (count must match rendered series count).",
+    )
+    _add_toggle_state_argument(
+        style_group,
+        flag="grid",
+        dest="grid",
+        feature_name="Grid display",
+    )
+    style_group.add_argument(
+        "--no-grid",
+        dest="grid",
+        action="store_false",
+        help=argparse.SUPPRESS,
+    )
+    _add_toggle_state_argument(
+        style_group,
+        flag="ticks",
+        dest="ticks",
+        feature_name="Tick display",
+    )
+    _add_toggle_state_argument(
+        style_group,
+        flag="markers",
+        dest="markers",
+        feature_name="Line markers",
+    )
+    style_group.add_argument(
+        "--grid-linestyle",
+        help="Grid linestyle (default: --)",
+    )
+    style_group.add_argument(
+        "--grid-linewidth",
+        type=_positive_float,
+        help="Grid line width (default: 0.8)",
+    )
+    style_group.add_argument(
+        "--grid-alpha",
+        type=_non_negative_float,
+        help="Grid alpha transparency (default: 0.35)",
+    )
+
+
+def _ensure_prompt_capable_terminal() -> None:
+    if not _interactive_prompts_available():
+        raise ValueError(
+            "Interactive prompt unavailable in non-interactive mode. "
+            "Provide explicit CLI arguments instead."
+        )
+
+
+def _interactive_prompts_available() -> bool:
+    return bool(getattr(sys.stdin, "isatty", lambda: False)())
+
+
+def _resolve_column_tokens(raw: str, candidates: list[str]) -> list[str]:
+    tokens = [token.strip() for token in raw.split(",") if token.strip()]
+    if not tokens:
+        raise ValueError("No column selection provided.")
+
+    resolved: list[str] = []
+    lowered = {name.lower(): name for name in candidates}
+    for token in tokens:
+        if token.isdigit():
+            index = int(token)
+            if index < 1 or index > len(candidates):
+                raise ValueError(f"Column index {index} is out of range 1..{len(candidates)}.")
+            resolved.append(candidates[index - 1])
+            continue
+        if token in candidates:
+            resolved.append(token)
+            continue
+        normalized = lowered.get(token.lower())
+        if normalized is None:
+            raise ValueError(f"Unknown column '{token}'.")
+        resolved.append(normalized)
+
+    unique: list[str] = []
+    for name in resolved:
+        if name not in unique:
+            unique.append(name)
+    return unique
+
+
+def _prompt_for_columns(
+    *,
+    columns: list[str],
+    prompt: str,
+    allow_multiple: bool,
+) -> list[str]:
+    _ensure_prompt_capable_terminal()
+    print("Available columns:")
+    for index, name in enumerate(columns, start=1):
+        print(f"  {index:>2}. {name}")
+
+    while True:
+        suffix = " (name/index, comma-separated)" if allow_multiple else " (name/index)"
+        raw = input(f"{prompt}{suffix}: ").strip()
+        try:
+            resolved = _resolve_column_tokens(raw, columns)
+        except ValueError as exc:
+            print(f"Invalid selection: {exc}")
+            continue
+        if not allow_multiple and len(resolved) != 1:
+            print("Please select exactly one column.")
+            continue
+        return resolved
+
+
+def _prompt_for_value(prompt: str, *, allowed: set[str] | None = None) -> str:
+    _ensure_prompt_capable_terminal()
+    while True:
+        value = input(f"{prompt}: ").strip()
+        if not value:
+            print("A value is required.")
+            continue
+        if allowed is not None and value.lower() not in allowed:
+            print(f"Please choose one of: {', '.join(sorted(allowed))}")
+            continue
+        return value
+
+
+def _prompt_yes_no(prompt: str, *, default: bool = False) -> bool:
+    _ensure_prompt_capable_terminal()
+    suffix = " [Y/n]" if default else " [y/N]"
+    while True:
+        raw = input(f"{prompt}{suffix}: ").strip().lower()
+        if not raw:
+            return default
+        if raw in {"y", "yes"}:
+            return True
+        if raw in {"n", "no"}:
+            return False
+        print("Please answer yes or no.")
+
+
+def _runtime_option_was_provided(args: argparse.Namespace, setting_key: str) -> bool:
+    flags = _PERSISTED_PLOT_SETTING_OPTION_FLAGS.get(setting_key)
+    if not flags:
+        return False
+    runtime_argv = tuple(getattr(args, "_runtime_argv", ()))
+    for token in runtime_argv:
+        for flag in flags:
+            if token == flag or token.startswith(f"{flag}="):
+                return True
+    return False
+
+
+def _json_ready_setting(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, (tuple, list)):
+        return [_json_ready_setting(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _json_ready_setting(item) for key, item in value.items()}
+    return value
+
+
+def _collect_plot_settings_from_args(
+    args: argparse.Namespace, *, keys: tuple[str, ...]
+) -> dict[str, Any]:
+    settings: dict[str, Any] = {}
+    for key in keys:
+        if hasattr(args, key):
+            settings[key] = _json_ready_setting(getattr(args, key))
+    return settings
+
+
+def _apply_saved_plot_settings(
+    *,
+    args: argparse.Namespace,
+    source_path: Path,
+    profile_key: str,
+    keys: tuple[str, ...],
+) -> dict[str, Any] | None:
+    from .plot_settings import read_plot_profile
+
+    try:
+        saved = read_plot_profile(source_path, profile_key)
+    except (FileNotFoundError, ValueError) as exc:
+        LOGGER.debug("Could not read saved plot settings from '%s': %s", source_path, exc)
+        return None
+    if saved is None:
+        return None
+
+    for key in keys:
+        if key not in saved:
+            continue
+        if not hasattr(args, key):
+            continue
+        if _runtime_option_was_provided(args, key):
+            continue
+        setattr(args, key, deepcopy(saved[key]))
+    return saved
+
+
+def _merge_rendered_plot_state(
+    settings: dict[str, Any],
+    rendered_state: dict[str, Any],
+    *,
+    keys: tuple[str, ...],
+) -> dict[str, Any]:
+    merged = dict(settings)
+    for key in keys:
+        if key in rendered_state and rendered_state[key] is not None:
+            merged[key] = _json_ready_setting(rendered_state[key])
+    return merged
+
+
+_PLOT_SETTINGS_MISSING = object()
+
+
+def _flatten_settings(value: Any, *, prefix: str = "") -> dict[str, Any]:
+    if isinstance(value, dict):
+        flattened: dict[str, Any] = {}
+        for key in sorted(value):
+            child_prefix = f"{prefix}.{key}" if prefix else str(key)
+            flattened.update(_flatten_settings(value[key], prefix=child_prefix))
+        return flattened
+    return {prefix: value}
+
+
+def _settings_differences(existing: dict[str, Any], candidate: dict[str, Any]) -> list[tuple[str, Any, Any]]:
+    existing_flat = _flatten_settings(existing)
+    candidate_flat = _flatten_settings(candidate)
+    all_keys = sorted(set(existing_flat) | set(candidate_flat))
+    differences: list[tuple[str, Any, Any]] = []
+    for key in all_keys:
+        old_value = existing_flat.get(key, _PLOT_SETTINGS_MISSING)
+        new_value = candidate_flat.get(key, _PLOT_SETTINGS_MISSING)
+        if old_value == new_value:
+            continue
+        differences.append((key, old_value, new_value))
+    return differences
+
+
+def _format_settings_value(value: Any) -> str:
+    if value is _PLOT_SETTINGS_MISSING:
+        return "<missing>"
+    rendered = json.dumps(_json_ready_setting(value), sort_keys=True)
+    if len(rendered) <= 120:
+        return rendered
+    return rendered[:117] + "..."
+
+
+def _set_nested_setting(settings: dict[str, Any], dotted_path: str, value: Any) -> None:
+    keys = dotted_path.split(".")
+    node = settings
+    for key in keys[:-1]:
+        child = node.get(key)
+        if not isinstance(child, dict):
+            child = {}
+            node[key] = child
+        node = child
+    node[keys[-1]] = deepcopy(value)
+
+
+def _delete_nested_setting(settings: dict[str, Any], dotted_path: str) -> None:
+    keys = dotted_path.split(".")
+    node: dict[str, Any] = settings
+    trail: list[tuple[dict[str, Any], str]] = []
+    for key in keys[:-1]:
+        child = node.get(key)
+        if not isinstance(child, dict):
+            return
+        trail.append((node, key))
+        node = child
+
+    if keys[-1] not in node:
+        return
+    del node[keys[-1]]
+
+    for parent, key in reversed(trail):
+        child = parent.get(key)
+        if isinstance(child, dict) and not child:
+            del parent[key]
+        else:
+            break
+
+
+def _prompt_plot_settings_resolution() -> str:
+    _ensure_prompt_capable_terminal()
+    print("")
+    print("Plot settings differ from the profile stored in this HDF5.")
+    print("  [Enter]/y : save new settings")
+    print("  n         : keep existing settings")
+    print("  c         : keep existing file and write new settings to a copy")
+    print("  i         : review each changed setting")
+    while True:
+        choice = input("Choice [Y/n/c/i]: ").strip().lower()
+        if choice in {"", "y", "yes"}:
+            return "save"
+        if choice in {"n", "no"}:
+            return "discard"
+        if choice in {"c", "copy"}:
+            return "copy"
+        if choice in {"i", "interactive"}:
+            return "interactive"
+        print("Please choose: y, n, c, or i.")
+
+
+def _copy_hdf5_for_plot_settings(
+    *,
+    source_path: Path,
+    profile_key: str,
+    settings: dict[str, Any],
+) -> Path:
+    from .plot_settings import write_plot_profile
+
+    default_target = source_path.with_name(f"{source_path.stem}_plot_settings{source_path.suffix}")
+    prompt = f"Copy target path [default: {default_target}]: "
+    raw = input(prompt).strip()
+    target_path = Path(raw).expanduser().resolve() if raw else default_target
+    if target_path.exists() and not _prompt_yes_no(
+        f"Overwrite existing file '{target_path}'", default=False
+    ):
+        raise ValueError("Copy aborted; target file already exists.")
+
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source_path, target_path)
+    write_plot_profile(target_path, profile_key, settings)
+    return target_path
+
+
+def _persist_plot_settings_with_resolution(
+    *,
+    source_path: Path,
+    profile_key: str,
+    existing_settings: dict[str, Any] | None,
+    candidate_settings: dict[str, Any],
+) -> None:
+    from .plot_settings import write_plot_profile
+
+    if existing_settings is None:
+        write_plot_profile(source_path, profile_key, candidate_settings)
+        LOGGER.info("Saved initial plot settings profile '%s' in '%s'.", profile_key, source_path)
+        return
+
+    differences = _settings_differences(existing_settings, candidate_settings)
+    if not differences:
+        return
+
+    if not _interactive_prompts_available():
+        LOGGER.info(
+            "Plot settings differ for '%s', but interactive prompts are unavailable. "
+            "Keeping existing settings.",
+            source_path,
+        )
+        return
+
+    print("")
+    print(f"Detected {len(differences)} plot-setting change(s):")
+    for key, old_value, new_value in differences:
+        print(f"  {key}")
+        print(f"    old: {_format_settings_value(old_value)}")
+        print(f"    new: {_format_settings_value(new_value)}")
+
+    decision = _prompt_plot_settings_resolution()
+    if decision == "discard":
+        print("Kept existing plot settings.")
+        return
+    if decision == "copy":
+        copied_path = _copy_hdf5_for_plot_settings(
+            source_path=source_path,
+            profile_key=profile_key,
+            settings=candidate_settings,
+        )
+        print(f"Wrote copied HDF5 with new plot settings: {copied_path}")
+        return
+    if decision == "interactive":
+        merged = deepcopy(existing_settings)
+        for key, old_value, new_value in differences:
+            print("")
+            print(f"{key}")
+            print(f"  old: {_format_settings_value(old_value)}")
+            print(f"  new: {_format_settings_value(new_value)}")
+            keep_new = _prompt_yes_no("Keep new value", default=True)
+            if not keep_new:
+                continue
+            if new_value is _PLOT_SETTINGS_MISSING:
+                _delete_nested_setting(merged, key)
+            else:
+                _set_nested_setting(merged, key, new_value)
+        write_plot_profile(source_path, profile_key, merged)
+        print("Saved merged plot settings.")
+        return
+
+    write_plot_profile(source_path, profile_key, candidate_settings)
+    print("Saved updated plot settings.")
+
+
+def _profile_key_from_analysis(analysis: str | None) -> str:
+    normalized = (analysis or "").strip().lower()
+    if normalized == "density":
+        return _PLOT_PROFILE_DENSITY
+    if normalized == "msd":
+        return _PLOT_PROFILE_MSD
+    if normalized == "rdf":
+        return _PLOT_PROFILE_RDF
+    return _PLOT_PROFILE_TABLE
+
+
+def _resolve_plot_profile_key(
+    *,
+    profile_token: str | None,
+    source_path: Path,
+) -> str:
+    if profile_token is None or profile_token == "auto":
+        from .plot_settings import read_hdf5_analysis
+
+        return _profile_key_from_analysis(read_hdf5_analysis(source_path))
+
+    normalized = profile_token.strip().lower()
+    if normalized == "density":
+        return _PLOT_PROFILE_DENSITY
+    if normalized == "msd":
+        return _PLOT_PROFILE_MSD
+    if normalized == "rdf":
+        return _PLOT_PROFILE_RDF
+    if normalized in {"table", "hdf5"}:
+        return _PLOT_PROFILE_TABLE
+    raise ValueError(f"Unsupported plot profile '{profile_token}'.")
+
+
+def _default_csv_output_path(source: str | Path, suffix: str) -> Path:
+    source_path = Path(source).expanduser().resolve()
+    stem = source_path.stem or "data"
+    return source_path.with_name(f"{stem}_{suffix}.h5")
+
+
+def _resolve_csv_output_path(args: argparse.Namespace, *, suffix: str) -> Path:
+    source = _resolve_single_source_argument(
+        args,
+        positional_attr="source",
+        source_label="HDF5 input file",
+    )
+    source_path = Path(source).expanduser().resolve()
+    if getattr(args, "inplace", False):
+        return source_path
+    if args.output:
+        return Path(args.output).expanduser().resolve()
+    return _default_csv_output_path(source_path, suffix)
+
+
+def _default_csv_plot_output_path(source: str | Path, kind: str) -> Path:
+    source_path = Path(source).expanduser().resolve()
+    stem = source_path.stem or "data"
+    return source_path.with_name(f"{stem}_{kind}.png")
+
+
+def _default_csv_plot_output_for_sources(sources: list[Path], kind: str) -> Path:
+    if len(sources) == 1:
+        return _default_csv_plot_output_path(sources[0], kind)
+    return Path.cwd() / f"linak_{kind}.png"
+
+
+def _print_csv_preview_for_interactive(
+    *,
+    frame: Any,
+    source_path: Path,
+    rows: int = 8,
+    heading: str = "Preview before interactive selection",
+) -> None:
+    from .csv_tools import format_frame_preview
+
+    print(f"{heading}: {source_path} (head {rows})")
+    print(format_frame_preview(frame, rows=rows, tail=False, show_index=False))
+    print("")
+
+
+def _load_csv_frame_from_source(
+    source: str | Path,
+    *,
+    group: str | None = None,
+) -> tuple[Any, Path]:
+    try:
+        from .hdf5_table import read_hdf5_frame
+    except ModuleNotFoundError as exc:
+        if exc.name in {"pandas", "h5py"}:
+            raise ValueError(
+                "HDF5 tabular commands require pandas and h5py. "
+                "Install dependencies and rerun (for example: pip install pandas h5py)."
+            ) from exc
+        raise
+
+    frame, source_info = read_hdf5_frame(source, group=group)
+    source_path = source_info.source_path
+    frame.attrs["linak_hdf5_source_info"] = source_info
+    LOGGER.info(
+        "Loaded HDF5 '%s' (analysis='%s', group='%s') with %d row(s) and %d column(s).",
+        source_path,
+        source_info.analysis or "unknown",
+        source_info.container,
+        len(frame),
+        len(frame.columns),
+    )
+    if source_info.skipped_datasets:
+        LOGGER.info("Skipped %d non-tabular dataset(s).", len(source_info.skipped_datasets))
+    return frame, source_path
+
+
+def _load_csv_frame(args: argparse.Namespace) -> tuple[Any, Path]:
+    source = _resolve_single_source_argument(
+        args,
+        positional_attr="source",
+        source_label="HDF5 input file",
+    )
+    return _load_csv_frame_from_source(
+        source,
+        group=getattr(args, "group", None),
+    )
+
+
+def _print_hdf5_metadata_overview(frame: Any) -> None:
+    source_info = frame.attrs.get("linak_hdf5_source_info")
+    if source_info is None:
+        return
+
+    from .hdf5_table import format_hdf5_metadata_overview
+
+    print(format_hdf5_metadata_overview(source_info))
+    print("")
+
+
+def _validate_csv_columns(frame: Any, requested: list[str]) -> list[str]:
+    unknown = [column for column in requested if column not in frame.columns]
+    if unknown:
+        raise ValueError(f"Unknown column(s): {', '.join(unknown)}")
+    unique: list[str] = []
+    for column in requested:
+        if column not in unique:
+            unique.append(column)
+    return unique
+
+
+def _format_float(value: float | int | None, digits: int) -> str:
+    if value is None:
+        return "NA"
+    if isinstance(value, int):
+        return str(value)
+    return f"{float(value):.{digits}g}"
+
+
+def _format_column_statistics(
+    stats: dict[str, object], *, digits: int, metrics: list[str] | None
+) -> str:
+    kind = stats["kind"]
+    if kind == "numeric":
+        default_metrics = [
+            "count",
+            "missing",
+            "distinct",
+            "min",
+            "max",
+            "mean",
+            "median",
+            "std",
+            "sum",
+            "q05",
+            "q25",
+            "q75",
+            "q95",
+            "iqr",
+        ]
+    else:
+        default_metrics = [
+            "count",
+            "missing",
+            "distinct",
+            "mode",
+            "mode_count",
+            "numeric_ratio",
+        ]
+
+    selected = metrics if metrics is not None else default_metrics
+    unavailable = [metric for metric in selected if metric not in stats]
+    if unavailable:
+        raise ValueError(
+            f"Metrics not available for column '{stats['column']}' ({kind}): {', '.join(unavailable)}."
+        )
+
+    lines = [f"Column: {stats['column']} ({kind})"]
+    for metric in selected:
+        value = stats[metric]
+        if isinstance(value, float):
+            rendered = _format_float(value, digits)
+        elif isinstance(value, int):
+            rendered = str(value)
+        elif isinstance(value, list):
+            rendered = ", ".join(f"{name}:{count}" for name, count in value) if value else "NA"
+        else:
+            rendered = "NA" if value is None else str(value)
+        lines.append(f"  {metric:>12}: {rendered}")
+    return "\n".join(lines)
+
+
+def _add_plot_common_options(parser: argparse.ArgumentParser) -> None:
+    parser.set_defaults(x_lim=None)
+    parser.set_defaults(y_lim=None)
+    render_group = parser.add_argument_group("General plot options")
+    render_group.add_argument(
+        "--gui",
+        action="store_true",
+        help=(
+            "Open an interactive plot-settings window with form controls, preview, and "
+            "save actions."
+        ),
+    )
+    render_group.add_argument("-o", "--output", help="Output image path (PNG, PDF, SVG, ...)")
+    render_group.add_argument(
+        "--show",
+        dest="show",
+        action="store_true",
+        default=True,
+        help="Show interactive plot window (default: enabled)",
+    )
+    render_group.add_argument(
+        "--no-show",
+        dest="show",
+        action="store_false",
+        help="Disable interactive plot window",
+    )
+    render_group.add_argument(
+        "--backend",
+        type=_parse_backend,
+        default=DEFAULT_INTERACTIVE_BACKEND,
+        metavar="BACKEND",
+        help=(
+            "Preferred Matplotlib backend when interactive plotting is enabled "
+            f"(default: {DEFAULT_INTERACTIVE_BACKEND})"
+        ),
+    )
+    render_group.add_argument(
+        "--settings-source",
+        metavar="PATH_OR_INDEX",
+        default=None,
+        help=(
+            "When plotting multiple input HDF5 files, select which source provides persisted "
+            "plot settings (default: first input). Accepts a 1-based index or one of the input paths."
+        ),
+    )
+
+    axis_group = parser.add_argument_group("Axes and title")
+    axis_group.add_argument(
+        "--title",
+        default=None,
+        help="Optional plot title (default: inferred from data and analysis type)",
+    )
+    _add_toggle_state_argument(
+        axis_group,
+        flag="title-mode",
+        dest="title_visible",
+        feature_name="Title display",
+    )
+    axis_group.add_argument("--x-label", help="Custom x-axis label")
+    axis_group.add_argument("--y-label", help="Custom y-axis label")
+    axis_group.add_argument(
+        "--x-scale",
+        choices=["linear", "log", "symlog", "logit"],
+        default="linear",
+        help="X-axis scale (default: linear)",
+    )
+    axis_group.add_argument(
+        "--y-scale",
+        choices=["linear", "log", "symlog", "logit"],
+        default="linear",
+        help="Y-axis scale (default: linear)",
+    )
+    axis_group.add_argument("--x-min", type=float, metavar="XMIN", help="Lower x-axis limit")
+    axis_group.add_argument("--x-max", type=float, metavar="XMAX", help="Upper x-axis limit")
+    axis_group.add_argument("--y-min", type=float, metavar="YMIN", help="Lower y-axis limit")
+    axis_group.add_argument("--y-max", type=float, metavar="YMAX", help="Upper y-axis limit")
+    axis_group.add_argument(
+        "--x-ticks",
+        nargs="+",
+        type=float,
+        metavar="XTICK",
+        help="Explicit x-axis tick positions",
+    )
+    axis_group.add_argument(
+        "--y-ticks",
+        nargs="+",
+        type=float,
+        metavar="YTICK",
+        help="Explicit y-axis tick positions",
+    )
+    axis_group.add_argument(
+        "--x-tick-rotation",
+        type=float,
+        help="X-axis tick-label rotation in degrees",
+    )
+    axis_group.add_argument(
+        "--y-tick-rotation",
+        type=float,
+        help="Y-axis tick-label rotation in degrees",
+    )
+
+    legend_group = parser.add_argument_group("Series labels and legend")
+    legend_group.add_argument(
+        "--labels",
+        "--series-labels",
+        dest="series_labels",
+        nargs="+",
+        metavar="LABEL",
+        help=(
+            "Custom labels for plotted series. Count must match the rendered series count "
+            "(used for legends and stored plot profiles). For multi-file plots, stored labels "
+            "are merged per source automatically unless this flag is provided."
+        ),
+    )
+    _add_toggle_state_argument(
+        legend_group,
+        flag="legend",
+        dest="legend",
+        feature_name="Legend display",
+    )
+    legend_group.add_argument(
+        "--no-legend",
+        dest="legend",
+        action="store_false",
+        help=argparse.SUPPRESS,
+    )
+    legend_group.add_argument(
+        "--legend-title",
+        help="Optional legend title",
+    )
+    legend_group.add_argument(
+        "--legend-loc",
+        default="best",
+        help="Matplotlib legend location (default: best)",
+    )
+
+    style_group = parser.add_argument_group("Plot style options")
+    style_group.add_argument(
+        "--figsize",
+        nargs=2,
+        type=_positive_float,
+        metavar=("WIDTH", "HEIGHT"),
+        help="Figure size in inches (default: 7 4)",
+    )
+    style_group.add_argument(
+        "--dpi",
+        type=_positive_int,
+        help="Figure DPI when saving output (default: 200)",
+    )
+    style_group.add_argument(
+        "--font-family",
+        help="Matplotlib font family (default: DejaVu Sans)",
+    )
+    style_group.add_argument(
+        "--title-font-size",
+        type=_positive_int,
+        help="Title font size (default: 14)",
+    )
+    style_group.add_argument(
+        "--label-font-size",
+        type=_positive_int,
+        help="Axis label font size (default: 12)",
+    )
+    style_group.add_argument(
+        "--tick-font-size",
+        type=_positive_int,
+        help="Tick label font size (default: 10)",
+    )
+    style_group.add_argument(
+        "--line-width",
+        type=_positive_float,
+        help="Main line width (default: 2.0)",
+    )
+    style_group.add_argument("--line-color", help="Main line color (default: #1f77b4)")
+    style_group.add_argument(
+        "--line-colors",
+        nargs="+",
+        metavar="COLOR",
+        help=(
+            "Per-series line colors (count must match rendered series count). For multi-file "
+            "plots, stored per-source colors are merged automatically unless this flag is provided."
+        ),
+    )
+    _add_toggle_state_argument(
+        style_group,
+        flag="grid",
+        dest="grid",
+        feature_name="Grid display",
+    )
+    style_group.add_argument(
+        "--no-grid",
+        dest="grid",
+        action="store_false",
+        help=argparse.SUPPRESS,
+    )
+    _add_toggle_state_argument(
+        style_group,
+        flag="ticks",
+        dest="ticks",
+        feature_name="Tick display",
+    )
+    _add_toggle_state_argument(
+        style_group,
+        flag="markers",
+        dest="markers",
+        feature_name="Line markers",
+    )
+    style_group.add_argument(
+        "--grid-linestyle",
+        help="Grid linestyle (default: --)",
+    )
+    style_group.add_argument(
+        "--grid-linewidth",
+        type=_positive_float,
+        help="Grid line width (default: 0.8)",
+    )
+    style_group.add_argument(
+        "--grid-alpha",
+        type=_non_negative_float,
+        help="Grid alpha transparency (default: 0.35)",
+    )
+
+
+def _add_plot_source_options(parser: argparse.ArgumentParser, *, help_text: str) -> None:
+    parser.add_argument(
+        "source",
+        nargs="*",
+        help=help_text,
+    )
+    parser.add_argument(
+        "-f",
+        "--files",
+        nargs="+",
+        metavar="PATH",
+        help="Input HDF5 file path(s). Use -f/--files even for one file; required for multiple.",
+    )
+
+
+def _resolve_apply_output_path(args: argparse.Namespace) -> Path:
+    if args.overwrite:
+        return Path(args.trajectory).expanduser().resolve()
+    if args.output is not None:
+        return Path(args.output).expanduser().resolve()
+    return _default_pbc_output_path(args.trajectory)
+
+
+def _add_cell_resolution_options(parser: argparse.ArgumentParser) -> None:
+    group = parser.add_argument_group("Cell / PBC options")
+    group.add_argument(
+        "--cell",
+        nargs=3,
+        type=_positive_float,
+        metavar=("A", "B", "C"),
+        help="Explicit orthorhombic cell lengths in Angstrom.",
+    )
+    group.add_argument(
+        "-i",
+        "--input",
+        "--cp2k-input",
+        "--lammps-input",
+        dest="input",
+        metavar="PATH",
+        help=(
+            "Path to simulation input file (.inp for CP2K, .lmp for LAMMPS). "
+            "Used if cache and auto input discovery fail."
+        ),
+    )
+
+
+def _set_cell_on_frames(frames: list[Atoms], cell: tuple[float, float, float]) -> None:
+    for frame in frames:
+        frame.set_cell(cell)
+        frame.set_pbc((True, True, True))
+
+
+def _resolve_and_apply_required_cell(
+    frames: list[Atoms],
+    trajectory: str | Path,
+    *,
+    cell: tuple[float, float, float] | None,
+    input_path: str | None,
+    analysis_name: str,
+) -> tuple[float, float, float]:
+    from .cell_cache import resolve_analysis_cell
+
+    has_trajectory_cell = _frames_have_usable_periodic_cell(frames)
+    if cell is None and input_path is None and has_trajectory_cell:
+        resolved = _cell_lengths_from_frame(frames[0])
+        LOGGER.info(
+            "Using periodic cell already present in trajectory for %s analysis: "
+            "A=%.6g, B=%.6g, C=%.6g Angstrom.",
+            analysis_name,
+            resolved[0],
+            resolved[1],
+            resolved[2],
+        )
+        return resolved
+
+    try:
+        resolved = resolve_analysis_cell(
+            trajectory,
+            cell=cell,
+            input_path=input_path,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        if cell is None and has_trajectory_cell:
+            resolved = _cell_lengths_from_frame(frames[0])
+            LOGGER.info(
+                "Could not resolve cell from simulation input for %s analysis; using "
+                "periodic cell already present in trajectory. %s",
+                analysis_name,
+                exc,
+            )
+            return resolved
+        raise
+    LOGGER.info(
+        "Using cell for %s analysis: A=%.6g, B=%.6g, C=%.6g Angstrom.",
+        analysis_name,
+        resolved[0],
+        resolved[1],
+        resolved[2],
+    )
+    _set_cell_on_frames(frames, resolved)
+    return resolved
+
+
+def _maybe_apply_density_cell(
+    frames: list[Atoms],
+    trajectory: str | Path,
+    *,
+    cell: tuple[float, float, float] | None,
+    input_path: str | None,
+) -> tuple[float, float, float] | None:
+    """Try to resolve/apply a periodic cell for density; return None on fallback."""
+    from .cell_cache import resolve_analysis_cell
+
+    has_trajectory_cell = _frames_have_usable_periodic_cell(frames)
+    if cell is None and input_path is None and has_trajectory_cell:
+        resolved = _cell_lengths_from_frame(frames[0])
+        LOGGER.info(
+            "Using periodic cell already present in trajectory for density analysis: "
+            "A=%.6g, B=%.6g, C=%.6g Angstrom.",
+            resolved[0],
+            resolved[1],
+            resolved[2],
+        )
+        return resolved
+
+    try:
+        resolved = resolve_analysis_cell(
+            trajectory,
+            cell=cell,
+            input_path=input_path,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        if cell is None and has_trajectory_cell:
+            resolved = _cell_lengths_from_frame(frames[0])
+            LOGGER.info(
+                "Could not resolve cell from simulation input for density analysis; using "
+                "periodic cell already present in trajectory. %s",
+                exc,
+            )
+            return resolved
+        LOGGER.info(
+            "No periodic cell resolved for density analysis; using linear density. %s",
+            exc,
+        )
+        return None
+
+    LOGGER.info(
+        "Using cell for density analysis: A=%.6g, B=%.6g, C=%.6g Angstrom.",
+        resolved[0],
+        resolved[1],
+        resolved[2],
+    )
+    _set_cell_on_frames(frames, resolved)
+    return resolved
+
+
+def _resolve_msd_timestep_fs(
+    trajectory: str | Path,
+    *,
+    timestep_fs: float | None,
+    input_path: str | None,
+    frames: list[Atoms] | None = None,
+) -> float:
+    from .cell_cache import resolve_analysis_timestep_fs
+
+    try:
+        resolved = resolve_analysis_timestep_fs(
+            trajectory,
+            timestep_fs=timestep_fs,
+            input_path=input_path,
+            frames=frames,
+        )
+        LOGGER.info("Using timestep for MSD analysis: %.6g fs.", resolved)
+        return resolved
+    except ValueError as exc:
+        if timestep_fs is not None:
+            raise
+        LOGGER.info(
+            "No timestep resolved for MSD analysis; using default 1.0 fs. %s",
+            exc,
+        )
+        return 1.0
+
+
+def _resolve_combined_msd_timestep_fs(timesteps_by_source: list[tuple[str, float]]) -> float:
+    if not timesteps_by_source:
+        raise ValueError("No trajectories available to resolve combined MSD timestep.")
+
+    reference_source, reference_timestep = timesteps_by_source[0]
+    for source, timestep in timesteps_by_source[1:]:
+        if isclose(reference_timestep, timestep, rel_tol=0.0, abs_tol=1e-9):
+            continue
+        raise ValueError(
+            "Cannot combine trajectories with different timestep values for MSD "
+            f"({Path(reference_source).name}: {reference_timestep:.6g} fs, "
+            f"{Path(source).name}: {timestep:.6g} fs). "
+            "Use --timestep-fs to force one shared value."
+        )
+    return reference_timestep
+
+
+def _build_plot_style(args: argparse.Namespace) -> PlotStyle:
+    from .plotting import with_style_overrides
+
+    figure_size = tuple(args.figsize) if args.figsize is not None else None
+    return with_style_overrides(
+        figure_size=figure_size,
+        dpi=args.dpi,
+        font_family=args.font_family,
+        title_font_size=args.title_font_size,
+        label_font_size=args.label_font_size,
+        tick_font_size=args.tick_font_size,
+        line_width=args.line_width,
+        line_color=args.line_color,
+        grid=args.grid,
+        grid_linestyle=args.grid_linestyle,
+        grid_linewidth=args.grid_linewidth,
+        grid_alpha=args.grid_alpha,
+    )
+
+
+def _normalize_series_setting_list(value: Any) -> list[str] | None:
+    if not isinstance(value, (list, tuple)):
+        return None
+    cleaned: list[str] = []
+    for item in value:
+        token = str(item).strip()
+        if not token:
+            return None
+        cleaned.append(token)
+    return cleaned or None
+
+
+def _default_multi_series_colors(count: int) -> list[str]:
+    if count <= 0:
+        return []
+
+    colors: list[str] = []
+    try:
+        import matplotlib
+
+        prop_cycle = matplotlib.rcParams.get("axes.prop_cycle")
+        if prop_cycle is not None:
+            by_key = prop_cycle.by_key()
+            raw_colors = by_key.get("color", [])
+            colors = [str(item).strip() for item in raw_colors if str(item).strip()]
+    except Exception:
+        colors = []
+
+    if not colors:
+        from .plotting import DEFAULT_PLOT_STYLE
+
+        colors = [DEFAULT_PLOT_STYLE.line_color]
+
+    return [colors[index % len(colors)] for index in range(count)]
+
+
+def _read_plot_profile_safe(
+    source: str | Path,
+    *,
+    profile_key: str,
+) -> dict[str, Any] | None:
+    from .plot_settings import read_plot_profile
+
+    source_path = Path(source).expanduser().resolve()
+    try:
+        return read_plot_profile(source_path, profile_key)
+    except (FileNotFoundError, OSError, ValueError) as exc:
+        LOGGER.debug("Could not read plot profile '%s' from '%s': %s", profile_key, source_path, exc)
+        return None
+
+
+def _resolve_multi_source_series_settings(
+    *,
+    sources: list[str],
+    profile_key: str,
+    fallback_labels_by_source: list[list[str]],
+) -> tuple[list[str], list[str] | None]:
+    if len(sources) != len(fallback_labels_by_source):
+        raise ValueError("sources and fallback_labels_by_source must have equal lengths.")
+
+    saved_label_segments: list[list[str] | None] = [None] * len(sources)
+    saved_color_segments: list[list[str] | None] = [None] * len(sources)
+    total_series = sum(len(labels) for labels in fallback_labels_by_source)
+
+    for index, source in enumerate(sources):
+        expected_count = len(fallback_labels_by_source[index])
+        if expected_count == 0:
+            continue
+        saved_profile = _read_plot_profile_safe(source, profile_key=profile_key)
+        if not isinstance(saved_profile, dict):
+            continue
+
+        source_name = Path(source).name or str(source)
+        saved_labels = _normalize_series_setting_list(saved_profile.get("series_labels"))
+        if saved_labels is not None:
+            if len(saved_labels) == expected_count:
+                saved_label_segments[index] = saved_labels
+            else:
+                LOGGER.info(
+                    "Ignoring saved series_labels from '%s': expected %d value(s) for current "
+                    "series selection, got %d.",
+                    source_name,
+                    expected_count,
+                    len(saved_labels),
+                )
+
+        saved_colors = _normalize_series_setting_list(saved_profile.get("line_colors"))
+        if saved_colors is not None:
+            if len(saved_colors) == expected_count:
+                saved_color_segments[index] = saved_colors
+            else:
+                LOGGER.info(
+                    "Ignoring saved line_colors from '%s': expected %d value(s) for current "
+                    "series selection, got %d.",
+                    source_name,
+                    expected_count,
+                    len(saved_colors),
+                )
+
+    merged_labels: list[str] = []
+    for fallback_labels, saved_labels in zip(fallback_labels_by_source, saved_label_segments):
+        merged_labels.extend(saved_labels if saved_labels is not None else fallback_labels)
+
+    if not any(segment is not None for segment in saved_color_segments):
+        return merged_labels, None
+
+    merged_colors = _default_multi_series_colors(total_series)
+    offset = 0
+    for expected_labels, saved_colors in zip(fallback_labels_by_source, saved_color_segments):
+        expected_count = len(expected_labels)
+        if saved_colors is not None:
+            merged_colors[offset : offset + expected_count] = saved_colors
+        offset += expected_count
+
+    return merged_labels, merged_colors
+
+
+def _apply_effective_series_settings(
+    *,
+    args: argparse.Namespace,
+    sources: list[str],
+    profile_key: str,
+    fallback_labels_by_source: list[list[str]],
+) -> None:
+    total_series = sum(len(labels) for labels in fallback_labels_by_source)
+    if total_series <= 0:
+        return
+
+    explicit_labels = _runtime_option_was_provided(args, "series_labels")
+    explicit_line_colors = _runtime_option_was_provided(args, "line_colors")
+
+    merged_labels: list[str] | None = None
+    merged_colors: list[str] | None = None
+    if len(sources) > 1:
+        merged_labels, merged_colors = _resolve_multi_source_series_settings(
+            sources=sources,
+            profile_key=profile_key,
+            fallback_labels_by_source=fallback_labels_by_source,
+        )
+
+    if not explicit_labels:
+        if merged_labels is not None:
+            args.series_labels = merged_labels
+        else:
+            normalized_labels = _normalize_series_setting_list(getattr(args, "series_labels", None))
+            if normalized_labels is None:
+                args.series_labels = None
+            elif len(normalized_labels) == total_series:
+                args.series_labels = normalized_labels
+            else:
+                LOGGER.info(
+                    "Ignoring saved series_labels: expected %d value(s) for current series "
+                    "selection, got %d.",
+                    total_series,
+                    len(normalized_labels),
+                )
+                args.series_labels = None
+
+    if not explicit_line_colors:
+        if merged_colors is not None:
+            args.line_colors = merged_colors
+        else:
+            normalized_colors = _normalize_series_setting_list(getattr(args, "line_colors", None))
+            if normalized_colors is None:
+                args.line_colors = None
+            elif len(normalized_colors) == total_series:
+                args.line_colors = normalized_colors
+            else:
+                LOGGER.info(
+                    "Ignoring saved line_colors: expected %d value(s) for current series "
+                    "selection, got %d.",
+                    total_series,
+                    len(normalized_colors),
+                )
+                args.line_colors = None
+
+
+def _persist_effective_series_settings(
+    *,
+    source_path: Path,
+    profile_key: str,
+    series_labels: list[str] | None,
+    line_colors: list[str] | None,
+) -> None:
+    from .plot_settings import read_plot_profile, write_plot_profile
+
+    existing = read_plot_profile(source_path, profile_key) or {}
+    if not isinstance(existing, dict):
+        existing = {}
+    updated = dict(existing)
+
+    if series_labels is None:
+        updated.pop("series_labels", None)
+    else:
+        updated["series_labels"] = list(series_labels)
+
+    if line_colors is None:
+        updated.pop("line_colors", None)
+    else:
+        updated["line_colors"] = list(line_colors)
+
+    if updated == existing:
+        return
+    write_plot_profile(source_path, profile_key, updated)
+
+
+def _parse_toggle_state(raw: str) -> bool | None:
+    token = raw.strip().lower()
+    if token in {"on", "true", "yes", "1"}:
+        return True
+    if token in {"off", "false", "no", "0"}:
+        return False
+    if token in {"auto", "default"}:
+        return None
+    raise argparse.ArgumentTypeError("Expected one of: on, off, auto")
+
+
+def _add_toggle_state_argument(
+    group: argparse._ArgumentGroup,
+    *,
+    flag: str,
+    dest: str,
+    feature_name: str,
+) -> None:
+    group.add_argument(
+        f"--{flag}",
+        dest=dest,
+        nargs="?",
+        const="on",
+        default=None,
+        type=_parse_toggle_state,
+        metavar="{on|off|auto}",
+        help=(
+            f"{feature_name}. Use `--{flag}` for on, `--{flag} off` for off, "
+            f"or `--{flag} auto` for default behavior."
+        ),
+    )
+
+
+def _resolve_x_lim(args: argparse.Namespace) -> list[float | None] | None:
+    """Resolve x-axis limits from explicit min/max bounds or persisted x_lim."""
+    x_min = getattr(args, "x_min", None)
+    x_max = getattr(args, "x_max", None)
+    if x_min is not None or x_max is not None:
+        return [
+            None if x_min is None else float(x_min),
+            None if x_max is None else float(x_max),
+        ]
+
+    raw = getattr(args, "x_lim", None)
+    if raw is None:
+        return None
+    return [
+        None if raw[0] is None else float(raw[0]),
+        None if raw[1] is None else float(raw[1]),
+    ]
+
+
+def _resolve_y_lim(args: argparse.Namespace) -> list[float | None] | None:
+    """Resolve y-axis limits from explicit min/max bounds or persisted y_lim."""
+    y_min = getattr(args, "y_min", None)
+    y_max = getattr(args, "y_max", None)
+    if y_min is not None or y_max is not None:
+        return [
+            None if y_min is None else float(y_min),
+            None if y_max is None else float(y_max),
+        ]
+
+    raw = getattr(args, "y_lim", None)
+    if raw is None:
+        return None
+    return [
+        None if raw[0] is None else float(raw[0]),
+        None if raw[1] is None else float(raw[1]),
+    ]
+
+
+def _render_profile_plot(
+    *,
+    args: argparse.Namespace,
+    source: str,
+    analysis_name: str,
+    profile: Any,
+    plotter: Callable[..., Path | None],
+    plotter_kwargs: dict[str, Any] | None = None,
+) -> tuple[Path | None, dict[str, Any]]:
+    extra_kwargs = {} if plotter_kwargs is None else dict(plotter_kwargs)
+    style = _build_plot_style(args)
+    captured_state: dict[str, Any] = {}
+    shared_kwargs = {
+        "title": args.title,
+        "x_label": args.x_label,
+        "y_label": args.y_label,
+        "x_scale": args.x_scale,
+        "y_scale": args.y_scale,
+        "x_lim": _resolve_x_lim(args),
+        "y_lim": _resolve_y_lim(args),
+        "x_ticks": args.x_ticks,
+        "y_ticks": args.y_ticks,
+        "x_tick_rotation": args.x_tick_rotation,
+        "y_tick_rotation": args.y_tick_rotation,
+        "title_visible": args.title_visible,
+        "ticks_visible": args.ticks,
+        "markers": args.markers,
+        "legend": args.legend,
+        "legend_title": args.legend_title,
+        "legend_loc": args.legend_loc,
+        "series_labels": args.series_labels,
+        "line_colors": args.line_colors,
+        "capture_state": captured_state,
+    }
+
+    def _render_with_options(show: bool, output: str | Path | None) -> Path | None:
+        call_kwargs = dict(shared_kwargs)
+        if not isinstance(profile, list):
+            call_kwargs.pop("series_labels", None)
+        return plotter(
+            profile,
+            output=output,
+            show=show,
+            preferred_backend=args.backend,
+            style=style,
+            **extra_kwargs,
+            **call_kwargs,
+        )
+
+    if args.show:
+        try:
+            saved = _render_with_options(True, args.output)
+            return saved, captured_state
+        except RuntimeError as exc:
+            fallback_output = args.output or _default_plot_output_path(source, analysis_name)
+            LOGGER.warning("Interactive plotting unavailable: %s", exc)
+            LOGGER.warning(
+                "Falling back to non-interactive render. Plot will be saved to '%s'.",
+                fallback_output,
+            )
+            saved = _render_with_options(False, fallback_output)
+            return saved, captured_state
+
+    saved_path = _render_with_options(False, args.output)
+    if saved_path is None:
+        LOGGER.warning("No interactive display or output path requested. Nothing was rendered.")
+    return saved_path, captured_state
+
+
+def _collect_plot_settings_for_persistence(
+    args: argparse.Namespace, *, keys: tuple[str, ...]
+) -> dict[str, Any]:
+    candidate = _collect_plot_settings_from_args(args, keys=keys)
+    if "x_lim" in candidate:
+        candidate["x_lim"] = _resolve_x_lim(args)
+    if "y_lim" in candidate:
+        candidate["y_lim"] = _resolve_y_lim(args)
+    return candidate
+
+
+def _apply_gui_settings_to_args(args: argparse.Namespace, settings: dict[str, Any]) -> None:
+    for key, value in settings.items():
+        if hasattr(args, key):
+            setattr(args, key, value)
+    if hasattr(args, "x_lim"):
+        args.x_lim = None
+    if hasattr(args, "y_lim"):
+        args.y_lim = None
+
+
+def _open_plot_settings_gui(
+    *,
+    title: str,
+    initial_settings: dict[str, Any],
+    on_preview: Callable[[dict[str, Any]], None],
+    on_save: Callable[[dict[str, Any]], str],
+    on_save_figure: Callable[[dict[str, Any], str], str] | None = None,
+) -> None:
+    from .plot_gui import launch_plot_settings_panel
+
+    launch_plot_settings_panel(
+        title=title,
+        initial_settings=initial_settings,
+        on_preview=on_preview,
+        on_save=on_save,
+        on_save_figure=on_save_figure,
+    )
+
+
+def _launch_profile_plot_gui(
+    *,
+    args: argparse.Namespace,
+    source_path: Path,
+    profile_key: str,
+    setting_keys: tuple[str, ...],
+    gui_title: str,
+    plot_source_label: str,
+    analysis_name: str,
+    profile: Any,
+    plotter: Callable[..., Path | None],
+    plotter_kwargs: dict[str, Any] | None = None,
+) -> None:
+    initial_settings = _collect_plot_settings_for_persistence(args, keys=setting_keys)
+
+    def _preview(gui_settings: dict[str, Any]) -> None:
+        preview_args = deepcopy(args)
+        _apply_gui_settings_to_args(preview_args, gui_settings)
+        preview_args.show = True
+        preview_args.output = None
+        _render_profile_plot(
+            args=preview_args,
+            source=plot_source_label,
+            analysis_name=analysis_name,
+            profile=profile,
+            plotter=plotter,
+            plotter_kwargs=plotter_kwargs,
+        )
+
+    def _save(gui_settings: dict[str, Any]) -> str:
+        from .plot_settings import write_plot_profile
+
+        save_args = deepcopy(args)
+        _apply_gui_settings_to_args(save_args, gui_settings)
+        candidate = _collect_plot_settings_for_persistence(save_args, keys=setting_keys)
+        write_plot_profile(source_path, profile_key, candidate)
+        return f"Saved plot settings to '{source_path.name}' ({profile_key})."
+
+    def _save_figure(gui_settings: dict[str, Any], output_path: str) -> str:
+        save_args = deepcopy(args)
+        _apply_gui_settings_to_args(save_args, gui_settings)
+        save_args.show = False
+        save_args.output = output_path
+        saved_path, _render_state = _render_profile_plot(
+            args=save_args,
+            source=plot_source_label,
+            analysis_name=analysis_name,
+            profile=profile,
+            plotter=plotter,
+            plotter_kwargs=plotter_kwargs,
+        )
+        if saved_path is None:
+            raise ValueError("No output was generated for the requested figure path.")
+        return f"Saved figure PNG to '{saved_path}'."
+
+    _open_plot_settings_gui(
+        title=gui_title,
+        initial_settings=initial_settings,
+        on_preview=_preview,
+        on_save=_save,
+        on_save_figure=_save_figure,
+    )
+
+
+def _handle_root_overview(_args: argparse.Namespace) -> int:
+    author = _read_project_author(default="Unknown")
+    version_date = _read_project_version_date(default="unknown")
+    print(
+        "\n".join(
+            [
+                "LiNaK Command Center",
+                "====================",
+                f"Version      : {__version__}",
+                f"Author       : {author}",
+                f"Version date : {version_date} (source metadata)",
+                "",
+                "Core workflow",
+                "  1) Compute analysis HDF5 from trajectory data",
+                "     linak compute density /path/to/traj.xyz --species O --axis z",
+                "  2) Plot from HDF5 only",
+                "     linak plot density /path/to/traj_density_o_z.h5",
+                "",
+                "Fast HDF5 plotting shorthand",
+                (
+                    "  linak plot /path/to/data.h5    "
+                    "# auto-detects analysis (density/msd/rdf) from HDF5 metadata, "
+                    f"or falls back to: linak {_TABULAR_COMMAND} plot ..."
+                ),
+                "",
+                "Command groups",
+                "  compute   trajectory -> HDF5",
+                "  plot      LiNaK analysis HDF5 -> figure",
+                (
+                    f"  {_TABULAR_COMMAND:<8} inspect/transform/plot tabular HDF5 "
+                    f"(aliases: {', '.join(_TABULAR_COMMAND_ALIASES)})"
+                ),
+                "  apply     trajectory transformations",
+                "",
+                "Need details?",
+                "  linak <command> --help",
+                "  linak compute --help",
+                "  linak plot --help",
+                f"  linak {_TABULAR_COMMAND} --help",
+                "  linak apply --help",
+            ]
+        )
+    )
+    return 0
+
+
+def _handle_plot_overview(_args: argparse.Namespace) -> int:
+    print(
+        "\n".join(
+            [
+                "LiNaK Plot Usage (HDF5-only)",
+                "============================",
+                "Plot commands accept only HDF5 inputs generated by `linak compute`.",
+                "",
+                "Examples",
+                "  linak compute density /path/to/traj.xyz --species O --axis z",
+                "  linak plot /path/to/traj_density_o_z.h5    # auto-detects density",
+                "  linak plot -f run1_density.h5 run2_density.h5 --no-show --output density.png",
+                "  linak plot density /path/to/traj_density_o_z.h5 --output density.png --no-show",
+                "",
+                "Subcommands",
+                "  linak plot density ...",
+                "  linak plot msd ...",
+                "  linak plot rdf ...",
+                "",
+                "Generic HDF5 table plotting (fallback when analysis is not density/msd/rdf)",
+                "  linak plot /path/to/data.h5             # auto-detect or table fallback",
+                f"  linak {_TABULAR_COMMAND} plot /path/to/data.h5 --help",
+            ]
+        )
+    )
+    return 0
+
+
+def _handle_compute_overview(_args: argparse.Namespace) -> int:
+    print(
+        "\n".join(
+            [
+                "LiNaK Compute Usage",
+                "===================",
+                "Compute commands read trajectory files and write HDF5 outputs.",
+                "",
+                "Examples",
+                "  linak compute density /path/to/traj.xyz --species O --axis z",
+                "  linak compute msd /path/to/traj.xyz --species O",
+                "  linak compute rdf /path/to/traj.xyz --species-a O --species-b H",
+                "  linak compute potential -f /path/to/*.cube",
+                "",
+                "Need command options?",
+                "  linak compute density --help",
+                "  linak compute msd --help",
+                "  linak compute rdf --help",
+                "  linak compute potential --help",
+            ]
+        )
+    )
+    return 0
+
+
+def _handle_apply_overview(_args: argparse.Namespace) -> int:
+    print(
+        "\n".join(
+            [
+                "LiNaK Apply Usage",
+                "=================",
+                "Apply commands transform trajectory files and related simulation artifacts.",
+                "",
+                "Examples",
+                "  linak apply pbc /path/to/traj.xyz --cell 10 10 10",
+                "  linak apply compress /path/to/output.out",
+                "",
+                "Need command options?",
+                "  linak apply pbc --help",
+                "  linak apply compress --help",
+            ]
+        )
+    )
+    return 0
+
+
+def _handle_csv_overview(_args: argparse.Namespace) -> int:
+    alias_lines = [f"  linak {alias} ..." for alias in _TABULAR_COMMAND_ALIASES]
+    print(
+        "\n".join(
+            [
+                "LiNaK HDF5 Table Usage",
+                "========================",
+                "Inspect, transform, and plot tabular data from HDF5 files.",
+                "",
+                "Subcommands",
+                "  interactive, info, preview, get, sort, filter, dedupe, combine, plot, plot-settings",
+                "",
+                "Examples",
+                f"  linak {_TABULAR_COMMAND} preview -f /path/to/data.h5",
+                f"  linak {_TABULAR_COMMAND} get /path/to/data.h5 --column value",
+                (
+                    f"  linak {_TABULAR_COMMAND} combine -f run1_density.h5 run2_density.h5 "
+                    "-o combined_density.h5"
+                ),
+                (
+                    f"  linak {_TABULAR_COMMAND} plot /path/to/data.h5 "
+                    "--kind line --x step --y value"
+                ),
+                (
+                    f"  linak {_TABULAR_COMMAND} plot-settings /path/to/data.h5 --profile auto --show-all"
+                ),
+                "",
+                "Quick start",
+                f"  linak {_TABULAR_COMMAND} interactive /path/to/data.h5",
+            ]
+            + (["", "Aliases", *alias_lines] if alias_lines else [])
+        )
+    )
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Create and return the top-level CLI parser."""
+    parser = argparse.ArgumentParser(
+        prog="linak",
+        description=(
+            "LiNaK: modular molecular dynamics analysis toolkit. "
+            "Start with `linak` for a guided overview."
+        ),
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
+    )
+    parser.add_argument(
+        "--log-level",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        default="INFO",
+        help="Logging verbosity (default: INFO)",
+    )
+    parser.add_argument(
+        "--log-file",
+        help="Optional log file path; logs are always shown in the terminal",
+    )
+    parser.set_defaults(handler=_handle_root_overview)
+
+    commands = parser.add_subparsers(dest="command", required=False)
+
+    plot_parser = commands.add_parser(
+        "plot",
+        help="Generate plots from precomputed LiNaK HDF5 data.",
+        description=(
+            "Plot LiNaK analysis HDF5 data. "
+            "Trajectory inputs are intentionally not supported here: run `linak compute ...` first."
+        ),
+        epilog=(
+            "Common plotting options are available under each plot subcommand "
+            "(for example: --output, --no-show, --backend, --font-family, "
+            "--title-font-size, --line-width)."
+        ),
+    )
+    plot_parser.set_defaults(handler=_handle_plot_overview)
+    plot_commands = plot_parser.add_subparsers(dest="plot_command", required=False)
+
+    plot_density = plot_commands.add_parser(
+        "density",
+        help="Plot 1D mass-density profiles.",
+        description=(
+            "Plot density from LiNaK density HDF5 input. "
+            "Pass multiple files with -f/--files to overlay all curves in one figure."
+        ),
+    )
+    _add_plot_common_options(plot_density)
+    _add_plot_source_options(
+        plot_density,
+        help_text="LiNaK density HDF5 input (legacy positional form)",
+    )
+    plot_density.add_argument(
+        "--species",
+        default=None,
+        help="Optional species override for loaded profile labels (default: use file metadata)",
+    )
+    plot_density.add_argument(
+        "--axis",
+        choices=["x", "y", "z"],
+        default=None,
+        help="Optional axis override for loaded profiles (default: use file metadata)",
+    )
+    plot_density.add_argument(
+        "--x-mode",
+        choices=["distance", "axis"],
+        default="distance",
+        help="Density x-axis mode: distance to surface (default) or raw axis coordinate.",
+    )
+    plot_density.add_argument(
+        "--quantity",
+        choices=["mass", "number"],
+        default="mass",
+        help="Density quantity to plot (default: mass; use number for atoms/A^3).",
+    )
+    _add_dry_run_option(plot_density)
+    plot_density.set_defaults(handler=_handle_plot_density)
+
+    plot_msd = plot_commands.add_parser(
+        "msd",
+        help="Plot mean-squared displacement profiles.",
+        description=(
+            "Plot MSD from LiNaK MSD HDF5 input. "
+            "Pass multiple files with -f/--files to overlay all curves in one figure."
+        ),
+    )
+    _add_plot_common_options(plot_msd)
+    _add_plot_source_options(
+        plot_msd,
+        help_text="LiNaK MSD HDF5 input (legacy positional form)",
+    )
+    plot_msd.add_argument(
+        "--species",
+        default=None,
+        help="Optional species override for loaded profile labels (default: use file metadata)",
+    )
+    _add_dry_run_option(plot_msd)
+    plot_msd.set_defaults(handler=_handle_plot_msd)
+
+    plot_rdf = plot_commands.add_parser(
+        "rdf",
+        help="Plot radial distribution functions.",
+        description=(
+            "Plot RDF from LiNaK RDF HDF5 input. "
+            "Pass multiple files with -f/--files to overlay all curves in one figure."
+        ),
+    )
+    _add_plot_common_options(plot_rdf)
+    _add_plot_source_options(
+        plot_rdf,
+        help_text="LiNaK RDF HDF5 input (legacy positional form)",
+    )
+    plot_rdf.add_argument(
+        "--species-a",
+        default=None,
+        help="Optional first-species override (default: use file metadata)",
+    )
+    plot_rdf.add_argument(
+        "--species-b",
+        default=None,
+        help="Optional second-species override (default: use file metadata or species-a)",
+    )
+    _add_dry_run_option(plot_rdf)
+    plot_rdf.set_defaults(handler=_handle_plot_rdf)
+
+    compute_parser = commands.add_parser(
+        "compute",
+        help="Compute analysis data and save HDF5 outputs.",
+        description=(
+            "Compute analysis data from trajectories. Commands under `compute` write HDF5 outputs "
+            "and do not plot by default."
+        ),
+    )
+    compute_parser.set_defaults(handler=_handle_compute_overview)
+    compute_commands = compute_parser.add_subparsers(dest="compute_command", required=False)
+
+    compute_density = compute_commands.add_parser(
+        "density",
+        help="Compute 1D mass-density profile and save HDF5.",
+    )
+    compute_density.add_argument(
+        "trajectory",
+        nargs="?",
+        help=(
+            "Path to trajectory file (ASE-supported; .dump supported) or LAMMPS input .lmp "
+            "(legacy positional form)"
+        ),
+    )
+    compute_density.add_argument(
+        "-f",
+        "--files",
+        nargs="+",
+        metavar="PATH",
+        help=(
+            "Trajectory source path(s). Use -f/--files even for one file; "
+            "this command accepts exactly one source."
+        ),
+    )
+    compute_density.add_argument(
+        "--species",
+        default="all",
+        help=("Chemical symbol (e.g. O), H2O, or all elements separately (default: all)"),
+    )
+    compute_density.add_argument(
+        "--axis",
+        choices=["x", "y", "z"],
+        default="z",
+        help="Axis for profile (default: z)",
+    )
+    compute_density.add_argument(
+        "--bin-width",
+        type=_positive_float,
+        default=0.1,
+        help="Histogram bin width in Angstrom (default: 0.1)",
+    )
+    compute_density.add_argument(
+        "--surface-mode",
+        choices=["auto", "layered", "rough"],
+        default="auto",
+        help=(
+            "Surface detection mode (default: auto). "
+            "'layered' uses top-layer mean; 'rough' uses low-mobility frame-wise mean."
+        ),
+    )
+    compute_density.add_argument(
+        "--surface-elements",
+        nargs="+",
+        metavar="ELEM",
+        help=(
+            "Optional element symbols used to detect the reference surface "
+            "(default: automatic detection)."
+        ),
+    )
+    compute_density.add_argument(
+        "--include-fixed-surface-atoms",
+        action="store_true",
+        help=(
+            "Allow atoms marked by ASE constraints to be used in surface detection "
+            "(default: constrained atoms are excluded)."
+        ),
+    )
+    _add_cell_resolution_options(compute_density)
+    compute_density.add_argument(
+        "-o",
+        "--output",
+        "--save-data",
+        dest="output",
+        help="HDF5 output path (default: auto-generated .h5)",
+    )
+    _add_dry_run_option(compute_density)
+    compute_density.set_defaults(handler=_handle_compute_density)
+
+    compute_msd = compute_commands.add_parser(
+        "msd",
+        help="Compute MSD and save HDF5.",
+    )
+    compute_msd.add_argument(
+        "trajectory",
+        nargs="?",
+        help=(
+            "Path to trajectory file (ASE-supported; .dump supported) or LAMMPS input .lmp "
+            "(legacy positional form)"
+        ),
+    )
+    compute_msd.add_argument(
+        "-f",
+        "--files",
+        nargs="+",
+        metavar="PATH",
+        help=(
+            "Trajectory source path(s). Use -f/--files even for one file; "
+            "this command accepts exactly one source."
+        ),
+    )
+    compute_msd.add_argument(
+        "--species",
+        default="all",
+        help="Species for MSD (default: all)",
+    )
+    compute_msd.add_argument(
+        "--timestep-fs",
+        type=_positive_float,
+        default=None,
+        help=(
+            "Timestep between frames in fs "
+            "(default: auto from metadata or simulation input, then cache; fallback 1.0)"
+        ),
+    )
+    _add_cell_resolution_options(compute_msd)
+    compute_msd.add_argument(
+        "-o",
+        "--output",
+        "--save-data",
+        dest="output",
+        help="HDF5 output path (default: auto-generated .h5)",
+    )
+    _add_dry_run_option(compute_msd)
+    compute_msd.set_defaults(handler=_handle_compute_msd)
+
+    compute_rdf = compute_commands.add_parser(
+        "rdf",
+        help="Compute RDF and save HDF5.",
+    )
+    compute_rdf.add_argument(
+        "trajectory",
+        nargs="?",
+        help=(
+            "Path to trajectory file (ASE-supported; .dump supported) or LAMMPS input .lmp "
+            "(legacy positional form)"
+        ),
+    )
+    compute_rdf.add_argument(
+        "-f",
+        "--files",
+        nargs="+",
+        metavar="PATH",
+        help=(
+            "Trajectory source path(s). Use -f/--files even for one file; "
+            "this command accepts exactly one source."
+        ),
+    )
+    compute_rdf.add_argument(
+        "--species-a",
+        default="all",
+        help="First species for RDF (default: all)",
+    )
+    compute_rdf.add_argument(
+        "--species-b",
+        default=None,
+        help="Second species for RDF (default: same as species-a)",
+    )
+    compute_rdf.add_argument(
+        "--r-max",
+        type=_positive_float,
+        default=None,
+        help="Maximum RDF radius in Angstrom (default: auto)",
+    )
+    compute_rdf.add_argument(
+        "--bin-width",
+        type=_positive_float,
+        default=0.05,
+        help="RDF bin width in Angstrom (default: 0.05)",
+    )
+    compute_rdf.add_argument(
+        "--threads",
+        type=int,
+        default=None,
+        help=("Number of threads for RDF compute (default: auto; set 1 to disable parallelism)"),
+    )
+    _add_cell_resolution_options(compute_rdf)
+    compute_rdf.add_argument(
+        "-o",
+        "--output",
+        "--save-data",
+        dest="output",
+        help="HDF5 output path (default: auto-generated .h5)",
+    )
+    _add_dry_run_option(compute_rdf)
+    compute_rdf.set_defaults(handler=_handle_compute_rdf)
+
+    compute_potential = compute_commands.add_parser(
+        "potential",
+        help="Compute CP2K electrode cSHE potentials from Hartree cube files and save HDF5.",
+        description=(
+            "Compute CP2K cSHE from Hartree cube files. "
+            "For each cube: parse E_Fermi from nearby output (.out), "
+            "compute water-bulk potential from O/H z-bounds in the cube header, "
+            "and report U_cSHE = V_bulk - E_F - offset."
+        ),
+        epilog=(
+            "Examples:\n"
+            "  linak compute potential /path/to/*-v_hartree-1_0.cube\n"
+            "  linak compute potential -f run1/*-v_hartree-1_0.cube run2/*-v_hartree-1_0.cube "
+            "--output potentials.h5\n"
+            "  linak compute potential -f *.cube --threads 4 --water-padding-ang 4.0"
+        ),
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    input_group = compute_potential.add_argument_group("Input")
+    input_group.add_argument(
+        "source",
+        nargs="*",
+        help="Hartree cube file path(s) (legacy positional form).",
+    )
+    input_group.add_argument(
+        "-f",
+        "--files",
+        nargs="+",
+        metavar="PATH",
+        help="One or more Hartree cube files.",
+    )
+    analysis_group = compute_potential.add_argument_group("Analysis")
+    analysis_group.add_argument(
+        "--water-padding-ang",
+        type=_non_negative_float,
+        default=5.0,
+        help="Padding removed from O/H z-bounds for water-bulk averaging (default: 5.0).",
+    )
+    analysis_group.add_argument(
+        "--cshe-offset-ev",
+        type=float,
+        default=0.81,
+        help="cSHE offset in eV applied as U_cSHE = V_bulk - E_F - offset (default: 0.81).",
+    )
+    execution_group = compute_potential.add_argument_group("Execution")
+    execution_group.add_argument(
+        "--threads",
+        type=int,
+        default=None,
+        help=(
+            "Number of threads for potential compute (default: auto; set 1 to disable parallelism)"
+        ),
+    )
+    execution_group.add_argument(
+        "--strict",
+        action="store_true",
+        help="Return a non-zero exit code when any source fails or yields incomplete cSHE data.",
+    )
+    execution_group.add_argument(
+        "--include-failures",
+        dest="include_failures",
+        action="store_true",
+        default=True,
+        help="Include failed sources as status=error rows in the HDF5 output (default: enabled).",
+    )
+    execution_group.add_argument(
+        "--no-include-failures",
+        dest="include_failures",
+        action="store_false",
+        help="Do not write failed sources to HDF5.",
+    )
+    output_group = compute_potential.add_argument_group("Output HDF5")
+    output_group.add_argument(
+        "--append",
+        dest="append",
+        action="store_true",
+        default=True,
+        help="Append to existing HDF5 when schema is compatible (default: enabled).",
+    )
+    output_group.add_argument(
+        "--no-append",
+        dest="append",
+        action="store_false",
+        help="Do not append to an existing HDF5 file (a new fallback file is created unless --overwrite is used).",
+    )
+    output_group.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Overwrite the HDF5 output path if it already exists.",
+    )
+    output_group.add_argument(
+        "-o",
+        "--output",
+        "--save-data",
+        dest="output",
+        help="HDF5 output path (default: auto-generated .h5).",
+    )
+    _add_dry_run_option(compute_potential)
+    compute_potential.set_defaults(handler=_handle_compute_potential)
+
+    apply_parser = commands.add_parser(
+        "apply",
+        help="Apply transformations to trajectory files.",
+        description="Apply post-processing transforms to trajectories and CP2K output artifacts.",
+    )
+    apply_parser.set_defaults(handler=_handle_apply_overview)
+    apply_commands = apply_parser.add_subparsers(dest="apply_command", required=False)
+
+    apply_pbc = apply_commands.add_parser(
+        "pbc",
+        help="Apply periodic boundary conditions by wrapping positions into a cell.",
+        description=(
+            "Apply orthorhombic PBC to a trajectory and wrap atom positions. "
+            "Cell dimensions are resolved in this order: --cell, --input, "
+            "or automatic .inp/.lmp simulation-input discovery in the output directory."
+        ),
+    )
+    apply_pbc.add_argument("trajectory", nargs="?", help="Input trajectory path (legacy positional form)")
+    apply_pbc.add_argument(
+        "-f",
+        "--files",
+        nargs="+",
+        metavar="PATH",
+        help=(
+            "Trajectory source path(s). Use -f/--files even for one file; "
+            "this command accepts exactly one source."
+        ),
+    )
+    output_group = apply_pbc.add_mutually_exclusive_group()
+    output_group.add_argument(
+        "-o",
+        "--output",
+        help="Output trajectory path (default: auto-generated next to input)",
+    )
+    output_group.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Overwrite input trajectory in place",
+    )
+    apply_pbc.add_argument(
+        "-i",
+        "--input",
+        "--cp2k-input",
+        "--lammps-input",
+        dest="input",
+        help=(
+            "Path to simulation input file (.inp for CP2K, .lmp for LAMMPS). "
+            "If omitted, LiNaK searches for one .inp/.lmp file in the output directory."
+        ),
+    )
+    apply_pbc.add_argument(
+        "--cell",
+        nargs=3,
+        type=_positive_float,
+        metavar=("A", "B", "C"),
+        help="Explicit orthorhombic cell lengths in Angstrom (overrides auto-discovery).",
+    )
+    _add_dry_run_option(apply_pbc)
+    apply_pbc.set_defaults(handler=_handle_apply_pbc)
+
+    from .compress import DROP_SECTION_CHOICES
+
+    apply_compress = apply_commands.add_parser(
+        "compress",
+        help="Compress CP2K output into structured files and back up the raw .out source.",
+        description=(
+            "Extract key CP2K data from one output file into a compact directory, then move the "
+            "original raw .out into a backup directory. This keeps analysis-friendly files near the "
+            "run while preserving the full source output."
+        ),
+        epilog=(
+            "What `linak apply compress` creates\n"
+            "  <stem>/README.txt          human-readable generated/skipped file report\n"
+            "  <stem>/manifest.json       machine-readable file/row metadata\n"
+            "  <stem>/summary.txt         compact CP2K run summary\n"
+            "  <stem>/*.csv               parsed tables (SCF, charges, forces, MD, ...)\n"
+            "  <stem>/*.txt               setup, warnings, timing, and performance snippets\n"
+            "  <backup-dir>/<unique>.out  moved original CP2K output\n"
+            "  <backup-dir>/<unique>.out.meta.json  source/backup/output linkage metadata\n\n"
+            "Defaults\n"
+            "  backup dir: <input-dir>/.linak_backups\n"
+            "  output dir: <input-stem> (auto-suffixed if already present)\n\n"
+            "Examples\n"
+            "  linak apply compress /path/to/output.out\n"
+            "  linak apply compress /path/to/output.out --backup-dir ./private_backups\n"
+            "  linak apply compress /path/to/output.out --drop mulliken hirshfeld\n"
+        ),
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    apply_compress.add_argument(
+        "output_file",
+        nargs="?",
+        metavar="OUTPUT_OUT",
+        help="Input CP2K output file path (legacy positional form).",
+    )
+    apply_compress.add_argument(
+        "-f",
+        "--files",
+        nargs="+",
+        metavar="PATH",
+        help=(
+            "CP2K output file path(s). Use -f/--files even for one file; "
+            "this command accepts exactly one source."
+        ),
+    )
+    apply_compress.add_argument(
+        "--backup-dir",
+        metavar="PATH",
+        help=(
+            "Backup directory for the moved raw .out file "
+            "(default: hidden .linak_backups next to input)."
+        ),
+    )
+    apply_compress.add_argument(
+        "--drop",
+        nargs="+",
+        choices=list(DROP_SECTION_CHOICES),
+        metavar="SECTION",
+        help=(
+            "Optional outputs to skip. Choices: "
+            + ", ".join(DROP_SECTION_CHOICES)
+            + "."
+        ),
+    )
+    _add_dry_run_option(apply_compress)
+    apply_compress.set_defaults(handler=_handle_apply_compress)
+
+    csv_parser = commands.add_parser(
+        _TABULAR_COMMAND,
+        aliases=list(_TABULAR_COMMAND_ALIASES),
+        help="Inspect, query, transform, and plot tabular HDF5 data.",
+        description=(
+            "Work with generic tabular datasets in HDF5 files. "
+            "Most subcommands are semi-interactive: if required choices such as columns are omitted, "
+            "LiNaK prompts with available options. "
+            f"Short alias: {', '.join(_TABULAR_COMMAND_ALIASES)}."
+        ),
+    )
+    csv_parser.set_defaults(handler=_handle_csv_overview)
+    csv_commands = csv_parser.add_subparsers(dest="csv_command", required=False)
+
+    csv_interactive = csv_commands.add_parser(
+        "interactive",
+        help="Interactive HDF5 assistant for one file.",
+    )
+    _add_csv_source_options(csv_interactive)
+    csv_interactive.add_argument(
+        "--rows",
+        type=_positive_int,
+        default=8,
+        help="Preview rows shown at startup (default: 8)",
+    )
+    csv_interactive.set_defaults(handler=_handle_csv_interactive)
+
+    csv_info = csv_commands.add_parser(
+        "info",
+        help="Show HDF5 table shape, inferred types, and data-quality summary.",
+    )
+    _add_csv_source_options(csv_info)
+    csv_info.set_defaults(handler=_handle_csv_info)
+
+    csv_preview = csv_commands.add_parser(
+        "preview",
+        help="Print a head/tail preview of HDF5 table rows.",
+    )
+    _add_csv_source_options(csv_preview)
+    csv_preview.add_argument(
+        "--rows",
+        type=_positive_int,
+        default=10,
+        help="Rows to preview (default: 10)",
+    )
+    csv_preview.add_argument(
+        "--tail",
+        action="store_true",
+        help="Show final rows instead of first rows",
+    )
+    csv_preview.add_argument(
+        "--show-index",
+        action="store_true",
+        help="Include row index in preview output",
+    )
+    csv_preview.set_defaults(handler=_handle_csv_preview)
+
+    csv_get = csv_commands.add_parser(
+        "get",
+        help="Compute useful statistics for one or more columns.",
+    )
+    _add_csv_source_options(csv_get)
+    csv_get.add_argument(
+        "--column",
+        nargs="+",
+        help="Column(s) to analyze. If omitted, LiNaK prompts interactively.",
+    )
+    csv_get.add_argument(
+        "--all-columns",
+        action="store_true",
+        help="Compute statistics for every column.",
+    )
+    csv_get.add_argument(
+        "--metric",
+        nargs="+",
+        help=(
+            "Optional metric subset. Common metrics: count missing distinct min max "
+            "mean median std sum q05 q25 q75 q95 iqr mode mode_count numeric_ratio."
+        ),
+    )
+    csv_get.add_argument(
+        "--round",
+        dest="round_digits",
+        type=_positive_int,
+        default=6,
+        help="Significant digits for floating-point output (default: 6)",
+    )
+    csv_get.set_defaults(handler=_handle_csv_get)
+
+    csv_sort = csv_commands.add_parser(
+        "sort",
+        help="Sort HDF5 table rows by one or more columns and write a new HDF5 file.",
+    )
+    _add_csv_source_options(csv_sort)
+    csv_sort.add_argument(
+        "--by",
+        nargs="+",
+        help="Sort key column(s). If omitted, LiNaK prompts interactively.",
+    )
+    csv_sort.add_argument(
+        "--descending",
+        action="store_true",
+        help="Sort in descending order",
+    )
+    csv_sort.add_argument(
+        "--na-position",
+        choices=["first", "last"],
+        default="last",
+        help="Placement of missing values in sorted output (default: last)",
+    )
+    csv_sort.add_argument(
+        "--mode",
+        choices=["auto", "numeric", "string"],
+        default="auto",
+        help="Sort mode for key columns (default: auto)",
+    )
+    _add_csv_write_options(csv_sort)
+    _add_dry_run_option(csv_sort)
+    csv_sort.set_defaults(handler=_handle_csv_sort)
+
+    csv_filter = csv_commands.add_parser(
+        "filter",
+        help="Filter rows with numeric/text predicates and write HDF5 output.",
+    )
+    _add_csv_source_options(csv_filter)
+    csv_filter.add_argument(
+        "--column",
+        help="Column used for filtering. If omitted, LiNaK prompts interactively.",
+    )
+    csv_filter.add_argument(
+        "--op",
+        "--operator",
+        dest="operator",
+        choices=[
+            "eq",
+            "ne",
+            "gt",
+            "ge",
+            "lt",
+            "le",
+            "contains",
+            "startswith",
+            "endswith",
+            "regex",
+            "in",
+            "not-in",
+        ],
+        help="Filter operator",
+    )
+    csv_filter.add_argument(
+        "--value",
+        help="Filter value (for in/not-in use comma-separated values)",
+    )
+    csv_filter.add_argument(
+        "--case-sensitive",
+        action="store_true",
+        help="Use case-sensitive text matching",
+    )
+    csv_filter.add_argument(
+        "--invert",
+        action="store_true",
+        help="Invert filter selection",
+    )
+    _add_csv_write_options(csv_filter)
+    _add_dry_run_option(csv_filter)
+    csv_filter.set_defaults(handler=_handle_csv_filter)
+
+    csv_dedupe = csv_commands.add_parser(
+        "dedupe",
+        help="Drop duplicate rows and write HDF5 output.",
+    )
+    _add_csv_source_options(csv_dedupe)
+    csv_dedupe.add_argument(
+        "--subset",
+        nargs="+",
+        help="Subset columns for duplicate detection (default: all columns)",
+    )
+    csv_dedupe.add_argument(
+        "--keep",
+        choices=["first", "last", "none"],
+        default="first",
+        help="Which duplicate occurrence to keep (default: first)",
+    )
+    _add_csv_write_options(csv_dedupe)
+    _add_dry_run_option(csv_dedupe)
+    csv_dedupe.set_defaults(handler=_handle_csv_dedupe)
+
+    csv_combine = csv_commands.add_parser(
+        "combine",
+        help="Combine multiple LiNaK analysis HDF5 files into one multi-profile HDF5.",
+        description=(
+            "Combine multiple density/MSD/RDF LiNaK HDF5 files into one combined HDF5 file "
+            "that can be plotted directly with `linak plot /path/to/combined.h5`."
+        ),
+    )
+    csv_combine.add_argument(
+        "source",
+        nargs="*",
+        metavar="SOURCE",
+        help="Input HDF5 file path(s) (legacy positional form; use -f/--files for multiple)",
+    )
+    csv_combine.add_argument(
+        "-f",
+        "--files",
+        nargs="+",
+        metavar="PATH",
+        help="Input HDF5 file path(s). Use -f/--files even for one file; required for multiple.",
+    )
+    csv_combine.add_argument(
+        "-o",
+        "--output",
+        metavar="PATH",
+        help="Output combined HDF5 path (default: auto-generated next to first input).",
+    )
+    csv_combine.add_argument(
+        "--settings-source",
+        metavar="PATH_OR_INDEX",
+        default=None,
+        help=(
+            "Input used as plot-settings source when multiple files are provided "
+            "(default: first input). Accepts a 1-based index or one of the input paths."
+        ),
+    )
+    _add_dry_run_option(csv_combine)
+    csv_combine.set_defaults(handler=_handle_csv_combine)
+
+    csv_plot = csv_commands.add_parser(
+        "plot",
+        help="Plot HDF5 table columns with line/scatter/bar/hist/box charts.",
+        description=(
+            "Plot one or more HDF5 files in a single figure.\n\n"
+            "Source rules:\n"
+            "  - Single file: SOURCE or -f FILE\n"
+            "  - Multiple files: -f FILE1 FILE2 ... (required)"
+        ),
+        epilog=(
+            "Examples:\n"
+            f"  linak {_TABULAR_COMMAND} plot data.h5 --kind line --x step --y value\n"
+            f"  linak {_TABULAR_COMMAND} plot -f run1.h5 run2.h5 "
+            "--x step --y value --labels run1 run2\n"
+            f"  linak {_TABULAR_COMMAND} plot data.h5 --kind hist --y energy --bins 50\n"
+            "Tip: if --x/--y is omitted, LiNaK previews the data and prompts interactively."
+        ),
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    _add_csv_plot_source_options(csv_plot)
+    selection_group = csv_plot.add_argument_group("Data selection")
+    selection_group.add_argument(
+        "--kind",
+        choices=["line", "scatter", "bar", "hist", "box"],
+        default="line",
+        help="Plot type (default: line)",
+    )
+    selection_group.add_argument(
+        "--x",
+        help="X-axis column for line/scatter/bar plots",
+    )
+    selection_group.add_argument(
+        "--y",
+        nargs="+",
+        help=(
+            "Y-axis column(s) for line/scatter/bar, or numeric column(s) for hist/box. "
+            "If omitted, LiNaK prompts interactively."
+        ),
+    )
+    selection_group.add_argument(
+        "--bins",
+        type=_positive_int,
+        default=30,
+        help="Number of bins for histogram plots (default: 30)",
+    )
+    _add_csv_plot_options(csv_plot)
+    _add_dry_run_option(csv_plot)
+    csv_plot.set_defaults(handler=_handle_csv_plot)
+
+    csv_plot_settings = csv_commands.add_parser(
+        "plot-settings",
+        help="Inspect/edit/copy persisted plot-setting profiles stored in HDF5 files.",
+        description=(
+            "Manage saved plot-setting profiles in LiNaK HDF5 files.\n\n"
+            "Profiles:\n"
+            "  - plot:density\n"
+            "  - plot:msd\n"
+            "  - plot:rdf\n"
+            "  - plot:table\n\n"
+            "Use this command to inspect settings, set/unset individual keys, "
+            "import/export profiles between files, or delete stale profiles."
+        ),
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    csv_plot_settings.add_argument(
+        "source",
+        nargs="?",
+        metavar="SOURCE",
+        help="Target HDF5 file (legacy positional form)",
+    )
+    csv_plot_settings.add_argument(
+        "-f",
+        "--files",
+        nargs="+",
+        metavar="PATH",
+        help="Target HDF5 file path (single file expected).",
+    )
+    csv_plot_settings.add_argument(
+        "--profile",
+        choices=["auto", "density", "msd", "rdf", "table"],
+        default="auto",
+        help=(
+            "Profile to target. 'auto' resolves from HDF5 analysis metadata; "
+            "if unresolved, it falls back to the table profile."
+        ),
+    )
+    csv_plot_settings.add_argument(
+        "--set",
+        nargs="+",
+        metavar="KEY=VALUE",
+        help=(
+            "Set one or more settings using dotted keys. "
+            "VALUE accepts JSON (for example: axis.x_lim=[0,10])."
+        ),
+    )
+    csv_plot_settings.add_argument(
+        "--unset",
+        nargs="+",
+        metavar="KEY",
+        help="Remove one or more dotted-key settings from the selected profile.",
+    )
+    csv_plot_settings.add_argument(
+        "--delete",
+        action="store_true",
+        help="Delete the selected profile from the HDF5 file.",
+    )
+    csv_plot_settings.add_argument(
+        "--import-from",
+        metavar="PATH",
+        help="Import the selected profile from another HDF5 file into SOURCE.",
+    )
+    csv_plot_settings.add_argument(
+        "--export-to",
+        nargs="+",
+        metavar="PATH",
+        help="Apply the selected profile from SOURCE to one or more target HDF5 files.",
+    )
+    csv_plot_settings.add_argument(
+        "--show-all",
+        action="store_true",
+        help="List every saved profile key in SOURCE instead of printing one profile payload.",
+    )
+    csv_plot_settings.set_defaults(handler=_handle_csv_plot_settings)
+
+    return parser
+
+
+def _resolve_metric_selection(metrics: list[str] | None) -> list[str] | None:
+    if metrics is None:
+        return None
+    return [metric.strip().lower() for metric in metrics if metric.strip()]
+
+
+def _parse_plot_setting_assignment(token: str) -> tuple[str, Any]:
+    if "=" not in token:
+        raise ValueError(f"Expected KEY=VALUE assignment, got '{token}'.")
+    key, raw_value = token.split("=", 1)
+    key = key.strip()
+    raw_value = raw_value.strip()
+    if not key:
+        raise ValueError(f"Invalid assignment '{token}': key cannot be empty.")
+    if not raw_value:
+        raise ValueError(f"Invalid assignment '{token}': value cannot be empty.")
+    try:
+        value = json.loads(raw_value)
+    except json.JSONDecodeError:
+        value = raw_value
+    return key, value
+
+
+def _handle_csv_plot_settings(args: argparse.Namespace) -> int:
+    start = perf_counter()
+    LOGGER.info("Starting HDF5 plot-settings management.")
+    source = _resolve_single_source_argument(
+        args,
+        positional_attr="source",
+        source_label="HDF5 input file",
+    )
+    source_path = Path(source).expanduser().resolve()
+    profile_key = _resolve_plot_profile_key(
+        profile_token=args.profile,
+        source_path=source_path,
+    )
+
+    from .plot_settings import (
+        copy_plot_profile,
+        delete_plot_profile,
+        read_plot_profile,
+        read_plot_profiles,
+        write_plot_profile,
+    )
+
+    if args.delete:
+        removed = delete_plot_profile(source_path, profile_key)
+        print(
+            f"Removed plot profile '{profile_key}' from {source_path}"
+            if removed
+            else f"No plot profile '{profile_key}' found in {source_path}"
+        )
+
+    if args.import_from is not None:
+        import_path = Path(args.import_from).expanduser().resolve()
+        copy_plot_profile(import_path, source_path, source_key=profile_key, target_key=profile_key)
+        print(f"Imported plot profile '{profile_key}' from {import_path} into {source_path}")
+
+    if args.set or args.unset:
+        current = read_plot_profile(source_path, profile_key) or {}
+        for assignment in args.set or []:
+            key, value = _parse_plot_setting_assignment(assignment)
+            _set_nested_setting(current, key, value)
+        for dotted in args.unset or []:
+            _delete_nested_setting(current, dotted)
+        write_plot_profile(source_path, profile_key, current)
+        print(f"Updated plot profile '{profile_key}' in {source_path}")
+
+    if args.export_to:
+        for raw_target in args.export_to:
+            target_path = Path(raw_target).expanduser().resolve()
+            if target_path == source_path:
+                continue
+            if not target_path.exists():
+                raise FileNotFoundError(
+                    f"Cannot export plot settings: target HDF5 does not exist: {target_path}"
+                )
+            copy_plot_profile(
+                source_path,
+                target_path,
+                source_key=profile_key,
+                target_key=profile_key,
+            )
+            print(f"Applied plot profile '{profile_key}' to {target_path}")
+
+    if args.show_all:
+        all_profiles = read_plot_profiles(source_path)
+        if not all_profiles:
+            print(f"No saved plot-setting profiles found in {source_path}")
+        else:
+            print(f"Saved plot-setting profiles in {source_path}:")
+            for key in sorted(all_profiles):
+                print(f"  - {key}")
+        LOGGER.info("HDF5 plot-settings management finished in %.2f s.", perf_counter() - start)
+        return 0
+
+    selected_profile = read_plot_profile(source_path, profile_key)
+    print("HDF5 plot-settings")
+    print(f"Source file         : {source_path}")
+    print(f"Requested profile   : {args.profile}")
+    print(f"Resolved profile key: {profile_key}")
+    if selected_profile is None:
+        print("Profile payload     : <none>")
+        print("Tip                 : use --set KEY=VALUE to create/update this profile.")
+    else:
+        print("Profile payload (JSON)")
+        print(json.dumps(selected_profile, indent=2, sort_keys=True))
+
+    LOGGER.info("HDF5 plot-settings management finished in %.2f s.", perf_counter() - start)
+    return 0
+
+
+def _handle_csv_info(args: argparse.Namespace) -> int:
+    start = perf_counter()
+    LOGGER.info("Starting HDF5 info.")
+
+    from .csv_tools import format_profiles_table, infer_numeric_columns, profile_columns
+
+    frame, source_path = _load_csv_frame(args)
+    profiles = profile_columns(frame)
+    numeric_columns = infer_numeric_columns(frame)
+
+    print(f"HDF5 file: {source_path}")
+    _print_hdf5_metadata_overview(frame)
+    print(f"Rows: {len(frame)}")
+    print(f"Columns: {len(frame.columns)}")
+    print(
+        f"Numeric-like columns ({len(numeric_columns)}): {', '.join(numeric_columns) if numeric_columns else 'none'}"
+    )
+    print("")
+    print(format_profiles_table(profiles))
+
+    LOGGER.info("HDF5 info finished in %.2f s.", perf_counter() - start)
+    return 0
+
+
+def _handle_csv_preview(args: argparse.Namespace) -> int:
+    start = perf_counter()
+    LOGGER.info("Starting HDF5 preview.")
+
+    from .csv_tools import format_frame_preview
+
+    frame, source_path = _load_csv_frame(args)
+    preview = format_frame_preview(
+        frame,
+        rows=args.rows,
+        tail=args.tail,
+        show_index=args.show_index,
+    )
+    print(f"Preview: {source_path} ({'tail' if args.tail else 'head'} {args.rows})")
+    _print_hdf5_metadata_overview(frame)
+    print(preview)
+
+    LOGGER.info("HDF5 preview finished in %.2f s.", perf_counter() - start)
+    return 0
+
+
+def _resolve_get_columns(args: argparse.Namespace, frame: Any) -> list[str]:
+    if args.all_columns:
+        return list(frame.columns)
+    if args.column:
+        return _validate_csv_columns(frame, args.column)
+    return _prompt_for_columns(
+        columns=list(frame.columns),
+        prompt="Select column(s) to analyze",
+        allow_multiple=True,
+    )
+
+
+def _handle_csv_get(args: argparse.Namespace) -> int:
+    start = perf_counter()
+    LOGGER.info("Starting HDF5 statistics.")
+
+    from .csv_tools import compute_column_statistics
+
+    frame, source_path = _load_csv_frame(args)
+    print(f"HDF5 file: {source_path}")
+    _print_hdf5_metadata_overview(frame)
+    if (
+        not args.all_columns
+        and not args.column
+        and _interactive_prompts_available()
+    ):
+        _print_csv_preview_for_interactive(frame=frame, source_path=source_path)
+    columns = _resolve_get_columns(args, frame)
+    metrics = _resolve_metric_selection(args.metric)
+
+    blocks: list[str] = []
+    for column in columns:
+        stats = compute_column_statistics(frame, column)
+        blocks.append(
+            _format_column_statistics(
+                stats,
+                digits=args.round_digits,
+                metrics=metrics,
+            )
+        )
+    print("\n\n".join(blocks))
+
+    LOGGER.info("HDF5 statistics finished in %.2f s for %d column(s).", perf_counter() - start, len(columns))
+    return 0
+
+
+def _resolve_sort_columns(args: argparse.Namespace, frame: Any) -> list[str]:
+    if args.by:
+        return _validate_csv_columns(frame, args.by)
+    return _prompt_for_columns(
+        columns=list(frame.columns),
+        prompt="Select sort column(s)",
+        allow_multiple=True,
+    )
+
+
+def _handle_csv_sort(args: argparse.Namespace) -> int:
+    start = perf_counter()
+    LOGGER.info("Starting HDF5 sort.")
+
+    from .csv_tools import sort_frame
+    from .hdf5_table import write_hdf5_frame
+
+    output_path = _resolve_csv_output_path(args, suffix="sorted")
+    if args.dry_run:
+        sort_columns = ", ".join(args.by) if args.by else "interactive (resolved at execution)"
+        plan = [
+            f"source: {Path(args.source).expanduser().resolve()}",
+            "rows/columns: not inspected in dry-run",
+            f"sort columns: {sort_columns}",
+            f"descending: {'yes' if args.descending else 'no'}",
+            f"mode: {args.mode}, na_position: {args.na_position}",
+            f"output: {output_path}",
+        ]
+        _log_dry_run_plan(f"{_TABULAR_COMMAND} sort", plan)
+        LOGGER.info("HDF5 sort dry run finished in %.2f s.", perf_counter() - start)
+        return 0
+
+    frame, source_path = _load_csv_frame(args)
+    if not args.by and _interactive_prompts_available():
+        _print_csv_preview_for_interactive(frame=frame, source_path=source_path)
+    sort_columns = _resolve_sort_columns(args, frame)
+
+    sorted_frame = sort_frame(
+        frame,
+        columns=sort_columns,
+        descending=args.descending,
+        na_position=args.na_position,
+        mode=args.mode,
+    )
+    source_info = frame.attrs.get("linak_hdf5_source_info")
+    written = write_hdf5_frame(sorted_frame, output_path, source_info=source_info)
+    print(f"Wrote sorted HDF5: {written}")
+
+    LOGGER.info("HDF5 sort finished in %.2f s.", perf_counter() - start)
+    return 0
+
+
+def _resolve_filter_inputs(args: argparse.Namespace, frame: Any) -> tuple[str, str, str]:
+    column = args.column
+    if column is None:
+        column = _prompt_for_columns(
+            columns=list(frame.columns),
+            prompt="Select filter column",
+            allow_multiple=False,
+        )[0]
+    elif column not in frame.columns:
+        raise ValueError(f"Unknown column '{column}'.")
+
+    operator = args.operator
+    allowed = {
+        "eq",
+        "ne",
+        "gt",
+        "ge",
+        "lt",
+        "le",
+        "contains",
+        "startswith",
+        "endswith",
+        "regex",
+        "in",
+        "not-in",
+    }
+    if operator is None:
+        operator = _prompt_for_value(
+            "Operator (eq/ne/gt/ge/lt/le/contains/startswith/endswith/regex/in/not-in)",
+            allowed=allowed,
+        ).lower()
+    value = args.value if args.value is not None else _prompt_for_value("Filter value")
+    return column, operator, value
+
+
+def _handle_csv_filter(args: argparse.Namespace) -> int:
+    start = perf_counter()
+    LOGGER.info("Starting HDF5 filter.")
+
+    from .csv_tools import filter_frame
+    from .hdf5_table import write_hdf5_frame
+
+    output_path = _resolve_csv_output_path(args, suffix="filtered")
+
+    if args.dry_run:
+        filter_column = args.column or "interactive (resolved at execution)"
+        filter_operator = args.operator or "interactive (resolved at execution)"
+        filter_value = args.value if args.value is not None else "interactive (resolved at execution)"
+        plan = [
+            f"source: {Path(args.source).expanduser().resolve()}",
+            "rows/columns: not inspected in dry-run",
+            f"filter: {filter_column} {filter_operator} {filter_value}",
+            f"case_sensitive: {'yes' if args.case_sensitive else 'no'}",
+            f"invert: {'yes' if args.invert else 'no'}",
+            f"output: {output_path}",
+        ]
+        _log_dry_run_plan(f"{_TABULAR_COMMAND} filter", plan)
+        LOGGER.info("HDF5 filter dry run finished in %.2f s.", perf_counter() - start)
+        return 0
+
+    frame, source_path = _load_csv_frame(args)
+    if (
+        (args.column is None or args.operator is None or args.value is None)
+        and _interactive_prompts_available()
+    ):
+        _print_csv_preview_for_interactive(frame=frame, source_path=source_path)
+    column, operator, value = _resolve_filter_inputs(args, frame)
+
+    filtered_frame = filter_frame(
+        frame,
+        column=column,
+        operator=operator,
+        value=value,
+        case_sensitive=args.case_sensitive,
+        invert=args.invert,
+    )
+    source_info = frame.attrs.get("linak_hdf5_source_info")
+    written = write_hdf5_frame(filtered_frame, output_path, source_info=source_info)
+    print(f"Rows kept: {len(filtered_frame)} / {len(frame)}")
+    print(f"Wrote filtered HDF5: {written}")
+
+    LOGGER.info("HDF5 filter finished in %.2f s.", perf_counter() - start)
+    return 0
+
+
+def _handle_csv_dedupe(args: argparse.Namespace) -> int:
+    start = perf_counter()
+    LOGGER.info("Starting HDF5 dedupe.")
+
+    from .csv_tools import deduplicate_frame
+    from .hdf5_table import write_hdf5_frame
+
+    output_path = _resolve_csv_output_path(args, suffix="deduped")
+
+    if args.dry_run:
+        subset_label = ", ".join(args.subset) if args.subset else "all columns"
+        plan = [
+            f"source: {Path(args.source).expanduser().resolve()}",
+            "rows/columns: not inspected in dry-run",
+            f"subset: {subset_label}",
+            f"keep: {args.keep}",
+            f"output: {output_path}",
+        ]
+        _log_dry_run_plan(f"{_TABULAR_COMMAND} dedupe", plan)
+        LOGGER.info("HDF5 dedupe dry run finished in %.2f s.", perf_counter() - start)
+        return 0
+
+    frame, source_path = _load_csv_frame(args)
+    subset = _validate_csv_columns(frame, args.subset) if args.subset else None
+
+    deduped = deduplicate_frame(
+        frame,
+        subset=subset,
+        keep=args.keep,
+    )
+    source_info = frame.attrs.get("linak_hdf5_source_info")
+    written = write_hdf5_frame(deduped, output_path, source_info=source_info)
+    print(f"Rows after dedupe: {len(deduped)} / {len(frame)}")
+    print(f"Wrote deduped HDF5: {written}")
+
+    LOGGER.info("HDF5 dedupe finished in %.2f s.", perf_counter() - start)
+    return 0
+
+
+def _handle_csv_combine(args: argparse.Namespace) -> int:
+    start = perf_counter()
+    LOGGER.info("Starting HDF5 combine.")
+    sources = _resolve_source_arguments(
+        positional=getattr(args, "source", None),
+        files=getattr(args, "files", None),
+        source_label="HDF5 input file",
+        allow_multiple=True,
+    )
+    _validate_hdf5_only_sources(sources, command_name=f"linak {_TABULAR_COMMAND} combine")
+    if len(sources) < 2:
+        raise ValueError(
+            f"linak {_TABULAR_COMMAND} combine requires at least two HDF5 input files."
+        )
+
+    detected_analysis = _resolve_auto_plot_analysis_from_sources(sources)
+    if detected_analysis not in {"density", "msd", "rdf"}:
+        raise ValueError(
+            "HDF5 combine currently supports LiNaK density/MSD/RDF analysis files only."
+        )
+
+    settings_source_path = _resolve_plot_settings_source_path(
+        sources,
+        setting_source_token=getattr(args, "settings_source", None),
+    )
+    if args.output:
+        from .hdf5_utils import resolve_hdf5_output_path
+
+        output_path = resolve_hdf5_output_path(args.output)
+    else:
+        output_path = _default_combined_analysis_hdf5_path(
+            sources,
+            analysis=detected_analysis,
+        )
+    output_path = _unique_path_with_numeric_suffix(output_path) if output_path.exists() else output_path
+
+    if args.dry_run:
+        plan = [
+            f"analysis: {detected_analysis}",
+            f"sources ({len(sources)}): {_summarize_sources(sources)}",
+            f"plot-settings source: {settings_source_path}",
+            f"output combined HDF5: {output_path}",
+        ]
+        _log_dry_run_plan(f"{_TABULAR_COMMAND} combine", plan)
+        LOGGER.info("HDF5 combine dry run finished in %.2f s.", perf_counter() - start)
+        return 0
+
+    written = _combine_analysis_hdf5_sources(
+        sources=sources,
+        analysis=detected_analysis,
+        output=output_path,
+        settings_source_path=settings_source_path,
+    )
+    print(f"Wrote combined HDF5: {written}")
+    LOGGER.info("HDF5 combine finished in %.2f s.", perf_counter() - start)
+    return 0
+
+
+def _resolve_plot_columns(args: argparse.Namespace, frame: Any) -> tuple[str | None, list[str]]:
+    from .csv_tools import infer_numeric_columns
+
+    numeric_columns = infer_numeric_columns(frame)
+    kind = args.kind
+
+    if kind in {"line", "scatter", "bar"}:
+        x_column = args.x
+        if x_column is None:
+            x_column = _prompt_for_columns(
+                columns=list(frame.columns),
+                prompt="Select x-axis column",
+                allow_multiple=False,
+            )[0]
+        if x_column not in frame.columns:
+            raise ValueError(f"Unknown x-axis column '{x_column}'.")
+
+        if args.y:
+            y_columns = _validate_csv_columns(frame, args.y)
+        else:
+            candidates = numeric_columns or list(frame.columns)
+            y_columns = _prompt_for_columns(
+                columns=candidates,
+                prompt="Select y-axis column(s)",
+                allow_multiple=True,
+            )
+        if kind == "bar" and len(y_columns) > 1:
+            raise ValueError("Bar plots currently support exactly one --y column.")
+        return x_column, y_columns
+
+    if args.y:
+        y_columns = _validate_csv_columns(frame, args.y)
+    else:
+        if not numeric_columns:
+            raise ValueError("No numeric-like columns available for hist/box plot.")
+        y_columns = _prompt_for_columns(
+            columns=numeric_columns,
+            prompt="Select numeric column(s) to plot",
+            allow_multiple=True,
+        )
+    return None, y_columns
+
+
+def _csv_plot_requires_interactive_selection(args: argparse.Namespace) -> bool:
+    if args.kind in {"line", "scatter", "bar"}:
+        return args.x is None or not args.y
+    return not args.y
+
+
+def _validate_plot_columns_across_frames(
+    *,
+    frames_by_source: list[tuple[Any, Path]],
+    x_column: str | None,
+    y_columns: list[str],
+) -> None:
+    required = list(y_columns)
+    if x_column is not None:
+        required.append(x_column)
+    for frame, source_path in frames_by_source:
+        missing = [column for column in required if column not in frame.columns]
+        if missing:
+            raise ValueError(
+                f"HDF5 table '{source_path}' is missing required column(s): {', '.join(missing)}."
+            )
+
+
+def _resolve_csv_plot_source_labels(
+    args: argparse.Namespace,
+    source_paths: list[Path],
+) -> list[str]:
+    if args.file_labels is None:
+        return [path.stem or path.name for path in source_paths]
+
+    labels = [label.strip() for label in args.file_labels]
+    if len(labels) != len(source_paths):
+        raise ValueError(
+            "--file-labels count must match the number of input HDF5 files "
+            f"({len(source_paths)})."
+        )
+    if any(not label for label in labels):
+        raise ValueError("--file-labels cannot contain empty values.")
+    return labels
+
+
+def _resolve_csv_plot_series_labels(
+    args: argparse.Namespace,
+    default_labels: list[str],
+) -> list[str]:
+    if args.series_labels is None:
+        return default_labels
+
+    labels = [label.strip() for label in args.series_labels]
+    if len(labels) != len(default_labels):
+        raise ValueError(
+            "--labels/--series-labels count must match rendered series count "
+            f"({len(default_labels)})."
+        )
+    if any(not label for label in labels):
+        raise ValueError("--labels/--series-labels cannot contain empty values.")
+    return labels
+
+
+def _should_render_csv_legend(args: argparse.Namespace, *, series_count: int) -> bool:
+    if args.legend is not None:
+        return args.legend and series_count > 0
+    return series_count > 1
+
+
+def _apply_csv_axis_controls(
+    *,
+    args: argparse.Namespace,
+    ax: Any,
+    kind: str,
+    title: str,
+    style: PlotStyle,
+    default_x_label: str | None,
+    default_y_label: str | None,
+) -> None:
+    x_label = args.x_label if args.x_label is not None else default_x_label
+    y_label = args.y_label if args.y_label is not None else default_y_label
+    if x_label is not None:
+        ax.set_xlabel(x_label, fontsize=style.label_font_size)
+    if y_label is not None:
+        ax.set_ylabel(y_label, fontsize=style.label_font_size)
+
+    if args.title_visible is not False:
+        ax.set_title(title, fontsize=style.title_font_size)
+    else:
+        ax.set_title("", fontsize=style.title_font_size)
+    ax.tick_params(axis="both", labelsize=style.tick_font_size)
+    if style.grid:
+        ax.grid(
+            True,
+            linestyle=style.grid_linestyle,
+            linewidth=style.grid_linewidth,
+            alpha=style.grid_alpha,
+        )
+    if args.ticks is not False:
+        if args.x_tick_rotation is not None:
+            ax.tick_params(axis="x", rotation=float(args.x_tick_rotation))
+        if args.y_tick_rotation is not None:
+            ax.tick_params(axis="y", rotation=float(args.y_tick_rotation))
+    else:
+        ax.tick_params(
+            axis="both",
+            which="both",
+            bottom=False,
+            top=False,
+            left=False,
+            right=False,
+            labelbottom=False,
+            labelleft=False,
+        )
+
+    if kind in {"bar", "box"} and args.x_scale != "linear":
+        raise ValueError("--x-scale is only supported for numeric x-axes (line/scatter/hist).")
+
+    try:
+        ax.set_xscale(args.x_scale)
+        ax.set_yscale(args.y_scale)
+    except ValueError as exc:
+        raise ValueError(
+            f"Could not apply axis scales x={args.x_scale}, y={args.y_scale}: {exc}"
+        ) from exc
+
+    resolved_x_lim = _resolve_x_lim(args)
+    if args.x_ticks is not None:
+        ax.set_xticks([float(value) for value in args.x_ticks])
+    if args.y_ticks is not None:
+        ax.set_yticks([float(value) for value in args.y_ticks])
+    # Apply explicit limits after ticks so tick placement cannot widen bounds.
+    if resolved_x_lim is not None:
+        ax.set_xlim(left=resolved_x_lim[0], right=resolved_x_lim[1])
+    resolved_y_lim = _resolve_y_lim(args)
+    if resolved_y_lim is not None:
+        ax.set_ylim(bottom=resolved_y_lim[0], top=resolved_y_lim[1])
+
+
+def _render_csv_plot(
+    *,
+    args: argparse.Namespace,
+    frames_by_source: list[tuple[Any, Path]],
+    x_column: str | None,
+    y_columns: list[str],
+) -> tuple[Path | None, dict[str, Any]]:
+    import matplotlib.pyplot as plt
+    import pandas as pd
+
+    from .plotting import ensure_interactive_backend
+
+    style = _build_plot_style(args)
+    source_paths = [source_path for _, source_path in frames_by_source]
+    title = args.title or (
+        f"{source_paths[0].name} ({args.kind})"
+        if len(source_paths) == 1
+        else f"{len(source_paths)} HDF5 files ({args.kind})"
+    )
+    source_labels = _resolve_csv_plot_source_labels(args, source_paths)
+    multi_source = len(frames_by_source) > 1
+
+    def _draw(show: bool, output: str | Path | None) -> tuple[Path | None, dict[str, Any]]:
+        with plt.rc_context({"font.family": style.font_family}):
+            fig, ax = plt.subplots(figsize=style.figure_size)
+            kind = args.kind
+            rendered_handles: list[Any] = []
+            rendered_labels: list[str] = []
+            rendered_colors: list[str] = []
+            box_data: list[Any] = []
+            box_labels: list[str] = []
+            final_labels: list[str] | None = None
+
+            def _label_for(source_label: str, y_column: str) -> str:
+                if multi_source:
+                    return f"{source_label}:{y_column}"
+                return y_column
+
+            if kind == "line":
+                total_series = len(frames_by_source) * len(y_columns)
+                if args.line_colors is not None and len(args.line_colors) != total_series:
+                    raise ValueError(
+                        "--line-colors count must match rendered series count "
+                        f"({total_series})."
+                    )
+                color_index = 0
+                for (frame, _source_path), source_label in zip(
+                    frames_by_source, source_labels, strict=True
+                ):
+                    x_values = frame[x_column] if x_column is not None else frame.index
+                    for y_column in y_columns:
+                        y_numeric = pd.to_numeric(frame[y_column], errors="coerce")
+                        mask = y_numeric.notna()
+                        if x_column is not None:
+                            mask = mask & frame[x_column].notna()
+                        label = _label_for(source_label, y_column)
+                        line_kwargs: dict[str, Any] = {
+                            "lw": style.line_width,
+                            "label": label,
+                        }
+                        if args.markers is True:
+                            line_kwargs["marker"] = "o"
+                        elif args.markers is False:
+                            line_kwargs["marker"] = ""
+                        if args.line_colors is not None:
+                            line_kwargs["color"] = args.line_colors[color_index]
+                        elif total_series == 1 and args.line_color is not None:
+                            line_kwargs["color"] = args.line_color
+                        (line_handle,) = ax.plot(
+                            x_values[mask],
+                            y_numeric[mask],
+                            **line_kwargs,
+                        )
+                        rendered_handles.append(line_handle)
+                        rendered_labels.append(label)
+                        rendered_colors.append(str(line_handle.get_color()))
+                        color_index += 1
+                default_x_label = x_column or "index"
+                default_y_label = "value"
+            elif kind == "scatter":
+                if x_column is None:
+                    raise ValueError("Scatter plot requires an x-axis column.")
+                for (frame, source_path), source_label in zip(
+                    frames_by_source, source_labels, strict=True
+                ):
+                    x_numeric = pd.to_numeric(frame[x_column], errors="coerce")
+                    if int(x_numeric.notna().sum()) == 0:
+                        raise ValueError(
+                            f"Scatter x-axis column '{x_column}' must be numeric in '{source_path}'."
+                        )
+                    for y_column in y_columns:
+                        y_numeric = pd.to_numeric(frame[y_column], errors="coerce")
+                        mask = x_numeric.notna() & y_numeric.notna()
+                        label = _label_for(source_label, y_column)
+                        points = ax.scatter(
+                            x_numeric[mask],
+                            y_numeric[mask],
+                            alpha=0.75,
+                            label=label,
+                        )
+                        rendered_handles.append(points)
+                        rendered_labels.append(label)
+                default_x_label = x_column
+                default_y_label = "value"
+            elif kind == "bar":
+                if x_column is None:
+                    raise ValueError("Bar plot requires an x-axis column.")
+                total_series = len(frames_by_source) * len(y_columns)
+                for (frame, _source_path), source_label in zip(
+                    frames_by_source, source_labels, strict=True
+                ):
+                    for y_column in y_columns:
+                        y_numeric = pd.to_numeric(frame[y_column], errors="coerce")
+                        mask = frame[x_column].notna() & y_numeric.notna()
+                        label = _label_for(source_label, y_column)
+                        bar_kwargs: dict[str, Any] = {"label": label}
+                        if total_series == 1:
+                            bar_kwargs["color"] = style.line_color
+                        else:
+                            bar_kwargs["alpha"] = 0.65
+                        bars = ax.bar(
+                            frame.loc[mask, x_column].astype("string"),
+                            y_numeric[mask],
+                            **bar_kwargs,
+                        )
+                        rendered_handles.append(bars)
+                        rendered_labels.append(label)
+                default_x_label = x_column
+                default_y_label = y_columns[0] if len(y_columns) == 1 else "value"
+                ax.tick_params(axis="x", rotation=35, labelsize=style.tick_font_size)
+            elif kind == "hist":
+                total_series = len(frames_by_source) * len(y_columns)
+                for (frame, _source_path), source_label in zip(
+                    frames_by_source, source_labels, strict=True
+                ):
+                    for y_column in y_columns:
+                        y_numeric = pd.to_numeric(frame[y_column], errors="coerce").dropna()
+                        if len(y_numeric) == 0:
+                            continue
+                        label = _label_for(source_label, y_column)
+                        _counts, _edges, patches = ax.hist(
+                            y_numeric,
+                            bins=args.bins,
+                            alpha=0.6 if total_series == 1 else 0.5,
+                            label=label,
+                        )
+                        if patches:
+                            rendered_handles.append(patches[0])
+                            rendered_labels.append(label)
+                default_x_label = "value"
+                default_y_label = "count"
+            else:  # box
+                for (frame, _source_path), source_label in zip(
+                    frames_by_source, source_labels, strict=True
+                ):
+                    for column in y_columns:
+                        values = pd.to_numeric(frame[column], errors="coerce").dropna().to_numpy()
+                        if len(values) == 0:
+                            continue
+                        box_data.append(values)
+                        box_labels.append(_label_for(source_label, column))
+                if not box_data:
+                    raise ValueError("No numeric data available for box plot.")
+                final_box_labels = _resolve_csv_plot_series_labels(args, box_labels)
+                ax.boxplot(box_data, tick_labels=final_box_labels)
+                final_labels = final_box_labels
+                default_x_label = "series"
+                default_y_label = "value"
+                ax.tick_params(axis="x", rotation=30, labelsize=style.tick_font_size)
+
+            if kind != "box":
+                if not rendered_labels:
+                    raise ValueError("No plottable data found for the requested HDF5 plot selection.")
+                final_labels = _resolve_csv_plot_series_labels(args, rendered_labels)
+                if _should_render_csv_legend(args, series_count=len(final_labels)):
+                    ax.legend(
+                        rendered_handles,
+                        final_labels,
+                        fontsize=style.tick_font_size,
+                        title=args.legend_title,
+                        loc=args.legend_loc,
+                    )
+
+            _apply_csv_axis_controls(
+                args=args,
+                ax=ax,
+                kind=kind,
+                title=title,
+                style=style,
+                default_x_label=default_x_label,
+                default_y_label=default_y_label,
+            )
+
+            fig.tight_layout()
+            output_path = None
+            if output is not None:
+                output_path = Path(output).expanduser().resolve()
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                fig.savefig(output_path, dpi=style.dpi)
+                LOGGER.info("Saved HDF5 plot to '%s'.", output_path)
+
+            if show:
+                backend = ensure_interactive_backend(preferred_backend=args.backend)
+                LOGGER.info(
+                    "Showing HDF5 plot using backend '%s'. Close the window to continue.",
+                    backend,
+                )
+                plt.show()
+
+            legend = ax.get_legend()
+            legend_title = None
+            if legend is not None:
+                title_obj = legend.get_title()
+                if title_obj is not None:
+                    legend_title = str(title_obj.get_text()) or None
+            captured_state = {
+                "title": str(ax.get_title()),
+                "title_visible": bool(ax.title.get_visible() and bool(str(ax.get_title()).strip())),
+                "x_label": str(ax.get_xlabel()),
+                "y_label": str(ax.get_ylabel()),
+                "x_scale": str(ax.get_xscale()),
+                "y_scale": str(ax.get_yscale()),
+                "x_lim": [float(value) for value in ax.get_xlim()],
+                "y_lim": [float(value) for value in ax.get_ylim()],
+                "x_ticks": [float(value) for value in ax.get_xticks()],
+                "y_ticks": [float(value) for value in ax.get_yticks()],
+                "ticks": bool(any(label.get_visible() for label in ax.get_xticklabels() + ax.get_yticklabels())),
+                "legend": legend is not None,
+                "legend_title": legend_title,
+                "legend_loc": args.legend_loc,
+                "series_labels": final_labels if final_labels is not None else None,
+                "line_colors": rendered_colors if rendered_colors else None,
+                "markers": bool(args.markers) if args.markers is not None else False,
+                "figsize": [float(style.figure_size[0]), float(style.figure_size[1])],
+                "dpi": int(style.dpi),
+                "font_family": style.font_family,
+                "title_font_size": int(style.title_font_size),
+                "label_font_size": int(style.label_font_size),
+                "tick_font_size": int(style.tick_font_size),
+                "line_width": float(style.line_width),
+                "grid": bool(style.grid),
+                "grid_linestyle": style.grid_linestyle,
+                "grid_linewidth": float(style.grid_linewidth),
+                "grid_alpha": float(style.grid_alpha),
+            }
+            plt.close(fig)
+            return output_path, captured_state
+
+    if args.show:
+        try:
+            return _draw(True, args.output)
+        except RuntimeError as exc:
+            fallback_output = args.output or _default_csv_plot_output_for_sources(
+                source_paths,
+                f"hdf5_{args.kind}" if len(source_paths) == 1 else f"multi_hdf5_{args.kind}",
+            )
+            LOGGER.warning("Interactive plotting unavailable: %s", exc)
+            LOGGER.warning(
+                "Falling back to non-interactive render. Plot will be saved to '%s'.",
+                fallback_output,
+            )
+            return _draw(False, fallback_output)
+    return _draw(False, args.output)
+
+
+def _handle_csv_plot(args: argparse.Namespace) -> int:
+    start = perf_counter()
+    LOGGER.info("Starting HDF5 plot.")
+    sources = _resolve_csv_plot_sources(args)
+    settings_source_path: Path | None = None
+    saved_plot_settings: dict[str, Any] | None = None
+    if len(sources) == 1:
+        settings_source_path = Path(sources[0]).expanduser().resolve()
+        saved_plot_settings = _apply_saved_plot_settings(
+            args=args,
+            source_path=settings_source_path,
+            profile_key=_PLOT_PROFILE_TABLE,
+            keys=_PLOT_SETTINGS_TABLE_KEYS,
+        )
+    _resolve_csv_plot_source_labels(args, [Path(source).expanduser().resolve() for source in sources])
+
+    if args.dry_run:
+        if args.output:
+            render_target = f"save plot to {Path(args.output).expanduser().resolve()}"
+        elif args.show:
+            render_target = f"interactive display via backend {args.backend}"
+        else:
+            render_target = "no render target (--no-show without --output)"
+        y_preview = ", ".join(args.y) if args.y else "interactive (resolved at execution)"
+        plan = [
+            f"sources ({len(sources)}): {_summarize_sources(sources)}",
+            "rows/columns: not inspected in dry-run",
+            f"kind={args.kind}",
+            f"x={args.x if args.x is not None else 'auto/interactive'}",
+            f"y={y_preview}",
+            f"bins={args.bins if args.kind == 'hist' else 'n/a'}",
+            f"legend={'auto' if args.legend is None else ('on' if args.legend else 'off')}",
+            f"render target: {render_target}",
+        ]
+        _log_dry_run_plan(f"{_TABULAR_COMMAND} plot", plan)
+        LOGGER.info("HDF5 plot dry run finished in %.2f s.", perf_counter() - start)
+        return 0
+
+    frames_by_source = [
+        _load_csv_frame_from_source(source, group=args.group)
+        for source in sources
+    ]
+    if _csv_plot_requires_interactive_selection(args) and _interactive_prompts_available():
+        for index, (frame, source_path) in enumerate(frames_by_source, start=1):
+            heading = (
+                "Preview before interactive plot selection"
+                if len(frames_by_source) == 1
+                else f"Preview [{index}/{len(frames_by_source)}] before interactive plot selection"
+            )
+            _print_csv_preview_for_interactive(
+                frame=frame,
+                source_path=source_path,
+                heading=heading,
+            )
+    x_column, y_columns = _resolve_plot_columns(args, frames_by_source[0][0])
+    if not y_columns:
+        raise ValueError("No y columns were selected for plotting.")
+    _validate_plot_columns_across_frames(
+        frames_by_source=frames_by_source,
+        x_column=x_column,
+        y_columns=y_columns,
+    )
+
+    saved_path, rendered_state = _render_csv_plot(
+        args=args,
+        frames_by_source=frames_by_source,
+        x_column=x_column,
+        y_columns=y_columns,
+    )
+    if saved_path is None and not args.show:
+        LOGGER.warning("No interactive display or output path requested. Nothing was rendered.")
+
+    if settings_source_path is not None:
+        candidate = _collect_plot_settings_from_args(args, keys=_PLOT_SETTINGS_TABLE_KEYS)
+        candidate = _merge_rendered_plot_state(
+            candidate,
+            rendered_state,
+            keys=_PLOT_SETTINGS_TABLE_KEYS,
+        )
+        _persist_plot_settings_with_resolution(
+            source_path=settings_source_path,
+            profile_key=_PLOT_PROFILE_TABLE,
+            existing_settings=saved_plot_settings,
+            candidate_settings=candidate,
+        )
+
+    LOGGER.info("HDF5 plot finished in %.2f s.", perf_counter() - start)
+    return 0
+
+
+def _handle_csv_interactive(args: argparse.Namespace) -> int:
+    start = perf_counter()
+    LOGGER.info("Starting HDF5 interactive assistant.")
+
+    from .csv_tools import format_frame_preview
+
+    frame, source_path = _load_csv_frame(args)
+    print(f"Interactive HDF5 assistant for: {source_path}")
+    _print_hdf5_metadata_overview(frame)
+    print(f"Rows: {len(frame)} | Columns: {len(frame.columns)}")
+    print("")
+    print(format_frame_preview(frame, rows=args.rows, tail=False, show_index=False))
+    print("")
+
+    action = _prompt_for_value(
+        "Action (info/preview/get/sort/filter/dedupe/plot/plot-settings)",
+        allowed={
+            "info",
+            "preview",
+            "get",
+            "sort",
+            "filter",
+            "dedupe",
+            "plot",
+            "plot-settings",
+        },
+    ).lower()
+
+    if action == "info":
+        delegated = argparse.Namespace(
+            source=args.source,
+            group=args.group,
+        )
+        rc = _handle_csv_info(delegated)
+    elif action == "preview":
+        rows = int(_prompt_for_value("Rows to preview"))
+        tail = _prompt_yes_no("Show tail rows", default=False)
+        delegated = argparse.Namespace(
+            source=args.source,
+            group=args.group,
+            rows=rows,
+            tail=tail,
+            show_index=False,
+        )
+        rc = _handle_csv_preview(delegated)
+    elif action == "get":
+        columns = _prompt_for_columns(
+            columns=list(frame.columns),
+            prompt="Select column(s) to analyze",
+            allow_multiple=True,
+        )
+        delegated = argparse.Namespace(
+            source=args.source,
+            group=args.group,
+            column=columns,
+            all_columns=False,
+            metric=None,
+            round_digits=6,
+        )
+        rc = _handle_csv_get(delegated)
+    elif action == "sort":
+        sort_columns = _prompt_for_columns(
+            columns=list(frame.columns),
+            prompt="Select sort column(s)",
+            allow_multiple=True,
+        )
+        descending = _prompt_yes_no("Sort descending", default=False)
+        inplace = _prompt_yes_no("Overwrite input HDF5", default=False)
+        delegated = argparse.Namespace(
+            source=args.source,
+            group=args.group,
+            by=sort_columns,
+            descending=descending,
+            na_position="last",
+            mode="auto",
+            output=None,
+            inplace=inplace,
+            dry_run=False,
+        )
+        rc = _handle_csv_sort(delegated)
+    elif action == "filter":
+        column = _prompt_for_columns(
+            columns=list(frame.columns),
+            prompt="Select filter column",
+            allow_multiple=False,
+        )[0]
+        operator = _prompt_for_value(
+            "Operator (eq/ne/gt/ge/lt/le/contains/startswith/endswith/regex/in/not-in)",
+            allowed={
+                "eq",
+                "ne",
+                "gt",
+                "ge",
+                "lt",
+                "le",
+                "contains",
+                "startswith",
+                "endswith",
+                "regex",
+                "in",
+                "not-in",
+            },
+        ).lower()
+        value = _prompt_for_value("Filter value")
+        delegated = argparse.Namespace(
+            source=args.source,
+            group=args.group,
+            column=column,
+            operator=operator,
+            value=value,
+            case_sensitive=False,
+            invert=False,
+            output=None,
+            inplace=False,
+            dry_run=False,
+        )
+        rc = _handle_csv_filter(delegated)
+    elif action == "dedupe":
+        subset = _prompt_for_columns(
+            columns=list(frame.columns),
+            prompt="Select dedupe subset column(s)",
+            allow_multiple=True,
+        )
+        keep = _prompt_for_value(
+            "Keep (first/last/none)", allowed={"first", "last", "none"}
+        ).lower()
+        inplace = _prompt_yes_no("Overwrite input HDF5", default=False)
+        delegated = argparse.Namespace(
+            source=args.source,
+            group=args.group,
+            subset=subset,
+            keep=keep,
+            output=None,
+            inplace=inplace,
+            dry_run=False,
+        )
+        rc = _handle_csv_dedupe(delegated)
+    elif action == "plot":
+        kind = _prompt_for_value(
+            "Plot kind (line/scatter/bar/hist/box)",
+            allowed={"line", "scatter", "bar", "hist", "box"},
+        ).lower()
+        delegated = argparse.Namespace(
+            source=[args.source],
+            files=None,
+            group=args.group,
+            kind=kind,
+            x=None,
+            y=None,
+            bins=30,
+            output=None,
+            show=True,
+            backend=DEFAULT_INTERACTIVE_BACKEND,
+            title=None,
+            x_label=None,
+            y_label=None,
+            x_scale="linear",
+            y_scale="linear",
+            title_visible=None,
+            ticks=None,
+            markers=None,
+            x_min=None,
+            x_max=None,
+            x_lim=None,
+            y_min=None,
+            y_max=None,
+            y_lim=None,
+            x_ticks=None,
+            y_ticks=None,
+            x_tick_rotation=None,
+            y_tick_rotation=None,
+            series_labels=None,
+            file_labels=None,
+            legend=None,
+            legend_title=None,
+            legend_loc="best",
+            figsize=None,
+            dpi=None,
+            font_family=None,
+            title_font_size=None,
+            label_font_size=None,
+            tick_font_size=None,
+            line_width=None,
+            line_color=None,
+            line_colors=None,
+            grid=None,
+            grid_linestyle=None,
+            grid_linewidth=None,
+            grid_alpha=None,
+            dry_run=False,
+        )
+        rc = _handle_csv_plot(delegated)
+    else:
+        delegated = argparse.Namespace(
+            source=args.source,
+            files=None,
+            profile="auto",
+            set=None,
+            unset=None,
+            delete=False,
+            import_from=None,
+            export_to=None,
+            show_all=False,
+        )
+        rc = _handle_csv_plot_settings(delegated)
+
+    LOGGER.info("HDF5 interactive assistant finished in %.2f s.", perf_counter() - start)
+    return rc
+
+
+def _detect_plot_analysis_from_hdf5_source(source: str | Path) -> str | None:
+    from .plot_settings import read_hdf5_analysis, read_plot_profiles
+
+    source_path = Path(source).expanduser().resolve()
+    analysis = read_hdf5_analysis(source_path)
+    if analysis in {"density", "msd", "rdf", "table"}:
+        return analysis
+
+    try:
+        profiles = read_plot_profiles(source_path)
+    except Exception:
+        return None
+    for profile_key in (_PLOT_PROFILE_DENSITY, _PLOT_PROFILE_MSD, _PLOT_PROFILE_RDF, _PLOT_PROFILE_TABLE):
+        if profile_key in profiles:
+            return _PROFILE_KEY_TO_ANALYSIS.get(profile_key)
+    return None
+
+
+def _resolve_plot_settings_source_path(
+    sources: list[str],
+    *,
+    setting_source_token: str | None,
+) -> Path:
+    if not sources:
+        raise ValueError("No HDF5 sources were provided.")
+
+    resolved_sources = [Path(source).expanduser().resolve() for source in sources]
+    if setting_source_token is None:
+        return resolved_sources[0]
+
+    token = setting_source_token.strip()
+    if not token:
+        return resolved_sources[0]
+
+    if token.isdigit():
+        one_based = int(token)
+        if one_based < 1 or one_based > len(resolved_sources):
+            raise ValueError(
+                "--settings-source index is out of range. "
+                f"Expected 1..{len(resolved_sources)}, got {one_based}."
+            )
+        return resolved_sources[one_based - 1]
+
+    requested = Path(token).expanduser().resolve()
+    if requested in resolved_sources:
+        return requested
+
+    raise ValueError(
+        "--settings-source path must match one of the provided input files. "
+        f"Got '{requested}'."
+    )
+
+
+def _resolve_auto_plot_analysis_from_sources(sources: list[str]) -> str | None:
+    detected = [_detect_plot_analysis_from_hdf5_source(source) for source in sources]
+    available = [name for name in detected if name is not None]
+    if not available:
+        return None
+    first = available[0]
+    if any(name != first for name in available[1:]):
+        LOGGER.warning(
+            "Input files report mixed analysis/profile metadata. "
+            "Using the first detected analysis '%s'.",
+            first,
+        )
+    return first
+
+
+def _read_analysis_profile_payloads(
+    *,
+    sources: list[str],
+    analysis: str,
+) -> list[dict[str, Any]]:
+    from .hdf5_utils import read_linak_hdf5_profiles
+
+    payloads: list[dict[str, Any]] = []
+    for source_index, source in enumerate(sources):
+        source_path = Path(source).expanduser().resolve()
+        profiles = read_linak_hdf5_profiles(source_path, expected_analysis=analysis)
+        if not profiles:
+            raise ValueError(f"No '{analysis}' profiles found in '{source_path}'.")
+        for profile_index, (datasets, metadata) in enumerate(profiles):
+            merged_metadata = dict(metadata)
+            merged_metadata["source_path"] = str(source_path)
+            merged_metadata.setdefault("source_index", source_index)
+            merged_metadata.setdefault("source_profile_index", profile_index)
+            payloads.append(
+                {
+                    "datasets": datasets,
+                    "metadata": merged_metadata,
+                }
+            )
+    return payloads
+
+
+def _combine_analysis_hdf5_sources(
+    *,
+    sources: list[str],
+    analysis: str,
+    output: str | Path | None,
+    settings_source_path: Path | None,
+) -> Path:
+    from .hdf5_utils import resolve_hdf5_output_path, write_linak_hdf5_profile_collection
+    from .plot_settings import copy_plot_profile
+
+    payloads = _read_analysis_profile_payloads(sources=sources, analysis=analysis)
+    if output is None:
+        output_path = _unique_path_with_numeric_suffix(
+            _default_combined_analysis_hdf5_path(sources, analysis=analysis)
+        )
+    else:
+        output_path = resolve_hdf5_output_path(output)
+
+    combined_metadata: dict[str, Any] = {
+        "analysis": analysis,
+        "source_files": [str(Path(source).expanduser().resolve()) for source in sources],
+    }
+    if settings_source_path is not None:
+        combined_metadata["settings_source"] = str(settings_source_path)
+
+    written_path = write_linak_hdf5_profile_collection(
+        output_path,
+        analysis=analysis,
+        profiles=payloads,
+        metadata=combined_metadata,
+    )
+
+    profile_key = _ANALYSIS_TO_PROFILE_KEY.get(analysis)
+    if profile_key is not None and settings_source_path is not None:
+        try:
+            copy_plot_profile(
+                settings_source_path,
+                written_path,
+                source_key=profile_key,
+                target_key=profile_key,
+            )
+        except ValueError:
+            LOGGER.debug(
+                "No plot settings profile '%s' found in settings source '%s'.",
+                profile_key,
+                settings_source_path,
+            )
+    return written_path
+
+
+def _resolve_plot_hdf5_sources(args: argparse.Namespace, *, command_name: str) -> list[str]:
+    sources = _resolve_plot_sources(args)
+    _validate_hdf5_only_sources(sources, command_name=command_name)
+    return sources
+
+
+def _handle_plot_density(args: argparse.Namespace) -> int:
+    start = perf_counter()
+    LOGGER.info("Starting density plotting.")
+    sources = _resolve_plot_hdf5_sources(args, command_name="linak plot density")
+    settings_source_path = _resolve_plot_settings_source_path(
+        sources,
+        setting_source_token=getattr(args, "settings_source", None),
+    )
+    saved_plot_settings = _apply_saved_plot_settings(
+        args=args,
+        source_path=settings_source_path,
+        profile_key=_PLOT_PROFILE_DENSITY,
+        keys=_PLOT_SETTINGS_DENSITY_KEYS,
+    )
+    if len(sources) > 1:
+        LOGGER.info("Processing %d density HDF5 input file(s).", len(sources))
+        LOGGER.info("Using '%s' as plot-settings source.", settings_source_path)
+    persistence_source_path = settings_source_path
+    persistence_existing_settings = saved_plot_settings
+
+    if args.dry_run:
+        if args.output:
+            render_target = f"save plot to {Path(args.output).expanduser()}"
+        elif args.show:
+            render_target = f"interactive display via backend {args.backend}"
+        else:
+            render_target = "no render target (--no-show without --output)"
+
+        plan = [
+            "input mode: HDF5 only",
+            f"sources ({len(sources)}): {_summarize_sources(sources)}",
+            (
+                f"species={args.species}, axis={args.axis}, "
+                f"x_mode={args.x_mode}, quantity={args.quantity}"
+            ),
+            f"plot-settings source: {settings_source_path}",
+            f"render target: {render_target}",
+        ]
+        _log_dry_run_plan("plot density", plan)
+        LOGGER.info("Density plotting dry run finished in %.2f s.", perf_counter() - start)
+        return 0
+
+    from .density import (
+        load_density_profiles,
+        plot_density_profiles,
+    )
+
+    profiles_by_source: list[tuple[str, list]] = []
+    for source in sources:
+        profiles = load_density_profiles(source, axis=args.axis, species=args.species)
+        profiles_by_source.append((source, profiles))
+
+    plot_profiles = []
+    fallback_labels_by_source: list[list[str]] = []
+    if len(sources) > 1:
+        for source, profiles in profiles_by_source:
+            source_label = Path(source).name or source
+            source_labels: list[str] = []
+            for profile in profiles:
+                rendered_species = f"{source_label}:{profile.species}"
+                source_labels.append(rendered_species)
+                plot_profiles.append(replace(profile, species=rendered_species))
+            fallback_labels_by_source.append(source_labels)
+    else:
+        flattened = _flatten_profiles_by_source(profiles_by_source)
+        plot_profiles.extend(flattened)
+        fallback_labels_by_source.append([profile.species for profile in flattened])
+
+    _apply_effective_series_settings(
+        args=args,
+        sources=sources,
+        profile_key=_PLOT_PROFILE_DENSITY,
+        fallback_labels_by_source=fallback_labels_by_source,
+    )
+
+    plot_source_label = sources[0] if len(sources) == 1 else "multi_source_density"
+    if len(sources) > 1 and not args.gui:
+        persistence_source_path = _combine_analysis_hdf5_sources(
+            sources=sources,
+            analysis="density",
+            output=None,
+            settings_source_path=None,
+        )
+        persistence_existing_settings = None
+        LOGGER.info(
+            "Created combined density HDF5 for multi-source plot settings: '%s'.",
+            persistence_source_path,
+        )
+        plot_source_label = str(persistence_source_path)
+
+    if args.gui:
+        gui_settings_path = settings_source_path
+        if len(sources) > 1:
+            gui_settings_path = _combine_analysis_hdf5_sources(
+                sources=sources,
+                analysis="density",
+                output=None,
+                settings_source_path=settings_source_path,
+            )
+            LOGGER.info(
+                "Created combined density HDF5 for GUI controls: '%s'.",
+                gui_settings_path,
+            )
+            _persist_effective_series_settings(
+                source_path=gui_settings_path,
+                profile_key=_PLOT_PROFILE_DENSITY,
+                series_labels=args.series_labels,
+                line_colors=args.line_colors,
+            )
+            plot_source_label = str(gui_settings_path)
+        _launch_profile_plot_gui(
+            args=args,
+            source_path=gui_settings_path,
+            profile_key=_PLOT_PROFILE_DENSITY,
+            setting_keys=_PLOT_SETTINGS_DENSITY_KEYS,
+            gui_title="LiNaK Plot Controls: Density",
+            plot_source_label=plot_source_label,
+            analysis_name="density",
+            profile=plot_profiles,
+            plotter=plot_density_profiles,
+            plotter_kwargs={
+                "x_mode": args.x_mode,
+                "quantity": args.quantity,
+            },
+        )
+        LOGGER.info("Density GUI plotting session finished in %.2f s.", perf_counter() - start)
+        return 0
+
+    _saved_path, rendered_state = _render_profile_plot(
+        args=args,
+        source=plot_source_label,
+        analysis_name="density",
+        profile=plot_profiles,
+        plotter=plot_density_profiles,
+        plotter_kwargs={
+            "x_mode": args.x_mode,
+            "quantity": args.quantity,
+        },
+    )
+    candidate = _collect_plot_settings_for_persistence(
+        args, keys=_PLOT_SETTINGS_DENSITY_KEYS
+    )
+    candidate = _merge_rendered_plot_state(
+        candidate,
+        rendered_state,
+        keys=_PLOT_SETTINGS_DENSITY_KEYS,
+    )
+    _persist_plot_settings_with_resolution(
+        source_path=persistence_source_path,
+        profile_key=_PLOT_PROFILE_DENSITY,
+        existing_settings=persistence_existing_settings,
+        candidate_settings=candidate,
+    )
+
+    LOGGER.info("Density plotting finished in %.2f s.", perf_counter() - start)
+    return 0
+
+
+def _handle_plot_msd(args: argparse.Namespace) -> int:
+    start = perf_counter()
+    LOGGER.info("Starting MSD plotting.")
+    sources = _resolve_plot_hdf5_sources(args, command_name="linak plot msd")
+    settings_source_path = _resolve_plot_settings_source_path(
+        sources,
+        setting_source_token=getattr(args, "settings_source", None),
+    )
+    saved_plot_settings = _apply_saved_plot_settings(
+        args=args,
+        source_path=settings_source_path,
+        profile_key=_PLOT_PROFILE_MSD,
+        keys=_PLOT_SETTINGS_MSD_KEYS,
+    )
+    if len(sources) > 1:
+        LOGGER.info("Processing %d MSD HDF5 input file(s).", len(sources))
+        LOGGER.info("Using '%s' as plot-settings source.", settings_source_path)
+    persistence_source_path = settings_source_path
+    persistence_existing_settings = saved_plot_settings
+
+    if args.dry_run:
+        if args.output:
+            render_target = f"save plot to {Path(args.output).expanduser()}"
+        elif args.show:
+            render_target = f"interactive display via backend {args.backend}"
+        else:
+            render_target = "no render target (--no-show without --output)"
+
+        plan = [
+            "input mode: HDF5 only",
+            f"sources ({len(sources)}): {_summarize_sources(sources)}",
+            f"species={args.species}",
+            f"plot-settings source: {settings_source_path}",
+            f"render target: {render_target}",
+        ]
+        _log_dry_run_plan("plot msd", plan)
+        LOGGER.info("MSD plotting dry run finished in %.2f s.", perf_counter() - start)
+        return 0
+
+    from .msd import (
+        load_msd_profiles,
+        plot_msd_profiles,
+    )
+
+    profiles_by_source: list[tuple[str, list]] = []
+    for source in sources:
+        profiles = load_msd_profiles(source, species=args.species)
+        profiles_by_source.append((source, profiles))
+
+    plot_profiles = []
+    fallback_labels_by_source: list[list[str]] = []
+    if len(sources) > 1:
+        for source, profiles in profiles_by_source:
+            source_label = Path(source).name or source
+            source_labels: list[str] = []
+            for profile in profiles:
+                rendered_species = f"{source_label}:{profile.species}"
+                source_labels.append(rendered_species)
+                plot_profiles.append(replace(profile, species=rendered_species))
+            fallback_labels_by_source.append(source_labels)
+    else:
+        flattened = _flatten_profiles_by_source(profiles_by_source)
+        plot_profiles.extend(flattened)
+        fallback_labels_by_source.append([profile.species for profile in flattened])
+
+    _apply_effective_series_settings(
+        args=args,
+        sources=sources,
+        profile_key=_PLOT_PROFILE_MSD,
+        fallback_labels_by_source=fallback_labels_by_source,
+    )
+
+    plot_source_label = sources[0] if len(sources) == 1 else "multi_source_msd"
+    if len(sources) > 1 and not args.gui:
+        persistence_source_path = _combine_analysis_hdf5_sources(
+            sources=sources,
+            analysis="msd",
+            output=None,
+            settings_source_path=None,
+        )
+        persistence_existing_settings = None
+        LOGGER.info(
+            "Created combined MSD HDF5 for multi-source plot settings: '%s'.",
+            persistence_source_path,
+        )
+        plot_source_label = str(persistence_source_path)
+
+    if args.gui:
+        gui_settings_path = settings_source_path
+        if len(sources) > 1:
+            gui_settings_path = _combine_analysis_hdf5_sources(
+                sources=sources,
+                analysis="msd",
+                output=None,
+                settings_source_path=settings_source_path,
+            )
+            LOGGER.info(
+                "Created combined MSD HDF5 for GUI controls: '%s'.",
+                gui_settings_path,
+            )
+            _persist_effective_series_settings(
+                source_path=gui_settings_path,
+                profile_key=_PLOT_PROFILE_MSD,
+                series_labels=args.series_labels,
+                line_colors=args.line_colors,
+            )
+            plot_source_label = str(gui_settings_path)
+        _launch_profile_plot_gui(
+            args=args,
+            source_path=gui_settings_path,
+            profile_key=_PLOT_PROFILE_MSD,
+            setting_keys=_PLOT_SETTINGS_MSD_KEYS,
+            gui_title="LiNaK Plot Controls: MSD",
+            plot_source_label=plot_source_label,
+            analysis_name="msd",
+            profile=plot_profiles,
+            plotter=plot_msd_profiles,
+        )
+        LOGGER.info("MSD GUI plotting session finished in %.2f s.", perf_counter() - start)
+        return 0
+
+    _saved_path, rendered_state = _render_profile_plot(
+        args=args,
+        source=plot_source_label,
+        analysis_name="msd",
+        profile=plot_profiles,
+        plotter=plot_msd_profiles,
+    )
+    candidate = _collect_plot_settings_for_persistence(args, keys=_PLOT_SETTINGS_MSD_KEYS)
+    candidate = _merge_rendered_plot_state(
+        candidate,
+        rendered_state,
+        keys=_PLOT_SETTINGS_MSD_KEYS,
+    )
+    _persist_plot_settings_with_resolution(
+        source_path=persistence_source_path,
+        profile_key=_PLOT_PROFILE_MSD,
+        existing_settings=persistence_existing_settings,
+        candidate_settings=candidate,
+    )
+
+    LOGGER.info("MSD plotting finished in %.2f s.", perf_counter() - start)
+    return 0
+
+
+def _handle_plot_rdf(args: argparse.Namespace) -> int:
+    start = perf_counter()
+    LOGGER.info("Starting RDF plotting.")
+    sources = _resolve_plot_hdf5_sources(args, command_name="linak plot rdf")
+    settings_source_path = _resolve_plot_settings_source_path(
+        sources,
+        setting_source_token=getattr(args, "settings_source", None),
+    )
+    saved_plot_settings = _apply_saved_plot_settings(
+        args=args,
+        source_path=settings_source_path,
+        profile_key=_PLOT_PROFILE_RDF,
+        keys=_PLOT_SETTINGS_RDF_KEYS,
+    )
+    if len(sources) > 1:
+        LOGGER.info("Processing %d RDF HDF5 input file(s).", len(sources))
+        LOGGER.info("Using '%s' as plot-settings source.", settings_source_path)
+    persistence_source_path = settings_source_path
+    persistence_existing_settings = saved_plot_settings
+
+    species_b = args.species_b if args.species_b is not None else args.species_a
+    if args.dry_run:
+        if args.output:
+            render_target = f"save plot to {Path(args.output).expanduser()}"
+        elif args.show:
+            render_target = f"interactive display via backend {args.backend}"
+        else:
+            render_target = "no render target (--no-show without --output)"
+
+        plan = [
+            "input mode: HDF5 only",
+            f"sources ({len(sources)}): {_summarize_sources(sources)}",
+            f"species_a={args.species_a}, species_b={species_b}",
+            f"plot-settings source: {settings_source_path}",
+            f"render target: {render_target}",
+        ]
+        _log_dry_run_plan("plot rdf", plan)
+        LOGGER.info("RDF plotting dry run finished in %.2f s.", perf_counter() - start)
+        return 0
+
+    from .rdf import (
+        load_rdf_profiles,
+        plot_rdf_profiles,
+    )
+
+    profiles_by_source: list[tuple[str, list]] = []
+    for source in sources:
+        profiles = load_rdf_profiles(source, species_a=args.species_a, species_b=species_b)
+        profiles_by_source.append((source, profiles))
+
+    plot_profiles = []
+    fallback_labels_by_source: list[list[str]] = []
+    if len(sources) > 1:
+        for source, profiles in profiles_by_source:
+            source_label = Path(source).name or source
+            source_labels: list[str] = []
+            for profile in profiles:
+                rendered_species_a = f"{source_label}:{profile.species_a}"
+                source_labels.append(f"{rendered_species_a}-{profile.species_b}")
+                plot_profiles.append(replace(profile, species_a=rendered_species_a))
+            fallback_labels_by_source.append(source_labels)
+    else:
+        flattened = _flatten_profiles_by_source(profiles_by_source)
+        plot_profiles.extend(flattened)
+        fallback_labels_by_source.append(
+            [f"{profile.species_a}-{profile.species_b}" for profile in flattened]
+        )
+
+    _apply_effective_series_settings(
+        args=args,
+        sources=sources,
+        profile_key=_PLOT_PROFILE_RDF,
+        fallback_labels_by_source=fallback_labels_by_source,
+    )
+
+    plot_source_label = sources[0] if len(sources) == 1 else "multi_source_rdf"
+    if len(sources) > 1 and not args.gui:
+        persistence_source_path = _combine_analysis_hdf5_sources(
+            sources=sources,
+            analysis="rdf",
+            output=None,
+            settings_source_path=None,
+        )
+        persistence_existing_settings = None
+        LOGGER.info(
+            "Created combined RDF HDF5 for multi-source plot settings: '%s'.",
+            persistence_source_path,
+        )
+        plot_source_label = str(persistence_source_path)
+
+    if args.gui:
+        gui_settings_path = settings_source_path
+        if len(sources) > 1:
+            gui_settings_path = _combine_analysis_hdf5_sources(
+                sources=sources,
+                analysis="rdf",
+                output=None,
+                settings_source_path=settings_source_path,
+            )
+            LOGGER.info(
+                "Created combined RDF HDF5 for GUI controls: '%s'.",
+                gui_settings_path,
+            )
+            _persist_effective_series_settings(
+                source_path=gui_settings_path,
+                profile_key=_PLOT_PROFILE_RDF,
+                series_labels=args.series_labels,
+                line_colors=args.line_colors,
+            )
+            plot_source_label = str(gui_settings_path)
+        _launch_profile_plot_gui(
+            args=args,
+            source_path=gui_settings_path,
+            profile_key=_PLOT_PROFILE_RDF,
+            setting_keys=_PLOT_SETTINGS_RDF_KEYS,
+            gui_title="LiNaK Plot Controls: RDF",
+            plot_source_label=plot_source_label,
+            analysis_name="rdf",
+            profile=plot_profiles,
+            plotter=plot_rdf_profiles,
+        )
+        LOGGER.info("RDF GUI plotting session finished in %.2f s.", perf_counter() - start)
+        return 0
+
+    _saved_path, rendered_state = _render_profile_plot(
+        args=args,
+        source=plot_source_label,
+        analysis_name="rdf",
+        profile=plot_profiles,
+        plotter=plot_rdf_profiles,
+    )
+    candidate = _collect_plot_settings_for_persistence(args, keys=_PLOT_SETTINGS_RDF_KEYS)
+    candidate = _merge_rendered_plot_state(
+        candidate,
+        rendered_state,
+        keys=_PLOT_SETTINGS_RDF_KEYS,
+    )
+    _persist_plot_settings_with_resolution(
+        source_path=persistence_source_path,
+        profile_key=_PLOT_PROFILE_RDF,
+        existing_settings=persistence_existing_settings,
+        candidate_settings=candidate,
+    )
+
+    LOGGER.info("RDF plotting finished in %.2f s.", perf_counter() - start)
+    return 0
+
+
+def _handle_compute_density(args: argparse.Namespace) -> int:
+    start = perf_counter()
+    LOGGER.info("Starting density compute.")
+    _resolve_single_source_argument(
+        args,
+        positional_attr="trajectory",
+        source_label="trajectory input file",
+    )
+
+    if args.dry_run:
+        source_path = Path(args.trajectory).expanduser().resolve()
+        cell_preview = _describe_cell_resolution_preview(
+            args.trajectory,
+            cell=_normalize_cell_args(args),
+            input_path=args.input,
+        )
+        if args.output:
+            output_preview = str(Path(args.output).expanduser().resolve())
+        elif args.species.lower() == "all":
+            output_preview = str(
+                source_path.parent
+                / f"{source_path.stem or 'trajectory'}_density_<species>_{args.axis.lower()}.h5"
+            )
+        else:
+            output_preview = str(
+                _default_density_hdf5_output_path(args.trajectory, args.species, args.axis)
+            )
+
+        plan = [
+            f"trajectory source: {source_path}",
+            (
+                f"species={args.species}, axis={args.axis}, bin_width={args.bin_width}, "
+                f"surface_mode={args.surface_mode}, "
+                f"surface_elements={args.surface_elements if args.surface_elements else 'auto'}, "
+                f"include_fixed_surface_atoms={args.include_fixed_surface_atoms}"
+            ),
+            (
+                "density mode: volumetric if a periodic cell is available after resolution, "
+                "otherwise linear fallback"
+            ),
+            f"cell resolution: {cell_preview}",
+            f"output HDF5 target: {output_preview}",
+        ]
+        _log_dry_run_plan("compute density", plan)
+        LOGGER.info("Density compute dry run finished in %.2f s.", perf_counter() - start)
+        return 0
+
+    from .density import compute_density_profiles, save_density_profile
+    from .io import read_trajectory
+
+    frames = read_trajectory(args.trajectory)
+    _maybe_apply_density_cell(
+        frames,
+        args.trajectory,
+        cell=_normalize_cell_args(args),
+        input_path=args.input,
+    )
+    profiles = compute_density_profiles(
+        frames=frames,
+        species=args.species,
+        axis=args.axis,
+        bin_width=args.bin_width,
+        surface_mode=args.surface_mode,
+        surface_elements=args.surface_elements,
+        include_fixed_surface_atoms=args.include_fixed_surface_atoms,
+    )
+    outputs = _density_hdf5_output_paths(
+        args.output,
+        args.trajectory,
+        profiles,
+        axis=args.axis,
+    )
+    for profile, output in zip(profiles, outputs):
+        save_density_profile(profile, output)
+
+    LOGGER.info("Density compute finished in %.2f s.", perf_counter() - start)
+    return 0
+
+
+def _handle_compute_msd(args: argparse.Namespace) -> int:
+    start = perf_counter()
+    LOGGER.info("Starting MSD compute.")
+    _resolve_single_source_argument(
+        args,
+        positional_attr="trajectory",
+        source_label="trajectory input file",
+    )
+
+    if args.dry_run:
+        source_path = Path(args.trajectory).expanduser().resolve()
+        resolved_cell, cell_source = _preview_resolve_cell_without_trajectory_read(
+            args.trajectory,
+            cell=_normalize_cell_args(args),
+            input_path=args.input,
+        )
+        resolved_timestep_fs, timestep_source = _preview_resolve_msd_timestep_without_trajectory_read(
+            args.trajectory,
+            timestep_fs=args.timestep_fs,
+            input_path=args.input,
+        )
+        output_preview = str(
+            Path(args.output).expanduser().resolve()
+            if args.output
+            else _default_msd_hdf5_output_path(args.trajectory, args.species)
+        )
+
+        if resolved_cell is None:
+            cell_preview = (
+                "unresolved from input/cache sources; execution may still use "
+                "trajectory-embedded periodic cell after loading frames"
+            )
+        else:
+            cell_preview = (
+                f"resolved {resolved_cell[0]:.6g} {resolved_cell[1]:.6g} "
+                f"{resolved_cell[2]:.6g} Angstrom ({cell_source})"
+            )
+
+        plan = [
+            f"trajectory source: {source_path}",
+            f"species={args.species}",
+            f"cell resolution: {cell_preview}",
+            f"timestep resolution: {resolved_timestep_fs:.6g} fs ({timestep_source})",
+            f"output HDF5 target: {output_preview}",
+        ]
+        _log_dry_run_plan("compute msd", plan)
+        LOGGER.info("MSD compute dry run finished in %.2f s.", perf_counter() - start)
+        return 0
+
+    from .io import read_trajectory
+    from .msd import compute_msd, save_msd_profile
+
+    frames = read_trajectory(args.trajectory)
+    _resolve_and_apply_required_cell(
+        frames,
+        args.trajectory,
+        cell=_normalize_cell_args(args),
+        input_path=args.input,
+        analysis_name="MSD",
+    )
+    timestep_fs = _resolve_msd_timestep_fs(
+        args.trajectory,
+        timestep_fs=args.timestep_fs,
+        input_path=args.input,
+        frames=frames,
+    )
+    profile = compute_msd(
+        frames=frames,
+        species=args.species,
+        timestep_fs=timestep_fs,
+    )
+    output = args.output or _default_msd_hdf5_output_path(
+        args.trajectory,
+        profile.species,
+    )
+    save_msd_profile(profile, output)
+
+    LOGGER.info("MSD compute finished in %.2f s.", perf_counter() - start)
+    return 0
+
+
+def _handle_compute_rdf(args: argparse.Namespace) -> int:
+    start = perf_counter()
+    LOGGER.info("Starting RDF compute.")
+    _resolve_single_source_argument(
+        args,
+        positional_attr="trajectory",
+        source_label="trajectory input file",
+    )
+
+    if args.dry_run:
+        source_path = Path(args.trajectory).expanduser().resolve()
+        resolved_cell, cell_source = _preview_resolve_cell_without_trajectory_read(
+            args.trajectory,
+            cell=_normalize_cell_args(args),
+            input_path=args.input,
+        )
+        if resolved_cell is None:
+            cell_preview = (
+                "unresolved from input/cache sources; execution may still use "
+                "trajectory-embedded periodic cell after loading frames"
+            )
+            r_max_preview = (
+                f"{args.r_max:.6g} (explicit)"
+                if args.r_max is not None
+                else "auto (resolved from loaded trajectory cell at execution)"
+            )
+        else:
+            cell_preview = f"resolved {_format_cell_values(resolved_cell)} ({cell_source})"
+            r_max_preview = (
+                f"{args.r_max:.6g} (explicit)"
+                if args.r_max is not None
+                else f"{0.5 * min(resolved_cell):.6g} (half min resolved cell length)"
+            )
+        species_b = args.species_b if args.species_b is not None else args.species_a
+        output_preview = str(
+            Path(args.output).expanduser().resolve()
+            if args.output
+            else _default_rdf_hdf5_output_path(args.trajectory, args.species_a, species_b)
+        )
+        plan = [
+            f"trajectory source: {source_path}",
+            (
+                f"species_a={args.species_a}, species_b={species_b}, r_max="
+                f"{args.r_max if args.r_max is not None else 'auto'}, bin_width={args.bin_width}, "
+                f"threads={args.threads if args.threads is not None else 'auto'}"
+            ),
+            f"cell resolution: {cell_preview}",
+            f"r_max resolution: {r_max_preview}",
+            f"output HDF5 target: {output_preview}",
+        ]
+        _log_dry_run_plan("compute rdf", plan)
+        LOGGER.info("RDF compute dry run finished in %.2f s.", perf_counter() - start)
+        return 0
+
+    from .io import read_trajectory
+    from .rdf import compute_rdf, save_rdf_profile
+
+    frames = read_trajectory(args.trajectory)
+    _resolve_and_apply_required_cell(
+        frames,
+        args.trajectory,
+        cell=_normalize_cell_args(args),
+        input_path=args.input,
+        analysis_name="RDF",
+    )
+    profile = compute_rdf(
+        frames=frames,
+        species_a=args.species_a,
+        species_b=args.species_b,
+        r_max=args.r_max,
+        bin_width=args.bin_width,
+        threads=args.threads,
+    )
+    output = args.output or _default_rdf_hdf5_output_path(
+        args.trajectory,
+        profile.species_a,
+        profile.species_b,
+    )
+    save_rdf_profile(profile, output)
+
+    LOGGER.info("RDF compute finished in %.2f s.", perf_counter() - start)
+    return 0
+
+
+def _handle_compute_potential(args: argparse.Namespace) -> int:
+    start = perf_counter()
+    LOGGER.info("Starting potential compute.")
+
+    from .potential import (
+        PotentialCsvAppender,
+        PotentialConfig,
+        compute_potential_records,
+        error_record_for_source,
+        plan_potential_csv_output,
+        summarize_potential_statistics,
+        validate_hartree_cube_source,
+    )
+
+    raw_sources = _resolve_plot_sources(args)
+    if len(raw_sources) > 1:
+        LOGGER.info("Received %d potential input file(s).", len(raw_sources))
+
+    validated_sources: list[str] = []
+    duplicate_sources: list[str] = []
+    seen_sources: set[str] = set()
+    for source in raw_sources:
+        resolved = validate_hartree_cube_source(source)
+        key = str(resolved)
+        if key in seen_sources:
+            duplicate_sources.append(key)
+            continue
+        seen_sources.add(key)
+        validated_sources.append(key)
+
+    if not validated_sources:
+        raise ValueError("No unique valid Hartree cube inputs were provided.")
+
+    default_output = _default_potential_hdf5_output_for_sources(validated_sources)
+    if args.output:
+        from .hdf5_utils import resolve_hdf5_output_path
+
+        output_target = resolve_hdf5_output_path(args.output)
+    else:
+        output_target = default_output
+
+    if args.dry_run:
+        plan = [
+            f"validated input files: {len(validated_sources)}",
+            (
+                f"skipped duplicates from CLI input: {len(duplicate_sources)}"
+                if duplicate_sources
+                else "skipped duplicates from CLI input: 0"
+            ),
+            "already present in HDF5 and would be skipped: not inspected in dry-run",
+            "files that would be computed: not inspected in dry-run",
+            (f"water_padding_ang={args.water_padding_ang}, cshe_offset_ev={args.cshe_offset_ev}"),
+            f"threads={args.threads if args.threads is not None else 'auto'}, strict={'yes' if args.strict else 'no'}",
+            f"HDF5 requested target: {_compact_path_for_log(output_target)}",
+            "HDF5 actual target (append/fallback behavior): not inspected in dry-run",
+            (
+                "dry-run behavior: inputs validated, no file contents inspected, "
+                "no compute executed, no file written"
+            ),
+        ]
+        _log_dry_run_plan("compute potential", plan)
+        LOGGER.info("Potential compute dry run finished in %.2f s.", perf_counter() - start)
+        return 0
+
+    hdf5_plan_preview = plan_potential_csv_output(
+        output_target,
+        append=args.append,
+        overwrite=args.overwrite,
+    )
+    existing_sources = (
+        hdf5_plan_preview.existing_source_keys if (args.append and not args.overwrite) else set()
+    )
+    skip_existing = [source for source in validated_sources if source in existing_sources]
+    sources_to_compute = [source for source in validated_sources if source not in existing_sources]
+
+    config = PotentialConfig(
+        water_padding_ang=args.water_padding_ang,
+        cshe_offset_ev=args.cshe_offset_ev,
+    )
+
+    if duplicate_sources:
+        LOGGER.info("Skipping %d duplicate CLI input file(s).", len(duplicate_sources))
+        LOGGER.debug("Duplicate input files skipped: %s", duplicate_sources)
+    if skip_existing:
+        LOGGER.info(
+            "Skipping %d input file(s) already present in '%s'.",
+            len(skip_existing),
+            _compact_path_for_log(
+                hdf5_plan_preview.target_path if hdf5_plan_preview.mode == "a" else output_target
+            ),
+        )
+        LOGGER.debug("HDF5-existing source keys skipped: %s", skip_existing)
+    if hdf5_plan_preview.used_fallback_path:
+        LOGGER.warning(
+            "HDF5 target switched to fallback '%s'.",
+            _compact_path_for_log(hdf5_plan_preview.target_path),
+        )
+        LOGGER.debug("HDF5 fallback target path: %s", hdf5_plan_preview.target_path)
+
+    if not sources_to_compute:
+        LOGGER.info("No new input files to compute after pre-checks. HDF5 left unchanged.")
+        LOGGER.info("Potential compute finished in %.2f s.", perf_counter() - start)
+        return 0
+
+    with PotentialCsvAppender(
+        output=output_target,
+        append=args.append,
+        overwrite=args.overwrite,
+        sync_on_write=True,
+    ) as csv_appender:
+        if csv_appender.used_fallback_path and csv_appender.path != hdf5_plan_preview.target_path:
+            LOGGER.warning(
+                "HDF5 write fallback in use: '%s'.",
+                _compact_path_for_log(csv_appender.path),
+            )
+            LOGGER.debug("HDF5 appender fallback path: %s", csv_appender.path)
+
+        def _persist_record(record: PotentialRecord) -> None:
+            csv_appender.append_record(record)
+
+        def _persist_failure(failure: PotentialComputationFailure) -> None:
+            if not args.include_failures:
+                return
+            csv_appender.append_record(error_record_for_source(failure.source, failure.error))
+
+        records, failures = compute_potential_records(
+            sources_to_compute,
+            config=config,
+            threads=args.threads,
+            on_record=_persist_record,
+            on_failure=_persist_failure,
+        )
+
+        rows_written = csv_appender.rows_written
+        write_path = csv_appender.path
+        write_used_fallback = csv_appender.used_fallback_path
+
+    if failures:
+        for failure in failures:
+            LOGGER.error(
+                "Potential compute failed for '%s': %s",
+                _compact_path_for_log(failure.source),
+                failure.error,
+            )
+            LOGGER.debug("Potential compute failure source: %s", failure.source)
+
+    if not records and not (args.include_failures and failures):
+        raise ValueError("No potential records were produced for HDF5 export.")
+    if write_used_fallback:
+        LOGGER.warning(
+            "Used fallback HDF5 path for this run: '%s'.",
+            _compact_path_for_log(write_path),
+        )
+        LOGGER.debug("Write-result fallback path: %s", write_path)
+
+    stats = summarize_potential_statistics(records)
+    for key, label in (
+        ("efermi_ev", "E_Fermi"),
+        ("water_bulk_potential_ev", "Water bulk potential"),
+        ("electrode_cshe_ev", "Electrode potential cSHE"),
+    ):
+        mean, std, count = stats[key]
+        if count == 0 or mean is None or std is None:
+            LOGGER.info("%s avg+-std (n=%d): NA", label, count)
+        else:
+            LOGGER.info("%s avg+-std (n=%d): %.6f +- %.6f eV", label, count, mean, std)
+
+    incomplete_count = sum(1 for record in records if not record.is_complete())
+    if incomplete_count:
+        LOGGER.warning(
+            "Computed %d incomplete potential row(s) (missing E_Fermi and/or water bulk and/or cSHE).",
+            incomplete_count,
+        )
+
+    if not records:
+        LOGGER.error("No potential source completed successfully.")
+        LOGGER.info("Potential compute finished in %.2f s.", perf_counter() - start)
+        return 1
+
+    if args.strict and (failures or incomplete_count):
+        LOGGER.error(
+            "Strict mode enabled: failing run due to %d failure(s) and %d incomplete row(s).",
+            len(failures),
+            incomplete_count,
+        )
+        LOGGER.info("Potential compute finished in %.2f s.", perf_counter() - start)
+        return 1
+
+    LOGGER.info(
+        "Potential compute finished in %.2f s. rows=%d success=%d errors=%d skipped_existing=%d.",
+        perf_counter() - start,
+        rows_written,
+        len(records),
+        len(failures),
+        len(skip_existing),
+    )
+    return 0
+
+
+def _handle_apply_pbc(args: argparse.Namespace) -> int:
+    start = perf_counter()
+    LOGGER.info("Starting PBC application.")
+    _resolve_single_source_argument(
+        args,
+        positional_attr="trajectory",
+        source_label="trajectory input file",
+    )
+    output_path = _resolve_apply_output_path(args)
+
+    if args.dry_run:
+        cell_preview = _describe_cell_resolution_preview(
+            args.trajectory,
+            cell=_normalize_cell_args(args),
+            input_path=args.input,
+        )
+        plan = [
+            f"input trajectory: {Path(args.trajectory).expanduser().resolve()}",
+            f"output trajectory: {output_path}",
+            f"overwrite input: {'yes' if args.overwrite else 'no'}",
+            f"cell resolution: {cell_preview}",
+            "operation: wrap atom positions into resolved orthorhombic periodic cell",
+        ]
+        _log_dry_run_plan("apply pbc", plan)
+        LOGGER.info("PBC dry run finished in %.2f s.", perf_counter() - start)
+        return 0
+
+    from .io import read_trajectory, write_trajectory
+    from .pbc import apply_pbc_to_frames, resolve_cell_dimensions
+
+    frames = read_trajectory(args.trajectory)
+
+    cell_arg = _normalize_cell_args(args)
+    if cell_arg is None and args.input is None and _frames_have_usable_periodic_cell(frames):
+        cell = _cell_lengths_from_frame(frames[0])
+        LOGGER.info(
+            "Using periodic cell already present in trajectory: A=%.6g, B=%.6g, C=%.6g Angstrom.",
+            cell[0],
+            cell[1],
+            cell[2],
+        )
+    else:
+        cell = resolve_cell_dimensions(
+            output_path=output_path,
+            input_path=args.input,
+            cell=cell_arg,
+        )
+    LOGGER.info(
+        "Using orthorhombic cell lengths: A=%.6g, B=%.6g, C=%.6g Angstrom.",
+        cell[0],
+        cell[1],
+        cell[2],
+    )
+
+    wrapped_frames = apply_pbc_to_frames(frames, cell)
+    write_trajectory(wrapped_frames, output_path)
+
+    LOGGER.info("PBC application finished in %.2f s.", perf_counter() - start)
+    return 0
+
+
+def _handle_apply_compress(args: argparse.Namespace) -> int:
+    start = perf_counter()
+    LOGGER.info("Starting CP2K output compression.")
+    _resolve_single_source_argument(
+        args,
+        positional_attr="output_file",
+        source_label="CP2K output file",
+    )
+
+    from .compress import (
+        build_parser_options_from_drop_sections,
+        compress_cp2k_output,
+        default_backup_dir_for_input,
+    )
+
+    input_path = Path(args.output_file).expanduser().resolve()
+    backup_dir = (
+        Path(args.backup_dir).expanduser().resolve()
+        if args.backup_dir
+        else default_backup_dir_for_input(input_path).resolve()
+    )
+    output_target = input_path.with_suffix("")
+    drop_sections = sorted(set(args.drop or []))
+
+    if args.dry_run:
+        dropped_text = ", ".join(drop_sections) if drop_sections else "none"
+        plan = [
+            f"input CP2K output: {input_path}",
+            f"output directory target: {output_target} (auto-unique suffix if path exists)",
+            f"backup directory: {backup_dir}",
+            "backup file naming: compress_output__<timestamp>__<stem>__<digest>.out",
+            f"optional outputs dropped: {dropped_text}",
+            (
+                "generated artifacts: README.txt, manifest.json, summary.txt, CSV extracts "
+                "(SCF/charges/forces/MD), setup/performance/warning notes, and backup_info.txt"
+            ),
+            "original .out handling: moved to backup directory with sidecar .meta.json",
+        ]
+        _log_dry_run_plan("apply compress", plan)
+        LOGGER.info("Compression dry run finished in %.2f s.", perf_counter() - start)
+        return 0
+
+    options = build_parser_options_from_drop_sections(drop_sections)
+    result = compress_cp2k_output(
+        input_path,
+        backup_dir=backup_dir,
+        options=options,
+    )
+    LOGGER.info(
+        "Compression finished in %.2f s. generated=%d skipped=%d output=%s backup=%s",
+        perf_counter() - start,
+        result.generated_count,
+        result.skipped_count,
+        result.output_dir,
+        result.backup_path,
+    )
+    print(result.output_dir)
+    return 0
+
+
+def _find_primary_command_index(argv: list[str]) -> int | None:
+    command_index = None
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token in {"--log-level", "--log-file"}:
+            index += 2
+            continue
+        if token.startswith("--log-level=") or token.startswith("--log-file="):
+            index += 1
+            continue
+        if token.startswith("-"):
+            index += 1
+            continue
+        command_index = index
+        break
+    return command_index
+
+
+def _rewrite_implicit_plot_csv(argv: list[str]) -> list[str]:
+    """Allow ``linak plot`` with implicit analysis/table dispatch for HDF5 sources."""
+    if not argv:
+        return argv
+
+    command_index = _find_primary_command_index(argv)
+    if command_index is None:
+        return argv
+    if argv[command_index] != "plot":
+        return argv
+    if len(argv) <= command_index + 1:
+        return argv
+
+    known_subcommands = {"density", "msd", "rdf"}
+    next_token = argv[command_index + 1]
+    if next_token in known_subcommands or next_token in {"-h", "--help"}:
+        return argv
+
+    trailing_tokens = argv[command_index + 1 :]
+    source_tokens: list[str] = []
+
+    if next_token in {"-f", "--files"}:
+        index = command_index + 2
+        while index < len(argv):
+            candidate = argv[index]
+            if candidate.startswith("-"):
+                break
+            source_tokens.append(candidate)
+            index += 1
+    else:
+        file_option_index = None
+        for index, token in enumerate(trailing_tokens):
+            if token in {"-f", "--files"}:
+                file_option_index = index
+                break
+        if file_option_index is not None:
+            index = command_index + 1 + file_option_index + 1
+            while index < len(argv):
+                candidate = argv[index]
+                if candidate.startswith("-"):
+                    break
+                source_tokens.append(candidate)
+                index += 1
+        else:
+            hdf5_positional = next(
+                (
+                    token
+                    for token in trailing_tokens
+                    if not token.startswith("-")
+                    and Path(token).suffix.lower() in {".h5", ".hdf5"}
+                ),
+                None,
+            )
+            if hdf5_positional is not None:
+                source_tokens = [hdf5_positional]
+
+    if not source_tokens:
+        return argv
+
+    if any(Path(token).suffix.lower() not in {".h5", ".hdf5"} for token in source_tokens):
+        return argv
+
+    detected_subcommand = _resolve_auto_plot_analysis_from_sources(source_tokens)
+
+    rewritten = list(argv)
+    if detected_subcommand in {"density", "msd", "rdf"}:
+        rewritten.insert(command_index + 1, detected_subcommand)
+    else:
+        rewritten[command_index] = _TABULAR_COMMAND
+        rewritten.insert(command_index + 1, "plot")
+    return rewritten
+
+
+def _rewrite_implicit_csv_interactive(argv: list[str]) -> list[str]:
+    """Allow ``linak hdf5 /path/to/file.h5`` as shorthand for ``hdf5 interactive``."""
+    if not argv:
+        return argv
+
+    command_index = _find_primary_command_index(argv)
+    if command_index is None:
+        return argv
+    if argv[command_index] not in _TABULAR_COMMAND_TOKENS:
+        return argv
+    if len(argv) <= command_index + 1:
+        return argv
+
+    known_subcommands = {
+        "interactive",
+        "info",
+        "preview",
+        "get",
+        "sort",
+        "filter",
+        "dedupe",
+        "combine",
+        "plot",
+        "plot-settings",
+    }
+    next_token = argv[command_index + 1]
+    if next_token in known_subcommands or next_token in {"-h", "--help"}:
+        return argv
+
+    rewritten = list(argv)
+    rewritten.insert(command_index + 1, "interactive")
+    return rewritten
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI entry point used by the ``linak`` console script."""
+    runtime_argv = list(argv) if argv is not None else sys.argv[1:]
+    runtime_argv = _rewrite_implicit_plot_csv(runtime_argv)
+    runtime_argv = _rewrite_implicit_csv_interactive(runtime_argv)
+    parser = build_parser()
+    args = parser.parse_args(runtime_argv)
+    args._runtime_argv = tuple(runtime_argv)
+    configure_logging(level=args.log_level, log_file=args.log_file)
+    _log_run_banner(args, runtime_argv)
+    try:
+        return args.handler(args)
+    except Exception as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

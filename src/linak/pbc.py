@@ -1,0 +1,337 @@
+"""PBC application helpers."""
+
+from __future__ import annotations
+
+import logging
+from pathlib import Path
+import re
+
+from ase import Atoms
+
+from .lammps import (
+    extract_cell_from_lammps_input,
+    extract_frame_timestep_fs_from_lammps_input,
+)
+from .progress import ProgressBar
+from .utils import ensure_positive
+
+LOGGER = logging.getLogger(__name__)
+SUPPORTED_SIM_INPUT_SUFFIXES = (".inp", ".lmp")
+
+_ABC_PATTERN = re.compile(
+    r"^\s*ABC(?:\s+\[[^\]]+\])?\s+"
+    r"([+-]?\d*\.?\d+(?:[eE][+-]?\d+)?)\s+"
+    r"([+-]?\d*\.?\d+(?:[eE][+-]?\d+)?)\s+"
+    r"([+-]?\d*\.?\d+(?:[eE][+-]?\d+)?)\s*$",
+    re.IGNORECASE,
+)
+_TIMESTEP_PATTERN = re.compile(
+    r"^\s*TIMESTEP(?:\s+\[([^\]]+)\])?\s+"
+    r"([+-]?\d*\.?\d+(?:[eE][+-]?\d+)?)\s*$",
+    re.IGNORECASE,
+)
+_SECTION_START_PATTERN = re.compile(r"^\s*&([A-Za-z_][A-Za-z0-9_]*)\b", re.IGNORECASE)
+_SECTION_END_PATTERN = re.compile(r"^\s*&END(?:\s+([A-Za-z_][A-Za-z0-9_]*))?\b", re.IGNORECASE)
+_MD_EACH_PATTERN = re.compile(r"^\s*MD\s+([+-]?\d+)\s*$", re.IGNORECASE)
+
+
+def _normalize_input_path(path: str | Path) -> Path:
+    input_path = Path(path).expanduser().resolve()
+    if not input_path.exists():
+        raise FileNotFoundError(f"Simulation input file not found: {input_path}")
+    if not input_path.is_file():
+        raise ValueError(f"Simulation input path is not a file: {input_path}")
+    return input_path
+
+
+def find_unique_simulation_input(search_dir: str | Path) -> Path:
+    """Find exactly one supported simulation input file in a directory."""
+    directory = Path(search_dir).expanduser().resolve()
+    if not directory.exists():
+        raise FileNotFoundError(f"Directory not found for simulation input search: {directory}")
+    if not directory.is_dir():
+        raise ValueError(f"Expected a directory for simulation input search, got: {directory}")
+
+    candidates = sorted(
+        path
+        for path in directory.iterdir()
+        if path.is_file() and path.suffix.lower() in SUPPORTED_SIM_INPUT_SUFFIXES
+    )
+    if not candidates:
+        supported = ", ".join(SUPPORTED_SIM_INPUT_SUFFIXES)
+        raise FileNotFoundError(
+            f"No simulation input file ({supported}) found in '{directory}'. "
+            "Provide --input or --cell A B C."
+        )
+    if len(candidates) > 1:
+        names = ", ".join(path.name for path in candidates)
+        raise ValueError(
+            f"Multiple simulation input files found in '{directory}': {names}. "
+            "Provide --input to choose one file, or --cell A B C."
+        )
+    return candidates[0]
+
+
+def find_unique_cp2k_input(search_dir: str | Path) -> Path:
+    """Find exactly one CP2K input file in a directory."""
+    directory = Path(search_dir).expanduser().resolve()
+    if not directory.exists():
+        raise FileNotFoundError(f"Directory not found for CP2K input search: {directory}")
+    if not directory.is_dir():
+        raise ValueError(f"Expected a directory for CP2K input search, got: {directory}")
+
+    candidates = sorted(
+        path for path in directory.iterdir() if path.is_file() and path.suffix.lower() == ".inp"
+    )
+    if not candidates:
+        raise FileNotFoundError(
+            f"No CP2K .inp file found in '{directory}'. "
+            "Provide --input /path/to/input.inp or --cell A B C."
+        )
+    if len(candidates) > 1:
+        names = ", ".join(path.name for path in candidates)
+        raise ValueError(
+            f"Multiple CP2K .inp files found in '{directory}': {names}. "
+            "Provide --input to choose one file, or --cell A B C."
+        )
+    return candidates[0]
+
+
+def extract_cell_from_simulation_input(path: str | Path) -> tuple[float, float, float]:
+    """Extract orthorhombic cell dimensions from a CP2K or LAMMPS input file."""
+    input_path = _normalize_input_path(path)
+    suffix = input_path.suffix.lower()
+    if suffix == ".lmp":
+        return extract_cell_from_lammps_input(input_path)
+    if suffix == ".inp":
+        return extract_cell_from_cp2k_input(input_path)
+    supported = ", ".join(SUPPORTED_SIM_INPUT_SUFFIXES)
+    raise ValueError(
+        f"Unsupported simulation input format '{input_path.suffix}' for '{input_path}'. "
+        f"Supported formats: {supported}."
+    )
+
+
+def extract_cell_from_cp2k_input(path: str | Path) -> tuple[float, float, float]:
+    """Extract orthorhombic `ABC` cell dimensions from a CP2K input file."""
+    input_path = Path(path).expanduser().resolve()
+    if not input_path.exists():
+        raise FileNotFoundError(f"CP2K input file not found: {input_path}")
+    if not input_path.is_file():
+        raise ValueError(f"CP2K input path is not a file: {input_path}")
+
+    with input_path.open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            no_comment = line.split("!", 1)[0].strip()
+            if not no_comment:
+                continue
+            match = _ABC_PATTERN.match(no_comment)
+            if not match:
+                continue
+
+            cell = (
+                float(match.group(1)),
+                float(match.group(2)),
+                float(match.group(3)),
+            )
+            ensure_positive("cell_a", cell[0])
+            ensure_positive("cell_b", cell[1])
+            ensure_positive("cell_c", cell[2])
+            LOGGER.info(
+                "Parsed CP2K ABC cell from '%s' line %d: %.6g %.6g %.6g Angstrom.",
+                input_path,
+                line_number,
+                cell[0],
+                cell[1],
+                cell[2],
+            )
+            return cell
+
+    raise ValueError(
+        f"No valid 'ABC ...' line found in CP2K input file '{input_path}'. "
+        "Provide --input with a valid file or --cell A B C."
+    )
+
+
+def extract_timestep_fs_from_cp2k_input(path: str | Path) -> float:
+    """Extract a CP2K `TIMESTEP` value in fs from an input file."""
+    input_path = Path(path).expanduser().resolve()
+    if not input_path.exists():
+        raise FileNotFoundError(f"CP2K input file not found: {input_path}")
+    if not input_path.is_file():
+        raise ValueError(f"CP2K input path is not a file: {input_path}")
+
+    with input_path.open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            no_comment = line.split("!", 1)[0].strip()
+            if not no_comment:
+                continue
+            match = _TIMESTEP_PATTERN.match(no_comment)
+            if not match:
+                continue
+
+            unit = (match.group(1) or "").strip().lower()
+            if unit and unit != "fs":
+                raise ValueError(
+                    f"Unsupported TIMESTEP unit '{unit}' in '{input_path}' line {line_number}. "
+                    "Only [fs] is supported."
+                )
+
+            timestep_fs = float(match.group(2))
+            ensure_positive("timestep_fs", timestep_fs)
+            LOGGER.info(
+                "Parsed CP2K TIMESTEP from '%s' line %d: %.6g fs.",
+                input_path,
+                line_number,
+                timestep_fs,
+            )
+            return timestep_fs
+
+    raise ValueError(
+        f"No valid 'TIMESTEP ...' line found in CP2K input file '{input_path}'. "
+        "Provide --timestep-fs explicitly."
+    )
+
+
+def extract_trajectory_stride_md_from_cp2k_input(path: str | Path) -> int:
+    """Extract `&TRAJECTORY / &EACH / MD N` stride from a CP2K input file.
+
+    Returns 1 when no explicit MD stride is configured.
+    """
+    input_path = Path(path).expanduser().resolve()
+    if not input_path.exists():
+        raise FileNotFoundError(f"CP2K input file not found: {input_path}")
+    if not input_path.is_file():
+        raise ValueError(f"CP2K input path is not a file: {input_path}")
+
+    sections: list[str] = []
+    with input_path.open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            no_comment = line.split("!", 1)[0].strip()
+            if not no_comment:
+                continue
+
+            section_end = _SECTION_END_PATTERN.match(no_comment)
+            if section_end:
+                name = section_end.group(1)
+                if name:
+                    expected = name.upper()
+                    for idx in range(len(sections) - 1, -1, -1):
+                        if sections[idx] == expected:
+                            sections = sections[:idx]
+                            break
+                elif sections:
+                    sections.pop()
+                continue
+
+            section_start = _SECTION_START_PATTERN.match(no_comment)
+            if section_start:
+                sections.append(section_start.group(1).upper())
+                continue
+
+            if "TRAJECTORY" not in sections or "EACH" not in sections:
+                continue
+
+            match = _MD_EACH_PATTERN.match(no_comment)
+            if not match:
+                continue
+
+            stride_md = int(match.group(1))
+            if stride_md <= 0:
+                raise ValueError(
+                    f"Invalid TRAJECTORY/EACH MD value '{stride_md}' in '{input_path}' line {line_number}."
+                )
+            LOGGER.info(
+                "Parsed CP2K TRAJECTORY stride from '%s' line %d: every %d MD step(s).",
+                input_path,
+                line_number,
+                stride_md,
+            )
+            return stride_md
+
+    LOGGER.info(
+        "No explicit TRAJECTORY/EACH MD stride found in '%s'; using default MD 1.",
+        input_path,
+    )
+    return 1
+
+
+def extract_frame_timestep_fs_from_cp2k_input(path: str | Path) -> tuple[float, float, int]:
+    """Extract per-frame timestep from CP2K input as `TIMESTEP [fs] * EACH MD`."""
+    input_path = Path(path).expanduser().resolve()
+    md_timestep_fs = extract_timestep_fs_from_cp2k_input(input_path)
+    stride_md = extract_trajectory_stride_md_from_cp2k_input(input_path)
+    frame_timestep_fs = md_timestep_fs * float(stride_md)
+    ensure_positive("frame_timestep_fs", frame_timestep_fs)
+    LOGGER.info(
+        "Resolved frame timestep from '%s': %.6g fs (TIMESTEP %.6g fs x MD %d).",
+        input_path,
+        frame_timestep_fs,
+        md_timestep_fs,
+        stride_md,
+    )
+    return frame_timestep_fs, md_timestep_fs, stride_md
+
+
+def extract_frame_timestep_fs_from_simulation_input(path: str | Path) -> tuple[float, float, int]:
+    """Extract per-frame timestep from a CP2K or LAMMPS input file."""
+    input_path = _normalize_input_path(path)
+    suffix = input_path.suffix.lower()
+    if suffix == ".lmp":
+        return extract_frame_timestep_fs_from_lammps_input(input_path)
+    if suffix == ".inp":
+        return extract_frame_timestep_fs_from_cp2k_input(input_path)
+    supported = ", ".join(SUPPORTED_SIM_INPUT_SUFFIXES)
+    raise ValueError(
+        f"Unsupported simulation input format '{input_path.suffix}' for '{input_path}'. "
+        f"Supported formats: {supported}."
+    )
+
+
+def resolve_cell_dimensions(
+    *,
+    output_path: str | Path,
+    input_path: str | Path | None = None,
+    cell: tuple[float, float, float] | None = None,
+) -> tuple[float, float, float]:
+    """Resolve cell dimensions from explicit arguments or simulation input discovery."""
+    if input_path is not None and cell is not None:
+        raise ValueError("Use either --input or --cell, not both.")
+
+    if cell is not None:
+        ensure_positive("cell_a", cell[0])
+        ensure_positive("cell_b", cell[1])
+        ensure_positive("cell_c", cell[2])
+        return cell
+
+    if input_path is not None:
+        return extract_cell_from_simulation_input(input_path)
+
+    out_path = Path(output_path).expanduser().resolve()
+    auto_input = find_unique_simulation_input(out_path.parent)
+    return extract_cell_from_simulation_input(auto_input)
+
+
+def apply_pbc_to_frames(
+    frames: list[Atoms],
+    cell: tuple[float, float, float],
+) -> list[Atoms]:
+    """Apply orthorhombic PBC and wrap atom positions into the unit cell."""
+    if not frames:
+        raise ValueError("At least one trajectory frame is required.")
+
+    ensure_positive("cell_a", cell[0])
+    ensure_positive("cell_b", cell[1])
+    ensure_positive("cell_c", cell[2])
+
+    wrapped_frames: list[Atoms] = []
+    with ProgressBar(desc="Applying PBC", total=len(frames), unit="frame") as progress:
+        for frame in frames:
+            wrapped = frame.copy()
+            wrapped.set_cell(cell)
+            wrapped.set_pbc((True, True, True))
+            wrapped.wrap(eps=1e-12)
+            wrapped_frames.append(wrapped)
+            progress.update()
+
+    return wrapped_frames

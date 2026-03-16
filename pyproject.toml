@@ -1,0 +1,82 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "LiNaK"
+version = "0.5.5"
+description = "Lightweight molecular dynamics trajectory analysis toolkit."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "R.S. Kort" }]
+keywords = ["molecular-dynamics", "trajectory-analysis", "materials-science", "chemistry", "cp2k"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Scientific/Engineering :: Chemistry",
+  "Topic :: Scientific/Engineering :: Physics",
+]
+dependencies = [
+  "ase>=3.22",
+  "numpy>=1.24",
+  "matplotlib>=3.7",
+  "pandas>=2.1",
+  "h5py>=3.10",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=7.0",
+  "ruff>=0.6.0",
+  "mypy>=1.8.0",
+]
+
+[project.scripts]
+linak = "linak.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+license-files = ["LICENSE"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+src = ["src", "tests"]
+extend-exclude = ["build", "src/LiNaK.egg-info"]
+
+[tool.ruff.lint]
+select = ["E", "F", "B", "UP"]
+ignore = ["E501"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"
+
+[tool.mypy]
+python_version = "3.10"
+files = ["src/linak", "tests"]
+check_untyped_defs = false
+disallow_incomplete_defs = false
+follow_imports = "silent"
+ignore_missing_imports = true
+no_site_packages = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_configs = true
+warn_unused_ignores = true
