@@ -77,6 +77,35 @@ def _iter_first_level_datasets(group: Any) -> list[tuple[str, Any]]:
     ]
 
 
+def _iter_first_level_groups(group: Any) -> list[tuple[str, Any]]:
+    return [
+        (str(name), node)
+        for name, node in group.items()
+        if hasattr(node, "items") and getattr(node, "shape", None) is None
+    ]
+
+
+def _has_row_like_dataset(items: list[tuple[str, Any]]) -> bool:
+    for _name, node in items:
+        shape = getattr(node, "shape", None)
+        if shape is None:
+            continue
+        if len(shape) > 0:
+            return True
+    return False
+
+
+def _group_has_row_like_first_level(group: Any) -> bool:
+    return _has_row_like_dataset(_iter_first_level_datasets(group))
+
+
+def _group_has_tabular_members(group: Any) -> bool:
+    for _name, member in _iter_first_level_groups(group):
+        if _group_has_row_like_first_level(member):
+            return True
+    return False
+
+
 def _resolve_container(handle: Any, *, group: str | None) -> tuple[Any, str]:
     if group:
         normalized = group.strip().strip("/")
@@ -91,18 +120,31 @@ def _resolve_container(handle: Any, *, group: str | None) -> tuple[Any, str]:
 
     if "records" in handle and hasattr(handle["records"], "items"):
         datasets = _iter_first_level_datasets(handle["records"])
-        if datasets:
+        if _has_row_like_dataset(datasets):
             return handle["records"], "/records"
 
     root_datasets = _iter_first_level_datasets(handle)
-    if root_datasets:
+    if _has_row_like_dataset(root_datasets):
         return handle, "/"
 
-    for name, node in handle.items():
-        if hasattr(node, "items"):
-            datasets = _iter_first_level_datasets(node)
-            if datasets:
-                return node, f"/{name}"
+    visible_groups = [
+        (name, node)
+        for name, node in _iter_first_level_groups(handle)
+        if not name.startswith("_")
+    ]
+    hidden_groups = [
+        (name, node)
+        for name, node in _iter_first_level_groups(handle)
+        if name.startswith("_")
+    ]
+
+    for name, node in [*visible_groups, *hidden_groups]:
+        if _group_has_row_like_first_level(node):
+            return node, f"/{name}"
+
+    for name, node in [*visible_groups, *hidden_groups]:
+        if _group_has_tabular_members(node):
+            return node, f"/{name}"
 
     raise ValueError(
         f"No tabular datasets found in '{handle.filename}'. "
@@ -119,6 +161,35 @@ def _row_count_from_datasets(datasets: list[tuple[str, np.ndarray]]) -> int:
     if not counter:
         raise ValueError("Selected HDF5 group has no row-like datasets.")
     return max(counter.items(), key=lambda item: (item[1], item[0]))[0]
+
+
+def _member_sort_key(name: str) -> tuple[int, int | str]:
+    return (0, int(name)) if name.isdigit() else (1, name)
+
+
+def _frame_data_from_datasets(
+    datasets: list[tuple[str, np.ndarray]],
+) -> tuple[dict[str, np.ndarray], int, list[str]]:
+    row_count = _row_count_from_datasets(datasets)
+    frame_data: dict[str, np.ndarray] = {}
+    skipped: list[str] = []
+    for name, values in datasets:
+        if values.ndim == 0:
+            skipped.append(f"{name} (scalar)")
+            continue
+        if int(values.shape[0]) != row_count:
+            skipped.append(f"{name} (rows={values.shape[0]})")
+            continue
+
+        if values.ndim == 1:
+            frame_data[name] = _decode_array(values)
+            continue
+
+        flattened = values.reshape(row_count, -1)
+        for index in range(flattened.shape[1]):
+            column_name = f"{name}[{index}]"
+            frame_data[column_name] = _decode_array(flattened[:, index])
+    return frame_data, row_count, skipped
 
 
 def _safe_int(value: Any) -> int | None:
@@ -216,8 +287,6 @@ def read_hdf5_frame(
         with h5py.File(source_path, "r") as handle:
             container, container_label = _resolve_container(handle, group=group)
             raw_items = _iter_first_level_datasets(container)
-            if not raw_items:
-                raise ValueError(f"No datasets found in group '{container_label}' for '{source_path}'.")
 
             attrs = {
                 str(key): _decode_attr_value(value)
@@ -225,35 +294,56 @@ def read_hdf5_frame(
             }
             metadata = _metadata_from_attrs(attrs)
 
-            datasets = [(name, np.asarray(dataset)) for name, dataset in raw_items]
-            row_count = _row_count_from_datasets(datasets)
+            frame: pd.DataFrame
+            skipped: list[str]
+            if _has_row_like_dataset(raw_items):
+                datasets = [(name, np.asarray(dataset)) for name, dataset in raw_items]
+                frame_data, row_count, skipped = _frame_data_from_datasets(datasets)
+                if not frame_data:
+                    raise ValueError(
+                        f"Could not build a tabular view from '{source_path}'. "
+                        "All datasets were non-row-aligned scalars or incompatible shapes."
+                    )
+                frame = pd.DataFrame(frame_data)
+            else:
+                member_groups = [
+                    (name, node)
+                    for name, node in _iter_first_level_groups(container)
+                    if _group_has_row_like_first_level(node)
+                ]
+                if not member_groups:
+                    if raw_items:
+                        raise ValueError(
+                            f"Could not build a tabular view from '{source_path}'. "
+                            "All datasets were scalar values."
+                        )
+                    raise ValueError(
+                        f"No datasets found in group '{container_label}' for '{source_path}'."
+                    )
 
-            frame_data: dict[str, np.ndarray] = {}
-            skipped: list[str] = []
-            for name, values in datasets:
-                if values.ndim == 0:
-                    skipped.append(f"{name} (scalar)")
-                    continue
-                if int(values.shape[0]) != row_count:
-                    skipped.append(f"{name} (rows={values.shape[0]})")
-                    continue
+                member_frames: list[pd.DataFrame] = []
+                skipped = []
+                for member_index, (member_name, member_group) in enumerate(
+                    sorted(member_groups, key=lambda item: _member_sort_key(item[0]))
+                ):
+                    member_items = _iter_first_level_datasets(member_group)
+                    datasets = [(name, np.asarray(dataset)) for name, dataset in member_items]
+                    member_data, _member_rows, member_skipped = _frame_data_from_datasets(datasets)
+                    if not member_data:
+                        continue
+                    member_frame = pd.DataFrame(member_data)
+                    member_frame.insert(0, "profile_index", member_index)
+                    member_frames.append(member_frame)
+                    skipped.extend(f"{member_name}/{item}" for item in member_skipped)
 
-                if values.ndim == 1:
-                    frame_data[name] = _decode_array(values)
-                    continue
+                if not member_frames:
+                    raise ValueError(
+                        f"Could not build a tabular view from '{source_path}'. "
+                        "No member groups contained row-aligned datasets."
+                    )
+                frame = pd.concat(member_frames, ignore_index=True, sort=False)
+                row_count = int(len(frame))
 
-                flattened = values.reshape(row_count, -1)
-                for index in range(flattened.shape[1]):
-                    column_name = f"{name}[{index}]"
-                    frame_data[column_name] = _decode_array(flattened[:, index])
-
-            if not frame_data:
-                raise ValueError(
-                    f"Could not build a tabular view from '{source_path}'. "
-                    "All datasets were non-row-aligned scalars or incompatible shapes."
-                )
-
-            frame = pd.DataFrame(frame_data)
             info = HDF5TableInfo(
                 source_path=source_path,
                 analysis=str(attrs.get("analysis", "")),

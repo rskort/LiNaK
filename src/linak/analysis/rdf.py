@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor
 from collections.abc import Mapping
 from dataclasses import dataclass
+from itertools import repeat
 import logging
 import os
 from pathlib import Path
@@ -21,7 +22,20 @@ from ..storage.hdf5_utils import (
     read_linak_hdf5_profiles,
     write_linak_hdf5,
 )
-from ..plot.plotting import DEFAULT_PLOT_STYLE, PlotStyle, plot_line_series, plot_multi_line_series
+from .binning import (
+    reconstruct_uniform_bin_edges_from_centers,
+    resolve_uniform_bin_width_for_load,
+    uniform_bin_width_from_edges,
+)
+from .schema import build_profile_metadata, default_plot_labels
+from ..plot.plotting import (
+    DEFAULT_PLOT_STYLE,
+    PlotStyle,
+    plot_line_series,
+    plot_multi_line_series,
+    resolve_series_labels,
+    resolve_single_series_options,
+)
 from ..progress import ProgressBar
 from ..utils import ensure_positive
 
@@ -29,6 +43,9 @@ LOGGER = logging.getLogger(__name__)
 _NEIGHBORLIST_DENSITY_THRESHOLD = 0.25
 _SELECTED_MATRIX_FRACTION_THRESHOLD = 0.40
 _DEFAULT_RDF_THREAD_CAP = 4
+_RDF_MIN_PARALLEL_FRAMES_PER_WORKER = 4
+_RDF_MIN_CHUNK_SIZE = 16
+_RDF_MAX_CHUNK_SIZE = 128
 
 
 @dataclass(frozen=True)
@@ -41,6 +58,32 @@ class RDFProfile:
     bin_centers: np.ndarray
     g_r: np.ndarray
     n_frames: int
+
+
+@dataclass(frozen=True)
+class _RDFSelectionCache:
+    """Stable per-frame selection metadata reused when atom identities do not change."""
+
+    mask_a: np.ndarray
+    mask_b: np.ndarray
+    indices_a: np.ndarray
+    indices_b: np.ndarray
+    count_a: int
+    count_b: int
+
+
+@dataclass(frozen=True)
+class _RDFWorkerConfig:
+    """Shared RDF worker configuration for one chunk of frames."""
+
+    label_a: str
+    label_b: str
+    same_selection: bool
+    r_max: float
+    bin_edges: np.ndarray
+    shell_volumes: np.ndarray
+    max_sphere_volume: float
+    selection_cache: _RDFSelectionCache | None = None
 
 
 def _normalize_species(species: str | None) -> str:
@@ -173,6 +216,86 @@ def _resolve_rdf_worker_count(threads: int | None, n_frames: int) -> int:
     return min(threads, max(1, n_frames))
 
 
+def _build_uniform_rdf_bins(
+    *,
+    r_max: float,
+    target_bin_width: float,
+) -> tuple[np.ndarray, float]:
+    """Construct uniform RDF bin edges that end exactly at ``r_max``."""
+    ratio = r_max / target_bin_width
+    n_bins = max(1, int(np.round(ratio)))
+    effective_bin_width = float(r_max) / float(n_bins)
+    bin_edges = np.linspace(0.0, float(r_max), n_bins + 1, dtype=float)
+    return bin_edges, effective_bin_width
+
+
+def _resolve_rdf_chunk_size(n_frames: int, worker_count: int) -> int:
+    target_chunks = max(worker_count * 8, 1)
+    chunk_size = max(_RDF_MIN_CHUNK_SIZE, (n_frames + target_chunks - 1) // target_chunks)
+    return min(_RDF_MAX_CHUNK_SIZE, chunk_size)
+
+
+def _should_parallelize_rdf(n_frames: int, worker_count: int) -> bool:
+    if worker_count <= 1:
+        return False
+    return n_frames >= max(_RDF_MIN_CHUNK_SIZE, worker_count * _RDF_MIN_PARALLEL_FRAMES_PER_WORKER)
+
+
+def _iter_rdf_frame_chunks(
+    frames: list[Atoms],
+    chunk_size: int,
+) -> list[list[tuple[int, Atoms]]]:
+    return [
+        list(enumerate(frames[start : start + chunk_size], start))
+        for start in range(0, len(frames), chunk_size)
+    ]
+
+
+def _resolve_rdf_selection_cache(
+    frames: list[Atoms],
+    *,
+    label_a: str,
+    label_b: str,
+) -> _RDFSelectionCache | None:
+    """Reuse species selections when atom identities remain fixed across all frames."""
+    if not frames:
+        return None
+    if label_a == "ALL" and label_b == "ALL":
+        return None
+
+    reference_numbers = np.asarray(frames[0].numbers, dtype=int)
+    for frame_index, frame in enumerate(frames[1:], start=1):
+        current_numbers = np.asarray(frame.numbers, dtype=int)
+        if current_numbers.shape != reference_numbers.shape or not np.array_equal(
+            current_numbers, reference_numbers
+        ):
+            LOGGER.warning(
+                "RDF atom identities/order changed at frame %d; "
+                "falling back to per-frame species selection.",
+                frame_index,
+            )
+            return None
+
+    mask_a = _select_mask(reference_numbers, label_a)
+    mask_b = _select_mask(reference_numbers, label_b)
+    indices_a = np.flatnonzero(mask_a)
+    indices_b = np.flatnonzero(mask_b)
+    count_a = int(indices_a.size)
+    count_b = int(indices_b.size)
+    if count_a == 0 or count_b == 0:
+        raise ValueError(
+            f"RDF selection produced no atoms in frame 0 (species_a={label_a}, species_b={label_b})."
+        )
+    return _RDFSelectionCache(
+        mask_a=mask_a,
+        mask_b=mask_b,
+        indices_a=indices_a,
+        indices_b=indices_b,
+        count_a=count_a,
+        count_b=count_b,
+    )
+
+
 def _compute_rdf_frame_contribution(
     frame_index: int,
     frame: Atoms,
@@ -184,6 +307,7 @@ def _compute_rdf_frame_contribution(
     bin_edges: np.ndarray,
     shell_volumes: np.ndarray,
     max_sphere_volume: float,
+    selection_cache: _RDFSelectionCache | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return histogram counts and expected shell counts for one frame."""
     volume = _frame_volume(frame)
@@ -213,10 +337,20 @@ def _compute_rdf_frame_contribution(
         expected = (n_atoms * rho_b) * shell_volumes
         return counts, expected
 
-    mask_a = _select_mask(numbers, label_a)
-    mask_b = _select_mask(numbers, label_b)
-    count_a = int(mask_a.sum())
-    count_b = int(mask_b.sum())
+    if selection_cache is not None:
+        mask_a = selection_cache.mask_a
+        mask_b = selection_cache.mask_b
+        indices_a = selection_cache.indices_a
+        indices_b = selection_cache.indices_b
+        count_a = selection_cache.count_a
+        count_b = selection_cache.count_b
+    else:
+        mask_a = _select_mask(numbers, label_a)
+        mask_b = _select_mask(numbers, label_b)
+        indices_a = np.flatnonzero(mask_a)
+        indices_b = np.flatnonzero(mask_b)
+        count_a = int(indices_a.size)
+        count_b = int(indices_b.size)
     if count_a == 0 or count_b == 0:
         raise ValueError(
             f"RDF selection produced no atoms in frame {frame_index} "
@@ -234,8 +368,6 @@ def _compute_rdf_frame_contribution(
             r_max=r_max,
         )
     else:
-        indices_a = np.flatnonzero(mask_a)
-        indices_b = np.flatnonzero(mask_b)
         if use_selected_matrix:
             sampled_distances = _sample_distances_selected_matrix(
                 frame,
@@ -260,6 +392,31 @@ def _compute_rdf_frame_contribution(
         rho_b = count_b / volume
     expected = (count_a * rho_b) * shell_volumes
     return counts, expected
+
+
+def _compute_rdf_chunk_contributions(
+    chunk: list[tuple[int, Atoms]],
+    config: _RDFWorkerConfig,
+) -> tuple[np.ndarray, np.ndarray, int]:
+    """Compute accumulated RDF contributions for one chunk of frames."""
+    counts_accum = np.zeros(config.bin_edges.size - 1, dtype=float)
+    expected_accum = np.zeros_like(counts_accum)
+    for frame_index, frame in chunk:
+        counts, expected = _compute_rdf_frame_contribution(
+            frame_index,
+            frame,
+            label_a=config.label_a,
+            label_b=config.label_b,
+            same_selection=config.same_selection,
+            r_max=config.r_max,
+            bin_edges=config.bin_edges,
+            shell_volumes=config.shell_volumes,
+            max_sphere_volume=config.max_sphere_volume,
+            selection_cache=config.selection_cache,
+        )
+        counts_accum += counts
+        expected_accum += expected
+    return counts_accum, expected_accum, len(chunk)
 
 
 def compute_rdf(
@@ -290,13 +447,18 @@ def compute_rdf(
 
     ensure_positive("r_max", r_max)
 
-    bin_edges = np.arange(0.0, r_max, bin_width, dtype=float)
-    if bin_edges.size == 0:
-        bin_edges = np.array([0.0], dtype=float)
-    if not np.isclose(bin_edges[-1], r_max):
-        bin_edges = np.append(bin_edges, r_max)
-    if bin_edges.size < 2:
-        bin_edges = np.array([0.0, r_max], dtype=float)
+    requested_bin_width = float(bin_width)
+    bin_edges, effective_bin_width = _build_uniform_rdf_bins(
+        r_max=float(r_max),
+        target_bin_width=requested_bin_width,
+    )
+    if not np.isclose(effective_bin_width, requested_bin_width, rtol=1.0e-9, atol=1.0e-12):
+        LOGGER.info(
+            "Adjusted RDF bin width from %.6g to %.6g Angstrom so uniform bins end at r_max=%.6g.",
+            requested_bin_width,
+            effective_bin_width,
+            r_max,
+        )
 
     counts_accum = np.zeros(bin_edges.size - 1, dtype=float)
     expected_accum = np.zeros_like(counts_accum)
@@ -313,52 +475,57 @@ def compute_rdf(
 
     max_sphere_volume = (4.0 / 3.0) * np.pi * (r_max**3)
     worker_count = _resolve_rdf_worker_count(threads, len(frames))
-    if worker_count > 1:
-        LOGGER.info("Using %d thread(s) for RDF frame processing.", worker_count)
+    selection_cache = _resolve_rdf_selection_cache(frames, label_a=label_a, label_b=label_b)
+    config = _RDFWorkerConfig(
+        label_a=label_a,
+        label_b=label_b,
+        same_selection=same_selection,
+        r_max=r_max,
+        bin_edges=bin_edges,
+        shell_volumes=shell_volumes,
+        max_sphere_volume=max_sphere_volume,
+        selection_cache=selection_cache,
+    )
+
+    use_parallel = _should_parallelize_rdf(len(frames), worker_count)
+    chunk_size = _resolve_rdf_chunk_size(len(frames), worker_count) if use_parallel else len(frames)
+    if use_parallel:
+        LOGGER.info(
+            "Using %d worker process(es) for RDF frame processing (chunk_size=%d).",
+            worker_count,
+            chunk_size,
+        )
     with ProgressBar(
         desc=f"Computing RDF {label_a}-{label_b}", total=len(frames), unit="frame"
     ) as progress:
-        if worker_count == 1:
+        if not use_parallel:
             for i, frame in enumerate(frames):
                 counts, expected = _compute_rdf_frame_contribution(
                     i,
                     frame,
-                    label_a=label_a,
-                    label_b=label_b,
-                    same_selection=same_selection,
-                    r_max=r_max,
-                    bin_edges=bin_edges,
-                    shell_volumes=shell_volumes,
-                    max_sphere_volume=max_sphere_volume,
+                    label_a=config.label_a,
+                    label_b=config.label_b,
+                    same_selection=config.same_selection,
+                    r_max=config.r_max,
+                    bin_edges=config.bin_edges,
+                    shell_volumes=config.shell_volumes,
+                    max_sphere_volume=config.max_sphere_volume,
+                    selection_cache=config.selection_cache,
                 )
                 counts_accum += counts
                 expected_accum += expected
                 progress.update()
         else:
-
-            def _frame_contribution_from_item(
-                item: tuple[int, Atoms],
-            ) -> tuple[np.ndarray, np.ndarray]:
-                frame_index, frame_item = item
-                return _compute_rdf_frame_contribution(
-                    frame_index,
-                    frame_item,
-                    label_a=label_a,
-                    label_b=label_b,
-                    same_selection=same_selection,
-                    r_max=r_max,
-                    bin_edges=bin_edges,
-                    shell_volumes=shell_volumes,
-                    max_sphere_volume=max_sphere_volume,
-                )
-
-            with ThreadPoolExecutor(max_workers=worker_count) as executor:
-                for counts, expected in executor.map(
-                    _frame_contribution_from_item, enumerate(frames)
+            chunks = _iter_rdf_frame_chunks(frames, chunk_size)
+            with ProcessPoolExecutor(max_workers=worker_count) as executor:
+                for counts, expected, processed_frames in executor.map(
+                    _compute_rdf_chunk_contributions,
+                    chunks,
+                    repeat(config),
                 ):
                     counts_accum += counts
                     expected_accum += expected
-                    progress.update()
+                    progress.update(processed_frames)
 
     g_r = np.zeros_like(counts_accum)
     non_zero = expected_accum > 0.0
@@ -373,73 +540,6 @@ def compute_rdf(
         g_r=g_r,
         n_frames=len(frames),
     )
-
-
-def _uniform_bin_width_from_edges(bin_edges: np.ndarray, *, source_label: str) -> float:
-    """Return a uniform bin width from edge coordinates."""
-    if bin_edges.ndim != 1 or bin_edges.size < 2:
-        raise ValueError(f"{source_label} must provide at least two bin edges.")
-    widths = np.diff(np.asarray(bin_edges, dtype=float))
-    if not np.all(np.isfinite(widths)) or np.any(widths <= 0.0):
-        raise ValueError(f"{source_label} contains invalid bin edges.")
-    width = float(widths[0])
-    if not np.allclose(widths, width, rtol=1.0e-9, atol=1.0e-12):
-        raise ValueError(
-            f"{source_label} uses non-uniform bins; LiNaK HDF5 stores uniform bins via bin_width_A."
-        )
-    return width
-
-
-def _resolve_bin_width_for_load(
-    *,
-    metadata: dict[str, object],
-    bin_centers: np.ndarray,
-    source_path: Path,
-) -> float:
-    """Resolve RDF bin width from metadata or infer from equally spaced centers."""
-    raw = metadata.get("bin_width_A")
-    if raw is not None:
-        try:
-            width = float(raw)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(
-                f"RDF HDF5 '{source_path}' has invalid metadata value bin_width_A={raw!r}."
-            ) from exc
-        if not np.isfinite(width) or width <= 0.0:
-            raise ValueError(
-                f"RDF HDF5 '{source_path}' has non-positive bin_width_A={raw!r}."
-            )
-        if bin_centers.size > 1:
-            center_steps = np.diff(bin_centers)
-            if not np.allclose(center_steps, width, rtol=1.0e-6, atol=1.0e-9):
-                raise ValueError(
-                    f"RDF HDF5 '{source_path}' has inconsistent bin_centers_A and bin_width_A."
-                )
-        return width
-
-    if bin_centers.size <= 1:
-        raise ValueError(
-            f"RDF HDF5 '{source_path}' is missing bin_edges_A and bin_width_A; "
-            "cannot reconstruct single-bin edges."
-        )
-    center_steps = np.diff(bin_centers)
-    if not np.all(np.isfinite(center_steps)) or np.any(center_steps <= 0.0):
-        raise ValueError(f"RDF HDF5 '{source_path}' has invalid bin_centers_A spacing.")
-    inferred = float(center_steps[0])
-    if not np.allclose(center_steps, inferred, rtol=1.0e-6, atol=1.0e-9):
-        raise ValueError(
-            f"RDF HDF5 '{source_path}' is missing bin_edges_A/bin_width_A and has non-uniform "
-            "bin_centers_A spacing."
-        )
-    return inferred
-
-
-def _reconstruct_bin_edges_from_centers(bin_centers: np.ndarray, *, bin_width: float) -> np.ndarray:
-    """Reconstruct RDF edge coordinates from centers and uniform bin width."""
-    if bin_centers.ndim != 1 or bin_centers.size == 0:
-        raise ValueError("Cannot reconstruct bin edges from empty or non-1D bin centers.")
-    left_edge = float(bin_centers[0]) - 0.5 * bin_width
-    return left_edge + np.arange(bin_centers.size + 1, dtype=float) * bin_width
 
 
 def save_rdf_profile(
@@ -459,22 +559,20 @@ def save_rdf_profile(
     expected_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
     if not np.allclose(expected_centers, bin_centers, rtol=1.0e-9, atol=1.0e-12):
         raise ValueError("RDF profile bin_centers are inconsistent with bin_edges.")
-    bin_width = _uniform_bin_width_from_edges(
+    bin_width = uniform_bin_width_from_edges(
         bin_edges,
         source_label=f"RDF profile '{profile.species_a}-{profile.species_b}'",
     )
 
-    metadata: dict[str, Any] = {
-        "species_a": profile.species_a,
-        "species_b": profile.species_b,
-        "n_frames": profile.n_frames,
-        "bin_width_A": bin_width,
-        "units": {
-            "bin_width_A": "Angstrom",
-            "bin_centers_A": "Angstrom",
-            "g_r": "dimensionless",
+    metadata = build_profile_metadata(
+        analysis="rdf",
+        metadata={
+            "species_a": profile.species_a,
+            "species_b": profile.species_b,
+            "n_frames": profile.n_frames,
+            "bin_width_A": bin_width,
         },
-    }
+    )
     if additional_metadata:
         metadata.update(dict(additional_metadata))
 
@@ -550,12 +648,16 @@ def load_rdf_profiles(
             if "bin_edges_A" in datasets:
                 bin_edges = np.asarray(datasets["bin_edges_A"], dtype=float)
             else:
-                bin_width = _resolve_bin_width_for_load(
+                bin_width = resolve_uniform_bin_width_for_load(
                     metadata=metadata,
                     bin_centers=bin_centers,
                     source_path=source_path,
+                    analysis_name="RDF",
                 )
-                bin_edges = _reconstruct_bin_edges_from_centers(bin_centers, bin_width=bin_width)
+                bin_edges = reconstruct_uniform_bin_edges_from_centers(
+                    bin_centers,
+                    bin_width=bin_width,
+                )
             if bin_edges.size != bin_centers.size + 1:
                 raise ValueError(
                     f"RDF HDF5 '{source_path}' has incompatible bin_edges_A/bin_centers_A sizes."
@@ -607,37 +709,59 @@ def plot_rdf_profile(
     series_enabled: list[bool] | None = None,
     series_line_widths: list[float | None] | None = None,
     series_markers: list[str | None] | None = None,
+    series_normalization_modes: list[str] | None = None,
+    series_normalization_values: list[float | None] | None = None,
+    series_normalization_x_refs: list[float | None] | None = None,
+    x_bin_width: float | None = None,
+    x_bin_reducer: str | None = None,
     capture_state: dict[str, Any] | None = None,
+    suppress_output_log: bool = False,
+    matplotlib_rc: dict[str, Any] | None = None,
+    figure_kwargs: dict[str, Any] | None = None,
+    axes_kwargs: dict[str, Any] | None = None,
+    line_kwargs: dict[str, Any] | None = None,
+    grid_kwargs: dict[str, Any] | None = None,
+    legend_kwargs: dict[str, Any] | None = None,
+    tick_params_kwargs: dict[str, Any] | None = None,
+    tight_layout_kwargs: dict[str, Any] | None = None,
+    savefig_kwargs: dict[str, Any] | None = None,
 ) -> Path | None:
     """Plot RDF profile using shared LiNaK plotting style."""
+    schema_labels = default_plot_labels("rdf")
+    default_x = "r (Angstrom)" if schema_labels is None else schema_labels[0]
+    default_y = "g(r)" if schema_labels is None else schema_labels[1]
     resolved_label = line_label
     if resolved_label is None and legend:
         resolved_label = f"{profile.species_a}-{profile.species_b}"
-    resolved_line_color = None
-    if line_colors:
-        resolved_line_color = line_colors[0]
-    line_visible = True if not series_enabled else bool(series_enabled[0])
-    line_width_override = None
-    if series_line_widths:
-        line_width_override = series_line_widths[0]
-    line_marker = None
-    if series_markers:
-        line_marker = series_markers[0]
+    single_series = resolve_single_series_options(
+        line_colors=line_colors,
+        series_enabled=series_enabled,
+        series_line_widths=series_line_widths,
+        series_markers=series_markers,
+        series_normalization_modes=series_normalization_modes,
+        series_normalization_values=series_normalization_values,
+        series_normalization_x_refs=series_normalization_x_refs,
+    )
     return plot_line_series(
         profile.bin_centers,
         profile.g_r,
         title=title or f"{profile.species_a}-{profile.species_b} radial distribution function",
-        x_label=x_label or "r (Angstrom)",
-        y_label=y_label or "g(r)",
+        x_label=x_label or default_x,
+        y_label=y_label or default_y,
         output=output,
         show=show,
         show_blocking=show_blocking,
         preferred_backend=preferred_backend,
         line_label=resolved_label,
-        line_color=resolved_line_color,
-        line_width_override=line_width_override,
-        line_marker=line_marker,
-        line_visible=line_visible,
+        line_color=single_series.line_color,
+        line_width_override=single_series.line_width_override,
+        line_marker=single_series.line_marker,
+        line_visible=single_series.line_visible,
+        normalization_mode=single_series.normalization_mode,
+        normalization_value=single_series.normalization_value,
+        normalization_x_ref=single_series.normalization_x_ref,
+        x_bin_width=x_bin_width,
+        x_bin_reducer=x_bin_reducer,
         style=style,
         x_scale=x_scale,
         y_scale=y_scale,
@@ -654,6 +778,16 @@ def plot_rdf_profile(
         legend_title=legend_title,
         legend_loc=legend_loc,
         capture_state=capture_state,
+        matplotlib_rc=matplotlib_rc,
+        figure_kwargs=figure_kwargs,
+        axes_kwargs=axes_kwargs,
+        line_kwargs=line_kwargs,
+        grid_kwargs=grid_kwargs,
+        legend_kwargs=legend_kwargs,
+        tick_params_kwargs=tick_params_kwargs,
+        tight_layout_kwargs=tight_layout_kwargs,
+        savefig_kwargs=savefig_kwargs,
+        suppress_output_log=suppress_output_log,
     )
 
 
@@ -686,22 +820,36 @@ def plot_rdf_profiles(
     series_enabled: list[bool] | None = None,
     series_line_widths: list[float | None] | None = None,
     series_markers: list[str | None] | None = None,
+    series_normalization_modes: list[str] | None = None,
+    series_normalization_values: list[float | None] | None = None,
+    series_normalization_x_refs: list[float | None] | None = None,
+    x_bin_width: float | None = None,
+    x_bin_reducer: str | None = None,
     capture_state: dict[str, Any] | None = None,
+    suppress_output_log: bool = False,
+    matplotlib_rc: dict[str, Any] | None = None,
+    figure_kwargs: dict[str, Any] | None = None,
+    axes_kwargs: dict[str, Any] | None = None,
+    line_kwargs: dict[str, Any] | None = None,
+    series_line_kwargs: list[dict[str, Any] | None] | None = None,
+    grid_kwargs: dict[str, Any] | None = None,
+    legend_kwargs: dict[str, Any] | None = None,
+    tick_params_kwargs: dict[str, Any] | None = None,
+    tight_layout_kwargs: dict[str, Any] | None = None,
+    savefig_kwargs: dict[str, Any] | None = None,
 ) -> Path | None:
     """Plot one or more RDF profiles."""
+    schema_labels = default_plot_labels("rdf")
+    default_x = "r (Angstrom)" if schema_labels is None else schema_labels[0]
+    default_y = "g(r)" if schema_labels is None else schema_labels[1]
     if not profiles:
         raise ValueError("At least one RDF profile is required.")
     default_labels = [f"{profile.species_a}-{profile.species_b}" for profile in profiles]
-    labels = default_labels
-    if series_labels is not None:
-        if len(series_labels) != len(default_labels):
-            raise ValueError(
-                "series_labels count must match the number of plotted RDF series "
-                f"({len(default_labels)})."
-            )
-        labels = [label.strip() for label in series_labels]
-        if any(not label for label in labels):
-            raise ValueError("series_labels cannot contain empty values.")
+    labels = resolve_series_labels(
+        default_labels,
+        series_labels,
+        series_kind="RDF",
+    )
 
     if len(profiles) == 1:
         return plot_rdf_profile(
@@ -733,7 +881,22 @@ def plot_rdf_profiles(
             series_enabled=series_enabled,
             series_line_widths=series_line_widths,
             series_markers=series_markers,
+            series_normalization_modes=series_normalization_modes,
+            series_normalization_values=series_normalization_values,
+            series_normalization_x_refs=series_normalization_x_refs,
+            x_bin_width=x_bin_width,
+            x_bin_reducer=x_bin_reducer,
             capture_state=capture_state,
+            suppress_output_log=suppress_output_log,
+            matplotlib_rc=matplotlib_rc,
+            figure_kwargs=figure_kwargs,
+            axes_kwargs=axes_kwargs,
+            line_kwargs=line_kwargs,
+            grid_kwargs=grid_kwargs,
+            legend_kwargs=legend_kwargs,
+            tick_params_kwargs=tick_params_kwargs,
+            tight_layout_kwargs=tight_layout_kwargs,
+            savefig_kwargs=savefig_kwargs,
         )
 
     return plot_multi_line_series(
@@ -741,8 +904,8 @@ def plot_rdf_profiles(
         [profile.g_r for profile in profiles],
         labels,
         title=title or "Radial distribution function",
-        x_label=x_label or "r (Angstrom)",
-        y_label=y_label or "g(r)",
+        x_label=x_label or default_x,
+        y_label=y_label or default_y,
         output=output,
         show=show,
         show_blocking=show_blocking,
@@ -752,6 +915,11 @@ def plot_rdf_profiles(
         series_enabled=series_enabled,
         series_line_widths=series_line_widths,
         series_markers=series_markers,
+        series_normalization_modes=series_normalization_modes,
+        series_normalization_values=series_normalization_values,
+        series_normalization_x_refs=series_normalization_x_refs,
+        x_bin_width=x_bin_width,
+        x_bin_reducer=x_bin_reducer,
         x_scale=x_scale,
         y_scale=y_scale,
         x_lim=x_lim,
@@ -767,4 +935,15 @@ def plot_rdf_profiles(
         legend_title=legend_title,
         legend_loc=legend_loc,
         capture_state=capture_state,
+        matplotlib_rc=matplotlib_rc,
+        figure_kwargs=figure_kwargs,
+        axes_kwargs=axes_kwargs,
+        line_kwargs=line_kwargs,
+        series_line_kwargs=series_line_kwargs,
+        grid_kwargs=grid_kwargs,
+        legend_kwargs=legend_kwargs,
+        tick_params_kwargs=tick_params_kwargs,
+        tight_layout_kwargs=tight_layout_kwargs,
+        savefig_kwargs=savefig_kwargs,
+        suppress_output_log=suppress_output_log,
     )

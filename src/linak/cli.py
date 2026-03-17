@@ -15,6 +15,7 @@ import re
 import shutil
 import shlex
 import sys
+import tempfile
 import textwrap
 from time import perf_counter
 from typing import Any, Callable, TYPE_CHECKING
@@ -79,6 +80,8 @@ _PERSISTED_PLOT_SETTING_OPTION_FLAGS = {
     "x_label": ("--x-label",),
     "x_lim": ("--x-min", "--x-max"),
     "x_mode": ("--x-mode",),
+    "x_bin_width": ("--x-bin-width",),
+    "x_bin_reducer": ("--x-bin-reducer",),
     "x_scale": ("--x-scale",),
     "x_tick_rotation": ("--x-tick-rotation",),
     "x_ticks": ("--x-ticks",),
@@ -109,6 +112,21 @@ _PLOT_SETTINGS_COMMON_KEYS = (
     "series_enabled",
     "series_line_widths",
     "series_markers",
+    "series_normalization_modes",
+    "series_normalization_values",
+    "series_normalization_x_refs",
+    "x_bin_width",
+    "x_bin_reducer",
+    "matplotlib_rc",
+    "figure_kwargs",
+    "axes_kwargs",
+    "line_kwargs",
+    "series_line_kwargs",
+    "grid_kwargs",
+    "legend_kwargs",
+    "tick_params_kwargs",
+    "tight_layout_kwargs",
+    "savefig_kwargs",
     "legend",
     "legend_title",
     "legend_loc",
@@ -897,6 +915,23 @@ def _add_csv_plot_options(parser: argparse.ArgumentParser) -> None:
         help="Y-axis tick-label rotation in degrees",
     )
 
+    data_group = parser.add_argument_group("Data transforms (plot-only)")
+    data_group.add_argument(
+        "--x-bin-width",
+        type=_positive_float,
+        default=None,
+        help=(
+            "Optional x-bin width for display-only rebinning. "
+            "This does not modify source HDF5 data."
+        ),
+    )
+    data_group.add_argument(
+        "--x-bin-reducer",
+        choices=["mean", "median", "sum", "min", "max"],
+        default=None,
+        help="Reducer applied during x rebinning (default when set: mean).",
+    )
+
     legend_group = parser.add_argument_group("Series labels and legend")
     legend_group.add_argument(
         "--labels",
@@ -1172,55 +1207,6 @@ def _apply_saved_plot_settings(
     return saved
 
 
-def _merge_rendered_plot_state(
-    settings: dict[str, Any],
-    rendered_state: dict[str, Any],
-    *,
-    keys: tuple[str, ...],
-) -> dict[str, Any]:
-    merged = dict(settings)
-    for key in keys:
-        if key in rendered_state and rendered_state[key] is not None:
-            merged[key] = _json_ready_setting(rendered_state[key])
-    return merged
-
-
-_PLOT_SETTINGS_MISSING = object()
-
-
-def _flatten_settings(value: Any, *, prefix: str = "") -> dict[str, Any]:
-    if isinstance(value, dict):
-        flattened: dict[str, Any] = {}
-        for key in sorted(value):
-            child_prefix = f"{prefix}.{key}" if prefix else str(key)
-            flattened.update(_flatten_settings(value[key], prefix=child_prefix))
-        return flattened
-    return {prefix: value}
-
-
-def _settings_differences(existing: dict[str, Any], candidate: dict[str, Any]) -> list[tuple[str, Any, Any]]:
-    existing_flat = _flatten_settings(existing)
-    candidate_flat = _flatten_settings(candidate)
-    all_keys = sorted(set(existing_flat) | set(candidate_flat))
-    differences: list[tuple[str, Any, Any]] = []
-    for key in all_keys:
-        old_value = existing_flat.get(key, _PLOT_SETTINGS_MISSING)
-        new_value = candidate_flat.get(key, _PLOT_SETTINGS_MISSING)
-        if old_value == new_value:
-            continue
-        differences.append((key, old_value, new_value))
-    return differences
-
-
-def _format_settings_value(value: Any) -> str:
-    if value is _PLOT_SETTINGS_MISSING:
-        return "<missing>"
-    rendered = json.dumps(_json_ready_setting(value), sort_keys=True)
-    if len(rendered) <= 120:
-        return rendered
-    return rendered[:117] + "..."
-
-
 def _set_nested_setting(settings: dict[str, Any], dotted_path: str, value: Any) -> None:
     keys = dotted_path.split(".")
     node = settings
@@ -1254,117 +1240,6 @@ def _delete_nested_setting(settings: dict[str, Any], dotted_path: str) -> None:
             del parent[key]
         else:
             break
-
-
-def _prompt_plot_settings_resolution() -> str:
-    _ensure_prompt_capable_terminal()
-    print("")
-    print("Plot settings differ from the profile stored in this HDF5.")
-    print("  [Enter]/y : save new settings")
-    print("  n         : keep existing settings")
-    print("  c         : keep existing file and write new settings to a copy")
-    print("  i         : review each changed setting")
-    while True:
-        choice = input("Choice [Y/n/c/i]: ").strip().lower()
-        if choice in {"", "y", "yes"}:
-            return "save"
-        if choice in {"n", "no"}:
-            return "discard"
-        if choice in {"c", "copy"}:
-            return "copy"
-        if choice in {"i", "interactive"}:
-            return "interactive"
-        print("Please choose: y, n, c, or i.")
-
-
-def _copy_hdf5_for_plot_settings(
-    *,
-    source_path: Path,
-    profile_key: str,
-    settings: dict[str, Any],
-) -> Path:
-    from .plot.plot_settings import write_plot_profile
-
-    default_target = source_path.with_name(f"{source_path.stem}_plot_settings{source_path.suffix}")
-    prompt = f"Copy target path [default: {default_target}]: "
-    raw = input(prompt).strip()
-    target_path = Path(raw).expanduser().resolve() if raw else default_target
-    if target_path.exists() and not _prompt_yes_no(
-        f"Overwrite existing file '{target_path}'", default=False
-    ):
-        raise ValueError("Copy aborted; target file already exists.")
-
-    target_path.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(source_path, target_path)
-    write_plot_profile(target_path, profile_key, settings)
-    return target_path
-
-
-def _persist_plot_settings_with_resolution(
-    *,
-    source_path: Path,
-    profile_key: str,
-    existing_settings: dict[str, Any] | None,
-    candidate_settings: dict[str, Any],
-) -> None:
-    from .plot.plot_settings import write_plot_profile
-
-    if existing_settings is None:
-        write_plot_profile(source_path, profile_key, candidate_settings)
-        LOGGER.info("Saved initial plot settings profile '%s' in '%s'.", profile_key, source_path)
-        return
-
-    differences = _settings_differences(existing_settings, candidate_settings)
-    if not differences:
-        return
-
-    if not _interactive_prompts_available():
-        LOGGER.info(
-            "Plot settings differ for '%s', but interactive prompts are unavailable. "
-            "Keeping existing settings.",
-            source_path,
-        )
-        return
-
-    print("")
-    print(f"Detected {len(differences)} plot-setting change(s):")
-    for key, old_value, new_value in differences:
-        print(f"  {key}")
-        print(f"    old: {_format_settings_value(old_value)}")
-        print(f"    new: {_format_settings_value(new_value)}")
-
-    decision = _prompt_plot_settings_resolution()
-    if decision == "discard":
-        print("Kept existing plot settings.")
-        return
-    if decision == "copy":
-        copied_path = _copy_hdf5_for_plot_settings(
-            source_path=source_path,
-            profile_key=profile_key,
-            settings=candidate_settings,
-        )
-        print(f"Wrote copied HDF5 with new plot settings: {copied_path}")
-        return
-    if decision == "interactive":
-        merged = deepcopy(existing_settings)
-        for key, old_value, new_value in differences:
-            print("")
-            print(f"{key}")
-            print(f"  old: {_format_settings_value(old_value)}")
-            print(f"  new: {_format_settings_value(new_value)}")
-            keep_new = _prompt_yes_no("Keep new value", default=True)
-            if not keep_new:
-                continue
-            if new_value is _PLOT_SETTINGS_MISSING:
-                _delete_nested_setting(merged, key)
-            else:
-                _set_nested_setting(merged, key, new_value)
-        write_plot_profile(source_path, profile_key, merged)
-        print("Saved merged plot settings.")
-        return
-
-    write_plot_profile(source_path, profile_key, candidate_settings)
-    print("Saved updated plot settings.")
 
 
 def _profile_key_from_analysis(analysis: str | None) -> str:
@@ -1578,10 +1453,12 @@ def _add_plot_common_options(parser: argparse.ArgumentParser) -> None:
     render_group = parser.add_argument_group("General plot options")
     render_group.add_argument(
         "--gui",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=None,
         help=(
             "Open an interactive plot-settings window with form controls, preview, and "
-            "save actions."
+            "save actions (default when interactive plotting is enabled). Use --no-gui "
+            "for direct Matplotlib rendering."
         ),
     )
     render_group.add_argument("-o", "--output", help="Output image path (PNG, PDF, SVG, ...)")
@@ -1989,10 +1866,10 @@ def _resolve_msd_timestep_fs(
         if timestep_fs is not None:
             raise
         LOGGER.info(
-            "No timestep resolved for MSD analysis; using default 1.0 fs. %s",
+            "No timestep resolved for MSD analysis; using default 0.5 fs. %s",
             exc,
         )
-        return 1.0, "fallback default", None, None, None
+        return 0.5, "fallback default", None, None, None
 
 
 def _resolve_combined_msd_timestep_fs(timesteps_by_source: list[tuple[str, float]]) -> float:
@@ -2309,6 +2186,13 @@ def _resolve_y_lim(args: argparse.Namespace) -> list[float | None] | None:
     ]
 
 
+def _resolve_gui_mode(args: argparse.Namespace) -> bool:
+    raw = getattr(args, "gui", None)
+    use_gui = bool(getattr(args, "show", True)) if raw is None else bool(raw)
+    args.gui = use_gui
+    return use_gui
+
+
 def _render_profile_plot(
     *,
     args: argparse.Namespace,
@@ -2358,9 +2242,25 @@ def _render_profile_plot(
         "series_enabled": getattr(args, "series_enabled", None),
         "series_line_widths": getattr(args, "series_line_widths", None),
         "series_markers": getattr(args, "series_markers", None),
+        "series_normalization_modes": getattr(args, "series_normalization_modes", None),
+        "series_normalization_values": getattr(args, "series_normalization_values", None),
+        "series_normalization_x_refs": getattr(args, "series_normalization_x_refs", None),
+        "x_bin_width": getattr(args, "x_bin_width", None),
+        "x_bin_reducer": getattr(args, "x_bin_reducer", None),
+        "matplotlib_rc": getattr(args, "matplotlib_rc", None),
+        "figure_kwargs": getattr(args, "figure_kwargs", None),
+        "axes_kwargs": getattr(args, "axes_kwargs", None),
+        "line_kwargs": getattr(args, "line_kwargs", None),
+        "series_line_kwargs": getattr(args, "series_line_kwargs", None),
+        "grid_kwargs": getattr(args, "grid_kwargs", None),
+        "legend_kwargs": getattr(args, "legend_kwargs", None),
+        "tick_params_kwargs": getattr(args, "tick_params_kwargs", None),
+        "tight_layout_kwargs": getattr(args, "tight_layout_kwargs", None),
+        "savefig_kwargs": getattr(args, "savefig_kwargs", None),
         "line_colors": args.line_colors,
         "show_blocking": not bool(getattr(args, "gui", False)),
         "capture_state": captured_state,
+        "suppress_output_log": bool(getattr(args, "_suppress_output_log", False)),
     }
 
     def _render_with_options(show: bool, output: str | Path | None) -> Path | None:
@@ -2369,6 +2269,15 @@ def _render_profile_plot(
             labels = call_kwargs.pop("series_labels", None)
             if isinstance(labels, list) and labels:
                 call_kwargs["line_label"] = str(labels[0])
+            per_series_line_kwargs = call_kwargs.pop("series_line_kwargs", None)
+            if isinstance(per_series_line_kwargs, list) and per_series_line_kwargs:
+                first_kwargs = per_series_line_kwargs[0]
+                if isinstance(first_kwargs, dict):
+                    merged_line_kwargs: dict[str, Any] = {}
+                    if isinstance(call_kwargs.get("line_kwargs"), dict):
+                        merged_line_kwargs.update(dict(call_kwargs["line_kwargs"]))
+                    merged_line_kwargs.update(first_kwargs)
+                    call_kwargs["line_kwargs"] = merged_line_kwargs
         return plotter(
             profile,
             output=output,
@@ -2426,6 +2335,7 @@ def _open_plot_settings_gui(
     on_preview: Callable[[dict[str, Any]], None],
     on_save: Callable[[dict[str, Any]], str],
     on_save_figure: Callable[[dict[str, Any], str], str] | None = None,
+    on_import_hdf5: Callable[[str], dict[str, Any]] | None = None,
 ) -> None:
     from .plot.plot_gui import launch_plot_settings_panel
 
@@ -2435,6 +2345,16 @@ def _open_plot_settings_gui(
         on_preview=on_preview,
         on_save=on_save,
         on_save_figure=on_save_figure,
+        on_import_hdf5=on_import_hdf5,
+    )
+
+
+def _is_gui_preview_output_path(path: str | Path) -> bool:
+    resolved = Path(path).expanduser()
+    return (
+        resolved.parent == Path(tempfile.gettempdir())
+        and resolved.name.startswith("linak_preview_")
+        and resolved.suffix.lower() == ".png"
     )
 
 
@@ -2451,6 +2371,8 @@ def _launch_profile_plot_gui(
     plotter: Callable[..., Path | None],
     plotter_kwargs: dict[str, Any] | None = None,
 ) -> None:
+    from .plot.plot_settings import read_plot_profile
+
     initial_settings = _collect_plot_settings_for_persistence(args, keys=setting_keys)
     initial_settings["series_count"] = len(profile) if isinstance(profile, list) else 1
 
@@ -2482,6 +2404,7 @@ def _launch_profile_plot_gui(
         _apply_gui_settings_to_args(save_args, gui_settings)
         save_args.show = False
         save_args.output = output_path
+        save_args._suppress_output_log = _is_gui_preview_output_path(output_path)
         saved_path, _render_state = _render_profile_plot(
             args=save_args,
             source=plot_source_label,
@@ -2492,7 +2415,21 @@ def _launch_profile_plot_gui(
         )
         if saved_path is None:
             raise ValueError("No output was generated for the requested figure path.")
-        return f"Saved figure PNG to '{saved_path}'."
+        return f"Saved figure to '{saved_path}'."
+
+    def _import_hdf5(source_hdf5_path: str) -> dict[str, Any]:
+        imported_path = Path(source_hdf5_path).expanduser().resolve()
+        imported = read_plot_profile(imported_path, profile_key)
+        if imported is None:
+            raise ValueError(
+                f"No plot settings profile '{profile_key}' found in '{imported_path}'."
+            )
+        LOGGER.info(
+            "Loaded plot settings template from '%s' (%s).",
+            imported_path,
+            profile_key,
+        )
+        return imported
 
     _open_plot_settings_gui(
         title=gui_title,
@@ -2500,6 +2437,7 @@ def _launch_profile_plot_gui(
         on_preview=_preview,
         on_save=_save,
         on_save_figure=_save_figure,
+        on_import_hdf5=_import_hdf5,
     )
 
 
@@ -2519,12 +2457,12 @@ def _handle_root_overview(_args: argparse.Namespace) -> int:
                 "  1) Compute analysis HDF5 from trajectory data",
                 "     linak compute density /path/to/traj.xyz --species O --axis z",
                 "  2) Plot from HDF5 only",
-                "     linak plot density /path/to/traj_density_o_z.h5",
+                "     linak plot /path/to/traj_density_o_z.h5",
                 "",
                 "Fast HDF5 plotting shorthand",
                 (
                     "  linak plot /path/to/data.h5    "
-                    "# auto-detects analysis (density/msd/rdf) from HDF5 metadata, "
+                    "# auto-detects density/msd/rdf from HDF5 metadata, "
                     f"or falls back to: linak {_TABULAR_COMMAND} plot ..."
                 ),
                 "",
@@ -2555,21 +2493,22 @@ def _handle_plot_overview(_args: argparse.Namespace) -> int:
             [
                 "LiNaK Plot Usage (HDF5-only)",
                 "============================",
-                "Plot commands accept only HDF5 inputs generated by `linak compute`.",
+                "Plot accepts LiNaK density/MSD/RDF HDF5 inputs and auto-detects the analysis.",
                 "",
                 "Examples",
                 "  linak compute density /path/to/traj.xyz --species O --axis z",
-                "  linak plot /path/to/traj_density_o_z.h5    # auto-detects density",
+                "  linak plot /path/to/traj_density_o_z.h5",
                 "  linak plot -f run1_density.h5 run2_density.h5 --no-show --output density.png",
-                "  linak plot density /path/to/traj_density_o_z.h5 --output density.png --no-show",
+                "  linak plot /path/to/traj_msd_o.h5 --no-show --output msd.png",
+                "  linak plot /path/to/traj_rdf_o_h.h5 --species-a O --species-b H",
                 "",
-                "Subcommands",
-                "  linak plot density ...",
-                "  linak plot msd ...",
-                "  linak plot rdf ...",
+                "Legacy syntax removed",
+                "  linak plot density ...    # removed",
+                "  linak plot msd ...        # removed",
+                "  linak plot rdf ...        # removed",
                 "",
-                "Generic HDF5 table plotting (fallback when analysis is not density/msd/rdf)",
-                "  linak plot /path/to/data.h5             # auto-detect or table fallback",
+                "Generic HDF5 table plotting",
+                "  linak plot /path/to/data.h5             # falls back to hdf5 plot when not LiNaK analysis",
                 f"  linak {_TABULAR_COMMAND} plot /path/to/data.h5 --help",
             ]
         )
@@ -2691,103 +2630,58 @@ def build_parser() -> argparse.ArgumentParser:
         "plot",
         help="Generate plots from precomputed LiNaK HDF5 data.",
         description=(
-            "Plot LiNaK analysis HDF5 data. "
-            "Trajectory inputs are intentionally not supported here: run `linak compute ...` first."
+            "Plot LiNaK analysis HDF5 data by auto-detecting density, MSD, or RDF from HDF5 "
+            "metadata. If the input HDF5 is not a supported LiNaK analysis file, LiNaK falls "
+            f"back to `{_TABULAR_COMMAND} plot`."
         ),
         epilog=(
-            "Common plotting options are available under each plot subcommand "
-            "(for example: --output, --no-show, --backend, --font-family, "
-            "--title-font-size, --line-width)."
+            "Trajectory inputs are intentionally not supported here: run `linak compute ...` "
+            "first. For generic tabular HDF5 plotting, use `linak hdf5 plot` directly."
         ),
     )
-    plot_parser.set_defaults(handler=_handle_plot_overview)
-    plot_commands = plot_parser.add_subparsers(dest="plot_command", required=False)
-
-    plot_density = plot_commands.add_parser(
-        "density",
-        help="Plot 1D mass-density profiles.",
-        description=(
-            "Plot density from LiNaK density HDF5 input. "
-            "Pass multiple files with -f/--files to overlay all curves in one figure."
-        ),
-    )
-    _add_plot_common_options(plot_density)
+    plot_parser.set_defaults(handler=_handle_plot)
+    _add_plot_common_options(plot_parser)
     _add_plot_source_options(
-        plot_density,
-        help_text="LiNaK density HDF5 input (legacy positional form)",
+        plot_parser,
+        help_text="LiNaK analysis HDF5 input (use `linak hdf5 plot` for generic tables)",
     )
-    plot_density.add_argument(
+    common_analysis_group = plot_parser.add_argument_group("Analysis selection filters")
+    common_analysis_group.add_argument(
         "--species",
         default=None,
-        help="Optional species override for loaded profile labels (default: use file metadata)",
+        help="Optional species override for density/MSD loaded profile labels (default: use file metadata)",
     )
-    plot_density.add_argument(
+    density_group = plot_parser.add_argument_group("Density plot options")
+    density_group.add_argument(
         "--axis",
         choices=["x", "y", "z"],
         default=None,
-        help="Optional axis override for loaded profiles (default: use file metadata)",
+        help="Optional axis override for loaded density profiles (default: use file metadata)",
     )
-    plot_density.add_argument(
+    density_group.add_argument(
         "--x-mode",
         choices=["distance", "axis"],
         default="distance",
         help="Density x-axis mode: distance to surface (default) or raw axis coordinate.",
     )
-    plot_density.add_argument(
+    density_group.add_argument(
         "--quantity",
         choices=["mass", "number"],
         default="mass",
         help="Density quantity to plot (default: mass; use number for atoms/A^3).",
     )
-    _add_dry_run_option(plot_density)
-    plot_density.set_defaults(handler=_handle_plot_density)
-
-    plot_msd = plot_commands.add_parser(
-        "msd",
-        help="Plot mean-squared displacement profiles.",
-        description=(
-            "Plot MSD from LiNaK MSD HDF5 input. "
-            "Pass multiple files with -f/--files to overlay all curves in one figure."
-        ),
-    )
-    _add_plot_common_options(plot_msd)
-    _add_plot_source_options(
-        plot_msd,
-        help_text="LiNaK MSD HDF5 input (legacy positional form)",
-    )
-    plot_msd.add_argument(
-        "--species",
-        default=None,
-        help="Optional species override for loaded profile labels (default: use file metadata)",
-    )
-    _add_dry_run_option(plot_msd)
-    plot_msd.set_defaults(handler=_handle_plot_msd)
-
-    plot_rdf = plot_commands.add_parser(
-        "rdf",
-        help="Plot radial distribution functions.",
-        description=(
-            "Plot RDF from LiNaK RDF HDF5 input. "
-            "Pass multiple files with -f/--files to overlay all curves in one figure."
-        ),
-    )
-    _add_plot_common_options(plot_rdf)
-    _add_plot_source_options(
-        plot_rdf,
-        help_text="LiNaK RDF HDF5 input (legacy positional form)",
-    )
-    plot_rdf.add_argument(
+    rdf_group = plot_parser.add_argument_group("RDF plot options")
+    rdf_group.add_argument(
         "--species-a",
         default=None,
-        help="Optional first-species override (default: use file metadata)",
+        help="Optional first-species override for RDF profiles (default: use file metadata)",
     )
-    plot_rdf.add_argument(
+    rdf_group.add_argument(
         "--species-b",
         default=None,
-        help="Optional second-species override (default: use file metadata or species-a)",
+        help="Optional second-species override for RDF profiles (default: use file metadata or species-a)",
     )
-    _add_dry_run_option(plot_rdf)
-    plot_rdf.set_defaults(handler=_handle_plot_rdf)
+    _add_dry_run_option(plot_parser)
 
     compute_parser = commands.add_parser(
         "compute",
@@ -2878,6 +2772,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     compute_msd = compute_commands.add_parser(
         "msd",
+        aliases=["MSD"],
         help="Compute MSD and save HDF5.",
     )
     compute_msd.add_argument(
@@ -2921,10 +2816,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="HDF5 output path (default: auto-generated .h5)",
     )
     _add_dry_run_option(compute_msd)
-    compute_msd.set_defaults(handler=_handle_compute_msd)
+    compute_msd.set_defaults(handler=_handle_compute_msd, compute_command="msd")
 
     compute_rdf = compute_commands.add_parser(
         "rdf",
+        aliases=["RDF"],
         help="Compute RDF and save HDF5.",
     )
     compute_rdf.add_argument(
@@ -2982,7 +2878,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="HDF5 output path (default: auto-generated .h5)",
     )
     _add_dry_run_option(compute_rdf)
-    compute_rdf.set_defaults(handler=_handle_compute_rdf)
+    compute_rdf.set_defaults(handler=_handle_compute_rdf, compute_command="rdf")
 
     compute_potential = compute_commands.add_parser(
         "potential",
@@ -4452,13 +4348,10 @@ def _handle_csv_plot(args: argparse.Namespace) -> int:
     start = perf_counter()
     LOGGER.info("Starting HDF5 plot.")
     sources = _resolve_csv_plot_sources(args)
-    settings_source_path: Path | None = None
-    saved_plot_settings: dict[str, Any] | None = None
     if len(sources) == 1:
-        settings_source_path = Path(sources[0]).expanduser().resolve()
-        saved_plot_settings = _apply_saved_plot_settings(
+        _apply_saved_plot_settings(
             args=args,
-            source_path=settings_source_path,
+            source_path=Path(sources[0]).expanduser().resolve(),
             profile_key=_PLOT_PROFILE_TABLE,
             keys=_PLOT_SETTINGS_TABLE_KEYS,
         )
@@ -4511,7 +4404,7 @@ def _handle_csv_plot(args: argparse.Namespace) -> int:
         y_columns=y_columns,
     )
 
-    saved_path, rendered_state = _render_csv_plot(
+    saved_path, _rendered_state = _render_csv_plot(
         args=args,
         frames_by_source=frames_by_source,
         x_column=x_column,
@@ -4519,20 +4412,6 @@ def _handle_csv_plot(args: argparse.Namespace) -> int:
     )
     if saved_path is None and not args.show:
         LOGGER.warning("No interactive display or output path requested. Nothing was rendered.")
-
-    if settings_source_path is not None:
-        candidate = _collect_plot_settings_from_args(args, keys=_PLOT_SETTINGS_TABLE_KEYS)
-        candidate = _merge_rendered_plot_state(
-            candidate,
-            rendered_state,
-            keys=_PLOT_SETTINGS_TABLE_KEYS,
-        )
-        _persist_plot_settings_with_resolution(
-            source_path=settings_source_path,
-            profile_key=_PLOT_PROFILE_TABLE,
-            existing_settings=saved_plot_settings,
-            candidate_settings=candidate,
-        )
 
     LOGGER.info("HDF5 plot finished in %.2f s.", perf_counter() - start)
     return 0
@@ -4865,8 +4744,6 @@ def _combine_analysis_hdf5_sources(
         "analysis": analysis,
         "source_files": [str(Path(source).expanduser().resolve()) for source in sources],
     }
-    if settings_source_path is not None:
-        combined_metadata["settings_source"] = str(settings_source_path)
 
     written_path = write_linak_hdf5_profile_collection(
         output_path,
@@ -4899,28 +4776,67 @@ def _resolve_plot_hdf5_sources(args: argparse.Namespace, *, command_name: str) -
     return sources
 
 
+def _legacy_plot_subcommand(args: argparse.Namespace) -> str | None:
+    positional_sources = _normalize_source_values(getattr(args, "source", None))
+    if positional_sources and positional_sources[0] in {"density", "msd", "rdf"}:
+        return positional_sources[0]
+    return None
+
+
+def _handle_plot(args: argparse.Namespace) -> int:
+    if _legacy_plot_subcommand(args) is not None:
+        raise ValueError(
+            "Explicit `linak plot density|msd|rdf` subcommands were removed. "
+            "Use `linak plot /path/to/file.h5` for LiNaK analysis HDF5, or "
+            f"`linak {_TABULAR_COMMAND} plot ...` for generic HDF5 tables."
+        )
+
+    if not _normalize_source_values(getattr(args, "source", None)) and not _normalize_source_values(
+        getattr(args, "files", None)
+    ):
+        return _handle_plot_overview(args)
+
+    sources = _resolve_plot_hdf5_sources(args, command_name="linak plot")
+    detected_analysis = _resolve_auto_plot_analysis_from_sources(sources)
+    if detected_analysis == "density":
+        args.plot_command = "density"
+        return _handle_plot_density(args)
+    if detected_analysis == "msd":
+        args.plot_command = "msd"
+        return _handle_plot_msd(args)
+    if detected_analysis == "rdf":
+        args.plot_command = "rdf"
+        return _handle_plot_rdf(args)
+
+    raise ValueError(
+        "Could not detect a LiNaK density/MSD/RDF analysis from the provided HDF5 input. "
+        f"Use `linak {_TABULAR_COMMAND} plot ...` for generic HDF5 plotting."
+    )
+
+
 def _handle_plot_density(args: argparse.Namespace) -> int:
     start = perf_counter()
     LOGGER.info("Starting density plotting.")
-    sources = _resolve_plot_hdf5_sources(args, command_name="linak plot density")
+    sources = _resolve_plot_hdf5_sources(args, command_name="linak plot")
     settings_source_path = _resolve_plot_settings_source_path(
         sources,
         setting_source_token=getattr(args, "settings_source", None),
     )
-    saved_plot_settings = _apply_saved_plot_settings(
+    _apply_saved_plot_settings(
         args=args,
         source_path=settings_source_path,
         profile_key=_PLOT_PROFILE_DENSITY,
         keys=_PLOT_SETTINGS_DENSITY_KEYS,
     )
+    use_gui = _resolve_gui_mode(args)
     if len(sources) > 1:
         LOGGER.info("Processing %d density HDF5 input file(s).", len(sources))
         LOGGER.info("Using '%s' as plot-settings source.", settings_source_path)
-    persistence_source_path = settings_source_path
-    persistence_existing_settings = saved_plot_settings
 
     if args.dry_run:
-        if args.output:
+        if use_gui:
+            render_target = "interactive GUI controls"
+        elif args.output:
             render_target = f"save plot to {Path(args.output).expanduser()}"
         elif args.show:
             render_target = f"interactive display via backend {args.backend}"
@@ -4975,21 +4891,8 @@ def _handle_plot_density(args: argparse.Namespace) -> int:
     )
 
     plot_source_label = sources[0] if len(sources) == 1 else "multi_source_density"
-    if len(sources) > 1 and not args.gui:
-        persistence_source_path = _combine_analysis_hdf5_sources(
-            sources=sources,
-            analysis="density",
-            output=None,
-            settings_source_path=None,
-        )
-        persistence_existing_settings = None
-        LOGGER.info(
-            "Created combined density HDF5 for multi-source plot settings: '%s'.",
-            persistence_source_path,
-        )
-        plot_source_label = str(persistence_source_path)
 
-    if args.gui:
+    if use_gui:
         gui_settings_path = settings_source_path
         if len(sources) > 1:
             gui_settings_path = _combine_analysis_hdf5_sources(
@@ -5027,7 +4930,7 @@ def _handle_plot_density(args: argparse.Namespace) -> int:
         LOGGER.info("Density GUI plotting session finished in %.2f s.", perf_counter() - start)
         return 0
 
-    _saved_path, rendered_state = _render_profile_plot(
+    _saved_path, _rendered_state = _render_profile_plot(
         args=args,
         source=plot_source_label,
         analysis_name="density",
@@ -5038,20 +4941,6 @@ def _handle_plot_density(args: argparse.Namespace) -> int:
             "quantity": args.quantity,
         },
     )
-    candidate = _collect_plot_settings_for_persistence(
-        args, keys=_PLOT_SETTINGS_DENSITY_KEYS
-    )
-    candidate = _merge_rendered_plot_state(
-        candidate,
-        rendered_state,
-        keys=_PLOT_SETTINGS_DENSITY_KEYS,
-    )
-    _persist_plot_settings_with_resolution(
-        source_path=persistence_source_path,
-        profile_key=_PLOT_PROFILE_DENSITY,
-        existing_settings=persistence_existing_settings,
-        candidate_settings=candidate,
-    )
 
     LOGGER.info("Density plotting finished in %.2f s.", perf_counter() - start)
     return 0
@@ -5060,25 +4949,26 @@ def _handle_plot_density(args: argparse.Namespace) -> int:
 def _handle_plot_msd(args: argparse.Namespace) -> int:
     start = perf_counter()
     LOGGER.info("Starting MSD plotting.")
-    sources = _resolve_plot_hdf5_sources(args, command_name="linak plot msd")
+    sources = _resolve_plot_hdf5_sources(args, command_name="linak plot")
     settings_source_path = _resolve_plot_settings_source_path(
         sources,
         setting_source_token=getattr(args, "settings_source", None),
     )
-    saved_plot_settings = _apply_saved_plot_settings(
+    _apply_saved_plot_settings(
         args=args,
         source_path=settings_source_path,
         profile_key=_PLOT_PROFILE_MSD,
         keys=_PLOT_SETTINGS_MSD_KEYS,
     )
+    use_gui = _resolve_gui_mode(args)
     if len(sources) > 1:
         LOGGER.info("Processing %d MSD HDF5 input file(s).", len(sources))
         LOGGER.info("Using '%s' as plot-settings source.", settings_source_path)
-    persistence_source_path = settings_source_path
-    persistence_existing_settings = saved_plot_settings
 
     if args.dry_run:
-        if args.output:
+        if use_gui:
+            render_target = "interactive GUI controls"
+        elif args.output:
             render_target = f"save plot to {Path(args.output).expanduser()}"
         elif args.show:
             render_target = f"interactive display via backend {args.backend}"
@@ -5130,21 +5020,8 @@ def _handle_plot_msd(args: argparse.Namespace) -> int:
     )
 
     plot_source_label = sources[0] if len(sources) == 1 else "multi_source_msd"
-    if len(sources) > 1 and not args.gui:
-        persistence_source_path = _combine_analysis_hdf5_sources(
-            sources=sources,
-            analysis="msd",
-            output=None,
-            settings_source_path=None,
-        )
-        persistence_existing_settings = None
-        LOGGER.info(
-            "Created combined MSD HDF5 for multi-source plot settings: '%s'.",
-            persistence_source_path,
-        )
-        plot_source_label = str(persistence_source_path)
 
-    if args.gui:
+    if use_gui:
         gui_settings_path = settings_source_path
         if len(sources) > 1:
             gui_settings_path = _combine_analysis_hdf5_sources(
@@ -5178,24 +5055,12 @@ def _handle_plot_msd(args: argparse.Namespace) -> int:
         LOGGER.info("MSD GUI plotting session finished in %.2f s.", perf_counter() - start)
         return 0
 
-    _saved_path, rendered_state = _render_profile_plot(
+    _saved_path, _rendered_state = _render_profile_plot(
         args=args,
         source=plot_source_label,
         analysis_name="msd",
         profile=plot_profiles,
         plotter=plot_msd_profiles,
-    )
-    candidate = _collect_plot_settings_for_persistence(args, keys=_PLOT_SETTINGS_MSD_KEYS)
-    candidate = _merge_rendered_plot_state(
-        candidate,
-        rendered_state,
-        keys=_PLOT_SETTINGS_MSD_KEYS,
-    )
-    _persist_plot_settings_with_resolution(
-        source_path=persistence_source_path,
-        profile_key=_PLOT_PROFILE_MSD,
-        existing_settings=persistence_existing_settings,
-        candidate_settings=candidate,
     )
 
     LOGGER.info("MSD plotting finished in %.2f s.", perf_counter() - start)
@@ -5205,26 +5070,27 @@ def _handle_plot_msd(args: argparse.Namespace) -> int:
 def _handle_plot_rdf(args: argparse.Namespace) -> int:
     start = perf_counter()
     LOGGER.info("Starting RDF plotting.")
-    sources = _resolve_plot_hdf5_sources(args, command_name="linak plot rdf")
+    sources = _resolve_plot_hdf5_sources(args, command_name="linak plot")
     settings_source_path = _resolve_plot_settings_source_path(
         sources,
         setting_source_token=getattr(args, "settings_source", None),
     )
-    saved_plot_settings = _apply_saved_plot_settings(
+    _apply_saved_plot_settings(
         args=args,
         source_path=settings_source_path,
         profile_key=_PLOT_PROFILE_RDF,
         keys=_PLOT_SETTINGS_RDF_KEYS,
     )
+    use_gui = _resolve_gui_mode(args)
     if len(sources) > 1:
         LOGGER.info("Processing %d RDF HDF5 input file(s).", len(sources))
         LOGGER.info("Using '%s' as plot-settings source.", settings_source_path)
-    persistence_source_path = settings_source_path
-    persistence_existing_settings = saved_plot_settings
 
     species_b = args.species_b if args.species_b is not None else args.species_a
     if args.dry_run:
-        if args.output:
+        if use_gui:
+            render_target = "interactive GUI controls"
+        elif args.output:
             render_target = f"save plot to {Path(args.output).expanduser()}"
         elif args.show:
             render_target = f"interactive display via backend {args.backend}"
@@ -5278,21 +5144,8 @@ def _handle_plot_rdf(args: argparse.Namespace) -> int:
     )
 
     plot_source_label = sources[0] if len(sources) == 1 else "multi_source_rdf"
-    if len(sources) > 1 and not args.gui:
-        persistence_source_path = _combine_analysis_hdf5_sources(
-            sources=sources,
-            analysis="rdf",
-            output=None,
-            settings_source_path=None,
-        )
-        persistence_existing_settings = None
-        LOGGER.info(
-            "Created combined RDF HDF5 for multi-source plot settings: '%s'.",
-            persistence_source_path,
-        )
-        plot_source_label = str(persistence_source_path)
 
-    if args.gui:
+    if use_gui:
         gui_settings_path = settings_source_path
         if len(sources) > 1:
             gui_settings_path = _combine_analysis_hdf5_sources(
@@ -5326,24 +5179,12 @@ def _handle_plot_rdf(args: argparse.Namespace) -> int:
         LOGGER.info("RDF GUI plotting session finished in %.2f s.", perf_counter() - start)
         return 0
 
-    _saved_path, rendered_state = _render_profile_plot(
+    _saved_path, _rendered_state = _render_profile_plot(
         args=args,
         source=plot_source_label,
         analysis_name="rdf",
         profile=plot_profiles,
         plotter=plot_rdf_profiles,
-    )
-    candidate = _collect_plot_settings_for_persistence(args, keys=_PLOT_SETTINGS_RDF_KEYS)
-    candidate = _merge_rendered_plot_state(
-        candidate,
-        rendered_state,
-        keys=_PLOT_SETTINGS_RDF_KEYS,
-    )
-    _persist_plot_settings_with_resolution(
-        source_path=persistence_source_path,
-        profile_key=_PLOT_PROFILE_RDF,
-        existing_settings=persistence_existing_settings,
-        candidate_settings=candidate,
     )
 
     LOGGER.info("RDF plotting finished in %.2f s.", perf_counter() - start)
@@ -5416,6 +5257,7 @@ def _handle_compute_density(args: argparse.Namespace) -> int:
         surface_mode=args.surface_mode,
         surface_elements=args.surface_elements,
         include_fixed_surface_atoms=args.include_fixed_surface_atoms,
+        binning="cell",
     )
     outputs = _density_hdf5_output_paths(
         args.output,
@@ -5967,7 +5809,7 @@ def _find_primary_command_index(argv: list[str]) -> int | None:
 
 
 def _rewrite_implicit_plot_csv(argv: list[str]) -> list[str]:
-    """Allow ``linak plot`` with implicit analysis/table dispatch for HDF5 sources."""
+    """Allow ``linak plot`` to fall back to ``linak hdf5 plot`` for non-analysis HDF5 sources."""
     if not argv:
         return argv
 
@@ -6028,14 +5870,17 @@ def _rewrite_implicit_plot_csv(argv: list[str]) -> list[str]:
     if any(Path(token).suffix.lower() not in {".h5", ".hdf5"} for token in source_tokens):
         return argv
 
+    if any(not Path(token).expanduser().exists() for token in source_tokens):
+        return argv
+
     detected_subcommand = _resolve_auto_plot_analysis_from_sources(source_tokens)
 
     rewritten = list(argv)
     if detected_subcommand in {"density", "msd", "rdf"}:
-        rewritten.insert(command_index + 1, detected_subcommand)
-    else:
-        rewritten[command_index] = _TABULAR_COMMAND
-        rewritten.insert(command_index + 1, "plot")
+        return rewritten
+
+    rewritten[command_index] = _TABULAR_COMMAND
+    rewritten.insert(command_index + 1, "plot")
     return rewritten
 
 
@@ -6092,4 +5937,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

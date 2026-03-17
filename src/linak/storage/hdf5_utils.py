@@ -173,7 +173,6 @@ def read_linak_hdf5_profiles(
                     )
                     profile_metadata.setdefault("analysis", analysis)
                     profile_metadata.setdefault("profile_index", index)
-                    profile_metadata.setdefault("profile_key", name)
                     profiles.append((datasets, profile_metadata))
                 return profiles
 

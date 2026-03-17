@@ -18,12 +18,24 @@ from ..storage.hdf5_utils import (
     read_linak_hdf5_profiles,
     write_linak_hdf5,
 )
+from .binning import (
+    reconstruct_uniform_bin_edges_from_centers,
+    resolve_uniform_bin_width_for_load,
+    uniform_bin_width_from_edges,
+)
+from .schema import (
+    build_profile_metadata,
+    canonicalize_density_units,
+    resolve_units_map,
+)
 from ..plot.plotting import (
     DEFAULT_PLOT_STYLE,
     PlotStyle,
     normalize_backend_name as normalize_backend_name,
     plot_line_series,
     plot_multi_line_series,
+    resolve_series_labels,
+    resolve_single_series_options,
 )
 from ..progress import ProgressBar
 from ..utils import axis_to_index, ensure_positive
@@ -32,6 +44,8 @@ LOGGER = logging.getLogger(__name__)
 H2O_VALIDATION_STRIDE = 250
 AMU_TO_G = 1.66053906660e-24
 ANGSTROM3_TO_CM3 = 1.0e-24
+ANGSTROM3_TO_NM3 = 1.0e-3
+PLOT_AUTO_LIMIT_MARGIN_FRACTION = 0.05
 SURFACE_MOBILITY_FRACTION = 0.35
 SURFACE_POSITION_QUANTILE = 0.90
 MIN_SURFACE_REFERENCE_ATOMS = 6
@@ -703,6 +717,51 @@ def _shift_axis_values_by_surface_per_frame(
     return shifted, "distance"
 
 
+def _coordinate_mode_from_surface_per_frame(
+    *,
+    surface_per_frame: np.ndarray | None,
+    frame_count: int,
+) -> str:
+    if surface_per_frame is None:
+        return "axis"
+    if surface_per_frame.shape[0] != frame_count:
+        return "axis"
+    if not np.all(np.isfinite(surface_per_frame)):
+        return "axis"
+    return "distance"
+
+
+def _cell_histogram_bounds(
+    *,
+    frames: list[Atoms],
+    axis_index: int,
+    coordinate_mode: str,
+    surface_per_frame: np.ndarray | None,
+) -> tuple[float, float] | None:
+    if not frames:
+        return None
+    if not all(_frame_has_usable_cell(frame, axis_index) for frame in frames):
+        return None
+
+    lower = float("inf")
+    upper = float("-inf")
+    for frame_index, frame in enumerate(frames):
+        cell = np.asarray(frame.cell.array, dtype=float)
+        axis_length = float(np.linalg.norm(cell[axis_index]))
+        frame_min = 0.0
+        frame_max = axis_length
+        if coordinate_mode == "distance" and surface_per_frame is not None:
+            frame_surface = float(surface_per_frame[frame_index])
+            frame_min -= frame_surface
+            frame_max -= frame_surface
+        lower = min(lower, frame_min)
+        upper = max(upper, frame_max)
+
+    if not np.isfinite(lower) or not np.isfinite(upper) or upper <= lower:
+        return None
+    return lower, upper
+
+
 def _select_axis_values_with_masses(
     frame: Atoms, species: str, axis_index: int
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -773,6 +832,7 @@ def _compute_density_profile_from_selected(
     coordinate_mode: str = "axis",
     surface_position: float | None = None,
     surface_position_std: float | None = None,
+    histogram_bounds: tuple[float, float] | None = None,
 ) -> DensityProfile:
     """Build a :class:`DensityProfile` from already-selected axis values."""
     n_selected_total = sum(values.size for values in selected_per_frame)
@@ -788,6 +848,18 @@ def _compute_density_profile_from_selected(
     non_empty_selected = [values for values in selected_per_frame if values.size > 0]
     data_min = min(float(np.min(values)) for values in non_empty_selected)
     data_max = max(float(np.max(values)) for values in non_empty_selected)
+    if histogram_bounds is not None:
+        bounds_min = float(histogram_bounds[0])
+        bounds_max = float(histogram_bounds[1])
+        if np.isfinite(bounds_min) and np.isfinite(bounds_max) and bounds_max > bounds_min:
+            data_min = min(data_min, bounds_min)
+            data_max = max(data_max, bounds_max)
+        else:
+            LOGGER.warning(
+                "Ignoring invalid histogram bounds for '%s': %s",
+                species_label,
+                histogram_bounds,
+            )
 
     if np.isclose(data_min, data_max):
         data_max = data_min + bin_width
@@ -846,7 +918,8 @@ def _compute_density_profile_from_selected(
             density = (masses_accum / slice_volumes[0]) / n_frames
         else:
             density = density_accum / n_frames
-        units = "g/Angstrom^3"
+        density = density / ANGSTROM3_TO_CM3
+        units = "g/cm^3"
     else:
         density = (masses_accum / n_frames) / bin_width
         units = "g/Angstrom"
@@ -863,10 +936,11 @@ def _compute_density_profile_from_selected(
             number_density = number_density_accum / n_frames
         else:
             number_density = (entities_accum / n_frames) / slice_volumes[0]
-        number_density_units = "atoms/Angstrom^3"
+        number_density = number_density / ANGSTROM3_TO_NM3
+        number_density_units = "atom/nm^3"
     else:
         number_density = entities_per_frame / bin_width
-        number_density_units = "atoms/Angstrom"
+        number_density_units = "atom/Angstrom"
 
     return DensityProfile(
         axis=axis.lower(),
@@ -894,6 +968,7 @@ def compute_density_profile(
     surface_mode: str = "auto",
     surface_elements: list[str] | tuple[str, ...] | None = None,
     include_fixed_surface_atoms: bool = False,
+    binning: str = "observed",
 ) -> DensityProfile:
     """Compute a 1D species mass-density profile along a Cartesian axis.
 
@@ -924,6 +999,9 @@ def compute_density_profile(
         raise ValueError("At least one trajectory frame is required.")
 
     ensure_positive("bin_width", bin_width)
+    normalized_binning = binning.strip().lower()
+    if normalized_binning not in {"observed", "cell"}:
+        raise ValueError("binning must be one of: observed, cell")
     axis_index = axis_to_index(axis)
     surface_estimate, surface_method = _select_surface_estimate(
         frames,
@@ -1003,6 +1081,26 @@ def compute_density_profile(
         selected_per_frame,
         None if surface_estimate is None else surface_estimate.per_frame,
     )
+    histogram_bounds = None
+    if normalized_binning == "cell":
+        surface_per_frame = (
+            None
+            if coordinate_mode != "distance" or surface_estimate is None
+            else surface_estimate.per_frame
+        )
+        histogram_bounds = _cell_histogram_bounds(
+            frames=frames,
+            axis_index=axis_index,
+            coordinate_mode=coordinate_mode,
+            surface_per_frame=surface_per_frame,
+        )
+        if histogram_bounds is None:
+            LOGGER.warning(
+                "Cell binning requested for '%s' along %s, but a usable cell was unavailable. "
+                "Falling back to observed-data binning.",
+                species_label,
+                axis.lower(),
+            )
     profile_surface_position = surface_position if coordinate_mode == "distance" else None
     profile_surface_position_std = surface_position_std if coordinate_mode == "distance" else None
     if surface_position is not None and coordinate_mode != "distance":
@@ -1023,6 +1121,7 @@ def compute_density_profile(
         coordinate_mode=coordinate_mode,
         surface_position=profile_surface_position,
         surface_position_std=profile_surface_position_std,
+        histogram_bounds=histogram_bounds,
     )
 
 
@@ -1034,9 +1133,13 @@ def compute_density_profiles(
     surface_mode: str = "auto",
     surface_elements: list[str] | tuple[str, ...] | None = None,
     include_fixed_surface_atoms: bool = False,
+    binning: str = "observed",
 ) -> list[DensityProfile]:
     """Compute one or more density profiles based on the species selection policy."""
     ensure_positive("bin_width", bin_width)
+    normalized_binning = binning.strip().lower()
+    if normalized_binning not in {"observed", "cell"}:
+        raise ValueError("binning must be one of: observed, cell")
     selection_mode, _ = _normalize_species_query(species)
     if selection_mode != "all":
         return [
@@ -1048,6 +1151,7 @@ def compute_density_profiles(
                 surface_mode=surface_mode,
                 surface_elements=surface_elements,
                 include_fixed_surface_atoms=include_fixed_surface_atoms,
+                binning=normalized_binning,
             )
         ]
 
@@ -1115,6 +1219,24 @@ def compute_density_profiles(
 
         profiles: list[DensityProfile] = []
         per_frame_surface = None if surface_estimate is None else surface_estimate.per_frame
+        coordinate_mode_global = _coordinate_mode_from_surface_per_frame(
+            surface_per_frame=per_frame_surface,
+            frame_count=len(frames),
+        )
+        histogram_bounds = None
+        if normalized_binning == "cell":
+            histogram_bounds = _cell_histogram_bounds(
+                frames=frames,
+                axis_index=axis_index,
+                coordinate_mode=coordinate_mode_global,
+                surface_per_frame=per_frame_surface,
+            )
+            if histogram_bounds is None:
+                LOGGER.warning(
+                    "Cell binning requested for element-resolved density along %s, but a usable "
+                    "cell was unavailable. Falling back to observed-data binning.",
+                    axis.lower(),
+                )
         with ProgressBar(
             desc="Computing element-resolved densities", total=len(element_species), unit="species"
         ) as progress:
@@ -1140,81 +1262,11 @@ def compute_density_profiles(
                         coordinate_mode=coordinate_mode,
                         surface_position=profile_surface_position,
                         surface_position_std=profile_surface_position_std,
+                        histogram_bounds=histogram_bounds,
                     )
                 )
                 progress.update()
         return profiles
-
-
-def _uniform_bin_width_from_edges(
-    bin_edges: np.ndarray, *, source_label: str
-) -> float:
-    """Return uniform bin width from edge coordinates or raise for invalid bins."""
-    if bin_edges.ndim != 1 or bin_edges.size < 2:
-        raise ValueError(f"{source_label} must provide at least two bin edges.")
-    widths = np.diff(np.asarray(bin_edges, dtype=float))
-    if not np.all(np.isfinite(widths)) or np.any(widths <= 0.0):
-        raise ValueError(f"{source_label} contains invalid bin edges.")
-    width = float(widths[0])
-    if not np.allclose(widths, width, rtol=1.0e-9, atol=1.0e-12):
-        raise ValueError(
-            f"{source_label} uses non-uniform bins; LiNaK HDF5 stores uniform bins via bin_width_A."
-        )
-    return width
-
-
-def _resolve_bin_width_for_load(
-    *,
-    metadata: dict[str, object],
-    bin_centers: np.ndarray,
-    source_path: Path,
-) -> float:
-    """Resolve bin width from metadata or infer from equally spaced bin centers."""
-    raw = metadata.get("bin_width_A")
-    if raw is not None:
-        try:
-            width = float(raw)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(
-                f"Density HDF5 '{source_path}' has invalid metadata value bin_width_A={raw!r}."
-            ) from exc
-        if not np.isfinite(width) or width <= 0.0:
-            raise ValueError(
-                f"Density HDF5 '{source_path}' has non-positive bin_width_A={raw!r}."
-            )
-        if bin_centers.size > 1:
-            center_steps = np.diff(bin_centers)
-            if not np.allclose(center_steps, width, rtol=1.0e-6, atol=1.0e-9):
-                raise ValueError(
-                    f"Density HDF5 '{source_path}' has inconsistent bin_centers_A and bin_width_A."
-                )
-        return width
-
-    if bin_centers.size <= 1:
-        raise ValueError(
-            f"Density HDF5 '{source_path}' is missing bin_edges_A and bin_width_A; "
-            "cannot reconstruct single-bin edges."
-        )
-    center_steps = np.diff(bin_centers)
-    if not np.all(np.isfinite(center_steps)) or np.any(center_steps <= 0.0):
-        raise ValueError(
-            f"Density HDF5 '{source_path}' has invalid bin_centers_A spacing."
-        )
-    inferred = float(center_steps[0])
-    if not np.allclose(center_steps, inferred, rtol=1.0e-6, atol=1.0e-9):
-        raise ValueError(
-            f"Density HDF5 '{source_path}' is missing bin_edges_A/bin_width_A and has non-uniform "
-            "bin_centers_A spacing."
-        )
-    return inferred
-
-
-def _reconstruct_bin_edges_from_centers(bin_centers: np.ndarray, *, bin_width: float) -> np.ndarray:
-    """Reconstruct edge coordinates from bin centers and a uniform bin width."""
-    if bin_centers.ndim != 1 or bin_centers.size == 0:
-        raise ValueError("Cannot reconstruct bin edges from empty or non-1D bin centers.")
-    left_edge = float(bin_centers[0]) - 0.5 * bin_width
-    return left_edge + np.arange(bin_centers.size + 1, dtype=float) * bin_width
 
 
 def save_density_profile(
@@ -1234,29 +1286,42 @@ def save_density_profile(
     expected_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
     if not np.allclose(expected_centers, bin_centers, rtol=1.0e-9, atol=1.0e-12):
         raise ValueError("Density profile bin_centers are inconsistent with bin_edges.")
-    bin_width = _uniform_bin_width_from_edges(
+    bin_width = uniform_bin_width_from_edges(
         bin_edges,
         source_label=f"Density profile '{profile.species}'",
     )
 
-    metadata: dict[str, Any] = {
-        "axis": profile.axis,
-        "species": profile.species,
-        "units": profile.units,
-        "n_frames": profile.n_frames,
-        "number_density_units": profile.number_density_units,
-        "coordinate_mode": profile.coordinate_mode,
-        "surface_position": profile.surface_position,
-        "surface_position_std": profile.surface_position_std,
-        "bin_width_A": bin_width,
-        "units_map": {
-            "bin_width_A": "Angstrom",
-            "bin_centers_A": "Angstrom",
-            "counts_per_frame": "g",
-            "density": profile.units,
-            "number_density": profile.number_density_units,
-        },
+    canonical_density, canonical_density_units, canonical_number_density, canonical_number_units = (
+        canonicalize_density_units(
+            density=profile.density,
+            density_units=profile.units,
+            number_density=profile.number_density,
+            number_density_units=profile.number_density_units,
+        )
+    )
+
+    units_map = {
+        "density": canonical_density_units,
     }
+    if canonical_number_units is not None:
+        units_map["number_density"] = canonical_number_units
+
+    metadata = build_profile_metadata(
+        analysis="density",
+        metadata={
+            "axis": profile.axis,
+            "species": profile.species,
+            "units": canonical_density_units,
+            "n_frames": profile.n_frames,
+            "number_density_units": canonical_number_units,
+            "coordinate_mode": profile.coordinate_mode,
+            "surface_position": profile.surface_position,
+            "surface_position_std": profile.surface_position_std,
+            "bin_width_A": bin_width,
+            "counts_per_frame_available": False,
+        },
+        units_map=units_map,
+    )
     if additional_metadata:
         metadata.update(dict(additional_metadata))
 
@@ -1265,9 +1330,8 @@ def save_density_profile(
         analysis="density",
         datasets={
             "bin_centers_A": profile.bin_centers,
-            "counts_per_frame": profile.counts_per_frame,
-            "density": profile.density,
-            "number_density": profile.number_density,
+            "density": canonical_density,
+            "number_density": canonical_number_density,
         },
         metadata=metadata,
     )
@@ -1307,7 +1371,7 @@ def load_density_profiles(
         payloads = read_linak_hdf5_profiles(source_path, expected_analysis="density")
         profiles: list[DensityProfile] = []
         for datasets, metadata in payloads:
-            required = ("bin_centers_A", "counts_per_frame", "density")
+            required = ("bin_centers_A", "density")
             missing = [name for name in required if name not in datasets]
             if missing:
                 raise ValueError(
@@ -1330,11 +1394,16 @@ def load_density_profiles(
             else:
                 species_label = "UNKNOWN"
 
-            units = str(metadata.get("units", "g/cm^3"))
+            resolved_units = resolve_units_map(analysis="density", metadata=metadata)
+            units = str(metadata.get("units") or resolved_units.get("density") or "g/cm^3")
             number_density_units_raw = metadata.get("number_density_units")
+            if number_density_units_raw is None:
+                number_density_units_raw = resolved_units.get("number_density")
             number_density_units = (
-                str(number_density_units_raw) if number_density_units_raw is not None else None
+                str(number_density_units_raw).strip() if number_density_units_raw is not None else None
             )
+            if number_density_units == "":
+                number_density_units = None
             coordinate_mode = str(metadata.get("coordinate_mode", "axis")).strip().lower()
             if coordinate_mode not in {"axis", "distance"}:
                 coordinate_mode = "axis"
@@ -1357,6 +1426,15 @@ def load_density_profiles(
             if "number_density" in datasets:
                 number_density = np.asarray(datasets["number_density"], dtype=float)
 
+            canonical_density, canonical_units, canonical_number_density, canonical_number_units = (
+                canonicalize_density_units(
+                    density=np.asarray(datasets["density"], dtype=float),
+                    density_units=units,
+                    number_density=number_density,
+                    number_density_units=number_density_units,
+                )
+            )
+
             entities_per_frame = None
             if "entities_per_frame" in datasets:
                 entities_per_frame = np.asarray(datasets["entities_per_frame"], dtype=float)
@@ -1365,16 +1443,25 @@ def load_density_profiles(
             if "bin_edges_A" in datasets:
                 bin_edges = np.asarray(datasets["bin_edges_A"], dtype=float)
             else:
-                bin_width = _resolve_bin_width_for_load(
+                bin_width = resolve_uniform_bin_width_for_load(
                     metadata=metadata,
                     bin_centers=bin_centers,
                     source_path=source_path,
+                    analysis_name="Density",
                 )
-                bin_edges = _reconstruct_bin_edges_from_centers(bin_centers, bin_width=bin_width)
+                bin_edges = reconstruct_uniform_bin_edges_from_centers(
+                    bin_centers,
+                    bin_width=bin_width,
+                )
             if bin_edges.size != bin_centers.size + 1:
                 raise ValueError(
                     f"Density HDF5 '{source_path}' has incompatible bin_edges_A/bin_centers_A sizes."
                 )
+
+            if "counts_per_frame" in datasets:
+                counts_per_frame = np.asarray(datasets["counts_per_frame"], dtype=float)
+            else:
+                counts_per_frame = np.full(bin_centers.shape, np.nan, dtype=float)
 
             profiles.append(
                 DensityProfile(
@@ -1382,13 +1469,13 @@ def load_density_profiles(
                     species=species_label,
                     bin_edges=bin_edges,
                     bin_centers=bin_centers,
-                    counts_per_frame=np.asarray(datasets["counts_per_frame"], dtype=float),
-                    density=np.asarray(datasets["density"], dtype=float),
-                    units=units,
+                    counts_per_frame=counts_per_frame,
+                    density=canonical_density,
+                    units=canonical_units,
                     n_frames=int(metadata.get("n_frames", 0)),
                     entities_per_frame=entities_per_frame,
-                    number_density=number_density,
-                    number_density_units=number_density_units,
+                    number_density=canonical_number_density,
+                    number_density_units=canonical_number_units,
                     coordinate_mode=coordinate_mode,
                     surface_position=surface_position,
                     surface_position_std=surface_position_std,
@@ -1455,17 +1542,138 @@ def _density_y_data(
                 f"Number-density data unavailable for profile '{profile.species}'. "
                 "Use quantity='mass' or recompute volumetric density."
             )
-        return profile.number_density, profile.number_density_units, "Number density"
+        _mass, _mass_units, canonical_number, canonical_number_units = canonicalize_density_units(
+            density=profile.density,
+            density_units=profile.units,
+            number_density=profile.number_density,
+            number_density_units=profile.number_density_units,
+        )
+        assert canonical_number is not None
+        assert canonical_number_units is not None
+        return canonical_number, canonical_number_units, "Number density"
 
     if quantity == "mass":
-        units = profile.units
-        density_values = profile.density
-        if units == "g/Angstrom^3":
-            density_values = profile.density / ANGSTROM3_TO_CM3
-            units = "g/cm^3"
+        density_values, units, _number, _number_units = canonicalize_density_units(
+            density=profile.density,
+            density_units=profile.units,
+            number_density=profile.number_density,
+            number_density_units=profile.number_density_units,
+        )
         return density_values, units, "Mass density"
 
     raise ValueError(f"Unsupported density quantity '{quantity}'. Choose 'mass' or 'number'.")
+
+
+def _expand_linear_limits(lower: float, upper: float) -> list[float]:
+    if np.isclose(lower, upper):
+        margin = max(abs(lower), 1.0) * PLOT_AUTO_LIMIT_MARGIN_FRACTION
+    else:
+        margin = abs(upper - lower) * PLOT_AUTO_LIMIT_MARGIN_FRACTION
+    if margin <= 0.0:
+        margin = PLOT_AUTO_LIMIT_MARGIN_FRACTION
+    return [float(lower - margin), float(upper + margin)]
+
+
+def _resolve_auto_axis_limits(
+    values: np.ndarray,
+    *,
+    scale: str,
+    clamp_nonnegative_to_zero: bool = False,
+) -> list[float] | None:
+    finite = np.asarray(values, dtype=float)
+    finite = finite[np.isfinite(finite)]
+    if finite.size == 0:
+        return None
+
+    normalized_scale = scale.strip().lower()
+    if normalized_scale == "linear":
+        lower = float(np.min(finite))
+        upper = float(np.max(finite))
+        if clamp_nonnegative_to_zero and lower >= 0.0:
+            if upper <= 0.0:
+                return [0.0, 1.0]
+            margin = max(upper * PLOT_AUTO_LIMIT_MARGIN_FRACTION, 1.0e-12)
+            return [0.0, float(upper + margin)]
+        return _expand_linear_limits(lower, upper)
+
+    if normalized_scale == "log":
+        positive = finite[finite > 0.0]
+        if positive.size == 0:
+            return None
+        lower = float(np.min(positive))
+        upper = float(np.max(positive))
+        if np.isclose(lower, upper):
+            return [lower / 1.2, upper * 1.2]
+        factor = float(np.exp(np.log(upper / lower) * PLOT_AUTO_LIMIT_MARGIN_FRACTION))
+        return [lower / factor, upper * factor]
+
+    return None
+
+
+def _merge_plot_limits(
+    requested: tuple[float, float] | list[float] | None,
+    auto: list[float] | None,
+) -> list[float | None] | None:
+    if requested is None:
+        return None if auto is None else [float(auto[0]), float(auto[1])]
+
+    resolved: list[float | None] = [
+        None if requested[0] is None else float(requested[0]),
+        None if requested[1] is None else float(requested[1]),
+    ]
+    if auto is None:
+        return resolved
+    if resolved[0] is None:
+        resolved[0] = float(auto[0])
+    if resolved[1] is None:
+        resolved[1] = float(auto[1])
+    return resolved
+
+
+def _density_auto_plot_limits(
+    x_series: list[np.ndarray],
+    y_series: list[np.ndarray],
+    *,
+    x_scale: str,
+    y_scale: str,
+) -> tuple[list[float] | None, list[float] | None]:
+    all_x: list[np.ndarray] = []
+    all_y: list[np.ndarray] = []
+    nonzero_x: list[np.ndarray] = []
+    nonzero_y: list[np.ndarray] = []
+
+    for x_values, y_values in zip(x_series, y_series):
+        x_data = np.asarray(x_values, dtype=float)
+        y_data = np.asarray(y_values, dtype=float)
+        finite_mask = np.isfinite(x_data) & np.isfinite(y_data)
+        if not np.any(finite_mask):
+            continue
+        x_finite = x_data[finite_mask]
+        y_finite = y_data[finite_mask]
+        all_x.append(x_finite)
+        all_y.append(y_finite)
+
+        nonzero_mask = y_finite != 0.0
+        if np.any(nonzero_mask):
+            nonzero_x.append(x_finite[nonzero_mask])
+            nonzero_y.append(y_finite[nonzero_mask])
+
+    if not all_x:
+        return None, None
+
+    x_focus = np.concatenate(nonzero_x) if nonzero_x else np.concatenate(all_x)
+    y_focus = np.concatenate(nonzero_y) if nonzero_y else np.concatenate(all_y)
+    auto_x = _resolve_auto_axis_limits(
+        x_focus,
+        scale=x_scale,
+        clamp_nonnegative_to_zero=False,
+    )
+    auto_y = _resolve_auto_axis_limits(
+        y_focus,
+        scale=y_scale,
+        clamp_nonnegative_to_zero=True,
+    )
+    return auto_x, auto_y
 
 
 def plot_density_profile(
@@ -1482,8 +1690,8 @@ def plot_density_profile(
     y_label: str | None = None,
     x_scale: str = "linear",
     y_scale: str = "linear",
-    x_lim: tuple[float, float] | list[float] | None = None,
-    y_lim: tuple[float, float] | list[float] | None = None,
+    x_lim: tuple[float | None, float | None] | list[float | None] | None = None,
+    y_lim: tuple[float | None, float | None] | list[float | None] | None = None,
     x_ticks: list[float] | tuple[float, ...] | None = None,
     y_ticks: list[float] | tuple[float, ...] | None = None,
     x_tick_rotation: float | None = None,
@@ -1499,7 +1707,22 @@ def plot_density_profile(
     series_enabled: list[bool] | None = None,
     series_line_widths: list[float | None] | None = None,
     series_markers: list[str | None] | None = None,
+    series_normalization_modes: list[str] | None = None,
+    series_normalization_values: list[float | None] | None = None,
+    series_normalization_x_refs: list[float | None] | None = None,
+    x_bin_width: float | None = None,
+    x_bin_reducer: str | None = None,
     capture_state: dict[str, Any] | None = None,
+    suppress_output_log: bool = False,
+    matplotlib_rc: dict[str, Any] | None = None,
+    figure_kwargs: dict[str, Any] | None = None,
+    axes_kwargs: dict[str, Any] | None = None,
+    line_kwargs: dict[str, Any] | None = None,
+    grid_kwargs: dict[str, Any] | None = None,
+    legend_kwargs: dict[str, Any] | None = None,
+    tick_params_kwargs: dict[str, Any] | None = None,
+    tight_layout_kwargs: dict[str, Any] | None = None,
+    savefig_kwargs: dict[str, Any] | None = None,
 ) -> Path | None:
     """Plot and optionally save a density profile."""
     x_values, default_x_label = _density_x_data(profile, x_mode=x_mode)
@@ -1508,16 +1731,23 @@ def plot_density_profile(
     resolved_line_label = line_label
     if resolved_line_label is None and legend:
         resolved_line_label = profile.species
-    resolved_line_color = None
-    if line_colors:
-        resolved_line_color = line_colors[0]
-    line_visible = True if not series_enabled else bool(series_enabled[0])
-    line_width_override = None
-    if series_line_widths:
-        line_width_override = series_line_widths[0]
-    line_marker = None
-    if series_markers:
-        line_marker = series_markers[0]
+    single_series = resolve_single_series_options(
+        line_colors=line_colors,
+        series_enabled=series_enabled,
+        series_line_widths=series_line_widths,
+        series_markers=series_markers,
+        series_normalization_modes=series_normalization_modes,
+        series_normalization_values=series_normalization_values,
+        series_normalization_x_refs=series_normalization_x_refs,
+    )
+    auto_x_lim, auto_y_lim = _density_auto_plot_limits(
+        [x_values] if single_series.line_visible else [],
+        [density_values] if single_series.line_visible else [],
+        x_scale=x_scale,
+        y_scale=y_scale,
+    )
+    resolved_x_lim = _merge_plot_limits(x_lim, auto_x_lim)
+    resolved_y_lim = _merge_plot_limits(y_lim, auto_y_lim)
 
     return plot_line_series(
         x_values,
@@ -1530,15 +1760,20 @@ def plot_density_profile(
         show_blocking=show_blocking,
         preferred_backend=preferred_backend,
         line_label=resolved_line_label,
-        line_color=resolved_line_color,
-        line_width_override=line_width_override,
-        line_marker=line_marker,
-        line_visible=line_visible,
+        line_color=single_series.line_color,
+        line_width_override=single_series.line_width_override,
+        line_marker=single_series.line_marker,
+        line_visible=single_series.line_visible,
+        normalization_mode=single_series.normalization_mode,
+        normalization_value=single_series.normalization_value,
+        normalization_x_ref=single_series.normalization_x_ref,
+        x_bin_width=x_bin_width,
+        x_bin_reducer=x_bin_reducer,
         style=style,
         x_scale=x_scale,
         y_scale=y_scale,
-        x_lim=x_lim,
-        y_lim=y_lim,
+        x_lim=resolved_x_lim,
+        y_lim=resolved_y_lim,
         x_ticks=x_ticks,
         y_ticks=y_ticks,
         x_tick_rotation=x_tick_rotation,
@@ -1550,6 +1785,16 @@ def plot_density_profile(
         legend_title=legend_title,
         legend_loc=legend_loc,
         capture_state=capture_state,
+        matplotlib_rc=matplotlib_rc,
+        figure_kwargs=figure_kwargs,
+        axes_kwargs=axes_kwargs,
+        line_kwargs=line_kwargs,
+        grid_kwargs=grid_kwargs,
+        legend_kwargs=legend_kwargs,
+        tick_params_kwargs=tick_params_kwargs,
+        tight_layout_kwargs=tight_layout_kwargs,
+        savefig_kwargs=savefig_kwargs,
+        suppress_output_log=suppress_output_log,
     )
 
 
@@ -1567,8 +1812,8 @@ def plot_density_profiles(
     y_label: str | None = None,
     x_scale: str = "linear",
     y_scale: str = "linear",
-    x_lim: tuple[float, float] | list[float] | None = None,
-    y_lim: tuple[float, float] | list[float] | None = None,
+    x_lim: tuple[float | None, float | None] | list[float | None] | None = None,
+    y_lim: tuple[float | None, float | None] | list[float | None] | None = None,
     x_ticks: list[float] | tuple[float, ...] | None = None,
     y_ticks: list[float] | tuple[float, ...] | None = None,
     x_tick_rotation: float | None = None,
@@ -1584,22 +1829,33 @@ def plot_density_profiles(
     series_enabled: list[bool] | None = None,
     series_line_widths: list[float | None] | None = None,
     series_markers: list[str | None] | None = None,
+    series_normalization_modes: list[str] | None = None,
+    series_normalization_values: list[float | None] | None = None,
+    series_normalization_x_refs: list[float | None] | None = None,
+    x_bin_width: float | None = None,
+    x_bin_reducer: str | None = None,
     capture_state: dict[str, Any] | None = None,
+    suppress_output_log: bool = False,
+    matplotlib_rc: dict[str, Any] | None = None,
+    figure_kwargs: dict[str, Any] | None = None,
+    axes_kwargs: dict[str, Any] | None = None,
+    line_kwargs: dict[str, Any] | None = None,
+    series_line_kwargs: list[dict[str, Any] | None] | None = None,
+    grid_kwargs: dict[str, Any] | None = None,
+    legend_kwargs: dict[str, Any] | None = None,
+    tick_params_kwargs: dict[str, Any] | None = None,
+    tight_layout_kwargs: dict[str, Any] | None = None,
+    savefig_kwargs: dict[str, Any] | None = None,
 ) -> Path | None:
     """Plot one or more density profiles."""
     if not profiles:
         raise ValueError("At least one density profile is required.")
     default_labels = [profile.species for profile in profiles]
-    labels = default_labels
-    if series_labels is not None:
-        if len(series_labels) != len(default_labels):
-            raise ValueError(
-                "series_labels count must match the number of plotted density series "
-                f"({len(default_labels)})."
-            )
-        labels = [label.strip() for label in series_labels]
-        if any(not label for label in labels):
-            raise ValueError("series_labels cannot contain empty values.")
+    labels = resolve_series_labels(
+        default_labels,
+        series_labels,
+        series_kind="density",
+    )
 
     if len(profiles) == 1:
         return plot_density_profile(
@@ -1633,7 +1889,22 @@ def plot_density_profiles(
             series_enabled=series_enabled,
             series_line_widths=series_line_widths,
             series_markers=series_markers,
+            series_normalization_modes=series_normalization_modes,
+            series_normalization_values=series_normalization_values,
+            series_normalization_x_refs=series_normalization_x_refs,
+            x_bin_width=x_bin_width,
+            x_bin_reducer=x_bin_reducer,
             capture_state=capture_state,
+            suppress_output_log=suppress_output_log,
+            matplotlib_rc=matplotlib_rc,
+            figure_kwargs=figure_kwargs,
+            axes_kwargs=axes_kwargs,
+            line_kwargs=line_kwargs,
+            grid_kwargs=grid_kwargs,
+            legend_kwargs=legend_kwargs,
+            tick_params_kwargs=tick_params_kwargs,
+            tight_layout_kwargs=tight_layout_kwargs,
+            savefig_kwargs=savefig_kwargs,
         )
 
     first = profiles[0]
@@ -1652,6 +1923,19 @@ def plot_density_profiles(
     x_series = [_density_x_data(profile, x_mode=x_mode)[0] for profile in profiles]
     default_x_label = _density_x_data(first, x_mode=x_mode)[1]
     display_units = _format_plot_density_units(y_units)
+    auto_x_series = x_series
+    auto_y_series = y_series
+    if series_enabled is not None and len(series_enabled) == len(x_series):
+        auto_x_series = [x for x, enabled in zip(x_series, series_enabled) if bool(enabled)]
+        auto_y_series = [y for y, enabled in zip(y_series, series_enabled) if bool(enabled)]
+    auto_x_lim, auto_y_lim = _density_auto_plot_limits(
+        auto_x_series,
+        auto_y_series,
+        x_scale=x_scale,
+        y_scale=y_scale,
+    )
+    resolved_x_lim = _merge_plot_limits(x_lim, auto_x_lim)
+    resolved_y_lim = _merge_plot_limits(y_lim, auto_y_lim)
 
     return plot_multi_line_series(
         x_series,
@@ -1669,10 +1953,15 @@ def plot_density_profiles(
         series_enabled=series_enabled,
         series_line_widths=series_line_widths,
         series_markers=series_markers,
+        series_normalization_modes=series_normalization_modes,
+        series_normalization_values=series_normalization_values,
+        series_normalization_x_refs=series_normalization_x_refs,
+        x_bin_width=x_bin_width,
+        x_bin_reducer=x_bin_reducer,
         x_scale=x_scale,
         y_scale=y_scale,
-        x_lim=x_lim,
-        y_lim=y_lim,
+        x_lim=resolved_x_lim,
+        y_lim=resolved_y_lim,
         x_ticks=x_ticks,
         y_ticks=y_ticks,
         x_tick_rotation=x_tick_rotation,
@@ -1684,4 +1973,15 @@ def plot_density_profiles(
         legend_title=legend_title,
         legend_loc=legend_loc,
         capture_state=capture_state,
+        matplotlib_rc=matplotlib_rc,
+        figure_kwargs=figure_kwargs,
+        axes_kwargs=axes_kwargs,
+        line_kwargs=line_kwargs,
+        series_line_kwargs=series_line_kwargs,
+        grid_kwargs=grid_kwargs,
+        legend_kwargs=legend_kwargs,
+        tick_params_kwargs=tick_params_kwargs,
+        tight_layout_kwargs=tight_layout_kwargs,
+        savefig_kwargs=savefig_kwargs,
+        suppress_output_log=suppress_output_log,
     )

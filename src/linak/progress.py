@@ -108,28 +108,66 @@ class ProgressBar:
         rate = self._update_rate(now, elapsed)
         elapsed_label = self._format_seconds(elapsed)
         rate_label = f"{rate:6.2f} {self.unit}/s" if rate is not None else f"{'--':>6} {self.unit}/s"
+        desc = self._truncate_desc(self.desc)
 
         if self.total is not None and self.total > 0:
             ratio = min(1.0, self.count / self.total)
-            bar_width = self._resolve_bar_width()
-            filled = int(bar_width * ratio)
-            bar = "=" * filled + "." * (bar_width - filled)
             percent = ratio * 100.0
             remaining = None
             if ratio > 0.0:
                 remaining = max(0.0, elapsed * (1.0 - ratio) / ratio)
             left_label = self._format_seconds(remaining) if remaining is not None else "--"
-            line = (
-                f"\r{self._BRAND} {self.desc}: [{bar}] {self.count}/{self.total} "
-                f"{percent:6.2f}% | elapsed {elapsed_label} | left {left_label} | {rate_label}"
+            bar_width = self._resolve_bar_width()
+            line = self._build_known_total_line(
+                desc=desc,
+                bar_width=bar_width,
+                ratio=ratio,
+                percent=percent,
+                elapsed_label=elapsed_label,
+                left_label=left_label,
+                rate_label=rate_label,
             )
+            if len(line) > self._terminal_columns:
+                desc = self._truncate_text(desc, max(8, len(desc) - (len(line) - self._terminal_columns)))
+                line = self._build_known_total_line(
+                    desc=desc,
+                    bar_width=bar_width,
+                    ratio=ratio,
+                    percent=percent,
+                    elapsed_label=elapsed_label,
+                    left_label=left_label,
+                    rate_label=rate_label,
+                )
+            while len(line) > self._terminal_columns and bar_width > 4:
+                bar_width -= 1
+                line = self._build_known_total_line(
+                    desc=desc,
+                    bar_width=bar_width,
+                    ratio=ratio,
+                    percent=percent,
+                    elapsed_label=elapsed_label,
+                    left_label=left_label,
+                    rate_label=rate_label,
+                )
         else:
             spinner = self._SPINNER[self._spinner_index % len(self._SPINNER)]
             self._spinner_index += 1
-            line = (
-                f"\r{self._BRAND} {self.desc}: {spinner} {self.count} {self.unit} "
-                f"| elapsed {elapsed_label} | {rate_label}"
+            line = self._build_unknown_total_line(
+                desc=desc,
+                spinner=spinner,
+                elapsed_label=elapsed_label,
+                rate_label=rate_label,
             )
+            if len(line) > self._terminal_columns:
+                desc = self._truncate_text(desc, max(8, len(desc) - (len(line) - self._terminal_columns)))
+                line = self._build_unknown_total_line(
+                    desc=desc,
+                    spinner=spinner,
+                    elapsed_label=elapsed_label,
+                    rate_label=rate_label,
+                )
+
+        line = self._clamp_line_to_terminal(line)
 
         if len(line) < self._last_line_length:
             line = line + (" " * (self._last_line_length - len(line)))
@@ -155,9 +193,66 @@ class ProgressBar:
 
     def _resolve_bar_width(self) -> int:
         """Compute a bar width that avoids wrapping on narrower terminals."""
-        # Keep the bar visible while leaving room for metadata columns.
-        max_for_terminal = max(10, self._terminal_columns - 90)
+        # Keep the bar visible while leaving room for metadata columns and description text.
+        # The metadata budget intentionally assumes a moderately long description so the line
+        # stays on one terminal row instead of wrapping and appearing as multi-line spam.
+        max_for_terminal = max(10, self._terminal_columns - 110)
         return min(self.width, max_for_terminal)
+
+    def _truncate_desc(self, desc: str) -> str:
+        """Shorten long descriptions so the rendered line stays within terminal width."""
+        if self.total is not None and self.total > 0:
+            max_desc = max(12, self._terminal_columns - 85 - self._resolve_bar_width())
+        else:
+            max_desc = max(12, self._terminal_columns - 48)
+        if len(desc) <= max_desc:
+            return desc
+        return self._truncate_text(desc, max_desc)
+
+    def _truncate_text(self, text: str, max_length: int) -> str:
+        if len(text) <= max_length:
+            return text
+        if max_length <= 3:
+            return text[:max_length]
+        return text[: max_length - 3] + "..."
+
+    def _build_known_total_line(
+        self,
+        *,
+        desc: str,
+        bar_width: int,
+        ratio: float,
+        percent: float,
+        elapsed_label: str,
+        left_label: str,
+        rate_label: str,
+    ) -> str:
+        filled = int(bar_width * ratio)
+        bar = "=" * filled + "." * (bar_width - filled)
+        return (
+            f"\r{self._BRAND} {desc}: [{bar}] {self.count}/{self.total} "
+            f"{percent:6.2f}% | elapsed {elapsed_label} | left {left_label} | {rate_label}"
+        )
+
+    def _build_unknown_total_line(
+        self,
+        *,
+        desc: str,
+        spinner: str,
+        elapsed_label: str,
+        rate_label: str,
+    ) -> str:
+        return (
+            f"\r{self._BRAND} {desc}: {spinner} {self.count} {self.unit} "
+            f"| elapsed {elapsed_label} | {rate_label}"
+        )
+
+    def _clamp_line_to_terminal(self, line: str) -> str:
+        if self._terminal_columns <= 0 or len(line) <= self._terminal_columns:
+            return line
+        if line.startswith("\r") and self._terminal_columns > 1:
+            return "\r" + line[1 : self._terminal_columns]
+        return line[: self._terminal_columns]
 
     def _update_rate(self, now: float, elapsed: float) -> float | None:
         _ = now

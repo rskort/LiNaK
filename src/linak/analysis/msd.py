@@ -17,7 +17,15 @@ from ..storage.hdf5_utils import (
     read_linak_hdf5_profiles,
     write_linak_hdf5,
 )
-from ..plot.plotting import DEFAULT_PLOT_STYLE, PlotStyle, plot_line_series, plot_multi_line_series
+from .schema import build_profile_metadata, default_plot_labels
+from ..plot.plotting import (
+    DEFAULT_PLOT_STYLE,
+    PlotStyle,
+    plot_line_series,
+    plot_multi_line_series,
+    resolve_series_labels,
+    resolve_single_series_options,
+)
 from ..progress import ProgressBar
 from ..utils import ensure_positive
 
@@ -124,7 +132,7 @@ def compute_msd(
                 prev_positions = current_positions
                 progress.update()
     else:
-        LOGGER.info("MSD mode: direct displacement (no usable periodic cell in all frames).")
+        LOGGER.warning("MSD mode: direct displacement (no usable periodic cell in all frames).")
         with ProgressBar(
             desc=f"Computing MSD for {species_label}", total=len(frames), unit="frame"
         ) as progress:
@@ -164,15 +172,13 @@ def save_msd_profile(
     additional_metadata: Mapping[str, Any] | None = None,
 ) -> Path:
     """Save MSD profile to LiNaK HDF5 and return written path."""
-    metadata: dict[str, Any] = {
-        "species": profile.species,
-        "n_frames": profile.n_frames,
-        "units": {
-            "time_fs": "fs",
-            "time_ps": "ps",
-            "msd_A2": "Angstrom^2",
+    metadata = build_profile_metadata(
+        analysis="msd",
+        metadata={
+            "species": profile.species,
+            "n_frames": profile.n_frames,
         },
-    }
+    )
     if additional_metadata:
         metadata.update(dict(additional_metadata))
 
@@ -275,37 +281,59 @@ def plot_msd_profile(
     series_enabled: list[bool] | None = None,
     series_line_widths: list[float | None] | None = None,
     series_markers: list[str | None] | None = None,
+    series_normalization_modes: list[str] | None = None,
+    series_normalization_values: list[float | None] | None = None,
+    series_normalization_x_refs: list[float | None] | None = None,
+    x_bin_width: float | None = None,
+    x_bin_reducer: str | None = None,
     capture_state: dict[str, Any] | None = None,
+    suppress_output_log: bool = False,
+    matplotlib_rc: dict[str, Any] | None = None,
+    figure_kwargs: dict[str, Any] | None = None,
+    axes_kwargs: dict[str, Any] | None = None,
+    line_kwargs: dict[str, Any] | None = None,
+    grid_kwargs: dict[str, Any] | None = None,
+    legend_kwargs: dict[str, Any] | None = None,
+    tick_params_kwargs: dict[str, Any] | None = None,
+    tight_layout_kwargs: dict[str, Any] | None = None,
+    savefig_kwargs: dict[str, Any] | None = None,
 ) -> Path | None:
     """Plot MSD profile using shared LiNaK plotting style."""
+    schema_labels = default_plot_labels("msd")
+    default_x = "Time (ps)" if schema_labels is None else schema_labels[0]
+    default_y = "MSD (Angstrom^2)" if schema_labels is None else schema_labels[1]
     resolved_label = line_label
     if resolved_label is None and legend:
         resolved_label = profile.species
-    resolved_line_color = None
-    if line_colors:
-        resolved_line_color = line_colors[0]
-    line_visible = True if not series_enabled else bool(series_enabled[0])
-    line_width_override = None
-    if series_line_widths:
-        line_width_override = series_line_widths[0]
-    line_marker = None
-    if series_markers:
-        line_marker = series_markers[0]
+    single_series = resolve_single_series_options(
+        line_colors=line_colors,
+        series_enabled=series_enabled,
+        series_line_widths=series_line_widths,
+        series_markers=series_markers,
+        series_normalization_modes=series_normalization_modes,
+        series_normalization_values=series_normalization_values,
+        series_normalization_x_refs=series_normalization_x_refs,
+    )
     return plot_line_series(
         profile.time_ps,
         profile.msd,
         title=title or f"{profile.species} mean squared displacement",
-        x_label=x_label or "Time (ps)",
-        y_label=y_label or "MSD (Angstrom^2)",
+        x_label=x_label or default_x,
+        y_label=y_label or default_y,
         output=output,
         show=show,
         show_blocking=show_blocking,
         preferred_backend=preferred_backend,
         line_label=resolved_label,
-        line_color=resolved_line_color,
-        line_width_override=line_width_override,
-        line_marker=line_marker,
-        line_visible=line_visible,
+        line_color=single_series.line_color,
+        line_width_override=single_series.line_width_override,
+        line_marker=single_series.line_marker,
+        line_visible=single_series.line_visible,
+        normalization_mode=single_series.normalization_mode,
+        normalization_value=single_series.normalization_value,
+        normalization_x_ref=single_series.normalization_x_ref,
+        x_bin_width=x_bin_width,
+        x_bin_reducer=x_bin_reducer,
         style=style,
         x_scale=x_scale,
         y_scale=y_scale,
@@ -322,6 +350,16 @@ def plot_msd_profile(
         legend_title=legend_title,
         legend_loc=legend_loc,
         capture_state=capture_state,
+        matplotlib_rc=matplotlib_rc,
+        figure_kwargs=figure_kwargs,
+        axes_kwargs=axes_kwargs,
+        line_kwargs=line_kwargs,
+        grid_kwargs=grid_kwargs,
+        legend_kwargs=legend_kwargs,
+        tick_params_kwargs=tick_params_kwargs,
+        tight_layout_kwargs=tight_layout_kwargs,
+        savefig_kwargs=savefig_kwargs,
+        suppress_output_log=suppress_output_log,
     )
 
 
@@ -354,22 +392,36 @@ def plot_msd_profiles(
     series_enabled: list[bool] | None = None,
     series_line_widths: list[float | None] | None = None,
     series_markers: list[str | None] | None = None,
+    series_normalization_modes: list[str] | None = None,
+    series_normalization_values: list[float | None] | None = None,
+    series_normalization_x_refs: list[float | None] | None = None,
+    x_bin_width: float | None = None,
+    x_bin_reducer: str | None = None,
     capture_state: dict[str, Any] | None = None,
+    suppress_output_log: bool = False,
+    matplotlib_rc: dict[str, Any] | None = None,
+    figure_kwargs: dict[str, Any] | None = None,
+    axes_kwargs: dict[str, Any] | None = None,
+    line_kwargs: dict[str, Any] | None = None,
+    series_line_kwargs: list[dict[str, Any] | None] | None = None,
+    grid_kwargs: dict[str, Any] | None = None,
+    legend_kwargs: dict[str, Any] | None = None,
+    tick_params_kwargs: dict[str, Any] | None = None,
+    tight_layout_kwargs: dict[str, Any] | None = None,
+    savefig_kwargs: dict[str, Any] | None = None,
 ) -> Path | None:
     """Plot one or more MSD profiles."""
+    schema_labels = default_plot_labels("msd")
+    default_x = "Time (ps)" if schema_labels is None else schema_labels[0]
+    default_y = "MSD (Angstrom^2)" if schema_labels is None else schema_labels[1]
     if not profiles:
         raise ValueError("At least one MSD profile is required.")
     default_labels = [profile.species for profile in profiles]
-    labels = default_labels
-    if series_labels is not None:
-        if len(series_labels) != len(default_labels):
-            raise ValueError(
-                "series_labels count must match the number of plotted MSD series "
-                f"({len(default_labels)})."
-            )
-        labels = [label.strip() for label in series_labels]
-        if any(not label for label in labels):
-            raise ValueError("series_labels cannot contain empty values.")
+    labels = resolve_series_labels(
+        default_labels,
+        series_labels,
+        series_kind="MSD",
+    )
 
     if len(profiles) == 1:
         return plot_msd_profile(
@@ -401,7 +453,22 @@ def plot_msd_profiles(
             series_enabled=series_enabled,
             series_line_widths=series_line_widths,
             series_markers=series_markers,
+            series_normalization_modes=series_normalization_modes,
+            series_normalization_values=series_normalization_values,
+            series_normalization_x_refs=series_normalization_x_refs,
+            x_bin_width=x_bin_width,
+            x_bin_reducer=x_bin_reducer,
             capture_state=capture_state,
+            suppress_output_log=suppress_output_log,
+            matplotlib_rc=matplotlib_rc,
+            figure_kwargs=figure_kwargs,
+            axes_kwargs=axes_kwargs,
+            line_kwargs=line_kwargs,
+            grid_kwargs=grid_kwargs,
+            legend_kwargs=legend_kwargs,
+            tick_params_kwargs=tick_params_kwargs,
+            tight_layout_kwargs=tight_layout_kwargs,
+            savefig_kwargs=savefig_kwargs,
         )
 
     return plot_multi_line_series(
@@ -409,8 +476,8 @@ def plot_msd_profiles(
         [profile.msd for profile in profiles],
         labels,
         title=title or "Mean squared displacement",
-        x_label=x_label or "Time (ps)",
-        y_label=y_label or "MSD (Angstrom^2)",
+        x_label=x_label or default_x,
+        y_label=y_label or default_y,
         output=output,
         show=show,
         show_blocking=show_blocking,
@@ -420,6 +487,11 @@ def plot_msd_profiles(
         series_enabled=series_enabled,
         series_line_widths=series_line_widths,
         series_markers=series_markers,
+        series_normalization_modes=series_normalization_modes,
+        series_normalization_values=series_normalization_values,
+        series_normalization_x_refs=series_normalization_x_refs,
+        x_bin_width=x_bin_width,
+        x_bin_reducer=x_bin_reducer,
         x_scale=x_scale,
         y_scale=y_scale,
         x_lim=x_lim,
@@ -435,4 +507,15 @@ def plot_msd_profiles(
         legend_title=legend_title,
         legend_loc=legend_loc,
         capture_state=capture_state,
+        matplotlib_rc=matplotlib_rc,
+        figure_kwargs=figure_kwargs,
+        axes_kwargs=axes_kwargs,
+        line_kwargs=line_kwargs,
+        series_line_kwargs=series_line_kwargs,
+        grid_kwargs=grid_kwargs,
+        legend_kwargs=legend_kwargs,
+        tick_params_kwargs=tick_params_kwargs,
+        tight_layout_kwargs=tight_layout_kwargs,
+        savefig_kwargs=savefig_kwargs,
+        suppress_output_log=suppress_output_log,
     )

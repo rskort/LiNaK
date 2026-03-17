@@ -61,9 +61,46 @@ def test_density_profile_volumetric_density_with_cell():
 
     np.testing.assert_allclose(profile.counts_per_frame, np.array([oxygen_mass_g, oxygen_mass_g]))
     np.testing.assert_allclose(
-        profile.density, np.array([0.01 * oxygen_mass_g, 0.01 * oxygen_mass_g])
+        profile.density,
+        np.array(
+            [
+                (0.01 * oxygen_mass_g) * 1.0e24,
+                (0.01 * oxygen_mass_g) * 1.0e24,
+            ]
+        ),
     )
-    assert profile.units == "g/Angstrom^3"
+    assert profile.units == "g/cm^3"
+
+
+def test_density_profile_cell_binning_extends_to_empty_bins():
+    frame = Atoms(
+        "OO",
+        positions=[[0.0, 0.0, 0.10], [0.0, 0.0, 1.10]],
+        cell=[10.0, 10.0, 10.0],
+        pbc=True,
+    )
+
+    observed = compute_density_profile(
+        frames=[frame],
+        species="O",
+        axis="z",
+        bin_width=1.0,
+        binning="observed",
+    )
+    cell_binned = compute_density_profile(
+        frames=[frame],
+        species="O",
+        axis="z",
+        bin_width=1.0,
+        binning="cell",
+    )
+
+    assert cell_binned.density.size > observed.density.size
+    assert np.count_nonzero(cell_binned.density == 0.0) > 0
+    np.testing.assert_allclose(
+        np.sum(cell_binned.counts_per_frame),
+        np.sum(observed.counts_per_frame),
+    )
 
 
 def test_density_profile_estimates_surface_from_low_mobility_atoms():
@@ -398,10 +435,12 @@ def test_save_density_profile_writes_hdf5(tmp_path):
         assert "linak_version" in handle.attrs
         assert "bin_edges_A" not in handle
         assert "bin_centers_A" in handle
+        assert "counts_per_frame" not in handle
         assert "density" in handle
         metadata = json.loads(str(handle.attrs["metadata_json"]))
         assert metadata["bin_width_A"] == pytest.approx(1.0)
         assert metadata["units_map"]["bin_width_A"] == "Angstrom"
+        assert metadata["units_map"]["density"] == "g/cm^3"
 
 
 def test_save_and_load_density_profile(tmp_path):
@@ -456,6 +495,7 @@ def test_load_density_profile_supports_legacy_bin_edges_dataset(tmp_path):
 
     loaded = load_density_profile(out, axis="z", species="O")
     np.testing.assert_allclose(loaded.bin_edges, np.array([0.0, 1.0, 2.0]))
+    assert loaded.units == "g/cm^3"
 
 
 def test_density_profile_uses_framewise_surface_distance_for_binning():
@@ -652,6 +692,55 @@ def test_plot_density_profiles_use_g_per_cm3_without_si_scaling(monkeypatch):
     assert captured["y_label"] == "Mass density (g/cm^3)"
 
 
+def test_plot_density_profiles_auto_limits_ignore_all_zero_tails(monkeypatch):
+    from linak.analysis.density import DensityProfile, plot_density_profiles
+
+    captured = {}
+
+    def _fake_plot_multi_line_series(_x_series, _y_series, _labels, **kwargs):
+        captured["x_lim"] = kwargs["x_lim"]
+        captured["y_lim"] = kwargs["y_lim"]
+        return None
+
+    monkeypatch.setattr("linak.analysis.density.plot_multi_line_series", _fake_plot_multi_line_series)
+
+    bin_edges = np.arange(0.0, 41.0, 1.0, dtype=float)
+    bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+    values_a = np.concatenate((np.ones(20, dtype=float), np.zeros(20, dtype=float)))
+    values_b = values_a * 2.0
+    profile_a = DensityProfile(
+        axis="z",
+        species="A",
+        bin_edges=bin_edges,
+        bin_centers=bin_centers,
+        counts_per_frame=values_a,
+        density=values_a,
+        units="g/Angstrom",
+        n_frames=1,
+        surface_position=0.0,
+    )
+    profile_b = DensityProfile(
+        axis="z",
+        species="B",
+        bin_edges=bin_edges,
+        bin_centers=bin_centers,
+        counts_per_frame=values_b,
+        density=values_b,
+        units="g/Angstrom",
+        n_frames=1,
+        surface_position=0.0,
+    )
+
+    plot_density_profiles([profile_a, profile_b], show=False, x_mode="axis")
+
+    assert captured["x_lim"] is not None
+    assert captured["x_lim"][1] > 20.0
+    assert captured["x_lim"][1] < 25.0
+    assert captured["y_lim"] is not None
+    assert captured["y_lim"][0] == pytest.approx(0.0)
+    assert captured["y_lim"][1] > 2.0
+
+
 def test_plot_density_profile_supports_number_density(monkeypatch):
     from linak.analysis.density import DensityProfile, plot_density_profile
 
@@ -678,8 +767,8 @@ def test_plot_density_profile_supports_number_density(monkeypatch):
     )
 
     plot_density_profile(profile, show=False, quantity="number")
-    np.testing.assert_allclose(captured["y"], np.array([0.25]))
-    assert captured["y_label"] == "Number density (atoms/A^3)"
+    np.testing.assert_allclose(captured["y"], np.array([250.0]))
+    assert captured["y_label"] == "Number density (atom/nm^3)"
 
 
 def test_plot_line_series_keeps_explicit_y_limits_when_ticks_are_outside_range():
@@ -699,6 +788,38 @@ def test_plot_line_series_keeps_explicit_y_limits_when_ticks_are_outside_range()
     )
 
     assert captured["y_lim"][0] == pytest.approx(0.0)
+
+
+def test_plot_line_series_can_hide_ticks_for_one_axis_only():
+    from linak.plot.plotting import plot_line_series
+
+    x_hidden_capture: dict[str, object] = {}
+    plot_line_series(
+        np.array([0.0, 1.0], dtype=float),
+        np.array([1.0, 2.0], dtype=float),
+        title="demo",
+        x_label="x",
+        y_label="y",
+        show=False,
+        ticks_visible=False,
+        tick_params_kwargs={"_ticks_axis": "x"},
+        capture_state=x_hidden_capture,
+    )
+
+    both_hidden_capture: dict[str, object] = {}
+    plot_line_series(
+        np.array([0.0, 1.0], dtype=float),
+        np.array([1.0, 2.0], dtype=float),
+        title="demo",
+        x_label="x",
+        y_label="y",
+        show=False,
+        ticks_visible=False,
+        capture_state=both_hidden_capture,
+    )
+
+    assert x_hidden_capture["ticks"] is True
+    assert both_hidden_capture["ticks"] is False
 
 
 def test_plot_line_series_non_blocking_show_keeps_figure_open(monkeypatch):
@@ -776,4 +897,99 @@ def test_plot_multi_line_series_hides_disabled_series_in_capture_state():
 
     assert captured["series_labels"] == ["run-b"]
     assert len(captured["line_colors"]) == 1
+
+
+def test_plot_multi_line_series_accepts_advanced_line_kwargs():
+    from linak.plot.plotting import plot_multi_line_series
+
+    captured = {}
+    plot_multi_line_series(
+        [np.array([0.0, 1.0], dtype=float), np.array([0.0, 1.0], dtype=float)],
+        [np.array([1.0, 2.0], dtype=float), np.array([2.0, 3.0], dtype=float)],
+        ["run-a", "run-b"],
+        title="demo",
+        x_label="x",
+        y_label="y",
+        show=False,
+        line_kwargs={"linestyle": "--"},
+        series_line_kwargs=[{"alpha": 0.4}, {"alpha": 0.8}],
+        capture_state=captured,
+    )
+
+    assert captured["series_labels"] == ["run-a", "run-b"]
+
+
+def test_plot_multi_line_series_rejects_invalid_series_line_kwargs_length():
+    from linak.plot.plotting import plot_multi_line_series
+
+    with pytest.raises(ValueError, match="series_line_kwargs count must match"):
+        plot_multi_line_series(
+            [np.array([0.0, 1.0], dtype=float), np.array([0.0, 1.0], dtype=float)],
+            [np.array([1.0, 2.0], dtype=float), np.array([2.0, 3.0], dtype=float)],
+            ["run-a", "run-b"],
+            title="demo",
+            x_label="x",
+            y_label="y",
+            show=False,
+            series_line_kwargs=[{"alpha": 0.5}],
+        )
+
+
+def test_plot_series_data_transform_supports_rebinning_and_max_normalization():
+    from linak.plot import plotting as plotting_mod
+
+    x_series, y_series, normalized_count = plotting_mod._prepare_plot_series_data(
+        x_series=[np.array([0.0, 0.2, 0.8, 1.0], dtype=float)],
+        y_series=[np.array([1.0, 3.0, 2.0, 6.0], dtype=float)],
+        labels=["run-a"],
+        x_bin_width=0.5,
+        x_bin_reducer="mean",
+        series_normalization_modes=["max"],
+        series_normalization_values=[2.0],
+        series_normalization_x_refs=[None],
+    )
+
+    assert normalized_count == 1
+    assert x_series[0].size == 3
+    assert np.max(y_series[0]) == pytest.approx(2.0)
+
+
+def test_plot_multi_line_series_warns_for_mixed_normalization(caplog):
+    from linak.plot.plotting import plot_multi_line_series
+
+    caplog.set_level(logging.WARNING, logger="linak.plot.plotting")
+    plot_multi_line_series(
+        [np.array([0.0, 1.0], dtype=float), np.array([0.0, 1.0], dtype=float)],
+        [np.array([1.0, 2.0], dtype=float), np.array([2.0, 3.0], dtype=float)],
+        ["run-a", "run-b"],
+        title="demo",
+        x_label="x",
+        y_label="y",
+        show=False,
+        series_normalization_modes=["max", "none"],
+        series_normalization_values=[1.0, None],
+        series_normalization_x_refs=[None, None],
+    )
+
+    assert "Only 1/2 plotted series are normalized" in caplog.text
+
+
+def test_plot_line_series_can_suppress_save_log(tmp_path, caplog):
+    from linak.plot.plotting import plot_line_series
+
+    caplog.set_level(logging.INFO, logger="linak.plot.plotting")
+    output = tmp_path / "quiet_plot.png"
+    plot_line_series(
+        np.array([0.0, 1.0], dtype=float),
+        np.array([1.0, 2.0], dtype=float),
+        title="demo",
+        x_label="x",
+        y_label="y",
+        output=output,
+        show=False,
+        suppress_output_log=True,
+    )
+
+    assert output.exists()
+    assert "Saved plot to" not in caplog.text
 

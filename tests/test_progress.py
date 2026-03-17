@@ -1,4 +1,5 @@
 import io
+import shutil
 
 from linak.progress import ProgressBar
 
@@ -58,3 +59,25 @@ def test_progress_bar_unknown_total_omits_left(monkeypatch) -> None:
         assert "[LiNaK] Working:" in text
         assert "left" not in text
         assert "frame/s" in text
+
+
+def test_progress_bar_truncates_to_fit_narrow_terminal(monkeypatch) -> None:
+    stream = _TTYBuffer()
+    now = {"value": 0.0}
+    monkeypatch.setattr("linak.progress.time.perf_counter", lambda: now["value"])
+    monkeypatch.setattr(
+        "linak.progress.shutil.get_terminal_size",
+        lambda fallback=(120, 20): shutil.os.terminal_size((80, 20)),
+    )
+
+    with ProgressBar(
+        desc="Selecting element data for density with a very long description",
+        total=100,
+        stream=stream,
+        min_interval=0.0,
+    ) as progress:
+        now["value"] = 1.0
+        progress.update(10)
+        lines = [line for line in stream.getvalue().split("\r") if line]
+        assert lines
+        assert max(len(line.rstrip("\n")) for line in lines) <= 80

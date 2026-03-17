@@ -4,6 +4,7 @@ import pytest
 import h5py
 from ase import Atoms
 
+import linak.analysis.rdf as rdf_mod
 from linak.analysis.rdf import compute_rdf, load_rdf_profile, save_rdf_profile
 
 
@@ -34,6 +35,30 @@ def test_compute_rdf_requires_nonzero_cell_volume():
     frame = Atoms("OH", positions=[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
     with pytest.raises(ValueError, match="non-zero cell volume"):
         compute_rdf([frame], species_a="O", species_b="H", r_max=2.0, bin_width=1.0)
+
+
+def test_compute_rdf_uses_uniform_bins_when_r_max_is_not_multiple_of_bin_width(tmp_path):
+    frame = Atoms(
+        "OH",
+        positions=[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+        cell=[10.0, 10.0, 10.0],
+        pbc=True,
+    )
+    profile = compute_rdf(
+        [frame],
+        species_a="O",
+        species_b="H",
+        r_max=2.3,
+        bin_width=1.0,
+    )
+
+    widths = np.diff(profile.bin_edges)
+    assert np.allclose(widths, widths[0])
+
+    out = tmp_path / "rdf_non_multiple.h5"
+    save_rdf_profile(profile, out)
+    loaded = load_rdf_profile(out, species_a="O", species_b="H")
+    np.testing.assert_allclose(loaded.bin_edges, profile.bin_edges)
 
 
 def test_save_and_load_rdf_profile(tmp_path):
@@ -130,4 +155,100 @@ def test_plot_rdf_profiles_uses_multi_line_plot_for_multiple_profiles(monkeypatc
 
     plot_rdf_profiles([profile_a, profile_b], show=False)
     assert captured["labels"] == ["O-H", "H-H"]
+
+
+def test_compute_rdf_reuses_species_selection_when_atom_identities_are_stable(monkeypatch):
+    frames = [
+        Atoms(
+            "OH",
+            positions=[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+            cell=[10.0, 10.0, 10.0],
+            pbc=True,
+        ),
+        Atoms(
+            "OH",
+            positions=[[0.0, 0.0, 0.0], [1.1, 0.0, 0.0]],
+            cell=[10.0, 10.0, 10.0],
+            pbc=True,
+        ),
+    ]
+    calls = {"count": 0}
+    original_select_mask = rdf_mod._select_mask
+
+    def _counting_select_mask(numbers, species):
+        calls["count"] += 1
+        return original_select_mask(numbers, species)
+
+    monkeypatch.setattr("linak.analysis.rdf._select_mask", _counting_select_mask)
+
+    compute_rdf(frames, species_a="O", species_b="H", r_max=2.0, bin_width=1.0, threads=1)
+
+    assert calls["count"] == 2
+
+
+def test_compute_rdf_warns_and_falls_back_when_atom_identities_change(monkeypatch, caplog):
+    frames = [
+        Atoms(
+            "OH",
+            positions=[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+            cell=[10.0, 10.0, 10.0],
+            pbc=True,
+        ),
+        Atoms(
+            "HO",
+            positions=[[0.0, 0.0, 0.0], [1.1, 0.0, 0.0]],
+            cell=[10.0, 10.0, 10.0],
+            pbc=True,
+        ),
+    ]
+    calls = {"count": 0}
+    original_select_mask = rdf_mod._select_mask
+
+    def _counting_select_mask(numbers, species):
+        calls["count"] += 1
+        return original_select_mask(numbers, species)
+
+    monkeypatch.setattr("linak.analysis.rdf._select_mask", _counting_select_mask)
+
+    with caplog.at_level("WARNING", logger="linak.analysis.rdf"):
+        compute_rdf(frames, species_a="O", species_b="H", r_max=2.0, bin_width=1.0, threads=1)
+
+    assert "RDF atom identities/order changed" in caplog.text
+    assert calls["count"] == 4
+
+
+def test_compute_rdf_parallel_path_uses_chunk_executor(monkeypatch):
+    frames = [
+        Atoms(
+            "OH",
+            positions=[[0.0, 0.0, 0.0], [1.0 + 0.01 * index, 0.0, 0.0]],
+            cell=[10.0, 10.0, 10.0],
+            pbc=True,
+        )
+        for index in range(20)
+    ]
+    captured = {"chunks": 0}
+
+    class _FakeProcessPoolExecutor:
+        def __init__(self, *, max_workers):
+            captured["max_workers"] = max_workers
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def map(self, func, chunks, configs):
+            for chunk, config in zip(chunks, configs):
+                captured["chunks"] += 1
+                yield func(chunk, config)
+
+    monkeypatch.setattr("linak.analysis.rdf.ProcessPoolExecutor", _FakeProcessPoolExecutor)
+
+    profile = compute_rdf(frames, species_a="O", species_b="H", r_max=2.0, bin_width=1.0, threads=2)
+
+    assert captured["max_workers"] == 2
+    assert captured["chunks"] >= 2
+    assert profile.n_frames == len(frames)
 

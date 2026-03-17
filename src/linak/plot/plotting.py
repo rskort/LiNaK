@@ -69,6 +69,19 @@ class PlotStyle:
 DEFAULT_PLOT_STYLE = PlotStyle()
 
 
+@dataclass(frozen=True)
+class SingleSeriesPlotOptions:
+    """Resolved plotting options for one rendered series."""
+
+    line_color: str | None = None
+    line_visible: bool = True
+    line_width_override: float | None = None
+    line_marker: str | None = None
+    normalization_mode: str | None = None
+    normalization_value: float | None = None
+    normalization_x_ref: float | None = None
+
+
 def with_style_overrides(
     *,
     base_style: PlotStyle = DEFAULT_PLOT_STYLE,
@@ -112,6 +125,52 @@ def with_style_overrides(
     if grid_alpha is not None:
         updates["grid_alpha"] = grid_alpha
     return replace(base_style, **updates)
+
+
+def resolve_series_labels(
+    default_labels: list[str],
+    series_labels: list[str] | None,
+    *,
+    series_kind: str,
+) -> list[str]:
+    """Return validated series labels for multi-line plots."""
+    if series_labels is None:
+        return list(default_labels)
+    if len(series_labels) != len(default_labels):
+        raise ValueError(
+            "series_labels count must match the number of plotted "
+            f"{series_kind} series ({len(default_labels)})."
+        )
+    labels = [label.strip() for label in series_labels]
+    if any(not label for label in labels):
+        raise ValueError("series_labels cannot contain empty values.")
+    return labels
+
+
+def resolve_single_series_options(
+    *,
+    line_colors: list[str] | None = None,
+    series_enabled: list[bool] | None = None,
+    series_line_widths: list[float | None] | None = None,
+    series_markers: list[str | None] | None = None,
+    series_normalization_modes: list[str] | None = None,
+    series_normalization_values: list[float | None] | None = None,
+    series_normalization_x_refs: list[float | None] | None = None,
+) -> SingleSeriesPlotOptions:
+    """Resolve single-series overrides from list-based plot settings."""
+    return SingleSeriesPlotOptions(
+        line_color=line_colors[0] if line_colors else None,
+        line_visible=True if not series_enabled else bool(series_enabled[0]),
+        line_width_override=series_line_widths[0] if series_line_widths else None,
+        line_marker=series_markers[0] if series_markers else None,
+        normalization_mode=series_normalization_modes[0] if series_normalization_modes else None,
+        normalization_value=series_normalization_values[0]
+        if series_normalization_values
+        else None,
+        normalization_x_ref=series_normalization_x_refs[0]
+        if series_normalization_x_refs
+        else None,
+    )
 
 
 def _is_interactive_backend(backend: str) -> bool:
@@ -214,6 +273,38 @@ def _to_float_list(values: Any) -> list[float]:
     return [float(value) for value in np.asarray(values, dtype=float).tolist()]
 
 
+def _normalize_tick_axis(value: Any) -> str:
+    token = str(value).strip().lower()
+    if token in {"x", "y", "both"}:
+        return token
+    return "both"
+
+
+def _normalize_minor_ticks_mode(value: Any) -> str:
+    token = str(value).strip().lower()
+    if token in {"on", "off", "auto"}:
+        return token
+    return "auto"
+
+
+def _extract_tick_controls(
+    tick_params_kwargs: dict[str, Any] | None,
+) -> tuple[dict[str, Any], str, str]:
+    if not isinstance(tick_params_kwargs, dict):
+        return {}, "both", "auto"
+
+    resolved = dict(tick_params_kwargs)
+    axis_hint_raw = resolved.pop("_ticks_axis", None)
+    minor_mode_raw = resolved.pop("_minor_ticks_mode", None)
+
+    axis_hint = _normalize_tick_axis(axis_hint_raw) if axis_hint_raw is not None else "both"
+    if axis_hint_raw is None and "axis" in resolved:
+        axis_hint = _normalize_tick_axis(resolved["axis"])
+
+    minor_mode = _normalize_minor_ticks_mode(minor_mode_raw)
+    return resolved, axis_hint, minor_mode
+
+
 def _capture_plot_state(
     *,
     ax: Any,
@@ -272,6 +363,211 @@ def _capture_plot_state(
     )
 
 
+def _resolve_reducer_name(value: str | None) -> str:
+    token = "mean" if value is None else str(value).strip().lower()
+    if token not in {"mean", "median", "sum", "min", "max"}:
+        raise ValueError("x_bin_reducer must be one of: mean, median, sum, min, max.")
+    return token
+
+
+def _reduce_values(values: np.ndarray, *, reducer: str) -> float:
+    if reducer == "mean":
+        return float(np.mean(values))
+    if reducer == "median":
+        return float(np.median(values))
+    if reducer == "sum":
+        return float(np.sum(values))
+    if reducer == "min":
+        return float(np.min(values))
+    if reducer == "max":
+        return float(np.max(values))
+    raise ValueError(f"Unsupported reducer '{reducer}'.")
+
+
+def _rebin_xy_series(
+    x: np.ndarray,
+    y: np.ndarray,
+    *,
+    bin_width: float,
+    reducer: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    if x.shape != y.shape:
+        raise ValueError("x and y data must have the same shape.")
+    if x.size == 0:
+        return x, y
+    if bin_width <= 0:
+        raise ValueError("x_bin_width must be positive.")
+
+    mask = np.isfinite(x) & np.isfinite(y)
+    if not np.any(mask):
+        return x, y
+
+    x_clean = np.asarray(x[mask], dtype=float)
+    y_clean = np.asarray(y[mask], dtype=float)
+    order = np.argsort(x_clean, kind="mergesort")
+    x_sorted = x_clean[order]
+    y_sorted = y_clean[order]
+
+    start = float(x_sorted[0])
+    bin_index = np.floor((x_sorted - start) / float(bin_width)).astype(np.int64)
+    unique_bins = np.unique(bin_index)
+
+    x_out = np.empty(unique_bins.size, dtype=float)
+    y_out = np.empty(unique_bins.size, dtype=float)
+    for out_index, group_id in enumerate(unique_bins):
+        group_mask = bin_index == group_id
+        x_group = x_sorted[group_mask]
+        y_group = y_sorted[group_mask]
+        x_out[out_index] = float(np.mean(x_group))
+        y_out[out_index] = _reduce_values(y_group, reducer=reducer)
+
+    return x_out, y_out
+
+
+def _normalize_mode(value: str | None) -> str:
+    token = "none" if value is None else str(value).strip().lower()
+    if token not in {"none", "max", "area", "value_at_x", "factor"}:
+        raise ValueError(
+            "Normalization mode must be one of: none, max, area, value_at_x, factor."
+        )
+    return token
+
+
+def _normalize_series_values(
+    x: np.ndarray,
+    y: np.ndarray,
+    *,
+    mode: str,
+    target_value: float | None,
+    reference_x: float | None,
+    label: str,
+) -> tuple[np.ndarray, bool]:
+    if mode == "none":
+        if target_value is not None or reference_x is not None:
+            raise ValueError(
+                f"Series '{label}' normalization mode is 'none'; remove target/reference values."
+            )
+        return y, False
+
+    if target_value is None:
+        raise ValueError(f"Series '{label}' normalization mode '{mode}' requires a target value.")
+
+    source_value: float
+    if mode == "max":
+        source_value = float(np.max(y))
+    elif mode == "area":
+        source_value = float(np.trapz(y, x))
+    elif mode == "value_at_x":
+        if reference_x is None:
+            raise ValueError(
+                f"Series '{label}' normalization mode 'value_at_x' requires a reference x value."
+            )
+        order = np.argsort(x, kind="mergesort")
+        x_sorted = x[order]
+        y_sorted = y[order]
+        source_value = float(
+            np.interp(float(reference_x), x_sorted, y_sorted, left=y_sorted[0], right=y_sorted[-1])
+        )
+    elif mode == "factor":
+        source_value = 1.0
+    else:
+        raise ValueError(f"Unsupported normalization mode '{mode}'.")
+
+    if not np.isfinite(source_value) or abs(source_value) <= 1e-15:
+        raise ValueError(
+            f"Series '{label}' normalization source value is zero/invalid; cannot normalize."
+        )
+
+    if mode == "factor":
+        scale = float(target_value)
+    else:
+        scale = float(target_value) / source_value
+    return y * scale, True
+
+
+def _prepare_plot_series_data(
+    *,
+    x_series: list[np.ndarray],
+    y_series: list[np.ndarray],
+    labels: list[str],
+    x_bin_width: float | None = None,
+    x_bin_reducer: str | None = None,
+    series_normalization_modes: list[str] | None = None,
+    series_normalization_values: list[float | None] | None = None,
+    series_normalization_x_refs: list[float | None] | None = None,
+) -> tuple[list[np.ndarray], list[np.ndarray], int]:
+    series_count = len(labels)
+    if len(x_series) != series_count or len(y_series) != series_count:
+        raise ValueError("x_series, y_series, and labels must have equal lengths.")
+
+    if series_normalization_modes is not None and len(series_normalization_modes) != series_count:
+        raise ValueError(
+            "series_normalization_modes count must match the number of plotted series "
+            f"({series_count})."
+        )
+    if (
+        series_normalization_values is not None
+        and len(series_normalization_values) != series_count
+    ):
+        raise ValueError(
+            "series_normalization_values count must match the number of plotted series "
+            f"({series_count})."
+        )
+    if series_normalization_x_refs is not None and len(series_normalization_x_refs) != series_count:
+        raise ValueError(
+            "series_normalization_x_refs count must match the number of plotted series "
+            f"({series_count})."
+        )
+
+    reducer = _resolve_reducer_name(x_bin_reducer) if x_bin_width is not None else "mean"
+    transformed_x: list[np.ndarray] = []
+    transformed_y: list[np.ndarray] = []
+    normalized_count = 0
+    for index, (x_values, y_values, label) in enumerate(zip(x_series, y_series, labels)):
+        x_data = np.asarray(x_values, dtype=float)
+        y_data = np.asarray(y_values, dtype=float)
+        if x_data.shape != y_data.shape:
+            raise ValueError(f"Series '{label}' x/y arrays must have the same shape.")
+
+        if x_bin_width is not None:
+            x_data, y_data = _rebin_xy_series(
+                x_data,
+                y_data,
+                bin_width=float(x_bin_width),
+                reducer=reducer,
+            )
+
+        mode = _normalize_mode(
+            series_normalization_modes[index]
+            if series_normalization_modes is not None
+            else None
+        )
+        target_value = (
+            series_normalization_values[index]
+            if series_normalization_values is not None
+            else None
+        )
+        reference_x = (
+            series_normalization_x_refs[index]
+            if series_normalization_x_refs is not None
+            else None
+        )
+        y_data, applied = _normalize_series_values(
+            x_data,
+            y_data,
+            mode=mode,
+            target_value=target_value,
+            reference_x=reference_x,
+            label=label,
+        )
+        if applied:
+            normalized_count += 1
+
+        transformed_x.append(x_data)
+        transformed_y.append(y_data)
+    return transformed_x, transformed_y, normalized_count
+
+
 def plot_line_series(
     x: np.ndarray,
     y: np.ndarray,
@@ -288,6 +584,11 @@ def plot_line_series(
     line_width_override: float | None = None,
     line_marker: str | None = None,
     line_visible: bool = True,
+    normalization_mode: str | None = None,
+    normalization_value: float | None = None,
+    normalization_x_ref: float | None = None,
+    x_bin_width: float | None = None,
+    x_bin_reducer: str | None = None,
     style: PlotStyle = DEFAULT_PLOT_STYLE,
     x_scale: str = "linear",
     y_scale: str = "linear",
@@ -304,38 +605,74 @@ def plot_line_series(
     legend_title: str | None = None,
     legend_loc: str = "best",
     capture_state: dict[str, Any] | None = None,
+    matplotlib_rc: dict[str, Any] | None = None,
+    figure_kwargs: dict[str, Any] | None = None,
+    axes_kwargs: dict[str, Any] | None = None,
+    line_kwargs: dict[str, Any] | None = None,
+    grid_kwargs: dict[str, Any] | None = None,
+    legend_kwargs: dict[str, Any] | None = None,
+    tick_params_kwargs: dict[str, Any] | None = None,
+    tight_layout_kwargs: dict[str, Any] | None = None,
+    savefig_kwargs: dict[str, Any] | None = None,
+    suppress_output_log: bool = False,
 ) -> Path | None:
     """Plot a single line using the shared LiNaK style."""
+    transformed_x, transformed_y, _normalized_count = _prepare_plot_series_data(
+        x_series=[np.asarray(x, dtype=float)],
+        y_series=[np.asarray(y, dtype=float)],
+        labels=["series"],
+        x_bin_width=x_bin_width,
+        x_bin_reducer=x_bin_reducer,
+        series_normalization_modes=None if normalization_mode is None else [normalization_mode],
+        series_normalization_values=None if normalization_value is None else [normalization_value],
+        series_normalization_x_refs=None if normalization_x_ref is None else [normalization_x_ref],
+    )
+    x_plot = transformed_x[0]
+    y_plot = transformed_y[0]
+
     active_backend = configure_matplotlib_backend(
         interactive=show,
         preferred_backend=preferred_backend,
     )
     plt = _import_pyplot()
-    with plt.rc_context({"font.family": style.font_family, "text.parse_math": True}):
+    rc_context_args: dict[str, Any] = {"font.family": style.font_family, "text.parse_math": True}
+    if matplotlib_rc is not None:
+        rc_context_args.update(dict(matplotlib_rc))
+    with plt.rc_context(rc_context_args):
         fig, ax = plt.subplots(figsize=style.figure_size)
+        if figure_kwargs is not None:
+            fig.set(**dict(figure_kwargs))
 
         color = line_color or style.line_color
         marker = ("o" if markers else "") if line_marker is None else str(line_marker)
         line_artist = None
         if line_visible:
+            resolved_line_kwargs: dict[str, Any] = {
+                "lw": style.line_width if line_width_override is None else float(line_width_override),
+                "color": color,
+                "label": line_label,
+                "marker": marker,
+            }
+            if line_kwargs is not None:
+                resolved_line_kwargs.update(dict(line_kwargs))
             (line_artist,) = ax.plot(
-                x,
-                y,
-                lw=style.line_width if line_width_override is None else float(line_width_override),
-                color=color,
-                label=line_label,
-                marker=marker,
+                x_plot,
+                y_plot,
+                **resolved_line_kwargs,
             )
 
         should_show_legend = bool(line_artist is not None and line_label) if legend is None else bool(
             legend and line_artist is not None and line_label
         )
         if should_show_legend:
-            ax.legend(
-                fontsize=style.tick_font_size,
-                title=legend_title,
-                loc=legend_loc,
-            )
+            resolved_legend_kwargs: dict[str, Any] = {
+                "fontsize": style.tick_font_size,
+                "title": legend_title,
+                "loc": legend_loc,
+            }
+            if legend_kwargs is not None:
+                resolved_legend_kwargs.update(dict(legend_kwargs))
+            ax.legend(**resolved_legend_kwargs)
 
         ax.set_xlabel(x_label, fontsize=style.label_font_size)
         ax.set_ylabel(y_label, fontsize=style.label_font_size)
@@ -344,30 +681,66 @@ def plot_line_series(
         else:
             ax.set_title(title, fontsize=style.title_font_size)
         ax.tick_params(axis="both", labelsize=style.tick_font_size)
+        resolved_tick_params_kwargs, tick_axis_hint, minor_ticks_mode = _extract_tick_controls(
+            tick_params_kwargs
+        )
 
         if style.grid:
-            ax.grid(
-                True,
-                linestyle=style.grid_linestyle,
-                linewidth=style.grid_linewidth,
-                alpha=style.grid_alpha,
-            )
+            resolved_grid_kwargs: dict[str, Any] = {
+                "linestyle": style.grid_linestyle,
+                "linewidth": style.grid_linewidth,
+                "alpha": style.grid_alpha,
+            }
+            if grid_kwargs is not None:
+                resolved_grid_kwargs.update(dict(grid_kwargs))
+            ax.grid(True, **resolved_grid_kwargs)
+        elif grid_kwargs is not None:
+            ax.grid(**dict(grid_kwargs))
         if ticks_visible is False:
-            ax.tick_params(
-                axis="both",
-                which="both",
-                bottom=False,
-                top=False,
-                left=False,
-                right=False,
-                labelbottom=False,
-                labelleft=False,
-            )
+            if tick_axis_hint in {"both", "x"}:
+                ax.tick_params(
+                    axis="x",
+                    which="both",
+                    bottom=False,
+                    top=False,
+                    labelbottom=False,
+                )
+            if tick_axis_hint in {"both", "y"}:
+                ax.tick_params(
+                    axis="y",
+                    which="both",
+                    left=False,
+                    right=False,
+                    labelleft=False,
+                )
         else:
+            if ticks_visible is True and tick_axis_hint in {"x", "y"}:
+                if tick_axis_hint == "x":
+                    ax.tick_params(
+                        axis="y",
+                        which="both",
+                        left=False,
+                        right=False,
+                        labelleft=False,
+                    )
+                else:
+                    ax.tick_params(
+                        axis="x",
+                        which="both",
+                        bottom=False,
+                        top=False,
+                        labelbottom=False,
+                    )
             if x_tick_rotation is not None:
                 ax.tick_params(axis="x", rotation=float(x_tick_rotation))
             if y_tick_rotation is not None:
                 ax.tick_params(axis="y", rotation=float(y_tick_rotation))
+        if minor_ticks_mode == "on":
+            ax.minorticks_on()
+        elif minor_ticks_mode == "off":
+            ax.minorticks_off()
+        if resolved_tick_params_kwargs:
+            ax.tick_params(**resolved_tick_params_kwargs)
         ax.set_xscale(x_scale)
         ax.set_yscale(y_scale)
         if x_ticks is not None:
@@ -383,13 +756,18 @@ def plot_line_series(
             bottom = None if y_lim[0] is None else float(y_lim[0])
             top = None if y_lim[1] is None else float(y_lim[1])
             ax.set_ylim(bottom=bottom, top=top)
+        if axes_kwargs is not None:
+            ax.set(**dict(axes_kwargs))
 
-        fig.tight_layout()
+        if tight_layout_kwargs is not None:
+            fig.tight_layout(**dict(tight_layout_kwargs))
+        else:
+            fig.tight_layout()
         _capture_plot_state(
             ax=ax,
             style=style,
             line_colors=[str(line_artist.get_color())] if line_artist is not None else [],
-            line_labels=[str(line_label) if line_label else "series_1"] if line_artist is not None else [],
+            line_labels=[str(line_artist.get_label())] if line_artist is not None else [],
             line_markers=[str(line_artist.get_marker())] if line_artist is not None else [],
             legend_loc=legend_loc,
             capture_state=capture_state,
@@ -399,8 +777,13 @@ def plot_line_series(
         if output is not None:
             output_path = Path(output).expanduser().resolve()
             output_path.parent.mkdir(parents=True, exist_ok=True)
-            fig.savefig(output_path, dpi=style.dpi)
-            LOGGER.info("Saved plot to '%s'.", output_path)
+            save_kwargs: dict[str, Any] = {}
+            if savefig_kwargs is not None:
+                save_kwargs.update(dict(savefig_kwargs))
+            save_kwargs.setdefault("dpi", style.dpi)
+            fig.savefig(output_path, **save_kwargs)
+            if not suppress_output_log:
+                LOGGER.info("Saved plot to '%s'.", output_path)
 
         if show:
             if show_blocking:
@@ -440,6 +823,13 @@ def plot_multi_line_series(
     series_enabled: list[bool] | None = None,
     series_line_widths: list[float | None] | None = None,
     series_markers: list[str | None] | None = None,
+    series_normalization_modes: list[str] | None = None,
+    series_normalization_values: list[float | None] | None = None,
+    series_normalization_x_refs: list[float | None] | None = None,
+    x_bin_width: float | None = None,
+    x_bin_reducer: str | None = None,
+    line_kwargs: dict[str, Any] | None = None,
+    series_line_kwargs: list[dict[str, Any] | None] | None = None,
     x_scale: str = "linear",
     y_scale: str = "linear",
     x_lim: tuple[float | None, float | None] | list[float | None] | None = None,
@@ -455,20 +845,52 @@ def plot_multi_line_series(
     legend_title: str | None = None,
     legend_loc: str = "best",
     capture_state: dict[str, Any] | None = None,
+    matplotlib_rc: dict[str, Any] | None = None,
+    figure_kwargs: dict[str, Any] | None = None,
+    axes_kwargs: dict[str, Any] | None = None,
+    grid_kwargs: dict[str, Any] | None = None,
+    legend_kwargs: dict[str, Any] | None = None,
+    tick_params_kwargs: dict[str, Any] | None = None,
+    tight_layout_kwargs: dict[str, Any] | None = None,
+    savefig_kwargs: dict[str, Any] | None = None,
+    suppress_output_log: bool = False,
 ) -> Path | None:
     """Plot multiple line series in a single axes using the shared LiNaK style."""
-    active_backend = configure_matplotlib_backend(
-        interactive=show,
-        preferred_backend=preferred_backend,
-    )
-    plt = _import_pyplot()
     if not (len(x_series) == len(y_series) == len(labels)):
         raise ValueError("x_series, y_series, and labels must have equal lengths.")
     if not x_series:
         raise ValueError("At least one series is required for multi-line plotting.")
 
-    with plt.rc_context({"font.family": style.font_family, "text.parse_math": True}):
+    transformed_x_series, transformed_y_series, normalized_count = _prepare_plot_series_data(
+        x_series=[np.asarray(values, dtype=float) for values in x_series],
+        y_series=[np.asarray(values, dtype=float) for values in y_series],
+        labels=labels,
+        x_bin_width=x_bin_width,
+        x_bin_reducer=x_bin_reducer,
+        series_normalization_modes=series_normalization_modes,
+        series_normalization_values=series_normalization_values,
+        series_normalization_x_refs=series_normalization_x_refs,
+    )
+    if len(labels) > 1 and 0 < normalized_count < len(labels):
+        LOGGER.warning(
+            "Only %d/%d plotted series are normalized. Interpret y-axis comparisons with care.",
+            normalized_count,
+            len(labels),
+        )
+
+    active_backend = configure_matplotlib_backend(
+        interactive=show,
+        preferred_backend=preferred_backend,
+    )
+    plt = _import_pyplot()
+
+    rc_context_args: dict[str, Any] = {"font.family": style.font_family, "text.parse_math": True}
+    if matplotlib_rc is not None:
+        rc_context_args.update(dict(matplotlib_rc))
+    with plt.rc_context(rc_context_args):
         fig, ax = plt.subplots(figsize=style.figure_size)
+        if figure_kwargs is not None:
+            fig.set(**dict(figure_kwargs))
         rendered_colors: list[str] = []
         rendered_markers: list[str] = []
         rendered_labels: list[str] = []
@@ -492,7 +914,14 @@ def plot_multi_line_series(
                 "series_markers count must match the number of plotted series "
                 f"({len(labels)})."
             )
-        for index, (x_values, y_values, label) in enumerate(zip(x_series, y_series, labels)):
+        if series_line_kwargs is not None and len(series_line_kwargs) != len(labels):
+            raise ValueError(
+                "series_line_kwargs count must match the number of plotted series "
+                f"({len(labels)})."
+            )
+        for index, (x_values, y_values, label) in enumerate(
+            zip(transformed_x_series, transformed_y_series, labels)
+        ):
             if series_enabled is not None and not bool(series_enabled[index]):
                 continue
             kwargs: dict[str, Any] = {"lw": style.line_width, "label": label}
@@ -503,19 +932,28 @@ def plot_multi_line_series(
                 marker_value = str(series_markers[index])
             kwargs["marker"] = marker_value
             if line_colors is not None:
-                kwargs["color"] = line_colors[index]
+                color_token = str(line_colors[index]).strip()
+                if color_token:
+                    kwargs["color"] = color_token
+            if line_kwargs is not None:
+                kwargs.update(dict(line_kwargs))
+            if series_line_kwargs is not None and series_line_kwargs[index] is not None:
+                kwargs.update(dict(series_line_kwargs[index]))
             (artist,) = ax.plot(x_values, y_values, **kwargs)
             rendered_colors.append(str(artist.get_color()))
             rendered_markers.append(str(artist.get_marker()))
-            rendered_labels.append(str(label))
+            rendered_labels.append(str(artist.get_label()))
 
         should_show_legend = len(rendered_labels) > 1 if legend is None else bool(legend and rendered_labels)
         if should_show_legend:
-            ax.legend(
-                fontsize=style.tick_font_size,
-                title=legend_title,
-                loc=legend_loc,
-            )
+            resolved_legend_kwargs: dict[str, Any] = {
+                "fontsize": style.tick_font_size,
+                "title": legend_title,
+                "loc": legend_loc,
+            }
+            if legend_kwargs is not None:
+                resolved_legend_kwargs.update(dict(legend_kwargs))
+            ax.legend(**resolved_legend_kwargs)
         ax.set_xlabel(x_label, fontsize=style.label_font_size)
         ax.set_ylabel(y_label, fontsize=style.label_font_size)
         if title_visible is False:
@@ -523,30 +961,66 @@ def plot_multi_line_series(
         else:
             ax.set_title(title, fontsize=style.title_font_size)
         ax.tick_params(axis="both", labelsize=style.tick_font_size)
+        resolved_tick_params_kwargs, tick_axis_hint, minor_ticks_mode = _extract_tick_controls(
+            tick_params_kwargs
+        )
 
         if style.grid:
-            ax.grid(
-                True,
-                linestyle=style.grid_linestyle,
-                linewidth=style.grid_linewidth,
-                alpha=style.grid_alpha,
-            )
+            resolved_grid_kwargs: dict[str, Any] = {
+                "linestyle": style.grid_linestyle,
+                "linewidth": style.grid_linewidth,
+                "alpha": style.grid_alpha,
+            }
+            if grid_kwargs is not None:
+                resolved_grid_kwargs.update(dict(grid_kwargs))
+            ax.grid(True, **resolved_grid_kwargs)
+        elif grid_kwargs is not None:
+            ax.grid(**dict(grid_kwargs))
         if ticks_visible is False:
-            ax.tick_params(
-                axis="both",
-                which="both",
-                bottom=False,
-                top=False,
-                left=False,
-                right=False,
-                labelbottom=False,
-                labelleft=False,
-            )
+            if tick_axis_hint in {"both", "x"}:
+                ax.tick_params(
+                    axis="x",
+                    which="both",
+                    bottom=False,
+                    top=False,
+                    labelbottom=False,
+                )
+            if tick_axis_hint in {"both", "y"}:
+                ax.tick_params(
+                    axis="y",
+                    which="both",
+                    left=False,
+                    right=False,
+                    labelleft=False,
+                )
         else:
+            if ticks_visible is True and tick_axis_hint in {"x", "y"}:
+                if tick_axis_hint == "x":
+                    ax.tick_params(
+                        axis="y",
+                        which="both",
+                        left=False,
+                        right=False,
+                        labelleft=False,
+                    )
+                else:
+                    ax.tick_params(
+                        axis="x",
+                        which="both",
+                        bottom=False,
+                        top=False,
+                        labelbottom=False,
+                    )
             if x_tick_rotation is not None:
                 ax.tick_params(axis="x", rotation=float(x_tick_rotation))
             if y_tick_rotation is not None:
                 ax.tick_params(axis="y", rotation=float(y_tick_rotation))
+        if minor_ticks_mode == "on":
+            ax.minorticks_on()
+        elif minor_ticks_mode == "off":
+            ax.minorticks_off()
+        if resolved_tick_params_kwargs:
+            ax.tick_params(**resolved_tick_params_kwargs)
         ax.set_xscale(x_scale)
         ax.set_yscale(y_scale)
         if x_ticks is not None:
@@ -562,8 +1036,13 @@ def plot_multi_line_series(
             bottom = None if y_lim[0] is None else float(y_lim[0])
             top = None if y_lim[1] is None else float(y_lim[1])
             ax.set_ylim(bottom=bottom, top=top)
+        if axes_kwargs is not None:
+            ax.set(**dict(axes_kwargs))
 
-        fig.tight_layout()
+        if tight_layout_kwargs is not None:
+            fig.tight_layout(**dict(tight_layout_kwargs))
+        else:
+            fig.tight_layout()
         _capture_plot_state(
             ax=ax,
             style=style,
@@ -578,8 +1057,13 @@ def plot_multi_line_series(
         if output is not None:
             output_path = Path(output).expanduser().resolve()
             output_path.parent.mkdir(parents=True, exist_ok=True)
-            fig.savefig(output_path, dpi=style.dpi)
-            LOGGER.info("Saved plot to '%s'.", output_path)
+            save_kwargs: dict[str, Any] = {}
+            if savefig_kwargs is not None:
+                save_kwargs.update(dict(savefig_kwargs))
+            save_kwargs.setdefault("dpi", style.dpi)
+            fig.savefig(output_path, **save_kwargs)
+            if not suppress_output_log:
+                LOGGER.info("Saved plot to '%s'.", output_path)
 
         if show:
             if show_blocking:

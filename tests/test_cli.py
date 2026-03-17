@@ -6,7 +6,13 @@ import pytest
 from ase import Atoms
 from ase.io import read, write
 
-from linak.cli import _rewrite_implicit_csv_interactive, _rewrite_implicit_plot_csv, build_parser, main
+import linak.cli as cli_mod
+from linak.cli import (
+    _rewrite_implicit_csv_interactive,
+    _rewrite_implicit_plot_csv,
+    build_parser,
+    main,
+)
 from linak.analysis.density import (
     compute_density_profile,
     load_density_profile,
@@ -14,10 +20,11 @@ from linak.analysis.density import (
     save_density_profile,
 )
 from linak.storage.hdf5_table import read_hdf5_frame
-from linak.storage.hdf5_utils import read_linak_hdf5
+from linak.storage.hdf5_utils import read_linak_hdf5, write_linak_hdf5_profile_collection
 from linak.analysis.msd import compute_msd, load_msd_profile, save_msd_profile
 from linak.plot.plot_settings import read_plot_profile, write_plot_profile
 from linak.analysis.rdf import compute_rdf, save_rdf_profile
+from linak.storage.hdf5_utils import read_linak_hdf5_profiles
 
 
 def _write_xyz(path: Path) -> None:
@@ -166,7 +173,7 @@ def test_plot_command_without_subcommand_shows_overview(capsys):
     assert rc == 0
     out = capsys.readouterr().out
     assert "LiNaK Plot Usage (HDF5-only)" in out
-    assert "linak plot density" in out
+    assert "linak plot /path/to/traj_density_o_z.h5" in out
 
 
 def test_compute_command_without_subcommand_shows_overview(capsys):
@@ -322,6 +329,72 @@ def test_hdf5_preview_prints_metadata_overview(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "Metadata overview" in out
     assert "selected group : /records" in out
+
+
+def test_hdf5_info_reads_profile_collection_with_gui_settings_group(tmp_path, capsys):
+    source = tmp_path / "combined_density.h5"
+    write_linak_hdf5_profile_collection(
+        source,
+        analysis="density",
+        profiles=[
+            {
+                "datasets": {
+                    "bin_centers_A": np.asarray([0.5, 1.5], dtype=float),
+                    "mass_density_g_per_angstrom": np.asarray([0.1, 0.2], dtype=float),
+                },
+                "metadata": {"species": "O"},
+            },
+            {
+                "datasets": {
+                    "bin_centers_A": np.asarray([0.5, 1.5], dtype=float),
+                    "mass_density_g_per_angstrom": np.asarray([0.3, 0.4], dtype=float),
+                },
+                "metadata": {"species": "H"},
+            },
+        ],
+        metadata={"source": "unit-test"},
+    )
+    write_plot_profile(source, "plot:density", {"title": "Saved title"})
+
+    rc = main(["--log-level", "ERROR", "hdf5", "info", str(source)])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Metadata overview" in out
+    assert "selected group : /profiles" in out
+    assert "profile_index" in out
+    assert "Rows: 4" in out
+
+
+def test_read_hdf5_frame_flattens_profile_collection_rows(tmp_path):
+    source = tmp_path / "combined_msd.h5"
+    write_linak_hdf5_profile_collection(
+        source,
+        analysis="msd",
+        profiles=[
+            {
+                "datasets": {
+                    "time_ps": np.asarray([0.0, 1.0], dtype=float),
+                    "msd_angstrom2": np.asarray([0.0, 0.5], dtype=float),
+                },
+                "metadata": {"species": "O"},
+            },
+            {
+                "datasets": {
+                    "time_ps": np.asarray([0.0, 1.0], dtype=float),
+                    "msd_angstrom2": np.asarray([0.0, 0.8], dtype=float),
+                },
+                "metadata": {"species": "Li"},
+            },
+        ],
+    )
+
+    frame, info = read_hdf5_frame(source)
+
+    assert info.container == "/profiles"
+    assert len(frame) == 4
+    assert frame["profile_index"].tolist() == [0, 0, 1, 1]
+    assert frame["time_ps"].tolist() == pytest.approx([0.0, 1.0, 0.0, 1.0])
 
 
 def test_csv_plot_writes_output_image(tmp_path):
@@ -657,16 +730,23 @@ def test_rewrite_implicit_csv_interactive():
     ]
 
 
-def test_rewrite_implicit_plot_csv():
-    assert _rewrite_implicit_plot_csv(["plot", "table.h5"]) == [
+def test_rewrite_implicit_plot_csv(tmp_path):
+    source = tmp_path / "table.h5"
+    _write_simple_hdf5(source)
+
+    assert _rewrite_implicit_plot_csv(["plot", str(source)]) == [
         "hdf5",
         "plot",
-        "table.h5",
+        str(source),
     ]
     assert _rewrite_implicit_plot_csv(["plot", "density", "table.h5"]) == [
         "plot",
         "density",
         "table.h5",
+    ]
+    assert _rewrite_implicit_plot_csv(["plot", "missing_table.h5"]) == [
+        "plot",
+        "missing_table.h5",
     ]
     assert _rewrite_implicit_plot_csv(["plot", "--help"]) == [
         "plot",
@@ -679,7 +759,7 @@ def test_rewrite_implicit_plot_csv_auto_detects_density_analysis(tmp_path):
     _write_density_hdf5(source)
 
     rewritten = _rewrite_implicit_plot_csv(["plot", str(source)])
-    assert rewritten == ["plot", "density", str(source)]
+    assert rewritten == ["plot", str(source)]
 
 
 def test_rewrite_implicit_plot_csv_detects_density_with_files_option(tmp_path):
@@ -693,7 +773,6 @@ def test_rewrite_implicit_plot_csv_detects_density_with_files_option(tmp_path):
     )
     assert rewritten == [
         "plot",
-        "density",
         "-f",
         str(source_a),
         str(source_b),
@@ -701,7 +780,7 @@ def test_rewrite_implicit_plot_csv_detects_density_with_files_option(tmp_path):
     ]
 
 
-def test_plot_density_persists_plot_settings_in_hdf5(tmp_path):
+def test_plot_density_non_gui_does_not_persist_plot_settings(tmp_path):
     source = tmp_path / "density.h5"
     output = tmp_path / "density.png"
     _write_density_hdf5(source)
@@ -711,7 +790,6 @@ def test_plot_density_persists_plot_settings_in_hdf5(tmp_path):
             "--log-level",
             "ERROR",
             "plot",
-            "density",
             str(source),
             "--title",
             "Stored Density Title",
@@ -728,12 +806,10 @@ def test_plot_density_persists_plot_settings_in_hdf5(tmp_path):
     assert output.exists()
 
     stored = read_plot_profile(source, "plot:density")
-    assert stored is not None
-    assert stored["title"] == "Stored Density Title"
-    assert stored["x_lim"] == pytest.approx([0.0, 3.0])
+    assert stored is None
 
 
-def test_plot_density_toggle_controls_persist_in_hdf5(tmp_path):
+def test_plot_density_toggle_controls_non_gui_do_not_persist(tmp_path):
     source = tmp_path / "density.h5"
     output = tmp_path / "density_toggles.png"
     _write_density_hdf5(source)
@@ -743,7 +819,6 @@ def test_plot_density_toggle_controls_persist_in_hdf5(tmp_path):
             "--log-level",
             "ERROR",
             "plot",
-            "density",
             str(source),
             "--title-mode",
             "off",
@@ -764,40 +839,19 @@ def test_plot_density_toggle_controls_persist_in_hdf5(tmp_path):
     assert output.exists()
 
     stored = read_plot_profile(source, "plot:density")
-    assert stored is not None
-    assert stored["title_visible"] is False
-    assert stored["legend"] is False
-    assert stored["grid"] is False
-    assert stored["ticks"] is False
-    assert stored["markers"] is True
+    assert stored is None
 
 
 def test_plot_density_keeps_existing_settings_when_changed_non_interactively(tmp_path):
     source = tmp_path / "density.h5"
     _write_density_hdf5(source)
-
-    rc_first = main(
-        [
-            "--log-level",
-            "ERROR",
-            "plot",
-            "density",
-            str(source),
-            "--title",
-            "Original Title",
-            "--no-show",
-            "--output",
-            str(tmp_path / "first.png"),
-        ]
-    )
-    assert rc_first == 0
+    write_plot_profile(source, "plot:density", {"title": "Original Title"})
 
     rc_second = main(
         [
             "--log-level",
             "ERROR",
             "plot",
-            "density",
             str(source),
             "--title",
             "New Title",
@@ -886,34 +940,35 @@ def test_csv_plot_accepts_one_sided_x_limits(tmp_path):
     assert output.exists()
 
     stored = read_plot_profile(source, "plot:table")
-    assert stored is not None
-    assert stored["x_lim"][0] == pytest.approx(0.5)
+    assert stored is None
 
 
-def test_plot_help_lists_subcommands_and_style_options(capsys):
+def test_plot_help_lists_analysis_and_style_options(capsys):
     parser = build_parser()
     with pytest.raises(SystemExit):
         parser.parse_args(["plot", "--help"])
     out = capsys.readouterr().out
-    assert "density" in out
-    assert "msd" in out
-    assert "rdf" in out
+    assert "--x-mode" in out
+    assert "--quantity" in out
+    assert "--species-a" in out
     assert "--font-family" in out
     assert "--title-font-size" in out
 
 
-def test_plot_subcommands_reject_save_data_flag():
-    parser = build_parser()
-    with pytest.raises(SystemExit):
-        parser.parse_args(["plot", "rdf", "input.h5", "--save-data", "copy.h5"])
+def test_plot_legacy_subcommands_are_rejected(tmp_path, capsys):
+    source = tmp_path / "density.h5"
+    _write_density_hdf5(source)
+
+    rc = main(["--log-level", "ERROR", "plot", "density", str(source), "--no-show"])
+
+    assert rc == 1
+    assert "subcommands were removed" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize(
     "argv",
     [
-        ["plot", "density", "input.h5", "--dry-run"],
-        ["plot", "msd", "input.h5", "--dry-run"],
-        ["plot", "rdf", "input.h5", "--dry-run"],
+        ["plot", "input.h5", "--dry-run"],
         ["hdf5", "combine", "-f", "a.h5", "b.h5", "--dry-run"],
         ["compute", "density", "traj.xyz", "--dry-run"],
         ["compute", "msd", "traj.xyz", "--dry-run"],
@@ -934,9 +989,27 @@ def test_all_leaf_commands_accept_dry_run_short_flag():
 
 
 def test_plot_density_defaults_to_surface_distance_mass():
-    args = build_parser().parse_args(["plot", "density", "input.h5"])
+    args = build_parser().parse_args(["plot", "input.h5"])
     assert args.x_mode == "distance"
     assert args.quantity == "mass"
+
+
+def test_plot_density_defaults_to_gui_when_show_is_enabled():
+    args = build_parser().parse_args(["plot", "input.h5"])
+    cli_mod._resolve_gui_mode(args)
+    assert args.gui is True
+
+
+def test_plot_density_defaults_to_non_gui_when_show_is_disabled():
+    args = build_parser().parse_args(["plot", "input.h5", "--no-show"])
+    cli_mod._resolve_gui_mode(args)
+    assert args.gui is False
+
+
+def test_plot_density_no_gui_flag_disables_gui_with_show_enabled():
+    args = build_parser().parse_args(["plot", "input.h5", "--no-gui"])
+    cli_mod._resolve_gui_mode(args)
+    assert args.gui is False
 
 
 def test_compute_density_defaults_surface_detection_options():
@@ -946,23 +1019,33 @@ def test_compute_density_defaults_surface_detection_options():
     assert args.include_fixed_surface_atoms is False
 
 
-def test_plot_density_dry_run_skips_input_file_processing(tmp_path):
-    missing_source = tmp_path / "missing_density.h5"
+def test_compute_msd_accepts_uppercase_alias():
+    args = build_parser().parse_args(["compute", "MSD", "traj.xyz"])
+    assert args.compute_command == "msd"
+
+
+def test_compute_rdf_accepts_uppercase_alias():
+    args = build_parser().parse_args(["compute", "RDF", "traj.xyz"])
+    assert args.compute_command == "rdf"
+
+
+def test_plot_density_dry_run_skips_rendering(tmp_path):
+    source = tmp_path / "density.h5"
+    _write_density_hdf5(source)
 
     rc = main(
         [
             "--log-level",
             "ERROR",
             "plot",
-            "density",
-            str(missing_source),
+            str(source),
             "--dry-run",
             "--no-show",
         ]
     )
 
     assert rc == 0
-    assert not missing_source.exists()
+    assert source.exists()
 
 
 def test_compute_density_dry_run_skips_trajectory_read_and_csv_write(tmp_path):
@@ -1203,7 +1286,6 @@ def test_plot_density_csv_does_not_write_csv_unless_requested(tmp_path, monkeypa
             "--log-level",
             "ERROR",
             "plot",
-            "density",
             str(source_csv),
             "--no-show",
             "--output",
@@ -1237,7 +1319,6 @@ def test_plot_density_multiple_files_overlays_with_source_labels(tmp_path, monke
             "--log-level",
             "ERROR",
             "plot",
-            "density",
             "-f",
             str(source_csv_1),
             str(source_csv_2),
@@ -1300,7 +1381,6 @@ def test_plot_density_multi_uses_requested_settings_source(tmp_path, monkeypatch
             "--log-level",
             "ERROR",
             "plot",
-            "density",
             "-f",
             str(source_a),
             str(source_b),
@@ -1314,7 +1394,7 @@ def test_plot_density_multi_uses_requested_settings_source(tmp_path, monkeypatch
     assert captured["title"] == "From second file"
 
 
-def test_plot_density_multi_writes_new_combined_hdf5_for_settings(tmp_path, monkeypatch):
+def test_plot_density_multi_non_gui_does_not_write_combined_settings_hdf5(tmp_path, monkeypatch):
     frame = Atoms("OO", positions=[[0.0, 0.0, 0.02], [0.0, 0.0, 0.18]])
     profile = compute_density_profile([frame], species="O", axis="z", bin_width=0.1)
     source_a = tmp_path / "source_a_density.h5"
@@ -1343,7 +1423,6 @@ def test_plot_density_multi_writes_new_combined_hdf5_for_settings(tmp_path, monk
             "--log-level",
             "ERROR",
             "plot",
-            "density",
             "-f",
             str(source_a),
             str(source_b),
@@ -1358,14 +1437,8 @@ def test_plot_density_multi_writes_new_combined_hdf5_for_settings(tmp_path, monk
     assert original_settings["line_colors"] == ["#1f77b4"]
 
     combined_files = sorted(tmp_path.glob("*density_combined*.h5"))
-    assert len(combined_files) == 1
-    combined_source = combined_files[0]
-    assert captured["source"] == str(combined_source)
-
-    combined_settings = read_plot_profile(combined_source, "plot:density")
-    assert combined_settings is not None
-    assert combined_settings["series_labels"] == ["H2O", f"{source_b.name}:O"]
-    assert len(combined_settings["line_colors"]) == 2
+    assert len(combined_files) == 0
+    assert captured["source"] == "multi_source_density"
 
 
 def test_plot_density_multi_auto_merges_series_labels_and_colors_from_sources(tmp_path, monkeypatch):
@@ -1400,7 +1473,6 @@ def test_plot_density_multi_auto_merges_series_labels_and_colors_from_sources(tm
             "--log-level",
             "ERROR",
             "plot",
-            "density",
             "-f",
             str(source_a),
             str(source_b),
@@ -1443,7 +1515,6 @@ def test_plot_density_ignores_stale_saved_series_settings_when_counts_do_not_mat
             "--log-level",
             "ERROR",
             "plot",
-            "density",
             str(source),
             "--no-show",
         ]
@@ -1479,7 +1550,6 @@ def test_plot_density_passes_x_mode_and_quantity_to_plotter(tmp_path, monkeypatc
             "--log-level",
             "ERROR",
             "plot",
-            "density",
             str(source_csv),
             "--x-mode",
             "axis",
@@ -1516,7 +1586,6 @@ def test_plot_density_gui_mode_uses_gui_launcher(tmp_path, monkeypatch):
             "--log-level",
             "ERROR",
             "plot",
-            "density",
             str(source_h5),
             "--gui",
         ]
@@ -1552,7 +1621,6 @@ def test_plot_density_gui_multi_sources_create_combined_hdf5(tmp_path, monkeypat
             "--log-level",
             "ERROR",
             "plot",
-            "density",
             "-f",
             str(source_h5_a),
             str(source_h5_b),
@@ -1594,7 +1662,6 @@ def test_plot_density_gui_multi_sources_copy_settings_from_requested_source(tmp_
             "--log-level",
             "ERROR",
             "plot",
-            "density",
             "-f",
             str(source_h5_a),
             str(source_h5_b),
@@ -1610,6 +1677,38 @@ def test_plot_density_gui_multi_sources_copy_settings_from_requested_source(tmp_
     copied_settings = read_plot_profile(combined_source, "plot:density")
     assert copied_settings is not None
     assert copied_settings["title"] == "From second"
+
+
+def test_combine_analysis_hdf5_sources_copies_settings_without_source_metadata(tmp_path):
+    frame = Atoms(
+        "OO",
+        positions=[[0.0, 0.0, 0.10], [0.0, 0.0, 1.10]],
+        cell=[10.0, 10.0, 10.0],
+        pbc=True,
+    )
+    profile = compute_density_profile([frame], species="O", axis="z", bin_width=1.0)
+    source_h5_a = tmp_path / "source_a_density.h5"
+    source_h5_b = tmp_path / "source_b_density.h5"
+    combined_h5 = tmp_path / "combined_density.h5"
+    save_density_profile(profile, source_h5_a)
+    save_density_profile(profile, source_h5_b)
+    write_plot_profile(source_h5_b, "plot:density", {"title": "From second"})
+
+    output_path = cli_mod._combine_analysis_hdf5_sources(
+        sources=[str(source_h5_a), str(source_h5_b)],
+        analysis="density",
+        output=combined_h5,
+        settings_source_path=source_h5_b,
+    )
+
+    assert output_path == combined_h5.resolve()
+    imported_settings = read_plot_profile(output_path, "plot:density")
+    assert imported_settings is not None
+    assert imported_settings["title"] == "From second"
+    profiles = read_linak_hdf5_profiles(output_path, expected_analysis="density")
+    assert profiles
+    _datasets, metadata = profiles[0]
+    assert "settings_source" not in metadata
 
 
 def test_plot_density_gui_multi_sources_combine_series_labels_and_colors(tmp_path, monkeypatch):
@@ -1647,7 +1746,6 @@ def test_plot_density_gui_multi_sources_combine_series_labels_and_colors(tmp_pat
             "--log-level",
             "ERROR",
             "plot",
-            "density",
             "-f",
             str(source_h5_a),
             str(source_h5_b),
@@ -1695,7 +1793,6 @@ def test_plot_density_gui_preview_renders_for_each_request(tmp_path, monkeypatch
             "--log-level",
             "ERROR",
             "plot",
-            "density",
             str(source_h5),
             "--gui",
         ]
@@ -1703,6 +1800,41 @@ def test_plot_density_gui_preview_renders_for_each_request(tmp_path, monkeypatch
 
     assert rc == 0
     assert len(preview_calls) == 2
+
+
+def test_plot_density_gui_provides_hdf5_import_callback(tmp_path, monkeypatch):
+    frame = Atoms(
+        "OO",
+        positions=[[0.0, 0.0, 0.10], [0.0, 0.0, 1.10]],
+        cell=[10.0, 10.0, 10.0],
+        pbc=True,
+    )
+    profile = compute_density_profile([frame], species="O", axis="z", bin_width=1.0)
+    source_h5 = tmp_path / "source_density.h5"
+    save_density_profile(profile, source_h5)
+    write_plot_profile(source_h5, "plot:density", {"title": "Imported title"})
+
+    imported_payload: dict[str, object] = {}
+
+    def _fake_gui_launcher(**kwargs):
+        callback = kwargs.get("on_import_hdf5")
+        assert callable(callback)
+        imported_payload.update(callback(str(source_h5)))
+
+    monkeypatch.setattr("linak.cli._open_plot_settings_gui", _fake_gui_launcher)
+
+    rc = main(
+        [
+            "--log-level",
+            "ERROR",
+            "plot",
+            str(source_h5),
+            "--gui",
+        ]
+    )
+
+    assert rc == 0
+    assert imported_payload["title"] == "Imported title"
 
 
 def test_plot_density_gui_preview_uses_non_blocking_show(tmp_path, monkeypatch):
@@ -1733,7 +1865,6 @@ def test_plot_density_gui_preview_uses_non_blocking_show(tmp_path, monkeypatch):
             "--log-level",
             "ERROR",
             "plot",
-            "density",
             str(source_h5),
             "--gui",
         ]
@@ -1773,7 +1904,6 @@ def test_plot_density_gui_single_series_label_maps_to_line_label(tmp_path, monke
             "--log-level",
             "ERROR",
             "plot",
-            "density",
             str(source_h5),
             "--gui",
         ]
@@ -1847,7 +1977,6 @@ def test_plot_density_rejects_trajectory_input(tmp_path, capsys):
             "--log-level",
             "ERROR",
             "plot",
-            "density",
             str(trajectory),
             "--no-show",
         ]
@@ -1870,7 +1999,6 @@ def test_plot_density_rejects_multiple_positional_sources_without_files_flag(tmp
             "--log-level",
             "ERROR",
             "plot",
-            "density",
             str(source_csv_1),
             str(source_csv_2),
             "--no-show",
@@ -1908,7 +2036,6 @@ def test_plot_msd_multiple_files_overlays_with_source_labels(tmp_path, monkeypat
             "--log-level",
             "ERROR",
             "plot",
-            "msd",
             "-f",
             str(source_csv_1),
             str(source_csv_2),
@@ -1931,7 +2058,6 @@ def test_plot_msd_rejects_trajectory_input(tmp_path, capsys):
             "--log-level",
             "ERROR",
             "plot",
-            "msd",
             str(trajectory),
             "--no-show",
         ]
@@ -1973,7 +2099,6 @@ def test_plot_rdf_multiple_files_overlays_with_source_labels(tmp_path, monkeypat
             "--log-level",
             "ERROR",
             "plot",
-            "rdf",
             "-f",
             str(source_csv_1),
             str(source_csv_2),
@@ -1998,7 +2123,6 @@ def test_plot_rdf_rejects_trajectory_input(tmp_path, capsys):
             "--log-level",
             "ERROR",
             "plot",
-            "rdf",
             str(trajectory),
             "--species-a",
             "O",
@@ -2234,7 +2358,7 @@ def test_compute_density_auto_detects_cell_for_volumetric_units(tmp_path, monkey
 
     assert rc == 0
     profile = load_density_profile(tmp_path / "traj_density_o_z.h5")
-    assert profile.units == "g/Angstrom^3"
+    assert profile.units == "g/cm^3"
 
 
 def test_compute_density_writes_resolution_metadata_to_hdf5(tmp_path, monkeypatch):
@@ -2314,7 +2438,7 @@ def test_compute_density_accepts_cp2k_input_alias(tmp_path, monkeypatch):
 
     assert rc == 0
     profile = load_density_profile(tmp_path / "traj_density_o_z.h5")
-    assert profile.units == "g/Angstrom^3"
+    assert profile.units == "g/cm^3"
 
 
 def test_compute_density_all_writes_one_csv_per_element(tmp_path, monkeypatch):

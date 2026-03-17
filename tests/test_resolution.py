@@ -1,5 +1,3 @@
-from pathlib import Path
-
 from ase import Atoms
 import pytest
 
