@@ -335,4 +335,3 @@ def apply_pbc_to_frames(
             progress.update()
 
     return wrapped_frames
-

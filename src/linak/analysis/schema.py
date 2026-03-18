@@ -6,8 +6,9 @@ code paths stay consistent and new analyses can be added with minimal edits.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any
 
 import numpy as np
 
@@ -52,6 +53,41 @@ _ANALYSIS_SCHEMAS: dict[str, AnalysisSchema] = {
             "g_r": "dimensionless",
         },
         default_plot_labels=("r (Angstrom)", "g(r)"),
+    ),
+    "position": AnalysisSchema(
+        analysis="position",
+        version=1,
+        default_units_map={
+            "frame_index": "index",
+            "step": "step",
+            "time_fs": "fs",
+            "time_ps": "ps",
+            "x_A": "Angstrom",
+            "y_A": "Angstrom",
+            "z_A": "Angstrom",
+            "distance_to_surface_A": "Angstrom",
+            "surface_position_per_frame_A": "Angstrom",
+        },
+        default_plot_labels=("Time (ps)", "Distance to surface (Angstrom)"),
+    ),
+    "coordination": AnalysisSchema(
+        analysis="coordination",
+        version=1,
+        default_units_map={
+            "frame_index": "index",
+            "step": "step",
+            "time_fs": "fs",
+            "time_ps": "ps",
+            "distance_to_surface_A": "Angstrom",
+            "coordination_number": "dimensionless",
+            "surface_position_per_frame_A": "Angstrom",
+            "cutoff_A": "Angstrom",
+            "cutoff_smoothing_width_A": "Angstrom",
+            "cutoff_rdf_bin_centers_A": "Angstrom",
+            "cutoff_rdf_g_r": "dimensionless",
+            "cutoff_rdf_g_r_smoothed": "dimensionless",
+        },
+        default_plot_labels=("Distance to surface (Angstrom)", "Coordination number"),
     ),
 }
 

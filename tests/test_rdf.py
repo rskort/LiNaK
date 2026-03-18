@@ -251,4 +251,3 @@ def test_compute_rdf_parallel_path_uses_chunk_executor(monkeypatch):
     assert captured["max_workers"] == 2
     assert captured["chunks"] >= 2
     assert profile.n_frames == len(frames)
-

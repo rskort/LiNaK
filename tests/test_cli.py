@@ -19,10 +19,25 @@ from linak.analysis.density import (
     load_density_profiles,
     save_density_profile,
 )
+from linak.analysis.position import (
+    compute_position_profile,
+    load_position_profile,
+    save_position_profile,
+)
+from linak.analysis.coordination import (
+    CoordinationCutoffResolution,
+    compute_coordination_profile,
+    save_coordination_profile,
+)
 from linak.storage.hdf5_table import read_hdf5_frame
 from linak.storage.hdf5_utils import read_linak_hdf5, write_linak_hdf5_profile_collection
 from linak.analysis.msd import compute_msd, load_msd_profile, save_msd_profile
-from linak.plot.plot_settings import read_plot_profile, write_plot_profile
+from linak.plot.plot_settings import (
+    read_active_plot_profile_name,
+    read_plot_profile,
+    read_plot_profile_names,
+    write_plot_profile,
+)
 from linak.analysis.rdf import compute_rdf, save_rdf_profile
 from linak.storage.hdf5_utils import read_linak_hdf5_profiles
 
@@ -88,9 +103,7 @@ def _write_cp2k_input(path: Path, *, timestep_fs: float = 0.5, stride_md: int = 
 
 def _write_minimal_cp2k_output(path: Path) -> None:
     path.write_text(
-        " CP2K| version string\n"
-        " GLOBAL| Run type ENERGY\n"
-        " PROGRAM ENDED AT 2026-01-01 00:00:00\n",
+        " CP2K| version string\n GLOBAL| Run type ENERGY\n PROGRAM ENDED AT 2026-01-01 00:00:00\n",
         encoding="utf-8",
     )
 
@@ -113,6 +126,10 @@ def _write_simple_hdf5(path: Path) -> None:
         )
 
 
+def _linak_output_dir(path: Path) -> Path:
+    return path / "linak_outputs"
+
+
 def _write_density_hdf5(path: Path) -> None:
     frame0 = Atoms(
         "OO",
@@ -128,6 +145,80 @@ def _write_density_hdf5(path: Path) -> None:
     )
     profile = compute_density_profile([frame0, frame1], species="O", axis="z", bin_width=0.1)
     save_density_profile(profile, path)
+
+
+def _write_position_hdf5(path: Path) -> None:
+    frame0 = Atoms(
+        "PtPtOO",
+        positions=[
+            [0.0, 0.0, 0.20],
+            [1.0, 0.0, 0.20],
+            [0.0, 0.0, 1.00],
+            [1.0, 0.0, 1.50],
+        ],
+        cell=[10.0, 10.0, 10.0],
+        pbc=True,
+    )
+    frame1 = Atoms(
+        "PtPtOO",
+        positions=[
+            [0.0, 0.0, 0.30],
+            [1.0, 0.0, 0.30],
+            [0.0, 0.0, 1.20],
+            [1.0, 0.0, 1.70],
+        ],
+        cell=[10.0, 10.0, 10.0],
+        pbc=True,
+    )
+    profile = compute_position_profile(
+        [frame0, frame1],
+        species="O",
+        axis="z",
+        timestep_fs=2.0,
+        surface_mode="rough",
+        surface_elements=["Pt"],
+    )
+    save_position_profile(profile, path)
+
+
+def _write_coordination_hdf5(path: Path) -> None:
+    frame0 = Atoms(
+        "PtPtOH",
+        positions=[
+            [0.0, 0.0, 0.20],
+            [1.0, 0.0, 0.20],
+            [0.0, 0.0, 1.00],
+            [0.70, 0.0, 1.00],
+        ],
+        cell=[10.0, 10.0, 10.0],
+        pbc=True,
+    )
+    frame1 = Atoms(
+        "PtPtOH",
+        positions=[
+            [0.0, 0.0, 0.30],
+            [1.0, 0.0, 0.30],
+            [0.0, 0.0, 1.20],
+            [1.10, 0.0, 1.20],
+        ],
+        cell=[10.0, 10.0, 10.0],
+        pbc=True,
+    )
+    profile = compute_coordination_profile(
+        [frame0, frame1],
+        species_a="O",
+        species_b="H",
+        axis="z",
+        timestep_fs=2.0,
+        surface_mode="rough",
+        surface_elements=["Pt"],
+        cutoff_resolution=CoordinationCutoffResolution(
+            cutoff_A=1.0,
+            smoothing_width_A=0.4,
+            mode="direct",
+        ),
+    )
+    save_coordination_profile(profile, path)
 
 
 def _read_table_frame(path: Path):
@@ -536,6 +627,47 @@ def test_hdf5_combine_density_outputs_plot_ready_hdf5(tmp_path):
     assert output.exists()
 
 
+def test_hdf5_combine_position_outputs_plot_ready_hdf5(tmp_path):
+    source_a = tmp_path / "source_a_position.h5"
+    source_b = tmp_path / "source_b_position.h5"
+    combined = tmp_path / "combined_position.h5"
+    output = tmp_path / "combined_position.png"
+    _write_position_hdf5(source_a)
+    _write_position_hdf5(source_b)
+
+    rc_combine = main(
+        [
+            "--log-level",
+            "ERROR",
+            "hdf5",
+            "combine",
+            "-f",
+            str(source_a),
+            str(source_b),
+            "--output",
+            str(combined),
+        ]
+    )
+    assert rc_combine == 0
+    assert combined.exists()
+    payloads = read_linak_hdf5_profiles(combined, expected_analysis="position")
+    assert len(payloads) == 2
+
+    rc_plot = main(
+        [
+            "--log-level",
+            "ERROR",
+            "plot",
+            str(combined),
+            "--no-show",
+            "--output",
+            str(output),
+        ]
+    )
+    assert rc_plot == 0
+    assert output.exists()
+
+
 def test_csv_plot_rejects_multiple_positional_sources_without_files_flag(tmp_path, capsys):
     source_a = tmp_path / "table_a.h5"
     source_b = tmp_path / "table_b.h5"
@@ -595,7 +727,9 @@ def test_csv_plot_series_labels_count_must_match_rendered_series(tmp_path, capsy
     )
 
     assert rc == 1
-    assert "--labels/--series-labels count must match rendered series count" in capsys.readouterr().err
+    assert (
+        "--labels/--series-labels count must match rendered series count" in capsys.readouterr().err
+    )
 
 
 def test_csv_plot_accepts_custom_axis_and_legend_options(tmp_path):
@@ -762,6 +896,22 @@ def test_rewrite_implicit_plot_csv_auto_detects_density_analysis(tmp_path):
     assert rewritten == ["plot", str(source)]
 
 
+def test_rewrite_implicit_plot_csv_auto_detects_position_analysis(tmp_path):
+    source = tmp_path / "position.h5"
+    _write_position_hdf5(source)
+
+    rewritten = _rewrite_implicit_plot_csv(["plot", str(source)])
+    assert rewritten == ["plot", str(source)]
+
+
+def test_rewrite_implicit_plot_csv_auto_detects_coordination_analysis(tmp_path):
+    source = tmp_path / "coordination.h5"
+    _write_coordination_hdf5(source)
+
+    rewritten = _rewrite_implicit_plot_csv(["plot", str(source)])
+    assert rewritten == ["plot", str(source)]
+
+
 def test_rewrite_implicit_plot_csv_detects_density_with_files_option(tmp_path):
     source_a = tmp_path / "density_a.h5"
     source_b = tmp_path / "density_b.h5"
@@ -910,6 +1060,13 @@ def test_hdf5_plot_settings_can_apply_profile_to_other_files(tmp_path):
     assert target_profile["x_lim"] == pytest.approx([0.0, 2.0])
 
 
+def test_hdf5_plot_settings_accepts_position_profile_choice():
+    args = build_parser().parse_args(
+        ["hdf5", "plot-settings", "source.h5", "--profile", "position"]
+    )
+    assert args.profile == "position"
+
+
 def test_csv_plot_accepts_one_sided_x_limits(tmp_path):
     source = tmp_path / "table.h5"
     output = tmp_path / "one_sided_xlim.png"
@@ -951,15 +1108,20 @@ def test_plot_help_lists_analysis_and_style_options(capsys):
     assert "--x-mode" in out
     assert "--quantity" in out
     assert "--species-a" in out
+    assert "--component" in out
+    assert "--map-color" in out
+    assert "--time-axis" in out
+    assert "--time-section-width" in out
     assert "--font-family" in out
     assert "--title-font-size" in out
 
 
-def test_plot_legacy_subcommands_are_rejected(tmp_path, capsys):
+@pytest.mark.parametrize("subcommand", ["density", "position"])
+def test_plot_legacy_subcommands_are_rejected(tmp_path, capsys, subcommand):
     source = tmp_path / "density.h5"
     _write_density_hdf5(source)
 
-    rc = main(["--log-level", "ERROR", "plot", "density", str(source), "--no-show"])
+    rc = main(["--log-level", "ERROR", "plot", subcommand, str(source), "--no-show"])
 
     assert rc == 1
     assert "subcommands were removed" in capsys.readouterr().err
@@ -972,6 +1134,7 @@ def test_plot_legacy_subcommands_are_rejected(tmp_path, capsys):
         ["hdf5", "combine", "-f", "a.h5", "b.h5", "--dry-run"],
         ["compute", "density", "traj.xyz", "--dry-run"],
         ["compute", "msd", "traj.xyz", "--dry-run"],
+        ["compute", "position", "traj.xyz", "--dry-run"],
         ["compute", "rdf", "traj.xyz", "--dry-run"],
         ["compute", "potential", "run_dir", "--dry-run"],
         ["apply", "pbc", "traj.xyz", "--dry-run"],
@@ -994,6 +1157,20 @@ def test_plot_density_defaults_to_surface_distance_mass():
     assert args.quantity == "mass"
 
 
+def test_plot_position_accepts_xy_z_component():
+    args = build_parser().parse_args(["plot", "input.h5", "--component", "xy-z"])
+    assert args.component == "xy-z"
+    assert args.map_color == "distance"
+
+
+def test_plot_position_accepts_xy_z_map_color_override():
+    args = build_parser().parse_args(
+        ["plot", "input.h5", "--component", "xy-z", "--map-color", "z"]
+    )
+    assert args.component == "xy-z"
+    assert args.map_color == "z"
+
+
 def test_plot_density_defaults_to_gui_when_show_is_enabled():
     args = build_parser().parse_args(["plot", "input.h5"])
     cli_mod._resolve_gui_mode(args)
@@ -1014,6 +1191,15 @@ def test_plot_density_no_gui_flag_disables_gui_with_show_enabled():
 
 def test_compute_density_defaults_surface_detection_options():
     args = build_parser().parse_args(["compute", "density", "traj.xyz"])
+    assert args.surface_mode == "auto"
+    assert args.surface_elements is None
+    assert args.include_fixed_surface_atoms is False
+
+
+def test_compute_position_defaults_surface_detection_options():
+    args = build_parser().parse_args(["compute", "position", "traj.xyz"])
+    assert args.species is None
+    assert args.axis == "z"
     assert args.surface_mode == "auto"
     assert args.surface_elements is None
     assert args.include_fixed_surface_atoms is False
@@ -1050,7 +1236,7 @@ def test_plot_density_dry_run_skips_rendering(tmp_path):
 
 def test_compute_density_dry_run_skips_trajectory_read_and_csv_write(tmp_path):
     missing_trajectory = tmp_path / "missing_traj.xyz"
-    expected_default_output = tmp_path / "missing_traj_density_o_z.h5"
+    expected_default_output = _linak_output_dir(tmp_path) / "missing_traj_density_o_z.h5"
 
     rc = main(
         [
@@ -1441,7 +1627,9 @@ def test_plot_density_multi_non_gui_does_not_write_combined_settings_hdf5(tmp_pa
     assert captured["source"] == "multi_source_density"
 
 
-def test_plot_density_multi_auto_merges_series_labels_and_colors_from_sources(tmp_path, monkeypatch):
+def test_plot_density_multi_auto_merges_series_labels_and_colors_from_sources(
+    tmp_path, monkeypatch
+):
     frame = Atoms("OO", positions=[[0.0, 0.0, 0.02], [0.0, 0.0, 0.18]])
     profile = compute_density_profile([frame], species="O", axis="z", bin_width=0.1)
     source_a = tmp_path / "source_a_density.h5"
@@ -1594,7 +1782,51 @@ def test_plot_density_gui_mode_uses_gui_launcher(tmp_path, monkeypatch):
     assert rc == 0
     assert captured["profile_key"] == "plot:density"
     assert captured["analysis_name"] == "density"
-    assert captured["gui_title"] == "LiNaK Plot Controls: Density"
+
+
+def test_plot_density_gui_initial_settings_include_analysis_controls(tmp_path, monkeypatch):
+    source_h5 = tmp_path / "source_density.h5"
+    _write_density_hdf5(source_h5)
+
+    captured: dict[str, object] = {}
+
+    def _fake_gui_launcher(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr("linak.cli._open_plot_settings_gui", _fake_gui_launcher)
+
+    rc = main(
+        [
+            "--log-level",
+            "ERROR",
+            "plot",
+            str(source_h5),
+            "--species",
+            "H2O",
+            "--axis",
+            "y",
+            "--x-mode",
+            "axis",
+            "--quantity",
+            "number",
+            "--gui",
+        ]
+    )
+
+    assert rc == 0
+    assert captured["analysis_name"] == "density"
+    initial = captured["initial_settings"]
+    assert isinstance(initial, dict)
+    assert initial["species"] == "H2O"
+    assert initial["axis"] == "y"
+    assert initial["x_mode"] == "axis"
+    assert initial["quantity"] == "number"
+    resolver = captured["on_resolve_series_defaults"]
+    resolved = resolver(initial)
+    assert resolved["series_count"] == 1
+    assert resolved["series_labels"] == ["H2O"]
+    assert captured["title"] == "LiNaK Plot Controls: Density"
+    assert captured["initial_profile_name"] == "Default"
 
 
 def test_plot_density_gui_multi_sources_create_combined_hdf5(tmp_path, monkeypatch):
@@ -1819,7 +2051,7 @@ def test_plot_density_gui_provides_hdf5_import_callback(tmp_path, monkeypatch):
     def _fake_gui_launcher(**kwargs):
         callback = kwargs.get("on_import_hdf5")
         assert callable(callback)
-        imported_payload.update(callback(str(source_h5)))
+        imported_payload.update(callback(str(source_h5), "Default"))
 
     monkeypatch.setattr("linak.cli._open_plot_settings_gui", _fake_gui_launcher)
 
@@ -1835,6 +2067,102 @@ def test_plot_density_gui_provides_hdf5_import_callback(tmp_path, monkeypatch):
 
     assert rc == 0
     assert imported_payload["title"] == "Imported title"
+
+
+def test_plot_density_gui_uses_requested_named_settings_profile(tmp_path, monkeypatch):
+    source_h5 = tmp_path / "source_density.h5"
+    _write_density_hdf5(source_h5)
+    write_plot_profile(source_h5, "plot:density", {"title": "Default title"})
+    write_plot_profile(
+        source_h5,
+        "plot:density",
+        {"title": "Paper title", "x_mode": "axis"},
+        profile_name="Paper",
+    )
+    captured: dict[str, object] = {}
+
+    def _fake_gui_launcher(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr("linak.cli._open_plot_settings_gui", _fake_gui_launcher)
+
+    rc = main(
+        [
+            "--log-level",
+            "ERROR",
+            "plot",
+            str(source_h5),
+            "--settings-profile",
+            "Paper",
+            "--gui",
+        ]
+    )
+
+    assert rc == 0
+    assert captured["initial_profile_name"] == "Paper"
+    assert captured["available_profile_names"] == ["Default", "Paper"]
+    initial = captured["initial_settings"]
+    assert isinstance(initial, dict)
+    assert initial["title"] == "Paper title"
+    assert initial["x_mode"] == "axis"
+
+
+def test_hdf5_plot_settings_named_profile_copy_and_activate(tmp_path):
+    source = tmp_path / "density.h5"
+    _write_density_hdf5(source)
+    write_plot_profile(source, "plot:density", {"title": "Default title"})
+
+    rc_copy = main(
+        [
+            "--log-level",
+            "ERROR",
+            "hdf5",
+            "plot-settings",
+            str(source),
+            "--profile",
+            "density",
+            "--copy-name",
+            "Publication",
+        ]
+    )
+    assert rc_copy == 0
+    assert read_plot_profile_names(source, "plot:density") == ["Default", "Publication"]
+
+    rc_set = main(
+        [
+            "--log-level",
+            "ERROR",
+            "hdf5",
+            "plot-settings",
+            str(source),
+            "--profile",
+            "density",
+            "--name",
+            "Publication",
+            "--set",
+            'title="Publication title"',
+        ]
+    )
+    assert rc_set == 0
+    assert read_plot_profile(source, "plot:density", profile_name="Publication") == {
+        "title": "Publication title"
+    }
+
+    rc_active = main(
+        [
+            "--log-level",
+            "ERROR",
+            "hdf5",
+            "plot-settings",
+            str(source),
+            "--profile",
+            "density",
+            "--set-active",
+            "Publication",
+        ]
+    )
+    assert rc_active == 0
+    assert read_active_plot_profile_name(source, "plot:density") == "Publication"
 
 
 def test_plot_density_gui_preview_uses_non_blocking_show(tmp_path, monkeypatch):
@@ -1942,7 +2270,9 @@ def test_compute_density_passes_surface_options_to_density_engine(tmp_path, monk
         return [profile]
 
     monkeypatch.setattr("linak.trajectory.io.read_trajectory", _fake_read_trajectory)
-    monkeypatch.setattr("linak.analysis.density.compute_density_profiles", _fake_compute_density_profiles)
+    monkeypatch.setattr(
+        "linak.analysis.density.compute_density_profiles", _fake_compute_density_profiles
+    )
 
     rc = main(
         [
@@ -2067,6 +2397,180 @@ def test_plot_msd_rejects_trajectory_input(tmp_path, capsys):
     assert "only accepts HDF5 input" in capsys.readouterr().err
 
 
+def test_plot_position_multiple_files_overlays_with_source_labels(tmp_path, monkeypatch):
+    source_h5_1 = tmp_path / "source1_position.h5"
+    source_h5_2 = tmp_path / "source2_position.h5"
+    _write_position_hdf5(source_h5_1)
+    _write_position_hdf5(source_h5_2)
+
+    captured: dict[str, object] = {}
+
+    def _fake_plot_position_profiles(profiles, **kwargs):
+        captured["species"] = [item.species for item in profiles]
+        captured["component"] = kwargs.get("component")
+        captured["map_color"] = kwargs.get("map_color")
+        captured["x_bin_width"] = kwargs.get("x_bin_width")
+        return None
+
+    monkeypatch.setattr(
+        "linak.analysis.position.plot_position_profiles", _fake_plot_position_profiles
+    )
+
+    rc = main(
+        [
+            "--log-level",
+            "ERROR",
+            "plot",
+            "-f",
+            str(source_h5_1),
+            str(source_h5_2),
+            "--species",
+            "O",
+            "--component",
+            "xy-z",
+            "--time-section-width",
+            "0.5",
+            "--no-show",
+        ]
+    )
+
+    assert rc == 0
+    assert captured["species"] == [f"{source_h5_1.name}:O", f"{source_h5_2.name}:O"]
+    assert captured["component"] == "xy-z"
+    assert captured["map_color"] == "distance"
+    assert captured["x_bin_width"] == pytest.approx(0.5)
+
+
+def test_plot_position_rejects_trajectory_input(tmp_path, capsys):
+    trajectory = tmp_path / "traj.xyz"
+    write(trajectory, [Atoms("O", positions=[[0.0, 0.0, 0.1]])], format="extxyz")
+
+    rc = main(
+        [
+            "--log-level",
+            "ERROR",
+            "plot",
+            str(trajectory),
+            "--species",
+            "O",
+            "--no-show",
+        ]
+    )
+
+    assert rc == 1
+    assert "only accepts HDF5 input" in capsys.readouterr().err
+
+
+def test_plot_position_gui_uses_atom_level_series_in_initial_settings(tmp_path, monkeypatch):
+    source_h5 = tmp_path / "source_position.h5"
+    _write_position_hdf5(source_h5)
+
+    captured: dict[str, object] = {}
+
+    def _fake_gui_launcher(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr("linak.cli._open_plot_settings_gui", _fake_gui_launcher)
+
+    rc = main(
+        [
+            "--log-level",
+            "ERROR",
+            "plot",
+            str(source_h5),
+            "--gui",
+        ]
+    )
+
+    assert rc == 0
+    assert captured["analysis_name"] == "position"
+    initial = captured["initial_settings"]
+    assert isinstance(initial, dict)
+    assert initial["series_count"] == 2
+    assert initial["series_labels"] == ["O[2]", "O[3]"]
+    assert initial["axis"] is None
+    assert initial["component"] == "distance"
+    assert initial["map_color"] == "distance"
+    assert initial["time_axis"] == "ps"
+    resolver = captured["on_resolve_series_defaults"]
+    resolved = resolver(initial)
+    assert resolved["series_count"] == 2
+    assert resolved["series_labels"] == ["O[2]", "O[3]"]
+
+
+def test_plot_coordination_multiple_files_overlays_with_source_labels(tmp_path, monkeypatch):
+    source_h5_1 = tmp_path / "source1_coordination.h5"
+    source_h5_2 = tmp_path / "source2_coordination.h5"
+    _write_coordination_hdf5(source_h5_1)
+    _write_coordination_hdf5(source_h5_2)
+
+    captured: dict[str, object] = {}
+
+    def _fake_plot_coordination_profiles(profiles, **kwargs):
+        captured["species_a"] = [item.species_a for item in profiles]
+        captured["component"] = kwargs.get("component")
+        return None
+
+    monkeypatch.setattr(
+        "linak.analysis.coordination.plot_coordination_profiles",
+        _fake_plot_coordination_profiles,
+    )
+
+    rc = main(
+        [
+            "--log-level",
+            "ERROR",
+            "plot",
+            "-f",
+            str(source_h5_1),
+            str(source_h5_2),
+            "--species-a",
+            "O",
+            "--species-b",
+            "H",
+            "--no-show",
+        ]
+    )
+
+    assert rc == 0
+    assert captured["species_a"] == [f"{source_h5_1.name}:O", f"{source_h5_2.name}:O"]
+    assert captured["component"] == "distance"
+
+
+def test_plot_coordination_gui_defaults_to_distance_and_resolves_time_series(tmp_path, monkeypatch):
+    source_h5 = tmp_path / "source_coordination.h5"
+    _write_coordination_hdf5(source_h5)
+
+    captured: dict[str, object] = {}
+
+    def _fake_gui_launcher(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr("linak.cli._open_plot_settings_gui", _fake_gui_launcher)
+
+    rc = main(
+        [
+            "--log-level",
+            "ERROR",
+            "plot",
+            str(source_h5),
+            "--gui",
+        ]
+    )
+
+    assert rc == 0
+    assert captured["analysis_name"] == "coordination"
+    initial = captured["initial_settings"]
+    assert isinstance(initial, dict)
+    assert initial["component"] == "distance"
+    assert initial["series_count"] == 1
+    assert initial["series_labels"] == ["O-H"]
+    resolver = captured["on_resolve_series_defaults"]
+    resolved = resolver({**initial, "component": "time"})
+    assert resolved["series_count"] == 1
+    assert resolved["series_labels"] == ["O[2]"]
+
+
 def test_plot_rdf_multiple_files_overlays_with_source_labels(tmp_path, monkeypatch):
     frame = Atoms(
         "OH",
@@ -2188,6 +2692,171 @@ def test_compute_rdf_threads_option_is_forwarded(tmp_path, monkeypatch):
     assert captured["threads"] == 2
 
 
+def test_compute_coordination_with_cutoff_rdf_writes_hdf5_and_diagnostic_png(tmp_path, monkeypatch):
+    from linak.analysis.rdf import RDFProfile
+
+    trajectory = tmp_path / "traj.xyz"
+    trajectory.write_text("", encoding="utf-8")
+    rdf_path = tmp_path / "cutoff_rdf.h5"
+    save_rdf_profile(
+        RDFProfile(
+            species_a="O",
+            species_b="H",
+            bin_edges=np.array([0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0], dtype=float),
+            bin_centers=np.array([0.25, 0.75, 1.25, 1.75, 2.25, 2.75], dtype=float),
+            g_r=np.array([0.2, 1.8, 1.2, 0.35, 0.55, 0.9], dtype=float),
+            n_frames=10,
+        ),
+        rdf_path,
+    )
+
+    frames = [
+        Atoms(
+            "PtPtOH",
+            positions=[
+                [0.0, 0.0, 0.20],
+                [1.0, 0.0, 0.20],
+                [0.0, 0.0, 1.00],
+                [0.70, 0.0, 1.00],
+            ],
+            cell=[10.0, 10.0, 10.0],
+            pbc=True,
+        ),
+        Atoms(
+            "PtPtOH",
+            positions=[
+                [0.0, 0.0, 0.30],
+                [1.0, 0.0, 0.30],
+                [0.0, 0.0, 1.20],
+                [1.10, 0.0, 1.20],
+            ],
+            cell=[10.0, 10.0, 10.0],
+            pbc=True,
+        ),
+    ]
+
+    monkeypatch.setattr("linak.trajectory.io.read_trajectory", lambda _path: frames)
+
+    rc = main(
+        [
+            "--log-level",
+            "ERROR",
+            "compute",
+            "coordination",
+            str(trajectory),
+            "--species-a",
+            "O",
+            "--species-b",
+            "H",
+            "--axis",
+            "z",
+            "--surface-mode",
+            "rough",
+            "--surface-elements",
+            "Pt",
+            "--timestep-fs",
+            "2.0",
+            "--cutoff-rdf",
+            str(rdf_path),
+            "--cell",
+            "10",
+            "10",
+            "10",
+        ]
+    )
+
+    assert rc == 0
+    assert (_linak_output_dir(tmp_path) / "traj_coordination_o_h.h5").exists()
+    assert (_linak_output_dir(tmp_path) / "traj_coordination_o_h_cutoff_rdf.png").exists()
+
+
+def test_compute_coordination_defaults_to_cutoff_from_rdf_when_unspecified(tmp_path, monkeypatch):
+    trajectory = tmp_path / "traj.xyz"
+    trajectory.write_text("", encoding="utf-8")
+
+    frames = [
+        Atoms(
+            "PtPtOH",
+            positions=[
+                [0.0, 0.0, 0.20],
+                [1.0, 0.0, 0.20],
+                [0.0, 0.0, 1.00],
+                [0.70, 0.0, 1.00],
+            ],
+            cell=[10.0, 10.0, 10.0],
+            pbc=True,
+        ),
+        Atoms(
+            "PtPtOH",
+            positions=[
+                [0.0, 0.0, 0.30],
+                [1.0, 0.0, 0.30],
+                [0.0, 0.0, 1.20],
+                [1.10, 0.0, 1.20],
+            ],
+            cell=[10.0, 10.0, 10.0],
+            pbc=True,
+        ),
+    ]
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr("linak.trajectory.io.read_trajectory", lambda _path: frames)
+
+    def _fake_resolve_coordination_cutoff(**kwargs):
+        captured["cutoff_A"] = kwargs["cutoff_A"]
+        captured["cutoff_rdf_path"] = kwargs["cutoff_rdf_path"]
+        captured["cutoff_from_rdf"] = kwargs["cutoff_from_rdf"]
+        diagnostic_path = kwargs.get("diagnostic_plot_output")
+        if diagnostic_path is not None:
+            Path(diagnostic_path).parent.mkdir(parents=True, exist_ok=True)
+            Path(diagnostic_path).write_text("fake png", encoding="utf-8")
+        return CoordinationCutoffResolution(
+            cutoff_A=1.0,
+            smoothing_width_A=0.4,
+            mode="sampled_rdf",
+        )
+
+    monkeypatch.setattr(
+        "linak.analysis.coordination.resolve_coordination_cutoff",
+        _fake_resolve_coordination_cutoff,
+    )
+
+    rc = main(
+        [
+            "--log-level",
+            "ERROR",
+            "compute",
+            "coordination",
+            str(trajectory),
+            "--species-a",
+            "O",
+            "--species-b",
+            "H",
+            "--axis",
+            "z",
+            "--surface-mode",
+            "rough",
+            "--surface-elements",
+            "Pt",
+            "--timestep-fs",
+            "2.0",
+            "--cell",
+            "10",
+            "10",
+            "10",
+        ]
+    )
+
+    assert rc == 0
+    assert captured == {
+        "cutoff_A": None,
+        "cutoff_rdf_path": None,
+        "cutoff_from_rdf": True,
+    }
+    assert (_linak_output_dir(tmp_path) / "traj_coordination_o_h.h5").exists()
+    assert (_linak_output_dir(tmp_path) / "traj_coordination_o_h_cutoff_rdf.png").exists()
+
+
 def test_compute_density_writes_default_csv(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     trajectory = tmp_path / "traj.xyz"
@@ -2210,7 +2879,7 @@ def test_compute_density_writes_default_csv(tmp_path, monkeypatch):
     )
 
     assert rc == 0
-    assert (tmp_path / "traj_density_o_z.h5").exists()
+    assert (_linak_output_dir(tmp_path) / "traj_density_o_z.h5").exists()
 
 
 def test_compute_density_accepts_single_source_via_files_option(tmp_path, monkeypatch):
@@ -2236,10 +2905,10 @@ def test_compute_density_accepts_single_source_via_files_option(tmp_path, monkey
     )
 
     assert rc == 0
-    assert (tmp_path / "traj_density_o_z.h5").exists()
+    assert (_linak_output_dir(tmp_path) / "traj_density_o_z.h5").exists()
 
 
-def test_compute_density_default_csv_is_next_to_input_not_cwd(tmp_path, monkeypatch):
+def test_compute_density_default_hdf5_uses_linak_output_dir_in_source_folder(tmp_path, monkeypatch):
     trajectory_dir = tmp_path / "traj_dir"
     work_dir = tmp_path / "work_dir"
     trajectory_dir.mkdir()
@@ -2266,11 +2935,11 @@ def test_compute_density_default_csv_is_next_to_input_not_cwd(tmp_path, monkeypa
     )
 
     assert rc == 0
-    assert (trajectory_dir / "traj_density_o_z.h5").exists()
+    assert (_linak_output_dir(trajectory_dir) / "traj_density_o_z.h5").exists()
     assert not (work_dir / "traj_density_o_z.h5").exists()
 
 
-def test_compute_msd_default_csv_is_next_to_input_not_cwd(tmp_path, monkeypatch):
+def test_compute_msd_default_hdf5_uses_linak_output_dir_in_source_folder(tmp_path, monkeypatch):
     trajectory_dir = tmp_path / "traj_dir"
     work_dir = tmp_path / "work_dir"
     trajectory_dir.mkdir()
@@ -2296,11 +2965,139 @@ def test_compute_msd_default_csv_is_next_to_input_not_cwd(tmp_path, monkeypatch)
     )
 
     assert rc == 0
-    assert (trajectory_dir / "traj_msd_o.h5").exists()
+    assert (_linak_output_dir(trajectory_dir) / "traj_msd_o.h5").exists()
     assert not (work_dir / "traj_msd_o.h5").exists()
 
 
-def test_compute_rdf_default_csv_is_next_to_input_not_cwd(tmp_path, monkeypatch):
+def test_compute_position_default_hdf5_uses_linak_output_dir_in_source_folder(
+    tmp_path, monkeypatch
+):
+    trajectory_dir = tmp_path / "traj_dir"
+    work_dir = tmp_path / "work_dir"
+    trajectory_dir.mkdir()
+    work_dir.mkdir()
+    monkeypatch.chdir(work_dir)
+
+    trajectory = trajectory_dir / "traj.xyz"
+    frame0 = Atoms("O", positions=[[0.9, 0.0, 0.0]])
+    frame1 = Atoms("O", positions=[[1.1, 0.0, 0.0]])
+    write(trajectory, [frame0, frame1], format="extxyz")
+
+    rc = main(
+        [
+            "--log-level",
+            "ERROR",
+            "compute",
+            "position",
+            str(trajectory),
+            "--species",
+            "O",
+            "--axis",
+            "z",
+        ]
+    )
+
+    assert rc == 0
+    assert (_linak_output_dir(trajectory_dir) / "traj_position_o_z.h5").exists()
+    assert not (work_dir / "traj_position_o_z.h5").exists()
+
+
+def test_compute_position_pbc_corrects_hdf5_positions_without_modifying_source_file(
+    tmp_path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    trajectory = tmp_path / "traj_pbc.xyz"
+    frame0 = Atoms(
+        "O",
+        positions=[[1.2, -0.1, 0.5]],
+        cell=[1.0, 1.0, 1.0],
+        pbc=True,
+    )
+    frame1 = Atoms(
+        "O",
+        positions=[[1.3, -0.2, 0.6]],
+        cell=[1.0, 1.0, 1.0],
+        pbc=True,
+    )
+    write(trajectory, [frame0, frame1], format="extxyz")
+
+    rc = main(
+        [
+            "--log-level",
+            "ERROR",
+            "compute",
+            "position",
+            str(trajectory),
+            "--species",
+            "O",
+            "--axis",
+            "z",
+        ]
+    )
+
+    assert rc == 0
+    output = _linak_output_dir(tmp_path) / "traj_pbc_position_o_z.h5"
+    profile = load_position_profile(output, species="O", axis="z")
+    np.testing.assert_allclose(profile.x[:, 0], np.array([0.2, 0.3]), atol=1e-12)
+    np.testing.assert_allclose(profile.y[:, 0], np.array([0.9, 0.8]), atol=1e-12)
+    np.testing.assert_allclose(profile.z[:, 0], np.array([0.5, 0.6]), atol=1e-12)
+
+    _datasets, metadata = read_linak_hdf5(output, expected_analysis="position")
+    assert metadata["positions_pbc_corrected"] is True
+    assert metadata["pbc_cell_angstrom"] == pytest.approx([1.0, 1.0, 1.0])
+
+    original = read(trajectory, index=":")
+    assert len(original) == 2
+    assert original[0].positions[0, 0] == pytest.approx(1.2)
+    assert original[0].positions[0, 1] == pytest.approx(-0.1)
+    assert original[1].positions[0, 0] == pytest.approx(1.3)
+    assert original[1].positions[0, 1] == pytest.approx(-0.2)
+
+
+def test_compute_position_without_species_warns_and_writes_per_species_files(tmp_path, capsys):
+    trajectory = tmp_path / "mixed.xyz"
+    frame0 = Atoms(
+        "HO",
+        positions=[[0.0, 0.0, 0.2], [1.0, 0.0, 0.8]],
+        cell=[10.0, 10.0, 10.0],
+        pbc=True,
+    )
+    frame1 = Atoms(
+        "HO",
+        positions=[[0.0, 0.0, 0.3], [1.0, 0.0, 0.9]],
+        cell=[10.0, 10.0, 10.0],
+        pbc=True,
+    )
+    write(trajectory, [frame0, frame1], format="extxyz")
+
+    rc = main(
+        [
+            "--log-level",
+            "WARNING",
+            "compute",
+            "position",
+            str(trajectory),
+            "--axis",
+            "z",
+        ]
+    )
+
+    assert rc == 0
+    expected_h = _linak_output_dir(tmp_path) / "mixed_position_h_z.h5"
+    expected_o = _linak_output_dir(tmp_path) / "mixed_position_o_z.h5"
+    assert expected_h.exists()
+    assert expected_o.exists()
+    for output_path in (expected_h, expected_o):
+        datasets, metadata = read_linak_hdf5(output_path, expected_analysis="position")
+        assert metadata["species"] in {"H", "O"}
+        assert datasets["x_A"].shape == (2, 1)
+        assert datasets["y_A"].shape == (2, 1)
+        assert datasets["z_A"].shape == (2, 1)
+        assert datasets["distance_to_surface_A"].shape == (2, 1)
+    assert "No --species provided for position analysis" in capsys.readouterr().err
+
+
+def test_compute_rdf_default_hdf5_uses_linak_output_dir_in_source_folder(tmp_path, monkeypatch):
     trajectory_dir = tmp_path / "traj_dir"
     work_dir = tmp_path / "work_dir"
     trajectory_dir.mkdir()
@@ -2330,8 +3127,70 @@ def test_compute_rdf_default_csv_is_next_to_input_not_cwd(tmp_path, monkeypatch)
     )
 
     assert rc == 0
-    assert (trajectory_dir / "traj_rdf_o_h.h5").exists()
+    assert (_linak_output_dir(trajectory_dir) / "traj_rdf_o_h.h5").exists()
     assert not (work_dir / "traj_rdf_o_h.h5").exists()
+
+
+def test_compute_density_default_output_avoids_overwriting_existing_hdf5(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    trajectory = tmp_path / "traj.xyz"
+    _write_xyz(trajectory)
+
+    first_rc = main(
+        [
+            "--log-level",
+            "ERROR",
+            "compute",
+            "density",
+            str(trajectory),
+            "--species",
+            "O",
+            "--axis",
+            "z",
+            "--bin-width",
+            "0.1",
+        ]
+    )
+    second_rc = main(
+        [
+            "--log-level",
+            "ERROR",
+            "compute",
+            "density",
+            str(trajectory),
+            "--species",
+            "O",
+            "--axis",
+            "z",
+            "--bin-width",
+            "0.1",
+        ]
+    )
+
+    assert first_rc == 0
+    assert second_rc == 0
+    assert (_linak_output_dir(tmp_path) / "traj_density_o_z.h5").exists()
+    assert (_linak_output_dir(tmp_path) / "traj_density_o_z_1.h5").exists()
+
+
+def test_default_combined_analysis_hdf5_path_uses_clean_linak_output_name(tmp_path):
+    source_a = tmp_path / "run_a_density.h5"
+    source_b = tmp_path / "run_b_density.h5"
+
+    output = cli_mod._default_combined_analysis_hdf5_path(
+        [str(source_a), str(source_b)],
+        analysis="density",
+    )
+
+    assert output == _linak_output_dir(tmp_path) / "linak_density_combined.h5"
+
+
+def test_default_csv_output_path_uses_shared_linak_output_dir_without_nesting(tmp_path):
+    source = _linak_output_dir(tmp_path) / "table_input.h5"
+
+    output = cli_mod._default_csv_output_path(source, "sorted")
+
+    assert output == _linak_output_dir(tmp_path) / "table_input_sorted.h5"
 
 
 def test_compute_density_auto_detects_cell_for_volumetric_units(tmp_path, monkeypatch):
@@ -2357,7 +3216,7 @@ def test_compute_density_auto_detects_cell_for_volumetric_units(tmp_path, monkey
     )
 
     assert rc == 0
-    profile = load_density_profile(tmp_path / "traj_density_o_z.h5")
+    profile = load_density_profile(_linak_output_dir(tmp_path) / "traj_density_o_z.h5")
     assert profile.units == "g/cm^3"
 
 
@@ -2382,7 +3241,7 @@ def test_compute_density_writes_resolution_metadata_to_hdf5(tmp_path, monkeypatc
 
     assert rc == 0
     _datasets, metadata = read_linak_hdf5(
-        tmp_path / "traj_density_o_z.h5",
+        _linak_output_dir(tmp_path) / "traj_density_o_z.h5",
         expected_analysis="density",
     )
     assert metadata["source_path"] == str(trajectory.resolve())
@@ -2437,11 +3296,11 @@ def test_compute_density_accepts_cp2k_input_alias(tmp_path, monkeypatch):
     )
 
     assert rc == 0
-    profile = load_density_profile(tmp_path / "traj_density_o_z.h5")
+    profile = load_density_profile(_linak_output_dir(tmp_path) / "traj_density_o_z.h5")
     assert profile.units == "g/cm^3"
 
 
-def test_compute_density_all_writes_one_csv_per_element(tmp_path, monkeypatch):
+def test_compute_density_all_writes_one_hdf5_with_all_species_series(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     trajectory = tmp_path / "traj.xyz"
     frame = Atoms(
@@ -2471,8 +3330,10 @@ def test_compute_density_all_writes_one_csv_per_element(tmp_path, monkeypatch):
     )
 
     assert rc == 0
-    assert (tmp_path / "traj_density_h_z.h5").exists()
-    assert (tmp_path / "traj_density_o_z.h5").exists()
+    output = _linak_output_dir(tmp_path) / "traj_density_z.h5"
+    assert output.exists()
+    profiles = load_density_profiles(output)
+    assert [profile.species for profile in profiles] == ["H", "O", "H2O"]
 
 
 def test_compute_density_h2o_stays_single_dataset(tmp_path, monkeypatch):
@@ -2508,9 +3369,9 @@ def test_compute_density_h2o_stays_single_dataset(tmp_path, monkeypatch):
     )
 
     assert rc == 0
-    assert (tmp_path / "water_density_h2o_z.h5").exists()
-    assert not (tmp_path / "water_density_h_z.h5").exists()
-    assert not (tmp_path / "water_density_o_z.h5").exists()
+    assert (_linak_output_dir(tmp_path) / "water_density_h2o_z.h5").exists()
+    assert not (_linak_output_dir(tmp_path) / "water_density_h_z.h5").exists()
+    assert not (_linak_output_dir(tmp_path) / "water_density_o_z.h5").exists()
 
 
 def test_apply_pbc_with_explicit_cell(tmp_path):
@@ -2654,10 +3515,13 @@ def test_compute_msd_writes_resolution_metadata_to_hdf5(tmp_path, monkeypatch):
         ]
     )
     assert rc == 0
-    profile = load_msd_profile(tmp_path / "traj_msd_o.h5")
+    profile = load_msd_profile(_linak_output_dir(tmp_path) / "traj_msd_o.h5")
     assert profile.time_fs[1] == pytest.approx(2.5)
 
-    _datasets, metadata = read_linak_hdf5(tmp_path / "traj_msd_o.h5", expected_analysis="msd")
+    _datasets, metadata = read_linak_hdf5(
+        _linak_output_dir(tmp_path) / "traj_msd_o.h5",
+        expected_analysis="msd",
+    )
     assert metadata["source_path"] == str(trajectory.resolve())
     assert metadata["timestep_source"].startswith("auto-detected")
     assert metadata["frame_timestep_fs"] == pytest.approx(2.5)
@@ -2784,5 +3648,3 @@ def test_apply_pbc_dump_default_output_uses_xyz_suffix(tmp_path):
     assert rc == 0
     wrapped = read(tmp_path / "lammps_pbc.xyz")
     assert wrapped.positions[0, 0] == pytest.approx(0.2)
-
-

@@ -307,7 +307,9 @@ def resolve_analysis_timestep_fs(
 
     explicit_timestep = _normalize_timestep_fs(timestep_fs) if timestep_fs is not None else None
 
-    metadata_timestep, metadata_md_timestep, metadata_stride = _extract_metadata_timestep_details(frames)
+    metadata_timestep, metadata_md_timestep, metadata_stride = _extract_metadata_timestep_details(
+        frames
+    )
 
     explicit_input_timestep: float | None = None
     explicit_input_md_timestep: float | None = None
@@ -338,13 +340,17 @@ def resolve_analysis_timestep_fs(
     if metadata_timestep is not None:
         candidates.append(("trajectory metadata", metadata_timestep))
     if explicit_input_timestep is not None and explicit_input_resolved is not None:
-        candidates.append((f"explicit --input ({explicit_input_resolved})", explicit_input_timestep))
+        candidates.append(
+            (f"explicit --input ({explicit_input_resolved})", explicit_input_timestep)
+        )
     if auto_timestep is not None and auto_input is not None:
         candidates.append((f"auto-detected ({auto_input})", auto_timestep))
     _warn_on_mismatched_timestep_sources(trajectory, candidates)
 
     if explicit_timestep is not None:
-        return TimestepResolution(frame_timestep_fs=explicit_timestep, source="explicit --timestep-fs")
+        return TimestepResolution(
+            frame_timestep_fs=explicit_timestep, source="explicit --timestep-fs"
+        )
 
     if metadata_timestep is not None:
         return TimestepResolution(
@@ -387,4 +393,3 @@ def resolve_analysis_timestep_fs(
         f"Checked trajectory metadata and automatic .inp/.lmp discovery in '{trajectory.parent}'. "
         "Provide --timestep-fs explicitly or --input /path/to/input.inp (or input.lmp)."
     )
-

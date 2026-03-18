@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 import json
 from pathlib import Path
@@ -13,12 +13,11 @@ import numpy as np
 from .. import __version__
 
 try:  # pragma: no cover - exercised in environments missing optional dependency.
+    _H5PY_IMPORT_ERROR: ModuleNotFoundError | None = None
     import h5py
 except ModuleNotFoundError as exc:  # pragma: no cover
     h5py = None
     _H5PY_IMPORT_ERROR = exc
-else:
-    _H5PY_IMPORT_ERROR = None
 
 LINAK_HDF5_FORMAT = "linak-hdf5"
 LINAK_HDF5_VERSION = 1
@@ -149,19 +148,16 @@ def read_linak_hdf5_profiles(
         collection = handle.get(_COLLECTION_GROUP)
         if collection is not None and hasattr(collection, "items"):
             member_items = [
-                (str(name), node)
-                for name, node in collection.items()
-                if hasattr(node, "items")
+                (str(name), node) for name, node in collection.items() if hasattr(node, "items")
             ]
             if member_items:
+
                 def _member_sort_key(item: tuple[str, Any]) -> tuple[int, int | str]:
                     name = item[0]
                     return (0, int(name)) if name.isdigit() else (1, name)
 
                 profiles: list[tuple[dict[str, np.ndarray], dict[str, Any]]] = []
-                for index, (name, group) in enumerate(
-                    sorted(member_items, key=_member_sort_key)
-                ):
+                for index, (_name, group) in enumerate(sorted(member_items, key=_member_sort_key)):
                     datasets = {
                         dataset_name: np.asarray(dataset)
                         for dataset_name, dataset in group.items()
@@ -201,7 +197,7 @@ def write_linak_hdf5_profile_collection(
     output: str | Path,
     *,
     analysis: str,
-    profiles: list[Mapping[str, Any]],
+    profiles: Sequence[Mapping[str, Any]],
     metadata: Mapping[str, Any] | None = None,
 ) -> Path:
     """Write a LiNaK HDF5 file containing multiple analysis profiles."""
@@ -228,18 +224,14 @@ def write_linak_hdf5_profile_collection(
         for index, payload in enumerate(profiles):
             datasets = payload.get("datasets")
             if not isinstance(datasets, Mapping):
-                raise ValueError(
-                    "Each profile payload must provide a 'datasets' mapping."
-                )
+                raise ValueError("Each profile payload must provide a 'datasets' mapping.")
             profile_metadata = payload.get("metadata")
             if profile_metadata is None:
                 profile_metadata_map: dict[str, Any] = {}
             elif isinstance(profile_metadata, Mapping):
                 profile_metadata_map = dict(profile_metadata)
             else:
-                raise ValueError(
-                    "Each profile payload metadata must be a mapping when provided."
-                )
+                raise ValueError("Each profile payload metadata must be a mapping when provided.")
             profile_group = profiles_group.require_group(f"{index:04d}")
             profile_group.attrs["metadata_json"] = json.dumps(
                 _json_ready(profile_metadata_map),

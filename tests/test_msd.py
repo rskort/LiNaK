@@ -92,4 +92,3 @@ def test_plot_msd_profiles_uses_multi_line_plot_for_multiple_profiles(monkeypatc
 
     plot_msd_profiles([profile_a, profile_b], show=False)
     assert captured["labels"] == ["A", "B"]
-

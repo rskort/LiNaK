@@ -6,14 +6,17 @@ from ase import Atoms
 from ase.constraints import FixAtoms
 import h5py
 
+import linak.analysis.density as density_module
 from linak.analysis.density import (
     available_element_species,
     compute_density_profiles,
     compute_density_profile,
     estimate_surface_position,
     load_density_profile,
+    load_density_profiles,
     normalize_backend_name,
     save_density_profile,
+    save_density_profiles,
 )
 
 
@@ -378,16 +381,56 @@ def test_density_profile_h2o_counts_water_molecules():
         frames=[frame],
         species="H2O",
         axis="z",
-        bin_width=1.0,
+        bin_width=0.5,
     )
 
     np.testing.assert_allclose(profile.counts_per_frame, np.array([h2o_mass_g, h2o_mass_g]))
-    np.testing.assert_allclose(profile.density, np.array([h2o_mass_g, h2o_mass_g]))
+    np.testing.assert_allclose(profile.density, np.array([h2o_mass_g / 0.5, h2o_mass_g / 0.5]))
     assert profile.species == "H2O"
     assert profile.units == "g/Angstrom"
 
 
-def test_compute_density_profiles_all_is_element_resolved():
+def test_select_water_axis_values_with_masses_uses_com_and_pbc():
+    frame = Atoms(
+        "OHH",
+        positions=[
+            [0.0, 0.0, 9.90],
+            [0.0, 0.0, 0.15],
+            [0.0, 0.0, 9.95],
+        ],
+        cell=[10.0, 10.0, 10.0],
+        pbc=True,
+    )
+
+    axis_values, masses = density_module._select_water_axis_values_with_masses(frame, axis_index=2)
+
+    atomic_masses_amu = np.asarray(frame.get_masses(), dtype=float)
+    expected_com_z = (
+        atomic_masses_amu[0] * 9.90 + atomic_masses_amu[1] * 10.15 + atomic_masses_amu[2] * 9.95
+    ) / np.sum(atomic_masses_amu)
+    expected_mass_g = float(np.sum(atomic_masses_amu) * 1.66053906660e-24)
+
+    np.testing.assert_allclose(axis_values, np.array([expected_com_z]))
+    np.testing.assert_allclose(masses, np.array([expected_mass_g]))
+
+
+def test_water_molecule_triplets_exclude_oxygen_with_third_hydrogen():
+    frame = Atoms(
+        "OHHH",
+        positions=[
+            [0.0, 0.0, 0.0],
+            [0.95, 0.0, 0.0],
+            [-0.30, 0.90, 0.0],
+            [0.0, -0.95, 0.0],
+        ],
+    )
+
+    water_triplets = density_module._water_molecule_triplets(frame)
+
+    assert water_triplets.shape == (0, 3)
+
+
+def test_compute_density_profiles_all_includes_elements_and_h2o():
     frame = Atoms(
         "OHH",
         positions=[
@@ -402,7 +445,42 @@ def test_compute_density_profiles_all_is_element_resolved():
         axis="z",
         bin_width=1.0,
     )
-    assert [profile.species for profile in profiles] == ["H", "O"]
+    assert [profile.species for profile in profiles] == ["H", "O", "H2O"]
+
+
+def test_compute_density_profiles_all_reuses_cached_h2o_topology(monkeypatch):
+    frame = Atoms(
+        "OHH",
+        positions=[
+            [0.0, 0.0, 0.10],
+            [0.8, 0.0, 0.10],
+            [-0.4, 0.7, 0.10],
+        ],
+    )
+    frames = [frame.copy() for _ in range(density_module.H2O_VALIDATION_STRIDE + 1)]
+    original = density_module._water_molecule_triplets
+    call_count = 0
+
+    def counting_water_molecule_triplets(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        density_module,
+        "_water_molecule_triplets",
+        counting_water_molecule_triplets,
+    )
+
+    profiles = compute_density_profiles(
+        frames=frames,
+        species="all",
+        axis="z",
+        bin_width=1.0,
+    )
+
+    assert [profile.species for profile in profiles] == ["H", "O", "H2O"]
+    assert call_count == 2
 
 
 def test_available_element_species_is_sorted_unique():
@@ -472,6 +550,32 @@ def test_save_and_load_density_profile(tmp_path):
         assert loaded.surface_position == pytest.approx(profile.surface_position)
     assert loaded.species == "O"
     assert loaded.axis == "z"
+
+
+def test_save_density_profiles_writes_hdf5_collection(tmp_path):
+    frame = Atoms(
+        "OHH",
+        positions=[
+            [0.0, 0.0, 0.10],
+            [0.8, 0.0, 0.10],
+            [-0.4, 0.7, 0.10],
+        ],
+        cell=[10.0, 10.0, 10.0],
+        pbc=True,
+    )
+    profiles = compute_density_profiles(
+        frames=[frame],
+        species="all",
+        axis="z",
+        bin_width=1.0,
+    )
+    out = tmp_path / "density_collection.h5"
+
+    saved_path = save_density_profiles(profiles, out)
+
+    assert saved_path == out.resolve()
+    loaded = load_density_profiles(out)
+    assert [profile.species for profile in loaded] == ["H", "O", "H2O"]
 
 
 def test_load_density_profile_supports_legacy_bin_edges_dataset(tmp_path):
@@ -593,6 +697,80 @@ def test_density_profile_auto_mode_fills_missing_framewise_surface_with_quantile
     assert "frame-wise surface alignment was unavailable" not in caplog.text
 
 
+def test_density_surface_logging_explains_reference_estimator_and_fill(caplog):
+    frame1 = Atoms(
+        "PtPtPtPtO",
+        positions=[
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.1],
+            [2.0, 0.0, 1.2],
+            [3.0, 0.0, 1.3],
+            [0.5, 0.0, 2.0],
+        ],
+        cell=[12.0, 12.0, 14.0],
+        pbc=True,
+    )
+    frame2 = Atoms(
+        "PtPtPtPtO",
+        positions=[
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.1],
+            [2.0, 0.0, 0.2],
+            [3.0, 0.0, 0.3],
+            [0.5, 0.0, 2.1],
+        ],
+        cell=[12.0, 12.0, 14.0],
+        pbc=True,
+    )
+    frame3 = Atoms(
+        "PtPtPtPtO",
+        positions=[
+            [0.0, 0.0, 0.05],
+            [1.0, 0.0, 0.15],
+            [2.0, 0.0, 1.25],
+            [3.0, 0.0, 1.35],
+            [0.5, 0.0, 2.05],
+        ],
+        cell=[12.0, 12.0, 14.0],
+        pbc=True,
+    )
+    frame4 = Atoms(
+        "PtPtPtPtO",
+        positions=[
+            [0.0, 0.0, 0.1],
+            [1.0, 0.0, 0.2],
+            [2.0, 0.0, 1.3],
+            [3.0, 0.0, 1.4],
+            [0.5, 0.0, 2.2],
+        ],
+        cell=[12.0, 12.0, 14.0],
+        pbc=True,
+    )
+
+    caplog.set_level(logging.INFO, logger="linak.analysis.density")
+    compute_density_profile(
+        frames=[frame1, frame2, frame3, frame4],
+        species="O",
+        axis="z",
+        bin_width=0.2,
+        surface_mode="auto",
+        surface_elements=["Pt"],
+    )
+
+    assert "Surface reference along Z: user-selected Pt reference atoms." in caplog.text
+    assert (
+        "Surface estimator along Z: layered top-layer mean on Z using Pt reference atoms"
+        in caplog.text
+    )
+    assert (
+        "Surface estimator gaps along Z: filled 1 missing frame values with tracked "
+        "top-layer mean from nearest valid layered frames."
+    ) in caplog.text
+    assert "per-frame Z q90 of Pt reference atoms" not in caplog.text
+    assert "Frame-wise Z surface alignment active:" in caplog.text
+    assert "summary of per-frame surface estimates:" in caplog.text
+
+
 def test_load_density_profile_rejects_csv_input(tmp_path):
     csv = tmp_path / "legacy_density.csv"
     csv.write_text(
@@ -659,7 +837,9 @@ def test_plot_density_profiles_use_g_per_cm3_without_si_scaling(monkeypatch):
         captured["y_label"] = kwargs["y_label"]
         return None
 
-    monkeypatch.setattr("linak.analysis.density.plot_multi_line_series", _fake_plot_multi_line_series)
+    monkeypatch.setattr(
+        "linak.analysis.density.plot_multi_line_series", _fake_plot_multi_line_series
+    )
 
     profile_a = DensityProfile(
         axis="z",
@@ -702,7 +882,9 @@ def test_plot_density_profiles_auto_limits_ignore_all_zero_tails(monkeypatch):
         captured["y_lim"] = kwargs["y_lim"]
         return None
 
-    monkeypatch.setattr("linak.analysis.density.plot_multi_line_series", _fake_plot_multi_line_series)
+    monkeypatch.setattr(
+        "linak.analysis.density.plot_multi_line_series", _fake_plot_multi_line_series
+    )
 
     bin_edges = np.arange(0.0, 41.0, 1.0, dtype=float)
     bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
@@ -833,9 +1015,13 @@ def test_plot_line_series_non_blocking_show_keeps_figure_open(monkeypatch):
 
     monkeypatch.setattr(plotting_mod, "configure_matplotlib_backend", lambda **_kwargs: "QtAgg")
     monkeypatch.setattr(plotting_mod, "_import_pyplot", lambda: plt)
-    monkeypatch.setattr(plt, "show", lambda *args, **kwargs: show_blocks.append(kwargs.get("block")))
+    monkeypatch.setattr(
+        plt, "show", lambda *args, **kwargs: show_blocks.append(kwargs.get("block"))
+    )
     monkeypatch.setattr(plt, "pause", lambda value: pause_calls.append(float(value)))
-    monkeypatch.setattr(plt, "close", lambda *args, **_kwargs: close_calls.append(args[0] if args else None))
+    monkeypatch.setattr(
+        plt, "close", lambda *args, **_kwargs: close_calls.append(args[0] if args else None)
+    )
 
     plotting_mod.plot_line_series(
         np.array([0.0, 1.0, 2.0], dtype=float),
@@ -862,8 +1048,12 @@ def test_plot_line_series_blocking_show_closes_figure(monkeypatch):
 
     monkeypatch.setattr(plotting_mod, "configure_matplotlib_backend", lambda **_kwargs: "QtAgg")
     monkeypatch.setattr(plotting_mod, "_import_pyplot", lambda: plt)
-    monkeypatch.setattr(plt, "show", lambda *args, **kwargs: show_blocks.append(kwargs.get("block")))
-    monkeypatch.setattr(plt, "close", lambda *args, **_kwargs: close_calls.append(args[0] if args else None))
+    monkeypatch.setattr(
+        plt, "show", lambda *args, **kwargs: show_blocks.append(kwargs.get("block"))
+    )
+    monkeypatch.setattr(
+        plt, "close", lambda *args, **_kwargs: close_calls.append(args[0] if args else None)
+    )
 
     plotting_mod.plot_line_series(
         np.array([0.0, 1.0, 2.0], dtype=float),
@@ -917,6 +1107,27 @@ def test_plot_multi_line_series_accepts_advanced_line_kwargs():
     )
 
     assert captured["series_labels"] == ["run-a", "run-b"]
+
+
+def test_plot_multi_line_series_preserves_explicit_labels_and_legend_font_size():
+    from linak.plot.plotting import plot_multi_line_series, with_style_overrides
+
+    captured = {}
+    plot_multi_line_series(
+        [np.array([0.0, 1.0], dtype=float), np.array([0.0, 1.0], dtype=float)],
+        [np.array([1.0, 2.0], dtype=float), np.array([2.0, 3.0], dtype=float)],
+        ["custom-a", "custom-b"],
+        title="demo",
+        x_label="x",
+        y_label="y",
+        show=False,
+        style=with_style_overrides(legend_font_size=17),
+        line_kwargs={"label": "stale-label"},
+        capture_state=captured,
+    )
+
+    assert captured["series_labels"] == ["custom-a", "custom-b"]
+    assert captured["legend_font_size"] == 17
 
 
 def test_plot_multi_line_series_rejects_invalid_series_line_kwargs_length():
@@ -992,4 +1203,3 @@ def test_plot_line_series_can_suppress_save_log(tmp_path, caplog):
 
     assert output.exists()
     assert "Saved plot to" not in caplog.text
-

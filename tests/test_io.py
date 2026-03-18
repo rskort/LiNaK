@@ -48,4 +48,3 @@ def test_read_trajectory_dump_does_not_depend_on_ase_iread(tmp_path, monkeypatch
     assert len(frames) == 2
     assert frames[0].info.get("timestep") == 0
     assert frames[1].info.get("timestep") == 10
-

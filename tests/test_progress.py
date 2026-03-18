@@ -1,5 +1,5 @@
 import io
-import shutil
+import os
 
 from linak.progress import ProgressBar
 
@@ -67,7 +67,7 @@ def test_progress_bar_truncates_to_fit_narrow_terminal(monkeypatch) -> None:
     monkeypatch.setattr("linak.progress.time.perf_counter", lambda: now["value"])
     monkeypatch.setattr(
         "linak.progress.shutil.get_terminal_size",
-        lambda fallback=(120, 20): shutil.os.terminal_size((80, 20)),
+        lambda fallback=(120, 20): os.terminal_size((80, 20)),
     )
 
     with ProgressBar(

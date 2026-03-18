@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -34,7 +35,8 @@ def resolve_uniform_bin_width_for_load(
     raw = metadata.get("bin_width_A")
     if raw is not None:
         try:
-            width = float(raw)
+            raw_value: Any = raw
+            width = float(raw_value)
         except (TypeError, ValueError) as exc:
             raise ValueError(
                 f"{analysis_name} HDF5 '{source_path}' has invalid metadata value "

@@ -63,6 +63,7 @@ POTENTIAL_CSV_COLUMNS = [
     "error",
 ]
 
+
 @dataclass(frozen=True)
 class CubeHeader:
     """Header metadata extracted from a CP2K cube file."""

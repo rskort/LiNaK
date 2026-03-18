@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from typing import cast
 
 import numpy as np
 from ase import Atoms
@@ -22,7 +23,9 @@ from ..progress import ProgressBar
 LOGGER = logging.getLogger(__name__)
 
 
-def _parse_box_bound(line: str, box_rows: list[str]) -> tuple[np.ndarray, np.ndarray, tuple[bool, bool, bool]]:
+def _parse_box_bound(
+    line: str, box_rows: list[str]
+) -> tuple[np.ndarray, np.ndarray, tuple[bool, bool, bool]]:
     """Parse a LAMMPS ``ITEM: BOX BOUNDS`` block."""
     tilt_items = line.split()[3:]
     celldata = np.loadtxt(box_rows, dtype=float, ndmin=2)
@@ -61,7 +64,7 @@ def _parse_box_bound(line: str, box_rows: list[str]) -> tuple[np.ndarray, np.nda
         pbc_items = tilt_items[3:6]
     else:
         pbc_items = ["f", "f", "f"]
-    pbc = tuple("p" in item.lower() for item in pbc_items)
+    pbc = cast(tuple[bool, bool, bool], tuple("p" in item.lower() for item in pbc_items))
     return cell, celldisp, pbc
 
 
@@ -80,13 +83,16 @@ def _read_lammps_dump_frames(path: Path) -> list[Atoms]:
     n_atoms = 0
     cell = None
     celldisp = None
-    pbc = False
+    pbc: tuple[bool, bool, bool] = (False, False, False)
     info: dict[str, int] = {}
 
-    with path.open("r", encoding="utf-8") as handle, ProgressBar(
-        desc="Reading trajectory",
-        unit="frame",
-    ) as progress:
+    with (
+        path.open("r", encoding="utf-8") as handle,
+        ProgressBar(
+            desc="Reading trajectory",
+            unit="frame",
+        ) as progress,
+    ):
         while True:
             line = handle.readline()
             if not line:
@@ -267,5 +273,3 @@ def write_trajectory(frames: list[Atoms], path: str | Path) -> Path:
         progress.update()
     LOGGER.info("Wrote %d frame(s) to '%s'.", len(frames), output_path)
     return output_path
-
-

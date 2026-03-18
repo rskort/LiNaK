@@ -18,6 +18,16 @@ class ProgressBar:
     _ACTIVE_BY_STREAM: dict[int, int] = {}
     _LINE_OPEN_BY_STREAM: dict[int, bool] = {}
 
+    @staticmethod
+    def _stream_is_tty(stream: TextIO) -> bool:
+        """Return whether a stream is an open TTY without raising on closed captures."""
+        if getattr(stream, "closed", False):
+            return False
+        try:
+            return bool(getattr(stream, "isatty", lambda: False)())
+        except ValueError:
+            return False
+
     def __init__(
         self,
         *,
@@ -43,7 +53,7 @@ class ProgressBar:
         self._last_line_length = 0
         self._last_terminal_probe = 0.0
         self._terminal_columns = shutil.get_terminal_size(fallback=(120, 20)).columns
-        self.enabled = enabled and bool(getattr(self.stream, "isatty", lambda: False)())
+        self.enabled = enabled and self._stream_is_tty(self.stream)
         self._stream_id = id(self.stream)
 
     def __enter__(self) -> ProgressBar:
@@ -84,7 +94,7 @@ class ProgressBar:
     @classmethod
     def prepare_for_external_write(cls, stream: TextIO) -> None:
         """Move to a fresh line before external writes when a progress line is active."""
-        if not bool(getattr(stream, "isatty", lambda: False)()):
+        if not cls._stream_is_tty(stream):
             return
         stream_id = id(stream)
         if cls._ACTIVE_BY_STREAM.get(stream_id, 0) <= 0:
@@ -107,7 +117,9 @@ class ProgressBar:
         self._refresh_terminal_width(now)
         rate = self._update_rate(now, elapsed)
         elapsed_label = self._format_seconds(elapsed)
-        rate_label = f"{rate:6.2f} {self.unit}/s" if rate is not None else f"{'--':>6} {self.unit}/s"
+        rate_label = (
+            f"{rate:6.2f} {self.unit}/s" if rate is not None else f"{'--':>6} {self.unit}/s"
+        )
         desc = self._truncate_desc(self.desc)
 
         if self.total is not None and self.total > 0:
@@ -128,7 +140,9 @@ class ProgressBar:
                 rate_label=rate_label,
             )
             if len(line) > self._terminal_columns:
-                desc = self._truncate_text(desc, max(8, len(desc) - (len(line) - self._terminal_columns)))
+                desc = self._truncate_text(
+                    desc, max(8, len(desc) - (len(line) - self._terminal_columns))
+                )
                 line = self._build_known_total_line(
                     desc=desc,
                     bar_width=bar_width,
@@ -159,7 +173,9 @@ class ProgressBar:
                 rate_label=rate_label,
             )
             if len(line) > self._terminal_columns:
-                desc = self._truncate_text(desc, max(8, len(desc) - (len(line) - self._terminal_columns)))
+                desc = self._truncate_text(
+                    desc, max(8, len(desc) - (len(line) - self._terminal_columns))
+                )
                 line = self._build_unknown_total_line(
                     desc=desc,
                     spinner=spinner,

@@ -9,7 +9,7 @@ import tempfile
 from typing import Any, Callable
 from uuid import uuid4
 
-from .plotting import DEFAULT_PLOT_STYLE
+from .plotting import DEFAULT_PLOT_STYLE, resolve_series_colors
 
 _LEGEND_LOCATIONS = (
     "best",
@@ -31,6 +31,7 @@ _GRID_WHICH = ("auto", "major", "minor", "both")
 _TICK_AXES = ("auto", "both", "x", "y")
 _TICK_DIRECTIONS = ("auto", "out", "in", "inout")
 _MINOR_TICKS_MODES = ("auto", "on", "off")
+_TOGGLE_MODES = ("on", "off")
 _SERIES_SPECIFIC_SETTINGS = frozenset(
     {
         "series_labels",
@@ -51,12 +52,12 @@ def _without_series_specific_settings(settings: dict[str, Any]) -> dict[str, Any
     return {key: value for key, value in settings.items() if key not in _SERIES_SPECIFIC_SETTINGS}
 
 
-def _toggle_to_mode(value: bool | None) -> str:
+def _toggle_to_mode(value: bool | None, *, auto_mode: str = "on") -> str:
     if value is True:
         return "on"
     if value is False:
         return "off"
-    return "auto"
+    return auto_mode
 
 
 def _mode_to_toggle(value: str) -> bool | None:
@@ -145,6 +146,11 @@ def _optional_json_dict(value: str, *, field_name: str) -> dict[str, Any] | None
     return parsed
 
 
+def _resolve_series_line_colors(colors: list[str]) -> list[str] | None:
+    """Return explicit per-series colors, filling blanks with default indexed colors."""
+    return resolve_series_colors(colors, series_count=len(colors))
+
+
 def _extract_dict_value(settings: dict[str, Any], *, key: str, nested_key: str) -> Any:
     raw = settings.get(key)
     if not isinstance(raw, dict):
@@ -159,11 +165,13 @@ def _extract_dict_text(settings: dict[str, Any], *, key: str, nested_key: str) -
     return str(value)
 
 
-def _extract_dict_mode(settings: dict[str, Any], *, key: str, nested_key: str) -> str:
+def _extract_dict_mode(
+    settings: dict[str, Any], *, key: str, nested_key: str, auto_mode: str = "on"
+) -> str:
     value = _extract_dict_value(settings, key=key, nested_key=nested_key)
     if isinstance(value, bool):
-        return _toggle_to_mode(value)
-    return "auto"
+        return _toggle_to_mode(value, auto_mode=auto_mode)
+    return auto_mode
 
 
 def _figure_filetype_filters() -> tuple[str, str]:
@@ -208,8 +216,23 @@ def _figure_filetype_filters() -> tuple[str, str]:
     return ";;".join(filters), default_name
 
 
+def _resolve_asset_path(filename: str, *, module_path: Path | None = None) -> Path:
+    """Resolve shared asset files from a source tree or an installed distribution."""
+    resolved_module_path = (
+        module_path.resolve() if module_path is not None else Path(__file__).resolve()
+    )
+    for parent in resolved_module_path.parents:
+        repo_candidate = parent / "assets" / filename
+        if repo_candidate.exists():
+            return repo_candidate
+        installed_candidate = parent / "share" / "linak" / "assets" / filename
+        if installed_candidate.exists():
+            return installed_candidate
+    return resolved_module_path.parent / "assets" / filename
+
+
 def _default_gui_artwork_path() -> Path:
-    return Path(__file__).resolve().parent / "assets" / "linak_gui_banner.svg"
+    return _resolve_asset_path("linak_gui_banner.svg")
 
 
 def _extract_limit(
@@ -246,9 +269,17 @@ def launch_plot_settings_panel(
     title: str,
     initial_settings: dict[str, Any],
     on_preview: Callable[[dict[str, Any]], None],
-    on_save: Callable[[dict[str, Any]], str],
+    on_save: Callable[[str, dict[str, Any]], str],
     on_save_figure: Callable[[dict[str, Any], str], str] | None = None,
-    on_import_hdf5: Callable[[str], dict[str, Any]] | None = None,
+    on_import_hdf5: Callable[[str, str], dict[str, Any]] | None = None,
+    analysis_name: str | None = None,
+    on_resolve_series_defaults: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+    initial_profile_name: str | None = None,
+    available_profile_names: list[str] | None = None,
+    default_profile_settings: dict[str, Any] | None = None,
+    on_load_profile: Callable[[str], dict[str, Any]] | None = None,
+    on_delete_profile: Callable[[str], tuple[str | None, str]] | None = None,
+    on_set_active_profile: Callable[[str], str] | None = None,
 ) -> None:
     """Open a PySide6 panel that previews and persists plot settings."""
     try:
@@ -265,6 +296,7 @@ def launch_plot_settings_panel(
             QGridLayout,
             QGroupBox,
             QHBoxLayout,
+            QInputDialog,
             QLabel,
             QLineEdit,
             QMainWindow,
@@ -290,7 +322,27 @@ def launch_plot_settings_panel(
             super().__init__()
             self.setWindowTitle(title)
             self.resize(980, 760)
+            self._analysis_name = (analysis_name or "").strip().lower() or None
+            self._on_resolve_series_defaults = on_resolve_series_defaults
             self._saved_signature: str | None = None
+            normalized_profile_names: list[str] = []
+            for raw_name in available_profile_names or []:
+                candidate = str(raw_name).strip()
+                if candidate and candidate not in normalized_profile_names:
+                    normalized_profile_names.append(candidate)
+            requested_profile_name = str(initial_profile_name or "").strip()
+            if requested_profile_name and requested_profile_name not in normalized_profile_names:
+                normalized_profile_names.insert(0, requested_profile_name)
+            if not normalized_profile_names:
+                normalized_profile_names = ["Default"]
+            self._profile_names = normalized_profile_names
+            self._current_profile_name = requested_profile_name or self._profile_names[0]
+            self._default_profile_settings = dict(
+                default_profile_settings
+                if isinstance(default_profile_settings, dict)
+                else initial_settings
+            )
+            self._profile_selector_syncing = False
             self._title_rows: list[tuple[QFormLayout, QWidget]] = []
             self._legend_rows: list[tuple[QFormLayout, QWidget]] = []
             self._ticks_rows: list[tuple[QFormLayout, QWidget]] = []
@@ -298,9 +350,14 @@ def launch_plot_settings_panel(
             self._x_bin_reducer_row: tuple[QFormLayout, QWidget] | None = None
             self._norm_value_row: tuple[QFormLayout, QWidget] | None = None
             self._norm_x_ref_row: tuple[QFormLayout, QWidget] | None = None
+            self._position_map_color_row: tuple[QFormLayout, QWidget] | None = None
+            self._position_time_axis_row: tuple[QFormLayout, QWidget] | None = None
+            self._coordination_time_axis_row: tuple[QFormLayout, QWidget] | None = None
             self._axes_ticks_group: QGroupBox | None = None
             self._tick_appearance_group: QGroupBox | None = None
             self._grid_group: QGroupBox | None = None
+            self._data_transform_group: QGroupBox | None = None
+            self._normalization_group: QGroupBox | None = None
             self._series_syncing = False
             self._series_active_index = 0
             self._series_labels_data: list[str] = []
@@ -437,6 +494,258 @@ def launch_plot_settings_panel(
             if app is not None:
                 app.setWindowIcon(icon)
 
+        @staticmethod
+        def _normalize_profile_name(name: str) -> str:
+            normalized = str(name).strip()
+            if not normalized:
+                raise ValueError("Profile name cannot be empty.")
+            return normalized
+
+        def _profile_name_exists(self, name: str) -> bool:
+            lowered = name.casefold()
+            return any(existing.casefold() == lowered for existing in self._profile_names)
+
+        def _sync_profile_selector(self) -> None:
+            self._profile_selector_syncing = True
+            try:
+                self._profile_selector.clear()
+                for name in self._profile_names:
+                    self._profile_selector.addItem(name)
+                if self._current_profile_name in self._profile_names:
+                    self._profile_selector.setCurrentText(self._current_profile_name)
+                elif self._profile_names:
+                    self._current_profile_name = self._profile_names[0]
+                    self._profile_selector.setCurrentText(self._current_profile_name)
+            finally:
+                self._profile_selector_syncing = False
+            self._profile_delete_button.setEnabled(
+                len(self._profile_names) > 1 and on_delete_profile is not None
+            )
+
+        def _resolved_default_profile_settings(self) -> dict[str, Any]:
+            settings = dict(self._default_profile_settings)
+            if self._on_resolve_series_defaults is not None:
+                try:
+                    resolved = self._on_resolve_series_defaults(settings)
+                except Exception:
+                    resolved = None
+                if isinstance(resolved, dict):
+                    if "series_count" in resolved:
+                        settings["series_count"] = resolved["series_count"]
+                    if "series_labels" in resolved:
+                        settings["series_labels"] = list(resolved["series_labels"])
+            return settings
+
+        def _load_settings_into_editor(
+            self,
+            settings: dict[str, Any],
+            *,
+            profile_name: str | None = None,
+            status_message: str | None = None,
+            mark_saved: bool,
+        ) -> None:
+            if profile_name is not None:
+                self._current_profile_name = profile_name
+                self._sync_profile_selector()
+            self._suspend_preview_events = True
+            try:
+                self._populate(settings)
+            finally:
+                self._suspend_preview_events = False
+            self._refresh_widget_states()
+            if status_message:
+                self._status_label.setText(status_message)
+            if mark_saved:
+                self._saved_signature = self._signature(self._collect_settings())
+
+        def _save_current_profile(self, *, status_prefix: str | None = None) -> bool:
+            try:
+                settings = self._collect_settings()
+                message = on_save(self._current_profile_name, settings)
+                self._status_label.setText(
+                    message if status_prefix is None else f"{status_prefix}{message}"
+                )
+                self._saved_signature = self._signature(settings)
+                return True
+            except Exception as exc:
+                self._report_error("Save failed", exc)
+                return False
+
+        def _confirm_context_change(self, *, action_label: str) -> bool:
+            try:
+                settings = self._collect_settings()
+                current_signature = self._signature(settings)
+            except Exception as exc:
+                decision = QMessageBox.question(
+                    self,
+                    "Invalid settings",
+                    "Current profile contains invalid values "
+                    f"({exc}). Continue without saving before {action_label}?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                return decision == QMessageBox.StandardButton.Yes
+
+            if self._saved_signature == current_signature:
+                return True
+
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Icon.Question)
+            box.setWindowTitle("Unsaved profile changes")
+            box.setText(
+                f"Save changes to profile '{self._current_profile_name}' before {action_label}?"
+            )
+            box.setStandardButtons(
+                QMessageBox.StandardButton.Save
+                | QMessageBox.StandardButton.Discard
+                | QMessageBox.StandardButton.Cancel
+            )
+            box.setDefaultButton(QMessageBox.StandardButton.Save)
+            decision = box.exec()
+            if decision == QMessageBox.StandardButton.Cancel:
+                return False
+            if decision == QMessageBox.StandardButton.Save:
+                return self._save_current_profile()
+            return True
+
+        def _prompt_profile_name(self, *, title_text: str, default_value: str) -> str | None:
+            raw_value, accepted = QInputDialog.getText(
+                self,
+                title_text,
+                "Profile name",
+                text=default_value,
+            )
+            if not accepted:
+                self._status_label.setText(f"{title_text} canceled.")
+                return None
+            name = self._normalize_profile_name(raw_value)
+            if self._profile_name_exists(name):
+                raise ValueError(f"A profile named '{name}' already exists.")
+            return name
+
+        def _next_duplicate_profile_name(self) -> str:
+            base = f"{self._current_profile_name} Copy"
+            if not self._profile_name_exists(base):
+                return base
+            for index in range(2, 1000):
+                candidate = f"{base} {index}"
+                if not self._profile_name_exists(candidate):
+                    return candidate
+            raise ValueError("Could not find an available duplicate profile name.")
+
+        def _handle_profile_selection_request(self, index: int) -> None:
+            if self._profile_selector_syncing or index < 0:
+                return
+            requested = self._profile_selector.itemText(index).strip()
+            if not requested or requested == self._current_profile_name:
+                return
+            if not self._confirm_context_change(action_label=f"switching to '{requested}'"):
+                self._sync_profile_selector()
+                return
+            try:
+                if on_load_profile is None:
+                    raise ValueError("Profile loading is unavailable for this plot session.")
+                loaded = on_load_profile(requested)
+                message = f"Loaded profile '{requested}'."
+                if on_set_active_profile is not None:
+                    message = on_set_active_profile(requested)
+                self._load_settings_into_editor(
+                    loaded,
+                    profile_name=requested,
+                    status_message=message,
+                    mark_saved=True,
+                )
+                self._schedule_preview_update()
+            except Exception as exc:
+                self._sync_profile_selector()
+                self._report_error("Load profile failed", exc)
+
+        def _handle_new_profile(self) -> None:
+            if not self._confirm_context_change(action_label="creating a new profile"):
+                return
+            try:
+                name = self._prompt_profile_name(
+                    title_text="Create profile",
+                    default_value="New Profile",
+                )
+                if name is None:
+                    return
+                settings = self._resolved_default_profile_settings()
+                message = on_save(name, settings)
+                self._profile_names.append(name)
+                self._load_settings_into_editor(
+                    settings,
+                    profile_name=name,
+                    status_message=message,
+                    mark_saved=True,
+                )
+                self._schedule_preview_update()
+            except Exception as exc:
+                self._report_error("Create profile failed", exc)
+
+        def _handle_duplicate_profile(self) -> None:
+            try:
+                settings = self._collect_settings()
+                name = self._prompt_profile_name(
+                    title_text="Duplicate profile",
+                    default_value=self._next_duplicate_profile_name(),
+                )
+                if name is None:
+                    return
+                message = on_save(name, settings)
+                self._profile_names.append(name)
+                self._load_settings_into_editor(
+                    settings,
+                    profile_name=name,
+                    status_message=message,
+                    mark_saved=True,
+                )
+                self._schedule_preview_update()
+            except Exception as exc:
+                self._report_error("Duplicate profile failed", exc)
+
+        def _handle_delete_profile(self) -> None:
+            if on_delete_profile is None:
+                self._status_label.setText("Delete profile is unavailable.")
+                return
+            if len(self._profile_names) <= 1:
+                self._status_label.setText("At least one profile must remain available.")
+                return
+            if not self._confirm_context_change(action_label="deleting the current profile"):
+                return
+            decision = QMessageBox.question(
+                self,
+                "Delete profile",
+                f"Delete saved profile '{self._current_profile_name}'?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if decision != QMessageBox.StandardButton.Yes:
+                self._status_label.setText("Delete profile canceled.")
+                return
+            try:
+                deleted_name = self._current_profile_name
+                next_profile_name, message = on_delete_profile(deleted_name)
+                self._profile_names = [name for name in self._profile_names if name != deleted_name]
+                if next_profile_name is None:
+                    self._current_profile_name = self._profile_names[0]
+                else:
+                    self._current_profile_name = next_profile_name
+                    if next_profile_name not in self._profile_names:
+                        self._profile_names.append(next_profile_name)
+                if on_load_profile is None:
+                    raise ValueError("Profile loading is unavailable after deletion.")
+                loaded = on_load_profile(self._current_profile_name)
+                self._load_settings_into_editor(
+                    loaded,
+                    profile_name=self._current_profile_name,
+                    status_message=message,
+                    mark_saved=True,
+                )
+                self._schedule_preview_update()
+            except Exception as exc:
+                self._report_error("Delete profile failed", exc)
+
         def _build_ui(self) -> None:
             root = QWidget(self)
             self.setCentralWidget(root)
@@ -458,6 +767,26 @@ def launch_plot_settings_panel(
             splitter.setStretchFactor(1, 1)
             splitter.setSizes([480, 640])
             self._apply_window_icon()
+
+            profile_box = QGroupBox("Saved Profile")
+            profile_layout = QHBoxLayout(profile_box)
+            profile_layout.addWidget(QLabel("Profile"))
+            self._profile_selector = QComboBox()
+            self._profile_selector.currentIndexChanged.connect(
+                self._handle_profile_selection_request
+            )
+            profile_layout.addWidget(self._profile_selector, stretch=1)
+            self._profile_new_button = QPushButton("New")
+            self._profile_new_button.clicked.connect(self._handle_new_profile)
+            profile_layout.addWidget(self._profile_new_button)
+            self._profile_duplicate_button = QPushButton("Duplicate")
+            self._profile_duplicate_button.clicked.connect(self._handle_duplicate_profile)
+            profile_layout.addWidget(self._profile_duplicate_button)
+            self._profile_delete_button = QPushButton("Delete")
+            self._profile_delete_button.clicked.connect(self._handle_delete_profile)
+            profile_layout.addWidget(self._profile_delete_button)
+            left_layout.addWidget(profile_box)
+            self._sync_profile_selector()
 
             tabs = QTabWidget(left_panel)
             left_layout.addWidget(tabs, stretch=1)
@@ -553,7 +882,9 @@ def launch_plot_settings_panel(
 
             status_row = QHBoxLayout()
             status_row.addStretch(1)
-            self._status_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            self._status_label.setAlignment(
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+            )
             status_row.addWidget(self._status_label)
             right_layout.addLayout(status_row)
 
@@ -568,31 +899,33 @@ def launch_plot_settings_panel(
 
         def _build_general_tab(self) -> None:
             form = QFormLayout(self._tab_general_content)
-            self.title_mode = self._combo(("auto", "on", "off"))
+            self.title_mode = self._combo(_TOGGLE_MODES)
             self.title_mode.currentTextChanged.connect(self._refresh_widget_states)
             self.title_text = self._line()
             self.x_label = self._line("Matplotlib mathtext supported, e.g. Distance ($A$)")
             self.y_label = self._line("e.g. Density ($g/cm^3$)")
 
-            self.legend_mode = self._combo(("auto", "on", "off"))
+            self.legend_mode = self._combo(_TOGGLE_MODES)
             self.legend_mode.currentTextChanged.connect(self._refresh_widget_states)
             self.legend_title = self._line()
             self.legend_loc = self._combo(_LEGEND_LOCATIONS)
-            self.legend_frame_mode = self._combo(("auto", "on", "off"))
+            self.legend_frame_mode = self._combo(_TOGGLE_MODES)
             self.legend_columns = self._line("1")
 
-            self.ticks_mode = self._combo(("auto", "on", "off"))
+            self.ticks_mode = self._combo(_TOGGLE_MODES)
             self.ticks_mode.currentTextChanged.connect(self._refresh_widget_states)
             self.ticks_axis = self._combo(_TICK_AXES)
-            self.grid_mode = self._combo(("auto", "on", "off"))
+            self.grid_mode = self._combo(_TOGGLE_MODES)
             self.grid_mode.currentTextChanged.connect(self._refresh_widget_states)
-            self.markers_mode = self._combo(("auto", "on", "off"))
+            self.markers_mode = self._combo(_TOGGLE_MODES)
 
             self._add_form_row(form, "Title", self.title_mode)
             self._add_form_row(form, "Title text", self.title_text)
             self._add_form_row(form, "X label", self.x_label)
             self._add_form_row(form, "Y label", self.y_label)
-            math_hint = QLabel("Math labels: use Matplotlib mathtext, e.g. $cm^3$, $\\Delta G$, $\\rho$.")
+            math_hint = QLabel(
+                "Math labels: use Matplotlib mathtext, e.g. $cm^3$, $\\Delta G$, $\\rho$."
+            )
             math_hint.setWordWrap(True)
             self._add_form_row(form, "", math_hint)
             self._add_form_row(form, "Legend", self.legend_mode)
@@ -675,7 +1008,7 @@ def launch_plot_settings_panel(
             self.dpi = self._line()
             self.font_family = self._line()
             figure_facecolor_row, self.figure_facecolor = self._color_field(placeholder="#ffffff")
-            self.transparent_mode = self._combo(("auto", "on", "off"))
+            self.transparent_mode = self._combo(_TOGGLE_MODES)
             metrics_form.addRow("Figure width", self.fig_width)
             metrics_form.addRow("Figure height", self.fig_height)
             metrics_form.addRow("DPI", self.dpi)
@@ -689,9 +1022,11 @@ def launch_plot_settings_panel(
             self.title_font = self._line()
             self.label_font = self._line()
             self.tick_font = self._line()
+            self.legend_font = self._line()
             fonts_form.addRow("Title", self.title_font)
             fonts_form.addRow("Labels", self.label_font)
             fonts_form.addRow("Ticks", self.tick_font)
+            fonts_form.addRow("Legend", self.legend_font)
             layout.addWidget(fonts)
 
             lines = QGroupBox("Lines and Colors")
@@ -749,6 +1084,7 @@ def launch_plot_settings_panel(
             ]
             self._title_rows.append((fonts_form, self.title_font))
             self._ticks_rows.append((fonts_form, self.tick_font))
+            self._legend_rows.append((fonts_form, self.legend_font))
 
         def _build_series_tab(self) -> None:
             layout = QVBoxLayout(self._tab_series_content)
@@ -770,7 +1106,9 @@ def launch_plot_settings_panel(
             self.series_color.textChanged.connect(self._on_series_editor_changed)
             self.series_line_width = self._line("blank: use global line width")
             self.series_line_width.textChanged.connect(self._on_series_editor_changed)
-            self.series_marker = self._combo(("", "o", "s", "^", "v", "d", "x", "+", ".", "*"), editable=True)
+            self.series_marker = self._combo(
+                ("", "o", "s", "^", "v", "d", "x", "+", ".", "*"), editable=True
+            )
             self.series_marker.currentTextChanged.connect(self._on_series_editor_changed)
             self.series_line_kwargs_json = QPlainTextEdit()
             self.series_line_kwargs_json.setPlaceholderText('{"linestyle": "--", "alpha": 0.8}')
@@ -792,25 +1130,236 @@ def launch_plot_settings_panel(
             layout.addWidget(hint)
             layout.addStretch(1)
 
+        def _build_analysis_data_sections(self, layout: QVBoxLayout) -> None:
+            analysis = self._analysis_name
+            if analysis is None:
+                return
+
+            if analysis in {"density", "msd", "position"}:
+                selection = QGroupBox("Profile Selection")
+                selection_form = QFormLayout(selection)
+                self.analysis_species = self._line("Leave blank to use file metadata")
+                self.analysis_species.textChanged.connect(self._handle_series_identity_change)
+                selection_form.addRow("Species", self.analysis_species)
+                if analysis in {"density", "position"}:
+                    self.analysis_axis = self._combo(("auto", "x", "y", "z"))
+                    self.analysis_axis.currentTextChanged.connect(
+                        self._handle_series_identity_change
+                    )
+                    selection_form.addRow("Axis", self.analysis_axis)
+                layout.addWidget(selection)
+
+            if analysis == "rdf":
+                selection = QGroupBox("Profile Selection")
+                selection_form = QFormLayout(selection)
+                self.rdf_species_a = self._line("Leave blank to use file metadata")
+                self.rdf_species_a.textChanged.connect(self._handle_series_identity_change)
+                self.rdf_species_b = self._line("Leave blank to reuse species A / file metadata")
+                self.rdf_species_b.textChanged.connect(self._handle_series_identity_change)
+                selection_form.addRow("Species A", self.rdf_species_a)
+                selection_form.addRow("Species B", self.rdf_species_b)
+                layout.addWidget(selection)
+
+            if analysis == "coordination":
+                selection = QGroupBox("Profile Selection")
+                selection_form = QFormLayout(selection)
+                self.coord_species_a = self._line("Leave blank to use file metadata")
+                self.coord_species_a.textChanged.connect(self._handle_series_identity_change)
+                self.coord_species_b = self._line("Leave blank to reuse species A / file metadata")
+                self.coord_species_b.textChanged.connect(self._handle_series_identity_change)
+                self.analysis_axis = self._combo(("auto", "x", "y", "z"))
+                self.analysis_axis.currentTextChanged.connect(self._handle_series_identity_change)
+                selection_form.addRow("Species A", self.coord_species_a)
+                selection_form.addRow("Species B", self.coord_species_b)
+                selection_form.addRow("Axis", self.analysis_axis)
+                layout.addWidget(selection)
+
+            if analysis == "density":
+                view = QGroupBox("Density View")
+                view_form = QFormLayout(view)
+                self.density_x_mode = self._combo(("distance", "axis"))
+                self.density_x_mode.currentTextChanged.connect(self._schedule_preview_update)
+                self.density_quantity = self._combo(("mass", "number"))
+                self.density_quantity.currentTextChanged.connect(self._schedule_preview_update)
+                view_form.addRow("X values", self.density_x_mode)
+                view_form.addRow("Quantity", self.density_quantity)
+                layout.addWidget(view)
+
+            if analysis == "position":
+                view = QGroupBox("Position View")
+                view_form = QFormLayout(view)
+                self.position_component = self._combo(("distance", "x", "y", "z", "xy-z"))
+                self.position_component.currentTextChanged.connect(
+                    self._handle_series_identity_change
+                )
+                self.position_map_color = self._combo(("distance", "z"))
+                self.position_map_color.currentTextChanged.connect(self._schedule_preview_update)
+                self.position_time_axis = self._combo(("ps", "fs", "step", "frame"))
+                self.position_time_axis.currentTextChanged.connect(self._schedule_preview_update)
+                view_form.addRow("Component", self.position_component)
+                view_form.addRow("Color by", self.position_map_color)
+                view_form.addRow("Time axis", self.position_time_axis)
+                self._position_map_color_row = (view_form, self.position_map_color)
+                self._position_time_axis_row = (view_form, self.position_time_axis)
+                layout.addWidget(view)
+
+            if analysis == "coordination":
+                view = QGroupBox("Coordination View")
+                view_form = QFormLayout(view)
+                self.coordination_component = self._combo(("distance", "time", "time-distance"))
+                self.coordination_component.currentTextChanged.connect(
+                    self._handle_series_identity_change
+                )
+                self.coordination_time_axis = self._combo(("ps", "fs", "step", "frame"))
+                self.coordination_time_axis.currentTextChanged.connect(
+                    self._schedule_preview_update
+                )
+                view_form.addRow("Component", self.coordination_component)
+                view_form.addRow("Time axis", self.coordination_time_axis)
+                self._coordination_time_axis_row = (view_form, self.coordination_time_axis)
+                layout.addWidget(view)
+
+        def _resize_list_with_defaults(
+            self,
+            values: list[Any],
+            *,
+            target_size: int,
+            default_factory: Callable[[], Any],
+        ) -> list[Any]:
+            resized = list(values[:target_size])
+            while len(resized) < target_size:
+                resized.append(default_factory())
+            return resized
+
+        def _apply_series_defaults(self, labels: list[str]) -> None:
+            if not labels:
+                return
+
+            selected_series = self._series_active_index
+            selected_norm = self._normalization_active_index
+            count = len(labels)
+
+            self._series_labels_data = [
+                label.strip() or f"Series {index + 1}" for index, label in enumerate(labels)
+            ]
+            self._series_colors_data = self._resize_list_with_defaults(
+                self._series_colors_data,
+                target_size=count,
+                default_factory=lambda: "",
+            )
+            self._series_enabled_data = self._resize_list_with_defaults(
+                self._series_enabled_data,
+                target_size=count,
+                default_factory=lambda: True,
+            )
+            self._series_line_widths_data = self._resize_list_with_defaults(
+                self._series_line_widths_data,
+                target_size=count,
+                default_factory=lambda: "",
+            )
+            self._series_markers_data = self._resize_list_with_defaults(
+                self._series_markers_data,
+                target_size=count,
+                default_factory=lambda: "",
+            )
+            self._series_line_kwargs_data = self._resize_list_with_defaults(
+                self._series_line_kwargs_data,
+                target_size=count,
+                default_factory=lambda: "",
+            )
+            self._series_normalization_modes_data = self._resize_list_with_defaults(
+                self._series_normalization_modes_data,
+                target_size=count,
+                default_factory=lambda: "none",
+            )
+            self._series_normalization_values_data = self._resize_list_with_defaults(
+                self._series_normalization_values_data,
+                target_size=count,
+                default_factory=lambda: "",
+            )
+            self._series_normalization_x_refs_data = self._resize_list_with_defaults(
+                self._series_normalization_x_refs_data,
+                target_size=count,
+                default_factory=lambda: "",
+            )
+
+            next_series_index = min(selected_series, count - 1)
+            next_norm_index = min(selected_norm, count - 1)
+
+            self._series_syncing = True
+            self._normalization_syncing = True
+            try:
+                self.series_selector.clear()
+                for index, label in enumerate(self._series_labels_data):
+                    self.series_selector.addItem(f"{index + 1}: {label}")
+                self._series_active_index = next_series_index
+                if self.series_selector.count() > 0:
+                    self.series_selector.setCurrentIndex(next_series_index)
+                self._load_series_into_editor(next_series_index)
+                self._sync_normalization_selector_labels()
+                self._normalization_active_index = next_norm_index
+                if self.norm_series_selector.count() > 0:
+                    self.norm_series_selector.setCurrentIndex(next_norm_index)
+                self._load_normalization_into_editor(next_norm_index)
+            finally:
+                self._normalization_syncing = False
+                self._series_syncing = False
+
+            self._update_normalization_warning()
+
+        def _handle_series_identity_change(self, *_unused: object) -> None:
+            self._refresh_widget_states()
+            if self._suspend_preview_events:
+                return
+            if self._on_resolve_series_defaults is not None:
+                try:
+                    settings = self._collect_settings()
+                    resolved = self._on_resolve_series_defaults(settings)
+                    raw_labels = resolved.get("series_labels")
+                    if isinstance(raw_labels, (list, tuple)):
+                        labels = [str(label) for label in raw_labels]
+                        if labels:
+                            self._apply_series_defaults(labels)
+                except Exception:
+                    pass
+            self._schedule_preview_update()
+
         def _build_data_tab(self) -> None:
             layout = QVBoxLayout(self._tab_data_content)
+            self._build_analysis_data_sections(layout)
 
-            binning = QGroupBox("X Rebinning (plot-only)")
+            binning_title = (
+                "Time Sectioning (plot-only)"
+                if self._analysis_name == "position"
+                else (
+                    "Distance / Time Binning (plot-only)"
+                    if self._analysis_name == "coordination"
+                    else "X Rebinning / Sectioning (plot-only)"
+                )
+            )
+            binning = QGroupBox(binning_title)
+            self._data_transform_group = binning
             binning_form = QFormLayout(binning)
             self.x_bin_width = self._line("Leave blank to disable")
             self.x_bin_width.textChanged.connect(self._refresh_widget_states)
             self.x_bin_reducer = self._combo(_BIN_REDUCERS)
-            binning_form.addRow("Bin width", self.x_bin_width)
+            width_label = (
+                "Time section width" if self._analysis_name == "position" else "Section width"
+            )
+            binning_form.addRow(width_label, self.x_bin_width)
             binning_form.addRow("Reducer", self.x_bin_reducer)
             self._x_bin_reducer_row = (binning_form, self.x_bin_reducer)
             layout.addWidget(binning)
 
             normalize_group = QGroupBox("Per-Series Normalization")
+            self._normalization_group = normalize_group
             normalize_layout = QVBoxLayout(normalize_group)
             selector_row = QHBoxLayout()
             selector_row.addWidget(QLabel("Series"))
             self.norm_series_selector = QComboBox()
-            self.norm_series_selector.currentIndexChanged.connect(self._handle_normalization_selection_change)
+            self.norm_series_selector.currentIndexChanged.connect(
+                self._handle_normalization_selection_change
+            )
             selector_row.addWidget(self.norm_series_selector, stretch=1)
             normalize_layout.addLayout(selector_row)
 
@@ -836,10 +1385,16 @@ def launch_plot_settings_panel(
             self.normalization_warning.setWordWrap(True)
             normalize_layout.addWidget(self.normalization_warning)
 
-            hint = QLabel(
-                "Normalization and x rebinning affect only the displayed figure. "
+            hint_text = (
+                "Normalization and time sectioning affect only the displayed figure. "
                 "Stored HDF5 datasets remain unchanged."
+                if self._analysis_name == "position"
+                else (
+                    "Normalization and x rebinning affect only the displayed figure. "
+                    "Stored HDF5 datasets remain unchanged."
+                )
             )
+            hint = QLabel(hint_text)
             hint.setWordWrap(True)
             normalize_layout.addWidget(hint)
             layout.addWidget(normalize_group)
@@ -999,7 +1554,9 @@ def launch_plot_settings_panel(
                 return
             self._series_syncing = True
             try:
-                self._set_combo_value(self.series_enabled, "on" if self._series_enabled_data[index] else "off")
+                self._set_combo_value(
+                    self.series_enabled, "on" if self._series_enabled_data[index] else "off"
+                )
                 self.series_label.setText(self._series_labels_data[index])
                 self.series_color.setText(self._series_colors_data[index])
                 self.series_line_width.setText(self._series_line_widths_data[index])
@@ -1014,10 +1571,14 @@ def launch_plot_settings_panel(
             label_value = self.series_label.text().strip()
             self._series_labels_data[index] = label_value or f"Series {index + 1}"
             self._series_colors_data[index] = self.series_color.text().strip()
-            self._series_enabled_data[index] = self.series_enabled.currentText().strip().lower() != "off"
+            self._series_enabled_data[index] = (
+                self.series_enabled.currentText().strip().lower() != "off"
+            )
             self._series_line_widths_data[index] = self.series_line_width.text().strip()
             self._series_markers_data[index] = self.series_marker.currentText().strip()
-            self._series_line_kwargs_data[index] = self.series_line_kwargs_json.toPlainText().strip()
+            self._series_line_kwargs_data[index] = (
+                self.series_line_kwargs_json.toPlainText().strip()
+            )
             label_text = f"{index + 1}: {self._series_labels_data[index]}"
             self.series_selector.setItemText(index, label_text)
             if self.norm_series_selector.count() > index:
@@ -1185,6 +1746,7 @@ def launch_plot_settings_panel(
                 self.title_font,
                 self.label_font,
                 self.tick_font,
+                self.legend_font,
                 self.line_width,
                 self.line_color,
                 self.line_alpha,
@@ -1365,35 +1927,71 @@ def launch_plot_settings_panel(
             widget.setCurrentIndex(index)
 
         def _populate(self, settings: dict[str, Any]) -> None:
-            self._set_combo_value(self.title_mode, _toggle_to_mode(settings.get("title_visible")))
+            self._set_combo_value(
+                self.title_mode,
+                _toggle_to_mode(settings.get("title_visible"), auto_mode="on"),
+            )
             self.title_text.setText(str(settings.get("title") or ""))
             self.x_label.setText(str(settings.get("x_label") or ""))
             self.y_label.setText(str(settings.get("y_label") or ""))
 
-            self._set_combo_value(self.legend_mode, _toggle_to_mode(settings.get("legend")))
+            self._set_combo_value(
+                self.legend_mode,
+                _toggle_to_mode(settings.get("legend"), auto_mode="on"),
+            )
             self.legend_title.setText(str(settings.get("legend_title") or ""))
             self._set_combo_value(self.legend_loc, str(settings.get("legend_loc") or "best"))
             self._set_combo_value(
                 self.legend_frame_mode,
-                _extract_dict_mode(settings, key="legend_kwargs", nested_key="frameon"),
+                _extract_dict_mode(
+                    settings,
+                    key="legend_kwargs",
+                    nested_key="frameon",
+                    auto_mode="on",
+                ),
             )
-            self.legend_columns.setText(_extract_dict_text(settings, key="legend_kwargs", nested_key="ncols"))
+            self.legend_columns.setText(
+                _extract_dict_text(settings, key="legend_kwargs", nested_key="ncols")
+            )
+            legend_font_size = settings.get("legend_font_size")
+            if legend_font_size is None:
+                legend_font_size = _extract_dict_text(
+                    settings,
+                    key="legend_kwargs",
+                    nested_key="fontsize",
+                )
+            self.legend_font.setText("" if legend_font_size is None else str(legend_font_size))
 
-            self._set_combo_value(self.ticks_mode, _toggle_to_mode(settings.get("ticks")))
-            self._set_combo_value(self.grid_mode, _toggle_to_mode(settings.get("grid")))
-            self._set_combo_value(self.markers_mode, _toggle_to_mode(settings.get("markers")))
+            self._set_combo_value(
+                self.ticks_mode,
+                _toggle_to_mode(settings.get("ticks"), auto_mode="on"),
+            )
+            self._set_combo_value(
+                self.grid_mode,
+                _toggle_to_mode(settings.get("grid"), auto_mode="on"),
+            )
+            self._set_combo_value(
+                self.markers_mode,
+                _toggle_to_mode(settings.get("markers"), auto_mode="off"),
+            )
             tick_params_settings = settings.get("tick_params_kwargs")
             tick_axis_mode = "auto"
             minor_ticks_mode = "auto"
             if isinstance(tick_params_settings, dict):
-                raw_tick_axis = str(
-                    tick_params_settings.get("_ticks_axis", tick_params_settings.get("axis", "auto"))
-                ).strip().lower()
+                raw_tick_axis = (
+                    str(
+                        tick_params_settings.get(
+                            "_ticks_axis", tick_params_settings.get("axis", "auto")
+                        )
+                    )
+                    .strip()
+                    .lower()
+                )
                 if raw_tick_axis in _TICK_AXES:
                     tick_axis_mode = raw_tick_axis
-                raw_minor_mode = str(
-                    tick_params_settings.get("_minor_ticks_mode", "auto")
-                ).strip().lower()
+                raw_minor_mode = (
+                    str(tick_params_settings.get("_minor_ticks_mode", "auto")).strip().lower()
+                )
                 if raw_minor_mode in {"auto", "on", "off"}:
                     minor_ticks_mode = raw_minor_mode
             self._set_combo_value(self.ticks_axis, tick_axis_mode)
@@ -1408,11 +2006,19 @@ def launch_plot_settings_panel(
             self.y_ticks.setText(_format_float_list(settings.get("y_ticks")))
             self.x_tick_rotation.setText(str(settings.get("x_tick_rotation") or ""))
             self.y_tick_rotation.setText(str(settings.get("y_tick_rotation") or ""))
-            self.x_margin.setText(_extract_dict_text(settings, key="axes_kwargs", nested_key="xmargin"))
-            self.y_margin.setText(_extract_dict_text(settings, key="axes_kwargs", nested_key="ymargin"))
+            self.x_margin.setText(
+                _extract_dict_text(settings, key="axes_kwargs", nested_key="xmargin")
+            )
+            self.y_margin.setText(
+                _extract_dict_text(settings, key="axes_kwargs", nested_key="ymargin")
+            )
 
-            self.fig_width.setText(_extract_figsize_dimension(settings, index=0, fallback=defaults.figure_size[0]))
-            self.fig_height.setText(_extract_figsize_dimension(settings, index=1, fallback=defaults.figure_size[1]))
+            self.fig_width.setText(
+                _extract_figsize_dimension(settings, index=0, fallback=defaults.figure_size[0])
+            )
+            self.fig_height.setText(
+                _extract_figsize_dimension(settings, index=1, fallback=defaults.figure_size[1])
+            )
             self.dpi.setText(str(settings.get("dpi") or defaults.dpi))
             self.font_family.setText(str(settings.get("font_family") or ""))
             self.figure_facecolor.setText(
@@ -1420,20 +2026,40 @@ def launch_plot_settings_panel(
             )
             self._set_combo_value(
                 self.transparent_mode,
-                _extract_dict_mode(settings, key="savefig_kwargs", nested_key="transparent"),
+                _extract_dict_mode(
+                    settings,
+                    key="savefig_kwargs",
+                    nested_key="transparent",
+                    auto_mode="off",
+                ),
             )
-            self.title_font.setText(str(settings.get("title_font_size") or defaults.title_font_size))
-            self.label_font.setText(str(settings.get("label_font_size") or defaults.label_font_size))
+            self.title_font.setText(
+                str(settings.get("title_font_size") or defaults.title_font_size)
+            )
+            self.label_font.setText(
+                str(settings.get("label_font_size") or defaults.label_font_size)
+            )
             self.tick_font.setText(str(settings.get("tick_font_size") or defaults.tick_font_size))
             self.line_width.setText(str(settings.get("line_width") or defaults.line_width))
             self.line_color.setText(str(settings.get("line_color") or ""))
-            self._set_combo_value(self.line_style, _extract_dict_text(settings, key="line_kwargs", nested_key="linestyle"))
-            self.line_alpha.setText(_extract_dict_text(settings, key="line_kwargs", nested_key="alpha"))
-            self.marker_size.setText(_extract_dict_text(settings, key="line_kwargs", nested_key="markersize"))
+            self._set_combo_value(
+                self.line_style,
+                _extract_dict_text(settings, key="line_kwargs", nested_key="linestyle"),
+            )
+            self.line_alpha.setText(
+                _extract_dict_text(settings, key="line_kwargs", nested_key="alpha")
+            )
+            self.marker_size.setText(
+                _extract_dict_text(settings, key="line_kwargs", nested_key="markersize")
+            )
             self._set_combo_value(self.grid_linestyle, str(settings.get("grid_linestyle") or ""))
-            self.grid_linewidth.setText(str(settings.get("grid_linewidth") or defaults.grid_linewidth))
+            self.grid_linewidth.setText(
+                str(settings.get("grid_linewidth") or defaults.grid_linewidth)
+            )
             self.grid_alpha.setText(str(settings.get("grid_alpha") or defaults.grid_alpha))
-            self.grid_color.setText(_extract_dict_text(settings, key="grid_kwargs", nested_key="color"))
+            self.grid_color.setText(
+                _extract_dict_text(settings, key="grid_kwargs", nested_key="color")
+            )
             self._set_combo_value(
                 self.grid_axis,
                 str(_extract_dict_value(settings, key="grid_kwargs", nested_key="axis") or "auto"),
@@ -1444,7 +2070,10 @@ def launch_plot_settings_panel(
             )
             self._set_combo_value(
                 self.tick_direction,
-                str(_extract_dict_value(settings, key="tick_params_kwargs", nested_key="direction") or "auto"),
+                str(
+                    _extract_dict_value(settings, key="tick_params_kwargs", nested_key="direction")
+                    or "auto"
+                ),
             )
             self.tick_length.setText(
                 _extract_dict_text(settings, key="tick_params_kwargs", nested_key="length")
@@ -1454,6 +2083,53 @@ def launch_plot_settings_panel(
             )
             self._set_combo_value(self.minor_ticks_mode, minor_ticks_mode)
 
+            if hasattr(self, "analysis_species"):
+                self.analysis_species.setText(str(settings.get("species") or ""))
+            if hasattr(self, "analysis_axis"):
+                self._set_combo_value(self.analysis_axis, str(settings.get("axis") or "auto"))
+            if hasattr(self, "density_x_mode"):
+                self._set_combo_value(
+                    self.density_x_mode,
+                    str(settings.get("x_mode") or "distance"),
+                )
+            if hasattr(self, "density_quantity"):
+                self._set_combo_value(
+                    self.density_quantity,
+                    str(settings.get("quantity") or "mass"),
+                )
+            if hasattr(self, "rdf_species_a"):
+                self.rdf_species_a.setText(str(settings.get("species_a") or ""))
+            if hasattr(self, "rdf_species_b"):
+                self.rdf_species_b.setText(str(settings.get("species_b") or ""))
+            if hasattr(self, "coord_species_a"):
+                self.coord_species_a.setText(str(settings.get("species_a") or ""))
+            if hasattr(self, "coord_species_b"):
+                self.coord_species_b.setText(str(settings.get("species_b") or ""))
+            if hasattr(self, "position_component"):
+                self._set_combo_value(
+                    self.position_component,
+                    str(settings.get("component") or "distance"),
+                )
+            if hasattr(self, "position_map_color"):
+                self._set_combo_value(
+                    self.position_map_color,
+                    str(settings.get("map_color") or "distance"),
+                )
+            if hasattr(self, "position_time_axis"):
+                self._set_combo_value(
+                    self.position_time_axis,
+                    str(settings.get("time_axis") or "ps"),
+                )
+            if hasattr(self, "coordination_component"):
+                self._set_combo_value(
+                    self.coordination_component,
+                    str(settings.get("component") or "distance"),
+                )
+            if hasattr(self, "coordination_time_axis"):
+                self._set_combo_value(
+                    self.coordination_time_axis,
+                    str(settings.get("time_axis") or "ps"),
+                )
             self.x_bin_width.setText(str(settings.get("x_bin_width") or ""))
             self._set_combo_value(self.x_bin_reducer, str(settings.get("x_bin_reducer") or "mean"))
             self._initialize_series_data(settings)
@@ -1470,7 +2146,9 @@ def launch_plot_settings_panel(
             self.tight_layout_kwargs_json.setPlainText(
                 _format_json_block(settings.get("tight_layout_kwargs"))
             )
-            self.savefig_kwargs_json.setPlainText(_format_json_block(settings.get("savefig_kwargs")))
+            self.savefig_kwargs_json.setPlainText(
+                _format_json_block(settings.get("savefig_kwargs"))
+            )
 
         def _refresh_widget_states(self, *_unused: object) -> None:
             title_enabled = self.title_mode.currentText().strip().lower() != "off"
@@ -1478,7 +2156,9 @@ def launch_plot_settings_panel(
             grid_enabled = self.grid_mode.currentText().strip().lower() != "off"
             ticks_mode = self.ticks_mode.currentText().strip().lower()
             ticks_enabled = ticks_mode != "off"
-            rebin_enabled = bool(self.x_bin_width.text().strip()) if hasattr(self, "x_bin_width") else False
+            rebin_enabled = (
+                bool(self.x_bin_width.text().strip()) if hasattr(self, "x_bin_width") else False
+            )
             norm_mode = (
                 self.norm_mode.currentText().strip().lower()
                 if hasattr(self, "norm_mode")
@@ -1486,6 +2166,19 @@ def launch_plot_settings_panel(
             )
             norm_enabled = norm_mode != "none"
             norm_x_ref_enabled = norm_mode == "value_at_x"
+            position_component = (
+                self.position_component.currentText().strip().lower()
+                if hasattr(self, "position_component")
+                else ""
+            )
+            position_xy_projection = position_component == "xy-z"
+            coordination_component = (
+                self.coordination_component.currentText().strip().lower()
+                if hasattr(self, "coordination_component")
+                else ""
+            )
+            coordination_time_distance = coordination_component == "time-distance"
+            coordination_distance = coordination_component == "distance"
 
             self._set_rows_visible(self._title_rows, title_enabled)
             self._set_rows_visible(self._legend_rows, legend_enabled)
@@ -1502,6 +2195,32 @@ def launch_plot_settings_panel(
                 self._tick_appearance_group.setVisible(ticks_enabled)
             if self._grid_group is not None:
                 self._grid_group.setVisible(grid_enabled)
+            if self._position_map_color_row is not None:
+                self._set_form_row_visible(
+                    self._position_map_color_row[0],
+                    self._position_map_color_row[1],
+                    position_xy_projection,
+                )
+            if self._position_time_axis_row is not None:
+                self._set_form_row_visible(
+                    self._position_time_axis_row[0],
+                    self._position_time_axis_row[1],
+                    not position_xy_projection,
+                )
+            if self._coordination_time_axis_row is not None:
+                self._set_form_row_visible(
+                    self._coordination_time_axis_row[0],
+                    self._coordination_time_axis_row[1],
+                    not coordination_distance,
+                )
+            if self._data_transform_group is not None and self._analysis_name == "position":
+                self._data_transform_group.setVisible(not position_xy_projection)
+            if self._normalization_group is not None and self._analysis_name == "position":
+                self._normalization_group.setVisible(not position_xy_projection)
+            if self._data_transform_group is not None and self._analysis_name == "coordination":
+                self._data_transform_group.setVisible(not coordination_time_distance)
+            if self._normalization_group is not None and self._analysis_name == "coordination":
+                self._normalization_group.setVisible(not coordination_time_distance)
             if self._x_bin_reducer_row is not None:
                 self._set_form_row_visible(
                     self._x_bin_reducer_row[0],
@@ -1528,20 +2247,19 @@ def launch_plot_settings_panel(
             fig_width = _optional_float(self.fig_width.text(), field_name="figure width")
             fig_height = _optional_float(self.fig_height.text(), field_name="figure height")
             if (fig_width is None) != (fig_height is None):
-                raise ValueError("Figure width and figure height must both be set or both be blank.")
+                raise ValueError(
+                    "Figure width and figure height must both be set or both be blank."
+                )
             figsize: list[float] | None = None
             if fig_width is not None and fig_height is not None:
                 figsize = [fig_width, fig_height]
 
-            series_labels = [label.strip() or f"Series {index + 1}" for index, label in enumerate(self._series_labels_data)]
+            series_labels = [
+                label.strip() or f"Series {index + 1}"
+                for index, label in enumerate(self._series_labels_data)
+            ]
             line_colors = [color.strip() for color in self._series_colors_data]
-            line_colors_value: list[str] | None = None
-            if any(color for color in line_colors):
-                if any(not color for color in line_colors):
-                    raise ValueError(
-                        "When using per-series colors, please set a color value for every series."
-                    )
-                line_colors_value = [color for color in line_colors]
+            line_colors_value = _resolve_series_line_colors(line_colors)
 
             series_enabled = [bool(value) for value in self._series_enabled_data]
             series_enabled_value: list[bool] | None = None
@@ -1559,9 +2277,7 @@ def launch_plot_settings_panel(
                     series_line_widths.append(float(token))
                     has_custom_series_width = True
                 except ValueError as exc:
-                    raise ValueError(
-                        f"Series {index + 1} line width must be a float."
-                    ) from exc
+                    raise ValueError(f"Series {index + 1} line width must be a float.") from exc
             series_line_widths_value: list[float | None] | None = None
             if has_custom_series_width:
                 series_line_widths_value = series_line_widths
@@ -1588,7 +2304,9 @@ def launch_plot_settings_panel(
             if has_series_line_kwargs:
                 series_line_kwargs_value = series_line_kwargs
 
-            normalization_modes = [mode.strip().lower() for mode in self._series_normalization_modes_data]
+            normalization_modes = [
+                mode.strip().lower() for mode in self._series_normalization_modes_data
+            ]
             normalization_values: list[float | None] = []
             normalization_x_refs: list[float | None] = []
             has_normalization = False
@@ -1604,10 +2322,8 @@ def launch_plot_settings_panel(
                     field_name=f"Series {index + 1} normalization reference x",
                 )
                 if mode == "none":
-                    if value is not None or x_ref is not None:
-                        raise ValueError(
-                            f"Series {index + 1} normalization mode is 'none'; remove target/reference values."
-                        )
+                    value = None
+                    x_ref = None
                 elif mode == "value_at_x":
                     if value is None or x_ref is None:
                         raise ValueError(
@@ -1679,7 +2395,9 @@ def launch_plot_settings_panel(
                 figure_kwargs_merged["facecolor"] = facecolor
             figure_kwargs_value = figure_kwargs_merged or None
 
-            axes_kwargs_merged = dict(axes_kwargs_value) if isinstance(axes_kwargs_value, dict) else {}
+            axes_kwargs_merged = (
+                dict(axes_kwargs_value) if isinstance(axes_kwargs_value, dict) else {}
+            )
             x_margin = _optional_float(self.x_margin.text(), field_name="x-margin")
             y_margin = _optional_float(self.y_margin.text(), field_name="y-margin")
             if x_margin is not None:
@@ -1692,7 +2410,9 @@ def launch_plot_settings_panel(
                 axes_kwargs_merged.pop("ymargin", None)
             axes_kwargs_value = axes_kwargs_merged or None
 
-            line_kwargs_merged = dict(line_kwargs_value) if isinstance(line_kwargs_value, dict) else {}
+            line_kwargs_merged = (
+                dict(line_kwargs_value) if isinstance(line_kwargs_value, dict) else {}
+            )
             line_style = _optional_text(self.line_style.currentText())
             line_alpha = _optional_float(self.line_alpha.text(), field_name="line-alpha")
             marker_size = _optional_float(self.marker_size.text(), field_name="marker-size")
@@ -1717,7 +2437,9 @@ def launch_plot_settings_panel(
                 legend_kwargs_merged["ncols"] = legend_columns
             legend_kwargs_value = legend_kwargs_merged or None
 
-            grid_kwargs_merged = dict(grid_kwargs_value) if isinstance(grid_kwargs_value, dict) else {}
+            grid_kwargs_merged = (
+                dict(grid_kwargs_value) if isinstance(grid_kwargs_value, dict) else {}
+            )
             grid_color = _optional_text(self.grid_color.text())
             if grid_color is not None:
                 grid_kwargs_merged["color"] = grid_color
@@ -1786,7 +2508,7 @@ def launch_plot_settings_panel(
             if x_bin_width is not None and x_bin_width <= 0:
                 raise ValueError("x-bin-width must be positive.")
 
-            return {
+            settings = {
                 "title": _optional_text(self.title_text.text()),
                 "x_label": _optional_text(self.x_label.text()),
                 "y_label": _optional_text(self.y_label.text()),
@@ -1814,9 +2536,16 @@ def launch_plot_settings_panel(
                 "figsize": figsize,
                 "dpi": _optional_int(self.dpi.text(), field_name="dpi"),
                 "font_family": _optional_text(self.font_family.text()),
-                "title_font_size": _optional_int(self.title_font.text(), field_name="title-font-size"),
-                "label_font_size": _optional_int(self.label_font.text(), field_name="label-font-size"),
+                "title_font_size": _optional_int(
+                    self.title_font.text(), field_name="title-font-size"
+                ),
+                "label_font_size": _optional_int(
+                    self.label_font.text(), field_name="label-font-size"
+                ),
                 "tick_font_size": _optional_int(self.tick_font.text(), field_name="tick-font-size"),
+                "legend_font_size": _optional_int(
+                    self.legend_font.text(), field_name="legend-font-size"
+                ),
                 "line_width": _optional_float(self.line_width.text(), field_name="line-width"),
                 "line_color": _optional_text(self.line_color.text()),
                 "line_colors": line_colors_value,
@@ -1829,9 +2558,7 @@ def launch_plot_settings_panel(
                 "series_normalization_values": normalization_values_value,
                 "series_normalization_x_refs": normalization_x_refs_value,
                 "x_bin_width": x_bin_width,
-                "x_bin_reducer": (
-                    self.x_bin_reducer.currentText().strip() or "mean"
-                )
+                "x_bin_reducer": (self.x_bin_reducer.currentText().strip() or "mean")
                 if x_bin_width is not None
                 else None,
                 "grid_linestyle": _optional_text(self.grid_linestyle.currentText()),
@@ -1849,6 +2576,36 @@ def launch_plot_settings_panel(
                 "tight_layout_kwargs": tight_layout_kwargs_value,
                 "savefig_kwargs": savefig_kwargs_value,
             }
+            if hasattr(self, "analysis_species"):
+                settings["species"] = _optional_text(self.analysis_species.text())
+            if hasattr(self, "analysis_axis"):
+                axis_value = self.analysis_axis.currentText().strip().lower()
+                settings["axis"] = None if axis_value in {"", "auto"} else axis_value
+            if hasattr(self, "density_x_mode"):
+                settings["x_mode"] = self.density_x_mode.currentText().strip() or "distance"
+            if hasattr(self, "density_quantity"):
+                settings["quantity"] = self.density_quantity.currentText().strip() or "mass"
+            if hasattr(self, "rdf_species_a"):
+                settings["species_a"] = _optional_text(self.rdf_species_a.text())
+            if hasattr(self, "rdf_species_b"):
+                settings["species_b"] = _optional_text(self.rdf_species_b.text())
+            if hasattr(self, "coord_species_a"):
+                settings["species_a"] = _optional_text(self.coord_species_a.text())
+            if hasattr(self, "coord_species_b"):
+                settings["species_b"] = _optional_text(self.coord_species_b.text())
+            if hasattr(self, "position_component"):
+                settings["component"] = self.position_component.currentText().strip() or "distance"
+            if hasattr(self, "position_map_color"):
+                settings["map_color"] = self.position_map_color.currentText().strip() or "distance"
+            if hasattr(self, "position_time_axis"):
+                settings["time_axis"] = self.position_time_axis.currentText().strip() or "ps"
+            if hasattr(self, "coordination_component"):
+                settings["component"] = (
+                    self.coordination_component.currentText().strip() or "distance"
+                )
+            if hasattr(self, "coordination_time_axis"):
+                settings["time_axis"] = self.coordination_time_axis.currentText().strip() or "ps"
+            return settings
 
         def _report_error(self, title_text: str, exc: Exception) -> None:
             self._status_label.setText(f"{title_text}: {exc}")
@@ -1861,7 +2618,7 @@ def launch_plot_settings_panel(
         def _handle_save(self) -> None:
             try:
                 settings = self._collect_settings()
-                message = on_save(settings)
+                message = on_save(self._current_profile_name, settings)
                 self._status_label.setText(message)
                 self._saved_signature = self._signature(settings)
             except Exception as exc:
@@ -1929,6 +2686,8 @@ def launch_plot_settings_panel(
             self._schedule_preview_update()
 
         def _handle_import_json(self) -> None:
+            if not self._confirm_context_change(action_label="importing settings"):
+                return
             path_str, _selected = QFileDialog.getOpenFileName(
                 self,
                 "Import Plot Settings",
@@ -1942,10 +2701,8 @@ def launch_plot_settings_panel(
                 suffix = source_path.suffix.lower()
                 if suffix in {".h5", ".hdf5"}:
                     if on_import_hdf5 is None:
-                        raise ValueError(
-                            "HDF5 import is unavailable for this plot session."
-                        )
-                    payload = on_import_hdf5(path_str)
+                        raise ValueError("HDF5 import is unavailable for this plot session.")
+                    payload = on_import_hdf5(path_str, self._current_profile_name)
                     source_label = source_path.name
                 else:
                     payload = json.loads(source_path.read_text(encoding="utf-8"))
@@ -1953,16 +2710,12 @@ def launch_plot_settings_panel(
                 if not isinstance(payload, dict):
                     raise ValueError("JSON root must be an object with setting keys.")
                 payload = _without_series_specific_settings(payload)
-                merged = dict(initial_settings)
+                merged = self._resolved_default_profile_settings()
                 merged.update(payload)
-                self._suspend_preview_events = True
-                try:
-                    self._populate(merged)
-                finally:
-                    self._suspend_preview_events = False
-                self._refresh_widget_states()
-                self._status_label.setText(
-                    f"Imported non-series settings from '{source_label}'."
+                self._load_settings_into_editor(
+                    merged,
+                    status_message=f"Imported non-series settings into '{self._current_profile_name}' from '{source_label}'.",
+                    mark_saved=False,
                 )
                 self._schedule_preview_update()
             except Exception as exc:
@@ -1975,7 +2728,7 @@ def launch_plot_settings_panel(
                 path_str, _selected = QFileDialog.getSaveFileName(
                     self,
                     "Export Plot Settings JSON",
-                    "linak_plot_settings.json",
+                    f"{self._current_profile_name.lower().replace(' ', '_')}_plot_settings.json",
                     "JSON files (*.json)",
                 )
                 if not path_str:
@@ -2076,7 +2829,7 @@ def launch_plot_settings_panel(
                 return
             if decision == QMessageBox.StandardButton.Yes:
                 try:
-                    message = on_save(settings)
+                    message = on_save(self._current_profile_name, settings)
                     self._status_label.setText(message)
                     self._saved_signature = current_signature
                 except Exception as exc:

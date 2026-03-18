@@ -28,7 +28,9 @@ CELL_PREFIX_RE = re.compile(r"^\s*(CELL(?:_TOP|_REF)?\|)\s*(.*)$")
 CELL_VECTOR_RE = re.compile(
     r"Vector\s+([abc])\s+\[angstrom\]?:?\s*([+-]?\d+\.\d+)\s+([+-]?\d+\.\d+)\s+([+-]?\d+\.\d+).*?\|[abc]\|\s*=\s*([+-]?\d+\.\d+)"
 )
-ATOMIC_KIND_RE = re.compile(r"^\s*(\d+)\.\s+Atomic kind:\s+([A-Za-z0-9_+-]+)\s+Number of atoms:\s+(\d+)\s*$")
+ATOMIC_KIND_RE = re.compile(
+    r"^\s*(\d+)\.\s+Atomic kind:\s+([A-Za-z0-9_+-]+)\s+Number of atoms:\s+(\d+)\s*$"
+)
 MD_INI_RE = re.compile(rf"^\s*MD_INI\|\s+(.*?)\s+({FLOAT_PATTERN})\s*$")
 
 SCF_ITERATION_FIELDS = [
@@ -328,7 +330,9 @@ class StreamingCSVTable:
         if self.handle is None:
             make_parent(self.path)
             self.handle = self.path.open("w", encoding="utf-8", newline="")
-            self.writer = csv.DictWriter(self.handle, fieldnames=self.fieldnames, extrasaction="ignore")
+            self.writer = csv.DictWriter(
+                self.handle, fieldnames=self.fieldnames, extrasaction="ignore"
+            )
             self.writer.writeheader()
         assert self.writer is not None
         self.writer.writerow(row)
@@ -344,13 +348,26 @@ class StreamingCSVTable:
 class StreamingCSVManager:
     def __init__(self, output_dir: Path, options: ParserOptions) -> None:
         self.tables: dict[str, StreamingCSVTable] = {}
-        self._register(output_dir, "scf_iterations.csv", SCF_ITERATION_FIELDS, enabled=not options.drop_scf_iterations)
-        self._register(output_dir, "mulliken.csv", MULLIKEN_FIELDS, enabled=not options.drop_mulliken)
-        self._register(output_dir, "hirshfeld.csv", HIRSHFELD_FIELDS, enabled=not options.drop_hirshfeld)
+        self._register(
+            output_dir,
+            "scf_iterations.csv",
+            SCF_ITERATION_FIELDS,
+            enabled=not options.drop_scf_iterations,
+        )
+        self._register(
+            output_dir, "mulliken.csv", MULLIKEN_FIELDS, enabled=not options.drop_mulliken
+        )
+        self._register(
+            output_dir, "hirshfeld.csv", HIRSHFELD_FIELDS, enabled=not options.drop_hirshfeld
+        )
         self._register(output_dir, "forces.csv", FORCES_FIELDS, enabled=not options.drop_forces)
-        self._register(output_dir, "md_steps.csv", MD_STEPS_FIELDS, enabled=not options.drop_md_steps)
+        self._register(
+            output_dir, "md_steps.csv", MD_STEPS_FIELDS, enabled=not options.drop_md_steps
+        )
 
-    def _register(self, output_dir: Path, filename: str, fieldnames: list[str], enabled: bool) -> None:
+    def _register(
+        self, output_dir: Path, filename: str, fieldnames: list[str], enabled: bool
+    ) -> None:
         if enabled:
             self.tables[filename] = StreamingCSVTable(output_dir / filename, fieldnames)
 
@@ -378,7 +395,9 @@ class StreamingCSVManager:
 
 
 class CP2KOutputParser:
-    def __init__(self, source_path: Path, backup_path: Path | None, output_dir: Path, options: ParserOptions) -> None:
+    def __init__(
+        self, source_path: Path, backup_path: Path | None, output_dir: Path, options: ParserOptions
+    ) -> None:
         self.source_path = source_path
         self.backup_path = backup_path
         self.output_dir = output_dir
@@ -391,7 +410,9 @@ class CP2KOutputParser:
         )
         self.stream_manager = StreamingCSVManager(output_dir, options)
         self.pending_stream_rows: dict[str, dict[int, list[dict[str, Any]]]] = {
-            filename: {} for filename in BLOCK_LINKED_STREAM_FILES if self.stream_manager.is_enabled(filename)
+            filename: {}
+            for filename in BLOCK_LINKED_STREAM_FILES
+            if self.stream_manager.is_enabled(filename)
         }
         self.parsed_row_counts: Counter[str] = Counter()
         self.coords_by_atom: dict[int, dict[str, Any]] = {}
@@ -454,7 +475,9 @@ class CP2KOutputParser:
         line_count = 0
         progress_interval = 10000  # update every 10k lines
 
-        with self.source_path.open("r", encoding="utf-8", errors="replace", buffering=READ_BUFFER_SIZE) as handle:
+        with self.source_path.open(
+            "r", encoding="utf-8", errors="replace", buffering=READ_BUFFER_SIZE
+        ) as handle:
             while True:
                 if self.pending_line is not None:
                     line = self.pending_line
@@ -464,7 +487,7 @@ class CP2KOutputParser:
 
                 if not line:
                     break
-                
+
                 line_count += 1
 
                 if total_lines > 0 and line_count % progress_interval == 0:
@@ -490,7 +513,11 @@ class CP2KOutputParser:
                     continue
 
                 if self.in_constants:
-                    if line.startswith(" CELL_TOP|") or line.startswith(" CELL|") or line.startswith(" CELL_REF|"):
+                    if (
+                        line.startswith(" CELL_TOP|")
+                        or line.startswith(" CELL|")
+                        or line.startswith(" CELL_REF|")
+                    ):
                         self.in_constants = False
                         self.pending_line = line
                         continue
@@ -507,7 +534,11 @@ class CP2KOutputParser:
                     continue
 
                 if self.in_coordinates:
-                    if line.startswith(" SCF PARAMETERS") or line.startswith(" Number of electrons:") or line.startswith(" Spin 1"):
+                    if (
+                        line.startswith(" SCF PARAMETERS")
+                        or line.startswith(" Number of electrons:")
+                        or line.startswith(" Spin 1")
+                    ):
                         self.in_coordinates = False
                         self.pending_line = line
                         continue
@@ -525,7 +556,9 @@ class CP2KOutputParser:
                         or line.startswith(" SCF WAVEFUNCTION OPTIMIZATION")
                     ):
                         if self.current_scf_settings_lines:
-                            self.result.scf_settings_blocks.append(self.current_scf_settings_lines[:])
+                            self.result.scf_settings_blocks.append(
+                                self.current_scf_settings_lines[:]
+                            )
                         self.current_scf_settings_lines = []
                         self.in_scf_params = False
                         self.pending_line = line
@@ -551,14 +584,18 @@ class CP2KOutputParser:
                     continue
 
                 if self.in_mulliken:
-                    if line.strip().startswith("!-----------------------------------------------------------------------------!"):
+                    if line.strip().startswith(
+                        "!-----------------------------------------------------------------------------!"
+                    ):
                         self.in_mulliken = False
                         continue
                     self._consume_mulliken_line(line)
                     continue
 
                 if self.in_hirshfeld:
-                    if line.strip().startswith("!-----------------------------------------------------------------------------!"):
+                    if line.strip().startswith(
+                        "!-----------------------------------------------------------------------------!"
+                    ):
                         self.in_hirshfeld = False
                         continue
                     self._consume_hirshfeld_line(line)
@@ -638,7 +675,9 @@ class CP2KOutputParser:
         self.result.electronic_summary_lines = unique_preserve(self.result.electronic_summary_lines)
         self.result.system_summary_lines = unique_preserve(self.result.system_summary_lines)
         self.result.references_lines = unique_preserve(self.result.references_lines)
-        self.result.performance_summary_lines = unique_preserve(self.result.performance_summary_lines)
+        self.result.performance_summary_lines = unique_preserve(
+            self.result.performance_summary_lines
+        )
         self.result.cube_files = unique_preserve(self.result.cube_files)
 
     def _increment_row_count(self, filename: str) -> None:
@@ -657,7 +696,9 @@ class CP2KOutputParser:
         row["y_ang"] = coord.get("y_ang")
         row["z_ang"] = coord.get("z_ang")
 
-    def _queue_stream_row_for_block(self, filename: str, block_index: int | None, row: dict[str, Any]) -> None:
+    def _queue_stream_row_for_block(
+        self, filename: str, block_index: int | None, row: dict[str, Any]
+    ) -> None:
         if not self.stream_manager.is_enabled(filename):
             return
         if block_index is None:
@@ -666,7 +707,9 @@ class CP2KOutputParser:
         rows_by_block = self.pending_stream_rows.setdefault(filename, {})
         rows_by_block.setdefault(block_index, []).append(row)
 
-    def _flush_pending_stream_rows_for_block(self, block_index: int, md_row: dict[str, Any] | None) -> None:
+    def _flush_pending_stream_rows_for_block(
+        self, block_index: int, md_row: dict[str, Any] | None
+    ) -> None:
         for filename in BLOCK_LINKED_STREAM_FILES:
             if not self.stream_manager.is_enabled(filename):
                 continue
@@ -772,7 +815,11 @@ class CP2KOutputParser:
             self.result.parallel_setup_lines.append(line.rstrip("\n"))
             return
 
-        if line.startswith("  **** ****") or line.startswith(" ***** **") or line.startswith(" **    ****"):
+        if (
+            line.startswith("  **** ****")
+            or line.startswith(" ***** **")
+            or line.startswith(" **    ****")
+        ):
             self.result.run_info_lines.append(line.rstrip("\n"))
             return
 
@@ -789,7 +836,11 @@ class CP2KOutputParser:
             self.result.constants_lines.append(line.rstrip("\n"))
             return
 
-        if line.startswith(" CELL_TOP|") or line.startswith(" CELL|") or line.startswith(" CELL_REF|"):
+        if (
+            line.startswith(" CELL_TOP|")
+            or line.startswith(" CELL|")
+            or line.startswith(" CELL_REF|")
+        ):
             self.result.cell_lines.append(line.rstrip("\n"))
             parsed = parse_cell_line(line)
             if parsed is not None:
@@ -876,7 +927,11 @@ class CP2KOutputParser:
             self.result.electronic_summary_lines.append(line.rstrip("\n"))
             return
 
-        if line.startswith(" Parameters for the always stable predictor-corrector (ASPC) method:") or line.startswith("  ASPC order:") or line.startswith("  B(1) ="):
+        if (
+            line.startswith(" Parameters for the always stable predictor-corrector (ASPC) method:")
+            or line.startswith("  ASPC order:")
+            or line.startswith("  B(1) =")
+        ):
             self.result.md_par_lines.append(line.rstrip("\n"))
             return
 
@@ -1087,42 +1142,42 @@ class CP2KOutputParser:
 
         if line.startswith(" MD| CPU time per MD step [s]"):
             self._ensure_current_md_step()
-            vals = parse_two_floats_from_tail(line)
-            if self.current_md_step is not None and vals is not None:
-                self.current_md_step["cpu_time_inst_s"] = vals[0]
-                self.current_md_step["cpu_time_avg_s"] = vals[1]
+            tail_pair = parse_two_floats_from_tail(line)
+            if self.current_md_step is not None and tail_pair is not None:
+                self.current_md_step["cpu_time_inst_s"] = tail_pair[0]
+                self.current_md_step["cpu_time_avg_s"] = tail_pair[1]
             return
 
         if line.startswith(" MD| Energy drift per atom [K]"):
             self._ensure_current_md_step()
-            vals = parse_two_floats_from_tail(line)
-            if self.current_md_step is not None and vals is not None:
-                self.current_md_step["energy_drift_inst_k"] = vals[0]
-                self.current_md_step["energy_drift_avg_k"] = vals[1]
+            tail_pair = parse_two_floats_from_tail(line)
+            if self.current_md_step is not None and tail_pair is not None:
+                self.current_md_step["energy_drift_inst_k"] = tail_pair[0]
+                self.current_md_step["energy_drift_avg_k"] = tail_pair[1]
             return
 
         if line.startswith(" MD| Potential energy [hartree]"):
             self._ensure_current_md_step()
-            vals = parse_two_floats_from_tail(line)
-            if self.current_md_step is not None and vals is not None:
-                self.current_md_step["potential_energy_inst_hartree"] = vals[0]
-                self.current_md_step["potential_energy_avg_hartree"] = vals[1]
+            tail_pair = parse_two_floats_from_tail(line)
+            if self.current_md_step is not None and tail_pair is not None:
+                self.current_md_step["potential_energy_inst_hartree"] = tail_pair[0]
+                self.current_md_step["potential_energy_avg_hartree"] = tail_pair[1]
             return
 
         if line.startswith(" MD| Kinetic energy [hartree]"):
             self._ensure_current_md_step()
-            vals = parse_two_floats_from_tail(line)
-            if self.current_md_step is not None and vals is not None:
-                self.current_md_step["kinetic_energy_inst_hartree"] = vals[0]
-                self.current_md_step["kinetic_energy_avg_hartree"] = vals[1]
+            tail_pair = parse_two_floats_from_tail(line)
+            if self.current_md_step is not None and tail_pair is not None:
+                self.current_md_step["kinetic_energy_inst_hartree"] = tail_pair[0]
+                self.current_md_step["kinetic_energy_avg_hartree"] = tail_pair[1]
             return
 
         if line.startswith(" MD| Temperature [K]"):
             self._ensure_current_md_step()
-            vals = parse_two_floats_from_tail(line)
-            if self.current_md_step is not None and vals is not None:
-                self.current_md_step["temperature_inst_k"] = vals[0]
-                self.current_md_step["temperature_avg_k"] = vals[1]
+            tail_pair = parse_two_floats_from_tail(line)
+            if self.current_md_step is not None and tail_pair is not None:
+                self.current_md_step["temperature_inst_k"] = tail_pair[0]
+                self.current_md_step["temperature_avg_k"] = tail_pair[1]
             return
 
         if line.startswith(" MD| Estimated peak process memory after this step [MiB]"):
@@ -1200,7 +1255,12 @@ class CP2KOutputParser:
             self.in_timing = True
             return
 
-        if "PROGRAM ENDED AT" in line or "PROGRAM RAN ON" in line or "PROGRAM RAN BY" in line or "PROGRAM STOPPED IN" in line:
+        if (
+            "PROGRAM ENDED AT" in line
+            or "PROGRAM RAN ON" in line
+            or "PROGRAM RAN BY" in line
+            or "PROGRAM STOPPED IN" in line
+        ):
             self.result.run_info_lines.append(line.rstrip("\n"))
             return
 
@@ -1301,8 +1361,9 @@ class CP2KOutputParser:
             return
         if not parts[0].isdigit():
             return
+        atom_id = int(parts[0])
         row = {
-            "atom": int(parts[0]),
+            "atom": atom_id,
             "kind": int(parts[1]),
             "element": parts[2],
             "atomic_number": int(parts[3]),
@@ -1313,7 +1374,7 @@ class CP2KOutputParser:
             "mass_amu": parse_float(parts[8]),
         }
         self.result.coordinates.append(row)
-        self.coords_by_atom[row["atom"]] = row
+        self.coords_by_atom[atom_id] = row
 
     def _consume_scf_line(self, line: str) -> None:
         if self.current_scf_block is None:
@@ -1333,9 +1394,10 @@ class CP2KOutputParser:
         time_value, convergence_value, total_energy_value, change_value = tail_values
 
         step = int(parts[0])
+        block_index = int(self.current_scf_block["scf_block_index"])
         method = " ".join(parts[1:-4])
         row = {
-            "scf_block_index": int(self.current_scf_block["scf_block_index"]),
+            "scf_block_index": block_index,
             "md_step": None,
             "md_time_fs": None,
             "iteration": step,
@@ -1347,7 +1409,7 @@ class CP2KOutputParser:
         }
         self.current_scf_block["_steps"].append(row)
         self._increment_row_count("scf_iterations.csv")
-        self._queue_stream_row_for_block("scf_iterations.csv", int(row["scf_block_index"]), row)
+        self._queue_stream_row_for_block("scf_iterations.csv", block_index, row)
 
     def _consume_mulliken_line(self, line: str) -> None:
         stripped = line.strip()
@@ -1384,7 +1446,9 @@ class CP2KOutputParser:
             alpha, beta, net_charge, spin_moment = numeric
             row["population_alpha"] = alpha
             row["population_beta"] = beta
-            row["population_total"] = (alpha if alpha is not None else 0.0) + (beta if beta is not None else 0.0)
+            row["population_total"] = (alpha if alpha is not None else 0.0) + (
+                beta if beta is not None else 0.0
+            )
             row["net_charge"] = net_charge
             row["spin_moment"] = spin_moment
         elif len(rest) >= 2:
@@ -1439,7 +1503,9 @@ class CP2KOutputParser:
             row["ref_charge"] = ref_charge
             row["population_alpha"] = pop_alpha
             row["population_beta"] = pop_beta
-            row["population_total"] = (pop_alpha if pop_alpha is not None else 0.0) + (pop_beta if pop_beta is not None else 0.0)
+            row["population_total"] = (pop_alpha if pop_alpha is not None else 0.0) + (
+                pop_beta if pop_beta is not None else 0.0
+            )
             row["spin_moment"] = spin_moment
             row["net_charge"] = net_charge
         elif len(rest) >= 3:
@@ -1483,7 +1549,11 @@ class CP2KOutputParser:
         stripped = line.strip()
         if not stripped:
             return
-        if stripped.startswith("SUBROUTINE") or stripped.startswith("MAXIMUM") or set(stripped) == {"-"}:
+        if (
+            stripped.startswith("SUBROUTINE")
+            or stripped.startswith("MAXIMUM")
+            or set(stripped) == {"-"}
+        ):
             return
         parts = stripped.split()
         if len(parts) < 7:
@@ -1568,17 +1638,52 @@ def parse_cell_line(line: str) -> dict[str, Any] | None:
         }
 
     if "alpha [degree]" in body:
-        return {"section": section, "property": "alpha_deg", "value_1": parse_last_float(line), "value_2": None, "value_3": None, "extra": None}
+        return {
+            "section": section,
+            "property": "alpha_deg",
+            "value_1": parse_last_float(line),
+            "value_2": None,
+            "value_3": None,
+            "extra": None,
+        }
     if "beta  [degree]" in body or "beta [degree]" in body:
-        return {"section": section, "property": "beta_deg", "value_1": parse_last_float(line), "value_2": None, "value_3": None, "extra": None}
+        return {
+            "section": section,
+            "property": "beta_deg",
+            "value_1": parse_last_float(line),
+            "value_2": None,
+            "value_3": None,
+            "extra": None,
+        }
     if "gamma [degree]" in body:
-        return {"section": section, "property": "gamma_deg", "value_1": parse_last_float(line), "value_2": None, "value_3": None, "extra": None}
+        return {
+            "section": section,
+            "property": "gamma_deg",
+            "value_1": parse_last_float(line),
+            "value_2": None,
+            "value_3": None,
+            "extra": None,
+        }
     if "Numerically orthorhombic" in body:
         value = body.split(":")[-1].strip()
-        return {"section": section, "property": "numerically_orthorhombic", "value_1": None, "value_2": None, "value_3": None, "extra": value}
+        return {
+            "section": section,
+            "property": "numerically_orthorhombic",
+            "value_1": None,
+            "value_2": None,
+            "value_3": None,
+            "extra": value,
+        }
     if "Periodicity" in body:
         value = body.split()[-1]
-        return {"section": section, "property": "periodicity", "value_1": None, "value_2": None, "value_3": None, "extra": value}
+        return {
+            "section": section,
+            "property": "periodicity",
+            "value_1": None,
+            "value_2": None,
+            "value_3": None,
+            "extra": value,
+        }
     return None
 
 
@@ -1636,7 +1741,11 @@ def normalize_text_key(text: str) -> str:
 
 def build_summary(result: ParseResult) -> str:
     last_block = result.scf_blocks[-1] if result.scf_blocks else None
-    last_md = result.last_md_step if result.last_md_step is not None else (result.md_steps[-1] if result.md_steps else None)
+    last_md = (
+        result.last_md_step
+        if result.last_md_step is not None
+        else (result.md_steps[-1] if result.md_steps else None)
+    )
     scf_iteration_count = parsed_count(result, "scf_iterations.csv", result.scf_iterations)
     mulliken_count = parsed_count(result, "mulliken.csv", result.mulliken_rows)
     hirshfeld_count = parsed_count(result, "hirshfeld.csv", result.hirshfeld_rows)
@@ -1898,7 +2007,9 @@ def write_outputs(result: ParseResult, options: ParserOptions) -> dict[str, File
         write_text(path, "\n".join(setup_overview_parts).rstrip() + "\n")
         mark_generated("setup_overview.txt", path)
     else:
-        mark_not_generated("setup_overview.txt", "No restart/system summary/SCF settings were detected.")
+        mark_not_generated(
+            "setup_overview.txt", "No restart/system summary/SCF settings were detected."
+        )
 
     if result.cell_rows:
         path = output_dir / "cell.csv"
@@ -1916,7 +2027,15 @@ def write_outputs(result: ParseResult, options: ParserOptions) -> dict[str, File
         write_csv(
             path,
             result.atomic_kinds,
-            ["kind_index", "element", "number_of_atoms", "basis_set", "potential", "covalent_radius_ang", "vdw_radius_ang"],
+            [
+                "kind_index",
+                "element",
+                "number_of_atoms",
+                "basis_set",
+                "potential",
+                "covalent_radius_ang",
+                "vdw_radius_ang",
+            ],
         )
         mark_generated("atomic_kinds.csv", path)
     else:
@@ -1927,7 +2046,17 @@ def write_outputs(result: ParseResult, options: ParserOptions) -> dict[str, File
         write_csv(
             csv_path,
             result.coordinates,
-            ["atom", "kind", "element", "atomic_number", "x_ang", "y_ang", "z_ang", "z_eff", "mass_amu"],
+            [
+                "atom",
+                "kind",
+                "element",
+                "atomic_number",
+                "x_ang",
+                "y_ang",
+                "z_ang",
+                "z_eff",
+                "mass_amu",
+            ],
         )
         mark_generated("coordinates.csv", csv_path)
     elif options.drop_coordinates:
@@ -2049,7 +2178,10 @@ def write_outputs(result: ParseResult, options: ParserOptions) -> dict[str, File
                         ("scf_block_index", row.get("scf_block_index")),
                         ("md_step", row.get("md_step")),
                         ("md_time_fs", row.get("md_time_fs")),
-                        ("electronic_density_regular_grid", row.get("electronic_density_regular_grid")),
+                        (
+                            "electronic_density_regular_grid",
+                            row.get("electronic_density_regular_grid"),
+                        ),
                         ("core_density_regular_grid", row.get("core_density_regular_grid")),
                         ("charge_density_rspace", row.get("charge_density_rspace")),
                         ("charge_density_gspace", row.get("charge_density_gspace")),
@@ -2065,7 +2197,10 @@ def write_outputs(result: ParseResult, options: ParserOptions) -> dict[str, File
                         ("total_energy_hartree", row.get("total_energy_hartree")),
                         ("energy_force_eval_hartree", row.get("energy_force_eval_hartree")),
                         ("integrated_spin_density", row.get("integrated_spin_density")),
-                        ("integrated_absolute_spin_density", row.get("integrated_absolute_spin_density")),
+                        (
+                            "integrated_absolute_spin_density",
+                            row.get("integrated_absolute_spin_density"),
+                        ),
                         ("ideal_s2", row.get("ideal_s2")),
                         ("single_determinant_s2", row.get("single_determinant_s2")),
                     ]
@@ -2167,7 +2302,15 @@ def write_outputs(result: ParseResult, options: ParserOptions) -> dict[str, File
         write_csv(
             path,
             result.timing_rows,
-            ["subroutine", "calls", "asd", "self_time_max", "self_time_avg", "total_time_max", "total_time_avg"],
+            [
+                "subroutine",
+                "calls",
+                "asd",
+                "self_time_max",
+                "self_time_avg",
+                "total_time_max",
+                "total_time_avg",
+            ],
         )
         mark_generated("timing.csv", path)
     elif options.drop_timing:
@@ -2197,34 +2340,49 @@ def write_outputs(result: ParseResult, options: ParserOptions) -> dict[str, File
             ("original_output_path", result.original_output_path),
             ("backup_path", result.backup_path),
             ("output_dir", result.output_dir),
-            ("counts", OrderedDict(
-                [
-                    ("atomic_kinds", len(result.atomic_kinds)),
-                    ("coordinates", len(result.coordinates)),
-                    ("thermostat_rows", len(result.thermostat_rows)),
-                    ("scf_blocks", len(result.scf_blocks)),
-                    ("scf_iterations", parsed_count(result, "scf_iterations.csv", result.scf_iterations)),
-                    ("mulliken_rows", parsed_count(result, "mulliken.csv", result.mulliken_rows)),
-                    ("hirshfeld_rows", parsed_count(result, "hirshfeld.csv", result.hirshfeld_rows)),
-                    ("forces_rows", parsed_count(result, "forces.csv", result.forces_rows)),
-                    ("md_steps", parsed_count(result, "md_steps.csv", result.md_steps)),
-                    ("timing_rows", len(result.timing_rows)),
-                    ("warnings_total", sum(result.warnings_counter.values())),
-                ]
-            )),
-            ("files", [
+            (
+                "counts",
                 OrderedDict(
                     [
-                        ("name", spec.name),
-                        ("format", spec.format),
-                        ("description", spec.description),
-                        ("generated", spec.generated),
-                        ("reason", spec.reason),
-                        ("size_bytes", spec.size_bytes),
+                        ("atomic_kinds", len(result.atomic_kinds)),
+                        ("coordinates", len(result.coordinates)),
+                        ("thermostat_rows", len(result.thermostat_rows)),
+                        ("scf_blocks", len(result.scf_blocks)),
+                        (
+                            "scf_iterations",
+                            parsed_count(result, "scf_iterations.csv", result.scf_iterations),
+                        ),
+                        (
+                            "mulliken_rows",
+                            parsed_count(result, "mulliken.csv", result.mulliken_rows),
+                        ),
+                        (
+                            "hirshfeld_rows",
+                            parsed_count(result, "hirshfeld.csv", result.hirshfeld_rows),
+                        ),
+                        ("forces_rows", parsed_count(result, "forces.csv", result.forces_rows)),
+                        ("md_steps", parsed_count(result, "md_steps.csv", result.md_steps)),
+                        ("timing_rows", len(result.timing_rows)),
+                        ("warnings_total", sum(result.warnings_counter.values())),
                     ]
-                )
-                for spec in specs.values()
-            ]),
+                ),
+            ),
+            (
+                "files",
+                [
+                    OrderedDict(
+                        [
+                            ("name", spec.name),
+                            ("format", spec.format),
+                            ("description", spec.description),
+                            ("generated", spec.generated),
+                            ("reason", spec.reason),
+                            ("size_bytes", spec.size_bytes),
+                        ]
+                    )
+                    for spec in specs.values()
+                ],
+            ),
         ]
     )
     manifest_path = output_dir / "manifest.json"
@@ -2305,7 +2463,9 @@ def build_parser_options_from_drop_sections(
     return ParserOptions(**kwargs)
 
 
-def write_backup_metadata(meta_path: Path, original_path: Path, backup_path: Path, output_dir: Path) -> None:
+def write_backup_metadata(
+    meta_path: Path, original_path: Path, backup_path: Path, output_dir: Path
+) -> None:
     meta = OrderedDict(
         [
             ("created_at", iso_now()),

@@ -235,7 +235,9 @@ def test_compute_potential_persists_rows_before_post_compute_crash(tmp_path, mon
     def _raise_after_compute(_records):
         raise RuntimeError("synthetic post-compute crash")
 
-    monkeypatch.setattr("linak.analysis.potential.summarize_potential_statistics", _raise_after_compute)
+    monkeypatch.setattr(
+        "linak.analysis.potential.summarize_potential_statistics", _raise_after_compute
+    )
 
     rc = main(
         [
@@ -295,4 +297,3 @@ def test_compute_potential_records_calls_callbacks_in_source_order(monkeypatch):
     assert [failure.source for failure in failures] == ["bad.cube"]
     assert seen_failures == ["bad.cube"]
     assert isinstance(failures[0], PotentialComputationFailure)
-

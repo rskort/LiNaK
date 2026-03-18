@@ -11,12 +11,14 @@ from typing import Any
 import numpy as np
 from ase import Atoms
 from ase.data import atomic_masses, atomic_numbers
+from ase.geometry import find_mic
 from ase.neighborlist import neighbor_list
 
 from ..storage.hdf5_utils import (
     is_hdf5_path,
     read_linak_hdf5_profiles,
     write_linak_hdf5,
+    write_linak_hdf5_profile_collection,
 )
 from .binning import (
     reconstruct_uniform_bin_edges_from_centers,
@@ -41,7 +43,8 @@ from ..progress import ProgressBar
 from ..utils import axis_to_index, ensure_positive
 
 LOGGER = logging.getLogger(__name__)
-H2O_VALIDATION_STRIDE = 250
+H2O_VALIDATION_STRIDE = 100
+H2O_OH_CUTOFF_A = 1.25
 AMU_TO_G = 1.66053906660e-24
 ANGSTROM3_TO_CM3 = 1.0e-24
 ANGSTROM3_TO_NM3 = 1.0e-3
@@ -87,6 +90,79 @@ class _SurfaceEstimate:
     per_frame: np.ndarray
 
 
+def _surface_reference_atoms_label(reference_elements: list[str] | tuple[str, ...]) -> str:
+    labels = [str(element).strip() for element in reference_elements if str(element).strip()]
+    if not labels:
+        return "reference atoms"
+    return f"{', '.join(labels)} reference atoms"
+
+
+def _extract_surface_method_argument(method: str, *, key: str) -> str | None:
+    marker = f"{key}="
+    start = method.find(marker)
+    if start < 0:
+        return None
+    start += len(marker)
+    end = method.find(")", start)
+    if end < 0:
+        end = len(method)
+    token = method[start:end].strip()
+    return token or None
+
+
+def _describe_surface_estimator(
+    method: str,
+    *,
+    axis: str,
+    reference_elements: list[str] | tuple[str, ...],
+) -> str:
+    axis_label = axis.upper()
+    reference_label = _surface_reference_atoms_label(reference_elements)
+    if method.startswith("layered_top_layer_mean"):
+        median_layers = _extract_surface_method_argument(method, key="median_layers")
+        detail = ""
+        if median_layers is not None:
+            detail = f" (median layer count {median_layers})"
+        tracked_fill = _extract_surface_method_argument(method, key="n")
+        tracked_detail = ""
+        if "+tracked_top_layer_fill" in method and tracked_fill is not None:
+            tracked_detail = f"; tracked top-layer mean reused for {tracked_fill} missing frame(s)"
+        return (
+            f"layered top-layer mean on {axis_label} using {reference_label}"
+            f"{detail}{tracked_detail}"
+        )
+    if method.startswith("rough_low_mobility_mean"):
+        fraction = _extract_surface_method_argument(method, key="fraction")
+        detail = ""
+        if fraction is not None:
+            detail = f" (mobility fraction {fraction})"
+        return f"low-mobility mean on {axis_label} using {reference_label}{detail}"
+    if method.startswith("rough_axis_quantile:q"):
+        quantile = method.split(":q", 1)[1].split("+", 1)[0].strip()
+        return f"per-frame {axis_label} q{quantile} of {reference_label}"
+    return method
+
+
+def _log_framewise_surface_alignment(
+    *,
+    logger: logging.Logger,
+    axis: str,
+    surface_position: float,
+    surface_position_std: float | None,
+) -> None:
+    axis_label = axis.upper()
+    logger.info(
+        "Frame-wise %s surface alignment active: LiNaK uses each atom's %s coordinate "
+        "minus that frame's surface %s; summary of per-frame surface estimates: "
+        "median=%.6g Angstrom, std=%.4g Angstrom.",
+        axis_label,
+        axis_label,
+        axis_label,
+        surface_position,
+        0.0 if surface_position_std is None else surface_position_std,
+    )
+
+
 def _frame_has_usable_cell(frame: Atoms, axis_index: int) -> bool:
     """Check whether a frame has a finite non-zero cell for volumetric density."""
     cell = np.asarray(frame.cell.array, dtype=float)
@@ -120,9 +196,7 @@ def _axis_is_periodic(frame: Atoms, axis_index: int) -> bool:
     return pbc.size == 3 and bool(pbc[axis_index])
 
 
-def _unwrap_axis_positions(
-    axis_matrix: np.ndarray, axis_lengths: np.ndarray | None
-) -> np.ndarray:
+def _unwrap_axis_positions(axis_matrix: np.ndarray, axis_lengths: np.ndarray | None) -> np.ndarray:
     """Unwrap per-atom axis trajectories to avoid periodic boundary jumps."""
     if axis_matrix.ndim != 2 or axis_matrix.shape[0] <= 1 or axis_lengths is None:
         return axis_matrix
@@ -147,10 +221,7 @@ def _axis_lengths_if_periodic(frames: list[Atoms], axis_index: int) -> np.ndarra
     if not all(_axis_is_periodic(frame, axis_index) for frame in frames):
         return None
     return np.asarray(
-        [
-            np.linalg.norm(np.asarray(frame.cell.array, dtype=float)[axis_index])
-            for frame in frames
-        ],
+        [np.linalg.norm(np.asarray(frame.cell.array, dtype=float)[axis_index]) for frame in frames],
         dtype=float,
     )
 
@@ -291,7 +362,12 @@ def _resolve_surface_elements(
                     if value <= mobility_limit and count_by_symbol.get(symbol, 0) >= abundance_floor
                 ]
                 if not candidates:
-                    candidates = [min(mobility_by_symbol, key=mobility_by_symbol.get)]
+                    candidates = [
+                        min(
+                            candidates or mobility_by_symbol,
+                            key=lambda symbol: mobility_by_symbol[symbol],
+                        )
+                    ]
 
                 candidates = sorted(
                     candidates,
@@ -305,10 +381,12 @@ def _resolve_surface_elements(
                 return candidates[:4], "auto"
 
     abundant_symbols = [
-        symbol for symbol, count in count_by_symbol.items() if count >= max(2, int(np.ceil(0.08 * total)))
+        symbol
+        for symbol, count in count_by_symbol.items()
+        if count >= max(2, int(np.ceil(0.08 * total)))
     ]
     if not abundant_symbols:
-        abundant_symbols = [max(count_by_symbol, key=count_by_symbol.get)]
+        abundant_symbols = [max(count_by_symbol, key=lambda symbol: count_by_symbol[symbol])]
 
     max_mass = max(float(atomic_masses[atomic_numbers[symbol]]) for symbol in abundant_symbols)
     mass_floor = 0.25 * max_mass
@@ -397,6 +475,92 @@ def _extract_top_layer(
     return sorted_axis_values[top_start:], layer_count
 
 
+def _nearest_valid_layer_indices(
+    top_layer_indices_by_frame: list[np.ndarray | None],
+    *,
+    frame_index: int,
+) -> np.ndarray | None:
+    previous: np.ndarray | None = None
+    next_: np.ndarray | None = None
+
+    for candidate_index in range(frame_index - 1, -1, -1):
+        candidate = top_layer_indices_by_frame[candidate_index]
+        if candidate is not None and candidate.size > 0:
+            previous = candidate
+            break
+    for candidate_index in range(frame_index + 1, len(top_layer_indices_by_frame)):
+        candidate = top_layer_indices_by_frame[candidate_index]
+        if candidate is not None and candidate.size > 0:
+            next_ = candidate
+            break
+
+    if previous is None and next_ is None:
+        return None
+    if previous is None:
+        return np.asarray(next_, dtype=int)
+    if next_ is None:
+        return np.asarray(previous, dtype=int)
+    if np.array_equal(previous, next_):
+        return np.asarray(previous, dtype=int)
+
+    shared = np.intersect1d(previous, next_, assume_unique=False)
+    if shared.size >= 2:
+        return np.asarray(shared, dtype=int)
+    return np.asarray(previous, dtype=int)
+
+
+def _fill_missing_surface_per_frame_from_tracked_layer(
+    frames: list[Atoms],
+    *,
+    axis_index: int,
+    estimate: _SurfaceEstimate,
+    top_layer_indices_by_frame: list[np.ndarray | None],
+) -> tuple[_SurfaceEstimate, int]:
+    primary_per_frame = np.asarray(estimate.per_frame, dtype=float)
+    if (
+        primary_per_frame.shape[0] == 0
+        or np.all(np.isfinite(primary_per_frame))
+        or len(top_layer_indices_by_frame) != primary_per_frame.shape[0]
+        or not _frames_share_consistent_atom_layout(frames)
+    ):
+        return estimate, 0
+
+    merged = np.array(primary_per_frame, dtype=float, copy=True)
+    fill_count = 0
+    for frame_index, surface_value in enumerate(primary_per_frame):
+        if np.isfinite(surface_value):
+            continue
+        tracked_indices = _nearest_valid_layer_indices(
+            top_layer_indices_by_frame,
+            frame_index=frame_index,
+        )
+        if tracked_indices is None or tracked_indices.size == 0:
+            continue
+        frame_axis_values = np.asarray(frames[frame_index].positions[:, axis_index], dtype=float)
+        if tracked_indices.size > frame_axis_values.size:
+            continue
+        tracked_values = frame_axis_values[tracked_indices]
+        if tracked_values.size == 0 or not np.all(np.isfinite(tracked_values)):
+            continue
+        merged[frame_index] = float(np.mean(tracked_values))
+        fill_count += 1
+
+    if fill_count == 0:
+        return estimate, 0
+
+    valid_mask = np.isfinite(merged)
+    return (
+        _SurfaceEstimate(
+            position=float(np.median(merged[valid_mask])),
+            std=float(np.std(merged[valid_mask], ddof=0)),
+            method=f"{estimate.method}+tracked_top_layer_fill(n={fill_count})",
+            success_ratio=float(np.count_nonzero(valid_mask)) / merged.size,
+            per_frame=merged,
+        ),
+        fill_count,
+    )
+
+
 def _estimate_surface_position_layered(
     frames: list[Atoms],
     *,
@@ -407,23 +571,32 @@ def _estimate_surface_position_layered(
     """Estimate surface via mean z of the top detected layer in each frame."""
     surface_per_frame = np.full(len(frames), np.nan, dtype=float)
     layer_counts: list[int] = []
+    top_layer_indices_by_frame: list[np.ndarray | None] = [None] * len(frames)
 
     for frame_index, frame in enumerate(frames):
-        axis_values = _surface_axis_values_for_frame(
-            frame,
-            axis_index=axis_index,
-            surface_elements=surface_elements,
-            include_fixed_surface_atoms=include_fixed_surface_atoms,
-        )
+        symbols = np.asarray(frame.get_chemical_symbols(), dtype=object)
+        mask = np.isin(symbols, list(surface_elements))
+        if not include_fixed_surface_atoms:
+            mask &= ~_fixed_atom_mask(frame)
+        if not np.any(mask):
+            continue
+        candidate_indices = np.flatnonzero(mask)
+        axis_values = np.asarray(frame.positions[candidate_indices, axis_index], dtype=float)
         if axis_values.size < 4:
             continue
-        sorted_axis_values = np.sort(axis_values)
+        sorted_order = np.argsort(axis_values)
+        sorted_axis_values = axis_values[sorted_order]
         top_layer, layer_count = _extract_top_layer(sorted_axis_values)
         if top_layer is None or top_layer.size == 0:
             continue
         minimum_top_layer_size = max(2, int(np.ceil(0.03 * sorted_axis_values.size)))
         if top_layer.size < minimum_top_layer_size:
             continue
+        top_start = sorted_axis_values.size - top_layer.size
+        top_layer_indices_by_frame[frame_index] = np.asarray(
+            candidate_indices[sorted_order[top_start:]],
+            dtype=int,
+        )
         surface_per_frame[frame_index] = float(np.mean(top_layer))
         layer_counts.append(layer_count)
 
@@ -438,13 +611,20 @@ def _estimate_surface_position_layered(
     top_surface_array = surface_per_frame[valid_mask]
     median_layers = int(np.median(np.asarray(layer_counts, dtype=float)))
     method = f"layered_top_layer_mean(median_layers={median_layers})"
-    return _SurfaceEstimate(
+    estimate = _SurfaceEstimate(
         position=float(np.median(top_surface_array)),
         std=float(np.std(top_surface_array, ddof=0)),
         method=method,
         success_ratio=success_ratio,
         per_frame=surface_per_frame,
     )
+    filled_estimate, _fill_count = _fill_missing_surface_per_frame_from_tracked_layer(
+        frames,
+        axis_index=axis_index,
+        estimate=estimate,
+        top_layer_indices_by_frame=top_layer_indices_by_frame,
+    )
+    return filled_estimate
 
 
 def _estimate_surface_position_rough(
@@ -465,10 +645,7 @@ def _estimate_surface_position_rough(
             mask &= ~fixed_mask
         if np.any(mask):
             axis_matrix = np.stack(
-                [
-                    np.asarray(frame.positions[:, axis_index], dtype=float)[mask]
-                    for frame in frames
-                ],
+                [np.asarray(frame.positions[:, axis_index], dtype=float)[mask] for frame in frames],
                 axis=0,
             )
             masses = np.asarray(frames[0].get_masses(), dtype=float)[mask]
@@ -509,8 +686,7 @@ def _estimate_surface_position_rough(
                     position=float(np.median(surface_array)),
                     std=float(np.std(surface_array, ddof=0)),
                     method=(
-                        f"rough_low_mobility({int(SURFACE_MOBILITY_FRACTION * 100)}%)"
-                        "+frame_mean"
+                        f"rough_low_mobility({int(SURFACE_MOBILITY_FRACTION * 100)}%)+frame_mean"
                     ),
                     success_ratio=1.0,
                     per_frame=surface_array,
@@ -597,10 +773,12 @@ def _select_surface_estimate(
         return None, "unavailable:no_surface_elements"
     resolved_element_set = set(resolved_elements)
 
+    selection_label = "auto-detected" if element_source == "auto" else "user-selected"
     LOGGER.info(
-        "Surface reference elements (%s): %s",
-        element_source,
-        ", ".join(resolved_elements),
+        "Surface reference along %s: %s %s.",
+        axis.upper(),
+        selection_label,
+        _surface_reference_atoms_label(resolved_elements),
     )
 
     layered_estimate = _estimate_surface_position_layered(
@@ -649,6 +827,25 @@ def _select_surface_estimate(
         else:
             return None, "unavailable:auto_failed"
 
+    selected_method_description = _describe_surface_estimator(
+        selected_estimate.method,
+        axis=axis,
+        reference_elements=resolved_elements,
+    )
+    LOGGER.info(
+        "Surface estimator along %s: %s.",
+        axis.upper(),
+        selected_method_description,
+    )
+    tracked_fill_count = _extract_surface_method_argument(selected_estimate.method, key="n")
+    if "+tracked_top_layer_fill" in selected_estimate.method and tracked_fill_count is not None:
+        LOGGER.info(
+            "Surface estimator gaps along %s: filled %s missing frame values with tracked "
+            "top-layer mean from nearest valid layered frames.",
+            axis.upper(),
+            tracked_fill_count,
+        )
+
     missing_before = int(np.count_nonzero(~np.isfinite(selected_estimate.per_frame)))
     if missing_before > 0:
         quantile_per_frame = _surface_quantile_per_frame(
@@ -665,8 +862,15 @@ def _select_surface_estimate(
         missing_after = int(np.count_nonzero(~np.isfinite(selected_estimate.per_frame)))
         if missing_after < missing_before:
             LOGGER.info(
-                "Filled %d frame-wise surface gaps with axis-quantile fallback values.",
+                "Surface estimator gaps along %s: filled %d/%d missing frame values with "
+                "per-frame %s q%d of %s after %s left them undefined.",
+                axis.upper(),
                 missing_before - missing_after,
+                len(frames),
+                axis.upper(),
+                int(SURFACE_POSITION_QUANTILE * 100),
+                _surface_reference_atoms_label(resolved_elements),
+                selected_method_description,
             )
 
     return selected_estimate, selected_estimate.method
@@ -799,24 +1003,130 @@ def available_element_species(frames: list[Atoms]) -> list[str]:
 
 
 def _select_water_axis_values_with_masses(
-    frame: Atoms, axis_index: int, oh_cutoff: float = 1.25
+    frame: Atoms, axis_index: int, oh_cutoff: float = H2O_OH_CUTOFF_A
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Return O-axis positions and molecular masses for detected water molecules."""
-    oxygen_indices = _water_oxygen_indices(frame, oh_cutoff=oh_cutoff)
-    if oxygen_indices.size == 0:
+    """Return COM axis positions and molecular masses for detected water molecules."""
+    water_triplets = _water_molecule_triplets(frame, oh_cutoff=oh_cutoff)
+    if water_triplets.size == 0:
         return np.array([], dtype=float), np.array([], dtype=float)
-    axis_values = np.asarray(frame.positions[oxygen_indices, axis_index], dtype=float)
-    masses = np.full(oxygen_indices.size, H2O_MASS_G, dtype=float)
-    return axis_values, masses
+    return _select_water_triplet_axis_values_with_masses(frame, water_triplets, axis_index)
 
 
-def _water_oxygen_indices(frame: Atoms, oh_cutoff: float = 1.25) -> np.ndarray:
-    """Return oxygen indices classified as water oxygens (>=2 H neighbors within cutoff)."""
-    pair_i, _ = neighbor_list("ij", frame, {("O", "H"): oh_cutoff})
-    if pair_i.size == 0:
+def _water_molecule_triplets(frame: Atoms, oh_cutoff: float = H2O_OH_CUTOFF_A) -> np.ndarray:
+    """Return unique ``(O, H1, H2)`` triplets for genuine water molecules."""
+    oxygen_indices, hydrogen_indices = neighbor_list("ij", frame, {("O", "H"): oh_cutoff})
+    if oxygen_indices.size == 0:
+        return np.empty((0, 3), dtype=int)
+
+    oxygen_to_hydrogen: dict[int, set[int]] = {}
+    hydrogen_to_oxygen: dict[int, set[int]] = {}
+    for oxygen_index, hydrogen_index in zip(
+        oxygen_indices.astype(int, copy=False),
+        hydrogen_indices.astype(int, copy=False),
+    ):
+        oxygen_key = int(oxygen_index)
+        hydrogen_key = int(hydrogen_index)
+        oxygen_to_hydrogen.setdefault(oxygen_key, set()).add(hydrogen_key)
+        hydrogen_to_oxygen.setdefault(hydrogen_key, set()).add(oxygen_key)
+
+    water_triplets: list[tuple[int, int, int]] = []
+    for oxygen_index in sorted(oxygen_to_hydrogen):
+        bonded_hydrogen_indices = sorted(oxygen_to_hydrogen[oxygen_index])
+        if len(bonded_hydrogen_indices) != 2:
+            continue
+        if any(
+            len(hydrogen_to_oxygen[hydrogen_index]) != 1
+            for hydrogen_index in bonded_hydrogen_indices
+        ):
+            continue
+        water_triplets.append(
+            (oxygen_index, bonded_hydrogen_indices[0], bonded_hydrogen_indices[1])
+        )
+
+    if not water_triplets:
+        return np.empty((0, 3), dtype=int)
+    return np.asarray(water_triplets, dtype=int)
+
+
+def _select_water_triplet_axis_values_with_masses(
+    frame: Atoms, water_triplets: np.ndarray, axis_index: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return PBC-aware water COM axis positions and molecular masses."""
+    if water_triplets.size == 0:
+        return np.array([], dtype=float), np.array([], dtype=float)
+
+    oxygen_indices = water_triplets[:, 0]
+    hydrogen1_indices = water_triplets[:, 1]
+    hydrogen2_indices = water_triplets[:, 2]
+    positions = np.asarray(frame.positions, dtype=float)
+    oxygen_positions = positions[oxygen_indices]
+    hydrogen1_vectors, _ = find_mic(
+        positions[hydrogen1_indices] - oxygen_positions,
+        frame.cell,
+        pbc=frame.pbc,
+    )
+    hydrogen2_vectors, _ = find_mic(
+        positions[hydrogen2_indices] - oxygen_positions,
+        frame.cell,
+        pbc=frame.pbc,
+    )
+    hydrogen1_positions = oxygen_positions + hydrogen1_vectors
+    hydrogen2_positions = oxygen_positions + hydrogen2_vectors
+
+    atomic_masses_amu = np.asarray(frame.get_masses(), dtype=float)
+    oxygen_masses = atomic_masses_amu[oxygen_indices]
+    hydrogen1_masses = atomic_masses_amu[hydrogen1_indices]
+    hydrogen2_masses = atomic_masses_amu[hydrogen2_indices]
+    molecular_masses_amu = oxygen_masses + hydrogen1_masses + hydrogen2_masses
+    com_positions = (
+        oxygen_positions * oxygen_masses[:, None]
+        + hydrogen1_positions * hydrogen1_masses[:, None]
+        + hydrogen2_positions * hydrogen2_masses[:, None]
+    ) / molecular_masses_amu[:, None]
+    axis_values = np.asarray(com_positions[:, axis_index], dtype=float)
+    molecular_masses = np.asarray(molecular_masses_amu * AMU_TO_G, dtype=float)
+    return axis_values, molecular_masses
+
+
+def _select_water_axis_values_per_frame(
+    frames: list[Atoms], axis_index: int
+) -> tuple[list[np.ndarray], list[np.ndarray]]:
+    """Select water-molecule COM axis values with periodic cached-topology validation."""
+    selected_per_frame: list[np.ndarray] = []
+    selected_masses_per_frame: list[np.ndarray] = []
+    cached_water_triplets: np.ndarray | None = None
+
+    with ProgressBar(desc="Selecting H2O for density", total=len(frames), unit="frame") as progress:
+        for frame_index, frame in enumerate(frames):
+            if cached_water_triplets is None:
+                cached_water_triplets = _water_molecule_triplets(frame)
+            elif frame_index % H2O_VALIDATION_STRIDE == 0:
+                validated_water_triplets = _water_molecule_triplets(frame)
+                if not np.array_equal(validated_water_triplets, cached_water_triplets):
+                    LOGGER.warning(
+                        "Detected H2O topology change at frame %d; refreshing cached water triplets.",
+                        frame_index,
+                    )
+                    cached_water_triplets = validated_water_triplets
+
+            axis_values, masses = _select_water_triplet_axis_values_with_masses(
+                frame,
+                cached_water_triplets,
+                axis_index,
+            )
+            selected_per_frame.append(axis_values)
+            selected_masses_per_frame.append(masses)
+            progress.update()
+
+    return selected_per_frame, selected_masses_per_frame
+
+
+def _water_oxygen_indices(frame: Atoms, oh_cutoff: float = H2O_OH_CUTOFF_A) -> np.ndarray:
+    """Return oxygen indices classified as water oxygens (exactly two unique H neighbors)."""
+    water_triplets = _water_molecule_triplets(frame, oh_cutoff=oh_cutoff)
+    if water_triplets.size == 0:
         return np.array([], dtype=int)
-    hydrogen_neighbor_count = np.bincount(pair_i, minlength=len(frame))
-    return np.where(hydrogen_neighbor_count >= 2)[0].astype(int, copy=False)
+    return water_triplets[:, 0].astype(int, copy=False)
 
 
 def _compute_density_profile_from_selected(
@@ -932,7 +1242,9 @@ def _compute_density_profile_from_selected(
             number_density_accum = np.zeros_like(entities_accum)
             for frame_index, axis_values in enumerate(selected_per_frame):
                 per_frame_entities, _ = np.histogram(axis_values, bins=bin_edges)
-                number_density_accum += per_frame_entities.astype(float) / slice_volumes[frame_index]
+                number_density_accum += (
+                    per_frame_entities.astype(float) / slice_volumes[frame_index]
+                )
             number_density = number_density_accum / n_frames
         else:
             number_density = (entities_accum / n_frames) / slice_volumes[0]
@@ -1003,7 +1315,7 @@ def compute_density_profile(
     if normalized_binning not in {"observed", "cell"}:
         raise ValueError("binning must be one of: observed, cell")
     axis_index = axis_to_index(axis)
-    surface_estimate, surface_method = _select_surface_estimate(
+    surface_estimate, _surface_method = _select_surface_estimate(
         frames,
         axis,
         mode=surface_mode,
@@ -1020,63 +1332,37 @@ def compute_density_profile(
             axis.lower(),
         )
     else:
-        LOGGER.info(
-            "Estimated %s-surface at %.6g Angstrom (std=%.4g; method=%s).",
-            axis.lower(),
-            surface_position,
-            0.0 if surface_position_std is None else surface_position_std,
-            surface_method,
+        _log_framewise_surface_alignment(
+            logger=LOGGER,
+            axis=axis,
+            surface_position=surface_position,
+            surface_position_std=surface_position_std,
         )
     selection_mode, species_label = _normalize_species_query(species)
     count_label = "molecules" if selection_mode == "h2o" else "atoms"
     LOGGER.debug("Selection mode: %s (label=%s).", selection_mode, species_label)
 
-    selected_per_frame = []
-    selected_masses_per_frame = []
-    reference_water_oxygen_indices: np.ndarray | None = None
-    use_static_water_indices = selection_mode == "h2o"
-    with ProgressBar(
-        desc=f"Selecting {species_label} for density", total=len(frames), unit="frame"
-    ) as progress:
-        for frame_index, frame in enumerate(frames):
-            if selection_mode == "all":
-                axis_values = np.asarray(frame.positions[:, axis_index], dtype=float)
-                masses = np.asarray(frame.get_masses(), dtype=float) * AMU_TO_G
-            elif selection_mode == "h2o":
-                if use_static_water_indices:
-                    dynamic_indices = None
-                    if reference_water_oxygen_indices is None:
-                        dynamic_indices = _water_oxygen_indices(frame)
-                        reference_water_oxygen_indices = dynamic_indices
-                    elif frame_index % H2O_VALIDATION_STRIDE == 0:
-                        dynamic_indices = _water_oxygen_indices(frame)
-                        if not np.array_equal(dynamic_indices, reference_water_oxygen_indices):
-                            LOGGER.warning(
-                                "Detected H2O topology change at frame %d; "
-                                "switching from cached water indices to per-frame detection.",
-                                frame_index,
-                            )
-                            use_static_water_indices = False
-
-                    if use_static_water_indices:
-                        indices = reference_water_oxygen_indices
-                    else:
-                        indices = (
-                            dynamic_indices
-                            if dynamic_indices is not None
-                            else _water_oxygen_indices(frame)
-                        )
-                    axis_values = np.asarray(frame.positions[indices, axis_index], dtype=float)
-                    masses = np.full(indices.size, H2O_MASS_G, dtype=float)
+    selected_per_frame: list[np.ndarray] = []
+    selected_masses_per_frame: list[np.ndarray] = []
+    if selection_mode == "h2o":
+        selected_per_frame, selected_masses_per_frame = _select_water_axis_values_per_frame(
+            frames, axis_index
+        )
+    else:
+        with ProgressBar(
+            desc=f"Selecting {species_label} for density", total=len(frames), unit="frame"
+        ) as progress:
+            for frame in frames:
+                if selection_mode == "all":
+                    axis_values = np.asarray(frame.positions[:, axis_index], dtype=float)
+                    masses = np.asarray(frame.get_masses(), dtype=float) * AMU_TO_G
                 else:
-                    axis_values, masses = _select_water_axis_values_with_masses(frame, axis_index)
-            else:
-                axis_values, masses = _select_axis_values_with_masses(
-                    frame, species_label, axis_index
-                )
-            selected_per_frame.append(axis_values)
-            selected_masses_per_frame.append(masses)
-            progress.update()
+                    axis_values, masses = _select_axis_values_with_masses(
+                        frame, species_label, axis_index
+                    )
+                selected_per_frame.append(axis_values)
+                selected_masses_per_frame.append(masses)
+                progress.update()
     selected_for_binning, coordinate_mode = _shift_axis_values_by_surface_per_frame(
         selected_per_frame,
         None if surface_estimate is None else surface_estimate.per_frame,
@@ -1158,7 +1444,7 @@ def compute_density_profiles(
     if not frames:
         raise ValueError("At least one trajectory frame is required.")
 
-    surface_estimate, surface_method = _select_surface_estimate(
+    surface_estimate, _surface_method = _select_surface_estimate(
         frames,
         axis,
         mode=surface_mode,
@@ -1175,107 +1461,129 @@ def compute_density_profiles(
             axis.lower(),
         )
     else:
-        LOGGER.info(
-            "Estimated %s-surface at %.6g Angstrom (std=%.4g; method=%s).",
-            axis.lower(),
-            surface_position,
-            0.0 if surface_position_std is None else surface_position_std,
-            surface_method,
+        _log_framewise_surface_alignment(
+            logger=LOGGER,
+            axis=axis,
+            surface_position=surface_position,
+            surface_position_std=surface_position_std,
         )
-    if selection_mode == "all":
-        element_species = available_element_species(frames)
-        if not element_species:
-            raise ValueError("No elements found in trajectory.")
+    element_species = available_element_species(frames)
+    if not element_species:
+        raise ValueError("No elements found in trajectory.")
 
-        axis_index = axis_to_index(axis)
-        selected_by_species: dict[str, list[np.ndarray]] = {
-            element: [] for element in element_species
-        }
-        selected_masses_by_species: dict[str, list[np.ndarray]] = {
-            element: [] for element in element_species
-        }
-        empty = np.array([], dtype=float)
-        with ProgressBar(
-            desc="Selecting element data for density", total=len(frames), unit="frame"
-        ) as progress:
-            for frame in frames:
-                symbols = np.asarray(frame.get_chemical_symbols())
-                axis_values = np.asarray(frame.positions[:, axis_index], dtype=float)
-                masses = np.asarray(frame.get_masses(), dtype=float) * AMU_TO_G
+    axis_index = axis_to_index(axis)
+    selected_by_species: dict[str, list[np.ndarray]] = {element: [] for element in element_species}
+    selected_masses_by_species: dict[str, list[np.ndarray]] = {
+        element: [] for element in element_species
+    }
+    empty = np.array([], dtype=float)
+    with ProgressBar(
+        desc="Selecting element data for density", total=len(frames), unit="frame"
+    ) as progress:
+        for frame in frames:
+            symbols = np.asarray(frame.get_chemical_symbols())
+            axis_values = np.asarray(frame.positions[:, axis_index], dtype=float)
+            masses = np.asarray(frame.get_masses(), dtype=float) * AMU_TO_G
 
-                frame_selected: dict[str, np.ndarray] = {}
-                frame_selected_masses: dict[str, np.ndarray] = {}
-                for symbol in np.unique(symbols):
-                    mask = symbols == symbol
-                    frame_selected[str(symbol)] = axis_values[mask]
-                    frame_selected_masses[str(symbol)] = masses[mask]
+            frame_selected: dict[str, np.ndarray] = {}
+            frame_selected_masses: dict[str, np.ndarray] = {}
+            for symbol in np.unique(symbols):
+                mask = symbols == symbol
+                frame_selected[str(symbol)] = axis_values[mask]
+                frame_selected_masses[str(symbol)] = masses[mask]
 
-                for element in element_species:
-                    selected_by_species[element].append(frame_selected.get(element, empty))
-                    selected_masses_by_species[element].append(
-                        frame_selected_masses.get(element, empty)
-                    )
-                progress.update()
-
-        profiles: list[DensityProfile] = []
-        per_frame_surface = None if surface_estimate is None else surface_estimate.per_frame
-        coordinate_mode_global = _coordinate_mode_from_surface_per_frame(
-            surface_per_frame=per_frame_surface,
-            frame_count=len(frames),
-        )
-        histogram_bounds = None
-        if normalized_binning == "cell":
-            histogram_bounds = _cell_histogram_bounds(
-                frames=frames,
-                axis_index=axis_index,
-                coordinate_mode=coordinate_mode_global,
-                surface_per_frame=per_frame_surface,
-            )
-            if histogram_bounds is None:
-                LOGGER.warning(
-                    "Cell binning requested for element-resolved density along %s, but a usable "
-                    "cell was unavailable. Falling back to observed-data binning.",
-                    axis.lower(),
-                )
-        with ProgressBar(
-            desc="Computing element-resolved densities", total=len(element_species), unit="species"
-        ) as progress:
             for element in element_species:
-                selected_for_binning, coordinate_mode = _shift_axis_values_by_surface_per_frame(
-                    selected_by_species[element],
-                    per_frame_surface,
+                selected_by_species[element].append(frame_selected.get(element, empty))
+                selected_masses_by_species[element].append(
+                    frame_selected_masses.get(element, empty)
                 )
-                profile_surface_position = surface_position if coordinate_mode == "distance" else None
-                profile_surface_position_std = (
-                    surface_position_std if coordinate_mode == "distance" else None
+            progress.update()
+
+    profiles: list[DensityProfile] = []
+    per_frame_surface = None if surface_estimate is None else surface_estimate.per_frame
+    coordinate_mode_global = _coordinate_mode_from_surface_per_frame(
+        surface_per_frame=per_frame_surface,
+        frame_count=len(frames),
+    )
+    histogram_bounds = None
+    if normalized_binning == "cell":
+        histogram_bounds = _cell_histogram_bounds(
+            frames=frames,
+            axis_index=axis_index,
+            coordinate_mode=coordinate_mode_global,
+            surface_per_frame=per_frame_surface,
+        )
+        if histogram_bounds is None:
+            LOGGER.warning(
+                "Cell binning requested for element-resolved density along %s, but a usable "
+                "cell was unavailable. Falling back to observed-data binning.",
+                axis.lower(),
+            )
+    with ProgressBar(
+        desc="Computing element-resolved densities", total=len(element_species), unit="species"
+    ) as progress:
+        for element in element_species:
+            selected_for_binning, coordinate_mode = _shift_axis_values_by_surface_per_frame(
+                selected_by_species[element],
+                per_frame_surface,
+            )
+            profile_surface_position = surface_position if coordinate_mode == "distance" else None
+            profile_surface_position_std = (
+                surface_position_std if coordinate_mode == "distance" else None
+            )
+            profiles.append(
+                _compute_density_profile_from_selected(
+                    frames=frames,
+                    selected_per_frame=selected_for_binning,
+                    selected_masses_per_frame=selected_masses_by_species[element],
+                    axis=axis,
+                    axis_index=axis_index,
+                    species_label=element,
+                    count_label="atoms",
+                    bin_width=bin_width,
+                    coordinate_mode=coordinate_mode,
+                    surface_position=profile_surface_position,
+                    surface_position_std=profile_surface_position_std,
+                    histogram_bounds=histogram_bounds,
                 )
-                profiles.append(
-                    _compute_density_profile_from_selected(
-                        frames=frames,
-                        selected_per_frame=selected_for_binning,
-                        selected_masses_per_frame=selected_masses_by_species[element],
-                        axis=axis,
-                        axis_index=axis_index,
-                        species_label=element,
-                        count_label="atoms",
-                        bin_width=bin_width,
-                        coordinate_mode=coordinate_mode,
-                        surface_position=profile_surface_position,
-                        surface_position_std=profile_surface_position_std,
-                        histogram_bounds=histogram_bounds,
-                    )
-                )
-                progress.update()
-        return profiles
+            )
+            progress.update()
+    water_selected_per_frame: list[np.ndarray] = []
+    water_masses_per_frame: list[np.ndarray] = []
+    water_selected_per_frame, water_masses_per_frame = _select_water_axis_values_per_frame(
+        frames, axis_index
+    )
+
+    if any(values.size > 0 for values in water_selected_per_frame):
+        selected_for_binning, coordinate_mode = _shift_axis_values_by_surface_per_frame(
+            water_selected_per_frame,
+            per_frame_surface,
+        )
+        profile_surface_position = surface_position if coordinate_mode == "distance" else None
+        profile_surface_position_std = (
+            surface_position_std if coordinate_mode == "distance" else None
+        )
+        profiles.append(
+            _compute_density_profile_from_selected(
+                frames=frames,
+                selected_per_frame=selected_for_binning,
+                selected_masses_per_frame=water_masses_per_frame,
+                axis=axis,
+                axis_index=axis_index,
+                species_label="H2O",
+                count_label="molecules",
+                bin_width=bin_width,
+                coordinate_mode=coordinate_mode,
+                surface_position=profile_surface_position,
+                surface_position_std=profile_surface_position_std,
+                histogram_bounds=histogram_bounds,
+            )
+        )
+    return profiles
 
 
-def save_density_profile(
-    profile: DensityProfile,
-    output: str | Path,
-    *,
-    additional_metadata: Mapping[str, Any] | None = None,
-) -> Path:
-    """Save a density profile to LiNaK HDF5 and return the written path."""
+def _density_profile_hdf5_payload(profile: DensityProfile) -> dict[str, Any]:
+    """Return validated HDF5 datasets/metadata payload for one density profile."""
     bin_edges = np.asarray(profile.bin_edges, dtype=float)
     bin_centers = np.asarray(profile.bin_centers, dtype=float)
     if bin_edges.size != bin_centers.size + 1:
@@ -1322,20 +1630,62 @@ def save_density_profile(
         },
         units_map=units_map,
     )
+    datasets = {
+        "bin_centers_A": profile.bin_centers,
+        "density": canonical_density,
+        "number_density": canonical_number_density,
+    }
+    return {
+        "datasets": datasets,
+        "metadata": metadata,
+    }
+
+
+def save_density_profile(
+    profile: DensityProfile,
+    output: str | Path,
+    *,
+    additional_metadata: Mapping[str, Any] | None = None,
+) -> Path:
+    """Save a density profile to LiNaK HDF5 and return the written path."""
+    payload = _density_profile_hdf5_payload(profile)
+    metadata = dict(payload["metadata"])
     if additional_metadata:
         metadata.update(dict(additional_metadata))
 
     output_path = write_linak_hdf5(
         output,
         analysis="density",
-        datasets={
-            "bin_centers_A": profile.bin_centers,
-            "density": canonical_density,
-            "number_density": canonical_number_density,
-        },
+        datasets=payload["datasets"],
         metadata=metadata,
     )
     LOGGER.info("Saved density data to '%s'.", output_path)
+    return output_path
+
+
+def save_density_profiles(
+    profiles: list[DensityProfile],
+    output: str | Path,
+    *,
+    additional_metadata: Mapping[str, Any] | None = None,
+) -> Path:
+    """Save one or more density profiles to LiNaK HDF5 and return the written path."""
+    if not profiles:
+        raise ValueError("At least one density profile is required.")
+    if len(profiles) == 1:
+        return save_density_profile(
+            profiles[0],
+            output,
+            additional_metadata=additional_metadata,
+        )
+
+    output_path = write_linak_hdf5_profile_collection(
+        output,
+        analysis="density",
+        profiles=[_density_profile_hdf5_payload(profile) for profile in profiles],
+        metadata=dict(additional_metadata or {}),
+    )
+    LOGGER.info("Saved %d density profiles to '%s'.", len(profiles), output_path)
     return output_path
 
 
@@ -1400,7 +1750,9 @@ def load_density_profiles(
             if number_density_units_raw is None:
                 number_density_units_raw = resolved_units.get("number_density")
             number_density_units = (
-                str(number_density_units_raw).strip() if number_density_units_raw is not None else None
+                str(number_density_units_raw).strip()
+                if number_density_units_raw is not None
+                else None
             )
             if number_density_units == "":
                 number_density_units = None
@@ -1504,7 +1856,9 @@ def _density_x_data(
     if x_mode == "axis":
         if profile.coordinate_mode == "distance":
             if profile.surface_position is not None and np.isfinite(profile.surface_position):
-                return profile.bin_centers + float(profile.surface_position), f"{profile.axis.upper()} (A)"
+                return profile.bin_centers + float(
+                    profile.surface_position
+                ), f"{profile.axis.upper()} (A)"
             LOGGER.warning(
                 "Density profile '%s' stores distance-aligned bins with no absolute surface "
                 "offset; using distance coordinates.",
@@ -1611,7 +1965,7 @@ def _resolve_auto_axis_limits(
 
 
 def _merge_plot_limits(
-    requested: tuple[float, float] | list[float] | None,
+    requested: tuple[float | None, float | None] | list[float | None] | None,
     auto: list[float] | None,
 ) -> list[float | None] | None:
     if requested is None:
@@ -1908,7 +2262,9 @@ def plot_density_profiles(
         )
 
     first = profiles[0]
-    if x_mode == "distance" and any(not _profile_has_surface_reference(profile) for profile in profiles):
+    if x_mode == "distance" and any(
+        not _profile_has_surface_reference(profile) for profile in profiles
+    ):
         LOGGER.warning(
             "At least one profile has no surface reference; combined plot falls back to axis coordinates."
         )

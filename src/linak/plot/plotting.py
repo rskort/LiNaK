@@ -41,6 +41,19 @@ _BACKEND_CONFIGURED = False
 _CONFIGURED_BACKEND: str | None = None
 
 
+def _trapezoid_integral(y: np.ndarray, x: np.ndarray) -> float:
+    """Integrate with NumPy's trapezoid API across NumPy 1.x and 2.x."""
+    trapezoid = getattr(np, "trapezoid", None)
+    if trapezoid is not None:
+        return float(trapezoid(y, x))
+    trapz = getattr(np, "trapz", None)
+    if trapz is not None:
+        return float(trapz(y, x))
+    if y.size < 2 or x.size < 2:
+        return 0.0
+    return float(np.sum((x[1:] - x[:-1]) * (y[1:] + y[:-1]) * 0.5))
+
+
 def _import_pyplot() -> Any:
     # Import pyplot lazily to guarantee backend selection happens first.
     import matplotlib.pyplot as plt
@@ -58,6 +71,7 @@ class PlotStyle:
     title_font_size: int = 14
     label_font_size: int = 12
     tick_font_size: int = 10
+    legend_font_size: int = 10
     line_width: float = 2.0
     line_color: str = "#1f77b4"
     grid: bool = True
@@ -67,6 +81,45 @@ class PlotStyle:
 
 
 DEFAULT_PLOT_STYLE = PlotStyle()
+
+
+def default_series_colors(count: int) -> list[str]:
+    """Return deterministic default series colors for a given series count."""
+    if count <= 0:
+        return []
+
+    colors: list[str] = []
+    prop_cycle = matplotlib.rcParams.get("axes.prop_cycle")
+    if prop_cycle is not None:
+        by_key = prop_cycle.by_key()
+        raw_colors = by_key.get("color", [])
+        colors = [str(item).strip() for item in raw_colors if str(item).strip()]
+
+    if not colors:
+        colors = [DEFAULT_PLOT_STYLE.line_color]
+
+    return [colors[index % len(colors)] for index in range(count)]
+
+
+def resolve_series_colors(
+    line_colors: list[str] | None,
+    *,
+    series_count: int,
+) -> list[str] | None:
+    """Fill blank per-series colors with the indexed default palette."""
+    if line_colors is None:
+        return None
+    if len(line_colors) != series_count:
+        raise ValueError(
+            f"line_colors count must match the number of plotted series ({series_count})."
+        )
+
+    normalized = [str(color).strip() for color in line_colors]
+    if not any(normalized):
+        return None
+
+    defaults = default_series_colors(series_count)
+    return [color or defaults[index] for index, color in enumerate(normalized)]
 
 
 @dataclass(frozen=True)
@@ -91,6 +144,7 @@ def with_style_overrides(
     title_font_size: int | None = None,
     label_font_size: int | None = None,
     tick_font_size: int | None = None,
+    legend_font_size: int | None = None,
     line_width: float | None = None,
     line_color: str | None = None,
     grid: bool | None = None,
@@ -112,6 +166,8 @@ def with_style_overrides(
         updates["label_font_size"] = label_font_size
     if tick_font_size is not None:
         updates["tick_font_size"] = tick_font_size
+    if legend_font_size is not None:
+        updates["legend_font_size"] = legend_font_size
     if line_width is not None:
         updates["line_width"] = line_width
     if line_color is not None:
@@ -164,12 +220,8 @@ def resolve_single_series_options(
         line_width_override=series_line_widths[0] if series_line_widths else None,
         line_marker=series_markers[0] if series_markers else None,
         normalization_mode=series_normalization_modes[0] if series_normalization_modes else None,
-        normalization_value=series_normalization_values[0]
-        if series_normalization_values
-        else None,
-        normalization_x_ref=series_normalization_x_refs[0]
-        if series_normalization_x_refs
-        else None,
+        normalization_value=series_normalization_values[0] if series_normalization_values else None,
+        normalization_x_ref=series_normalization_x_refs[0] if series_normalization_x_refs else None,
     )
 
 
@@ -346,7 +398,9 @@ def _capture_plot_state(
             "legend_title": legend_title,
             "legend_loc": legend_loc,
             "line_colors": list(line_colors),
-            "markers": any(marker not in {"", "None", "none", " ", "NoneType"} for marker in line_markers),
+            "markers": any(
+                marker not in {"", "None", "none", " ", "NoneType"} for marker in line_markers
+            ),
             "series_labels": list(line_labels),
             "figsize": [float(style.figure_size[0]), float(style.figure_size[1])],
             "dpi": int(style.dpi),
@@ -354,6 +408,7 @@ def _capture_plot_state(
             "title_font_size": int(style.title_font_size),
             "label_font_size": int(style.label_font_size),
             "tick_font_size": int(style.tick_font_size),
+            "legend_font_size": int(style.legend_font_size),
             "line_width": float(style.line_width),
             "grid": bool(style.grid),
             "grid_linestyle": style.grid_linestyle,
@@ -427,9 +482,7 @@ def _rebin_xy_series(
 def _normalize_mode(value: str | None) -> str:
     token = "none" if value is None else str(value).strip().lower()
     if token not in {"none", "max", "area", "value_at_x", "factor"}:
-        raise ValueError(
-            "Normalization mode must be one of: none, max, area, value_at_x, factor."
-        )
+        raise ValueError("Normalization mode must be one of: none, max, area, value_at_x, factor.")
     return token
 
 
@@ -443,10 +496,6 @@ def _normalize_series_values(
     label: str,
 ) -> tuple[np.ndarray, bool]:
     if mode == "none":
-        if target_value is not None or reference_x is not None:
-            raise ValueError(
-                f"Series '{label}' normalization mode is 'none'; remove target/reference values."
-            )
         return y, False
 
     if target_value is None:
@@ -456,7 +505,7 @@ def _normalize_series_values(
     if mode == "max":
         source_value = float(np.max(y))
     elif mode == "area":
-        source_value = float(np.trapz(y, x))
+        source_value = _trapezoid_integral(y, x)
     elif mode == "value_at_x":
         if reference_x is None:
             raise ValueError(
@@ -505,10 +554,7 @@ def _prepare_plot_series_data(
             "series_normalization_modes count must match the number of plotted series "
             f"({series_count})."
         )
-    if (
-        series_normalization_values is not None
-        and len(series_normalization_values) != series_count
-    ):
+    if series_normalization_values is not None and len(series_normalization_values) != series_count:
         raise ValueError(
             "series_normalization_values count must match the number of plotted series "
             f"({series_count})."
@@ -538,19 +584,13 @@ def _prepare_plot_series_data(
             )
 
         mode = _normalize_mode(
-            series_normalization_modes[index]
-            if series_normalization_modes is not None
-            else None
+            series_normalization_modes[index] if series_normalization_modes is not None else None
         )
         target_value = (
-            series_normalization_values[index]
-            if series_normalization_values is not None
-            else None
+            series_normalization_values[index] if series_normalization_values is not None else None
         )
         reference_x = (
-            series_normalization_x_refs[index]
-            if series_normalization_x_refs is not None
-            else None
+            series_normalization_x_refs[index] if series_normalization_x_refs is not None else None
         )
         y_data, applied = _normalize_series_values(
             x_data,
@@ -648,25 +688,31 @@ def plot_line_series(
         line_artist = None
         if line_visible:
             resolved_line_kwargs: dict[str, Any] = {
-                "lw": style.line_width if line_width_override is None else float(line_width_override),
+                "lw": style.line_width
+                if line_width_override is None
+                else float(line_width_override),
                 "color": color,
                 "label": line_label,
                 "marker": marker,
             }
             if line_kwargs is not None:
                 resolved_line_kwargs.update(dict(line_kwargs))
+            if line_label is not None:
+                resolved_line_kwargs["label"] = line_label
             (line_artist,) = ax.plot(
                 x_plot,
                 y_plot,
                 **resolved_line_kwargs,
             )
 
-        should_show_legend = bool(line_artist is not None and line_label) if legend is None else bool(
-            legend and line_artist is not None and line_label
+        should_show_legend = (
+            bool(line_artist is not None and line_label)
+            if legend is None
+            else bool(legend and line_artist is not None and line_label)
         )
         if should_show_legend:
             resolved_legend_kwargs: dict[str, Any] = {
-                "fontsize": style.tick_font_size,
+                "fontsize": style.legend_font_size,
                 "title": legend_title,
                 "loc": legend_loc,
             }
@@ -894,30 +940,22 @@ def plot_multi_line_series(
         rendered_colors: list[str] = []
         rendered_markers: list[str] = []
         rendered_labels: list[str] = []
-        if line_colors is not None and len(line_colors) != len(labels):
-            raise ValueError(
-                "line_colors count must match the number of plotted series "
-                f"({len(labels)})."
-            )
+        resolved_line_colors = resolve_series_colors(line_colors, series_count=len(labels))
         if series_enabled is not None and len(series_enabled) != len(labels):
             raise ValueError(
-                "series_enabled count must match the number of plotted series "
-                f"({len(labels)})."
+                f"series_enabled count must match the number of plotted series ({len(labels)})."
             )
         if series_line_widths is not None and len(series_line_widths) != len(labels):
             raise ValueError(
-                "series_line_widths count must match the number of plotted series "
-                f"({len(labels)})."
+                f"series_line_widths count must match the number of plotted series ({len(labels)})."
             )
         if series_markers is not None and len(series_markers) != len(labels):
             raise ValueError(
-                "series_markers count must match the number of plotted series "
-                f"({len(labels)})."
+                f"series_markers count must match the number of plotted series ({len(labels)})."
             )
         if series_line_kwargs is not None and len(series_line_kwargs) != len(labels):
             raise ValueError(
-                "series_line_kwargs count must match the number of plotted series "
-                f"({len(labels)})."
+                f"series_line_kwargs count must match the number of plotted series ({len(labels)})."
             )
         for index, (x_values, y_values, label) in enumerate(
             zip(transformed_x_series, transformed_y_series, labels)
@@ -925,29 +963,34 @@ def plot_multi_line_series(
             if series_enabled is not None and not bool(series_enabled[index]):
                 continue
             kwargs: dict[str, Any] = {"lw": style.line_width, "label": label}
-            if series_line_widths is not None and series_line_widths[index] is not None:
-                kwargs["lw"] = float(series_line_widths[index])
+            line_width_override = None if series_line_widths is None else series_line_widths[index]
+            if line_width_override is not None:
+                kwargs["lw"] = float(line_width_override)
             marker_value = "o" if markers else ""
             if series_markers is not None and series_markers[index] is not None:
                 marker_value = str(series_markers[index])
             kwargs["marker"] = marker_value
-            if line_colors is not None:
-                color_token = str(line_colors[index]).strip()
+            if resolved_line_colors is not None:
+                color_token = str(resolved_line_colors[index]).strip()
                 if color_token:
                     kwargs["color"] = color_token
             if line_kwargs is not None:
                 kwargs.update(dict(line_kwargs))
-            if series_line_kwargs is not None and series_line_kwargs[index] is not None:
-                kwargs.update(dict(series_line_kwargs[index]))
+            line_kwargs_override = None if series_line_kwargs is None else series_line_kwargs[index]
+            if line_kwargs_override is not None:
+                kwargs.update(dict(line_kwargs_override))
+            kwargs["label"] = label
             (artist,) = ax.plot(x_values, y_values, **kwargs)
             rendered_colors.append(str(artist.get_color()))
             rendered_markers.append(str(artist.get_marker()))
             rendered_labels.append(str(artist.get_label()))
 
-        should_show_legend = len(rendered_labels) > 1 if legend is None else bool(legend and rendered_labels)
+        should_show_legend = (
+            len(rendered_labels) > 1 if legend is None else bool(legend and rendered_labels)
+        )
         if should_show_legend:
             resolved_legend_kwargs: dict[str, Any] = {
-                "fontsize": style.tick_font_size,
+                "fontsize": style.legend_font_size,
                 "title": legend_title,
                 "loc": legend_loc,
             }

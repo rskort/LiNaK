@@ -128,14 +128,10 @@ def _resolve_container(handle: Any, *, group: str | None) -> tuple[Any, str]:
         return handle, "/"
 
     visible_groups = [
-        (name, node)
-        for name, node in _iter_first_level_groups(handle)
-        if not name.startswith("_")
+        (name, node) for name, node in _iter_first_level_groups(handle) if not name.startswith("_")
     ]
     hidden_groups = [
-        (name, node)
-        for name, node in _iter_first_level_groups(handle)
-        if name.startswith("_")
+        (name, node) for name, node in _iter_first_level_groups(handle) if name.startswith("_")
     ]
 
     for name, node in [*visible_groups, *hidden_groups]:
@@ -288,10 +284,7 @@ def read_hdf5_frame(
             container, container_label = _resolve_container(handle, group=group)
             raw_items = _iter_first_level_datasets(container)
 
-            attrs = {
-                str(key): _decode_attr_value(value)
-                for key, value in handle.attrs.items()
-            }
+            attrs = {str(key): _decode_attr_value(value) for key, value in handle.attrs.items()}
             metadata = _metadata_from_attrs(attrs)
 
             frame: pd.DataFrame
@@ -353,8 +346,12 @@ def read_hdf5_frame(
                 skipped_datasets=tuple(skipped),
                 linak_format=str(attrs.get("linak_format", "")),
                 linak_format_version=_safe_int(attrs.get("linak_format_version")),
-                created_utc=str(attrs.get("created_utc")) if attrs.get("created_utc") is not None else None,
-                linak_version=str(attrs.get("linak_version")) if attrs.get("linak_version") is not None else None,
+                created_utc=str(attrs.get("created_utc"))
+                if attrs.get("created_utc") is not None
+                else None,
+                linak_version=str(attrs.get("linak_version"))
+                if attrs.get("linak_version") is not None
+                else None,
                 metadata=metadata,
             )
     except OSError as exc:
@@ -424,4 +421,3 @@ def write_hdf5_frame(
             records.create_dataset(str(column), data=values, **kwargs)
 
     return output_path
-

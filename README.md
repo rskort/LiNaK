@@ -2,9 +2,11 @@
 
 LiNaK is a lightweight Python toolkit for molecular dynamics trajectory analysis. The package is designed for electrochemical systems (e.g. a Pt(111)-surface with an electrolyte of water and cations), but many features are general-purpose and applicable to other MD contexts as well. It combines trajectory analysis, HDF5-based data storage, plotting, and a few practical CP2K/LAMMPS utilities behind one CLI.
 
+<img src="assets/linak_gui_banner.svg" alt="LiNaK GUI banner" width="200">
+
 LiNaK provides four top-level commands:
 - `linak compute`: generate LiNaK HDF5 analysis files
-- `linak plot`: plot LiNaK density, MSD, and RDF HDF5 files by auto-detecting the analysis from the HDF5 metadata
+- `linak plot`: plot LiNaK density, MSD, RDF, and position HDF5 files by auto-detecting the analysis from the HDF5 metadata
 - `linak apply`: apply PBC or compress CP2K output files
 - `linak hdf5` (`linak hd`, `linak h5`): inspect, combine, transform, and plot generic tabular HDF5 data
 
@@ -47,13 +49,20 @@ pip install -e .[dev]
 Trajectory to HDF5 to plot:
 
 ```bash
+linak compute density traj.xyz
+linak plot traj_density_z.h5
+
 linak compute density traj.xyz --species H2O
 linak plot traj_density_h2o_z.h5
 
 linak compute msd traj.xyz --species O
 linak plot traj_msd_o.h5
+linak compute position traj.xyz --species O
+linak plot traj_position_o_z.h5
 linak compute rdf traj.xyz --species-a O --species-b H
 linak plot traj_rdf_o_h.h5
+linak compute coordination traj.xyz --species-a O --species-b H --cutoff-from-rdf
+linak plot traj_coordination_o_h.h5
 ```
 
 Run `linak` for information or `linak --help` for the full CLI overview.
@@ -84,34 +93,50 @@ LiNaK HDF5 outputs.
 Available analyses:
 - `density`: 1D density profiles
 - `msd`: mean-squared displacement
+- `position`: atom-resolved trajectories (`x`, `y`, `z`, and distance to surface) vs time
 - `rdf`: radial distribution function
+- `coordination`: continuous coordination number vs time and/or distance to surface
 - `potential`: CP2K cSHE-related quantities from Hartree cube files
 
 Examples:
 
 ```bash
+linak compute density traj.xyz
 linak compute density traj.xyz --species H2O --axis z --bin-width 0.1
 linak compute msd traj.xyz --species O --timestep-fs 0.5
+linak compute position traj.xyz --species O --axis z
 linak compute rdf traj.xyz --species-a O --species-b H --bin-width 0.05
+linak compute coordination traj.xyz --species-a O --species-b H --cutoff-from-rdf
 linak compute potential -f run1/*-v_hartree-1_0.cube run2/*-v_hartree-1_0.cube --output potentials.h5
 ```
 
 ### `linak plot`
 
 The `plot` command reads LiNaK analysis HDF5 files and auto-detects whether the
-file contains density, MSD, or RDF data.
+file contains density, MSD, RDF, position, or coordination data.
 
 Examples:
 
 ```bash
-linak plot traj_density_o_z.h5
-linak plot -f traj_density_h2o_z.h5 traj_density_li_z.h5
+linak plot traj_density_z.h5
+linak plot -f run1_density_z.h5 run2_density_z.h5
 linak plot traj_msd_o.h5 
+linak plot traj_position_o_z.h5
 linak plot traj_rdf_o_h.h5 
+linak plot traj_coordination_o_h.h5
 ```
 
 When `linak plot` cannot detect a supported LiNaK analysis in the HDF5 file, it
 falls back to generic HDF5 plotting via `linak hdf5 plot`.
+
+When interactive plotting is available, `linak plot` opens the Plot Studio GUI
+by default. The GUI provides a live preview plus analysis-aware controls, 
+allowing you to control options for analysis alongside the usual style, axis, 
+and legend settings. It can also manage named saved profiles stored inside the
+HDF5 file: select a profile, duplicate it, create a fresh default profile, and
+import/export profile settings as JSON.
+
+<img src="assets/screenshot_gui.png" alt="LiNaK GUI screenshot" width="1000">
 
 ### `linak apply`
 
@@ -131,7 +156,7 @@ linak apply compress /path/to/output.out
 The `hdf5` command group works with generic tabular HDF5 data. It supports:
 - `info`, `preview`, `get`
 - `sort`, `filter`, `dedupe`
-- `combine` for LiNaK density/MSD/RDF HDF5 files
+- `combine` for LiNaK density/MSD/RDF/position HDF5 files
 - `plot` for generic column-based plotting
 - `plot-settings` for persisted plot profiles stored inside HDF5 files
 
@@ -139,7 +164,7 @@ Examples:
 
 ```bash
 linak hdf5 info density.h5
-linak hdf5 combine -f traj_density_h2o_z.h5 traj_density_li_z.h5
+linak hdf5 combine -f run1_density_z.h5 run2_density_z.h5
 linak hdf5 plot table.h5 --kind line --x time_ps --y msd_A2
 ```
 
@@ -153,7 +178,7 @@ are omitted, LiNaK can prompt with available choices.
 `linak compute density` supports:
 - `--species O`: one element
 - `--species H2O`: molecular water density
-- `--species all`: one output profile per element
+- `--species all`: one HDF5 file with one series per element, plus `H2O` when water is present
 
 Cell handling for density:
 - first use `--cell A B C` if provided
@@ -192,6 +217,55 @@ accumulation. Otherwise it falls back to direct displacement.
 `--bin-width`, and `--threads`. RDF requires a usable cell volume, taken from
 trajectory metadata when present or resolved from simulation input.
 
+### Coordination
+
+`linak compute coordination` stores one continuous coordination-number value per
+selected species-`a` atom and frame together with that atom's distance to the
+surface:
+- `distance_to_surface_A[T, N_a]`
+- `coordination_number[T, N_a]`
+- time axes (`frame`, `step`, `time_fs`, `time_ps`)
+
+Cutoff selection for coordination supports:
+- `--cutoff 3.2`: explicit cutoff in Angstrom
+- `--cutoff-rdf ref_rdf.h5`: determine the cutoff from an existing RDF HDF5
+- `--cutoff-from-rdf`: recompute an average RDF from sampled frames and determine the cutoff automatically
+
+Continuous CN uses a cosine taper around the cutoff controlled by
+`--cutoff-smoothing-width` so atoms just outside the cutoff contribute less
+instead of causing hard integer jumps.
+
+When the cutoff is derived from RDF data, LiNaK stores the reference RDF inside
+the coordination HDF5 and also writes a diagnostic PNG showing the RDF, the
+smoothed RDF, and the selected minimum.
+
+### Position
+
+`linak compute position` stores atom-resolved trajectories for each selected species:
+- Cartesian coordinates `x`, `y`, `z` for every selected atom and frame
+- distance to the detected surface (default: `z`-surface) for every selected atom and frame
+- time axes (`frame`, `step`, `time_fs`, `time_ps`)
+
+By default, position coordinates written to HDF5 are PBC-corrected in memory (wrapped into
+the resolved periodic cell when available). Source trajectory files are not modified.
+
+Species selection for position:
+- `--species O`: one species
+- omitted `--species`: LiNaK warns and computes one HDF5 file per detected species
+
+Surface handling for position uses the same logic as density (`--surface-mode`, `--surface-elements`,
+`--include-fixed-surface-atoms`), and distances are computed frame-by-frame as
+`axis_coordinate - surface_position(frame)`.
+
+Position plotting components:
+- `--component distance` (default): distance to detected surface vs time
+- `--component x|y|z`: Cartesian coordinate vs time
+- `--component xy-z`: XY trajectory with colormap along the path
+  - default colormap source is distance-to-surface (`--map-color distance`)
+  - use `--map-color z` for raw Z-coordinate coloring
+  - default axes limits use cell dimensions (`x: 0..A`, `y: 0..B`) when cell data is available
+  - PBC boundary jumps are rendered without artificial cross-box connector lines
+
 ### Potential
 
 `linak compute potential` is CP2K-focused. For each Hartree cube file, LiNaK:
@@ -220,6 +294,8 @@ installed. Use:
 
 The easiest, and recommended method to change plot styles is to use the interactive controls in Plot Studio. For more advanced users, or when using `--no-gui`, LiNaK supports a wide range of CLI options to customize plot styles and settings.
 
+For position plots specifically, `--time-section-width` can be used to aggregate points into larger time sections for display (plot-only, source HDF5 unchanged). This applies to time-axis components (`distance`, `x`, `y`, `z`); `xy-z` ignores time sectioning.
+
 Shared style controls include:
 - `--figsize WIDTH HEIGHT`
 - `--dpi`
@@ -231,7 +307,9 @@ Shared style controls include:
 
 Plot settings can be persisted inside HDF5 files and reused across sessions.
 Use `linak hdf5 plot-settings` to inspect, edit, copy, import, or export those
-saved plot profiles.
+saved plot profiles. Named profiles are supported per analysis key, and
+`linak plot --settings-profile NAME` loads a specific saved profile instead of
+the active one.
 
 ## Apply Commands
 
