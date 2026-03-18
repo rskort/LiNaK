@@ -8,9 +8,10 @@ from typing import cast
 
 import numpy as np
 from ase import Atoms
+from ase.calculators.singlepoint import SinglePointCalculator
 from ase.io import iread, write
 from ase.io.formats import UnknownFileTypeError
-from ase.io.lammpsrun import lammps_data_to_ase_atoms
+from ase.io import lammpsrun as ase_lammpsrun
 
 from .lammps import (
     extract_cell_from_lammps_input,
@@ -21,6 +22,121 @@ from .lammps import (
 from ..progress import ProgressBar
 
 LOGGER = logging.getLogger(__name__)
+
+_ASE_LAMMPS_DATA_TO_ASE_ATOMS = getattr(ase_lammpsrun, "lammps_data_to_ase_atoms", None)
+
+
+def _lammps_data_to_ase_atoms(
+    data: np.ndarray,
+    colnames: list[str],
+    cell: np.ndarray,
+    celldisp: np.ndarray,
+    *,
+    pbc: tuple[bool, bool, bool] = (False, False, False),
+    atomsobj: type[Atoms] = Atoms,
+    order: bool = True,
+    specorder: list[str] | None = None,
+    units: str = "metal",
+) -> Atoms:
+    """Compatibility wrapper for ASE's removed ``lammps_data_to_ase_atoms`` helper."""
+    if _ASE_LAMMPS_DATA_TO_ASE_ATOMS is not None:
+        return _ASE_LAMMPS_DATA_TO_ASE_ATOMS(
+            data=data,
+            colnames=colnames,
+            cell=cell,
+            celldisp=celldisp,
+            pbc=pbc,
+            atomsobj=atomsobj,
+            order=order,
+            specorder=specorder,
+            units=units,
+        )
+
+    if len(data.shape) == 1:
+        data = data[np.newaxis, :]
+
+    if "id" in colnames and order:
+        ids = data[:, colnames.index("id")].astype(int)
+        data = data[np.argsort(ids), :]
+
+    if "element" in colnames:
+        elements = data[:, colnames.index("element")]
+    elif "mass" in colnames:
+        mass_to_element = getattr(ase_lammpsrun, "_mass2element", None)
+        if mass_to_element is None:
+            raise ValueError("ASE does not expose mass-to-element conversion for LAMMPS dumps.")
+        elements = [mass_to_element(m) for m in data[:, colnames.index("mass")].astype(float)]
+    elif "type" in colnames:
+        elements = data[:, colnames.index("type")].astype(int)
+        if specorder is not None:
+            elements = [specorder[int(value) - 1] for value in elements]
+    else:
+        raise ValueError("Cannot determine atom types from LAMMPS dump file.")
+
+    convert = getattr(ase_lammpsrun, "convert", None)
+
+    def get_quantity(labels: list[str], quantity: str | None = None) -> np.ndarray | None:
+        try:
+            cols = [colnames.index(label) for label in labels]
+        except ValueError:
+            return None
+
+        values = data[:, cols].astype(float)
+        if quantity is not None and convert is not None:
+            return convert(values, quantity, units, "ASE")
+        return values
+
+    positions = None
+    scaled_positions = None
+    if "x" in colnames:
+        positions = get_quantity(["x", "y", "z"], "distance")
+    elif "xs" in colnames:
+        scaled_positions = get_quantity(["xs", "ys", "zs"])
+    elif "xu" in colnames:
+        positions = get_quantity(["xu", "yu", "zu"], "distance")
+    elif "xsu" in colnames:
+        scaled_positions = get_quantity(["xsu", "ysu", "zsu"])
+    else:
+        raise ValueError("No atomic positions found in LAMMPS output.")
+
+    velocities = get_quantity(["vx", "vy", "vz"], "velocity")
+    charges = get_quantity(["q"], "charge")
+    forces = get_quantity(["fx", "fy", "fz"], "force")
+
+    if convert is not None:
+        cell = convert(cell, "distance", units, "ASE")
+        celldisp = convert(celldisp, "distance", units, "ASE")
+
+    if positions is not None:
+        out_atoms = atomsobj(
+            symbols=elements,
+            positions=positions,
+            pbc=pbc,
+            celldisp=celldisp,
+            cell=cell,
+        )
+    elif scaled_positions is not None:
+        out_atoms = atomsobj(
+            symbols=elements,
+            scaled_positions=scaled_positions,
+            pbc=pbc,
+            celldisp=celldisp,
+            cell=cell,
+        )
+    else:  # pragma: no cover - guarded by position checks above.
+        raise ValueError("No usable coordinates found in LAMMPS dump.")
+
+    if velocities is not None:
+        out_atoms.set_velocities(velocities)
+    if charges is not None:
+        out_atoms.set_initial_charges([float(charge[0]) for charge in charges])
+    if forces is not None:
+        out_atoms.calc = SinglePointCalculator(out_atoms, energy=0.0, forces=forces)
+
+    if "type" in colnames:
+        out_atoms.new_array("type", data[:, colnames.index("type")], dtype="int")
+
+    return out_atoms
 
 
 def _parse_box_bound(
@@ -130,7 +246,7 @@ def _read_lammps_dump_frames(path: Path) -> list[Atoms]:
                 if any(not row for row in datarows):
                     raise ValueError(f"Incomplete LAMMPS dump '{path}': truncated atom table.")
                 data = np.loadtxt(datarows, dtype=str, ndmin=2)
-                frame = lammps_data_to_ase_atoms(
+                frame = _lammps_data_to_ase_atoms(
                     data=data,
                     colnames=colnames,
                     cell=cell,
