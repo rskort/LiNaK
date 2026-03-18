@@ -5139,9 +5139,7 @@ def _render_csv_plot(
                         f"--line-colors count must match rendered series count ({total_series})."
                     )
                 color_index = 0
-                for (frame, _source_path), source_label in zip(
-                    frames_by_source, source_labels, strict=True
-                ):
+                for (frame, _source_path), source_label in zip(frames_by_source, source_labels):
                     x_values = frame[x_column] if x_column is not None else frame.index
                     for y_column in y_columns:
                         y_numeric = pd.to_numeric(frame[y_column], errors="coerce")
@@ -5175,9 +5173,7 @@ def _render_csv_plot(
             elif kind == "scatter":
                 if x_column is None:
                     raise ValueError("Scatter plot requires an x-axis column.")
-                for (frame, source_path), source_label in zip(
-                    frames_by_source, source_labels, strict=True
-                ):
+                for (frame, source_path), source_label in zip(frames_by_source, source_labels):
                     x_numeric = pd.to_numeric(frame[x_column], errors="coerce")
                     if int(x_numeric.notna().sum()) == 0:
                         raise ValueError(
@@ -5201,9 +5197,7 @@ def _render_csv_plot(
                 if x_column is None:
                     raise ValueError("Bar plot requires an x-axis column.")
                 total_series = len(frames_by_source) * len(y_columns)
-                for (frame, _source_path), source_label in zip(
-                    frames_by_source, source_labels, strict=True
-                ):
+                for (frame, _source_path), source_label in zip(frames_by_source, source_labels):
                     for y_column in y_columns:
                         y_numeric = pd.to_numeric(frame[y_column], errors="coerce")
                         mask = frame[x_column].notna() & y_numeric.notna()
@@ -5225,9 +5219,7 @@ def _render_csv_plot(
                 ax.tick_params(axis="x", rotation=35, labelsize=style.tick_font_size)
             elif kind == "hist":
                 total_series = len(frames_by_source) * len(y_columns)
-                for (frame, _source_path), source_label in zip(
-                    frames_by_source, source_labels, strict=True
-                ):
+                for (frame, _source_path), source_label in zip(frames_by_source, source_labels):
                     for y_column in y_columns:
                         y_numeric = pd.to_numeric(frame[y_column], errors="coerce").dropna()
                         if len(y_numeric) == 0:
@@ -5245,9 +5237,7 @@ def _render_csv_plot(
                 default_x_label = "value"
                 default_y_label = "count"
             else:  # box
-                for (frame, _source_path), source_label in zip(
-                    frames_by_source, source_labels, strict=True
-                ):
+                for (frame, _source_path), source_label in zip(frames_by_source, source_labels):
                     for column in y_columns:
                         values = pd.to_numeric(frame[column], errors="coerce").dropna().to_numpy()
                         if len(values) == 0:
