@@ -1859,7 +1859,14 @@ def launch_plot_settings_panel(
                 self._header_state_label.setText("Unsaved")
 
         def _update_overview_panel(self) -> None:
-            if self._overview_session_label is None:
+            if (
+                self._overview_session_label is None
+                or self._overview_analysis_label is None
+                or self._overview_profile_label is None
+                or self._overview_series_label is None
+                or self._overview_preview_label is None
+                or self._overview_override_label is None
+            ):
                 return
             settings, error = self._safe_collect_settings()
             self._overview_session_label.setText(title)

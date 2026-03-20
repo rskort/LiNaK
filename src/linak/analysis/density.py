@@ -2138,11 +2138,11 @@ def plot_density_profile(
     auto_x_series, auto_y_series = _prepared_density_auto_limit_series(
         x_series=[x_values],
         y_series=[density_values],
-        labels=[resolved_line_label or profile.species],
+        labels=[resolved_line_label or profile.species or "Series"],
         series_enabled=[single_series.line_visible],
         x_bin_width=x_bin_width,
         x_bin_reducer=x_bin_reducer,
-        series_normalization_modes=[single_series.normalization_mode],
+        series_normalization_modes=[single_series.normalization_mode or "none"],
         series_normalization_values=[single_series.normalization_value],
         series_normalization_x_refs=[single_series.normalization_x_ref],
     )

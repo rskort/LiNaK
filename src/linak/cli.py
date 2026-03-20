@@ -244,7 +244,7 @@ def _read_project_author(default: str = "Unknown") -> str:
     except PackageNotFoundError:
         return default
     for key in ("Author", "Author-email", "Maintainer", "Maintainer-email"):
-        value = str(metadata.get(key) or "").strip()
+        value = str(metadata[key] if key in metadata else "").strip()
         if value:
             return value
     return default
@@ -916,7 +916,7 @@ def _coordination_series_labels_for_profile(profile: Any) -> list[str]:
 
 
 def _ordered_common_items_by_source(
-    items_by_source: list[list[tuple[str, ...]]],
+    items_by_source: Sequence[Sequence[tuple[str, ...]]],
 ) -> list[tuple[str, ...]]:
     if not items_by_source:
         return []
@@ -2498,17 +2498,17 @@ def _resolve_and_apply_required_cell(
             preflight_error = exc
 
     if cell_resolution is None:
-        exc = preflight_error or ValueError("Could not resolve analysis cell.")
+        resolved_error = preflight_error or ValueError("Could not resolve analysis cell.")
         if cell is None and has_trajectory_cell:
             resolved = _cell_lengths_from_frame(frames[0])
             LOGGER.info(
                 "Could not resolve cell from simulation input for %s analysis; using "
                 "periodic cell already present in trajectory. %s",
                 analysis_name,
-                exc,
+                resolved_error,
             )
             return resolved, "trajectory metadata", None
-        raise exc
+        raise resolved_error
 
     resolved_cell = cell_resolution.cell_angstrom
     LOGGER.info(
@@ -2562,18 +2562,18 @@ def _maybe_apply_density_cell(
             preflight_error = exc
 
     if cell_resolution is None:
-        exc = preflight_error or ValueError("Could not resolve density cell.")
+        resolved_error = preflight_error or ValueError("Could not resolve density cell.")
         if cell is None and has_trajectory_cell:
             resolved = _cell_lengths_from_frame(frames[0])
             LOGGER.info(
                 "Could not resolve cell from simulation input for density analysis; using "
                 "periodic cell already present in trajectory. %s",
-                exc,
+                resolved_error,
             )
             return resolved, "trajectory metadata", None
         LOGGER.info(
             "No periodic cell resolved for density analysis; using linear density. %s",
-            exc,
+            resolved_error,
         )
         return None, "unresolved", None
     resolved_cell = cell_resolution.cell_angstrom
@@ -2662,13 +2662,13 @@ def _resolve_analysis_timestep_fs(
             )
 
     if resolved is None:
-        exc = preflight_error or ValueError("Could not resolve analysis timestep.")
+        resolved_error = preflight_error or ValueError("Could not resolve analysis timestep.")
         if timestep_fs is not None or input_path is not None:
-            raise exc
+            raise resolved_error
         LOGGER.info(
             "No timestep resolved for %s analysis; using default 0.5 fs. %s",
             analysis_name,
-            exc,
+            resolved_error,
         )
         return 0.5, "fallback default", None, None, None
 
@@ -2920,7 +2920,7 @@ def _apply_effective_series_settings(
             any_disabled = any_disabled or (enabled is False)
 
             raw_width = entry.get("line_width")
-            width_value = None if raw_width in {None, ""} else float(raw_width)
+            width_value = None if raw_width in {None, ""} else float(str(raw_width))
             override_widths.append(width_value)
             any_width = any_width or (width_value is not None)
 
@@ -5618,7 +5618,6 @@ def _handle_csv_combine(args: argparse.Namespace) -> int:
         sources=sources,
         analysis=detected_analysis,
         output=output_path,
-        settings_source_path=settings_source_path,
     )
     print(f"Wrote combined HDF5: {written}")
     LOGGER.info("HDF5 combine finished in %.2f s.", perf_counter() - start)
