@@ -6,7 +6,7 @@ LiNaK is a lightweight Python toolkit for molecular dynamics trajectory analysis
 
 LiNaK provides four top-level commands:
 - `linak compute`: generate LiNaK HDF5 analysis files
-- `linak plot`: plot LiNaK density, MSD, RDF, and position HDF5 files by auto-detecting the analysis from the HDF5 metadata
+- `linak plot`: plot LiNaK density, MSD, RDF, position, and coordination HDF5 files by auto-detecting the analysis from the HDF5 metadata
 - `linak apply`: apply PBC or compress CP2K output files
 - `linak hdf5` (`linak hd`, `linak h5`): inspect, combine, transform, and plot generic tabular HDF5 data
 
@@ -15,7 +15,8 @@ Supported inputs include:
 - LAMMPS and CP2K input scripts (`.lmp`, and `.inp`, respectively)
 - CP2K Hartree cube files for potential analysis
 
-LiNaK supports Python `>=3.9`.
+LiNaK currently supports Python `3.9`, `3.11`, and `3.13`. 
+Other versions may work but are not guaranteed to be tested or supported.
 
 ## Installation
 
@@ -32,7 +33,7 @@ From the project root:
 pip install .
 ```
 
-Install the optional GUI dependency for the interactive Plot Studio:
+Install the optional GUI dependency for the interactive LiNaK Studio:
 
 ```bash
 pip install -e .[gui]
@@ -129,14 +130,30 @@ linak plot traj_coordination_o_h.h5
 When `linak plot` cannot detect a supported LiNaK analysis in the HDF5 file, it
 falls back to generic HDF5 plotting via `linak hdf5 plot`.
 
-When interactive plotting is available, `linak plot` opens the Plot Studio GUI
+When interactive plotting is available, `linak plot` opens the LiNaK Studio GUI
 by default. The GUI provides a live preview plus analysis-aware controls, 
-allowing you to control options for analysis alongside the usual style, axis, 
-and legend settings. It can also manage named saved profiles stored inside the
-HDF5 file: select a profile, duplicate it, create a fresh default profile, and
-import/export profile settings as JSON.
+allowing you to control options for analysis alongside the usual figure, axis,
+legend, series, and export settings.
 
-<img src="assets/screenshot_gui.png" alt="LiNaK GUI screenshot" width="1000">
+The current Studio layout is organized as:
+- `Overview`
+- `Data`
+- `Series`
+- `Figure`
+- `Profiles`
+- `Export`
+- `Advanced`
+
+Named plot profiles are stored inside the HDF5 file. The `Profiles` page is
+used to select, save, duplicate, rename, delete, import, and export those
+profiles. The `Export` page is only for writing rendered figure files.
+
+For RDF and coordination HDF5 files, `Data > Profile Selection` filters which
+stored profile(s) are loaded from the HDF5. When multiple stored species
+combinations exist, the GUI offers dropdowns built from the available metadata
+instead of requiring free-text entry.
+
+<img src="assets/screenshot_gui.png" alt="LiNaK Studio GUI screenshot" width="1000">
 
 ### `linak apply`
 
@@ -229,15 +246,17 @@ surface:
 Cutoff selection for coordination supports:
 - `--cutoff 3.2`: explicit cutoff in Angstrom
 - `--cutoff-rdf ref_rdf.h5`: determine the cutoff from an existing RDF HDF5
-- `--cutoff-from-rdf`: recompute an average RDF from sampled frames and determine the cutoff automatically
+- `--cutoff-from-rdf`: determine the cutoff automatically from a sampled RDF
 
 Continuous CN uses a cosine taper around the cutoff controlled by
 `--cutoff-smoothing-width` so atoms just outside the cutoff contribute less
 instead of causing hard integer jumps.
 
-When the cutoff is derived from RDF data, LiNaK stores the reference RDF inside
-the coordination HDF5 and also writes a diagnostic PNG showing the RDF, the
-smoothed RDF, and the selected minimum.
+When the cutoff is derived from RDF data, LiNaK samples random frame batches and
+accumulates them into one convergence RDF. LiNaK then determines the first
+minimum after the first RDF peak from the smoothed curve. The sampled reference
+RDF is stored inside the coordination HDF5, and LiNaK also writes a diagnostic
+PNG showing the raw RDF, the smoothed RDF, and the selected minimum.
 
 ### Position
 
@@ -293,6 +312,10 @@ installed. Use:
 - `--backend` to request a specific interactive Matplotlib backend (default is `QtAgg`, but it falls back to the best available backend if that one is not installed)
 
 The easiest, and recommended method to change plot styles is to use the interactive controls in Plot Studio. For more advanced users, or when using `--no-gui`, LiNaK supports a wide range of CLI options to customize plot styles and settings.
+
+When multiple LiNaK HDF5 sources are plotted together, LiNaK combines the data
+into a temporary or saved combined HDF5 and starts from default plot settings
+rather than inheriting saved plot profiles from one input file.
 
 For position plots specifically, `--time-section-width` can be used to aggregate points into larger time sections for display (plot-only, source HDF5 unchanged). This applies to time-axis components (`distance`, `x`, `y`, `z`); `xy-z` ignores time sectioning.
 

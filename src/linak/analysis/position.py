@@ -26,6 +26,7 @@ from .schema import build_profile_metadata, default_plot_labels
 from ..plot.plotting import (
     DEFAULT_PLOT_STYLE,
     PlotStyle,
+    _sanitize_line_collection_kwargs,
     configure_matplotlib_backend,
     plot_line_series,
     plot_multi_line_series,
@@ -610,7 +611,7 @@ def _position_component_data(
                 profile.axis.upper(),
             )
             return profile.distance_to_surface, f"{profile.axis.upper()} (A)"
-        return profile.distance_to_surface, "Distance to surface (A)"
+        return profile.distance_to_surface, "Distance to the surface ($\\mathrm{\\AA}$)"
     if normalized == "x":
         return profile.x, "X (A)"
     if normalized == "y":
@@ -699,6 +700,8 @@ def _plot_position_xy_z_projection(
     y_ticks: list[float] | tuple[float, ...] | None,
     x_tick_rotation: float | None,
     y_tick_rotation: float | None,
+    x_label_pad: float | None,
+    y_label_pad: float | None,
     title_visible: bool | None,
     ticks_visible: bool | None,
     line_colors: list[str] | None,
@@ -851,15 +854,7 @@ def _plot_position_xy_z_projection(
         color_max += 0.5
     norm = mcolors.Normalize(vmin=color_min, vmax=color_max)
 
-    line_collection_kwargs: dict[str, Any] = {}
-    if line_kwargs is not None:
-        line_collection_kwargs.update(dict(line_kwargs))
-    if "lw" in line_collection_kwargs and "linewidths" not in line_collection_kwargs:
-        line_collection_kwargs["linewidths"] = line_collection_kwargs.pop("lw")
-    line_collection_kwargs.pop("label", None)
-    line_collection_kwargs.pop("color", None)
-    line_collection_kwargs.pop("c", None)
-    line_collection_kwargs.pop("marker", None)
+    line_collection_kwargs = _sanitize_line_collection_kwargs(line_kwargs)
     explicit_line_width = _first_non_none(series_line_widths)
     line_collection_kwargs.setdefault(
         "linewidths",
@@ -1095,6 +1090,8 @@ def plot_position_profile(
     y_ticks: list[float] | tuple[float, ...] | None = None,
     x_tick_rotation: float | None = None,
     y_tick_rotation: float | None = None,
+    x_label_pad: float | None = None,
+    y_label_pad: float | None = None,
     title_visible: bool | None = None,
     ticks_visible: bool | None = None,
     markers: bool | None = None,
@@ -1102,6 +1099,7 @@ def plot_position_profile(
     legend_title: str | None = None,
     legend_loc: str = "best",
     line_label: str | None = None,
+    series_labels: list[str] | None = None,
     line_colors: list[str] | None = None,
     series_enabled: list[bool] | None = None,
     series_line_widths: list[float | None] | None = None,
@@ -1109,6 +1107,7 @@ def plot_position_profile(
     series_normalization_modes: list[str] | None = None,
     series_normalization_values: list[float | None] | None = None,
     series_normalization_x_refs: list[float | None] | None = None,
+    series_line_kwargs: list[dict[str, Any] | None] | None = None,
     x_bin_width: float | None = None,
     x_bin_reducer: str | None = None,
     capture_state: dict[str, Any] | None = None,
@@ -1145,6 +1144,8 @@ def plot_position_profile(
             y_ticks=y_ticks,
             x_tick_rotation=x_tick_rotation,
             y_tick_rotation=y_tick_rotation,
+            x_label_pad=x_label_pad,
+            y_label_pad=y_label_pad,
             title_visible=title_visible,
             ticks_visible=ticks_visible,
             line_colors=line_colors,
@@ -1178,11 +1179,12 @@ def plot_position_profile(
         if schema_labels is not None
         else "Atom-resolved positions"
     )
+    labels = resolve_series_labels(default_labels, series_labels, series_kind="position")
 
     if matrix.shape[1] == 1:
         resolved_label = line_label
         if resolved_label is None and effective_legend:
-            resolved_label = default_labels[0]
+            resolved_label = labels[0]
         single_series = resolve_single_series_options(
             line_colors=line_colors,
             series_enabled=series_enabled,
@@ -1221,6 +1223,8 @@ def plot_position_profile(
             y_ticks=y_ticks,
             x_tick_rotation=x_tick_rotation,
             y_tick_rotation=y_tick_rotation,
+            x_label_pad=x_label_pad,
+            y_label_pad=y_label_pad,
             title_visible=title_visible,
             ticks_visible=ticks_visible,
             markers=markers,
@@ -1240,7 +1244,6 @@ def plot_position_profile(
             suppress_output_log=suppress_output_log,
         )
 
-    labels = resolve_series_labels(default_labels, None, series_kind="position")
     return plot_multi_line_series(
         [np.asarray(x_values, dtype=float) for _ in range(matrix.shape[1])],
         [np.asarray(matrix[:, col], dtype=float) for col in range(matrix.shape[1])],
@@ -1257,6 +1260,7 @@ def plot_position_profile(
         series_enabled=series_enabled,
         series_line_widths=series_line_widths,
         series_markers=series_markers,
+        series_line_kwargs=series_line_kwargs,
         series_normalization_modes=series_normalization_modes,
         series_normalization_values=series_normalization_values,
         series_normalization_x_refs=series_normalization_x_refs,
@@ -1270,6 +1274,8 @@ def plot_position_profile(
         y_ticks=y_ticks,
         x_tick_rotation=x_tick_rotation,
         y_tick_rotation=y_tick_rotation,
+        x_label_pad=x_label_pad,
+        y_label_pad=y_label_pad,
         title_visible=title_visible,
         ticks_visible=ticks_visible,
         markers=markers,
@@ -1311,6 +1317,8 @@ def plot_position_profiles(
     y_ticks: list[float] | tuple[float, ...] | None = None,
     x_tick_rotation: float | None = None,
     y_tick_rotation: float | None = None,
+    x_label_pad: float | None = None,
+    y_label_pad: float | None = None,
     title_visible: bool | None = None,
     ticks_visible: bool | None = None,
     markers: bool | None = None,
@@ -1364,6 +1372,8 @@ def plot_position_profiles(
             y_ticks=y_ticks,
             x_tick_rotation=x_tick_rotation,
             y_tick_rotation=y_tick_rotation,
+            x_label_pad=x_label_pad,
+            y_label_pad=y_label_pad,
             title_visible=title_visible,
             ticks_visible=ticks_visible,
             line_colors=line_colors,
@@ -1409,12 +1419,15 @@ def plot_position_profiles(
             y_ticks=y_ticks,
             x_tick_rotation=x_tick_rotation,
             y_tick_rotation=y_tick_rotation,
+            x_label_pad=x_label_pad,
+            y_label_pad=y_label_pad,
             title_visible=title_visible,
             ticks_visible=ticks_visible,
             markers=markers,
             legend=legend,
             legend_title=legend_title,
             legend_loc=legend_loc,
+            series_labels=series_labels,
             line_colors=line_colors,
             series_enabled=series_enabled,
             series_line_widths=series_line_widths,
@@ -1422,6 +1435,7 @@ def plot_position_profiles(
             series_normalization_modes=series_normalization_modes,
             series_normalization_values=series_normalization_values,
             series_normalization_x_refs=series_normalization_x_refs,
+            series_line_kwargs=series_line_kwargs,
             x_bin_width=x_bin_width,
             x_bin_reducer=x_bin_reducer,
             capture_state=capture_state,

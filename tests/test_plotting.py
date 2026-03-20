@@ -46,3 +46,23 @@ def test_normalize_series_values_none_ignores_stale_target_and_reference():
 
     assert changed is False
     np.testing.assert_allclose(normalized, y)
+
+
+def test_sanitize_line_collection_kwargs_removes_marker_only_fields():
+    sanitized = plotting_module._sanitize_line_collection_kwargs(
+        {
+            "label": "Series A",
+            "color": "#ff0000",
+            "marker": "o",
+            "markersize": 8.0,
+            "markeredgecolor": "#000000",
+            "markevery": 2,
+            "lw": 1.5,
+            "alpha": 0.7,
+        }
+    )
+
+    assert sanitized == {
+        "linewidths": 1.5,
+        "alpha": 0.7,
+    }

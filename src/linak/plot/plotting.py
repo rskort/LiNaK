@@ -267,7 +267,9 @@ def configure_matplotlib_backend(
     global _BACKEND_CONFIGURED, _CONFIGURED_BACKEND
 
     if _BACKEND_CONFIGURED and _CONFIGURED_BACKEND is not None:
-        return _CONFIGURED_BACKEND
+        configured_is_interactive = _is_interactive_backend(_CONFIGURED_BACKEND)
+        if configured_is_interactive == bool(interactive):
+            return _CONFIGURED_BACKEND
 
     if interactive:
         candidates = list(CANONICAL_INTERACTIVE_BACKENDS)
@@ -339,6 +341,32 @@ def _normalize_minor_ticks_mode(value: Any) -> str:
     return "auto"
 
 
+def _sanitize_line_collection_kwargs(line_kwargs: dict[str, Any] | None) -> dict[str, Any]:
+    """Strip line-only marker kwargs that ``LineCollection`` does not accept."""
+    resolved = {} if line_kwargs is None else dict(line_kwargs)
+    if "lw" in resolved and "linewidths" not in resolved:
+        resolved["linewidths"] = resolved.pop("lw")
+    for key in (
+        "label",
+        "color",
+        "c",
+        "marker",
+        "markersize",
+        "ms",
+        "markeredgecolor",
+        "mec",
+        "markeredgewidth",
+        "mew",
+        "markerfacecolor",
+        "mfc",
+        "markerfacecoloralt",
+        "fillstyle",
+        "markevery",
+    ):
+        resolved.pop(key, None)
+    return resolved
+
+
 def _extract_tick_controls(
     tick_params_kwargs: dict[str, Any] | None,
 ) -> tuple[dict[str, Any], str, str]:
@@ -377,6 +405,34 @@ def _capture_plot_state(
         if title_obj is not None:
             title_text = str(title_obj.get_text())
             legend_title = title_text if title_text else None
+    figure = ax.figure
+    try:
+        import matplotlib.colors as mcolors
+
+        facecolor_value = str(mcolors.to_hex(figure.get_facecolor(), keep_alpha=False))
+    except Exception:
+        facecolor_value = str(figure.get_facecolor())
+    first_line = ax.lines[0] if getattr(ax, "lines", None) else None
+    legend_kwargs = None
+    if legend is not None:
+        legend_kwargs = {
+            "frameon": bool(legend.get_frame_on()),
+            "ncols": int(getattr(legend, "_ncols", 1)),
+        }
+    axes_kwargs = {
+        "xmargin": float(ax.get_xmargin()),
+        "ymargin": float(ax.get_ymargin()),
+    }
+    line_kwargs = None
+    line_color = None
+    if first_line is not None:
+        line_color = str(first_line.get_color())
+        line_alpha = first_line.get_alpha()
+        line_kwargs = {
+            "linestyle": str(first_line.get_linestyle()),
+            "alpha": None if line_alpha is None else float(line_alpha),
+            "markersize": float(first_line.get_markersize()),
+        }
 
     capture_state.clear()
     capture_state.update(
@@ -397,7 +453,9 @@ def _capture_plot_state(
             "legend": legend is not None,
             "legend_title": legend_title,
             "legend_loc": legend_loc,
+            "legend_kwargs": legend_kwargs,
             "line_colors": list(line_colors),
+            "line_color": line_color,
             "markers": any(
                 marker not in {"", "None", "none", " ", "NoneType"} for marker in line_markers
             ),
@@ -410,6 +468,15 @@ def _capture_plot_state(
             "tick_font_size": int(style.tick_font_size),
             "legend_font_size": int(style.legend_font_size),
             "line_width": float(style.line_width),
+            "line_kwargs": line_kwargs,
+            "axes_kwargs": axes_kwargs,
+            "x_margin": float(ax.get_xmargin()),
+            "y_margin": float(ax.get_ymargin()),
+            "x_label_pad": float(ax.xaxis.labelpad),
+            "y_label_pad": float(ax.yaxis.labelpad),
+            "figure_kwargs": {
+                "facecolor": facecolor_value,
+            },
             "grid": bool(style.grid),
             "grid_linestyle": style.grid_linestyle,
             "grid_linewidth": float(style.grid_linewidth),
@@ -638,6 +705,8 @@ def plot_line_series(
     y_ticks: list[float] | tuple[float, ...] | None = None,
     x_tick_rotation: float | None = None,
     y_tick_rotation: float | None = None,
+    x_label_pad: float | None = None,
+    y_label_pad: float | None = None,
     title_visible: bool | None = None,
     ticks_visible: bool | None = None,
     markers: bool | None = None,
@@ -720,8 +789,14 @@ def plot_line_series(
                 resolved_legend_kwargs.update(dict(legend_kwargs))
             ax.legend(**resolved_legend_kwargs)
 
-        ax.set_xlabel(x_label, fontsize=style.label_font_size)
-        ax.set_ylabel(y_label, fontsize=style.label_font_size)
+        xlabel_kwargs: dict[str, Any] = {"fontsize": style.label_font_size}
+        ylabel_kwargs: dict[str, Any] = {"fontsize": style.label_font_size}
+        if x_label_pad is not None:
+            xlabel_kwargs["labelpad"] = float(x_label_pad)
+        if y_label_pad is not None:
+            ylabel_kwargs["labelpad"] = float(y_label_pad)
+        ax.set_xlabel(x_label, **xlabel_kwargs)
+        ax.set_ylabel(y_label, **ylabel_kwargs)
         if title_visible is False:
             ax.set_title("", fontsize=style.title_font_size)
         else:
@@ -740,8 +815,8 @@ def plot_line_series(
             if grid_kwargs is not None:
                 resolved_grid_kwargs.update(dict(grid_kwargs))
             ax.grid(True, **resolved_grid_kwargs)
-        elif grid_kwargs is not None:
-            ax.grid(**dict(grid_kwargs))
+        else:
+            ax.grid(False)
         if ticks_visible is False:
             if tick_axis_hint in {"both", "x"}:
                 ax.tick_params(
@@ -813,7 +888,9 @@ def plot_line_series(
             ax=ax,
             style=style,
             line_colors=[str(line_artist.get_color())] if line_artist is not None else [],
-            line_labels=[str(line_artist.get_label())] if line_artist is not None else [],
+            line_labels=[str(line_label or line_artist.get_label())]
+            if line_artist is not None
+            else [],
             line_markers=[str(line_artist.get_marker())] if line_artist is not None else [],
             legend_loc=legend_loc,
             capture_state=capture_state,
@@ -884,6 +961,8 @@ def plot_multi_line_series(
     y_ticks: list[float] | tuple[float, ...] | None = None,
     x_tick_rotation: float | None = None,
     y_tick_rotation: float | None = None,
+    x_label_pad: float | None = None,
+    y_label_pad: float | None = None,
     title_visible: bool | None = None,
     ticks_visible: bool | None = None,
     markers: bool | None = None,
@@ -997,8 +1076,14 @@ def plot_multi_line_series(
             if legend_kwargs is not None:
                 resolved_legend_kwargs.update(dict(legend_kwargs))
             ax.legend(**resolved_legend_kwargs)
-        ax.set_xlabel(x_label, fontsize=style.label_font_size)
-        ax.set_ylabel(y_label, fontsize=style.label_font_size)
+        xlabel_kwargs: dict[str, Any] = {"fontsize": style.label_font_size}
+        ylabel_kwargs: dict[str, Any] = {"fontsize": style.label_font_size}
+        if x_label_pad is not None:
+            xlabel_kwargs["labelpad"] = float(x_label_pad)
+        if y_label_pad is not None:
+            ylabel_kwargs["labelpad"] = float(y_label_pad)
+        ax.set_xlabel(x_label, **xlabel_kwargs)
+        ax.set_ylabel(y_label, **ylabel_kwargs)
         if title_visible is False:
             ax.set_title("", fontsize=style.title_font_size)
         else:
@@ -1017,8 +1102,8 @@ def plot_multi_line_series(
             if grid_kwargs is not None:
                 resolved_grid_kwargs.update(dict(grid_kwargs))
             ax.grid(True, **resolved_grid_kwargs)
-        elif grid_kwargs is not None:
-            ax.grid(**dict(grid_kwargs))
+        else:
+            ax.grid(False)
         if ticks_visible is False:
             if tick_axis_hint in {"both", "x"}:
                 ax.tick_params(

@@ -620,6 +620,12 @@ def load_rdf_profiles(
     if is_hdf5_path(source_path):
         payloads = read_linak_hdf5_profiles(source_path, expected_analysis="rdf")
         profiles: list[RDFProfile] = []
+        wanted_species_a = (
+            None if species_a is None or not species_a.strip() else _normalize_species(species_a)
+        )
+        wanted_species_b = (
+            None if species_b is None or not species_b.strip() else _normalize_species(species_b)
+        )
         for datasets, metadata in payloads:
             required = ("bin_centers_A", "g_r")
             missing = [name for name in required if name not in datasets]
@@ -628,21 +634,20 @@ def load_rdf_profiles(
                     f"RDF HDF5 '{source_path}' is missing required dataset(s): {', '.join(missing)}."
                 )
 
-            meta_species_a = str(metadata.get("species_a", "")).strip()
-            meta_species_b = str(metadata.get("species_b", "")).strip()
-            if species_a is not None and species_a.strip():
-                resolved_species_a = _normalize_species(species_a)
-            elif meta_species_a:
-                resolved_species_a = meta_species_a
-            else:
-                resolved_species_a = "UNKNOWN"
-
-            if species_b is not None and species_b.strip():
-                resolved_species_b = _normalize_species(species_b)
-            elif meta_species_b:
-                resolved_species_b = meta_species_b
-            else:
-                resolved_species_b = resolved_species_a
+            resolved_species_a = str(metadata.get("species_a", "")).strip() or "UNKNOWN"
+            resolved_species_b = (
+                str(metadata.get("species_b", "")).strip() or resolved_species_a
+            )
+            if (
+                wanted_species_a is not None
+                and _normalize_species(resolved_species_a) != wanted_species_a
+            ):
+                continue
+            if (
+                wanted_species_b is not None
+                and _normalize_species(resolved_species_b) != wanted_species_b
+            ):
+                continue
 
             bin_centers = np.asarray(datasets["bin_centers_A"], dtype=float)
             if "bin_edges_A" in datasets:
@@ -698,6 +703,8 @@ def plot_rdf_profile(
     y_ticks: list[float] | tuple[float, ...] | None = None,
     x_tick_rotation: float | None = None,
     y_tick_rotation: float | None = None,
+    x_label_pad: float | None = None,
+    y_label_pad: float | None = None,
     title_visible: bool | None = None,
     ticks_visible: bool | None = None,
     markers: bool | None = None,
@@ -771,6 +778,8 @@ def plot_rdf_profile(
         y_ticks=y_ticks,
         x_tick_rotation=x_tick_rotation,
         y_tick_rotation=y_tick_rotation,
+        x_label_pad=x_label_pad,
+        y_label_pad=y_label_pad,
         title_visible=title_visible,
         ticks_visible=ticks_visible,
         markers=markers,
@@ -809,6 +818,8 @@ def plot_rdf_profiles(
     y_ticks: list[float] | tuple[float, ...] | None = None,
     x_tick_rotation: float | None = None,
     y_tick_rotation: float | None = None,
+    x_label_pad: float | None = None,
+    y_label_pad: float | None = None,
     title_visible: bool | None = None,
     ticks_visible: bool | None = None,
     markers: bool | None = None,
@@ -870,6 +881,8 @@ def plot_rdf_profiles(
             y_ticks=y_ticks,
             x_tick_rotation=x_tick_rotation,
             y_tick_rotation=y_tick_rotation,
+            x_label_pad=x_label_pad,
+            y_label_pad=y_label_pad,
             title_visible=title_visible,
             ticks_visible=ticks_visible,
             markers=markers,
@@ -928,6 +941,8 @@ def plot_rdf_profiles(
         y_ticks=y_ticks,
         x_tick_rotation=x_tick_rotation,
         y_tick_rotation=y_tick_rotation,
+        x_label_pad=x_label_pad,
+        y_label_pad=y_label_pad,
         title_visible=title_visible,
         ticks_visible=ticks_visible,
         markers=markers,

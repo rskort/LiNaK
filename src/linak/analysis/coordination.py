@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from concurrent.futures import ProcessPoolExecutor
+from contextlib import nullcontext
 from dataclasses import dataclass
+from itertools import repeat
 import logging
 from pathlib import Path
 from typing import Any
@@ -15,11 +18,13 @@ import numpy as np
 from ..plot.plotting import (
     DEFAULT_PLOT_STYLE,
     PlotStyle,
+    _sanitize_line_collection_kwargs,
     configure_matplotlib_backend,
     plot_line_series,
     plot_multi_line_series,
     resolve_series_labels,
 )
+from ..progress import ProgressBar
 from ..storage.hdf5_utils import (
     is_hdf5_path,
     read_linak_hdf5_profiles,
@@ -31,21 +36,32 @@ from .position import (
     compute_position_profile,
 )
 from .rdf import (
+    _RDFWorkerConfig,
     _build_uniform_rdf_bins,
+    _compute_rdf_chunk_contributions,
     _compute_rdf_frame_contribution,
     _normalize_species as _normalize_rdf_species,
+    _resolve_rdf_chunk_size,
     _resolve_rdf_selection_cache,
+    _resolve_rdf_worker_count,
+    _should_parallelize_rdf,
 )
 from .schema import build_profile_metadata
 
 LOGGER = logging.getLogger(__name__)
 _DEFAULT_DISTANCE_BIN_WIDTH_A = 0.25
-_DEFAULT_CUTOFF_SMOOTHING_WIDTH_A = 0.20
-_DEFAULT_RDF_SAMPLE_FRACTION = 0.10
+_DEFAULT_CUTOFF_SMOOTHING_WIDTH_A = 0.50
 _DEFAULT_RDF_BIN_WIDTH_A = 0.05
 _DEFAULT_RDF_SMOOTHING_SIGMA_A = 0.10
+_DEFAULT_RDF_CONVERGENCE_BATCH_SIZE = 250
+_DEFAULT_RDF_CONVERGENCE_MIN_FRAMES = 1_000
+_DEFAULT_RDF_CONVERGENCE_MAX_FRAMES = 5_000
+_DEFAULT_RDF_CONVERGENCE_WINDOW = 3
+_DEFAULT_RDF_CONVERGENCE_TOLERANCE_A = 1.0e-3
 _MIN_FIT_POINTS = 3
 _FIT_HALF_WINDOW_POINTS = 3
+_COORD_VECTORIZE_PAIR_THRESHOLD = 50_000
+_COORD_MAX_DISTANCE_VALUES_PER_CHUNK = 2_000_000
 
 
 @dataclass(frozen=True)
@@ -245,26 +261,258 @@ def _fit_local_quadratic_minimum(
     return float(np.clip(vertex, lower, upper))
 
 
-def _default_sample_size(frame_count: int, *, fraction: float) -> int:
-    sampled = int(np.ceil(float(frame_count) * float(fraction)))
-    return max(1, min(frame_count, sampled))
-
-
-def _select_sampled_frame_indices(
-    frame_count: int,
+def _resolve_converged_sampled_rdf(
+    frames: list[Atoms],
     *,
-    sample_fraction: float,
-) -> np.ndarray:
-    if frame_count <= 0:
-        return np.empty(0, dtype=int)
-    if sample_fraction >= 1.0:
-        return np.arange(frame_count, dtype=int)
-    sample_size = _default_sample_size(frame_count, fraction=sample_fraction)
-    if sample_size >= frame_count:
-        return np.arange(frame_count, dtype=int)
-    rng = np.random.default_rng(0)
-    sampled = np.sort(rng.choice(frame_count, size=sample_size, replace=False))
-    return np.asarray(sampled, dtype=int)
+    species_a: str,
+    species_b: str,
+    batch_size: int = _DEFAULT_RDF_CONVERGENCE_BATCH_SIZE,
+    tolerance_A: float = _DEFAULT_RDF_CONVERGENCE_TOLERANCE_A,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, float]:
+    if not frames:
+        raise ValueError("At least one trajectory frame is required.")
+    ensure_positive("batch_size", batch_size)
+    ensure_positive("tolerance_A", tolerance_A)
+
+    frame_order = np.asarray(np.random.default_rng(0).permutation(len(frames)), dtype=int)
+    max_sampled_frames = min(len(frame_order), int(_DEFAULT_RDF_CONVERGENCE_MAX_FRAMES))
+    min_frames_before_check = min(max_sampled_frames, int(_DEFAULT_RDF_CONVERGENCE_MIN_FRAMES))
+    convergence_window = max(2, int(_DEFAULT_RDF_CONVERGENCE_WINDOW))
+    selected_index_batches: list[np.ndarray] = []
+    sampled_frame_count = 0
+    previous_cutoff_A: float | None = None
+    recent_cutoffs_A: list[float] = []
+    selected_frame_batch = [(frame_index, frames[frame_index]) for frame_index in frame_order.tolist()]
+    (
+        bin_edges,
+        config,
+    ) = _build_reference_rdf_config(
+        selected_frame_batch,
+        species_a=species_a,
+        species_b=species_b,
+        r_max=None,
+        bin_width=float(_DEFAULT_RDF_BIN_WIDTH_A),
+    )
+    counts_accum = np.zeros(bin_edges.size - 1, dtype=float)
+    expected_accum = np.zeros_like(counts_accum)
+    final_bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+    final_g_r = np.zeros_like(counts_accum)
+    final_smoothed = np.empty(0, dtype=float)
+    final_peak_A = 0.0
+    final_minimum_A = 0.0
+    max_batch_frames = min(int(batch_size), max_sampled_frames)
+    worker_count = _resolve_rdf_worker_count(None, max_batch_frames)
+    use_parallel = _should_parallelize_rdf(max_batch_frames, worker_count)
+
+    executor_context = (
+        ProcessPoolExecutor(max_workers=worker_count) if use_parallel else nullcontext(None)
+    )
+    with executor_context as executor:
+        for step_index, start in enumerate(range(0, max_sampled_frames, int(batch_size)), start=1):
+            stop = min(start + int(batch_size), max_sampled_frames)
+            next_batch = frame_order[start:stop]
+            batch_frames = selected_frame_batch[start:stop]
+            if next_batch.size == 0:
+                break
+            batch_counts, batch_expected = _accumulate_reference_rdf_contributions(
+                batch_frames,
+                config=config,
+                progress=None,
+                executor=executor,
+                worker_count=worker_count,
+            )
+            counts_accum += batch_counts
+            expected_accum += batch_expected
+            selected_index_batches.append(next_batch.astype(int))
+            sampled_frame_count += int(next_batch.size)
+            non_zero = expected_accum > 0.0
+            final_g_r = np.zeros_like(counts_accum)
+            final_g_r[non_zero] = counts_accum[non_zero] / expected_accum[non_zero]
+            final_smoothed, final_peak_A, final_minimum_A = _resolve_cutoff_from_rdf_curve(
+                bin_centers_A=final_bin_centers,
+                g_r=final_g_r,
+                smoothing_sigma_A=float(_DEFAULT_RDF_SMOOTHING_SIGMA_A),
+            )
+            delta_A = (
+                None
+                if previous_cutoff_A is None
+                else abs(float(final_minimum_A) - float(previous_cutoff_A))
+            )
+            previous_cutoff_A = float(final_minimum_A)
+            recent_cutoffs_A.append(float(final_minimum_A))
+            if len(recent_cutoffs_A) > convergence_window:
+                recent_cutoffs_A = recent_cutoffs_A[-convergence_window:]
+            recent_span_A = (
+                None
+                if len(recent_cutoffs_A) < convergence_window
+                else max(recent_cutoffs_A) - min(recent_cutoffs_A)
+            )
+            LOGGER.info(
+                "Coordination cutoff RDF step %d: sampled=%d frame(s), cutoff=%.6g A%s%s",
+                step_index,
+                sampled_frame_count,
+                final_minimum_A,
+                ""
+                if delta_A is None
+                else f", delta={delta_A:.6g} A",
+                ""
+                if recent_span_A is None
+                else f", recent_span={recent_span_A:.6g} A",
+            )
+            if (
+                sampled_frame_count >= min_frames_before_check
+                and recent_span_A is not None
+                and recent_span_A <= float(tolerance_A)
+            ):
+                return (
+                    np.sort(np.concatenate(selected_index_batches)).astype(int, copy=False),
+                    np.asarray(final_bin_centers, dtype=float),
+                    np.asarray(final_g_r, dtype=float),
+                    np.asarray(final_smoothed, dtype=float),
+                    float(final_peak_A),
+                    float(final_minimum_A),
+                )
+
+    LOGGER.info(
+        "Coordination cutoff RDF did not converge within %.6g A after sampling %d frame(s); using the final sampled cutoff.",
+        float(tolerance_A),
+        sampled_frame_count,
+    )
+    return (
+        np.sort(np.concatenate(selected_index_batches)).astype(int, copy=False),
+        np.asarray(final_bin_centers, dtype=float),
+        np.asarray(final_g_r, dtype=float),
+        np.asarray(final_smoothed, dtype=float),
+        float(final_peak_A),
+        float(final_minimum_A),
+    )
+
+
+def _resolve_reference_rdf_r_max(
+    frames: list[Atoms],
+    *,
+    r_max: float | None,
+) -> float:
+    if r_max is not None:
+        ensure_positive("r_max", r_max)
+        return float(r_max)
+    min_cell_lengths = []
+    for frame in frames:
+        cell = np.asarray(frame.cell.array, dtype=float)
+        if cell.shape != (3, 3):
+            raise ValueError("RDF cutoff detection requires valid periodic cell vectors.")
+        cell_lengths = np.linalg.norm(cell, axis=1)
+        min_cell_lengths.append(float(np.min(cell_lengths)))
+    resolved_r_max = 0.5 * min(min_cell_lengths)
+    ensure_positive("r_max", resolved_r_max)
+    return float(resolved_r_max)
+
+
+def _build_reference_rdf_config(
+    selected_frames: list[tuple[int, Atoms]],
+    *,
+    species_a: str,
+    species_b: str,
+    r_max: float | None,
+    bin_width: float,
+) -> tuple[np.ndarray, _RDFWorkerConfig]:
+    if not selected_frames:
+        raise ValueError("No frames were selected for RDF cutoff resolution.")
+    ensure_positive("bin_width", bin_width)
+
+    frame_objects = [frame for _frame_index, frame in selected_frames]
+    resolved_r_max = _resolve_reference_rdf_r_max(frame_objects, r_max=r_max)
+    bin_edges, _effective_bin_width = _build_uniform_rdf_bins(
+        r_max=resolved_r_max,
+        target_bin_width=float(bin_width),
+    )
+    shell_volumes = (4.0 / 3.0) * np.pi * (bin_edges[1:] ** 3 - bin_edges[:-1] ** 3)
+    max_sphere_volume = (4.0 / 3.0) * np.pi * (resolved_r_max**3)
+    same_selection = species_a == species_b
+    selection_cache = _resolve_rdf_selection_cache(
+        frame_objects,
+        label_a=species_a,
+        label_b=species_b,
+    )
+    return (
+        bin_edges,
+        _RDFWorkerConfig(
+            label_a=species_a,
+            label_b=species_b,
+            same_selection=same_selection,
+            r_max=resolved_r_max,
+            bin_edges=bin_edges,
+            shell_volumes=shell_volumes,
+            max_sphere_volume=max_sphere_volume,
+            selection_cache=selection_cache,
+        ),
+    )
+
+
+def _accumulate_reference_rdf_contributions(
+    selected_frames: list[tuple[int, Atoms]],
+    *,
+    config: _RDFWorkerConfig,
+    progress: ProgressBar | None = None,
+    executor: ProcessPoolExecutor | None = None,
+    worker_count: int | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    counts_accum = np.zeros(config.bin_edges.size - 1, dtype=float)
+    expected_accum = np.zeros_like(counts_accum)
+    if not selected_frames:
+        return counts_accum, expected_accum
+
+    resolved_worker_count = _resolve_rdf_worker_count(None, len(selected_frames)) if worker_count is None else worker_count
+    resolved_worker_count = min(resolved_worker_count, max(1, len(selected_frames)))
+    use_parallel = _should_parallelize_rdf(len(selected_frames), resolved_worker_count)
+    if not use_parallel:
+        for frame_index, frame in selected_frames:
+            counts, expected = _compute_rdf_frame_contribution(
+                frame_index,
+                frame,
+                label_a=config.label_a,
+                label_b=config.label_b,
+                same_selection=config.same_selection,
+                r_max=config.r_max,
+                bin_edges=config.bin_edges,
+                shell_volumes=config.shell_volumes,
+                max_sphere_volume=config.max_sphere_volume,
+                selection_cache=config.selection_cache,
+            )
+            counts_accum += counts
+            expected_accum += expected
+            if progress is not None:
+                progress.update()
+        return counts_accum, expected_accum
+
+    chunk_size = _resolve_rdf_chunk_size(len(selected_frames), resolved_worker_count)
+    chunks = [
+        selected_frames[start : start + chunk_size]
+        for start in range(0, len(selected_frames), chunk_size)
+    ]
+    if executor is None:
+        with ProcessPoolExecutor(max_workers=resolved_worker_count) as local_executor:
+            for counts, expected, processed_frames in local_executor.map(
+                _compute_rdf_chunk_contributions,
+                chunks,
+                repeat(config),
+            ):
+                counts_accum += counts
+                expected_accum += expected
+                if progress is not None:
+                    progress.update(processed_frames)
+        return counts_accum, expected_accum
+
+    for counts, expected, processed_frames in executor.map(
+        _compute_rdf_chunk_contributions,
+        chunks,
+        repeat(config),
+    ):
+        counts_accum += counts
+        expected_accum += expected
+        if progress is not None:
+            progress.update(processed_frames)
+    return counts_accum, expected_accum
 
 
 def _compute_reference_rdf(
@@ -279,52 +527,24 @@ def _compute_reference_rdf(
     if not frames:
         raise ValueError("At least one trajectory frame is required.")
 
-    selected_frames = [frames[int(index)] for index in frame_indices.tolist()]
-    if not selected_frames:
-        raise ValueError("No frames were selected for RDF cutoff resolution.")
-
-    if r_max is None:
-        min_cell_lengths = []
-        for frame in selected_frames:
-            cell = np.asarray(frame.cell.array, dtype=float)
-            if cell.shape != (3, 3):
-                raise ValueError("RDF cutoff detection requires valid periodic cell vectors.")
-            cell_lengths = np.linalg.norm(cell, axis=1)
-            min_cell_lengths.append(float(np.min(cell_lengths)))
-        r_max = 0.5 * min(min_cell_lengths)
-
-    ensure_positive("r_max", r_max)
-    ensure_positive("bin_width", bin_width)
-
-    bin_edges, _effective_bin_width = _build_uniform_rdf_bins(
-        r_max=float(r_max),
-        target_bin_width=float(bin_width),
-    )
-    shell_volumes = (4.0 / 3.0) * np.pi * (bin_edges[1:] ** 3 - bin_edges[:-1] ** 3)
-    max_sphere_volume = (4.0 / 3.0) * np.pi * (float(r_max) ** 3)
-    same_selection = species_a == species_b
-    selection_cache = _resolve_rdf_selection_cache(
+    selected_frames = [(int(index), frames[int(index)]) for index in frame_indices.tolist()]
+    bin_edges, config = _build_reference_rdf_config(
         selected_frames,
-        label_a=species_a,
-        label_b=species_b,
+        species_a=species_a,
+        species_b=species_b,
+        r_max=r_max,
+        bin_width=float(bin_width),
     )
-    counts_accum = np.zeros(bin_edges.size - 1, dtype=float)
-    expected_accum = np.zeros_like(counts_accum)
-    for frame_offset, frame in enumerate(selected_frames):
-        counts, expected = _compute_rdf_frame_contribution(
-            frame_offset,
-            frame,
-            label_a=species_a,
-            label_b=species_b,
-            same_selection=same_selection,
-            r_max=float(r_max),
-            bin_edges=bin_edges,
-            shell_volumes=shell_volumes,
-            max_sphere_volume=max_sphere_volume,
-            selection_cache=selection_cache,
+    with ProgressBar(
+        desc=f"Coordination cutoff RDF ({species_a}-{species_b})",
+        total=len(selected_frames),
+        unit="frame",
+    ) as progress:
+        counts_accum, expected_accum = _accumulate_reference_rdf_contributions(
+            selected_frames,
+            config=config,
+            progress=progress,
         )
-        counts_accum += counts
-        expected_accum += expected
 
     g_r = np.zeros_like(counts_accum)
     non_zero = expected_accum > 0.0
@@ -371,8 +591,11 @@ def _save_cutoff_diagnostic_plot(
     species_a: str,
     species_b: str,
 ) -> Path:
-    active_backend = configure_matplotlib_backend(interactive=False, preferred_backend=None)
-    del active_backend
+    import matplotlib
+
+    pyplot_module = matplotlib.pyplot if hasattr(matplotlib, "pyplot") else None
+    if pyplot_module is None:
+        matplotlib.use("Agg", force=True)
     import matplotlib.pyplot as plt
 
     output_path = Path(output).expanduser().resolve()
@@ -423,17 +646,9 @@ def resolve_coordination_cutoff(
     cutoff_rdf_path: str | Path | None,
     cutoff_from_rdf: bool,
     cutoff_smoothing_width_A: float = _DEFAULT_CUTOFF_SMOOTHING_WIDTH_A,
-    rdf_sample_fraction: float = _DEFAULT_RDF_SAMPLE_FRACTION,
-    rdf_bin_width_A: float = _DEFAULT_RDF_BIN_WIDTH_A,
-    rdf_r_max_A: float | None = None,
-    rdf_smoothing_sigma_A: float = _DEFAULT_RDF_SMOOTHING_SIGMA_A,
     diagnostic_plot_output: str | Path | None = None,
 ) -> CoordinationCutoffResolution:
     ensure_positive("cutoff_smoothing_width_A", cutoff_smoothing_width_A)
-    ensure_positive("rdf_bin_width_A", rdf_bin_width_A)
-    ensure_positive("rdf_smoothing_sigma_A", rdf_smoothing_sigma_A)
-    if rdf_sample_fraction <= 0.0 or rdf_sample_fraction > 1.0:
-        raise ValueError("rdf_sample_fraction must be in the interval (0, 1].")
 
     label_a = _normalize_species(species_a)
     label_b = _normalize_species(species_b if species_b is not None else species_a)
@@ -454,7 +669,7 @@ def resolve_coordination_cutoff(
         smoothed, peak_A, minimum_A = _resolve_cutoff_from_rdf_curve(
             bin_centers_A=np.asarray(rdf_profile.bin_centers, dtype=float),
             g_r=np.asarray(rdf_profile.g_r, dtype=float),
-            smoothing_sigma_A=float(rdf_smoothing_sigma_A),
+            smoothing_sigma_A=float(_DEFAULT_RDF_SMOOTHING_SIGMA_A),
         )
         diagnostic_path = None
         if diagnostic_plot_output is not None:
@@ -482,22 +697,18 @@ def resolve_coordination_cutoff(
         )
 
     # Default to an internally sampled RDF whenever no higher-priority cutoff source is provided.
-    sampled_indices = _select_sampled_frame_indices(
-        len(frames),
-        sample_fraction=float(rdf_sample_fraction),
+    LOGGER.info(
+        "Resolving coordination cutoff from sampled RDF using random %d-frame batches (check after %d frame(s), %d-step span <= %.6g A, cap=%d frame(s)).",
+        int(_DEFAULT_RDF_CONVERGENCE_BATCH_SIZE),
+        int(_DEFAULT_RDF_CONVERGENCE_MIN_FRAMES),
+        int(_DEFAULT_RDF_CONVERGENCE_WINDOW),
+        float(_DEFAULT_RDF_CONVERGENCE_TOLERANCE_A),
+        int(_DEFAULT_RDF_CONVERGENCE_MAX_FRAMES),
     )
-    bin_centers_A, g_r = _compute_reference_rdf(
+    sampled_indices, bin_centers_A, g_r, smoothed, peak_A, minimum_A = _resolve_converged_sampled_rdf(
         frames,
         species_a=label_a,
         species_b=label_b,
-        frame_indices=sampled_indices,
-        r_max=rdf_r_max_A,
-        bin_width=float(rdf_bin_width_A),
-    )
-    smoothed, peak_A, minimum_A = _resolve_cutoff_from_rdf_curve(
-        bin_centers_A=bin_centers_A,
-        g_r=g_r,
-        smoothing_sigma_A=float(rdf_smoothing_sigma_A),
     )
     diagnostic_path = None
     if diagnostic_plot_output is not None:
@@ -646,6 +857,90 @@ def _compute_coordination_frame_values(
     return np.sum(weights_matrix, axis=1)
 
 
+def _resolve_coordination_chunk_size(
+    *,
+    frame_count: int,
+    pair_count: int,
+) -> int:
+    if frame_count <= 0:
+        return 1
+    if pair_count <= 0:
+        return frame_count
+    max_chunk = max(1, _COORD_MAX_DISTANCE_VALUES_PER_CHUNK // pair_count)
+    return max(1, min(frame_count, max_chunk))
+
+
+def _can_vectorize_coordination_kernel(
+    frames: list[Atoms],
+    *,
+    pair_count: int,
+) -> bool:
+    if pair_count <= 0 or pair_count > _COORD_VECTORIZE_PAIR_THRESHOLD:
+        return False
+    if not frames:
+        return False
+    usable_pbc = [_frame_has_usable_cell(frame) for frame in frames]
+    return all(usable_pbc) or not any(usable_pbc)
+
+
+def _compute_coordination_values_chunked(
+    frames: list[Atoms],
+    *,
+    center_indices: np.ndarray,
+    neighbor_indices: np.ndarray,
+    same_selection: bool,
+    cutoff_A: float,
+    smoothing_width_A: float,
+) -> np.ndarray:
+    frame_count = len(frames)
+    center_count = int(center_indices.size)
+    neighbor_count = int(neighbor_indices.size)
+    pair_count = max(0, center_count * neighbor_count - (center_count if same_selection else 0))
+    chunk_size = _resolve_coordination_chunk_size(frame_count=frame_count, pair_count=pair_count)
+    use_mic = bool(frames) and all(_frame_has_usable_cell(frame) for frame in frames)
+
+    coordination = np.zeros((frame_count, center_count), dtype=np.float32)
+    with ProgressBar(
+        desc=f"Coordination values ({center_count}x{neighbor_count})",
+        total=frame_count,
+        unit="frame",
+    ) as progress:
+        for start in range(0, frame_count, chunk_size):
+            stop = min(frame_count, start + chunk_size)
+            center_positions = np.stack(
+                [np.asarray(frame.positions[center_indices], dtype=float) for frame in frames[start:stop]],
+                axis=0,
+            )
+            neighbor_positions = np.stack(
+                [np.asarray(frame.positions[neighbor_indices], dtype=float) for frame in frames[start:stop]],
+                axis=0,
+            )
+            deltas = center_positions[:, :, np.newaxis, :] - neighbor_positions[:, np.newaxis, :, :]
+            if use_mic:
+                cell_lengths = np.stack(
+                    [np.asarray(frame.cell.lengths(), dtype=float) for frame in frames[start:stop]],
+                    axis=0,
+                )
+                deltas -= cell_lengths[:, np.newaxis, np.newaxis, :] * np.round(
+                    deltas / cell_lengths[:, np.newaxis, np.newaxis, :]
+                )
+            distances = np.linalg.norm(deltas, axis=3)
+            if same_selection:
+                diagonal = np.arange(center_count, dtype=int)
+                distances[:, diagonal, diagonal] = np.inf
+            weights = _continuous_coordination_weights(
+                distances,
+                cutoff_A=float(cutoff_A),
+                smoothing_width_A=float(smoothing_width_A),
+            )
+            coordination[start:stop, :] = np.sum(weights, axis=2, dtype=float).astype(
+                np.float32,
+                copy=False,
+            )
+            progress.update(stop - start)
+    return coordination
+
+
 def compute_coordination_profile(
     frames: list[Atoms],
     *,
@@ -666,6 +961,11 @@ def compute_coordination_profile(
     label_b = _normalize_species(species_b if species_b is not None else species_a)
     ensure_positive("timestep_fs", timestep_fs)
 
+    LOGGER.info(
+        "Resolving coordination center trajectories for %d frame(s) using species_a=%s.",
+        len(frames),
+        label_a,
+    )
     position_profile = compute_position_profile(
         frames,
         species=label_a,
@@ -681,25 +981,64 @@ def compute_coordination_profile(
         raise ValueError(f"No atoms found for species '{label_b}' in frame 0.")
 
     same_selection = label_a == label_b
-    coordination = np.zeros(
-        (len(frames), int(position_profile.atom_indices.size)),
-        dtype=np.float32,
+    center_indices = np.asarray(position_profile.atom_indices, dtype=int)
+    center_count = int(center_indices.size)
+    neighbor_count = int(neighbor_indices.size)
+    pair_count = max(0, center_count * neighbor_count - (center_count if same_selection else 0))
+    LOGGER.info(
+        "Computing coordination values for %d frame(s), %d center atom(s), %d neighbor atom(s).",
+        len(frames),
+        center_count,
+        neighbor_count,
     )
-    for frame_index, frame in enumerate(frames):
-        coordination[frame_index, :] = _compute_coordination_frame_values(
-            frame,
-            center_indices=np.asarray(position_profile.atom_indices, dtype=int),
+    if _can_vectorize_coordination_kernel(frames, pair_count=pair_count):
+        chunk_size = _resolve_coordination_chunk_size(
+            frame_count=len(frames),
+            pair_count=max(1, pair_count),
+        )
+        LOGGER.info(
+            "Using chunked vectorized coordination kernel (pair_count=%d, chunk_size=%d frame(s)).",
+            pair_count,
+            chunk_size,
+        )
+        coordination = _compute_coordination_values_chunked(
+            frames,
+            center_indices=center_indices,
             neighbor_indices=np.asarray(neighbor_indices, dtype=int),
             same_selection=same_selection,
             cutoff_A=float(cutoff_resolution.cutoff_A),
             smoothing_width_A=float(cutoff_resolution.smoothing_width_A),
         )
+    else:
+        LOGGER.info(
+            "Using framewise coordination kernel (pair_count=%d per frame).",
+            pair_count,
+        )
+        coordination = np.zeros(
+            (len(frames), center_count),
+            dtype=np.float32,
+        )
+        with ProgressBar(
+            desc=f"Coordination values ({center_count}x{neighbor_count})",
+            total=len(frames),
+            unit="frame",
+        ) as progress:
+            for frame_index, frame in enumerate(frames):
+                coordination[frame_index, :] = _compute_coordination_frame_values(
+                    frame,
+                    center_indices=center_indices,
+                    neighbor_indices=np.asarray(neighbor_indices, dtype=int),
+                    same_selection=same_selection,
+                    cutoff_A=float(cutoff_resolution.cutoff_A),
+                    smoothing_width_A=float(cutoff_resolution.smoothing_width_A),
+                )
+                progress.update()
 
     return CoordinationProfile(
         species_a=label_a,
         species_b=label_b,
         axis=axis_label,
-        atom_indices=np.asarray(position_profile.atom_indices, dtype=int),
+        atom_indices=center_indices,
         frame_index=np.asarray(position_profile.frame_index, dtype=int),
         step=np.asarray(position_profile.step, dtype=float),
         time_fs=np.asarray(position_profile.time_fs, dtype=float),
@@ -1001,7 +1340,7 @@ def _coordination_time_data(
 def _coordination_distance_label(profile: CoordinationProfile) -> str:
     if profile.coordinate_mode != "distance":
         return f"{profile.axis.upper()} (A)"
-    return "Distance to surface (A)"
+    return "Distance to the surface ($\\mathrm{\\AA}$)"
 
 
 def _default_coordination_series_labels(profile: CoordinationProfile) -> list[str]:
@@ -1068,6 +1407,8 @@ def _plot_coordination_time_distance_projection(
     y_ticks: list[float] | tuple[float, ...] | None,
     x_tick_rotation: float | None,
     y_tick_rotation: float | None,
+    x_label_pad: float | None,
+    y_label_pad: float | None,
     title_visible: bool | None,
     ticks_visible: bool | None,
     line_colors: list[str] | None,
@@ -1175,11 +1516,7 @@ def _plot_coordination_time_distance_projection(
         color_max = color_min + 1.0
     norm = mcolors.Normalize(vmin=color_min, vmax=color_max)
 
-    line_collection_kwargs = {} if line_kwargs is None else dict(line_kwargs)
-    if "lw" in line_collection_kwargs and "linewidths" not in line_collection_kwargs:
-        line_collection_kwargs["linewidths"] = line_collection_kwargs.pop("lw")
-    for key in ("label", "color", "c", "marker"):
-        line_collection_kwargs.pop(key, None)
+    line_collection_kwargs = _sanitize_line_collection_kwargs(line_kwargs)
     explicit_line_width = None
     if series_line_widths:
         for value in series_line_widths:
@@ -1374,6 +1711,8 @@ def plot_coordination_profile(
     y_ticks: list[float] | tuple[float, ...] | None = None,
     x_tick_rotation: float | None = None,
     y_tick_rotation: float | None = None,
+    x_label_pad: float | None = None,
+    y_label_pad: float | None = None,
     title_visible: bool | None = None,
     ticks_visible: bool | None = None,
     markers: bool | None = None,
@@ -1423,6 +1762,8 @@ def plot_coordination_profile(
             y_ticks=y_ticks,
             x_tick_rotation=x_tick_rotation,
             y_tick_rotation=y_tick_rotation,
+            x_label_pad=x_label_pad,
+            y_label_pad=y_label_pad,
             title_visible=title_visible,
             ticks_visible=ticks_visible,
             line_colors=line_colors,
@@ -1482,6 +1823,8 @@ def plot_coordination_profile(
             y_ticks=y_ticks,
             x_tick_rotation=x_tick_rotation,
             y_tick_rotation=y_tick_rotation,
+            x_label_pad=x_label_pad,
+            y_label_pad=y_label_pad,
             title_visible=title_visible,
             ticks_visible=ticks_visible,
             markers=markers,
@@ -1508,9 +1851,8 @@ def plot_coordination_profile(
         bin_width_A=bin_width,
         reducer=reducer,
     )
-    line_label_resolved = line_label
-    if line_label_resolved is None and legend:
-        line_label_resolved = f"{profile.species_a}-{profile.species_b}"
+    line_label_resolved = line_label or f"{profile.species_a}-{profile.species_b}"
+    effective_legend = False if legend is None else legend
     return plot_line_series(
         x_values,
         y_values,
@@ -1540,10 +1882,12 @@ def plot_coordination_profile(
         y_ticks=y_ticks,
         x_tick_rotation=x_tick_rotation,
         y_tick_rotation=y_tick_rotation,
+        x_label_pad=x_label_pad,
+        y_label_pad=y_label_pad,
         title_visible=title_visible,
         ticks_visible=ticks_visible,
         markers=markers,
-        legend=legend,
+        legend=effective_legend,
         legend_title=legend_title,
         legend_loc=legend_loc,
         capture_state=capture_state,
@@ -1580,6 +1924,8 @@ def plot_coordination_profiles(
     y_ticks: list[float] | tuple[float, ...] | None = None,
     x_tick_rotation: float | None = None,
     y_tick_rotation: float | None = None,
+    x_label_pad: float | None = None,
+    y_label_pad: float | None = None,
     title_visible: bool | None = None,
     ticks_visible: bool | None = None,
     markers: bool | None = None,
@@ -1633,6 +1979,8 @@ def plot_coordination_profiles(
             y_ticks=y_ticks,
             x_tick_rotation=x_tick_rotation,
             y_tick_rotation=y_tick_rotation,
+            x_label_pad=x_label_pad,
+            y_label_pad=y_label_pad,
             title_visible=title_visible,
             ticks_visible=ticks_visible,
             line_colors=line_colors,
@@ -1684,6 +2032,8 @@ def plot_coordination_profiles(
             y_ticks=y_ticks,
             x_tick_rotation=x_tick_rotation,
             y_tick_rotation=y_tick_rotation,
+            x_label_pad=x_label_pad,
+            y_label_pad=y_label_pad,
             title_visible=title_visible,
             ticks_visible=ticks_visible,
             markers=markers,
@@ -1756,6 +2106,8 @@ def plot_coordination_profiles(
             y_ticks=y_ticks,
             x_tick_rotation=x_tick_rotation,
             y_tick_rotation=y_tick_rotation,
+            x_label_pad=x_label_pad,
+            y_label_pad=y_label_pad,
             title_visible=title_visible,
             ticks_visible=ticks_visible,
             markers=markers,

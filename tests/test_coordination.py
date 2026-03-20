@@ -1,4 +1,5 @@
 import json
+from types import SimpleNamespace
 
 import h5py
 import numpy as np
@@ -70,6 +71,57 @@ def test_compute_coordination_profile_tracks_continuous_cn_and_surface_distance(
     assert 0.0 < profile.coordination_number[1, 0] < 1.0
 
 
+def test_coordination_analysis_reports_progress_for_cutoff_and_values(monkeypatch):
+    events: list[tuple[str, object]] = []
+
+    class _DummyProgressBar:
+        def __init__(self, *, desc, total=None, unit="it", **_kwargs):
+            self.desc = desc
+            self.total = total
+            self.unit = unit
+
+        def __enter__(self):
+            events.append(("enter", self.desc, self.total, self.unit))
+            return self
+
+        def update(self, n=1):
+            events.append(("update", self.desc, n))
+
+        def close(self):
+            events.append(("close", self.desc))
+
+        def __exit__(self, exc_type, exc, tb):
+            self.close()
+
+    monkeypatch.setattr(coordination_module, "ProgressBar", _DummyProgressBar)
+
+    frames = _coordination_test_frames()
+    cutoff = resolve_coordination_cutoff(
+        frames=frames,
+        species_a="O",
+        species_b="H",
+        cutoff_A=None,
+        cutoff_rdf_path=None,
+        cutoff_from_rdf=False,
+    )
+    profile = compute_coordination_profile(
+        frames,
+        species_a="O",
+        species_b="H",
+        axis="z",
+        timestep_fs=2.0,
+        surface_mode="rough",
+        surface_elements=["Pt"],
+        cutoff_resolution=cutoff,
+    )
+
+    assert profile.coordination_number.shape == (2, 1)
+    entered = [event[1] for event in events if event[0] == "enter"]
+    assert any("Coordination values" in desc for desc in entered)
+    updates = [event for event in events if event[0] == "update"]
+    assert updates
+
+
 def test_resolve_coordination_cutoff_from_rdf_file_saves_diagnostic_plot(tmp_path):
     rdf_path = tmp_path / "reference_rdf.h5"
     diagnostic = tmp_path / "reference_rdf_cutoff.png"
@@ -103,13 +155,24 @@ def test_resolve_coordination_cutoff_from_rdf_file_saves_diagnostic_plot(tmp_pat
 
 
 def test_resolve_coordination_cutoff_defaults_to_sampled_rdf(monkeypatch):
-    def _fake_compute_reference_rdf(*args, **kwargs):
-        return (
-            np.array([0.25, 0.75, 1.25, 1.75, 2.25, 2.75], dtype=float),
-            np.array([0.2, 1.8, 1.2, 0.35, 0.55, 0.9], dtype=float),
-        )
-
-    monkeypatch.setattr(coordination_module, "_compute_reference_rdf", _fake_compute_reference_rdf)
+    bin_edges = np.array([0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0], dtype=float)
+    counts = np.array([0.2, 1.8, 1.2, 0.35, 0.55, 0.9], dtype=float)
+    monkeypatch.setattr(
+        coordination_module,
+        "_build_reference_rdf_config",
+        lambda *args, **kwargs: (
+            bin_edges,
+            SimpleNamespace(bin_edges=bin_edges),
+        ),
+    )
+    monkeypatch.setattr(
+        coordination_module,
+        "_accumulate_reference_rdf_contributions",
+        lambda *args, **kwargs: (
+            counts.copy(),
+            np.ones_like(counts),
+        ),
+    )
 
     resolution = resolve_coordination_cutoff(
         frames=_coordination_test_frames(),
@@ -123,6 +186,81 @@ def test_resolve_coordination_cutoff_defaults_to_sampled_rdf(monkeypatch):
     assert resolution.mode == "sampled_rdf"
     assert resolution.rdf_sampled_frame_index is not None
     assert resolution.cutoff_A == pytest.approx(resolution.rdf_minimum_A)
+
+
+def test_resolve_coordination_cutoff_converges_in_random_batches(monkeypatch):
+    batch_sizes: list[int] = []
+    observed_cumulative_counts: list[np.ndarray] = []
+    bin_edges = np.array([0.0, 0.5, 1.0, 1.5], dtype=float)
+    batch_size = coordination_module._DEFAULT_RDF_CONVERGENCE_BATCH_SIZE
+    min_frames = coordination_module._DEFAULT_RDF_CONVERGENCE_MIN_FRAMES
+    expected_steps = int(np.ceil(min_frames / batch_size))
+    monkeypatch.setattr(
+        coordination_module,
+        "_build_reference_rdf_config",
+        lambda *args, **kwargs: (
+            bin_edges,
+            SimpleNamespace(bin_edges=bin_edges),
+        ),
+    )
+    monkeypatch.setattr(coordination_module, "_resolve_rdf_worker_count", lambda *_args, **_kwargs: 1)
+    def _fake_accumulate(selected_frames, **_kwargs):
+        batch_sizes.append(len(selected_frames))
+        counts = np.full(bin_edges.size - 1, float(len(selected_frames)), dtype=float)
+        expected = np.full(
+            bin_edges.size - 1,
+            float(batch_size) if len(batch_sizes) == 1 else 0.0,
+            dtype=float,
+        )
+        return counts, expected
+
+    monkeypatch.setattr(
+        coordination_module,
+        "_accumulate_reference_rdf_contributions",
+        _fake_accumulate,
+    )
+    monkeypatch.setattr(
+        coordination_module,
+        "_resolve_cutoff_from_rdf_curve",
+        lambda **_kwargs: observed_cumulative_counts.append(
+            np.asarray(_kwargs["g_r"], dtype=float).copy()
+        ) or (
+            np.zeros(bin_edges.size - 1, dtype=float),
+            0.75,
+            1.55
+            if len(observed_cumulative_counts) == 1
+            else (
+                1.50020
+                if len(observed_cumulative_counts) == expected_steps - 2
+                else (
+                    1.50025
+                    if len(observed_cumulative_counts) == expected_steps - 1
+                    else 1.50023
+                )
+            ),
+        ),
+    )
+
+    frames = _coordination_test_frames() * 1200
+    resolution = resolve_coordination_cutoff(
+        frames=frames,
+        species_a="O",
+        species_b="H",
+        cutoff_A=None,
+        cutoff_rdf_path=None,
+        cutoff_from_rdf=False,
+    )
+
+    assert batch_sizes == [batch_size] * expected_steps
+    np.testing.assert_allclose(observed_cumulative_counts[0], np.full(3, 1.0))
+    np.testing.assert_allclose(observed_cumulative_counts[1], np.full(3, 2.0))
+    np.testing.assert_allclose(
+        observed_cumulative_counts[-1],
+        np.full(3, float(expected_steps)),
+    )
+    assert resolution.rdf_sampled_frame_index is not None
+    assert resolution.rdf_sampled_frame_index.size == batch_size * expected_steps
+    assert resolution.mode == "sampled_rdf"
 
 
 def test_resolve_coordination_cutoff_prefers_direct_cutoff_over_other_sources(tmp_path):
@@ -215,7 +353,7 @@ def test_plot_coordination_profile_defaults_to_distance(monkeypatch):
     )
 
     plot_coordination_profile(profile, show=False)
-    assert captured["x_label"] == "Distance to surface (A)"
+    assert captured["x_label"] == "Distance to the surface ($\\mathrm{\\AA}$)"
     assert captured["y_label"] == "Coordination number"
     assert len(captured["x"]) > 0
 
@@ -257,3 +395,35 @@ def test_plot_coordination_profile_time_uses_atom_series(monkeypatch):
     assert captured["x_label"] == "Time (ps)"
     assert captured["labels"] == ["O[2]", "O[3]"]
     assert len(captured["y_series"]) == 2
+
+
+def test_plot_coordination_time_distance_ignores_marker_only_line_kwargs(tmp_path):
+    profile = CoordinationProfile(
+        species_a="O",
+        species_b="H",
+        axis="z",
+        atom_indices=np.array([2]),
+        frame_index=np.array([0, 1, 2]),
+        step=np.array([0.0, 1.0, 2.0]),
+        time_fs=np.array([0.0, 2.0, 4.0]),
+        time_ps=np.array([0.0, 0.002, 0.004]),
+        distance_to_surface=np.array([[0.8], [1.0], [1.1]], dtype=float),
+        coordination_number=np.array([[1.0], [0.5], [0.8]], dtype=float),
+        n_frames=3,
+        n_atoms=1,
+        coordinate_mode="distance",
+        cutoff_A=1.0,
+        cutoff_smoothing_width_A=0.4,
+    )
+
+    output = tmp_path / "coordination_time_distance.png"
+    result = plot_coordination_profile(
+        profile,
+        component="time-distance",
+        line_kwargs={"markersize": 9.0, "marker": "o", "alpha": 0.7},
+        output=output,
+        show=False,
+    )
+
+    assert result == output.resolve()
+    assert output.exists()

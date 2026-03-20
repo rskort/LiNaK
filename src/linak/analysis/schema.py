@@ -9,6 +9,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
+from uuid import uuid4
 
 import numpy as np
 
@@ -130,6 +131,7 @@ def build_profile_metadata(
 
     payload.setdefault("analysis", schema.analysis)
     payload["analysis_schema_version"] = schema.version
+    payload.setdefault("profile_uid", uuid4().hex)
     return payload
 
 

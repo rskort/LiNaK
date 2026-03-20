@@ -33,6 +33,7 @@ from .schema import (
 from ..plot.plotting import (
     DEFAULT_PLOT_STYLE,
     PlotStyle,
+    _prepare_plot_series_data,
     normalize_backend_name as normalize_backend_name,
     plot_line_series,
     plot_multi_line_series,
@@ -1864,17 +1865,17 @@ def _density_x_data(
                 "offset; using distance coordinates.",
                 profile.species,
             )
-            return profile.bin_centers, "Distance to surface (A)"
+            return profile.bin_centers, "Distance to the surface ($\\mathrm{\\AA}$)"
         return profile.bin_centers, f"{profile.axis.upper()} (A)"
 
     if x_mode == "distance":
         if profile.coordinate_mode == "distance":
-            return profile.bin_centers, "Distance to surface (A)"
+            return profile.bin_centers, "Distance to the surface ($\\mathrm{\\AA}$)"
         if _profile_has_surface_reference(profile):
             assert profile.surface_position is not None
             return (
                 profile.bin_centers - float(profile.surface_position),
-                "Distance to surface (A)",
+                "Distance to the surface ($\\mathrm{\\AA}$)",
             )
         LOGGER.warning(
             "Density profile '%s' has no surface reference; falling back to axis coordinates.",
@@ -1913,7 +1914,7 @@ def _density_y_data(
             number_density=profile.number_density,
             number_density_units=profile.number_density_units,
         )
-        return density_values, units, "Mass density"
+        return density_values, units, "Density"
 
     raise ValueError(f"Unsupported density quantity '{quantity}'. Choose 'mass' or 'number'.")
 
@@ -2030,6 +2031,44 @@ def _density_auto_plot_limits(
     return auto_x, auto_y
 
 
+def _prepared_density_auto_limit_series(
+    *,
+    x_series: list[np.ndarray],
+    y_series: list[np.ndarray],
+    labels: list[str],
+    series_enabled: list[bool] | None = None,
+    x_bin_width: float | None = None,
+    x_bin_reducer: str | None = None,
+    series_normalization_modes: list[str] | None = None,
+    series_normalization_values: list[float | None] | None = None,
+    series_normalization_x_refs: list[float | None] | None = None,
+) -> tuple[list[np.ndarray], list[np.ndarray]]:
+    visible_indices = list(range(len(labels)))
+    if series_enabled is not None and len(series_enabled) == len(labels):
+        visible_indices = [index for index, enabled in enumerate(series_enabled) if bool(enabled)]
+    if not visible_indices:
+        return [], []
+
+    def _select_visible(values: list[Any] | None) -> list[Any] | None:
+        if values is None:
+            return None
+        if len(values) != len(labels):
+            return values
+        return [values[index] for index in visible_indices]
+
+    prepared_x, prepared_y, _normalized_count = _prepare_plot_series_data(
+        x_series=[x_series[index] for index in visible_indices],
+        y_series=[y_series[index] for index in visible_indices],
+        labels=[labels[index] for index in visible_indices],
+        x_bin_width=x_bin_width,
+        x_bin_reducer=x_bin_reducer,
+        series_normalization_modes=_select_visible(series_normalization_modes),
+        series_normalization_values=_select_visible(series_normalization_values),
+        series_normalization_x_refs=_select_visible(series_normalization_x_refs),
+    )
+    return prepared_x, prepared_y
+
+
 def plot_density_profile(
     profile: DensityProfile,
     output: str | Path | None = None,
@@ -2050,6 +2089,8 @@ def plot_density_profile(
     y_ticks: list[float] | tuple[float, ...] | None = None,
     x_tick_rotation: float | None = None,
     y_tick_rotation: float | None = None,
+    x_label_pad: float | None = None,
+    y_label_pad: float | None = None,
     title_visible: bool | None = None,
     ticks_visible: bool | None = None,
     markers: bool | None = None,
@@ -2094,9 +2135,20 @@ def plot_density_profile(
         series_normalization_values=series_normalization_values,
         series_normalization_x_refs=series_normalization_x_refs,
     )
+    auto_x_series, auto_y_series = _prepared_density_auto_limit_series(
+        x_series=[x_values],
+        y_series=[density_values],
+        labels=[resolved_line_label or profile.species],
+        series_enabled=[single_series.line_visible],
+        x_bin_width=x_bin_width,
+        x_bin_reducer=x_bin_reducer,
+        series_normalization_modes=[single_series.normalization_mode],
+        series_normalization_values=[single_series.normalization_value],
+        series_normalization_x_refs=[single_series.normalization_x_ref],
+    )
     auto_x_lim, auto_y_lim = _density_auto_plot_limits(
-        [x_values] if single_series.line_visible else [],
-        [density_values] if single_series.line_visible else [],
+        auto_x_series,
+        auto_y_series,
         x_scale=x_scale,
         y_scale=y_scale,
     )
@@ -2132,6 +2184,8 @@ def plot_density_profile(
         y_ticks=y_ticks,
         x_tick_rotation=x_tick_rotation,
         y_tick_rotation=y_tick_rotation,
+        x_label_pad=x_label_pad,
+        y_label_pad=y_label_pad,
         title_visible=title_visible,
         ticks_visible=ticks_visible,
         markers=markers,
@@ -2172,6 +2226,8 @@ def plot_density_profiles(
     y_ticks: list[float] | tuple[float, ...] | None = None,
     x_tick_rotation: float | None = None,
     y_tick_rotation: float | None = None,
+    x_label_pad: float | None = None,
+    y_label_pad: float | None = None,
     title_visible: bool | None = None,
     ticks_visible: bool | None = None,
     markers: bool | None = None,
@@ -2232,6 +2288,8 @@ def plot_density_profiles(
             y_ticks=y_ticks,
             x_tick_rotation=x_tick_rotation,
             y_tick_rotation=y_tick_rotation,
+            x_label_pad=x_label_pad,
+            y_label_pad=y_label_pad,
             title_visible=title_visible,
             ticks_visible=ticks_visible,
             markers=markers,
@@ -2279,11 +2337,17 @@ def plot_density_profiles(
     x_series = [_density_x_data(profile, x_mode=x_mode)[0] for profile in profiles]
     default_x_label = _density_x_data(first, x_mode=x_mode)[1]
     display_units = _format_plot_density_units(y_units)
-    auto_x_series = x_series
-    auto_y_series = y_series
-    if series_enabled is not None and len(series_enabled) == len(x_series):
-        auto_x_series = [x for x, enabled in zip(x_series, series_enabled) if bool(enabled)]
-        auto_y_series = [y for y, enabled in zip(y_series, series_enabled) if bool(enabled)]
+    auto_x_series, auto_y_series = _prepared_density_auto_limit_series(
+        x_series=x_series,
+        y_series=y_series,
+        labels=labels,
+        series_enabled=series_enabled,
+        x_bin_width=x_bin_width,
+        x_bin_reducer=x_bin_reducer,
+        series_normalization_modes=series_normalization_modes,
+        series_normalization_values=series_normalization_values,
+        series_normalization_x_refs=series_normalization_x_refs,
+    )
     auto_x_lim, auto_y_lim = _density_auto_plot_limits(
         auto_x_series,
         auto_y_series,
@@ -2322,6 +2386,8 @@ def plot_density_profiles(
         y_ticks=y_ticks,
         x_tick_rotation=x_tick_rotation,
         y_tick_rotation=y_tick_rotation,
+        x_label_pad=x_label_pad,
+        y_label_pad=y_label_pad,
         title_visible=title_visible,
         ticks_visible=ticks_visible,
         markers=markers,

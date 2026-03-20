@@ -6,7 +6,7 @@ import argparse
 from copy import deepcopy
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
-from datetime import datetime
+from importlib.metadata import PackageNotFoundError, metadata as package_metadata
 import json
 import logging
 from math import isclose
@@ -63,10 +63,12 @@ class _GuiPlotRenderContext:
     plotter_kwargs: dict[str, Any] | None
     fallback_labels_by_source: list[list[str]]
     default_series_labels: list[str]
+    series_descriptors: list[dict[str, Any]]
+    profile_filter_options: dict[str, Any] | None = None
 
     @property
     def series_count(self) -> int:
-        return len(self.default_series_labels)
+        return len(self.series_descriptors)
 
 
 _PERSISTED_PLOT_SETTING_OPTION_FLAGS = {
@@ -136,7 +138,11 @@ _PLOT_SETTINGS_COMMON_KEYS = (
     "y_ticks",
     "x_tick_rotation",
     "y_tick_rotation",
+    "x_label_pad",
+    "y_label_pad",
     "series_labels",
+    "series_descriptors",
+    "series_overrides",
     "series_enabled",
     "series_line_widths",
     "series_markers",
@@ -228,21 +234,20 @@ def _read_project_author(default: str = "Unknown") -> str:
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
     except OSError:
-        return default
+        lines = []
     for line in lines:
         match = _PROJECT_AUTHOR_LINE.match(line.strip())
         if match:
             return match.group(1)
-    return default
-
-
-def _read_project_version_date(default: str = "unknown") -> str:
-    path = _project_pyproject_path()
     try:
-        modified = path.stat().st_mtime
-    except OSError:
+        metadata = package_metadata("LiNaK")
+    except PackageNotFoundError:
         return default
-    return datetime.fromtimestamp(modified).strftime("%Y-%m-%d")
+    for key in ("Author", "Author-email", "Maintainer", "Maintainer-email"):
+        value = str(metadata.get(key) or "").strip()
+        if value:
+            return value
+    return default
 
 
 class _ProgressAwareStreamHandler(logging.StreamHandler):
@@ -538,10 +543,9 @@ def _linak_output_dir_for_sources(sources: Sequence[str | Path]) -> Path:
     resolved_sources = [Path(source).expanduser().resolve() for source in sources]
     if not resolved_sources:
         return _linak_output_dir_for_parent(Path.cwd())
-    parents = {source.parent for source in resolved_sources}
-    if len(parents) == 1:
+    if len(resolved_sources) == 1:
         return _linak_output_dir_for_parent(resolved_sources[0].parent)
-    return _linak_output_dir_for_parent(resolved_sources[0].parent)
+    return _linak_output_dir_for_parent(Path.cwd())
 
 
 def _resolve_non_overwriting_hdf5_path(path: str | Path) -> Path:
@@ -549,6 +553,30 @@ def _resolve_non_overwriting_hdf5_path(path: str | Path) -> Path:
 
     resolved = resolve_hdf5_output_path(path)
     return _unique_path_with_numeric_suffix(resolved) if resolved.exists() else resolved
+
+
+def _output_request_looks_like_directory(value: str | Path) -> bool:
+    text = str(value).strip()
+    return text.endswith(("/", "\\"))
+
+
+def _resolve_single_analysis_hdf5_output_path(
+    base_output: str | None,
+    default_output: str | Path,
+) -> Path:
+    if base_output is None:
+        return _resolve_non_overwriting_hdf5_path(default_output)
+
+    base_path = Path(base_output).expanduser()
+    default_path = Path(default_output).expanduser()
+    if _output_request_looks_like_directory(base_output) or (
+        base_path.exists() and base_path.is_dir()
+    ):
+        return _resolve_non_overwriting_hdf5_path(base_path / default_path.name)
+
+    if not base_path.suffix:
+        base_path = base_path.with_suffix(".h5")
+    return _resolve_non_overwriting_hdf5_path(base_path)
 
 
 def _default_density_hdf5_output_path(source: str | Path, species: str, axis: str) -> Path:
@@ -569,15 +597,10 @@ def _density_hdf5_output_path(
     species: str,
     axis: str,
 ) -> Path:
-    if base_output is None:
-        return _resolve_non_overwriting_hdf5_path(
-            _default_density_hdf5_output_path(source, species, axis)
-        )
-
-    base_path = Path(base_output).expanduser()
-    if not base_path.suffix:
-        base_path = base_path.with_suffix(".h5")
-    return _resolve_non_overwriting_hdf5_path(base_path)
+    return _resolve_single_analysis_hdf5_output_path(
+        base_output,
+        _default_density_hdf5_output_path(source, species, axis),
+    )
 
 
 def _normalize_source_values(value: Any) -> list[str]:
@@ -708,7 +731,13 @@ def _position_hdf5_output_paths(
 
     base_path = Path(base_output).expanduser()
     if len(profiles) == 1:
-        paths = [base_path if base_path.suffix else base_path.with_suffix(".h5")]
+        default_path = _default_position_hdf5_output_path(source, profiles[0].species, axis)
+        if _output_request_looks_like_directory(base_output) or (
+            base_path.exists() and base_path.is_dir()
+        ):
+            paths = [base_path / default_path.name]
+        else:
+            paths = [base_path if base_path.suffix else base_path.with_suffix(".h5")]
         return [_resolve_non_overwriting_hdf5_path(path) for path in paths]
 
     if base_path.suffix.lower() in {".h5", ".hdf5"}:
@@ -886,14 +915,116 @@ def _coordination_series_labels_for_profile(profile: Any) -> list[str]:
     return labels
 
 
+def _ordered_common_items_by_source(
+    items_by_source: list[list[tuple[str, ...]]],
+) -> list[tuple[str, ...]]:
+    if not items_by_source:
+        return []
+    common_items = set(items_by_source[0])
+    for source_items in items_by_source[1:]:
+        common_items &= set(source_items)
+    ordered: list[tuple[str, ...]] = []
+    seen: set[tuple[str, ...]] = set()
+    for item in items_by_source[0]:
+        if item in common_items and item not in seen:
+            ordered.append(item)
+            seen.add(item)
+    return ordered
+
+
+def _build_rdf_profile_filter_options(
+    raw_payloads_by_source: list[tuple[str, list[dict[str, Any]]]],
+) -> dict[str, Any]:
+    pairs_by_source: list[list[tuple[str, str]]] = []
+    for _source, payloads in raw_payloads_by_source:
+        source_pairs: list[tuple[str, str]] = []
+        for payload in payloads:
+            metadata = payload.get("metadata", {})
+            species_a = str(metadata.get("species_a", "")).strip()
+            species_b = str(metadata.get("species_b", "")).strip() or species_a
+            if not species_a:
+                continue
+            source_pairs.append((species_a, species_b))
+        pairs_by_source.append(source_pairs)
+
+    common_pairs = _ordered_common_items_by_source(pairs_by_source)
+    species_a_options: list[str] = []
+    species_b_by_species_a: dict[str, list[str]] = {"": []}
+    for species_a, species_b in common_pairs:
+        if species_a not in species_a_options:
+            species_a_options.append(species_a)
+        global_species_b = species_b_by_species_a[""]
+        if species_b not in global_species_b:
+            global_species_b.append(species_b)
+        species_b_by_species_a.setdefault(species_a, [])
+        if species_b not in species_b_by_species_a[species_a]:
+            species_b_by_species_a[species_a].append(species_b)
+
+    return {
+        "species_a": species_a_options,
+        "species_b_by_species_a": species_b_by_species_a,
+    }
+
+
+def _build_coordination_profile_filter_options(
+    raw_payloads_by_source: list[tuple[str, list[dict[str, Any]]]],
+) -> dict[str, Any]:
+    triples_by_source: list[list[tuple[str, str, str]]] = []
+    for _source, payloads in raw_payloads_by_source:
+        source_triples: list[tuple[str, str, str]] = []
+        for payload in payloads:
+            metadata = payload.get("metadata", {})
+            species_a = str(metadata.get("species_a", "")).strip()
+            species_b = str(metadata.get("species_b", "")).strip() or species_a
+            axis = str(metadata.get("axis", "z")).strip().lower() or "z"
+            if not species_a:
+                continue
+            source_triples.append((species_a, species_b, axis))
+        triples_by_source.append(source_triples)
+
+    common_triples = _ordered_common_items_by_source(triples_by_source)
+    species_a_options: list[str] = []
+    species_b_by_species_a: dict[str, list[str]] = {"": []}
+    axes: list[str] = []
+    axes_by_species_pair: dict[str, dict[str, list[str]]] = {"": {"": []}}
+    for species_a, species_b, axis in common_triples:
+        if species_a not in species_a_options:
+            species_a_options.append(species_a)
+        global_species_b = species_b_by_species_a[""]
+        if species_b not in global_species_b:
+            global_species_b.append(species_b)
+        species_b_by_species_a.setdefault(species_a, [])
+        if species_b not in species_b_by_species_a[species_a]:
+            species_b_by_species_a[species_a].append(species_b)
+        if axis not in axes:
+            axes.append(axis)
+        axes_by_species_pair.setdefault("", {}).setdefault("", [])
+        if axis not in axes_by_species_pair[""][""]:
+            axes_by_species_pair[""][""].append(axis)
+        axes_by_species_pair.setdefault(species_a, {}).setdefault(species_b, [])
+        if axis not in axes_by_species_pair[species_a][species_b]:
+            axes_by_species_pair[species_a][species_b].append(axis)
+
+    return {
+        "species_a": species_a_options,
+        "species_b_by_species_a": species_b_by_species_a,
+        "axes": axes,
+        "axes_by_species_pair": axes_by_species_pair,
+    }
+
+
 def _load_density_plot_profiles(
     *,
     sources: list[str],
     species: str | None,
     axis: str | None,
-) -> tuple[list[Any], list[list[str]]]:
+) -> tuple[list[Any], list[list[str]], list[list[str]]]:
     from .analysis.density import load_density_profiles
 
+    raw_payloads_by_source = _read_analysis_profile_payloads_by_source(
+        sources=sources,
+        analysis="density",
+    )
     profiles_by_source: list[tuple[str, list[Any]]] = []
     for source in sources:
         profiles = load_density_profiles(source, axis=axis, species=species)
@@ -901,30 +1032,53 @@ def _load_density_plot_profiles(
 
     plot_profiles: list[Any] = []
     fallback_labels_by_source: list[list[str]] = []
+    series_id_segments_by_source: list[list[str]] = []
     if len(sources) > 1:
-        for source, profiles in profiles_by_source:
+        for source_index, (source, profiles) in enumerate(profiles_by_source):
+            raw_payloads = raw_payloads_by_source[source_index][1]
+            if len(raw_payloads) != len(profiles):
+                raise ValueError("Density profile metadata does not match loaded profiles.")
             source_label = Path(source).name or source
             source_labels: list[str] = []
-            for profile in profiles:
+            source_ids: list[str] = []
+            for profile_index, profile in enumerate(profiles):
+                payload = raw_payloads[profile_index]
                 rendered_species = f"{source_label}:{profile.species}"
                 source_labels.append(rendered_species)
+                source_ids.append(
+                    _profile_uid_from_payload(payload, fallback_prefix="density", index=profile_index)
+                )
                 plot_profiles.append(replace(profile, species=rendered_species))
             fallback_labels_by_source.append(source_labels)
+            series_id_segments_by_source.append(source_ids)
     else:
         flattened = _flatten_profiles_by_source(profiles_by_source)
         plot_profiles.extend(flattened)
         fallback_labels_by_source.append([profile.species for profile in flattened])
+        raw_payloads = raw_payloads_by_source[0][1]
+        if len(raw_payloads) != len(flattened):
+            raise ValueError("Density profile metadata does not match loaded profiles.")
+        series_id_segments_by_source.append(
+            [
+                _profile_uid_from_payload(payload, fallback_prefix="density", index=profile_index)
+                for profile_index, payload in enumerate(raw_payloads)
+            ]
+        )
 
-    return plot_profiles, fallback_labels_by_source
+    return plot_profiles, fallback_labels_by_source, series_id_segments_by_source
 
 
 def _load_msd_plot_profiles(
     *,
     sources: list[str],
     species: str | None,
-) -> tuple[list[Any], list[list[str]]]:
+) -> tuple[list[Any], list[list[str]], list[list[str]]]:
     from .analysis.msd import load_msd_profiles
 
+    raw_payloads_by_source = _read_analysis_profile_payloads_by_source(
+        sources=sources,
+        analysis="msd",
+    )
     profiles_by_source: list[tuple[str, list[Any]]] = []
     for source in sources:
         profiles = load_msd_profiles(source, species=species)
@@ -932,21 +1086,40 @@ def _load_msd_plot_profiles(
 
     plot_profiles: list[Any] = []
     fallback_labels_by_source: list[list[str]] = []
+    series_id_segments_by_source: list[list[str]] = []
     if len(sources) > 1:
-        for source, profiles in profiles_by_source:
+        for source_index, (source, profiles) in enumerate(profiles_by_source):
+            raw_payloads = raw_payloads_by_source[source_index][1]
+            if len(raw_payloads) != len(profiles):
+                raise ValueError("MSD profile metadata does not match loaded profiles.")
             source_label = Path(source).name or source
             source_labels: list[str] = []
-            for profile in profiles:
+            source_ids: list[str] = []
+            for profile_index, profile in enumerate(profiles):
+                payload = raw_payloads[profile_index]
                 rendered_species = f"{source_label}:{profile.species}"
                 source_labels.append(rendered_species)
+                source_ids.append(
+                    _profile_uid_from_payload(payload, fallback_prefix="msd", index=profile_index)
+                )
                 plot_profiles.append(replace(profile, species=rendered_species))
             fallback_labels_by_source.append(source_labels)
+            series_id_segments_by_source.append(source_ids)
     else:
         flattened = _flatten_profiles_by_source(profiles_by_source)
         plot_profiles.extend(flattened)
         fallback_labels_by_source.append([profile.species for profile in flattened])
+        raw_payloads = raw_payloads_by_source[0][1]
+        if len(raw_payloads) != len(flattened):
+            raise ValueError("MSD profile metadata does not match loaded profiles.")
+        series_id_segments_by_source.append(
+            [
+                _profile_uid_from_payload(payload, fallback_prefix="msd", index=profile_index)
+                for profile_index, payload in enumerate(raw_payloads)
+            ]
+        )
 
-    return plot_profiles, fallback_labels_by_source
+    return plot_profiles, fallback_labels_by_source, series_id_segments_by_source
 
 
 def _load_rdf_plot_profiles(
@@ -954,10 +1127,41 @@ def _load_rdf_plot_profiles(
     sources: list[str],
     species_a: str | None,
     species_b: str | None,
-) -> tuple[list[Any], list[list[str]]]:
-    from .analysis.rdf import load_rdf_profiles
+) -> tuple[list[Any], list[list[str]], list[list[str]]]:
+    from .analysis.rdf import load_rdf_profiles, _normalize_species as _normalize_rdf_species
 
     resolved_species_b = species_b if species_b is not None else species_a
+    raw_payloads_by_source = _read_analysis_profile_payloads_by_source(
+        sources=sources,
+        analysis="rdf",
+    )
+    wanted_species_a = (
+        None if species_a is None or not str(species_a).strip() else _normalize_rdf_species(species_a)
+    )
+    wanted_species_b = (
+        None
+        if resolved_species_b is None or not str(resolved_species_b).strip()
+        else _normalize_rdf_species(resolved_species_b)
+    )
+    filtered_raw_payloads_by_source: list[tuple[str, list[dict[str, Any]]]] = []
+    for source, payloads in raw_payloads_by_source:
+        filtered_payloads: list[dict[str, Any]] = []
+        for payload in payloads:
+            metadata = payload.get("metadata", {})
+            meta_species_a = str(metadata.get("species_a", "")).strip() or "UNKNOWN"
+            meta_species_b = str(metadata.get("species_b", "")).strip() or meta_species_a
+            if (
+                wanted_species_a is not None
+                and _normalize_rdf_species(meta_species_a) != wanted_species_a
+            ):
+                continue
+            if (
+                wanted_species_b is not None
+                and _normalize_rdf_species(meta_species_b) != wanted_species_b
+            ):
+                continue
+            filtered_payloads.append(payload)
+        filtered_raw_payloads_by_source.append((source, filtered_payloads))
     profiles_by_source: list[tuple[str, list[Any]]] = []
     for source in sources:
         profiles = load_rdf_profiles(source, species_a=species_a, species_b=resolved_species_b)
@@ -965,23 +1169,42 @@ def _load_rdf_plot_profiles(
 
     plot_profiles: list[Any] = []
     fallback_labels_by_source: list[list[str]] = []
+    series_id_segments_by_source: list[list[str]] = []
     if len(sources) > 1:
-        for source, profiles in profiles_by_source:
+        for source_index, (source, profiles) in enumerate(profiles_by_source):
+            raw_payloads = filtered_raw_payloads_by_source[source_index][1]
+            if len(raw_payloads) != len(profiles):
+                raise ValueError("RDF profile metadata does not match loaded profiles.")
             source_label = Path(source).name or source
             source_labels: list[str] = []
-            for profile in profiles:
+            source_ids: list[str] = []
+            for profile_index, profile in enumerate(profiles):
+                payload = raw_payloads[profile_index]
                 rendered_species_a = f"{source_label}:{profile.species_a}"
                 source_labels.append(f"{rendered_species_a}-{profile.species_b}")
+                source_ids.append(
+                    _profile_uid_from_payload(payload, fallback_prefix="rdf", index=profile_index)
+                )
                 plot_profiles.append(replace(profile, species_a=rendered_species_a))
             fallback_labels_by_source.append(source_labels)
+            series_id_segments_by_source.append(source_ids)
     else:
         flattened = _flatten_profiles_by_source(profiles_by_source)
         plot_profiles.extend(flattened)
         fallback_labels_by_source.append(
             [f"{profile.species_a}-{profile.species_b}" for profile in flattened]
         )
+        raw_payloads = filtered_raw_payloads_by_source[0][1]
+        if len(raw_payloads) != len(flattened):
+            raise ValueError("RDF profile metadata does not match loaded profiles.")
+        series_id_segments_by_source.append(
+            [
+                _profile_uid_from_payload(payload, fallback_prefix="rdf", index=profile_index)
+                for profile_index, payload in enumerate(raw_payloads)
+            ]
+        )
 
-    return plot_profiles, fallback_labels_by_source
+    return plot_profiles, fallback_labels_by_source, series_id_segments_by_source
 
 
 def _load_position_plot_profiles(
@@ -989,9 +1212,13 @@ def _load_position_plot_profiles(
     sources: list[str],
     species: str | None,
     axis: str | None,
-) -> tuple[list[Any], list[list[str]]]:
+) -> tuple[list[Any], list[list[str]], list[list[str]]]:
     from .analysis.position import load_position_profiles
 
+    raw_payloads_by_source = _read_analysis_profile_payloads_by_source(
+        sources=sources,
+        analysis="position",
+    )
     profiles_by_source: list[tuple[str, list[Any]]] = []
     for source in sources:
         profiles = load_position_profiles(source, species=species, axis=axis)
@@ -999,25 +1226,54 @@ def _load_position_plot_profiles(
 
     plot_profiles: list[Any] = []
     fallback_labels_by_source: list[list[str]] = []
+    series_id_segments_by_source: list[list[str]] = []
     if len(sources) > 1:
-        for source, profiles in profiles_by_source:
+        for source_index, (source, profiles) in enumerate(profiles_by_source):
+            raw_payloads = raw_payloads_by_source[source_index][1]
+            if len(raw_payloads) != len(profiles):
+                raise ValueError("Position profile metadata does not match loaded profiles.")
             source_label = Path(source).name or source
             source_labels: list[str] = []
-            for profile in profiles:
+            source_ids: list[str] = []
+            for profile_index, profile in enumerate(profiles):
+                payload = raw_payloads[profile_index]
+                profile_uid = _profile_uid_from_payload(
+                    payload,
+                    fallback_prefix="position",
+                    index=profile_index,
+                )
                 rendered_species = f"{source_label}:{profile.species}"
                 rendered_profile = replace(profile, species=rendered_species)
                 plot_profiles.append(rendered_profile)
                 source_labels.extend(_position_series_labels_for_profile(rendered_profile))
+                source_ids.extend(
+                    [f"{profile_uid}:atom:{int(atom_index)}" for atom_index in profile.atom_indices.tolist()]
+                )
             fallback_labels_by_source.append(source_labels)
+            series_id_segments_by_source.append(source_ids)
     else:
         flattened = _flatten_profiles_by_source(profiles_by_source)
         plot_profiles.extend(flattened)
         flattened_source_labels: list[str] = []
-        for profile in flattened:
+        flattened_source_ids: list[str] = []
+        raw_payloads = raw_payloads_by_source[0][1]
+        if len(raw_payloads) != len(flattened):
+            raise ValueError("Position profile metadata does not match loaded profiles.")
+        for profile_index, profile in enumerate(flattened):
+            payload = raw_payloads[profile_index]
+            profile_uid = _profile_uid_from_payload(
+                payload,
+                fallback_prefix="position",
+                index=profile_index,
+            )
             flattened_source_labels.extend(_position_series_labels_for_profile(profile))
+            flattened_source_ids.extend(
+                [f"{profile_uid}:atom:{int(atom_index)}" for atom_index in profile.atom_indices.tolist()]
+            )
         fallback_labels_by_source.append(flattened_source_labels)
+        series_id_segments_by_source.append(flattened_source_ids)
 
-    return plot_profiles, fallback_labels_by_source
+    return plot_profiles, fallback_labels_by_source, series_id_segments_by_source
 
 
 def _load_coordination_plot_profiles(
@@ -1027,11 +1283,54 @@ def _load_coordination_plot_profiles(
     species_b: str | None,
     axis: str | None,
     component: str,
-) -> tuple[list[Any], list[list[str]]]:
-    from .analysis.coordination import load_coordination_profiles
+) -> tuple[list[Any], list[list[str]], list[list[str]]]:
+    from .analysis.coordination import (
+        _normalize_axis as _normalize_coordination_axis,
+        _normalize_species as _normalize_coordination_species,
+        load_coordination_profiles,
+    )
 
     normalized_component = str(component).strip().lower().replace("_", "-")
     resolved_species_b = species_b if species_b is not None else species_a
+    raw_payloads_by_source = _read_analysis_profile_payloads_by_source(
+        sources=sources,
+        analysis="coordination",
+    )
+    wanted_species_a = (
+        None
+        if species_a is None or not str(species_a).strip()
+        else _normalize_coordination_species(species_a)
+    )
+    wanted_species_b = (
+        None
+        if resolved_species_b is None or not str(resolved_species_b).strip()
+        else _normalize_coordination_species(resolved_species_b)
+    )
+    wanted_axis = (
+        None if axis is None or not str(axis).strip() else _normalize_coordination_axis(axis)
+    )
+    filtered_raw_payloads_by_source: list[tuple[str, list[dict[str, Any]]]] = []
+    for source, payloads in raw_payloads_by_source:
+        filtered_payloads: list[dict[str, Any]] = []
+        for payload in payloads:
+            metadata = payload.get("metadata", {})
+            meta_species_a = str(metadata.get("species_a", "")).strip() or "UNKNOWN"
+            meta_species_b = str(metadata.get("species_b", "")).strip() or meta_species_a
+            meta_axis = str(metadata.get("axis", "z")).strip().lower() or "z"
+            if (
+                wanted_species_a is not None
+                and _normalize_coordination_species(meta_species_a) != wanted_species_a
+            ):
+                continue
+            if (
+                wanted_species_b is not None
+                and _normalize_coordination_species(meta_species_b) != wanted_species_b
+            ):
+                continue
+            if wanted_axis is not None and _normalize_coordination_axis(meta_axis) != wanted_axis:
+                continue
+            filtered_payloads.append(payload)
+        filtered_raw_payloads_by_source.append((source, filtered_payloads))
     profiles_by_source: list[tuple[str, list[Any]]] = []
     for source in sources:
         profiles = load_coordination_profiles(
@@ -1044,31 +1343,62 @@ def _load_coordination_plot_profiles(
 
     plot_profiles: list[Any] = []
     fallback_labels_by_source: list[list[str]] = []
+    series_id_segments_by_source: list[list[str]] = []
     if len(sources) > 1:
-        for source, profiles in profiles_by_source:
+        for source_index, (source, profiles) in enumerate(profiles_by_source):
+            raw_payloads = filtered_raw_payloads_by_source[source_index][1]
+            if len(raw_payloads) != len(profiles):
+                raise ValueError("Coordination profile metadata does not match loaded profiles.")
             source_label = Path(source).name or source
             source_labels: list[str] = []
-            for profile in profiles:
+            source_ids: list[str] = []
+            for profile_index, profile in enumerate(profiles):
+                payload = raw_payloads[profile_index]
+                profile_uid = _profile_uid_from_payload(
+                    payload,
+                    fallback_prefix="coordination",
+                    index=profile_index,
+                )
                 rendered_species_a = f"{source_label}:{profile.species_a}"
                 rendered_profile = replace(profile, species_a=rendered_species_a)
                 plot_profiles.append(rendered_profile)
                 if normalized_component == "distance":
                     source_labels.append(f"{rendered_species_a}-{profile.species_b}")
+                    source_ids.append(profile_uid)
                 else:
                     source_labels.extend(_coordination_series_labels_for_profile(rendered_profile))
+                    source_ids.extend(
+                        [f"{profile_uid}:atom:{int(atom_index)}" for atom_index in profile.atom_indices.tolist()]
+                    )
             fallback_labels_by_source.append(source_labels)
+            series_id_segments_by_source.append(source_ids)
     else:
         flattened = _flatten_profiles_by_source(profiles_by_source)
         plot_profiles.extend(flattened)
         flattened_source_labels: list[str] = []
-        for profile in flattened:
+        flattened_source_ids: list[str] = []
+        raw_payloads = filtered_raw_payloads_by_source[0][1]
+        if len(raw_payloads) != len(flattened):
+            raise ValueError("Coordination profile metadata does not match loaded profiles.")
+        for profile_index, profile in enumerate(flattened):
+            payload = raw_payloads[profile_index]
+            profile_uid = _profile_uid_from_payload(
+                payload,
+                fallback_prefix="coordination",
+                index=profile_index,
+            )
             if normalized_component == "distance":
                 flattened_source_labels.append(f"{profile.species_a}-{profile.species_b}")
+                flattened_source_ids.append(profile_uid)
             else:
                 flattened_source_labels.extend(_coordination_series_labels_for_profile(profile))
+                flattened_source_ids.extend(
+                    [f"{profile_uid}:atom:{int(atom_index)}" for atom_index in profile.atom_indices.tolist()]
+                )
         fallback_labels_by_source.append(flattened_source_labels)
+        series_id_segments_by_source.append(flattened_source_ids)
 
-    return plot_profiles, fallback_labels_by_source
+    return plot_profiles, fallback_labels_by_source, series_id_segments_by_source
 
 
 def _positive_float(value: str) -> float:
@@ -2092,6 +2422,29 @@ def _set_cell_on_frames(frames: list[Atoms], cell: tuple[float, float, float]) -
         frame.set_pbc((True, True, True))
 
 
+def _preflight_resolve_cell(
+    trajectory: str | Path,
+    *,
+    cell: tuple[float, float, float] | None,
+    input_path: str | None,
+    analysis_name: str,
+) -> tuple[Any | None, Exception | None]:
+    from .resolution import resolve_analysis_cell
+
+    try:
+        return resolve_analysis_cell(trajectory, cell=cell, input_path=input_path), None
+    except (FileNotFoundError, ValueError) as exc:
+        if cell is not None:
+            raise
+        LOGGER.info(
+            "Could not resolve cell from simulation input before loading trajectory for %s "
+            "analysis; checking trajectory metadata after load. %s",
+            analysis_name,
+            exc,
+        )
+        return None, exc
+
+
 def _resolve_and_apply_required_cell(
     frames: list[Atoms],
     trajectory: str | Path,
@@ -2099,6 +2452,8 @@ def _resolve_and_apply_required_cell(
     cell: tuple[float, float, float] | None,
     input_path: str | None,
     analysis_name: str,
+    pre_resolved: Any | None = None,
+    preflight_error: Exception | None = None,
 ) -> tuple[tuple[float, float, float], str, str | None]:
     from .resolution import resolve_analysis_cell
 
@@ -2115,13 +2470,19 @@ def _resolve_and_apply_required_cell(
         )
         return resolved, "trajectory metadata", None
 
-    try:
-        cell_resolution = resolve_analysis_cell(
-            trajectory,
-            cell=cell,
-            input_path=input_path,
-        )
-    except (FileNotFoundError, ValueError) as exc:
+    cell_resolution = pre_resolved
+    if cell_resolution is None and preflight_error is None:
+        try:
+            cell_resolution = resolve_analysis_cell(
+                trajectory,
+                cell=cell,
+                input_path=input_path,
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            preflight_error = exc
+
+    if cell_resolution is None:
+        exc = preflight_error or ValueError("Could not resolve analysis cell.")
         if cell is None and has_trajectory_cell:
             resolved = _cell_lengths_from_frame(frames[0])
             LOGGER.info(
@@ -2131,7 +2492,8 @@ def _resolve_and_apply_required_cell(
                 exc,
             )
             return resolved, "trajectory metadata", None
-        raise
+        raise exc
+
     resolved_cell = cell_resolution.cell_angstrom
     LOGGER.info(
         "Using cell for %s analysis: A=%.6g, B=%.6g, C=%.6g Angstrom.",
@@ -2154,6 +2516,8 @@ def _maybe_apply_density_cell(
     *,
     cell: tuple[float, float, float] | None,
     input_path: str | None,
+    pre_resolved: Any | None = None,
+    preflight_error: Exception | None = None,
 ) -> tuple[tuple[float, float, float] | None, str, str | None]:
     """Try to resolve/apply a periodic cell for density; return None on fallback."""
     from .resolution import resolve_analysis_cell
@@ -2170,13 +2534,19 @@ def _maybe_apply_density_cell(
         )
         return resolved, "trajectory metadata", None
 
-    try:
-        cell_resolution = resolve_analysis_cell(
-            trajectory,
-            cell=cell,
-            input_path=input_path,
-        )
-    except (FileNotFoundError, ValueError) as exc:
+    cell_resolution = pre_resolved
+    if cell_resolution is None and preflight_error is None:
+        try:
+            cell_resolution = resolve_analysis_cell(
+                trajectory,
+                cell=cell,
+                input_path=input_path,
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            preflight_error = exc
+
+    if cell_resolution is None:
+        exc = preflight_error or ValueError("Could not resolve density cell.")
         if cell is None and has_trajectory_cell:
             resolved = _cell_lengths_from_frame(frames[0])
             LOGGER.info(
@@ -2190,7 +2560,6 @@ def _maybe_apply_density_cell(
             exc,
         )
         return None, "unresolved", None
-
     resolved_cell = cell_resolution.cell_angstrom
     LOGGER.info(
         "Using cell for density analysis: A=%.6g, B=%.6g, C=%.6g Angstrom.",
@@ -2206,38 +2575,95 @@ def _maybe_apply_density_cell(
     )
 
 
-def _resolve_msd_timestep_fs(
+def _preflight_resolve_analysis_timestep_fs(
     trajectory: str | Path,
     *,
     timestep_fs: float | None,
     input_path: str | None,
-    frames: list[Atoms] | None = None,
-) -> tuple[float, str, str | None, float | None, int | None]:
+    analysis_name: str,
+) -> tuple[Any | None, Exception | None]:
     from .resolution import resolve_analysis_timestep_fs
 
     try:
-        resolved = resolve_analysis_timestep_fs(
-            trajectory,
-            timestep_fs=timestep_fs,
-            input_path=input_path,
-            frames=frames,
-        )
-        LOGGER.info("Using timestep for MSD analysis: %.6g fs.", resolved.frame_timestep_fs)
         return (
-            resolved.frame_timestep_fs,
-            resolved.source,
-            str(resolved.input_path) if resolved.input_path is not None else None,
-            resolved.md_timestep_fs,
-            resolved.trajectory_stride_md,
+            resolve_analysis_timestep_fs(
+                trajectory,
+                timestep_fs=timestep_fs,
+                input_path=input_path,
+            ),
+            None,
         )
     except ValueError as exc:
         if timestep_fs is not None:
             raise
         LOGGER.info(
-            "No timestep resolved for MSD analysis; using default 0.5 fs. %s",
+            "Could not resolve timestep from simulation input before loading trajectory for %s "
+            "analysis; checking trajectory metadata after load. %s",
+            analysis_name,
+            exc,
+        )
+        return None, exc
+
+
+def _resolve_analysis_timestep_fs(
+    trajectory: str | Path,
+    *,
+    timestep_fs: float | None,
+    input_path: str | None,
+    analysis_name: str,
+    frames: list[Atoms] | None = None,
+    pre_resolved: Any | None = None,
+    preflight_error: Exception | None = None,
+) -> tuple[float, str, str | None, float | None, int | None]:
+    from .resolution import TimestepResolution, _extract_metadata_timestep_details, resolve_analysis_timestep_fs
+
+    resolved = pre_resolved
+    if resolved is None and preflight_error is None:
+        try:
+            resolved = resolve_analysis_timestep_fs(
+                trajectory,
+                timestep_fs=timestep_fs,
+                input_path=input_path,
+                frames=frames,
+            )
+        except ValueError as exc:
+            preflight_error = exc
+
+    if resolved is None and frames is not None:
+        metadata_timestep, metadata_md_timestep, metadata_stride = _extract_metadata_timestep_details(
+            frames
+        )
+        if metadata_timestep is not None:
+            resolved = TimestepResolution(
+                frame_timestep_fs=metadata_timestep,
+                source="trajectory metadata",
+                md_timestep_fs=metadata_md_timestep,
+                trajectory_stride_md=metadata_stride,
+            )
+
+    if resolved is None:
+        exc = preflight_error or ValueError("Could not resolve analysis timestep.")
+        if timestep_fs is not None or input_path is not None:
+            raise exc
+        LOGGER.info(
+            "No timestep resolved for %s analysis; using default 0.5 fs. %s",
+            analysis_name,
             exc,
         )
         return 0.5, "fallback default", None, None, None
+
+    LOGGER.info(
+        "Using timestep for %s analysis: %.6g fs.",
+        analysis_name,
+        resolved.frame_timestep_fs,
+    )
+    return (
+        resolved.frame_timestep_fs,
+        resolved.source,
+        str(resolved.input_path) if resolved.input_path is not None else None,
+        resolved.md_timestep_fs,
+        resolved.trajectory_stride_md,
+    )
 
 
 def _resolve_combined_msd_timestep_fs(timesteps_by_source: list[tuple[str, float]]) -> float:
@@ -2288,6 +2714,25 @@ def _normalize_series_setting_list(value: Any) -> list[str] | None:
             return None
         cleaned.append(token)
     return cleaned or None
+
+
+def _normalize_line_color_setting_list(value: Any) -> list[str] | None:
+    if not isinstance(value, (list, tuple)):
+        return None
+    cleaned = [str(item).strip() for item in value]
+    return cleaned if any(cleaned) else None
+
+
+def _coerce_series_override_map(value: Any) -> dict[str, dict[str, Any]]:
+    if not isinstance(value, dict):
+        return {}
+    overrides: dict[str, dict[str, Any]] = {}
+    for raw_key, raw_value in value.items():
+        series_id = str(raw_key).strip()
+        if not series_id or not isinstance(raw_value, dict):
+            continue
+        overrides[series_id] = dict(raw_value)
+    return overrides
 
 
 def _default_multi_series_colors(count: int) -> list[str]:
@@ -2372,7 +2817,7 @@ def _resolve_multi_source_series_settings(
                     len(saved_labels),
                 )
 
-        saved_colors = _normalize_series_setting_list(saved_profile.get("line_colors"))
+        saved_colors = _normalize_line_color_setting_list(saved_profile.get("line_colors"))
         if saved_colors is not None:
             if len(saved_colors) == expected_count:
                 saved_color_segments[index] = saved_colors
@@ -2409,6 +2854,7 @@ def _apply_effective_series_settings(
     sources: list[str],
     profile_key: str,
     fallback_labels_by_source: list[list[str]],
+    series_descriptors: list[dict[str, Any]] | None = None,
 ) -> None:
     total_series = sum(len(labels) for labels in fallback_labels_by_source)
     if total_series <= 0:
@@ -2419,13 +2865,78 @@ def _apply_effective_series_settings(
 
     merged_labels: list[str] | None = None
     merged_colors: list[str] | None = None
-    if len(sources) > 1:
-        merged_labels, merged_colors = _resolve_multi_source_series_settings(
-            sources=sources,
-            profile_key=profile_key,
-            fallback_labels_by_source=fallback_labels_by_source,
-            profile_name=getattr(args, "settings_profile", None),
-        )
+    overrides = _coerce_series_override_map(getattr(args, "series_overrides", None))
+    ordered_descriptors = (
+        list(series_descriptors) if isinstance(series_descriptors, list) else []
+    )
+
+    if overrides and len(ordered_descriptors) == total_series:
+        override_labels: list[str] = []
+        override_colors: list[str] = []
+        override_enabled: list[bool] = []
+        override_widths: list[float | None] = []
+        override_markers: list[str | None] = []
+        override_line_kwargs: list[dict[str, Any] | None] = []
+        override_norm_modes: list[str | None] = []
+        override_norm_values: list[float | None] = []
+        override_norm_x_refs: list[float | None] = []
+        any_color = False
+        any_disabled = False
+        any_width = False
+        any_marker = False
+        any_line_kwargs = False
+        any_norm = False
+        for descriptor in ordered_descriptors:
+            default_label = str(descriptor.get("default_label") or "Series").strip() or "Series"
+            series_id = str(descriptor.get("series_id") or "").strip()
+            entry = overrides.get(series_id, {})
+            label_override = str(entry.get("label_override") or "").strip()
+            override_labels.append(label_override or default_label)
+
+            color = str(entry.get("color") or "").strip()
+            override_colors.append(color)
+            any_color = any_color or bool(color)
+
+            enabled = bool(entry.get("enabled", True))
+            override_enabled.append(enabled)
+            any_disabled = any_disabled or (enabled is False)
+
+            raw_width = entry.get("line_width")
+            width_value = None if raw_width in {None, ""} else float(raw_width)
+            override_widths.append(width_value)
+            any_width = any_width or (width_value is not None)
+
+            marker = entry.get("marker")
+            marker_value = None if marker in {None, ""} else str(marker)
+            override_markers.append(marker_value)
+            any_marker = any_marker or bool(marker_value)
+
+            line_kwargs = entry.get("line_kwargs")
+            line_kwargs_value = dict(line_kwargs) if isinstance(line_kwargs, dict) else None
+            override_line_kwargs.append(line_kwargs_value)
+            any_line_kwargs = any_line_kwargs or (line_kwargs_value is not None)
+
+            mode_value = str(entry.get("normalization_mode") or "").strip().lower() or None
+            if mode_value == "none":
+                mode_value = None
+            override_norm_modes.append(mode_value)
+            override_norm_values.append(
+                None if entry.get("normalization_value") is None else float(entry["normalization_value"])
+            )
+            override_norm_x_refs.append(
+                None if entry.get("normalization_x_ref") is None else float(entry["normalization_x_ref"])
+            )
+            any_norm = any_norm or (mode_value is not None)
+
+        merged_labels = override_labels
+        merged_colors = override_colors if any_color else None
+        setattr(args, "series_enabled", override_enabled if any_disabled else None)
+        setattr(args, "series_line_widths", override_widths if any_width else None)
+        setattr(args, "series_markers", override_markers if any_marker else None)
+        setattr(args, "series_line_kwargs", override_line_kwargs if any_line_kwargs else None)
+        setattr(args, "series_normalization_modes", override_norm_modes if any_norm else None)
+        setattr(args, "series_normalization_values", override_norm_values if any_norm else None)
+        setattr(args, "series_normalization_x_refs", override_norm_x_refs if any_norm else None)
 
     if not explicit_labels:
         if merged_labels is not None:
@@ -2449,7 +2960,9 @@ def _apply_effective_series_settings(
         if merged_colors is not None:
             args.line_colors = merged_colors
         else:
-            normalized_colors = _normalize_series_setting_list(getattr(args, "line_colors", None))
+            normalized_colors = _normalize_line_color_setting_list(
+                getattr(args, "line_colors", None)
+            )
             if normalized_colors is None:
                 args.line_colors = None
             elif len(normalized_colors) == total_series:
@@ -2503,6 +3016,52 @@ def _flatten_series_labels_by_source(fallback_labels_by_source: list[list[str]])
     return [label for source_labels in fallback_labels_by_source for label in source_labels]
 
 
+def _build_gui_series_descriptors(
+    *,
+    sources: list[str],
+    fallback_labels_by_source: list[list[str]],
+    series_id_segments_by_source: list[list[str]] | None = None,
+) -> list[dict[str, Any]]:
+    if len(sources) != len(fallback_labels_by_source):
+        raise ValueError("sources and fallback_labels_by_source must have equal lengths.")
+    if series_id_segments_by_source is not None and len(series_id_segments_by_source) != len(sources):
+        raise ValueError("series_id_segments_by_source must align with sources.")
+
+    descriptors: list[dict[str, Any]] = []
+    for source_index, (source, labels) in enumerate(zip(sources, fallback_labels_by_source)):
+        source_path = Path(source).expanduser()
+        source_name = source_path.name or str(source)
+        source_directory = (
+            str(source_path.parent)
+            if str(source_path.parent) not in {"", "."}
+            else ""
+        )
+        id_segment = (
+            series_id_segments_by_source[source_index]
+            if series_id_segments_by_source is not None
+            else None
+        )
+        if id_segment is not None and len(id_segment) != len(labels):
+            raise ValueError("series id segments must align with fallback labels.")
+        for local_index, default_label in enumerate(labels):
+            descriptors.append(
+                {
+                    "series_id": (
+                        str(id_segment[local_index]).strip()
+                        if id_segment is not None
+                        else f"series:{source_index}:{local_index}"
+                    ),
+                    "source_index": source_index,
+                    "series_index": local_index,
+                    "source_name": source_name,
+                    "source_directory": source_directory,
+                    "source_path": str(source_path),
+                    "default_label": str(default_label).strip() or f"Series {len(descriptors) + 1}",
+                }
+            )
+    return descriptors
+
+
 def _resolve_gui_default_series_labels(
     *,
     args: argparse.Namespace,
@@ -2513,6 +3072,7 @@ def _resolve_gui_default_series_labels(
     default_args = deepcopy(args)
     default_args.series_labels = None
     default_args.line_colors = None
+    default_args.series_overrides = None
     default_args._runtime_argv = ()
     _apply_effective_series_settings(
         args=default_args,
@@ -2526,12 +3086,51 @@ def _resolve_gui_default_series_labels(
     return _flatten_series_labels_by_source(fallback_labels_by_source)
 
 
+def _profile_uid_from_payload(payload: dict[str, Any], *, fallback_prefix: str, index: int) -> str:
+    metadata = payload.get("metadata")
+    if isinstance(metadata, dict):
+        token = str(metadata.get("profile_uid") or "").strip()
+        if token:
+            return token
+    return f"{fallback_prefix}:{index}"
+
+
+def _merge_gui_only_plot_settings(
+    target: dict[str, Any],
+    saved: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if not isinstance(saved, dict):
+        return target
+    merged = dict(target)
+    for key in ("series_overrides", "_gui_locked_fields"):
+        if key in saved:
+            merged[key] = deepcopy(saved[key])
+    return merged
+
+
+def _without_preview_series_state(settings: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(settings, dict):
+        return {}
+    blocked = {
+        "series_labels",
+        "line_colors",
+        "series_enabled",
+        "series_line_widths",
+        "series_markers",
+        "series_line_kwargs",
+        "series_normalization_modes",
+        "series_normalization_values",
+        "series_normalization_x_refs",
+    }
+    return {key: deepcopy(value) for key, value in settings.items() if key not in blocked}
+
+
 def _build_density_gui_context(
     args: argparse.Namespace,
     *,
     sources: list[str],
 ) -> _GuiPlotRenderContext:
-    plot_profiles, fallback_labels_by_source = _load_density_plot_profiles(
+    plot_profiles, fallback_labels_by_source, series_id_segments_by_source = _load_density_plot_profiles(
         sources=sources,
         species=args.species,
         axis=args.axis,
@@ -2550,6 +3149,11 @@ def _build_density_gui_context(
             profile_key=_PLOT_PROFILE_DENSITY,
             fallback_labels_by_source=fallback_labels_by_source,
         ),
+        series_descriptors=_build_gui_series_descriptors(
+            sources=sources,
+            fallback_labels_by_source=fallback_labels_by_source,
+            series_id_segments_by_source=series_id_segments_by_source,
+        ),
     )
 
 
@@ -2558,7 +3162,7 @@ def _build_msd_gui_context(
     *,
     sources: list[str],
 ) -> _GuiPlotRenderContext:
-    plot_profiles, fallback_labels_by_source = _load_msd_plot_profiles(
+    plot_profiles, fallback_labels_by_source, series_id_segments_by_source = _load_msd_plot_profiles(
         sources=sources,
         species=args.species,
     )
@@ -2573,6 +3177,11 @@ def _build_msd_gui_context(
             profile_key=_PLOT_PROFILE_MSD,
             fallback_labels_by_source=fallback_labels_by_source,
         ),
+        series_descriptors=_build_gui_series_descriptors(
+            sources=sources,
+            fallback_labels_by_source=fallback_labels_by_source,
+            series_id_segments_by_source=series_id_segments_by_source,
+        ),
     )
 
 
@@ -2581,7 +3190,11 @@ def _build_rdf_gui_context(
     *,
     sources: list[str],
 ) -> _GuiPlotRenderContext:
-    plot_profiles, fallback_labels_by_source = _load_rdf_plot_profiles(
+    raw_payloads_by_source = _read_analysis_profile_payloads_by_source(
+        sources=sources,
+        analysis="rdf",
+    )
+    plot_profiles, fallback_labels_by_source, series_id_segments_by_source = _load_rdf_plot_profiles(
         sources=sources,
         species_a=args.species_a,
         species_b=args.species_b,
@@ -2597,6 +3210,12 @@ def _build_rdf_gui_context(
             profile_key=_PLOT_PROFILE_RDF,
             fallback_labels_by_source=fallback_labels_by_source,
         ),
+        series_descriptors=_build_gui_series_descriptors(
+            sources=sources,
+            fallback_labels_by_source=fallback_labels_by_source,
+            series_id_segments_by_source=series_id_segments_by_source,
+        ),
+        profile_filter_options=_build_rdf_profile_filter_options(raw_payloads_by_source),
     )
 
 
@@ -2605,7 +3224,7 @@ def _build_position_gui_context(
     *,
     sources: list[str],
 ) -> _GuiPlotRenderContext:
-    plot_profiles, fallback_labels_by_source = _load_position_plot_profiles(
+    plot_profiles, fallback_labels_by_source, series_id_segments_by_source = _load_position_plot_profiles(
         sources=sources,
         species=args.species,
         axis=args.axis,
@@ -2625,6 +3244,11 @@ def _build_position_gui_context(
             profile_key=_PLOT_PROFILE_POSITION,
             fallback_labels_by_source=fallback_labels_by_source,
         ),
+        series_descriptors=_build_gui_series_descriptors(
+            sources=sources,
+            fallback_labels_by_source=fallback_labels_by_source,
+            series_id_segments_by_source=series_id_segments_by_source,
+        ),
     )
 
 
@@ -2633,7 +3257,11 @@ def _build_coordination_gui_context(
     *,
     sources: list[str],
 ) -> _GuiPlotRenderContext:
-    plot_profiles, fallback_labels_by_source = _load_coordination_plot_profiles(
+    raw_payloads_by_source = _read_analysis_profile_payloads_by_source(
+        sources=sources,
+        analysis="coordination",
+    )
+    plot_profiles, fallback_labels_by_source, series_id_segments_by_source = _load_coordination_plot_profiles(
         sources=sources,
         species_a=args.species_a,
         species_b=args.species_b,
@@ -2654,6 +3282,12 @@ def _build_coordination_gui_context(
             profile_key=_PLOT_PROFILE_COORDINATION,
             fallback_labels_by_source=fallback_labels_by_source,
         ),
+        series_descriptors=_build_gui_series_descriptors(
+            sources=sources,
+            fallback_labels_by_source=fallback_labels_by_source,
+            series_id_segments_by_source=series_id_segments_by_source,
+        ),
+        profile_filter_options=_build_coordination_profile_filter_options(raw_payloads_by_source),
     )
 
 
@@ -2746,7 +3380,7 @@ def _render_profile_plot(
 ) -> tuple[Path | None, dict[str, Any]]:
     from .plot.plotting import configure_matplotlib_backend
 
-    interactive_requested = bool(args.show or getattr(args, "gui", False))
+    interactive_requested = bool(args.show)
     if interactive_requested:
         try:
             configure_matplotlib_backend(
@@ -2774,6 +3408,8 @@ def _render_profile_plot(
         "y_ticks": args.y_ticks,
         "x_tick_rotation": args.x_tick_rotation,
         "y_tick_rotation": args.y_tick_rotation,
+        "x_label_pad": getattr(args, "x_label_pad", None),
+        "y_label_pad": getattr(args, "y_label_pad", None),
         "title_visible": args.title_visible,
         "ticks_visible": args.ticks,
         "markers": args.markers,
@@ -2847,7 +3483,7 @@ def _render_profile_plot(
             return saved, captured_state
 
     saved_path = _render_with_options(False, args.output)
-    if saved_path is None:
+    if saved_path is None and not bool(getattr(args, "_suppress_output_log", False)):
         LOGGER.warning("No interactive display or output path requested. Nothing was rendered.")
     return saved_path, captured_state
 
@@ -2861,6 +3497,22 @@ def _collect_plot_settings_for_persistence(
     if "y_lim" in candidate:
         candidate["y_lim"] = _resolve_y_lim(args)
     return candidate
+
+
+def _derive_gui_locked_fields(settings: dict[str, Any]) -> dict[str, bool]:
+    x_lim = settings.get("x_lim")
+    y_lim = settings.get("y_lim")
+    return {
+        "title": settings.get("title") is not None,
+        "x_label": settings.get("x_label") is not None,
+        "y_label": settings.get("y_label") is not None,
+        "x_lim": isinstance(x_lim, (list, tuple)) and any(value is not None for value in x_lim[:2]),
+        "y_lim": isinstance(y_lim, (list, tuple)) and any(value is not None for value in y_lim[:2]),
+        "x_ticks": settings.get("x_ticks") is not None,
+        "y_ticks": settings.get("y_ticks") is not None,
+        "x_label_pad": settings.get("x_label_pad") is not None,
+        "y_label_pad": settings.get("y_label_pad") is not None,
+    }
 
 
 def _apply_gui_settings_to_args(args: argparse.Namespace, settings: dict[str, Any]) -> None:
@@ -2878,9 +3530,9 @@ def _open_plot_settings_gui(
     *,
     title: str,
     initial_settings: dict[str, Any],
-    on_preview: Callable[[dict[str, Any]], None],
+    on_preview: Callable[[dict[str, Any]], dict[str, Any] | None],
     on_save: Callable[[str, dict[str, Any]], str],
-    on_save_figure: Callable[[dict[str, Any], str], str] | None = None,
+    on_save_figure: Callable[[dict[str, Any], str], str | tuple[str, dict[str, Any]]] | None = None,
     on_import_hdf5: Callable[[str, str], dict[str, Any]] | None = None,
     analysis_name: str | None = None,
     on_resolve_series_defaults: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
@@ -2943,11 +3595,16 @@ def _launch_profile_plot_gui(
     )
 
     initial_settings = _collect_plot_settings_for_persistence(args, keys=setting_keys)
+    initial_settings["_gui_locked_fields"] = _derive_gui_locked_fields(initial_settings)
     initial_settings["series_count"] = max(1, int(initial_context.series_count))
+    initial_settings["series_descriptors"] = deepcopy(initial_context.series_descriptors)
+    initial_settings["_profile_filter_options"] = deepcopy(initial_context.profile_filter_options)
     if initial_context.default_series_labels and not initial_settings.get("series_labels"):
         initial_settings["series_labels"] = list(initial_context.default_series_labels)
     default_settings = _collect_plot_settings_for_persistence(default_args, keys=setting_keys)
     default_settings["series_count"] = max(1, int(initial_context.series_count))
+    default_settings["series_descriptors"] = deepcopy(initial_context.series_descriptors)
+    default_settings["_profile_filter_options"] = deepcopy(initial_context.profile_filter_options)
     if initial_context.default_series_labels and not default_settings.get("series_labels"):
         default_settings["series_labels"] = list(initial_context.default_series_labels)
     available_profile_names = read_plot_profile_names(source_path, profile_key)
@@ -2956,14 +3613,36 @@ def _launch_profile_plot_gui(
     initial_profile_name = (
         read_active_plot_profile_name(source_path, profile_key) or available_profile_names[0]
     )
+    initial_saved_profile = read_plot_profile(
+        source_path,
+        profile_key,
+        profile_name=initial_profile_name,
+    )
+    initial_settings = _merge_gui_only_plot_settings(initial_settings, initial_saved_profile)
 
-    def _preview(gui_settings: dict[str, Any]) -> None:
+    initial_preview_args = deepcopy(args)
+    initial_preview_args.show = False
+    initial_preview_args.output = None
+    initial_preview_args._suppress_output_log = True
+    initial_preview_context = build_context(initial_preview_args)
+    _initial_saved_path, initial_render_state = _render_profile_plot(
+        args=initial_preview_args,
+        source=initial_preview_context.plot_source_label,
+        analysis_name=analysis_name,
+        profile=initial_preview_context.profile,
+        plotter=plotter,
+        plotter_kwargs=initial_preview_context.plotter_kwargs,
+    )
+    if initial_render_state:
+        initial_settings.update(_without_preview_series_state(initial_render_state))
+
+    def _preview(gui_settings: dict[str, Any]) -> dict[str, Any]:
         preview_args = deepcopy(args)
         _apply_gui_settings_to_args(preview_args, gui_settings)
         preview_args.show = True
         preview_args.output = None
         context = build_context(preview_args)
-        _render_profile_plot(
+        _saved_path, render_state = _render_profile_plot(
             args=preview_args,
             source=context.plot_source_label,
             analysis_name=analysis_name,
@@ -2971,11 +3650,30 @@ def _launch_profile_plot_gui(
             plotter=plotter,
             plotter_kwargs=context.plotter_kwargs,
         )
+        return render_state
 
     def _save(profile_name: str, gui_settings: dict[str, Any]) -> str:
         save_args = deepcopy(args)
         _apply_gui_settings_to_args(save_args, gui_settings)
         candidate = _collect_plot_settings_for_persistence(save_args, keys=setting_keys)
+        save_context = build_context(save_args)
+        candidate["series_descriptors"] = deepcopy(save_context.series_descriptors)
+        if "series_overrides" in gui_settings:
+            candidate["series_overrides"] = deepcopy(gui_settings["series_overrides"])
+            for key in (
+                "series_labels",
+                "line_colors",
+                "series_enabled",
+                "series_line_widths",
+                "series_markers",
+                "series_line_kwargs",
+                "series_normalization_modes",
+                "series_normalization_values",
+                "series_normalization_x_refs",
+            ):
+                candidate.pop(key, None)
+        if "_gui_locked_fields" in gui_settings:
+            candidate["_gui_locked_fields"] = deepcopy(gui_settings["_gui_locked_fields"])
         write_plot_profile(
             source_path,
             profile_key,
@@ -2984,14 +3682,14 @@ def _launch_profile_plot_gui(
         )
         return f"Saved profile '{profile_name}' to '{source_path.name}' ({profile_key})."
 
-    def _save_figure(gui_settings: dict[str, Any], output_path: str) -> str:
+    def _save_figure(gui_settings: dict[str, Any], output_path: str) -> tuple[str, dict[str, Any]]:
         save_args = deepcopy(args)
         _apply_gui_settings_to_args(save_args, gui_settings)
         save_args.show = False
         save_args.output = output_path
         save_args._suppress_output_log = _is_gui_preview_output_path(output_path)
         context = build_context(save_args)
-        saved_path, _render_state = _render_profile_plot(
+        saved_path, render_state = _render_profile_plot(
             args=save_args,
             source=context.plot_source_label,
             analysis_name=analysis_name,
@@ -3001,7 +3699,7 @@ def _launch_profile_plot_gui(
         )
         if saved_path is None:
             raise ValueError("No output was generated for the requested figure path.")
-        return f"Saved figure to '{saved_path}'."
+        return f"Saved figure to '{saved_path}'.", render_state
 
     def _import_hdf5(source_hdf5_path: str, profile_name: str) -> dict[str, Any]:
         imported_path = Path(source_hdf5_path).expanduser().resolve()
@@ -3025,7 +3723,14 @@ def _launch_profile_plot_gui(
             raise ValueError(
                 f"No saved profile '{profile_name}' found in '{source_path.name}' ({profile_key})."
             )
-        return loaded
+        load_args = deepcopy(args)
+        for key, value in loaded.items():
+            setattr(load_args, key, deepcopy(value))
+        context = build_context(load_args)
+        merged = _merge_gui_only_plot_settings(loaded, loaded)
+        merged["series_descriptors"] = deepcopy(context.series_descriptors)
+        merged["_profile_filter_options"] = deepcopy(initial_context.profile_filter_options)
+        return merged
 
     def _delete_profile(profile_name: str) -> tuple[str | None, str]:
         removed, active_profile = delete_named_plot_profile(
@@ -3056,6 +3761,8 @@ def _launch_profile_plot_gui(
         return {
             "series_count": context.series_count,
             "series_labels": list(context.default_series_labels),
+            "series_descriptors": deepcopy(context.series_descriptors),
+            "_profile_filter_options": deepcopy(initial_context.profile_filter_options),
         }
 
     _open_plot_settings_gui(
@@ -3078,7 +3785,6 @@ def _launch_profile_plot_gui(
 
 def _handle_root_overview(_args: argparse.Namespace) -> int:
     author = _read_project_author(default="Unknown")
-    version_date = _read_project_version_date(default="unknown")
     print(
         "\n".join(
             [
@@ -3086,7 +3792,6 @@ def _handle_root_overview(_args: argparse.Namespace) -> int:
                 "====================",
                 f"Version      : {__version__}",
                 f"Author       : {author}",
-                f"Version date : {version_date} (source metadata)",
                 "",
                 "Core workflow",
                 "  1) Compute analysis HDF5 from trajectory data",
@@ -3743,30 +4448,6 @@ def build_parser() -> argparse.ArgumentParser:
         type=_positive_float,
         default=0.20,
         help="Width of the cosine taper around the cutoff in Angstrom (default: 0.20).",
-    )
-    compute_coordination.add_argument(
-        "--rdf-sample-fraction",
-        type=float,
-        default=0.10,
-        help="Fraction of frames sampled when using --cutoff-from-rdf (default: 0.10).",
-    )
-    compute_coordination.add_argument(
-        "--rdf-bin-width",
-        type=_positive_float,
-        default=0.05,
-        help="Bin width in Angstrom for cutoff-detection RDFs (default: 0.05).",
-    )
-    compute_coordination.add_argument(
-        "--rdf-r-max",
-        type=_positive_float,
-        default=None,
-        help="Maximum RDF radius in Angstrom for cutoff detection (default: auto).",
-    )
-    compute_coordination.add_argument(
-        "--rdf-smoothing-sigma",
-        type=_positive_float,
-        default=0.10,
-        help="Gaussian smoothing sigma in Angstrom for cutoff detection (default: 0.10).",
     )
     _add_cell_resolution_options(compute_coordination)
     compute_coordination.add_argument(
@@ -5717,26 +6398,40 @@ def _read_analysis_profile_payloads(
     sources: list[str],
     analysis: str,
 ) -> list[dict[str, Any]]:
+    payloads_by_source = _read_analysis_profile_payloads_by_source(
+        sources=sources,
+        analysis=analysis,
+    )
+    return [payload for _source, source_payloads in payloads_by_source for payload in source_payloads]
+
+
+def _read_analysis_profile_payloads_by_source(
+    *,
+    sources: list[str],
+    analysis: str,
+) -> list[tuple[str, list[dict[str, Any]]]]:
     from .storage.hdf5_utils import read_linak_hdf5_profiles
 
-    payloads: list[dict[str, Any]] = []
+    payloads_by_source: list[tuple[str, list[dict[str, Any]]]] = []
     for source_index, source in enumerate(sources):
         source_path = Path(source).expanduser().resolve()
         profiles = read_linak_hdf5_profiles(source_path, expected_analysis=analysis)
         if not profiles:
             raise ValueError(f"No '{analysis}' profiles found in '{source_path}'.")
+        source_payloads: list[dict[str, Any]] = []
         for profile_index, (datasets, metadata) in enumerate(profiles):
             merged_metadata = dict(metadata)
             merged_metadata["source_path"] = str(source_path)
             merged_metadata.setdefault("source_index", source_index)
             merged_metadata.setdefault("source_profile_index", profile_index)
-            payloads.append(
+            source_payloads.append(
                 {
                     "datasets": datasets,
                     "metadata": merged_metadata,
                 }
             )
-    return payloads
+        payloads_by_source.append((source, source_payloads))
+    return payloads_by_source
 
 
 def _combine_analysis_hdf5_sources(
@@ -5744,10 +6439,8 @@ def _combine_analysis_hdf5_sources(
     sources: list[str],
     analysis: str,
     output: str | Path | None,
-    settings_source_path: Path | None,
 ) -> Path:
     from .storage.hdf5_utils import write_linak_hdf5_profile_collection
-    from .plot.plot_settings import copy_plot_profile
 
     payloads = _read_analysis_profile_payloads(sources=sources, analysis=analysis)
     if output is None:
@@ -5768,22 +6461,6 @@ def _combine_analysis_hdf5_sources(
         profiles=payloads,
         metadata=combined_metadata,
     )
-
-    profile_key = _ANALYSIS_TO_PROFILE_KEY.get(analysis)
-    if profile_key is not None and settings_source_path is not None:
-        try:
-            copy_plot_profile(
-                settings_source_path,
-                written_path,
-                source_key=profile_key,
-                target_key=profile_key,
-            )
-        except ValueError:
-            LOGGER.debug(
-                "No plot settings profile '%s' found in settings source '%s'.",
-                profile_key,
-                settings_source_path,
-            )
     return written_path
 
 
@@ -5847,22 +6524,27 @@ def _handle_plot_density(args: argparse.Namespace) -> int:
     start = perf_counter()
     LOGGER.info("Starting density plotting.")
     sources = _resolve_plot_hdf5_sources(args, command_name="linak plot")
-    settings_source_path = _resolve_plot_settings_source_path(
-        sources,
-        setting_source_token=getattr(args, "settings_source", None),
+    settings_source_path = (
+        _resolve_plot_settings_source_path(
+            sources,
+            setting_source_token=getattr(args, "settings_source", None),
+        )
+        if len(sources) == 1
+        else None
     )
     default_args = deepcopy(args)
-    _apply_saved_plot_settings(
-        args=args,
-        source_path=settings_source_path,
-        profile_key=_PLOT_PROFILE_DENSITY,
-        keys=_PLOT_SETTINGS_DENSITY_KEYS,
-        profile_name=getattr(args, "settings_profile", None),
-    )
+    if len(sources) == 1:
+        assert settings_source_path is not None
+        _apply_saved_plot_settings(
+            args=args,
+            source_path=settings_source_path,
+            profile_key=_PLOT_PROFILE_DENSITY,
+            keys=_PLOT_SETTINGS_DENSITY_KEYS,
+            profile_name=getattr(args, "settings_profile", None),
+        )
     use_gui = _resolve_gui_mode(args)
     if len(sources) > 1:
         LOGGER.info("Processing %d density HDF5 input file(s).", len(sources))
-        LOGGER.info("Using '%s' as plot-settings source.", settings_source_path)
 
     if args.dry_run:
         if use_gui:
@@ -5881,9 +6563,10 @@ def _handle_plot_density(args: argparse.Namespace) -> int:
                 f"species={args.species}, axis={args.axis}, "
                 f"x_mode={args.x_mode}, quantity={args.quantity}"
             ),
-            f"plot-settings source: {settings_source_path}",
             f"render target: {render_target}",
         ]
+        if settings_source_path is not None:
+            plan.insert(-1, f"plot-settings source: {settings_source_path}")
         _log_dry_run_plan("plot density", plan)
         LOGGER.info("Density plotting dry run finished in %.2f s.", perf_counter() - start)
         return 0
@@ -5897,6 +6580,7 @@ def _handle_plot_density(args: argparse.Namespace) -> int:
         sources=sources,
         profile_key=_PLOT_PROFILE_DENSITY,
         fallback_labels_by_source=render_context.fallback_labels_by_source,
+        series_descriptors=render_context.series_descriptors,
     )
 
     if use_gui:
@@ -5906,19 +6590,12 @@ def _handle_plot_density(args: argparse.Namespace) -> int:
                 sources=sources,
                 analysis="density",
                 output=None,
-                settings_source_path=settings_source_path,
             )
             LOGGER.info(
                 "Created combined density HDF5 for GUI controls: '%s'.",
                 gui_settings_path,
             )
-            _persist_effective_series_settings(
-                source_path=gui_settings_path,
-                profile_key=_PLOT_PROFILE_DENSITY,
-                series_labels=args.series_labels,
-                line_colors=args.line_colors,
-                profile_name=getattr(args, "settings_profile", None),
-            )
+        assert gui_settings_path is not None
         _launch_profile_plot_gui(
             args=args,
             default_args=default_args,
@@ -5954,22 +6631,27 @@ def _handle_plot_msd(args: argparse.Namespace) -> int:
     start = perf_counter()
     LOGGER.info("Starting MSD plotting.")
     sources = _resolve_plot_hdf5_sources(args, command_name="linak plot")
-    settings_source_path = _resolve_plot_settings_source_path(
-        sources,
-        setting_source_token=getattr(args, "settings_source", None),
+    settings_source_path = (
+        _resolve_plot_settings_source_path(
+            sources,
+            setting_source_token=getattr(args, "settings_source", None),
+        )
+        if len(sources) == 1
+        else None
     )
     default_args = deepcopy(args)
-    _apply_saved_plot_settings(
-        args=args,
-        source_path=settings_source_path,
-        profile_key=_PLOT_PROFILE_MSD,
-        keys=_PLOT_SETTINGS_MSD_KEYS,
-        profile_name=getattr(args, "settings_profile", None),
-    )
+    if len(sources) == 1:
+        assert settings_source_path is not None
+        _apply_saved_plot_settings(
+            args=args,
+            source_path=settings_source_path,
+            profile_key=_PLOT_PROFILE_MSD,
+            keys=_PLOT_SETTINGS_MSD_KEYS,
+            profile_name=getattr(args, "settings_profile", None),
+        )
     use_gui = _resolve_gui_mode(args)
     if len(sources) > 1:
         LOGGER.info("Processing %d MSD HDF5 input file(s).", len(sources))
-        LOGGER.info("Using '%s' as plot-settings source.", settings_source_path)
 
     if args.dry_run:
         if use_gui:
@@ -5985,9 +6667,10 @@ def _handle_plot_msd(args: argparse.Namespace) -> int:
             "input mode: HDF5 only",
             f"sources ({len(sources)}): {_summarize_sources(sources)}",
             f"species={args.species}",
-            f"plot-settings source: {settings_source_path}",
             f"render target: {render_target}",
         ]
+        if settings_source_path is not None:
+            plan.insert(-1, f"plot-settings source: {settings_source_path}")
         _log_dry_run_plan("plot msd", plan)
         LOGGER.info("MSD plotting dry run finished in %.2f s.", perf_counter() - start)
         return 0
@@ -6001,6 +6684,7 @@ def _handle_plot_msd(args: argparse.Namespace) -> int:
         sources=sources,
         profile_key=_PLOT_PROFILE_MSD,
         fallback_labels_by_source=render_context.fallback_labels_by_source,
+        series_descriptors=render_context.series_descriptors,
     )
 
     if use_gui:
@@ -6010,19 +6694,12 @@ def _handle_plot_msd(args: argparse.Namespace) -> int:
                 sources=sources,
                 analysis="msd",
                 output=None,
-                settings_source_path=settings_source_path,
             )
             LOGGER.info(
                 "Created combined MSD HDF5 for GUI controls: '%s'.",
                 gui_settings_path,
             )
-            _persist_effective_series_settings(
-                source_path=gui_settings_path,
-                profile_key=_PLOT_PROFILE_MSD,
-                series_labels=args.series_labels,
-                line_colors=args.line_colors,
-                profile_name=getattr(args, "settings_profile", None),
-            )
+        assert gui_settings_path is not None
         _launch_profile_plot_gui(
             args=args,
             default_args=default_args,
@@ -6058,22 +6735,27 @@ def _handle_plot_rdf(args: argparse.Namespace) -> int:
     start = perf_counter()
     LOGGER.info("Starting RDF plotting.")
     sources = _resolve_plot_hdf5_sources(args, command_name="linak plot")
-    settings_source_path = _resolve_plot_settings_source_path(
-        sources,
-        setting_source_token=getattr(args, "settings_source", None),
+    settings_source_path = (
+        _resolve_plot_settings_source_path(
+            sources,
+            setting_source_token=getattr(args, "settings_source", None),
+        )
+        if len(sources) == 1
+        else None
     )
     default_args = deepcopy(args)
-    _apply_saved_plot_settings(
-        args=args,
-        source_path=settings_source_path,
-        profile_key=_PLOT_PROFILE_RDF,
-        keys=_PLOT_SETTINGS_RDF_KEYS,
-        profile_name=getattr(args, "settings_profile", None),
-    )
+    if len(sources) == 1:
+        assert settings_source_path is not None
+        _apply_saved_plot_settings(
+            args=args,
+            source_path=settings_source_path,
+            profile_key=_PLOT_PROFILE_RDF,
+            keys=_PLOT_SETTINGS_RDF_KEYS,
+            profile_name=getattr(args, "settings_profile", None),
+        )
     use_gui = _resolve_gui_mode(args)
     if len(sources) > 1:
         LOGGER.info("Processing %d RDF HDF5 input file(s).", len(sources))
-        LOGGER.info("Using '%s' as plot-settings source.", settings_source_path)
 
     species_b = args.species_b if args.species_b is not None else args.species_a
     if args.dry_run:
@@ -6090,9 +6772,10 @@ def _handle_plot_rdf(args: argparse.Namespace) -> int:
             "input mode: HDF5 only",
             f"sources ({len(sources)}): {_summarize_sources(sources)}",
             f"species_a={args.species_a}, species_b={species_b}",
-            f"plot-settings source: {settings_source_path}",
             f"render target: {render_target}",
         ]
+        if settings_source_path is not None:
+            plan.insert(-1, f"plot-settings source: {settings_source_path}")
         _log_dry_run_plan("plot rdf", plan)
         LOGGER.info("RDF plotting dry run finished in %.2f s.", perf_counter() - start)
         return 0
@@ -6106,6 +6789,7 @@ def _handle_plot_rdf(args: argparse.Namespace) -> int:
         sources=sources,
         profile_key=_PLOT_PROFILE_RDF,
         fallback_labels_by_source=render_context.fallback_labels_by_source,
+        series_descriptors=render_context.series_descriptors,
     )
 
     if use_gui:
@@ -6115,19 +6799,12 @@ def _handle_plot_rdf(args: argparse.Namespace) -> int:
                 sources=sources,
                 analysis="rdf",
                 output=None,
-                settings_source_path=settings_source_path,
             )
             LOGGER.info(
                 "Created combined RDF HDF5 for GUI controls: '%s'.",
                 gui_settings_path,
             )
-            _persist_effective_series_settings(
-                source_path=gui_settings_path,
-                profile_key=_PLOT_PROFILE_RDF,
-                series_labels=args.series_labels,
-                line_colors=args.line_colors,
-                profile_name=getattr(args, "settings_profile", None),
-            )
+        assert gui_settings_path is not None
         _launch_profile_plot_gui(
             args=args,
             default_args=default_args,
@@ -6163,22 +6840,28 @@ def _handle_plot_position(args: argparse.Namespace) -> int:
     start = perf_counter()
     LOGGER.info("Starting position plotting.")
     sources = _resolve_plot_hdf5_sources(args, command_name="linak plot")
-    settings_source_path = _resolve_plot_settings_source_path(
-        sources,
-        setting_source_token=getattr(args, "settings_source", None),
+    settings_source_path = (
+        _resolve_plot_settings_source_path(
+            sources,
+            setting_source_token=getattr(args, "settings_source", None),
+        )
+        if len(sources) == 1
+        else None
     )
     default_args = deepcopy(args)
     if not hasattr(args, "x_bin_width"):
         args.x_bin_width = None
     if getattr(args, "time_section_width", None) is not None:
         args.x_bin_width = args.time_section_width
-    _apply_saved_plot_settings(
-        args=args,
-        source_path=settings_source_path,
-        profile_key=_PLOT_PROFILE_POSITION,
-        keys=_PLOT_SETTINGS_POSITION_KEYS,
-        profile_name=getattr(args, "settings_profile", None),
-    )
+    if len(sources) == 1:
+        assert settings_source_path is not None
+        _apply_saved_plot_settings(
+            args=args,
+            source_path=settings_source_path,
+            profile_key=_PLOT_PROFILE_POSITION,
+            keys=_PLOT_SETTINGS_POSITION_KEYS,
+            profile_name=getattr(args, "settings_profile", None),
+        )
     if (
         getattr(args, "time_section_width", None) is None
         and getattr(args, "x_bin_width", None) is not None
@@ -6188,7 +6871,6 @@ def _handle_plot_position(args: argparse.Namespace) -> int:
     use_gui = _resolve_gui_mode(args)
     if len(sources) > 1:
         LOGGER.info("Processing %d position HDF5 input file(s).", len(sources))
-        LOGGER.info("Using '%s' as plot-settings source.", settings_source_path)
 
     if args.dry_run:
         if use_gui:
@@ -6211,9 +6893,10 @@ def _handle_plot_position(args: argparse.Namespace) -> int:
                 f"map_color={args.map_color}, time_axis={args.time_axis}, "
                 f"time_section_width={section_preview}"
             ),
-            f"plot-settings source: {settings_source_path}",
             f"render target: {render_target}",
         ]
+        if settings_source_path is not None:
+            plan.insert(-1, f"plot-settings source: {settings_source_path}")
         _log_dry_run_plan("plot position", plan)
         LOGGER.info("Position plotting dry run finished in %.2f s.", perf_counter() - start)
         return 0
@@ -6227,6 +6910,7 @@ def _handle_plot_position(args: argparse.Namespace) -> int:
         sources=sources,
         profile_key=_PLOT_PROFILE_POSITION,
         fallback_labels_by_source=render_context.fallback_labels_by_source,
+        series_descriptors=render_context.series_descriptors,
     )
 
     if use_gui:
@@ -6236,19 +6920,12 @@ def _handle_plot_position(args: argparse.Namespace) -> int:
                 sources=sources,
                 analysis="position",
                 output=None,
-                settings_source_path=settings_source_path,
             )
             LOGGER.info(
                 "Created combined position HDF5 for GUI controls: '%s'.",
                 gui_settings_path,
             )
-            _persist_effective_series_settings(
-                source_path=gui_settings_path,
-                profile_key=_PLOT_PROFILE_POSITION,
-                series_labels=args.series_labels,
-                line_colors=args.line_colors,
-                profile_name=getattr(args, "settings_profile", None),
-            )
+        assert gui_settings_path is not None
         _launch_profile_plot_gui(
             args=args,
             default_args=default_args,
@@ -6284,22 +6961,27 @@ def _handle_plot_coordination(args: argparse.Namespace) -> int:
     start = perf_counter()
     LOGGER.info("Starting coordination plotting.")
     sources = _resolve_plot_hdf5_sources(args, command_name="linak plot")
-    settings_source_path = _resolve_plot_settings_source_path(
-        sources,
-        setting_source_token=getattr(args, "settings_source", None),
+    settings_source_path = (
+        _resolve_plot_settings_source_path(
+            sources,
+            setting_source_token=getattr(args, "settings_source", None),
+        )
+        if len(sources) == 1
+        else None
     )
     default_args = deepcopy(args)
-    _apply_saved_plot_settings(
-        args=args,
-        source_path=settings_source_path,
-        profile_key=_PLOT_PROFILE_COORDINATION,
-        keys=_PLOT_SETTINGS_COORDINATION_KEYS,
-        profile_name=getattr(args, "settings_profile", None),
-    )
+    if len(sources) == 1:
+        assert settings_source_path is not None
+        _apply_saved_plot_settings(
+            args=args,
+            source_path=settings_source_path,
+            profile_key=_PLOT_PROFILE_COORDINATION,
+            keys=_PLOT_SETTINGS_COORDINATION_KEYS,
+            profile_name=getattr(args, "settings_profile", None),
+        )
     use_gui = _resolve_gui_mode(args)
     if len(sources) > 1:
         LOGGER.info("Processing %d coordination HDF5 input file(s).", len(sources))
-        LOGGER.info("Using '%s' as plot-settings source.", settings_source_path)
 
     species_b = args.species_b if args.species_b is not None else args.species_a
     if args.dry_run:
@@ -6319,9 +7001,10 @@ def _handle_plot_coordination(args: argparse.Namespace) -> int:
                 f"component={args.component}, time_axis={args.time_axis}, "
                 f"x_bin_width={getattr(args, 'x_bin_width', None)}"
             ),
-            f"plot-settings source: {settings_source_path}",
             f"render target: {render_target}",
         ]
+        if settings_source_path is not None:
+            plan.insert(-1, f"plot-settings source: {settings_source_path}")
         _log_dry_run_plan("plot coordination", plan)
         LOGGER.info("Coordination plotting dry run finished in %.2f s.", perf_counter() - start)
         return 0
@@ -6335,6 +7018,7 @@ def _handle_plot_coordination(args: argparse.Namespace) -> int:
         sources=sources,
         profile_key=_PLOT_PROFILE_COORDINATION,
         fallback_labels_by_source=render_context.fallback_labels_by_source,
+        series_descriptors=render_context.series_descriptors,
     )
 
     if use_gui:
@@ -6344,19 +7028,12 @@ def _handle_plot_coordination(args: argparse.Namespace) -> int:
                 sources=sources,
                 analysis="coordination",
                 output=None,
-                settings_source_path=settings_source_path,
             )
             LOGGER.info(
                 "Created combined coordination HDF5 for GUI controls: '%s'.",
                 gui_settings_path,
             )
-            _persist_effective_series_settings(
-                source_path=gui_settings_path,
-                profile_key=_PLOT_PROFILE_COORDINATION,
-                series_labels=args.series_labels,
-                line_colors=args.line_colors,
-                profile_name=getattr(args, "settings_profile", None),
-            )
+        assert gui_settings_path is not None
         _launch_profile_plot_gui(
             args=args,
             default_args=default_args,
@@ -6441,12 +7118,20 @@ def _handle_compute_density(args: argparse.Namespace) -> int:
     from .trajectory.io import read_trajectory
 
     source_path = Path(args.trajectory).expanduser().resolve()
+    pre_resolved_cell, preflight_cell_error = _preflight_resolve_cell(
+        args.trajectory,
+        cell=_normalize_cell_args(args),
+        input_path=args.input,
+        analysis_name="density",
+    )
     frames = read_trajectory(args.trajectory)
     resolved_cell, cell_source, cell_input_path = _maybe_apply_density_cell(
         frames,
         args.trajectory,
         cell=_normalize_cell_args(args),
         input_path=args.input,
+        pre_resolved=pre_resolved_cell,
+        preflight_error=preflight_cell_error,
     )
     profiles = compute_density_profiles(
         frames=frames,
@@ -6506,9 +7191,10 @@ def _handle_compute_msd(args: argparse.Namespace) -> int:
             )
         )
         output_preview = str(
-            _resolve_non_overwriting_hdf5_path(args.output)
-            if args.output
-            else _default_msd_hdf5_output_path(args.trajectory, args.species)
+            _resolve_single_analysis_hdf5_output_path(
+                args.output,
+                _default_msd_hdf5_output_path(args.trajectory, args.species),
+            )
         )
 
         if resolved_cell is None:
@@ -6537,6 +7223,18 @@ def _handle_compute_msd(args: argparse.Namespace) -> int:
     from .analysis.msd import compute_msd, save_msd_profile
 
     source_path = Path(args.trajectory).expanduser().resolve()
+    pre_resolved_cell, preflight_cell_error = _preflight_resolve_cell(
+        args.trajectory,
+        cell=_normalize_cell_args(args),
+        input_path=args.input,
+        analysis_name="MSD",
+    )
+    pre_resolved_timestep, preflight_timestep_error = _preflight_resolve_analysis_timestep_fs(
+        args.trajectory,
+        timestep_fs=args.timestep_fs,
+        input_path=args.input,
+        analysis_name="MSD",
+    )
     frames = read_trajectory(args.trajectory)
     resolved_cell, cell_source, cell_input_path = _resolve_and_apply_required_cell(
         frames,
@@ -6544,13 +7242,18 @@ def _handle_compute_msd(args: argparse.Namespace) -> int:
         cell=_normalize_cell_args(args),
         input_path=args.input,
         analysis_name="MSD",
+        pre_resolved=pre_resolved_cell,
+        preflight_error=preflight_cell_error,
     )
     timestep_fs, timestep_source, timestep_input_path, md_timestep_fs, trajectory_stride_md = (
-        _resolve_msd_timestep_fs(
+        _resolve_analysis_timestep_fs(
             args.trajectory,
             timestep_fs=args.timestep_fs,
             input_path=args.input,
+            analysis_name="MSD",
             frames=frames,
+            pre_resolved=pre_resolved_timestep,
+            preflight_error=preflight_timestep_error,
         )
     )
     profile = compute_msd(
@@ -6559,10 +7262,9 @@ def _handle_compute_msd(args: argparse.Namespace) -> int:
         timestep_fs=timestep_fs,
     )
     output = (
-        _resolve_non_overwriting_hdf5_path(args.output)
-        if args.output
-        else _resolve_non_overwriting_hdf5_path(
-            _default_msd_hdf5_output_path(args.trajectory, profile.species)
+        _resolve_single_analysis_hdf5_output_path(
+            args.output,
+            _default_msd_hdf5_output_path(args.trajectory, profile.species),
         )
     )
     msd_metadata: dict[str, Any] = {
@@ -6615,7 +7317,12 @@ def _handle_compute_position(args: argparse.Namespace) -> int:
             )
         )
         if args.output:
-            output_preview = str(_resolve_non_overwriting_hdf5_path(args.output))
+            output_preview = str(
+                _resolve_single_analysis_hdf5_output_path(
+                    args.output,
+                    _default_position_hdf5_output_path(args.trajectory, species_token, args.axis),
+                )
+            )
         elif species_token.lower() in {"all", "*"}:
             output_preview = str(
                 _linak_output_dir_for_source(source_path)
@@ -6651,12 +7358,26 @@ def _handle_compute_position(args: argparse.Namespace) -> int:
     from .trajectory.io import read_trajectory
 
     source_path = Path(args.trajectory).expanduser().resolve()
+    pre_resolved_cell, preflight_cell_error = _preflight_resolve_cell(
+        args.trajectory,
+        cell=_normalize_cell_args(args),
+        input_path=args.input,
+        analysis_name="position",
+    )
+    pre_resolved_timestep, preflight_timestep_error = _preflight_resolve_analysis_timestep_fs(
+        args.trajectory,
+        timestep_fs=args.timestep_fs,
+        input_path=args.input,
+        analysis_name="position",
+    )
     frames = read_trajectory(args.trajectory)
     resolved_cell, cell_source, cell_input_path = _maybe_apply_density_cell(
         frames,
         args.trajectory,
         cell=_normalize_cell_args(args),
         input_path=args.input,
+        pre_resolved=pre_resolved_cell,
+        preflight_error=preflight_cell_error,
     )
     pbc_corrected_positions = False
     pbc_cell: tuple[float, float, float] | None = None
@@ -6678,11 +7399,14 @@ def _handle_compute_position(args: argparse.Namespace) -> int:
             "without PBC correction."
         )
     timestep_fs, timestep_source, timestep_input_path, md_timestep_fs, trajectory_stride_md = (
-        _resolve_msd_timestep_fs(
+        _resolve_analysis_timestep_fs(
             args.trajectory,
             timestep_fs=args.timestep_fs,
             input_path=args.input,
+            analysis_name="position",
             frames=frames,
+            pre_resolved=pre_resolved_timestep,
+            preflight_error=preflight_timestep_error,
         )
     )
     profiles = compute_position_profiles(
@@ -6761,9 +7485,10 @@ def _handle_compute_rdf(args: argparse.Namespace) -> int:
             )
         species_b = args.species_b if args.species_b is not None else args.species_a
         output_preview = str(
-            _resolve_non_overwriting_hdf5_path(args.output)
-            if args.output
-            else _default_rdf_hdf5_output_path(args.trajectory, args.species_a, species_b)
+            _resolve_single_analysis_hdf5_output_path(
+                args.output,
+                _default_rdf_hdf5_output_path(args.trajectory, args.species_a, species_b),
+            )
         )
         plan = [
             f"trajectory source: {source_path}",
@@ -6784,6 +7509,12 @@ def _handle_compute_rdf(args: argparse.Namespace) -> int:
     from .analysis.rdf import compute_rdf, save_rdf_profile
 
     source_path = Path(args.trajectory).expanduser().resolve()
+    pre_resolved_cell, preflight_cell_error = _preflight_resolve_cell(
+        args.trajectory,
+        cell=_normalize_cell_args(args),
+        input_path=args.input,
+        analysis_name="RDF",
+    )
     frames = read_trajectory(args.trajectory)
     resolved_cell, cell_source, cell_input_path = _resolve_and_apply_required_cell(
         frames,
@@ -6791,6 +7522,8 @@ def _handle_compute_rdf(args: argparse.Namespace) -> int:
         cell=_normalize_cell_args(args),
         input_path=args.input,
         analysis_name="RDF",
+        pre_resolved=pre_resolved_cell,
+        preflight_error=preflight_cell_error,
     )
     profile = compute_rdf(
         frames=frames,
@@ -6801,10 +7534,9 @@ def _handle_compute_rdf(args: argparse.Namespace) -> int:
         threads=args.threads,
     )
     output = (
-        _resolve_non_overwriting_hdf5_path(args.output)
-        if args.output
-        else _resolve_non_overwriting_hdf5_path(
-            _default_rdf_hdf5_output_path(args.trajectory, profile.species_a, profile.species_b)
+        _resolve_single_analysis_hdf5_output_path(
+            args.output,
+            _default_rdf_hdf5_output_path(args.trajectory, profile.species_a, profile.species_b),
         )
     )
     rdf_metadata: dict[str, Any] = {
@@ -6830,12 +7562,9 @@ def _handle_compute_coordination(args: argparse.Namespace) -> int:
     )
 
     species_b = args.species_b if args.species_b is not None else args.species_a
-    output_path = (
-        _resolve_non_overwriting_hdf5_path(args.output)
-        if args.output
-        else _resolve_non_overwriting_hdf5_path(
-            _default_coordination_hdf5_output_path(args.trajectory, args.species_a, species_b)
-        )
+    output_path = _resolve_single_analysis_hdf5_output_path(
+        args.output,
+        _default_coordination_hdf5_output_path(args.trajectory, args.species_a, species_b),
     )
     use_cutoff_from_rdf = bool(args.cutoff_from_rdf) or (
         args.cutoff is None and args.cutoff_rdf is None
@@ -6863,10 +7592,7 @@ def _handle_compute_coordination(args: argparse.Namespace) -> int:
         elif args.cutoff_rdf:
             cutoff_preview = f"RDF file={Path(args.cutoff_rdf).expanduser().resolve()}"
         else:
-            cutoff_preview = (
-                f"sampled RDF (fraction={args.rdf_sample_fraction:.3g}, "
-                f"bin_width={args.rdf_bin_width:.6g}, r_max={args.rdf_r_max or 'auto'})"
-            )
+            cutoff_preview = "sampled RDF convergence (random 100-frame batches until cutoff stabilizes)"
         plan = [
             f"trajectory source: {source_path}",
             (
@@ -6901,12 +7627,26 @@ def _handle_compute_coordination(args: argparse.Namespace) -> int:
     from .trajectory.io import read_trajectory
 
     source_path = Path(args.trajectory).expanduser().resolve()
+    pre_resolved_cell, preflight_cell_error = _preflight_resolve_cell(
+        args.trajectory,
+        cell=_normalize_cell_args(args),
+        input_path=args.input,
+        analysis_name="coordination",
+    )
+    pre_resolved_timestep, preflight_timestep_error = _preflight_resolve_analysis_timestep_fs(
+        args.trajectory,
+        timestep_fs=args.timestep_fs,
+        input_path=args.input,
+        analysis_name="coordination",
+    )
     frames = read_trajectory(args.trajectory)
     resolved_cell, cell_source, cell_input_path = _maybe_apply_density_cell(
         frames,
         args.trajectory,
         cell=_normalize_cell_args(args),
         input_path=args.input,
+        pre_resolved=pre_resolved_cell,
+        preflight_error=preflight_cell_error,
     )
     pbc_corrected_positions = False
     pbc_cell: tuple[float, float, float] | None = None
@@ -6922,11 +7662,14 @@ def _handle_compute_coordination(args: argparse.Namespace) -> int:
         )
 
     timestep_fs, timestep_source, timestep_input_path, md_timestep_fs, trajectory_stride_md = (
-        _resolve_msd_timestep_fs(
+        _resolve_analysis_timestep_fs(
             args.trajectory,
             timestep_fs=args.timestep_fs,
             input_path=args.input,
+            analysis_name="coordination",
             frames=frames,
+            pre_resolved=pre_resolved_timestep,
+            preflight_error=preflight_timestep_error,
         )
     )
     cutoff_resolution = resolve_coordination_cutoff(
@@ -6937,10 +7680,6 @@ def _handle_compute_coordination(args: argparse.Namespace) -> int:
         cutoff_rdf_path=args.cutoff_rdf,
         cutoff_from_rdf=use_cutoff_from_rdf,
         cutoff_smoothing_width_A=args.cutoff_smoothing_width,
-        rdf_sample_fraction=float(args.rdf_sample_fraction),
-        rdf_bin_width_A=args.rdf_bin_width,
-        rdf_r_max_A=args.rdf_r_max,
-        rdf_smoothing_sigma_A=args.rdf_smoothing_sigma,
         diagnostic_plot_output=diagnostic_plot_output,
     )
     profile = compute_coordination_profile(

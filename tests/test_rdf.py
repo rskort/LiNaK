@@ -5,7 +5,8 @@ import h5py
 from ase import Atoms
 
 import linak.analysis.rdf as rdf_mod
-from linak.analysis.rdf import compute_rdf, load_rdf_profile, save_rdf_profile
+from linak.analysis.rdf import compute_rdf, load_rdf_profile, load_rdf_profiles, save_rdf_profile
+from linak.storage.hdf5_utils import write_linak_hdf5_profile_collection
 
 
 def test_compute_rdf_returns_expected_shape_and_values():
@@ -155,6 +156,36 @@ def test_plot_rdf_profiles_uses_multi_line_plot_for_multiple_profiles(monkeypatc
 
     plot_rdf_profiles([profile_a, profile_b], show=False)
     assert captured["labels"] == ["O-H", "H-H"]
+
+
+def test_load_rdf_profiles_filters_by_stored_species_metadata(tmp_path):
+    out = tmp_path / "multi_rdf.h5"
+    write_linak_hdf5_profile_collection(
+        out,
+        analysis="rdf",
+        profiles=[
+            {
+                "metadata": {"species_a": "O", "species_b": "H", "n_frames": 1},
+                "datasets": {
+                    "bin_centers_A": np.array([0.5, 1.5], dtype=float),
+                    "g_r": np.array([0.1, 0.2], dtype=float),
+                },
+            },
+            {
+                "metadata": {"species_a": "H", "species_b": "H", "n_frames": 1},
+                "datasets": {
+                    "bin_centers_A": np.array([0.5, 1.5], dtype=float),
+                    "g_r": np.array([0.3, 0.4], dtype=float),
+                },
+            },
+        ],
+    )
+
+    loaded = load_rdf_profiles(out, species_a="O", species_b="H")
+
+    assert len(loaded) == 1
+    assert loaded[0].species_a == "O"
+    assert loaded[0].species_b == "H"
 
 
 def test_compute_rdf_reuses_species_selection_when_atom_identities_are_stable(monkeypatch):

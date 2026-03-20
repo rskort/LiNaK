@@ -8,6 +8,12 @@ from ase.io import read, write
 
 import linak.cli as cli_mod
 from linak.cli import (
+    _build_coordination_profile_filter_options,
+    _build_density_gui_context,
+    _build_gui_series_descriptors,
+    _build_rdf_profile_filter_options,
+    _combine_analysis_hdf5_sources,
+    _without_preview_series_state,
     _rewrite_implicit_csv_interactive,
     _rewrite_implicit_plot_csv,
     build_parser,
@@ -38,7 +44,7 @@ from linak.plot.plot_settings import (
     read_plot_profile_names,
     write_plot_profile,
 )
-from linak.analysis.rdf import compute_rdf, save_rdf_profile
+from linak.analysis.rdf import RDFProfile, compute_rdf, save_rdf_profile
 from linak.storage.hdf5_utils import read_linak_hdf5_profiles
 
 
@@ -128,6 +134,12 @@ def _write_simple_hdf5(path: Path) -> None:
 
 def _linak_output_dir(path: Path) -> Path:
     return path / "linak_outputs"
+
+def test_read_project_author_falls_back_to_installed_package_metadata(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli_mod, "_project_pyproject_path", lambda: tmp_path / "missing.toml")
+    monkeypatch.setattr(cli_mod, "package_metadata", lambda _name: {"Author": "R.S. Kort"})
+
+    assert cli_mod._read_project_author(default="Unknown") == "R.S. Kort"
 
 
 def _write_density_hdf5(path: Path) -> None:
@@ -1545,7 +1557,9 @@ def test_plot_implicit_multi_density_with_files_option(tmp_path):
     assert output.exists()
 
 
-def test_plot_density_multi_uses_requested_settings_source(tmp_path, monkeypatch):
+def test_plot_density_multi_ignores_saved_settings_source_and_starts_from_defaults(
+    tmp_path, monkeypatch, caplog
+):
     frame = Atoms("OO", positions=[[0.0, 0.0, 0.02], [0.0, 0.0, 0.18]])
     profile = compute_density_profile([frame], species="O", axis="z", bin_width=0.1)
     source_a = tmp_path / "source_a_density.h5"
@@ -1561,11 +1575,12 @@ def test_plot_density_multi_uses_requested_settings_source(tmp_path, monkeypatch
         return None, {}
 
     monkeypatch.setattr("linak.cli._render_profile_plot", _fake_render_profile_plot)
+    caplog.set_level("INFO")
 
     rc = main(
         [
             "--log-level",
-            "ERROR",
+            "INFO",
             "plot",
             "-f",
             str(source_a),
@@ -1577,7 +1592,124 @@ def test_plot_density_multi_uses_requested_settings_source(tmp_path, monkeypatch
     )
 
     assert rc == 0
-    assert captured["title"] == "From second file"
+    assert captured["title"] is None
+    assert "plot-settings source" not in caplog.text
+
+
+def test_build_gui_series_descriptors_include_directory_metadata():
+    descriptors = _build_gui_series_descriptors(
+        sources=["/tmp/runs/run_04/density.h5"],
+        fallback_labels_by_source=[["Au", "H2O"]],
+    )
+
+    assert [item["series_id"] for item in descriptors] == ["series:0:0", "series:0:1"]
+    assert descriptors[0]["default_label"] == "Au"
+    assert descriptors[1]["default_label"] == "H2O"
+    assert descriptors[0]["source_name"] == "density.h5"
+    assert descriptors[0]["source_directory"].endswith("run_04")
+
+
+def test_build_rdf_profile_filter_options_uses_common_pairs_across_sources():
+    options = _build_rdf_profile_filter_options(
+        [
+            (
+                "a.h5",
+                [
+                    {"metadata": {"species_a": "O", "species_b": "H"}},
+                    {"metadata": {"species_a": "H", "species_b": "H"}},
+                ],
+            ),
+            (
+                "b.h5",
+                [
+                    {"metadata": {"species_a": "O", "species_b": "H"}},
+                    {"metadata": {"species_a": "O", "species_b": "O"}},
+                ],
+            ),
+        ]
+    )
+
+    assert options["species_a"] == ["O"]
+    assert options["species_b_by_species_a"][""] == ["H"]
+    assert options["species_b_by_species_a"]["O"] == ["H"]
+
+
+def test_build_coordination_profile_filter_options_tracks_axes_by_pair():
+    options = _build_coordination_profile_filter_options(
+        [
+            (
+                "a.h5",
+                [
+                    {"metadata": {"species_a": "K", "species_b": "O", "axis": "z"}},
+                    {"metadata": {"species_a": "K", "species_b": "O", "axis": "x"}},
+                ],
+            ),
+            (
+                "b.h5",
+                [
+                    {"metadata": {"species_a": "K", "species_b": "O", "axis": "z"}},
+                    {"metadata": {"species_a": "Li", "species_b": "O", "axis": "z"}},
+                ],
+            ),
+        ]
+    )
+
+    assert options["species_a"] == ["K"]
+    assert options["species_b_by_species_a"]["K"] == ["O"]
+    assert options["axes"] == ["z"]
+    assert options["axes_by_species_pair"]["K"]["O"] == ["z"]
+
+
+def test_without_preview_series_state_drops_rendered_series_arrays():
+    filtered = _without_preview_series_state(
+        {
+            "title": "Preview",
+            "series_labels": ["Only rendered line"],
+            "line_colors": ["#1f77b4"],
+            "series_enabled": [False, True],
+        }
+    )
+
+    assert filtered == {"title": "Preview"}
+
+
+def test_density_gui_series_ids_stay_stable_between_multi_source_and_reopened_combined_hdf5(
+    tmp_path,
+):
+    frame = Atoms("OO", positions=[[0.0, 0.0, 0.02], [0.0, 0.0, 0.18]])
+    profile = compute_density_profile([frame], species="O", axis="z", bin_width=0.1)
+    source_a = tmp_path / "source_a_density.h5"
+    source_b = tmp_path / "source_b_density.h5"
+    save_density_profile(profile, source_a)
+    save_density_profile(profile, source_b)
+
+    args = cli_mod.argparse.Namespace(
+        species=None,
+        axis="z",
+        x_mode="distance",
+        quantity="mass",
+        series_labels=None,
+        line_colors=None,
+        series_overrides=None,
+        _runtime_argv=(),
+    )
+    multi_context = _build_density_gui_context(
+        args,
+        sources=[str(source_a), str(source_b)],
+    )
+    combined_path = _combine_analysis_hdf5_sources(
+        sources=[str(source_a), str(source_b)],
+        analysis="density",
+        output=tmp_path / "combined_density.h5",
+    )
+    reopened_context = _build_density_gui_context(
+        args,
+        sources=[str(combined_path)],
+    )
+
+    assert [item["series_id"] for item in multi_context.series_descriptors] == [
+        item["series_id"] for item in reopened_context.series_descriptors
+    ]
 
 
 def test_plot_density_multi_non_gui_does_not_write_combined_settings_hdf5(tmp_path, monkeypatch):
@@ -1868,7 +2000,9 @@ def test_plot_density_gui_multi_sources_create_combined_hdf5(tmp_path, monkeypat
     assert len(loaded) == 2
 
 
-def test_plot_density_gui_multi_sources_copy_settings_from_requested_source(tmp_path, monkeypatch):
+def test_plot_density_gui_multi_sources_do_not_copy_saved_plot_settings(
+    tmp_path, monkeypatch
+):
     frame = Atoms(
         "OO",
         positions=[[0.0, 0.0, 0.10], [0.0, 0.0, 1.10]],
@@ -1907,11 +2041,10 @@ def test_plot_density_gui_multi_sources_copy_settings_from_requested_source(tmp_
     combined_source = captured["source_path"]
     assert isinstance(combined_source, Path)
     copied_settings = read_plot_profile(combined_source, "plot:density")
-    assert copied_settings is not None
-    assert copied_settings["title"] == "From second"
+    assert copied_settings is None
 
 
-def test_combine_analysis_hdf5_sources_copies_settings_without_source_metadata(tmp_path):
+def test_combine_analysis_hdf5_sources_write_data_without_plot_settings(tmp_path):
     frame = Atoms(
         "OO",
         positions=[[0.0, 0.0, 0.10], [0.0, 0.0, 1.10]],
@@ -1935,15 +2068,16 @@ def test_combine_analysis_hdf5_sources_copies_settings_without_source_metadata(t
 
     assert output_path == combined_h5.resolve()
     imported_settings = read_plot_profile(output_path, "plot:density")
-    assert imported_settings is not None
-    assert imported_settings["title"] == "From second"
+    assert imported_settings is None
     profiles = read_linak_hdf5_profiles(output_path, expected_analysis="density")
     assert profiles
     _datasets, metadata = profiles[0]
     assert "settings_source" not in metadata
 
 
-def test_plot_density_gui_multi_sources_combine_series_labels_and_colors(tmp_path, monkeypatch):
+def test_plot_density_gui_multi_sources_use_default_series_labels_without_saved_overrides(
+    tmp_path, monkeypatch
+):
     frame = Atoms(
         "OO",
         positions=[[0.0, 0.0, 0.10], [0.0, 0.0, 1.10]],
@@ -1986,14 +2120,16 @@ def test_plot_density_gui_multi_sources_combine_series_labels_and_colors(tmp_pat
     )
 
     assert rc == 0
-    assert captured["args"].series_labels == ["run-A", "run-B"]
-    assert captured["args"].line_colors == ["#ff0000", "#00ff00"]
+    assert captured["args"].series_labels is None
+    assert captured["args"].line_colors is None
+    assert captured["initial_context"].default_series_labels == [
+        f"{source_h5_a.name}:O",
+        f"{source_h5_b.name}:O",
+    ]
     combined_source = captured["source_path"]
     assert isinstance(combined_source, Path)
     merged_settings = read_plot_profile(combined_source, "plot:density")
-    assert merged_settings is not None
-    assert merged_settings["series_labels"] == ["run-A", "run-B"]
-    assert merged_settings["line_colors"] == ["#ff0000", "#00ff00"]
+    assert merged_settings is None
 
 
 def test_plot_density_gui_preview_renders_for_each_request(tmp_path, monkeypatch):
@@ -2031,7 +2167,93 @@ def test_plot_density_gui_preview_renders_for_each_request(tmp_path, monkeypatch
     )
 
     assert rc == 0
-    assert len(preview_calls) == 2
+    assert len(preview_calls) == 3
+    assert preview_calls[0]["args"].show is False
+    assert preview_calls[1]["args"].x_min == 0.0
+    assert preview_calls[2]["args"].x_min == 1.0
+
+
+def test_plot_density_gui_seed_render_uses_noninteractive_backend_without_warning(
+    tmp_path, monkeypatch, caplog
+):
+    source_h5 = tmp_path / "source_density.h5"
+    _write_density_hdf5(source_h5)
+
+    backend_calls: list[bool] = []
+
+    def _fake_configure_backend(*, interactive, preferred_backend=None):
+        del preferred_backend
+        backend_calls.append(bool(interactive))
+        return "QtAgg" if interactive else "Agg"
+
+    monkeypatch.setattr(
+        "linak.plot.plotting.configure_matplotlib_backend",
+        _fake_configure_backend,
+    )
+    monkeypatch.setattr(
+        "linak.analysis.density.plot_density_profiles",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr("linak.cli._open_plot_settings_gui", lambda **_kwargs: None)
+
+    caplog.set_level("INFO")
+    rc = main(
+        [
+            "--log-level",
+            "INFO",
+            "plot",
+            str(source_h5),
+            "--gui",
+        ]
+    )
+
+    assert rc == 0
+    assert backend_calls
+    assert all(call is False for call in backend_calls)
+    assert "No interactive display or output path requested. Nothing was rendered." not in caplog.text
+
+
+def test_plot_density_gui_preview_switches_from_seed_agg_to_interactive_backend(
+    tmp_path, monkeypatch
+):
+    source_h5 = tmp_path / "source_density.h5"
+    _write_density_hdf5(source_h5)
+
+    backend_calls: list[bool] = []
+
+    def _fake_configure_backend(*, interactive, preferred_backend=None):
+        del preferred_backend
+        backend_calls.append(bool(interactive))
+        return "QtAgg" if interactive else "Agg"
+
+    monkeypatch.setattr(
+        "linak.plot.plotting.configure_matplotlib_backend",
+        _fake_configure_backend,
+    )
+    monkeypatch.setattr(
+        "linak.analysis.density.plot_density_profiles",
+        lambda *_args, **_kwargs: None,
+    )
+
+    def _fake_gui_launcher(**kwargs):
+        kwargs["on_preview"]({})
+
+    monkeypatch.setattr("linak.cli._open_plot_settings_gui", _fake_gui_launcher)
+
+    rc = main(
+        [
+            "--log-level",
+            "ERROR",
+            "plot",
+            str(source_h5),
+            "--gui",
+        ]
+    )
+
+    assert rc == 0
+    assert backend_calls
+    assert backend_calls[0] is False
+    assert True in backend_calls
 
 
 def test_plot_density_gui_provides_hdf5_import_callback(tmp_path, monkeypatch):
@@ -2199,9 +2421,10 @@ def test_plot_density_gui_preview_uses_non_blocking_show(tmp_path, monkeypatch):
     )
 
     assert rc == 0
-    assert len(plot_calls) == 1
-    assert plot_calls[0]["show"] is True
-    assert plot_calls[0]["show_blocking"] is False
+    assert len(plot_calls) == 2
+    assert plot_calls[0]["show"] is False
+    assert plot_calls[1]["show"] is True
+    assert plot_calls[1]["show_blocking"] is False
 
 
 def test_plot_density_gui_single_series_label_maps_to_line_label(tmp_path, monkeypatch):
@@ -2238,8 +2461,9 @@ def test_plot_density_gui_single_series_label_maps_to_line_label(tmp_path, monke
     )
 
     assert rc == 0
-    assert len(plot_calls) == 1
-    assert plot_calls[0]["line_label"] == "custom-series"
+    assert len(plot_calls) == 2
+    assert plot_calls[0]["show"] is False
+    assert plot_calls[1]["line_label"] == "custom-series"
 
 
 def test_compute_density_passes_surface_options_to_density_engine(tmp_path, monkeypatch):
@@ -2857,6 +3081,17 @@ def test_compute_coordination_defaults_to_cutoff_from_rdf_when_unspecified(tmp_p
     assert (_linak_output_dir(tmp_path) / "traj_coordination_o_h_cutoff_rdf.png").exists()
 
 
+def test_build_parser_omits_coordination_rdf_tuning_flags():
+    parser = build_parser()
+
+    args = parser.parse_args(["compute", "coordination", "traj.xyz"])
+
+    assert not hasattr(args, "rdf_sample_fraction")
+    assert not hasattr(args, "rdf_bin_width")
+    assert not hasattr(args, "rdf_r_max")
+    assert not hasattr(args, "rdf_smoothing_sigma")
+
+
 def test_compute_density_writes_default_csv(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     trajectory = tmp_path / "traj.xyz"
@@ -2937,6 +3172,66 @@ def test_compute_density_default_hdf5_uses_linak_output_dir_in_source_folder(tmp
     assert rc == 0
     assert (_linak_output_dir(trajectory_dir) / "traj_density_o_z.h5").exists()
     assert not (work_dir / "traj_density_o_z.h5").exists()
+
+
+def test_compute_density_output_trailing_slash_uses_directory_with_default_filename(
+    tmp_path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    trajectory = tmp_path / "traj.xyz"
+    _write_xyz(trajectory)
+    output_dir = tmp_path / "custom_output"
+
+    rc = main(
+        [
+            "--log-level",
+            "ERROR",
+            "compute",
+            "density",
+            str(trajectory),
+            "--species",
+            "O",
+            "--axis",
+            "z",
+            "--bin-width",
+            "0.1",
+            "--output",
+            f"{output_dir.as_posix()}/",
+        ]
+    )
+
+    assert rc == 0
+    assert (output_dir / "traj_density_o_z.h5").exists()
+    assert not (tmp_path / "custom_output.h5").exists()
+
+
+def test_compute_density_output_without_suffix_stays_file_path(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    trajectory = tmp_path / "traj.xyz"
+    _write_xyz(trajectory)
+    output_base = tmp_path / "custom_output"
+
+    rc = main(
+        [
+            "--log-level",
+            "ERROR",
+            "compute",
+            "density",
+            str(trajectory),
+            "--species",
+            "O",
+            "--axis",
+            "z",
+            "--bin-width",
+            "0.1",
+            "--output",
+            str(output_base),
+        ]
+    )
+
+    assert rc == 0
+    assert (tmp_path / "custom_output.h5").exists()
+    assert not (output_base / "traj_density_o_z.h5").exists()
 
 
 def test_compute_msd_default_hdf5_uses_linak_output_dir_in_source_folder(tmp_path, monkeypatch):
@@ -3173,16 +3468,21 @@ def test_compute_density_default_output_avoids_overwriting_existing_hdf5(tmp_pat
     assert (_linak_output_dir(tmp_path) / "traj_density_o_z_1.h5").exists()
 
 
-def test_default_combined_analysis_hdf5_path_uses_clean_linak_output_name(tmp_path):
+def test_default_combined_analysis_hdf5_path_uses_pwd_linak_output_dir_for_multi_source(
+    tmp_path, monkeypatch
+):
     source_a = tmp_path / "run_a_density.h5"
     source_b = tmp_path / "run_b_density.h5"
+    working_dir = tmp_path / "workspace"
+    working_dir.mkdir()
+    monkeypatch.chdir(working_dir)
 
     output = cli_mod._default_combined_analysis_hdf5_path(
         [str(source_a), str(source_b)],
         analysis="density",
     )
 
-    assert output == _linak_output_dir(tmp_path) / "linak_density_combined.h5"
+    assert output == _linak_output_dir(working_dir) / "linak_density_combined.h5"
 
 
 def test_default_csv_output_path_uses_shared_linak_output_dir_without_nesting(tmp_path):
@@ -3528,6 +3828,55 @@ def test_compute_msd_writes_resolution_metadata_to_hdf5(tmp_path, monkeypatch):
     assert metadata["resolved_cell_angstrom"] == pytest.approx([1.0, 1.0, 1.0])
 
 
+def test_compute_msd_resolves_sidecars_before_loading_trajectory(tmp_path, monkeypatch):
+    trajectory = tmp_path / "traj.xyz"
+    trajectory.write_text("", encoding="utf-8")
+    events: list[str] = []
+
+    frames = [
+        Atoms(
+            "O",
+            positions=[[0.9, 0.0, 0.0]],
+            cell=[1.0, 1.0, 1.0],
+            pbc=True,
+            info={"timestep_fs": 2.0},
+        ),
+        Atoms(
+            "O",
+            positions=[[0.1, 0.0, 0.0]],
+            cell=[1.0, 1.0, 1.0],
+            pbc=True,
+            info={"timestep_fs": 2.0},
+        ),
+    ]
+
+    def _fake_find_unique_simulation_input(_search_dir):
+        events.append("input_lookup")
+        raise FileNotFoundError("no simulation input")
+
+    def _fake_read_trajectory(_path):
+        events.append("read_trajectory")
+        return frames
+
+    monkeypatch.setattr("linak.resolution.find_unique_simulation_input", _fake_find_unique_simulation_input)
+    monkeypatch.setattr("linak.trajectory.io.read_trajectory", _fake_read_trajectory)
+
+    rc = main(
+        [
+            "--log-level",
+            "ERROR",
+            "compute",
+            "msd",
+            str(trajectory),
+            "--species",
+            "O",
+        ]
+    )
+
+    assert rc == 0
+    assert events[:3] == ["input_lookup", "input_lookup", "read_trajectory"]
+
+
 def test_compute_msd_from_lammps_dump_with_lmp_input(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     trajectory = tmp_path / "lammps.dump"
@@ -3629,6 +3978,85 @@ def test_compute_rdf_writes_resolution_metadata_to_hdf5(tmp_path, monkeypatch):
     assert metadata["cell_source"].startswith("auto-detected")
     assert metadata["input_path"] == str(simulation_input.resolve())
     assert metadata["resolved_cell_angstrom"] == pytest.approx([10.0, 10.0, 10.0])
+
+
+def test_compute_coordination_logs_coordination_timestep_without_backend_noise(
+    tmp_path, monkeypatch, capsys
+):
+    trajectory = tmp_path / "traj.xyz"
+    trajectory.write_text("", encoding="utf-8")
+    rdf_path = tmp_path / "reference_rdf.h5"
+    save_rdf_profile(
+        RDFProfile(
+            species_a="O",
+            species_b="H",
+            bin_edges=np.array([0.0, 0.5, 1.0, 1.5], dtype=float),
+            bin_centers=np.array([0.25, 0.75, 1.25], dtype=float),
+            g_r=np.array([0.2, 1.8, 0.4], dtype=float),
+            n_frames=4,
+        ),
+        rdf_path,
+    )
+
+    frames = [
+        Atoms(
+            "PtPtOH",
+            positions=[
+                [0.0, 0.0, 0.20],
+                [1.0, 0.0, 0.20],
+                [0.0, 0.0, 1.00],
+                [0.70, 0.0, 1.00],
+            ],
+            cell=[10.0, 10.0, 10.0],
+            pbc=True,
+        ),
+        Atoms(
+            "PtPtOH",
+            positions=[
+                [0.0, 0.0, 0.30],
+                [1.0, 0.0, 0.30],
+                [0.0, 0.0, 1.20],
+                [1.10, 0.0, 1.20],
+            ],
+            cell=[10.0, 10.0, 10.0],
+            pbc=True,
+        ),
+    ]
+    monkeypatch.setattr("linak.trajectory.io.read_trajectory", lambda _path: frames)
+
+    rc = main(
+        [
+            "--log-level",
+            "INFO",
+            "compute",
+            "coordination",
+            str(trajectory),
+            "--species-a",
+            "O",
+            "--species-b",
+            "H",
+            "--axis",
+            "z",
+            "--surface-mode",
+            "rough",
+            "--surface-elements",
+            "Pt",
+            "--cell",
+            "10",
+            "10",
+            "10",
+            "--timestep-fs",
+            "2.0",
+            "--cutoff-rdf",
+            str(rdf_path),
+        ]
+    )
+
+    assert rc == 0
+    stderr = capsys.readouterr().err
+    assert "Using timestep for coordination analysis: 2" in stderr
+    assert "MSD analysis" not in stderr
+    assert "Configured Matplotlib backend" not in stderr
 
 
 def test_apply_pbc_dump_default_output_uses_xyz_suffix(tmp_path):

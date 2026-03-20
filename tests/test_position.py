@@ -12,6 +12,7 @@ from linak.analysis.position import (
     compute_position_profiles,
     load_position_profile,
     plot_position_profile,
+    plot_position_profiles,
     save_position_profile,
 )
 
@@ -164,8 +165,50 @@ def test_plot_position_profile_defaults_to_distance_vs_time(monkeypatch):
 
     plot_position_profile(profile, show=False)
     assert captured["x_label"] == "Time (ps)"
-    assert captured["y_label"] == "Distance to surface (A)"
+    assert captured["y_label"] == "Distance to the surface ($\\mathrm{\\AA}$)"
     np.testing.assert_allclose(captured["y_series"][0], np.array([0.8, 0.9]))
+
+
+def test_plot_position_profiles_single_profile_preserves_series_labels(monkeypatch):
+    captured: dict[str, object] = {}
+
+    def _fake_plot_multi_line_series(_x_series, _y_series, labels, **kwargs):
+        captured["labels"] = labels
+        captured["legend"] = kwargs["legend"]
+        return None
+
+    monkeypatch.setattr(
+        "linak.analysis.position.plot_multi_line_series", _fake_plot_multi_line_series
+    )
+
+    profile = PositionProfile(
+        species="O",
+        axis="z",
+        atom_indices=np.array([0, 1]),
+        frame_index=np.array([0, 1]),
+        step=np.array([0.0, 1.0]),
+        time_fs=np.array([0.0, 1.0]),
+        time_ps=np.array([0.0, 0.001]),
+        x=np.array([[0.0, 1.0], [0.1, 1.1]]),
+        y=np.array([[0.0, 0.0], [0.0, 0.0]]),
+        z=np.array([[1.0, 2.0], [1.2, 2.2]]),
+        distance_to_surface=np.array([[0.8, 1.8], [0.9, 1.9]]),
+        n_frames=2,
+        n_atoms=2,
+        coordinate_mode="distance",
+        surface_position=0.2,
+        surface_position_std=0.0,
+        surface_position_per_frame=np.array([0.2, 0.3]),
+    )
+
+    plot_position_profiles(
+        [profile],
+        show=False,
+        series_labels=["O-first", "O-second"],
+    )
+
+    assert captured["labels"] == ["O-first", "O-second"]
+    assert captured["legend"] is True
 
 
 def test_plot_position_profile_xy_z_projection_writes_output(tmp_path):

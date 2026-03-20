@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -23,6 +24,15 @@ LINAK_HDF5_FORMAT = "linak-hdf5"
 LINAK_HDF5_VERSION = 1
 HDF5_SUFFIXES = (".h5", ".hdf5")
 _COLLECTION_GROUP = "profiles"
+_PROFILE_UID_EXCLUDED_METADATA_KEYS = {
+    "combined",
+    "profile_count",
+    "profile_index",
+    "source_files",
+    "source_index",
+    "source_path",
+    "source_profile_index",
+}
 
 
 def require_h5py() -> None:
@@ -81,6 +91,36 @@ def _decode_metadata_json(raw: Any) -> dict[str, Any]:
 
 def _now_utc_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _stable_profile_uid(
+    *,
+    analysis: str,
+    metadata: Mapping[str, Any],
+    datasets: Mapping[str, np.ndarray],
+) -> str:
+    explicit = str(metadata.get("profile_uid") or "").strip()
+    if explicit:
+        return explicit
+
+    fingerprint = hashlib.sha256()
+    fingerprint.update(str(analysis).strip().lower().encode("utf-8", errors="replace"))
+
+    filtered_metadata = {
+        str(key): _json_ready(value)
+        for key, value in metadata.items()
+        if str(key) not in _PROFILE_UID_EXCLUDED_METADATA_KEYS and str(key) != "profile_uid"
+    }
+    fingerprint.update(json.dumps(filtered_metadata, sort_keys=True).encode("utf-8"))
+
+    for name in sorted(datasets):
+        array = np.asarray(datasets[name])
+        fingerprint.update(str(name).encode("utf-8", errors="replace"))
+        fingerprint.update(str(array.dtype).encode("ascii", errors="replace"))
+        fingerprint.update(repr(tuple(array.shape)).encode("ascii", errors="replace"))
+        contiguous = np.ascontiguousarray(array)
+        fingerprint.update(contiguous.view(np.uint8))
+    return f"legacy-{fingerprint.hexdigest()}"
 
 
 def write_linak_hdf5(
@@ -169,6 +209,11 @@ def read_linak_hdf5_profiles(
                     )
                     profile_metadata.setdefault("analysis", analysis)
                     profile_metadata.setdefault("profile_index", index)
+                    profile_metadata["profile_uid"] = _stable_profile_uid(
+                        analysis=analysis,
+                        metadata=profile_metadata,
+                        datasets=datasets,
+                    )
                     profiles.append((datasets, profile_metadata))
                 return profiles
 
@@ -177,6 +222,11 @@ def read_linak_hdf5_profiles(
             for name, dataset in handle.items()
             if hasattr(dataset, "shape")
         }
+        root_metadata["profile_uid"] = _stable_profile_uid(
+            analysis=analysis,
+            metadata=root_metadata,
+            datasets=datasets,
+        )
         return [(datasets, root_metadata)]
 
 

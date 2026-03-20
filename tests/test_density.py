@@ -821,8 +821,8 @@ def test_plot_density_profile_defaults_to_distance_axis(monkeypatch):
     plot_density_profile(profile, show=False)
     np.testing.assert_allclose(captured["x"], np.array([0.25]))
     np.testing.assert_allclose(captured["y"], np.array([2.0e-6]))
-    assert captured["x_label"] == "Distance to surface (A)"
-    assert captured["y_label"] == "Mass density (g/A)"
+    assert captured["x_label"] == "Distance to the surface ($\\mathrm{\\AA}$)"
+    assert captured["y_label"] == "Density (g/A)"
 
 
 def test_plot_density_profiles_use_g_per_cm3_without_si_scaling(monkeypatch):
@@ -868,8 +868,8 @@ def test_plot_density_profiles_use_g_per_cm3_without_si_scaling(monkeypatch):
     np.testing.assert_allclose(captured["x_series"][0], np.array([0.25]))
     np.testing.assert_allclose(captured["y_series"][0], np.array([1.0e15]))
     np.testing.assert_allclose(captured["y_series"][1], np.array([2.0e15]))
-    assert captured["x_label"] == "Distance to surface (A)"
-    assert captured["y_label"] == "Mass density (g/cm^3)"
+    assert captured["x_label"] == "Distance to the surface ($\\mathrm{\\AA}$)"
+    assert captured["y_label"] == "Density (g/cm^3)"
 
 
 def test_plot_density_profiles_auto_limits_ignore_all_zero_tails(monkeypatch):
@@ -1004,6 +1004,35 @@ def test_plot_line_series_can_hide_ticks_for_one_axis_only():
     assert both_hidden_capture["ticks"] is False
 
 
+def test_plot_line_series_grid_off_stays_off_even_with_grid_kwargs(monkeypatch):
+    import matplotlib.pyplot as plt
+
+    from linak.plot import plotting as plotting_mod
+
+    monkeypatch.setattr(plotting_mod, "configure_matplotlib_backend", lambda **_kwargs: "Agg")
+    monkeypatch.setattr(plotting_mod, "_import_pyplot", lambda: plt)
+    monkeypatch.setattr(plt, "close", lambda *_args, **_kwargs: None)
+
+    plotting_mod.plot_line_series(
+        np.array([0.0, 1.0], dtype=float),
+        np.array([1.0, 2.0], dtype=float),
+        title="demo",
+        x_label="x",
+        y_label="y",
+        show=False,
+        style=plotting_mod.with_style_overrides(grid=False),
+        grid_kwargs={"axis": "both", "which": "major", "color": "#ff0000"},
+    )
+
+    figure = plt.gcf()
+    try:
+        axes = figure.axes[0]
+        assert not any(line.get_visible() for line in axes.get_xgridlines())
+        assert not any(line.get_visible() for line in axes.get_ygridlines())
+    finally:
+        plt.close(figure)
+
+
 def test_plot_line_series_non_blocking_show_keeps_figure_open(monkeypatch):
     import matplotlib.pyplot as plt
 
@@ -1128,6 +1157,134 @@ def test_plot_multi_line_series_preserves_explicit_labels_and_legend_font_size()
 
     assert captured["series_labels"] == ["custom-a", "custom-b"]
     assert captured["legend_font_size"] == 17
+
+
+def test_plot_multi_line_series_applies_axis_label_padding():
+    from linak.plot.plotting import plot_multi_line_series
+
+    captured = {}
+    plot_multi_line_series(
+        [np.array([0.0, 1.0], dtype=float)],
+        [np.array([1.0, 2.0], dtype=float)],
+        ["run-a"],
+        title="demo",
+        x_label="x",
+        y_label="y",
+        show=False,
+        x_label_pad=14.0,
+        y_label_pad=18.0,
+        capture_state=captured,
+    )
+
+    assert captured["x_label_pad"] == pytest.approx(14.0)
+    assert captured["y_label_pad"] == pytest.approx(18.0)
+
+
+def test_plot_density_profiles_accepts_axis_label_padding(monkeypatch):
+    from linak.analysis.density import DensityProfile, plot_density_profiles
+
+    captured_kwargs = {}
+
+    def _fake_plot_multi_line_series(_x_series, _y_series, _labels, **kwargs):
+        captured_kwargs.update(kwargs)
+        return None
+
+    monkeypatch.setattr(
+        density_module,
+        "plot_multi_line_series",
+        _fake_plot_multi_line_series,
+    )
+
+    profile_a = DensityProfile(
+        axis="z",
+        species="Au",
+        bin_edges=np.array([-0.5, 0.5, 1.5], dtype=float),
+        bin_centers=np.array([0.0, 1.0], dtype=float),
+        counts_per_frame=np.array([1.0, 2.0], dtype=float),
+        density=np.array([1.0, 2.0], dtype=float),
+        units="g/cm^3",
+        n_frames=2,
+        coordinate_mode="distance",
+        surface_position=0.0,
+        surface_position_std=0.0,
+    )
+    profile_b = DensityProfile(
+        axis="z",
+        species="H2O",
+        bin_edges=np.array([-0.5, 0.5, 1.5], dtype=float),
+        bin_centers=np.array([0.0, 1.0], dtype=float),
+        counts_per_frame=np.array([2.0, 3.0], dtype=float),
+        density=np.array([2.0, 3.0], dtype=float),
+        units="g/cm^3",
+        n_frames=2,
+        coordinate_mode="distance",
+        surface_position=0.0,
+        surface_position_std=0.0,
+    )
+
+    plot_density_profiles(
+        [profile_a, profile_b],
+        show=False,
+        x_label_pad=11.0,
+        y_label_pad=13.0,
+    )
+
+    assert captured_kwargs["x_label_pad"] == pytest.approx(11.0)
+    assert captured_kwargs["y_label_pad"] == pytest.approx(13.0)
+
+
+def test_plot_density_profiles_auto_limits_follow_normalized_data(monkeypatch):
+    from linak.analysis.density import DensityProfile, plot_density_profiles
+
+    captured_kwargs = {}
+
+    def _fake_plot_multi_line_series(_x_series, _y_series, _labels, **kwargs):
+        captured_kwargs.update(kwargs)
+        return None
+
+    monkeypatch.setattr(
+        density_module,
+        "plot_multi_line_series",
+        _fake_plot_multi_line_series,
+    )
+
+    profile_a = DensityProfile(
+        axis="z",
+        species="Au",
+        bin_edges=np.array([-0.5, 0.5, 1.5], dtype=float),
+        bin_centers=np.array([0.0, 1.0], dtype=float),
+        counts_per_frame=np.array([1.0, 2.0], dtype=float),
+        density=np.array([10.0, 20.0], dtype=float),
+        units="g/cm^3",
+        n_frames=2,
+        coordinate_mode="distance",
+        surface_position=0.0,
+        surface_position_std=0.0,
+    )
+    profile_b = DensityProfile(
+        axis="z",
+        species="H2O",
+        bin_edges=np.array([-0.5, 0.5, 1.5], dtype=float),
+        bin_centers=np.array([0.0, 1.0], dtype=float),
+        counts_per_frame=np.array([2.0, 3.0], dtype=float),
+        density=np.array([100.0, 200.0], dtype=float),
+        units="g/cm^3",
+        n_frames=2,
+        coordinate_mode="distance",
+        surface_position=0.0,
+        surface_position_std=0.0,
+    )
+
+    plot_density_profiles(
+        [profile_a, profile_b],
+        show=False,
+        series_normalization_modes=["max", "max"],
+        series_normalization_values=[1.0, 1.0],
+        series_normalization_x_refs=[None, None],
+    )
+
+    assert captured_kwargs["x_lim"] == pytest.approx([-0.05, 1.05])
+    assert captured_kwargs["y_lim"] == pytest.approx([0.0, 1.05])
 
 
 def test_plot_multi_line_series_rejects_invalid_series_line_kwargs_length():
