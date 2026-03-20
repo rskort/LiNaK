@@ -2875,6 +2875,7 @@ def _apply_effective_series_settings(
     profile_key: str,
     fallback_labels_by_source: list[list[str]],
     series_descriptors: list[dict[str, Any]] | None = None,
+    allow_saved_multi_source_merge: bool = True,
 ) -> None:
     total_series = sum(len(labels) for labels in fallback_labels_by_source)
     if total_series <= 0:
@@ -2885,7 +2886,7 @@ def _apply_effective_series_settings(
 
     merged_labels: list[str] | None = None
     merged_colors: list[str] | None = None
-    if len(sources) > 1:
+    if len(sources) > 1 and allow_saved_multi_source_merge:
         merged_labels, merged_colors = _resolve_multi_source_series_settings(
             sources=sources,
             profile_key=profile_key,
@@ -3107,6 +3108,7 @@ def _resolve_gui_default_series_labels(
         sources=sources,
         profile_key=profile_key,
         fallback_labels_by_source=fallback_labels_by_source,
+        allow_saved_multi_source_merge=False,
     )
     labels = _normalize_series_setting_list(getattr(default_args, "series_labels", None))
     if labels is not None:
@@ -6622,6 +6624,7 @@ def _handle_plot_density(args: argparse.Namespace) -> int:
         profile_key=_PLOT_PROFILE_DENSITY,
         fallback_labels_by_source=render_context.fallback_labels_by_source,
         series_descriptors=render_context.series_descriptors,
+        allow_saved_multi_source_merge=not (use_gui and len(sources) > 1),
     )
 
     if use_gui:
@@ -6726,6 +6729,7 @@ def _handle_plot_msd(args: argparse.Namespace) -> int:
         profile_key=_PLOT_PROFILE_MSD,
         fallback_labels_by_source=render_context.fallback_labels_by_source,
         series_descriptors=render_context.series_descriptors,
+        allow_saved_multi_source_merge=not (use_gui and len(sources) > 1),
     )
 
     if use_gui:
@@ -6831,6 +6835,7 @@ def _handle_plot_rdf(args: argparse.Namespace) -> int:
         profile_key=_PLOT_PROFILE_RDF,
         fallback_labels_by_source=render_context.fallback_labels_by_source,
         series_descriptors=render_context.series_descriptors,
+        allow_saved_multi_source_merge=not (use_gui and len(sources) > 1),
     )
 
     if use_gui:
@@ -6952,6 +6957,7 @@ def _handle_plot_position(args: argparse.Namespace) -> int:
         profile_key=_PLOT_PROFILE_POSITION,
         fallback_labels_by_source=render_context.fallback_labels_by_source,
         series_descriptors=render_context.series_descriptors,
+        allow_saved_multi_source_merge=not (use_gui and len(sources) > 1),
     )
 
     if use_gui:
@@ -7060,6 +7066,7 @@ def _handle_plot_coordination(args: argparse.Namespace) -> int:
         profile_key=_PLOT_PROFILE_COORDINATION,
         fallback_labels_by_source=render_context.fallback_labels_by_source,
         series_descriptors=render_context.series_descriptors,
+        allow_saved_multi_source_merge=not (use_gui and len(sources) > 1),
     )
 
     if use_gui:
