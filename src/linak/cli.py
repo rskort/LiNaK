@@ -2885,6 +2885,12 @@ def _apply_effective_series_settings(
 
     merged_labels: list[str] | None = None
     merged_colors: list[str] | None = None
+    if len(sources) > 1:
+        merged_labels, merged_colors = _resolve_multi_source_series_settings(
+            sources=sources,
+            profile_key=profile_key,
+            fallback_labels_by_source=fallback_labels_by_source,
+        )
     overrides = _coerce_series_override_map(getattr(args, "series_overrides", None))
     ordered_descriptors = list(series_descriptors) if isinstance(series_descriptors, list) else []
 
@@ -6472,9 +6478,11 @@ def _combine_analysis_hdf5_sources(
     sources: list[str],
     analysis: str,
     output: str | Path | None,
+    settings_source_path: str | Path | None = None,
 ) -> Path:
     from .storage.hdf5_utils import write_linak_hdf5_profile_collection
 
+    del settings_source_path
     payloads = _read_analysis_profile_payloads(sources=sources, analysis=analysis)
     if output is None:
         output_path = _resolve_non_overwriting_hdf5_path(
