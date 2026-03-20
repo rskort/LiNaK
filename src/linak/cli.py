@@ -2930,13 +2930,13 @@ def _apply_effective_series_settings(
 
         merged_labels = override_labels
         merged_colors = override_colors if any_color else None
-        setattr(args, "series_enabled", override_enabled if any_disabled else None)
-        setattr(args, "series_line_widths", override_widths if any_width else None)
-        setattr(args, "series_markers", override_markers if any_marker else None)
-        setattr(args, "series_line_kwargs", override_line_kwargs if any_line_kwargs else None)
-        setattr(args, "series_normalization_modes", override_norm_modes if any_norm else None)
-        setattr(args, "series_normalization_values", override_norm_values if any_norm else None)
-        setattr(args, "series_normalization_x_refs", override_norm_x_refs if any_norm else None)
+        args.series_enabled = override_enabled if any_disabled else None
+        args.series_line_widths = override_widths if any_width else None
+        args.series_markers = override_markers if any_marker else None
+        args.series_line_kwargs = override_line_kwargs if any_line_kwargs else None
+        args.series_normalization_modes = override_norm_modes if any_norm else None
+        args.series_normalization_values = override_norm_values if any_norm else None
+        args.series_normalization_x_refs = override_norm_x_refs if any_norm else None
 
     if not explicit_labels:
         if merged_labels is not None:
