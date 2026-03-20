@@ -1046,7 +1046,9 @@ def _load_density_plot_profiles(
                 rendered_species = f"{source_label}:{profile.species}"
                 source_labels.append(rendered_species)
                 source_ids.append(
-                    _profile_uid_from_payload(payload, fallback_prefix="density", index=profile_index)
+                    _profile_uid_from_payload(
+                        payload, fallback_prefix="density", index=profile_index
+                    )
                 )
                 plot_profiles.append(replace(profile, species=rendered_species))
             fallback_labels_by_source.append(source_labels)
@@ -1136,7 +1138,9 @@ def _load_rdf_plot_profiles(
         analysis="rdf",
     )
     wanted_species_a = (
-        None if species_a is None or not str(species_a).strip() else _normalize_rdf_species(species_a)
+        None
+        if species_a is None or not str(species_a).strip()
+        else _normalize_rdf_species(species_a)
     )
     wanted_species_b = (
         None
@@ -1247,7 +1251,10 @@ def _load_position_plot_profiles(
                 plot_profiles.append(rendered_profile)
                 source_labels.extend(_position_series_labels_for_profile(rendered_profile))
                 source_ids.extend(
-                    [f"{profile_uid}:atom:{int(atom_index)}" for atom_index in profile.atom_indices.tolist()]
+                    [
+                        f"{profile_uid}:atom:{int(atom_index)}"
+                        for atom_index in profile.atom_indices.tolist()
+                    ]
                 )
             fallback_labels_by_source.append(source_labels)
             series_id_segments_by_source.append(source_ids)
@@ -1268,7 +1275,10 @@ def _load_position_plot_profiles(
             )
             flattened_source_labels.extend(_position_series_labels_for_profile(profile))
             flattened_source_ids.extend(
-                [f"{profile_uid}:atom:{int(atom_index)}" for atom_index in profile.atom_indices.tolist()]
+                [
+                    f"{profile_uid}:atom:{int(atom_index)}"
+                    for atom_index in profile.atom_indices.tolist()
+                ]
             )
         fallback_labels_by_source.append(flattened_source_labels)
         series_id_segments_by_source.append(flattened_source_ids)
@@ -1368,7 +1378,10 @@ def _load_coordination_plot_profiles(
                 else:
                     source_labels.extend(_coordination_series_labels_for_profile(rendered_profile))
                     source_ids.extend(
-                        [f"{profile_uid}:atom:{int(atom_index)}" for atom_index in profile.atom_indices.tolist()]
+                        [
+                            f"{profile_uid}:atom:{int(atom_index)}"
+                            for atom_index in profile.atom_indices.tolist()
+                        ]
                     )
             fallback_labels_by_source.append(source_labels)
             series_id_segments_by_source.append(source_ids)
@@ -1393,7 +1406,10 @@ def _load_coordination_plot_profiles(
             else:
                 flattened_source_labels.extend(_coordination_series_labels_for_profile(profile))
                 flattened_source_ids.extend(
-                    [f"{profile_uid}:atom:{int(atom_index)}" for atom_index in profile.atom_indices.tolist()]
+                    [
+                        f"{profile_uid}:atom:{int(atom_index)}"
+                        for atom_index in profile.atom_indices.tolist()
+                    ]
                 )
         fallback_labels_by_source.append(flattened_source_labels)
         series_id_segments_by_source.append(flattened_source_ids)
@@ -2615,7 +2631,11 @@ def _resolve_analysis_timestep_fs(
     pre_resolved: Any | None = None,
     preflight_error: Exception | None = None,
 ) -> tuple[float, str, str | None, float | None, int | None]:
-    from .resolution import TimestepResolution, _extract_metadata_timestep_details, resolve_analysis_timestep_fs
+    from .resolution import (
+        TimestepResolution,
+        _extract_metadata_timestep_details,
+        resolve_analysis_timestep_fs,
+    )
 
     resolved = pre_resolved
     if resolved is None and preflight_error is None:
@@ -2630,8 +2650,8 @@ def _resolve_analysis_timestep_fs(
             preflight_error = exc
 
     if resolved is None and frames is not None:
-        metadata_timestep, metadata_md_timestep, metadata_stride = _extract_metadata_timestep_details(
-            frames
+        metadata_timestep, metadata_md_timestep, metadata_stride = (
+            _extract_metadata_timestep_details(frames)
         )
         if metadata_timestep is not None:
             resolved = TimestepResolution(
@@ -2866,9 +2886,7 @@ def _apply_effective_series_settings(
     merged_labels: list[str] | None = None
     merged_colors: list[str] | None = None
     overrides = _coerce_series_override_map(getattr(args, "series_overrides", None))
-    ordered_descriptors = (
-        list(series_descriptors) if isinstance(series_descriptors, list) else []
-    )
+    ordered_descriptors = list(series_descriptors) if isinstance(series_descriptors, list) else []
 
     if overrides and len(ordered_descriptors) == total_series:
         override_labels: list[str] = []
@@ -2921,10 +2939,14 @@ def _apply_effective_series_settings(
                 mode_value = None
             override_norm_modes.append(mode_value)
             override_norm_values.append(
-                None if entry.get("normalization_value") is None else float(entry["normalization_value"])
+                None
+                if entry.get("normalization_value") is None
+                else float(entry["normalization_value"])
             )
             override_norm_x_refs.append(
-                None if entry.get("normalization_x_ref") is None else float(entry["normalization_x_ref"])
+                None
+                if entry.get("normalization_x_ref") is None
+                else float(entry["normalization_x_ref"])
             )
             any_norm = any_norm or (mode_value is not None)
 
@@ -3024,7 +3046,9 @@ def _build_gui_series_descriptors(
 ) -> list[dict[str, Any]]:
     if len(sources) != len(fallback_labels_by_source):
         raise ValueError("sources and fallback_labels_by_source must have equal lengths.")
-    if series_id_segments_by_source is not None and len(series_id_segments_by_source) != len(sources):
+    if series_id_segments_by_source is not None and len(series_id_segments_by_source) != len(
+        sources
+    ):
         raise ValueError("series_id_segments_by_source must align with sources.")
 
     descriptors: list[dict[str, Any]] = []
@@ -3032,9 +3056,7 @@ def _build_gui_series_descriptors(
         source_path = Path(source).expanduser()
         source_name = source_path.name or str(source)
         source_directory = (
-            str(source_path.parent)
-            if str(source_path.parent) not in {"", "."}
-            else ""
+            str(source_path.parent) if str(source_path.parent) not in {"", "."} else ""
         )
         id_segment = (
             series_id_segments_by_source[source_index]
@@ -3130,10 +3152,12 @@ def _build_density_gui_context(
     *,
     sources: list[str],
 ) -> _GuiPlotRenderContext:
-    plot_profiles, fallback_labels_by_source, series_id_segments_by_source = _load_density_plot_profiles(
-        sources=sources,
-        species=args.species,
-        axis=args.axis,
+    plot_profiles, fallback_labels_by_source, series_id_segments_by_source = (
+        _load_density_plot_profiles(
+            sources=sources,
+            species=args.species,
+            axis=args.axis,
+        )
     )
     return _GuiPlotRenderContext(
         profile=plot_profiles,
@@ -3162,9 +3186,11 @@ def _build_msd_gui_context(
     *,
     sources: list[str],
 ) -> _GuiPlotRenderContext:
-    plot_profiles, fallback_labels_by_source, series_id_segments_by_source = _load_msd_plot_profiles(
-        sources=sources,
-        species=args.species,
+    plot_profiles, fallback_labels_by_source, series_id_segments_by_source = (
+        _load_msd_plot_profiles(
+            sources=sources,
+            species=args.species,
+        )
     )
     return _GuiPlotRenderContext(
         profile=plot_profiles,
@@ -3194,10 +3220,12 @@ def _build_rdf_gui_context(
         sources=sources,
         analysis="rdf",
     )
-    plot_profiles, fallback_labels_by_source, series_id_segments_by_source = _load_rdf_plot_profiles(
-        sources=sources,
-        species_a=args.species_a,
-        species_b=args.species_b,
+    plot_profiles, fallback_labels_by_source, series_id_segments_by_source = (
+        _load_rdf_plot_profiles(
+            sources=sources,
+            species_a=args.species_a,
+            species_b=args.species_b,
+        )
     )
     return _GuiPlotRenderContext(
         profile=plot_profiles,
@@ -3224,10 +3252,12 @@ def _build_position_gui_context(
     *,
     sources: list[str],
 ) -> _GuiPlotRenderContext:
-    plot_profiles, fallback_labels_by_source, series_id_segments_by_source = _load_position_plot_profiles(
-        sources=sources,
-        species=args.species,
-        axis=args.axis,
+    plot_profiles, fallback_labels_by_source, series_id_segments_by_source = (
+        _load_position_plot_profiles(
+            sources=sources,
+            species=args.species,
+            axis=args.axis,
+        )
     )
     return _GuiPlotRenderContext(
         profile=plot_profiles,
@@ -3261,12 +3291,14 @@ def _build_coordination_gui_context(
         sources=sources,
         analysis="coordination",
     )
-    plot_profiles, fallback_labels_by_source, series_id_segments_by_source = _load_coordination_plot_profiles(
-        sources=sources,
-        species_a=args.species_a,
-        species_b=args.species_b,
-        axis=args.axis,
-        component=args.component,
+    plot_profiles, fallback_labels_by_source, series_id_segments_by_source = (
+        _load_coordination_plot_profiles(
+            sources=sources,
+            species_a=args.species_a,
+            species_b=args.species_b,
+            axis=args.axis,
+            component=args.component,
+        )
     )
     return _GuiPlotRenderContext(
         profile=plot_profiles,
@@ -6402,7 +6434,9 @@ def _read_analysis_profile_payloads(
         sources=sources,
         analysis=analysis,
     )
-    return [payload for _source, source_payloads in payloads_by_source for payload in source_payloads]
+    return [
+        payload for _source, source_payloads in payloads_by_source for payload in source_payloads
+    ]
 
 
 def _read_analysis_profile_payloads_by_source(
@@ -7261,11 +7295,9 @@ def _handle_compute_msd(args: argparse.Namespace) -> int:
         species=args.species,
         timestep_fs=timestep_fs,
     )
-    output = (
-        _resolve_single_analysis_hdf5_output_path(
-            args.output,
-            _default_msd_hdf5_output_path(args.trajectory, profile.species),
-        )
+    output = _resolve_single_analysis_hdf5_output_path(
+        args.output,
+        _default_msd_hdf5_output_path(args.trajectory, profile.species),
     )
     msd_metadata: dict[str, Any] = {
         "source_path": str(source_path),
@@ -7533,11 +7565,9 @@ def _handle_compute_rdf(args: argparse.Namespace) -> int:
         bin_width=args.bin_width,
         threads=args.threads,
     )
-    output = (
-        _resolve_single_analysis_hdf5_output_path(
-            args.output,
-            _default_rdf_hdf5_output_path(args.trajectory, profile.species_a, profile.species_b),
-        )
+    output = _resolve_single_analysis_hdf5_output_path(
+        args.output,
+        _default_rdf_hdf5_output_path(args.trajectory, profile.species_a, profile.species_b),
     )
     rdf_metadata: dict[str, Any] = {
         "source_path": str(source_path),
@@ -7592,7 +7622,9 @@ def _handle_compute_coordination(args: argparse.Namespace) -> int:
         elif args.cutoff_rdf:
             cutoff_preview = f"RDF file={Path(args.cutoff_rdf).expanduser().resolve()}"
         else:
-            cutoff_preview = "sampled RDF convergence (random 100-frame batches until cutoff stabilizes)"
+            cutoff_preview = (
+                "sampled RDF convergence (random 100-frame batches until cutoff stabilizes)"
+            )
         plan = [
             f"trajectory source: {source_path}",
             (

@@ -223,7 +223,9 @@ def test_derive_warning_messages_reports_disabled_sections_and_partial_normaliza
 def test_derive_warning_messages_ignores_advanced_json_overlap():
     warnings = _derive_warning_messages({"legend": True})
 
-    assert all("Advanced JSON overlaps with standard controls" not in message for message in warnings)
+    assert all(
+        "Advanced JSON overlaps with standard controls" not in message for message in warnings
+    )
 
 
 def test_resolve_asset_path_prefers_repo_root_assets(tmp_path):

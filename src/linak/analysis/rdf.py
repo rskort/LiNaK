@@ -635,9 +635,7 @@ def load_rdf_profiles(
                 )
 
             resolved_species_a = str(metadata.get("species_a", "")).strip() or "UNKNOWN"
-            resolved_species_b = (
-                str(metadata.get("species_b", "")).strip() or resolved_species_a
-            )
+            resolved_species_b = str(metadata.get("species_b", "")).strip() or resolved_species_a
             if (
                 wanted_species_a is not None
                 and _normalize_species(resolved_species_a) != wanted_species_a

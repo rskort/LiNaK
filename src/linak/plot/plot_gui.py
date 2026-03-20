@@ -297,12 +297,8 @@ def _derive_warning_messages(
 
     legend_enabled = settings.get("legend") is not False
     legend_kwargs = settings.get("legend_kwargs")
-    legend_columns = (
-        legend_kwargs.get("ncols") if isinstance(legend_kwargs, dict) else None
-    )
-    if not legend_enabled and (
-        settings.get("legend_title") or legend_columns is not None
-    ):
+    legend_columns = legend_kwargs.get("ncols") if isinstance(legend_kwargs, dict) else None
+    if not legend_enabled and (settings.get("legend_title") or legend_columns is not None):
         messages.append("Legend is off; legend title and layout options will not be used.")
 
     ticks_enabled = settings.get("ticks") is not False
@@ -1096,7 +1092,9 @@ def launch_plot_settings_panel(
                 if on_set_active_profile is not None:
                     on_set_active_profile(name)
                 on_delete_profile(current_name)
-                self._profile_names = [name if entry == current_name else entry for entry in self._profile_names]
+                self._profile_names = [
+                    name if entry == current_name else entry for entry in self._profile_names
+                ]
                 message = f"Renamed profile '{current_name}' to '{name}'."
                 self._load_settings_into_editor(
                     settings,
@@ -1477,17 +1475,17 @@ def launch_plot_settings_panel(
                 f"  color: {colors['disabled_text']};"
                 f"  border-color: {colors['border_soft']};"
                 f"}}"
-                f"QPushButton[role=\"primary\"] {{"
+                f'QPushButton[role="primary"] {{'
                 f"  background-color: {colors['accent']};"
                 f"  color: {colors['accent_text']};"
                 f"  border-color: {colors['accent']};"
                 f"  font-weight: 700;"
                 f"}}"
-                f"QPushButton[role=\"primary\"]:hover {{"
+                f'QPushButton[role="primary"]:hover {{'
                 f"  background-color: {colors['accent_hover']};"
                 f"  border-color: {colors['accent_hover']};"
                 f"}}"
-                f"QPushButton[role=\"primary\"]:pressed {{"
+                f'QPushButton[role="primary"]:pressed {{'
                 f"  background-color: {colors['accent_hover']};"
                 f"}}"
                 f"QLineEdit, QComboBox, QPlainTextEdit, QListWidget {{"
@@ -1750,9 +1748,9 @@ def launch_plot_settings_panel(
                         self._set_combo_value(self.grid_which, which_value)
                 elif section_key == "tick_params_kwargs":
                     direction = str(parsed.get("direction") or "out").strip().lower()
-                    axis_value = str(
-                        parsed.get("_ticks_axis", parsed.get("axis", "both"))
-                    ).strip().lower()
+                    axis_value = (
+                        str(parsed.get("_ticks_axis", parsed.get("axis", "both"))).strip().lower()
+                    )
                     minor_value = str(parsed.get("_minor_ticks_mode") or "off").strip().lower()
                     if direction in _TICK_DIRECTIONS:
                         self._set_combo_value(self.tick_direction, direction)
@@ -1891,7 +1889,9 @@ def launch_plot_settings_panel(
             settings, error = self._safe_collect_settings()
             warnings = _derive_warning_messages(settings, error=error)
             if warnings:
-                self._warning_summary_label.setText("\n".join(f"- {message}" for message in warnings[:4]))
+                self._warning_summary_label.setText(
+                    "\n".join(f"- {message}" for message in warnings[:4])
+                )
                 self._warning_summary_label.show()
             else:
                 self._warning_summary_label.setText("")
@@ -2099,7 +2099,9 @@ def launch_plot_settings_panel(
 
             transfer_group = QGroupBox("Transfer Profiles")
             transfer_layout = QGridLayout(transfer_group)
-            transfer_layout.addWidget(_page_button("Import Profile", self._handle_import_json), 0, 0)
+            transfer_layout.addWidget(
+                _page_button("Import Profile", self._handle_import_json), 0, 0
+            )
             transfer_layout.addWidget(
                 _page_button("Export Profile JSON", self._handle_export_json),
                 0,
@@ -2171,9 +2173,7 @@ def launch_plot_settings_panel(
             self._add_form_row(form, "Y label", y_label_row)
             self._add_form_row(form, "Title font", self.title_font)
             self._add_form_row(form, "Label font", self.label_font)
-            math_hint = QLabel(
-                "Math labels: e.g. $cm^3$, $\\Delta G$, $\\rho$."
-            )
+            math_hint = QLabel("Math labels: e.g. $cm^3$, $\\Delta G$, $\\rho$.")
             math_hint.setWordWrap(True)
             self._add_form_row(form, "", math_hint)
             self._title_rows = [(form, self.title_font)]
@@ -2465,9 +2465,7 @@ def launch_plot_settings_panel(
                 self.rdf_species_b = self._combo(
                     tuple(self._rdf_species_b_choices(None)),
                 )
-                self.rdf_species_b.currentTextChanged.connect(
-                    self._handle_series_identity_change
-                )
+                self.rdf_species_b.currentTextChanged.connect(self._handle_series_identity_change)
                 selection_form.addRow("Species A", self.rdf_species_a)
                 selection_form.addRow("Species B", self.rdf_species_b)
                 layout.addWidget(selection)
@@ -2870,9 +2868,7 @@ def launch_plot_settings_panel(
             self.normalization_warning.hide()
             normalize_layout.addWidget(self.normalization_warning)
 
-            hint_text = (
-                "Normalization affects only the displayed figure. Stored HDF5 datasets remain unchanged."
-            )
+            hint_text = "Normalization affects only the displayed figure. Stored HDF5 datasets remain unchanged."
             hint = QLabel(hint_text)
             hint.setWordWrap(True)
             normalize_layout.addWidget(hint)
@@ -3032,11 +3028,17 @@ def launch_plot_settings_panel(
 
             for index in range(count):
                 descriptor = (
-                    dict(descriptors[index]) if index < len(descriptors) else {"series_id": f"series:{index}"}
+                    dict(descriptors[index])
+                    if index < len(descriptors)
+                    else {"series_id": f"series:{index}"}
                 )
                 fallback_label = f"Series {index + 1}"
                 default_label = str(descriptor.get("default_label") or "").strip()
-                if not default_label and isinstance(raw_labels, (list, tuple)) and index < len(raw_labels):
+                if (
+                    not default_label
+                    and isinstance(raw_labels, (list, tuple))
+                    and index < len(raw_labels)
+                ):
                     token = str(raw_labels[index]).strip()
                     if token:
                         default_label = token
@@ -3074,7 +3076,10 @@ def launch_plot_settings_panel(
                 self._series_enabled_data.append(enabled)
 
                 width = ""
-                if isinstance(series_override, dict) and series_override.get("line_width") is not None:
+                if (
+                    isinstance(series_override, dict)
+                    and series_override.get("line_width") is not None
+                ):
                     width = str(series_override.get("line_width")).strip()
                 elif isinstance(raw_widths, (list, tuple)) and index < len(raw_widths):
                     width = str(raw_widths[index]).strip()
@@ -3115,7 +3120,10 @@ def launch_plot_settings_panel(
                 self._series_normalization_modes_data.append(mode)
 
                 norm_value = ""
-                if isinstance(series_override, dict) and series_override.get("normalization_value") is not None:
+                if (
+                    isinstance(series_override, dict)
+                    and series_override.get("normalization_value") is not None
+                ):
                     norm_value = str(series_override.get("normalization_value")).strip()
                 elif isinstance(raw_norm_values, (list, tuple)) and index < len(raw_norm_values):
                     raw_value = raw_norm_values[index]
@@ -3124,7 +3132,10 @@ def launch_plot_settings_panel(
                 self._series_normalization_values_data.append(norm_value)
 
                 norm_x_ref = ""
-                if isinstance(series_override, dict) and series_override.get("normalization_x_ref") is not None:
+                if (
+                    isinstance(series_override, dict)
+                    and series_override.get("normalization_x_ref") is not None
+                ):
                     norm_x_ref = str(series_override.get("normalization_x_ref")).strip()
                 elif isinstance(raw_norm_x_refs, (list, tuple)) and index < len(raw_norm_x_refs):
                     raw_x_ref = raw_norm_x_refs[index]
@@ -3661,11 +3672,7 @@ def launch_plot_settings_panel(
             values = mapping.get(key)
             if not isinstance(values, list):
                 values = mapping.get("", [])
-            resolved = [
-                str(value).strip()
-                for value in values
-                if str(value).strip()
-            ]
+            resolved = [str(value).strip() for value in values if str(value).strip()]
             return [_PROFILE_FILTER_SPECIES_B_AUTO_LABEL, *resolved]
 
         def _coordination_species_b_choices(self, species_a: str | None) -> list[str]:
@@ -3694,9 +3701,7 @@ def launch_plot_settings_panel(
                     if isinstance(candidate, list):
                         axis_values = candidate
             resolved = [
-                str(value).strip().lower()
-                for value in (axis_values or [])
-                if str(value).strip()
+                str(value).strip().lower() for value in (axis_values or []) if str(value).strip()
             ]
             resolved = [value for value in resolved if value in {"x", "y", "z"}]
             return ["", *resolved] if resolved else ["", "x", "y", "z"]
@@ -3820,8 +3825,12 @@ def launch_plot_settings_panel(
             self.y_ticks.setText(_format_float_list(settings.get("y_ticks")))
             self.x_tick_rotation.setText(str(settings.get("x_tick_rotation") or ""))
             self.y_tick_rotation.setText(str(settings.get("y_tick_rotation") or ""))
-            self.x_label_pad.setText("" if settings.get("x_label_pad") is None else str(settings.get("x_label_pad")))
-            self.y_label_pad.setText("" if settings.get("y_label_pad") is None else str(settings.get("y_label_pad")))
+            self.x_label_pad.setText(
+                "" if settings.get("x_label_pad") is None else str(settings.get("x_label_pad"))
+            )
+            self.y_label_pad.setText(
+                "" if settings.get("y_label_pad") is None else str(settings.get("y_label_pad"))
+            )
 
             self.fig_width.setText(
                 _extract_figsize_dimension(settings, index=0, fallback=defaults.figure_size[0])
@@ -3881,7 +3890,9 @@ def launch_plot_settings_panel(
             )
             self._set_combo_value(
                 self.grid_which,
-                str(_extract_dict_value(settings, key="grid_kwargs", nested_key="which") or "major"),
+                str(
+                    _extract_dict_value(settings, key="grid_kwargs", nested_key="which") or "major"
+                ),
             )
             self._set_combo_value(
                 self.tick_direction,
@@ -4162,7 +4173,10 @@ def launch_plot_settings_panel(
             if fig_width is not None and fig_height is not None:
                 figsize = [fig_width, fig_height]
 
-            series_labels = [self._effective_series_label(index) for index in range(len(self._series_labels_data))]
+            series_labels = [
+                self._effective_series_label(index)
+                for index in range(len(self._series_labels_data))
+            ]
             line_colors = [color.strip() for color in self._series_colors_data]
             line_colors_value = _resolve_series_line_colors(line_colors)
 

@@ -282,7 +282,9 @@ def _resolve_converged_sampled_rdf(
     sampled_frame_count = 0
     previous_cutoff_A: float | None = None
     recent_cutoffs_A: list[float] = []
-    selected_frame_batch = [(frame_index, frames[frame_index]) for frame_index in frame_order.tolist()]
+    selected_frame_batch = [
+        (frame_index, frames[frame_index]) for frame_index in frame_order.tolist()
+    ]
     (
         bin_edges,
         config,
@@ -352,12 +354,8 @@ def _resolve_converged_sampled_rdf(
                 step_index,
                 sampled_frame_count,
                 final_minimum_A,
-                ""
-                if delta_A is None
-                else f", delta={delta_A:.6g} A",
-                ""
-                if recent_span_A is None
-                else f", recent_span={recent_span_A:.6g} A",
+                "" if delta_A is None else f", delta={delta_A:.6g} A",
+                "" if recent_span_A is None else f", recent_span={recent_span_A:.6g} A",
             )
             if (
                 sampled_frame_count >= min_frames_before_check
@@ -462,7 +460,11 @@ def _accumulate_reference_rdf_contributions(
     if not selected_frames:
         return counts_accum, expected_accum
 
-    resolved_worker_count = _resolve_rdf_worker_count(None, len(selected_frames)) if worker_count is None else worker_count
+    resolved_worker_count = (
+        _resolve_rdf_worker_count(None, len(selected_frames))
+        if worker_count is None
+        else worker_count
+    )
     resolved_worker_count = min(resolved_worker_count, max(1, len(selected_frames)))
     use_parallel = _should_parallelize_rdf(len(selected_frames), resolved_worker_count)
     if not use_parallel:
@@ -705,10 +707,12 @@ def resolve_coordination_cutoff(
         float(_DEFAULT_RDF_CONVERGENCE_TOLERANCE_A),
         int(_DEFAULT_RDF_CONVERGENCE_MAX_FRAMES),
     )
-    sampled_indices, bin_centers_A, g_r, smoothed, peak_A, minimum_A = _resolve_converged_sampled_rdf(
-        frames,
-        species_a=label_a,
-        species_b=label_b,
+    sampled_indices, bin_centers_A, g_r, smoothed, peak_A, minimum_A = (
+        _resolve_converged_sampled_rdf(
+            frames,
+            species_a=label_a,
+            species_b=label_b,
+        )
     )
     diagnostic_path = None
     if diagnostic_plot_output is not None:
@@ -908,11 +912,17 @@ def _compute_coordination_values_chunked(
         for start in range(0, frame_count, chunk_size):
             stop = min(frame_count, start + chunk_size)
             center_positions = np.stack(
-                [np.asarray(frame.positions[center_indices], dtype=float) for frame in frames[start:stop]],
+                [
+                    np.asarray(frame.positions[center_indices], dtype=float)
+                    for frame in frames[start:stop]
+                ],
                 axis=0,
             )
             neighbor_positions = np.stack(
-                [np.asarray(frame.positions[neighbor_indices], dtype=float) for frame in frames[start:stop]],
+                [
+                    np.asarray(frame.positions[neighbor_indices], dtype=float)
+                    for frame in frames[start:stop]
+                ],
                 axis=0,
             )
             deltas = center_positions[:, :, np.newaxis, :] - neighbor_positions[:, np.newaxis, :, :]

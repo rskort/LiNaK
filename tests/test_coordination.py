@@ -203,7 +203,10 @@ def test_resolve_coordination_cutoff_converges_in_random_batches(monkeypatch):
             SimpleNamespace(bin_edges=bin_edges),
         ),
     )
-    monkeypatch.setattr(coordination_module, "_resolve_rdf_worker_count", lambda *_args, **_kwargs: 1)
+    monkeypatch.setattr(
+        coordination_module, "_resolve_rdf_worker_count", lambda *_args, **_kwargs: 1
+    )
+
     def _fake_accumulate(selected_frames, **_kwargs):
         batch_sizes.append(len(selected_frames))
         counts = np.full(bin_edges.size - 1, float(len(selected_frames)), dtype=float)
@@ -222,22 +225,23 @@ def test_resolve_coordination_cutoff_converges_in_random_batches(monkeypatch):
     monkeypatch.setattr(
         coordination_module,
         "_resolve_cutoff_from_rdf_curve",
-        lambda **_kwargs: observed_cumulative_counts.append(
-            np.asarray(_kwargs["g_r"], dtype=float).copy()
-        ) or (
-            np.zeros(bin_edges.size - 1, dtype=float),
-            0.75,
-            1.55
-            if len(observed_cumulative_counts) == 1
-            else (
-                1.50020
-                if len(observed_cumulative_counts) == expected_steps - 2
+        lambda **_kwargs: (
+            observed_cumulative_counts.append(np.asarray(_kwargs["g_r"], dtype=float).copy())
+            or (
+                np.zeros(bin_edges.size - 1, dtype=float),
+                0.75,
+                1.55
+                if len(observed_cumulative_counts) == 1
                 else (
-                    1.50025
-                    if len(observed_cumulative_counts) == expected_steps - 1
-                    else 1.50023
-                )
-            ),
+                    1.50020
+                    if len(observed_cumulative_counts) == expected_steps - 2
+                    else (
+                        1.50025
+                        if len(observed_cumulative_counts) == expected_steps - 1
+                        else 1.50023
+                    )
+                ),
+            )
         ),
     )
 

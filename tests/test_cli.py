@@ -135,6 +135,7 @@ def _write_simple_hdf5(path: Path) -> None:
 def _linak_output_dir(path: Path) -> Path:
     return path / "linak_outputs"
 
+
 def test_read_project_author_falls_back_to_installed_package_metadata(tmp_path, monkeypatch):
     monkeypatch.setattr(cli_mod, "_project_pyproject_path", lambda: tmp_path / "missing.toml")
     monkeypatch.setattr(cli_mod, "package_metadata", lambda _name: {"Author": "R.S. Kort"})
@@ -2000,9 +2001,7 @@ def test_plot_density_gui_multi_sources_create_combined_hdf5(tmp_path, monkeypat
     assert len(loaded) == 2
 
 
-def test_plot_density_gui_multi_sources_do_not_copy_saved_plot_settings(
-    tmp_path, monkeypatch
-):
+def test_plot_density_gui_multi_sources_do_not_copy_saved_plot_settings(tmp_path, monkeypatch):
     frame = Atoms(
         "OO",
         positions=[[0.0, 0.0, 0.10], [0.0, 0.0, 1.10]],
@@ -2210,7 +2209,9 @@ def test_plot_density_gui_seed_render_uses_noninteractive_backend_without_warnin
     assert rc == 0
     assert backend_calls
     assert all(call is False for call in backend_calls)
-    assert "No interactive display or output path requested. Nothing was rendered." not in caplog.text
+    assert (
+        "No interactive display or output path requested. Nothing was rendered." not in caplog.text
+    )
 
 
 def test_plot_density_gui_preview_switches_from_seed_agg_to_interactive_backend(
@@ -3858,7 +3859,9 @@ def test_compute_msd_resolves_sidecars_before_loading_trajectory(tmp_path, monke
         events.append("read_trajectory")
         return frames
 
-    monkeypatch.setattr("linak.resolution.find_unique_simulation_input", _fake_find_unique_simulation_input)
+    monkeypatch.setattr(
+        "linak.resolution.find_unique_simulation_input", _fake_find_unique_simulation_input
+    )
     monkeypatch.setattr("linak.trajectory.io.read_trajectory", _fake_read_trajectory)
 
     rc = main(
