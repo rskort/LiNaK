@@ -1,12 +1,14 @@
 # LiNaK
 
+**LiNaK is currently still under active development. Any bugs, feedback, or feature requests are very welcome!**
+
 LiNaK is a lightweight Python toolkit for molecular dynamics trajectory analysis. The package is designed for electrochemical systems (e.g. a Pt(111)-surface with an electrolyte of water and cations), but many features are general-purpose and applicable to other MD contexts as well. It combines trajectory analysis, HDF5-based data storage, plotting, and a few practical CP2K/LAMMPS utilities behind one CLI.
 
 <img src="assets/linak_gui_banner.svg" alt="LiNaK GUI banner" width="200">
 
 LiNaK provides four top-level commands:
 - `linak compute`: generate LiNaK HDF5 analysis files
-- `linak plot`: plot LiNaK density, MSD, RDF, position, and coordination HDF5 files by auto-detecting the analysis from the HDF5 metadata
+- `linak plot`: plot LiNaK density, MSD, RDF, position, coordination, and potential HDF5 files by auto-detecting the analysis from the HDF5 metadata
 - `linak apply`: apply PBC or compress CP2K output files
 - `linak hdf5` (`linak hd`, `linak h5`): inspect, combine, transform, and plot generic tabular HDF5 data
 
@@ -114,7 +116,7 @@ linak compute potential -f run1/*-v_hartree-1_0.cube run2/*-v_hartree-1_0.cube -
 ### `linak plot`
 
 The `plot` command reads LiNaK analysis HDF5 files and auto-detects whether the
-file contains density, MSD, RDF, position, or coordination data.
+file contains density, MSD, RDF, position, coordination, or potential data.
 
 Examples:
 
@@ -125,6 +127,7 @@ linak plot traj_msd_o.h5
 linak plot traj_position_o_z.h5
 linak plot traj_rdf_o_h.h5 
 linak plot traj_coordination_o_h.h5
+linak plot potentials.h5
 ```
 
 When `linak plot` cannot detect a supported LiNaK analysis in the HDF5 file, it
@@ -134,6 +137,10 @@ When interactive plotting is available, `linak plot` opens the LiNaK Studio GUI
 by default. The GUI provides a live preview plus analysis-aware controls, 
 allowing you to control options for analysis alongside the usual figure, axis,
 legend, series, and export settings.
+
+Potential HDF5 files open in the same Studio. The default potential plot shows
+the stored `Water bulk`, `Fermi`, and `cSHE` series against `Record ID`, and
+each series can optionally add a linear-fit overlay from the `Series` page.
 
 The current Studio layout is organized as:
 - `Overview`

@@ -7,6 +7,7 @@ from pathlib import Path
 import re
 
 from ase import Atoms
+import numpy as np
 
 from .trajectory.lammps import (
     extract_cell_from_lammps_input,
@@ -20,6 +21,13 @@ SUPPORTED_SIM_INPUT_SUFFIXES = (".inp", ".lmp")
 
 _ABC_PATTERN = re.compile(
     r"^\s*ABC(?:\s+\[[^\]]+\])?\s+"
+    r"([+-]?\d*\.?\d+(?:[eE][+-]?\d+)?)\s+"
+    r"([+-]?\d*\.?\d+(?:[eE][+-]?\d+)?)\s+"
+    r"([+-]?\d*\.?\d+(?:[eE][+-]?\d+)?)\s*$",
+    re.IGNORECASE,
+)
+_ALPHA_BETA_GAMMA_PATTERN = re.compile(
+    r"^\s*ALPHA_BETA_GAMMA(?:\s+\[[^\]]+\])?\s+"
     r"([+-]?\d*\.?\d+(?:[eE][+-]?\d+)?)\s+"
     r"([+-]?\d*\.?\d+(?:[eE][+-]?\d+)?)\s+"
     r"([+-]?\d*\.?\d+(?:[eE][+-]?\d+)?)\s*$",
@@ -120,37 +128,70 @@ def extract_cell_from_cp2k_input(path: str | Path) -> tuple[float, float, float]
     if not input_path.is_file():
         raise ValueError(f"CP2K input path is not a file: {input_path}")
 
+    cell: tuple[float, float, float] | None = None
+    angles: tuple[float, float, float] | None = None
+    abc_line_number: int | None = None
+    angle_line_number: int | None = None
     with input_path.open("r", encoding="utf-8") as handle:
         for line_number, line in enumerate(handle, start=1):
             no_comment = line.split("!", 1)[0].strip()
             if not no_comment:
                 continue
-            match = _ABC_PATTERN.match(no_comment)
-            if not match:
+            abc_match = _ABC_PATTERN.match(no_comment)
+            if abc_match:
+                cell = (
+                    float(abc_match.group(1)),
+                    float(abc_match.group(2)),
+                    float(abc_match.group(3)),
+                )
+                abc_line_number = line_number
                 continue
 
-            cell = (
-                float(match.group(1)),
-                float(match.group(2)),
-                float(match.group(3)),
-            )
-            ensure_positive("cell_a", cell[0])
-            ensure_positive("cell_b", cell[1])
-            ensure_positive("cell_c", cell[2])
-            LOGGER.info(
-                "Parsed CP2K ABC cell from '%s' line %d: %.6g %.6g %.6g Angstrom.",
-                input_path,
-                line_number,
-                cell[0],
-                cell[1],
-                cell[2],
-            )
-            return cell
+            angle_match = _ALPHA_BETA_GAMMA_PATTERN.match(no_comment)
+            if angle_match:
+                angles = (
+                    float(angle_match.group(1)),
+                    float(angle_match.group(2)),
+                    float(angle_match.group(3)),
+                )
+                angle_line_number = line_number
 
-    raise ValueError(
-        f"No valid 'ABC ...' line found in CP2K input file '{input_path}'. "
-        "Provide --input with a valid file or --cell A B C."
+    if cell is None:
+        raise ValueError(
+            f"No valid 'ABC ...' line found in CP2K input file '{input_path}'. "
+            "Provide --input with a valid file or --cell A B C."
+        )
+
+    ensure_positive("cell_a", cell[0])
+    ensure_positive("cell_b", cell[1])
+    ensure_positive("cell_c", cell[2])
+
+    if angles is not None:
+        if not all(abs(angle - 90.0) <= 1e-6 for angle in angles):
+            raise ValueError(
+                f"CP2K input '{input_path}' defines ALPHA_BETA_GAMMA "
+                f"{angles[0]:.6g} {angles[1]:.6g} {angles[2]:.6g} on line "
+                f"{angle_line_number}, but LiNaK PBC handling currently supports "
+                "orthorhombic cells only (90 90 90)."
+            )
+        LOGGER.info(
+            "Validated CP2K ALPHA_BETA_GAMMA from '%s' line %d: %.6g %.6g %.6g deg.",
+            input_path,
+            angle_line_number,
+            angles[0],
+            angles[1],
+            angles[2],
+        )
+
+    LOGGER.info(
+        "Parsed CP2K ABC cell from '%s' line %d: %.6g %.6g %.6g Angstrom.",
+        input_path,
+        abc_line_number,
+        cell[0],
+        cell[1],
+        cell[2],
     )
+    return cell
 
 
 def extract_timestep_fs_from_cp2k_input(path: str | Path) -> float:
@@ -324,13 +365,14 @@ def apply_pbc_to_frames(
     ensure_positive("cell_b", cell[1])
     ensure_positive("cell_c", cell[2])
 
+    cell_array = np.asarray(cell, dtype=float)
     wrapped_frames: list[Atoms] = []
     with ProgressBar(desc="Applying PBC", total=len(frames), unit="frame") as progress:
         for frame in frames:
             wrapped = frame.copy()
             wrapped.set_cell(cell)
             wrapped.set_pbc((True, True, True))
-            wrapped.wrap(eps=1e-12)
+            wrapped.positions[:] = np.mod(np.asarray(wrapped.positions, dtype=float), cell_array)
             wrapped_frames.append(wrapped)
             progress.update()
 

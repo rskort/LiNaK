@@ -7,11 +7,14 @@ import difflib
 import logging
 import os
 from pathlib import Path
+import re
 import sys
 from typing import Any
 
 import matplotlib
 import numpy as np
+
+from .fitting import execute_series_fit, resolve_series_fit_configs
 
 LOGGER = logging.getLogger(__name__)
 
@@ -81,6 +84,31 @@ class PlotStyle:
 
 
 DEFAULT_PLOT_STYLE = PlotStyle()
+
+_AXIS_LABEL_UNIT_PATTERN = re.compile(r"^(?P<prefix>.+?)\s+\((?P<units>[^()]*)\)\s*$")
+
+
+def format_axis_label_units(label: str) -> str:
+    """Wrap trailing unit text in mathmathrm for cleaner Matplotlib rendering."""
+    raw_label = str(label)
+    if "$" in raw_label:
+        return raw_label
+
+    match = _AXIS_LABEL_UNIT_PATTERN.match(raw_label.strip())
+    if match is None:
+        return raw_label
+
+    prefix = match.group("prefix").strip()
+    units = match.group("units").strip()
+    if not prefix or not units or "$" in units:
+        return raw_label
+
+    normalized_units = units.replace("Å", r"\AA")
+    lowered_units = normalized_units.lower()
+    if lowered_units == "a" or lowered_units == "angstrom":
+        normalized_units = r"\AA"
+
+    return f"{prefix} ($\\mathrm{{{normalized_units}}}$)"
 
 
 def default_series_colors(count: int) -> list[str]:
@@ -679,6 +707,7 @@ def plot_line_series(
     x: np.ndarray,
     y: np.ndarray,
     *,
+    series_id: str | None = None,
     title: str,
     x_label: str,
     y_label: str,
@@ -691,6 +720,11 @@ def plot_line_series(
     line_width_override: float | None = None,
     line_marker: str | None = None,
     line_visible: bool = True,
+    show_in_legend: bool = True,
+    fit_config: dict[str, Any] | None = None,
+    fit_enabled: bool = False,
+    fit_label: str | None = None,
+    fit_show_in_legend: bool = True,
     normalization_mode: str | None = None,
     normalization_value: float | None = None,
     normalization_x_ref: float | None = None,
@@ -755,13 +789,22 @@ def plot_line_series(
         color = line_color or style.line_color
         marker = ("o" if markers else "") if line_marker is None else str(line_marker)
         line_artist = None
+        fit_summary_key = str(series_id or "series")
+        fit_summaries: dict[str, dict[str, Any]] = {}
+        resolved_fit_config = resolve_series_fit_configs(
+            series_count=1,
+            series_fit_configs=[fit_config],
+            series_fit_enabled=[fit_enabled],
+            series_fit_labels=[fit_label],
+            series_fit_show_in_legend=[fit_show_in_legend],
+        )[0]
         if line_visible:
             resolved_line_kwargs: dict[str, Any] = {
                 "lw": style.line_width
                 if line_width_override is None
                 else float(line_width_override),
                 "color": color,
-                "label": line_label,
+                "label": line_label if show_in_legend else "_nolegend_",
                 "marker": marker,
             }
             if line_kwargs is not None:
@@ -774,10 +817,51 @@ def plot_line_series(
                 **resolved_line_kwargs,
             )
 
+        if line_artist is not None and bool(resolved_fit_config.get("fit_enabled")):
+            fit_summary = execute_series_fit(
+                x_plot,
+                y_plot,
+                fit_config=resolved_fit_config,
+                visible_x_lim=x_lim,
+            )
+            fit_render_label = (
+                str(resolved_fit_config.get("fit_label_override") or "").strip()
+                or f"{line_label or 'Series'} fit"
+            )
+            fit_summary["fit_enabled"] = True
+            fit_summary["label"] = fit_render_label
+            fit_summaries[fit_summary_key] = fit_summary
+            if fit_summary.get("status") == "ok":
+                fit_kwargs: dict[str, Any] = {
+                    "color": str(line_artist.get_color()),
+                    "linestyle": "--",
+                    "linewidth": float(line_artist.get_linewidth()),
+                    "marker": "",
+                    "label": (
+                        fit_render_label
+                        if bool(resolved_fit_config.get("fit_show_in_legend", True))
+                        else "_nolegend_"
+                    ),
+                }
+                line_alpha = line_artist.get_alpha()
+                if line_alpha is not None:
+                    fit_kwargs["alpha"] = float(line_alpha)
+                ax.plot(
+                    np.asarray(fit_summary.get("x_fit", []), dtype=float),
+                    np.asarray(fit_summary.get("y_fit", []), dtype=float),
+                    **fit_kwargs,
+                )
+        elif bool(resolved_fit_config.get("fit_enabled")):
+            fit_summaries[fit_summary_key] = {
+                "fit_enabled": True,
+                "status": "disabled",
+                "fit_type": str(resolved_fit_config.get("fit_type") or "linear"),
+            }
+
         should_show_legend = (
-            bool(line_artist is not None and line_label)
+            bool(ax.get_legend_handles_labels()[1])
             if legend is None
-            else bool(legend and line_artist is not None and line_label)
+            else bool(legend and ax.get_legend_handles_labels()[1])
         )
         if should_show_legend:
             resolved_legend_kwargs: dict[str, Any] = {
@@ -795,8 +879,8 @@ def plot_line_series(
             xlabel_kwargs["labelpad"] = float(x_label_pad)
         if y_label_pad is not None:
             ylabel_kwargs["labelpad"] = float(y_label_pad)
-        ax.set_xlabel(x_label, **xlabel_kwargs)
-        ax.set_ylabel(y_label, **ylabel_kwargs)
+        ax.set_xlabel(format_axis_label_units(x_label), **xlabel_kwargs)
+        ax.set_ylabel(format_axis_label_units(y_label), **ylabel_kwargs)
         if title_visible is False:
             ax.set_title("", fontsize=style.title_font_size)
         else:
@@ -895,6 +979,8 @@ def plot_line_series(
             legend_loc=legend_loc,
             capture_state=capture_state,
         )
+        if capture_state is not None:
+            capture_state["series_fit_summaries"] = fit_summaries
 
         output_path = None
         if output is not None:
@@ -934,6 +1020,7 @@ def plot_multi_line_series(
     y_series: list[np.ndarray],
     labels: list[str],
     *,
+    series_ids: list[str] | None = None,
     title: str,
     x_label: str,
     y_label: str,
@@ -944,8 +1031,13 @@ def plot_multi_line_series(
     style: PlotStyle = DEFAULT_PLOT_STYLE,
     line_colors: list[str] | None = None,
     series_enabled: list[bool] | None = None,
+    series_show_in_legend: list[bool] | None = None,
     series_line_widths: list[float | None] | None = None,
     series_markers: list[str | None] | None = None,
+    series_fit_configs: list[dict[str, Any] | None] | None = None,
+    series_fit_enabled: list[bool] | None = None,
+    series_fit_labels: list[str | None] | None = None,
+    series_fit_show_in_legend: list[bool] | None = None,
     series_normalization_modes: list[str] | None = None,
     series_normalization_values: list[float | None] | None = None,
     series_normalization_x_refs: list[float | None] | None = None,
@@ -983,6 +1075,8 @@ def plot_multi_line_series(
     """Plot multiple line series in a single axes using the shared LiNaK style."""
     if not (len(x_series) == len(y_series) == len(labels)):
         raise ValueError("x_series, y_series, and labels must have equal lengths.")
+    if series_ids is not None and len(series_ids) != len(labels):
+        raise ValueError("series_ids count must match the number of plotted series.")
     if not x_series:
         raise ValueError("At least one series is required for multi-line plotting.")
 
@@ -1024,6 +1118,10 @@ def plot_multi_line_series(
             raise ValueError(
                 f"series_enabled count must match the number of plotted series ({len(labels)})."
             )
+        if series_show_in_legend is not None and len(series_show_in_legend) != len(labels):
+            raise ValueError(
+                f"series_show_in_legend count must match the number of plotted series ({len(labels)})."
+            )
         if series_line_widths is not None and len(series_line_widths) != len(labels):
             raise ValueError(
                 f"series_line_widths count must match the number of plotted series ({len(labels)})."
@@ -1036,12 +1134,52 @@ def plot_multi_line_series(
             raise ValueError(
                 f"series_line_kwargs count must match the number of plotted series ({len(labels)})."
             )
+        if series_fit_enabled is not None and len(series_fit_enabled) != len(labels):
+            raise ValueError(
+                f"series_fit_enabled count must match the number of plotted series ({len(labels)})."
+            )
+        if series_fit_configs is not None and len(series_fit_configs) != len(labels):
+            raise ValueError(
+                f"series_fit_configs count must match the number of plotted series ({len(labels)})."
+            )
+        if series_fit_labels is not None and len(series_fit_labels) != len(labels):
+            raise ValueError(
+                f"series_fit_labels count must match the number of plotted series ({len(labels)})."
+            )
+        if series_fit_show_in_legend is not None and len(series_fit_show_in_legend) != len(labels):
+            raise ValueError(
+                f"series_fit_show_in_legend count must match the number of plotted series ({len(labels)})."
+            )
+        resolved_fit_configs = resolve_series_fit_configs(
+            series_count=len(labels),
+            series_fit_configs=series_fit_configs,
+            series_fit_enabled=series_fit_enabled,
+            series_fit_labels=series_fit_labels,
+            series_fit_show_in_legend=series_fit_show_in_legend,
+        )
+        fit_summaries: dict[str, dict[str, Any]] = {}
         for index, (x_values, y_values, label) in enumerate(
             zip(transformed_x_series, transformed_y_series, labels)
         ):
             if series_enabled is not None and not bool(series_enabled[index]):
+                if bool(resolved_fit_configs[index].get("fit_enabled")):
+                    fit_key = (
+                        str(series_ids[index]) if series_ids is not None else f"series:{index}"
+                    )
+                    fit_summaries[fit_key] = {
+                        "fit_enabled": True,
+                        "status": "disabled",
+                        "fit_type": str(resolved_fit_configs[index].get("fit_type") or "linear"),
+                    }
                 continue
-            kwargs: dict[str, Any] = {"lw": style.line_width, "label": label}
+            kwargs: dict[str, Any] = {
+                "lw": style.line_width,
+                "label": (
+                    label
+                    if series_show_in_legend is None or bool(series_show_in_legend[index])
+                    else "_nolegend_"
+                ),
+            }
             line_width_override = None if series_line_widths is None else series_line_widths[index]
             if line_width_override is not None:
                 kwargs["lw"] = float(line_width_override)
@@ -1058,11 +1196,52 @@ def plot_multi_line_series(
             line_kwargs_override = None if series_line_kwargs is None else series_line_kwargs[index]
             if line_kwargs_override is not None:
                 kwargs.update(dict(line_kwargs_override))
-            kwargs["label"] = label
+            kwargs["label"] = (
+                label
+                if series_show_in_legend is None or bool(series_show_in_legend[index])
+                else "_nolegend_"
+            )
             (artist,) = ax.plot(x_values, y_values, **kwargs)
             rendered_colors.append(str(artist.get_color()))
             rendered_markers.append(str(artist.get_marker()))
             rendered_labels.append(str(artist.get_label()))
+            fit_config = resolved_fit_configs[index]
+            if not bool(fit_config.get("fit_enabled")):
+                continue
+            fit_summary = execute_series_fit(
+                x_values,
+                y_values,
+                fit_config=fit_config,
+                visible_x_lim=x_lim,
+            )
+            fit_render_label = (
+                str(fit_config.get("fit_label_override") or "").strip() or f"{label} fit"
+            )
+            fit_key = str(series_ids[index]) if series_ids is not None else f"series:{index}"
+            fit_summary["fit_enabled"] = True
+            fit_summary["label"] = fit_render_label
+            fit_summaries[fit_key] = fit_summary
+            if fit_summary.get("status") != "ok":
+                continue
+            fit_kwargs: dict[str, Any] = {
+                "color": str(artist.get_color()),
+                "linestyle": "--",
+                "linewidth": float(artist.get_linewidth()),
+                "marker": "",
+                "label": (
+                    fit_render_label
+                    if bool(fit_config.get("fit_show_in_legend", True))
+                    else "_nolegend_"
+                ),
+            }
+            line_alpha = artist.get_alpha()
+            if line_alpha is not None:
+                fit_kwargs["alpha"] = float(line_alpha)
+            ax.plot(
+                np.asarray(fit_summary.get("x_fit", []), dtype=float),
+                np.asarray(fit_summary.get("y_fit", []), dtype=float),
+                **fit_kwargs,
+            )
 
         should_show_legend = (
             len(rendered_labels) > 1 if legend is None else bool(legend and rendered_labels)
@@ -1082,8 +1261,8 @@ def plot_multi_line_series(
             xlabel_kwargs["labelpad"] = float(x_label_pad)
         if y_label_pad is not None:
             ylabel_kwargs["labelpad"] = float(y_label_pad)
-        ax.set_xlabel(x_label, **xlabel_kwargs)
-        ax.set_ylabel(y_label, **ylabel_kwargs)
+        ax.set_xlabel(format_axis_label_units(x_label), **xlabel_kwargs)
+        ax.set_ylabel(format_axis_label_units(y_label), **ylabel_kwargs)
         if title_visible is False:
             ax.set_title("", fontsize=style.title_font_size)
         else:
@@ -1180,6 +1359,8 @@ def plot_multi_line_series(
             legend_loc=legend_loc,
             capture_state=capture_state,
         )
+        if capture_state is not None:
+            capture_state["series_fit_summaries"] = fit_summaries
 
         output_path = None
         if output is not None:

@@ -401,6 +401,58 @@ def test_plot_coordination_profile_time_uses_atom_series(monkeypatch):
     assert len(captured["y_series"]) == 2
 
 
+def test_plot_coordination_time_distance_applies_axis_label_padding(monkeypatch):
+    import matplotlib.axes
+
+    profile = CoordinationProfile(
+        species_a="O",
+        species_b="H",
+        axis="z",
+        atom_indices=np.array([2]),
+        frame_index=np.array([0, 1, 2]),
+        step=np.array([0.0, 1.0, 2.0]),
+        time_fs=np.array([0.0, 2.0, 4.0]),
+        time_ps=np.array([0.0, 0.002, 0.004]),
+        distance_to_surface=np.array([[0.8], [1.0], [1.1]], dtype=float),
+        coordination_number=np.array([[1.0], [0.5], [0.8]], dtype=float),
+        n_frames=3,
+        n_atoms=1,
+        coordinate_mode="distance",
+        cutoff_A=1.0,
+        cutoff_smoothing_width_A=0.4,
+    )
+    captured: dict[str, object] = {}
+
+    original_set_xlabel = matplotlib.axes.Axes.set_xlabel
+    original_set_ylabel = matplotlib.axes.Axes.set_ylabel
+
+    def _capture_set_xlabel(self, xlabel, *args, **kwargs):
+        captured["x_label"] = xlabel
+        captured["x_label_pad"] = kwargs.get("labelpad")
+        return original_set_xlabel(self, xlabel, *args, **kwargs)
+
+    def _capture_set_ylabel(self, ylabel, *args, **kwargs):
+        captured["y_label"] = ylabel
+        captured["y_label_pad"] = kwargs.get("labelpad")
+        return original_set_ylabel(self, ylabel, *args, **kwargs)
+
+    monkeypatch.setattr(matplotlib.axes.Axes, "set_xlabel", _capture_set_xlabel)
+    monkeypatch.setattr(matplotlib.axes.Axes, "set_ylabel", _capture_set_ylabel)
+
+    plot_coordination_profile(
+        profile,
+        component="time-distance",
+        show=False,
+        x_label_pad=7.0,
+        y_label_pad=9.0,
+    )
+
+    assert captured["x_label"] == "Time ($\\mathrm{ps}$)"
+    assert captured["y_label"] == "Distance to the surface ($\\mathrm{\\AA}$)"
+    assert captured["x_label_pad"] == pytest.approx(7.0)
+    assert captured["y_label_pad"] == pytest.approx(9.0)
+
+
 def test_plot_coordination_time_distance_ignores_marker_only_line_kwargs(tmp_path):
     profile = CoordinationProfile(
         species_a="O",

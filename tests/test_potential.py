@@ -11,6 +11,8 @@ from linak.analysis.potential import (
     HARTREE_TO_EV,
     PotentialComputationFailure,
     PotentialConfig,
+    load_potential_plot_profiles,
+    plot_potential_profiles,
     PotentialRecord,
     compute_potential_records,
 )
@@ -97,6 +99,172 @@ def _read_hdf5_rows(path: Path) -> list[dict[str, str]]:
                     row[column] = str(value)
             rows.append(row)
     return rows
+
+
+def _write_potential_summary_hdf5(
+    path: Path,
+    *,
+    ids: list[int],
+    efermi: list[float | None],
+    water_bulk: list[float | None],
+    cshe: list[float | None],
+    status: list[str],
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with h5py.File(path, "w") as handle:
+        handle.attrs["analysis"] = "potential"
+        records = handle.create_group("records")
+        records.create_dataset("id", data=np.asarray(ids, dtype=np.int64))
+        records.create_dataset(
+            "source",
+            data=np.asarray([f"source_{index}" for index in range(len(ids))], dtype=object),
+            dtype=h5py.string_dtype(encoding="utf-8"),
+        )
+        records.create_dataset(
+            "source_dir",
+            data=np.asarray([f"dir_{index}" for index in range(len(ids))], dtype=object),
+            dtype=h5py.string_dtype(encoding="utf-8"),
+        )
+        records.create_dataset(
+            "status",
+            data=np.asarray(status, dtype=object),
+            dtype=h5py.string_dtype(encoding="utf-8"),
+        )
+        records.create_dataset(
+            "efermi_ev",
+            data=np.asarray([np.nan if value is None else value for value in efermi], dtype=float),
+        )
+        records.create_dataset(
+            "water_bulk_potential_ev",
+            data=np.asarray(
+                [np.nan if value is None else value for value in water_bulk],
+                dtype=float,
+            ),
+        )
+        records.create_dataset(
+            "electrode_cshe_ev",
+            data=np.asarray([np.nan if value is None else value for value in cshe], dtype=float),
+        )
+
+
+def test_load_potential_plot_profiles_sorts_rows_and_summarizes(tmp_path):
+    source = tmp_path / "potential.h5"
+    _write_potential_summary_hdf5(
+        source,
+        ids=[3, 1, 2],
+        efermi=[1.3, 1.1, 1.2],
+        water_bulk=[2.3, 2.1, 2.2],
+        cshe=[0.3, 0.1, 0.2],
+        status=["ok", "ok", "missing_fermi"],
+    )
+
+    profiles, summary = load_potential_plot_profiles(source)
+
+    assert [profile.series_id for profile in profiles] == [
+        "water_bulk_potential_ev",
+        "efermi_ev",
+        "electrode_cshe_ev",
+    ]
+    assert [profile.default_label for profile in profiles] == ["Water bulk", "Fermi", "cSHE"]
+    assert profiles[0].x_values.tolist() == [1.0, 2.0, 3.0]
+    assert profiles[0].y_values.tolist() == [2.1, 2.2, 2.3]
+    assert profiles[1].y_values.tolist() == [1.1, 1.2, 1.3]
+    assert summary == {
+        "x_axis_label": "Record ID",
+        "total_rows": 3,
+        "complete_rows": 2,
+        "incomplete_rows": 1,
+    }
+
+
+def test_load_potential_plot_profiles_falls_back_to_row_order_for_invalid_ids(tmp_path):
+    source = tmp_path / "potential_invalid_ids.h5"
+    _write_potential_summary_hdf5(
+        source,
+        ids=[2, 2, -1],
+        efermi=[1.0, 2.0, 3.0],
+        water_bulk=[4.0, 5.0, 6.0],
+        cshe=[0.1, 0.2, 0.3],
+        status=["ok", "ok", "ok"],
+    )
+
+    profiles, _summary = load_potential_plot_profiles(source)
+
+    assert profiles[0].x_values.tolist() == [1.0, 2.0, 3.0]
+    assert profiles[1].y_values.tolist() == [1.0, 2.0, 3.0]
+
+
+def test_plot_potential_profiles_capture_defaults_and_fit_summary(tmp_path):
+    source = tmp_path / "potential_plot.h5"
+    _write_potential_summary_hdf5(
+        source,
+        ids=[1, 2, 3, 4],
+        efermi=[1.0, 1.2, 1.4, 1.6],
+        water_bulk=[2.0, 2.1, 2.2, 2.3],
+        cshe=[0.2, None, 0.4, 0.5],
+        status=["ok", "ok", "ok", "ok"],
+    )
+    profiles, _summary = load_potential_plot_profiles(source)
+    output = tmp_path / "potential.png"
+    capture_state: dict[str, object] = {}
+
+    result = plot_potential_profiles(
+        profiles,
+        show=False,
+        output=output,
+        capture_state=capture_state,
+        series_fit_enabled=[True, False, True],
+    )
+
+    assert result == output.resolve()
+    assert output.exists()
+    assert capture_state["title"] == "Hartree potential summary"
+    assert capture_state["x_label"] == "Record ID"
+    assert capture_state["y_label"] == "Potential ($\\mathrm{eV}$)"
+    fit_summaries = capture_state["series_fit_summaries"]
+    assert isinstance(fit_summaries, dict)
+    assert fit_summaries["water_bulk_potential_ev"]["status"] == "ok"
+    assert fit_summaries["water_bulk_potential_ev"]["point_count"] == 4
+    assert fit_summaries["efermi_ev"]["status"] == "off"
+    assert fit_summaries["electrode_cshe_ev"]["status"] == "ok"
+
+
+def test_plot_potential_hdf5_non_gui_renders_png(tmp_path):
+    run_dir = tmp_path / "run"
+    cube = _write_potential_case(run_dir, fermi_au=0.0367493036)
+    source = tmp_path / "potential_summary.h5"
+    output = tmp_path / "potential_plot.png"
+
+    compute_rc = main(
+        [
+            "--log-level",
+            "ERROR",
+            "compute",
+            "potential",
+            str(cube),
+            "--output",
+            str(source),
+            "--water-padding-ang",
+            "0.2",
+        ]
+    )
+    assert compute_rc == 0
+
+    plot_rc = main(
+        [
+            "--log-level",
+            "ERROR",
+            "plot",
+            str(source),
+            "--no-gui",
+            "--no-show",
+            "--output",
+            str(output),
+        ]
+    )
+
+    assert plot_rc == 0
+    assert output.exists()
 
 
 def test_compute_potential_writes_and_appends_hdf5(tmp_path):

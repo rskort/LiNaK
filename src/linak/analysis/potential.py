@@ -17,6 +17,12 @@ from typing import Any, Callable
 import numpy as np
 
 from .. import __version__
+from ..plot.plotting import (
+    DEFAULT_PLOT_STYLE,
+    PlotStyle,
+    plot_multi_line_series,
+    resolve_series_labels,
+)
 from ..storage.hdf5_utils import (
     LINAK_HDF5_FORMAT,
     LINAK_HDF5_VERSION,
@@ -118,6 +124,20 @@ class PotentialRecord:
             and self.water_bulk_potential_ev is not None
             and self.electrode_cshe_ev is not None
         )
+
+
+@dataclass(frozen=True)
+class PotentialPlotSeries:
+    """One rendered potential summary series."""
+
+    series_id: str
+    default_label: str
+    x_values: np.ndarray
+    y_values: np.ndarray
+    source_path: str
+    total_rows: int
+    complete_rows: int
+    incomplete_rows: int
 
 
 @dataclass(frozen=True)
@@ -867,6 +887,223 @@ def summarize_potential_statistics(
         ),
         "electrode_cshe_ev": _mean_std([record.electrode_cshe_ev for record in records]),
     }
+
+
+def load_potential_plot_profiles(
+    source: str | Path,
+) -> tuple[list[PotentialPlotSeries], dict[str, Any]]:
+    """Load a potential HDF5 file into fixed plotting series."""
+    require_h5py()
+    import h5py
+
+    source_path = Path(source).expanduser().resolve()
+    if not source_path.exists():
+        raise FileNotFoundError(f"HDF5 file not found: {source_path}")
+
+    required_columns = (
+        "id",
+        "efermi_ev",
+        "water_bulk_potential_ev",
+        "electrode_cshe_ev",
+        "status",
+        "source",
+        "source_dir",
+    )
+    ordered_series_values: dict[str, np.ndarray] = {}
+    with h5py.File(source_path, "r") as handle:
+        if str(handle.attrs.get("analysis", "")) != "potential":
+            raise ValueError(f"HDF5 analysis mismatch for '{source_path}': expected 'potential'.")
+        if "records" not in handle:
+            raise ValueError(f"Potential HDF5 '{source_path}' is missing '/records'.")
+        records = handle["records"]
+        missing = [column for column in required_columns if column not in records]
+        if missing:
+            joined = ", ".join(missing)
+            raise ValueError(
+                f"Potential HDF5 '{source_path}' is missing required column(s): {joined}."
+            )
+
+        total_rows = int(records["id"].shape[0])
+        raw_ids = np.asarray(records["id"], dtype=np.int64)
+        finite_positive_ids = raw_ids.size > 0 and bool(np.all(raw_ids > 0))
+        unique_positive_ids = finite_positive_ids and len(np.unique(raw_ids)) == len(raw_ids)
+        if finite_positive_ids and unique_positive_ids:
+            order = np.argsort(raw_ids, kind="mergesort")
+            x_values = np.asarray(raw_ids[order], dtype=float)
+        else:
+            order = np.arange(total_rows, dtype=np.int64)
+            x_values = np.arange(1, total_rows + 1, dtype=float)
+
+        for column in (
+            "water_bulk_potential_ev",
+            "efermi_ev",
+            "electrode_cshe_ev",
+        ):
+            values = np.asarray(records[column], dtype=float)
+            ordered_series_values[column] = np.asarray(values[order], dtype=float)
+
+        status_values = np.asarray(records["status"].asstr()[...], dtype=object)
+        ordered_status = [str(status_values[index]).strip().lower() for index in order]
+        complete_rows = sum(1 for value in ordered_status if value == "ok")
+        incomplete_rows = total_rows - complete_rows
+
+    series_specs = (
+        ("water_bulk_potential_ev", "Water bulk"),
+        ("efermi_ev", "Fermi"),
+        ("electrode_cshe_ev", "cSHE"),
+    )
+    profiles = [
+        PotentialPlotSeries(
+            series_id=series_id,
+            default_label=default_label,
+            x_values=np.asarray(x_values, dtype=float),
+            y_values=ordered_series_values[series_id],
+            source_path=str(source_path),
+            total_rows=total_rows,
+            complete_rows=complete_rows,
+            incomplete_rows=incomplete_rows,
+        )
+        for series_id, default_label in series_specs
+    ]
+    return profiles, {
+        "x_axis_label": "Record ID",
+        "total_rows": total_rows,
+        "complete_rows": complete_rows,
+        "incomplete_rows": incomplete_rows,
+    }
+
+
+def plot_potential_profiles(
+    profiles: list[PotentialPlotSeries],
+    *,
+    series_ids: list[str] | None = None,
+    title: str = "Hartree potential summary",
+    x_label: str | None = None,
+    y_label: str | None = None,
+    output: str | Path | None = None,
+    show: bool = True,
+    show_blocking: bool = True,
+    preferred_backend: str | None = None,
+    style: PlotStyle = DEFAULT_PLOT_STYLE,
+    line_colors: list[str] | None = None,
+    series_labels: list[str] | None = None,
+    series_enabled: list[bool] | None = None,
+    series_show_in_legend: list[bool] | None = None,
+    series_line_widths: list[float | None] | None = None,
+    series_markers: list[str | None] | None = None,
+    series_fit_configs: list[dict[str, Any] | None] | None = None,
+    series_fit_enabled: list[bool] | None = None,
+    series_fit_labels: list[str | None] | None = None,
+    series_fit_show_in_legend: list[bool] | None = None,
+    series_normalization_modes: list[str] | None = None,
+    series_normalization_values: list[float | None] | None = None,
+    series_normalization_x_refs: list[float | None] | None = None,
+    x_bin_width: float | None = None,
+    x_bin_reducer: str | None = None,
+    line_kwargs: dict[str, Any] | None = None,
+    series_line_kwargs: list[dict[str, Any] | None] | None = None,
+    x_scale: str = "linear",
+    y_scale: str = "linear",
+    x_lim: tuple[float | None, float | None] | list[float | None] | None = None,
+    y_lim: tuple[float | None, float | None] | list[float | None] | None = None,
+    x_ticks: list[float] | tuple[float, ...] | None = None,
+    y_ticks: list[float] | tuple[float, ...] | None = None,
+    x_tick_rotation: float | None = None,
+    y_tick_rotation: float | None = None,
+    x_label_pad: float | None = None,
+    y_label_pad: float | None = None,
+    title_visible: bool | None = None,
+    ticks_visible: bool | None = None,
+    markers: bool | None = None,
+    legend: bool | None = None,
+    legend_title: str | None = None,
+    legend_loc: str = "best",
+    capture_state: dict[str, Any] | None = None,
+    matplotlib_rc: dict[str, Any] | None = None,
+    figure_kwargs: dict[str, Any] | None = None,
+    axes_kwargs: dict[str, Any] | None = None,
+    grid_kwargs: dict[str, Any] | None = None,
+    legend_kwargs: dict[str, Any] | None = None,
+    tick_params_kwargs: dict[str, Any] | None = None,
+    tight_layout_kwargs: dict[str, Any] | None = None,
+    savefig_kwargs: dict[str, Any] | None = None,
+    suppress_output_log: bool = False,
+) -> Path | None:
+    """Plot potential summary series with optional fitted child overlays."""
+    if not profiles:
+        raise ValueError("At least one potential series is required for plotting.")
+
+    labels = resolve_series_labels(
+        [profile.default_label for profile in profiles],
+        series_labels,
+        series_kind="potential",
+    )
+    x_series = [np.asarray(profile.x_values, dtype=float) for profile in profiles]
+    y_series = [np.asarray(profile.y_values, dtype=float) for profile in profiles]
+    output_path = plot_multi_line_series(
+        x_series,
+        y_series,
+        labels,
+        title=title or "Hartree potential summary",
+        x_label=x_label or "Record ID",
+        y_label=y_label or "Potential (eV)",
+        output=output,
+        show=show,
+        show_blocking=show_blocking,
+        preferred_backend=preferred_backend,
+        series_ids=series_ids or [profile.series_id for profile in profiles],
+        style=style,
+        line_colors=line_colors,
+        series_enabled=series_enabled,
+        series_show_in_legend=series_show_in_legend,
+        series_line_widths=series_line_widths,
+        series_markers=series_markers,
+        series_fit_configs=series_fit_configs,
+        series_fit_enabled=series_fit_enabled,
+        series_fit_labels=series_fit_labels,
+        series_fit_show_in_legend=series_fit_show_in_legend,
+        series_normalization_modes=series_normalization_modes,
+        series_normalization_values=series_normalization_values,
+        series_normalization_x_refs=series_normalization_x_refs,
+        x_bin_width=x_bin_width,
+        x_bin_reducer=x_bin_reducer,
+        line_kwargs=line_kwargs,
+        series_line_kwargs=series_line_kwargs,
+        x_scale=x_scale,
+        y_scale=y_scale,
+        x_lim=x_lim,
+        y_lim=y_lim,
+        x_ticks=x_ticks,
+        y_ticks=y_ticks,
+        x_tick_rotation=x_tick_rotation,
+        y_tick_rotation=y_tick_rotation,
+        x_label_pad=x_label_pad,
+        y_label_pad=y_label_pad,
+        title_visible=title_visible,
+        ticks_visible=ticks_visible,
+        markers=markers,
+        legend=legend,
+        legend_title=legend_title,
+        legend_loc=legend_loc,
+        capture_state=capture_state,
+        matplotlib_rc=matplotlib_rc,
+        figure_kwargs=figure_kwargs,
+        axes_kwargs=axes_kwargs,
+        grid_kwargs=grid_kwargs,
+        legend_kwargs=legend_kwargs,
+        tick_params_kwargs=tick_params_kwargs,
+        tight_layout_kwargs=tight_layout_kwargs,
+        savefig_kwargs=savefig_kwargs,
+        suppress_output_log=suppress_output_log,
+    )
+    if capture_state is not None:
+        capture_state["potential_summary"] = {
+            "x_axis_label": "Record ID",
+            "total_rows": int(profiles[0].total_rows),
+            "complete_rows": int(profiles[0].complete_rows),
+            "incomplete_rows": int(profiles[0].incomplete_rows),
+        }
+    return output_path
 
 
 def _read_csv_header(path: Path) -> list[str]:

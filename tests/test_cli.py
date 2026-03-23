@@ -36,7 +36,11 @@ from linak.analysis.coordination import (
     save_coordination_profile,
 )
 from linak.storage.hdf5_table import read_hdf5_frame
-from linak.storage.hdf5_utils import read_linak_hdf5, write_linak_hdf5_profile_collection
+from linak.storage.hdf5_utils import (
+    read_linak_hdf5,
+    read_linak_hdf5_profiles,
+    write_linak_hdf5_profile_collection,
+)
 from linak.analysis.msd import compute_msd, load_msd_profile, save_msd_profile
 from linak.plot.plot_settings import (
     read_active_plot_profile_name,
@@ -45,7 +49,6 @@ from linak.plot.plot_settings import (
     write_plot_profile,
 )
 from linak.analysis.rdf import RDFProfile, compute_rdf, save_rdf_profile
-from linak.storage.hdf5_utils import read_linak_hdf5_profiles
 
 
 def _write_xyz(path: Path) -> None:
@@ -133,7 +136,7 @@ def _write_simple_hdf5(path: Path) -> None:
 
 
 def _linak_output_dir(path: Path) -> Path:
-    return path / "linak_outputs"
+    return path / "LiNaK_outputs"
 
 
 def test_read_project_author_falls_back_to_installed_package_metadata(tmp_path, monkeypatch):
@@ -232,6 +235,41 @@ def _write_coordination_hdf5(path: Path) -> None:
         ),
     )
     save_coordination_profile(profile, path)
+
+
+def _write_potential_hdf5(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with h5py.File(path, "w") as handle:
+        handle.attrs["analysis"] = "potential"
+        records = handle.create_group("records")
+        records.create_dataset("id", data=np.asarray([3, 1, 2], dtype=np.int64))
+        records.create_dataset(
+            "source",
+            data=np.asarray(["run3", "run1", "run2"], dtype=object),
+            dtype=h5py.string_dtype(encoding="utf-8"),
+        )
+        records.create_dataset(
+            "source_dir",
+            data=np.asarray(["dir3", "dir1", "dir2"], dtype=object),
+            dtype=h5py.string_dtype(encoding="utf-8"),
+        )
+        records.create_dataset(
+            "status",
+            data=np.asarray(["ok", "ok", "missing_fermi"], dtype=object),
+            dtype=h5py.string_dtype(encoding="utf-8"),
+        )
+        records.create_dataset(
+            "efermi_ev",
+            data=np.asarray([1.3, 1.1, np.nan], dtype=float),
+        )
+        records.create_dataset(
+            "water_bulk_potential_ev",
+            data=np.asarray([2.3, 2.1, 2.2], dtype=float),
+        )
+        records.create_dataset(
+            "electrode_cshe_ev",
+            data=np.asarray([0.2, 0.1, np.nan], dtype=float),
+        )
 
 
 def _read_table_frame(path: Path):
@@ -925,6 +963,44 @@ def test_rewrite_implicit_plot_csv_auto_detects_coordination_analysis(tmp_path):
     assert rewritten == ["plot", str(source)]
 
 
+def test_rewrite_implicit_plot_csv_auto_detects_potential_analysis(tmp_path):
+    source = tmp_path / "potential.h5"
+    _write_potential_hdf5(source)
+
+    rewritten = _rewrite_implicit_plot_csv(["plot", str(source)])
+    assert rewritten == ["plot", str(source)]
+
+
+def test_hdf5_plot_settings_accept_potential_profile():
+    args = build_parser().parse_args(
+        ["hdf5", "plot-settings", "dummy.h5", "--profile", "potential"]
+    )
+
+    assert args.profile == "potential"
+
+
+def test_plot_potential_multi_source_returns_error(tmp_path):
+    source_a = tmp_path / "potential_a.h5"
+    source_b = tmp_path / "potential_b.h5"
+    _write_potential_hdf5(source_a)
+    _write_potential_hdf5(source_b)
+
+    rc = main(
+        [
+            "--log-level",
+            "ERROR",
+            "plot",
+            "-f",
+            str(source_a),
+            str(source_b),
+            "--no-gui",
+            "--no-show",
+        ]
+    )
+
+    assert rc == 1
+
+
 def test_rewrite_implicit_plot_csv_detects_density_with_files_option(tmp_path):
     source_a = tmp_path / "density_a.h5"
     source_b = tmp_path / "density_b.h5"
@@ -1610,6 +1686,31 @@ def test_build_gui_series_descriptors_include_directory_metadata():
     assert descriptors[0]["source_directory"].endswith("run_04")
 
 
+def test_build_gui_series_descriptors_use_origin_paths_for_metadata_and_grouping():
+    descriptors = _build_gui_series_descriptors(
+        sources=["/tmp/combined_density.h5"],
+        fallback_labels_by_source=[["Au", "K", "O"]],
+        series_id_segments_by_source=[["a", "b", "c"]],
+        origin_path_segments_by_source=[
+            [
+                "/tmp/runs/run_01/density.h5",
+                "/tmp/runs/run_01/density.h5",
+                "/tmp/runs/run_02/density.h5",
+            ]
+        ],
+    )
+
+    assert [item["source_name"] for item in descriptors] == [
+        "density.h5",
+        "density.h5",
+        "density.h5",
+    ]
+    assert descriptors[0]["source_directory"].endswith("run_01")
+    assert descriptors[1]["source_index"] == descriptors[0]["source_index"]
+    assert descriptors[2]["source_index"] != descriptors[0]["source_index"]
+    assert descriptors[2]["source_directory"].endswith("run_02")
+
+
 def test_build_rdf_profile_filter_options_uses_common_pairs_across_sources():
     options = _build_rdf_profile_filter_options(
         [
@@ -1710,6 +1811,43 @@ def test_density_gui_series_ids_stay_stable_between_multi_source_and_reopened_co
 
     assert [item["series_id"] for item in multi_context.series_descriptors] == [
         item["series_id"] for item in reopened_context.series_descriptors
+    ]
+
+
+def test_density_gui_reopened_combined_hdf5_preserves_original_source_metadata(tmp_path):
+    frame = Atoms("OO", positions=[[0.0, 0.0, 0.02], [0.0, 0.0, 0.18]])
+    profile = compute_density_profile([frame], species="O", axis="z", bin_width=0.1)
+    source_a = tmp_path / "source_a_density.h5"
+    source_b = tmp_path / "source_b_density.h5"
+    save_density_profile(profile, source_a)
+    save_density_profile(profile, source_b)
+
+    combined_path = _combine_analysis_hdf5_sources(
+        sources=[str(source_a), str(source_b)],
+        analysis="density",
+        output=tmp_path / "combined_density.h5",
+    )
+    args = cli_mod.argparse.Namespace(
+        species=None,
+        axis="z",
+        x_mode="distance",
+        quantity="mass",
+        series_labels=None,
+        line_colors=None,
+        series_overrides=None,
+        _runtime_argv=(),
+    )
+    reopened_context = _build_density_gui_context(args, sources=[str(combined_path)])
+
+    assert [item["source_name"] for item in reopened_context.series_descriptors] == [
+        source_a.name,
+        source_b.name,
+    ]
+    assert [
+        Path(item["source_path"]).resolve() for item in reopened_context.series_descriptors
+    ] == [
+        source_a.resolve(),
+        source_b.resolve(),
     ]
 
 
@@ -2070,8 +2208,11 @@ def test_combine_analysis_hdf5_sources_write_data_without_plot_settings(tmp_path
     assert imported_settings is None
     profiles = read_linak_hdf5_profiles(output_path, expected_analysis="density")
     assert profiles
-    _datasets, metadata = profiles[0]
-    assert "settings_source" not in metadata
+    metadata_by_path = {
+        Path(metadata["origin_hdf5_path"]).resolve() for _datasets, metadata in profiles
+    }
+    assert "settings_source" not in profiles[0][1]
+    assert metadata_by_path == {source_h5_a.resolve(), source_h5_b.resolve()}
 
 
 def test_plot_density_gui_multi_sources_use_default_series_labels_without_saved_overrides(
@@ -2660,7 +2801,12 @@ def test_plot_position_multiple_files_overlays_with_source_labels(tmp_path, monk
     )
 
     assert rc == 0
-    assert captured["species"] == [f"{source_h5_1.name}:O", f"{source_h5_2.name}:O"]
+    assert captured["species"] == [
+        f"{source_h5_1.name}:O",
+        f"{source_h5_1.name}:O",
+        f"{source_h5_2.name}:O",
+        f"{source_h5_2.name}:O",
+    ]
     assert captured["component"] == "xy-z"
     assert captured["map_color"] == "distance"
     assert captured["x_bin_width"] == pytest.approx(0.5)

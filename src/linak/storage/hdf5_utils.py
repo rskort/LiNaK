@@ -28,6 +28,7 @@ _PROFILE_UID_EXCLUDED_METADATA_KEYS = {
     "combined",
     "profile_count",
     "profile_index",
+    "origin_hdf5_path",
     "source_files",
     "source_index",
     "source_path",

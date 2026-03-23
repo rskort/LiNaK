@@ -14,7 +14,7 @@ dist/
 .pytest_cache/
 .coverage
 htmlcov/
-linak_outputs/
+LiNaK_outputs/
 
 # Type checking / lint caches
 .mypy_cache/

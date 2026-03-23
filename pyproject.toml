@@ -27,6 +27,7 @@ classifiers = [
 dependencies = [
   "ase>=3.22",
   "numpy>=1.24",
+  "scipy>=1.11",
   "matplotlib>=3.7",
   "pandas>=2.1",
   "h5py>=3.10",

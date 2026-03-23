@@ -20,6 +20,7 @@ from ..plot.plotting import (
     PlotStyle,
     _sanitize_line_collection_kwargs,
     configure_matplotlib_backend,
+    format_axis_label_units,
     plot_line_series,
     plot_multi_line_series,
     resolve_series_labels,
@@ -619,7 +620,10 @@ def _save_cutoff_diagnostic_plot(
         color="#b22222",
         zorder=3,
     )
-    ax.set_xlabel("r (Angstrom)", fontsize=DEFAULT_PLOT_STYLE.label_font_size)
+    ax.set_xlabel(
+        format_axis_label_units("r (Angstrom)"),
+        fontsize=DEFAULT_PLOT_STYLE.label_font_size,
+    )
     ax.set_ylabel("g(r)", fontsize=DEFAULT_PLOT_STYLE.label_font_size)
     ax.set_title(
         f"{species_a}-{species_b} cutoff reference RDF",
@@ -1583,8 +1587,14 @@ def _plot_coordination_time_distance_projection(
             colorbar.set_label("Coordination number", fontsize=style.label_font_size)
             colorbar.ax.tick_params(labelsize=style.tick_font_size)
 
-        ax.set_xlabel(x_label or default_x_label, fontsize=style.label_font_size)
-        ax.set_ylabel(y_label or default_y_label, fontsize=style.label_font_size)
+        xlabel_kwargs: dict[str, Any] = {"fontsize": style.label_font_size}
+        ylabel_kwargs: dict[str, Any] = {"fontsize": style.label_font_size}
+        if x_label_pad is not None:
+            xlabel_kwargs["labelpad"] = float(x_label_pad)
+        if y_label_pad is not None:
+            ylabel_kwargs["labelpad"] = float(y_label_pad)
+        ax.set_xlabel(format_axis_label_units(x_label or default_x_label), **xlabel_kwargs)
+        ax.set_ylabel(format_axis_label_units(y_label or default_y_label), **ylabel_kwargs)
         if title_visible is False:
             ax.set_title("", fontsize=style.title_font_size)
         else:
@@ -1707,6 +1717,7 @@ def plot_coordination_profile(
     show: bool = True,
     show_blocking: bool = True,
     preferred_backend: str | None = None,
+    series_id: str | None = None,
     style: PlotStyle = DEFAULT_PLOT_STYLE,
     component: str = "distance",
     time_axis: str = "ps",
@@ -1732,8 +1743,13 @@ def plot_coordination_profile(
     line_label: str | None = None,
     line_colors: list[str] | None = None,
     series_enabled: list[bool] | None = None,
+    series_show_in_legend: list[bool] | None = None,
     series_line_widths: list[float | None] | None = None,
     series_markers: list[str | None] | None = None,
+    series_fit_configs: list[dict[str, Any] | None] | None = None,
+    series_fit_enabled: list[bool] | None = None,
+    series_fit_labels: list[str | None] | None = None,
+    series_fit_show_in_legend: list[bool] | None = None,
     series_normalization_modes: list[str] | None = None,
     series_normalization_values: list[float | None] | None = None,
     series_normalization_x_refs: list[float | None] | None = None,
@@ -1816,10 +1832,16 @@ def plot_coordination_profile(
             show_blocking=show_blocking,
             preferred_backend=preferred_backend,
             style=style,
+            series_ids=[series_id] if series_id is not None else None,
             line_colors=line_colors,
             series_enabled=series_enabled,
+            series_show_in_legend=series_show_in_legend,
             series_line_widths=series_line_widths,
             series_markers=series_markers,
+            series_fit_configs=series_fit_configs,
+            series_fit_enabled=series_fit_enabled,
+            series_fit_labels=series_fit_labels,
+            series_fit_show_in_legend=series_fit_show_in_legend,
             series_normalization_modes=series_normalization_modes,
             series_normalization_values=series_normalization_values,
             series_normalization_x_refs=series_normalization_x_refs,
@@ -1873,11 +1895,21 @@ def plot_coordination_profile(
         show=show,
         show_blocking=show_blocking,
         preferred_backend=preferred_backend,
+        series_id=series_id,
         line_label=line_label_resolved,
         line_color=line_colors[0] if line_colors else None,
         line_width_override=series_line_widths[0] if series_line_widths else None,
         line_marker=series_markers[0] if series_markers else None,
         line_visible=True if not series_enabled else bool(series_enabled[0]),
+        show_in_legend=True if not series_show_in_legend else bool(series_show_in_legend[0]),
+        fit_config=None if not series_fit_configs else series_fit_configs[0],
+        fit_enabled=True if series_fit_enabled and bool(series_fit_enabled[0]) else False,
+        fit_label=(
+            None if not series_fit_labels or not series_fit_labels[0] else str(series_fit_labels[0])
+        ),
+        fit_show_in_legend=(
+            True if not series_fit_show_in_legend else bool(series_fit_show_in_legend[0])
+        ),
         normalization_mode=series_normalization_modes[0] if series_normalization_modes else None,
         normalization_value=series_normalization_values[0] if series_normalization_values else None,
         normalization_x_ref=series_normalization_x_refs[0] if series_normalization_x_refs else None,
@@ -1942,11 +1974,17 @@ def plot_coordination_profiles(
     legend: bool | None = None,
     legend_title: str | None = None,
     legend_loc: str = "best",
+    series_ids: list[str] | None = None,
     series_labels: list[str] | None = None,
     line_colors: list[str] | None = None,
     series_enabled: list[bool] | None = None,
+    series_show_in_legend: list[bool] | None = None,
     series_line_widths: list[float | None] | None = None,
     series_markers: list[str | None] | None = None,
+    series_fit_configs: list[dict[str, Any] | None] | None = None,
+    series_fit_enabled: list[bool] | None = None,
+    series_fit_labels: list[str | None] | None = None,
+    series_fit_show_in_legend: list[bool] | None = None,
     series_normalization_modes: list[str] | None = None,
     series_normalization_values: list[float | None] | None = None,
     series_normalization_x_refs: list[float | None] | None = None,
@@ -2050,11 +2088,17 @@ def plot_coordination_profiles(
             legend=legend,
             legend_title=legend_title,
             legend_loc=legend_loc,
+            series_id=None if not series_ids else str(series_ids[0]),
             line_label=None if not single_series_labels else single_series_labels[0],
             line_colors=line_colors,
             series_enabled=series_enabled,
+            series_show_in_legend=series_show_in_legend,
             series_line_widths=series_line_widths,
             series_markers=series_markers,
+            series_fit_configs=series_fit_configs,
+            series_fit_enabled=series_fit_enabled,
+            series_fit_labels=series_fit_labels,
+            series_fit_show_in_legend=series_fit_show_in_legend,
             series_normalization_modes=series_normalization_modes,
             series_normalization_values=series_normalization_values,
             series_normalization_x_refs=series_normalization_x_refs,
@@ -2098,11 +2142,17 @@ def plot_coordination_profiles(
             show=show,
             show_blocking=show_blocking,
             preferred_backend=preferred_backend,
+            series_ids=series_ids,
             style=style,
             line_colors=line_colors,
             series_enabled=series_enabled,
+            series_show_in_legend=series_show_in_legend,
             series_line_widths=series_line_widths,
             series_markers=series_markers,
+            series_fit_configs=series_fit_configs,
+            series_fit_enabled=series_fit_enabled,
+            series_fit_labels=series_fit_labels,
+            series_fit_show_in_legend=series_fit_show_in_legend,
             series_normalization_modes=series_normalization_modes,
             series_normalization_values=series_normalization_values,
             series_normalization_x_refs=series_normalization_x_refs,
@@ -2167,11 +2217,17 @@ def plot_coordination_profiles(
         show=show,
         show_blocking=show_blocking,
         preferred_backend=preferred_backend,
+        series_ids=series_ids,
         style=style,
         line_colors=line_colors,
         series_enabled=series_enabled,
+        series_show_in_legend=series_show_in_legend,
         series_line_widths=series_line_widths,
         series_markers=series_markers,
+        series_fit_configs=series_fit_configs,
+        series_fit_enabled=series_fit_enabled,
+        series_fit_labels=series_fit_labels,
+        series_fit_show_in_legend=series_fit_show_in_legend,
         series_normalization_modes=series_normalization_modes,
         series_normalization_values=series_normalization_values,
         series_normalization_x_refs=series_normalization_x_refs,

@@ -1,5 +1,6 @@
 import pytest
 from ase import Atoms
+import numpy as np
 
 from linak.pbc import (
     apply_pbc_to_frames,
@@ -26,6 +27,28 @@ def test_extract_cell_from_cp2k_input_parses_abc_line(tmp_path):
 
     cell = extract_cell_from_cp2k_input(cp2k_input)
     assert cell == pytest.approx((17.887, 15.491, 59.671))
+
+
+def test_extract_cell_from_cp2k_input_accepts_orthorhombic_alpha_beta_gamma(tmp_path):
+    cp2k_input = tmp_path / "input.inp"
+    cp2k_input.write_text(
+        "&CELL\n  ABC [angstrom] 14.25 14.81 54.48\n  ALPHA_BETA_GAMMA [deg] 90 90 90\n&END CELL\n",
+        encoding="utf-8",
+    )
+
+    cell = extract_cell_from_cp2k_input(cp2k_input)
+    assert cell == pytest.approx((14.25, 14.81, 54.48))
+
+
+def test_extract_cell_from_cp2k_input_rejects_non_orthorhombic_alpha_beta_gamma(tmp_path):
+    cp2k_input = tmp_path / "input.inp"
+    cp2k_input.write_text(
+        "&CELL\n  ABC [angstrom] 14.25 14.81 54.48\n  ALPHA_BETA_GAMMA [deg] 90 91 90\n&END CELL\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="orthorhombic cells only"):
+        extract_cell_from_cp2k_input(cp2k_input)
 
 
 def test_extract_cell_from_cp2k_input_raises_without_abc(tmp_path):
@@ -213,3 +236,14 @@ def test_apply_pbc_to_frames_wraps_positions():
     assert wrapped.positions[0, 0] == pytest.approx(0.2)
     assert wrapped.positions[0, 1] == pytest.approx(0.9)
     assert wrapped.positions[0, 2] == pytest.approx(0.5)
+
+
+def test_apply_pbc_to_frames_wraps_positions_for_non_cubic_orthorhombic_cell():
+    frame = Atoms("H2", positions=[[3.7, -0.1, 5.2], [-1.1, 4.6, -0.2]])
+    wrapped = apply_pbc_to_frames([frame], (2.0, 3.0, 4.0))[0]
+
+    np.testing.assert_allclose(
+        wrapped.positions,
+        np.array([[1.7, 2.9, 1.2], [0.9, 1.6, 3.8]]),
+        atol=1e-12,
+    )

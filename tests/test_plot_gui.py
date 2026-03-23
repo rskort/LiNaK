@@ -1,4 +1,5 @@
 from linak.plot.plot_gui import (
+    _coerce_series_order,
     _coerce_series_descriptors,
     _coerce_series_overrides,
     _derive_synced_field_locks,
@@ -8,6 +9,7 @@ from linak.plot.plot_gui import (
     _format_series_display_text,
     _lock_to_sync_mode,
     _resolve_asset_path,
+    _resolve_series_id_order,
     _resolve_series_line_colors,
     _sync_mode_to_lock,
     _toggle_to_mode,
@@ -129,6 +131,17 @@ def test_coerce_series_overrides_keeps_sparse_label_override_mapping():
     assert overrides["series:0:3"]["enabled"] is False
 
 
+def test_coerce_series_order_deduplicates_and_strips_values():
+    assert _coerce_series_order([" a ", "", "b", "a", "b", "c"]) == ["a", "b", "c"]
+
+
+def test_resolve_series_id_order_appends_new_series_after_requested_order():
+    assert _resolve_series_id_order(
+        ["series-a", "series-b", "series-c"],
+        ["series-c", "series-a", "missing"],
+    ) == ["series-c", "series-a", "series-b"]
+
+
 def test_derive_synced_field_locks_prefers_explicit_metadata():
     locks = _derive_synced_field_locks(
         {
@@ -214,9 +227,9 @@ def test_derive_warning_messages_reports_disabled_sections_and_partial_normaliza
         }
     )
 
-    assert any("Legend is off" in message for message in warnings)
+    assert all("Legend is off" not in message for message in warnings)
     assert all("Grid is off" not in message for message in warnings)
-    assert any("Ticks are off" in message for message in warnings)
+    assert all("Ticks are off" not in message for message in warnings)
     assert any("Only part of the plotted series is normalized" in message for message in warnings)
 
 
