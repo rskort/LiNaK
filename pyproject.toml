@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "LiNaK"
-version = "0.6.5"
+version = "0.6.7"
 description = "Lightweight molecular dynamics trajectory analysis toolkit."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -31,6 +31,7 @@ dependencies = [
   "matplotlib>=3.7",
   "pandas>=2.1",
   "h5py>=3.10",
+  "PySide6>=6.7",
 ]
 
 [project.optional-dependencies]
@@ -38,9 +39,6 @@ dev = [
   "pytest>=7.0",
   "ruff>=0.6.0",
   "mypy>=1.8.0",
-]
-gui = [
-  "PySide6>=6.7",
 ]
 
 [project.scripts]

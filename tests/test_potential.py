@@ -11,10 +11,11 @@ from linak.analysis.potential import (
     HARTREE_TO_EV,
     PotentialComputationFailure,
     PotentialConfig,
-    load_potential_plot_profiles,
-    plot_potential_profiles,
     PotentialRecord,
     compute_potential_records,
+    load_potential_plot_profiles,
+    plot_potential_profiles,
+    _resolve_worker_count,
 )
 
 
@@ -220,7 +221,7 @@ def test_plot_potential_profiles_capture_defaults_and_fit_summary(tmp_path):
     assert output.exists()
     assert capture_state["title"] == "Hartree potential summary"
     assert capture_state["x_label"] == "Record ID"
-    assert capture_state["y_label"] == "Potential ($\\mathrm{eV}$)"
+    assert capture_state["y_label"] == "Potential (eV)"
     fit_summaries = capture_state["series_fit_summaries"]
     assert isinstance(fit_summaries, dict)
     assert fit_summaries["water_bulk_potential_ev"]["status"] == "ok"
@@ -256,6 +257,76 @@ def test_plot_potential_hdf5_non_gui_renders_png(tmp_path):
             "ERROR",
             "plot",
             str(source),
+            "--no-gui",
+            "--no-show",
+            "--output",
+            str(output),
+        ]
+    )
+
+    assert plot_rc == 0
+    assert output.exists()
+
+
+def test_plot_potential_profiles_preserve_explicit_blank_axis_labels(monkeypatch, tmp_path):
+    captured: dict[str, object] = {}
+
+    def _fake_plot_multi_line_series(_x_series, _y_series, _labels, **kwargs):
+        captured["x_label"] = kwargs["x_label"]
+        captured["y_label"] = kwargs["y_label"]
+        return tmp_path / "noop.png"
+
+    monkeypatch.setattr(
+        "linak.analysis.potential.plot_multi_line_series",
+        _fake_plot_multi_line_series,
+    )
+
+    source = tmp_path / "potential_summary.h5"
+    _write_potential_summary_hdf5(
+        source,
+        ids=[1, 2],
+        efermi=[1.0, 1.1],
+        water_bulk=[2.0, 2.1],
+        cshe=[0.2, 0.3],
+        status=["ok", "ok"],
+    )
+    profiles, _summary = load_potential_plot_profiles(source)
+
+    plot_potential_profiles(profiles, show=False, x_label="", y_label="")
+
+    assert captured["x_label"] == ""
+    assert captured["y_label"] == ""
+
+
+def test_plot_potential_hdf5_multi_source_non_gui_renders_png(tmp_path):
+    source_a = tmp_path / "potential_a.h5"
+    source_b = tmp_path / "potential_b.h5"
+    output = tmp_path / "potential_overlay.png"
+    _write_potential_summary_hdf5(
+        source_a,
+        ids=[1, 2, 3],
+        efermi=[1.0, 1.1, 1.2],
+        water_bulk=[2.0, 2.1, 2.2],
+        cshe=[0.2, 0.3, 0.4],
+        status=["ok", "ok", "ok"],
+    )
+    _write_potential_summary_hdf5(
+        source_b,
+        ids=[1, 2, 3],
+        efermi=[1.5, 1.6, 1.7],
+        water_bulk=[2.5, 2.6, 2.7],
+        cshe=[0.6, 0.7, 0.8],
+        status=["ok", "ok", "ok"],
+    )
+
+    plot_rc = main(
+        [
+            "--log-level",
+            "ERROR",
+            "plot",
+            "-f",
+            str(source_a),
+            str(source_b),
             "--no-gui",
             "--no-show",
             "--output",
@@ -467,3 +538,8 @@ def test_compute_potential_records_calls_callbacks_in_source_order(monkeypatch):
     assert [failure.source for failure in failures] == ["bad.cube"]
     assert seen_failures == ["bad.cube"]
     assert isinstance(failures[0], PotentialComputationFailure)
+
+
+def test_resolve_worker_count_defaults_auto_to_single_worker():
+    assert _resolve_worker_count(None, 1) == 1
+    assert _resolve_worker_count(None, 5) == 1

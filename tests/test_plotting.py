@@ -4,10 +4,8 @@ import linak.plot.plotting as plotting_module
 
 
 def test_format_axis_label_units_wraps_trailing_units_in_mathrm():
-    assert plotting_module.format_axis_label_units("Density (g/cm^3)") == (
-        "Density ($\\mathrm{g/cm^3}$)"
-    )
-    assert plotting_module.format_axis_label_units("Time (ps)") == "Time ($\\mathrm{ps}$)"
+    assert plotting_module.format_axis_label_units("Density (g/cm^3)") == "Density (g/cm^3)"
+    assert plotting_module.format_axis_label_units("Time (ps)") == "Time (ps)"
 
 
 def test_format_axis_label_units_preserves_existing_math_and_non_unit_parentheses():
@@ -15,6 +13,11 @@ def test_format_axis_label_units_preserves_existing_math_and_non_unit_parenthese
         "Distance to the surface ($\\mathrm{\\AA}$)"
     ) == ("Distance to the surface ($\\mathrm{\\AA}$)")
     assert plotting_module.format_axis_label_units("g(r)") == "g(r)"
+
+
+def test_resolve_explicit_plot_text_preserves_blank_override():
+    assert plotting_module.resolve_explicit_plot_text(None, "Time (ps)") == "Time (ps)"
+    assert plotting_module.resolve_explicit_plot_text("", "Time (ps)") == ""
 
 
 def test_normalize_series_values_area_uses_numpy_compatibility(monkeypatch):

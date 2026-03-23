@@ -67,23 +67,25 @@ def _coerce_degree(value: Any) -> int | None:
         return None
 
 
-def _coerce_fit_bounds(value: Any, parameter_order: tuple[str, ...]) -> tuple[np.ndarray, np.ndarray]:
+def _coerce_fit_bounds(
+    value: Any, parameter_order: tuple[str, ...]
+) -> tuple[np.ndarray, np.ndarray]:
     if not isinstance(value, dict):
-        lower = np.full(len(parameter_order), -np.inf, dtype=float)
-        upper = np.full(len(parameter_order), np.inf, dtype=float)
-        return lower, upper
+        lower_bounds = np.full(len(parameter_order), -np.inf, dtype=float)
+        upper_bounds = np.full(len(parameter_order), np.inf, dtype=float)
+        return lower_bounds, upper_bounds
 
-    lower: list[float] = []
-    upper: list[float] = []
+    lower_limits: list[float] = []
+    upper_limits: list[float] = []
     for name in parameter_order:
         raw = value.get(name)
         if not isinstance(raw, (list, tuple)) or len(raw) != 2:
-            lower.append(-np.inf)
-            upper.append(np.inf)
+            lower_limits.append(-np.inf)
+            upper_limits.append(np.inf)
             continue
-        lower.append(-np.inf if raw[0] is None else float(raw[0]))
-        upper.append(np.inf if raw[1] is None else float(raw[1]))
-    return np.asarray(lower, dtype=float), np.asarray(upper, dtype=float)
+        lower_limits.append(-np.inf if raw[0] is None else float(raw[0]))
+        upper_limits.append(np.inf if raw[1] is None else float(raw[1]))
+    return np.asarray(lower_limits, dtype=float), np.asarray(upper_limits, dtype=float)
 
 
 def _coerce_fit_initial_guess(
@@ -251,10 +253,26 @@ def resolve_series_fit_configs(
     """Resolve per-series fit configurations, preserving legacy compatibility."""
     configs: list[FitConfigDict] = []
     for index in range(series_count):
-        raw = None if series_fit_configs is None or index >= len(series_fit_configs) else series_fit_configs[index]
-        legacy_enabled = False if series_fit_enabled is None or index >= len(series_fit_enabled) else bool(series_fit_enabled[index])
-        legacy_label = None if series_fit_labels is None or index >= len(series_fit_labels) else series_fit_labels[index]
-        legacy_show = True if series_fit_show_in_legend is None or index >= len(series_fit_show_in_legend) else bool(series_fit_show_in_legend[index])
+        raw = (
+            None
+            if series_fit_configs is None or index >= len(series_fit_configs)
+            else series_fit_configs[index]
+        )
+        legacy_enabled = (
+            False
+            if series_fit_enabled is None or index >= len(series_fit_enabled)
+            else bool(series_fit_enabled[index])
+        )
+        legacy_label = (
+            None
+            if series_fit_labels is None or index >= len(series_fit_labels)
+            else series_fit_labels[index]
+        )
+        legacy_show = (
+            True
+            if series_fit_show_in_legend is None or index >= len(series_fit_show_in_legend)
+            else bool(series_fit_show_in_legend[index])
+        )
         configs.append(
             coerce_fit_config(
                 raw,
@@ -266,7 +284,9 @@ def resolve_series_fit_configs(
     return configs
 
 
-def _initial_guess_for_model(model: FitModel, x: np.ndarray, y: np.ndarray, *, degree: int | None) -> list[float] | None:
+def _initial_guess_for_model(
+    model: FitModel, x: np.ndarray, y: np.ndarray, *, degree: int | None
+) -> list[float] | None:
     x_min = float(np.min(x))
     x_max = float(np.max(x))
     x_span = max(x_max - x_min, 1.0e-12)
@@ -339,6 +359,7 @@ def execute_series_fit(
             "r_squared": None,
             "rmse": None,
             "fit_point_count": 0,
+            "point_count": 0,
             "display_point_count": 0,
             "x_fit": [],
             "y_fit": [],
@@ -374,6 +395,7 @@ def execute_series_fit(
             "r_squared": None,
             "rmse": None,
             "fit_point_count": int(x.size),
+            "point_count": int(x.size),
             "display_point_count": display_point_count,
             "x_fit": [],
             "y_fit": [],
@@ -412,6 +434,7 @@ def execute_series_fit(
             "r_squared": None,
             "rmse": None,
             "fit_point_count": fit_point_count,
+            "point_count": fit_point_count,
             "display_point_count": display_point_count,
             "x_fit": [],
             "y_fit": [],
@@ -447,8 +470,11 @@ def execute_series_fit(
             equation = _polynomial_equation(degree)
         else:
             assert model.model is not None
+            nonlinear_model = model.model
             parameter_order = list(model.parameter_order)
-            initial_guess = _coerce_fit_initial_guess(config.get("fit_initial_guess"), model.parameter_order)
+            initial_guess = _coerce_fit_initial_guess(
+                config.get("fit_initial_guess"), model.parameter_order
+            )
             if initial_guess is None:
                 initial_guess = _initial_guess_for_model(
                     model,
@@ -464,7 +490,7 @@ def execute_series_fit(
                 gamma_index = parameter_order.index("gamma")
                 lower[gamma_index] = max(lower[gamma_index], 1.0e-12)
             coefficients, _cov = curve_fit(
-                model.model,
+                nonlinear_model,
                 fit_x,
                 fit_y,
                 p0=initial_guess,
@@ -475,7 +501,7 @@ def execute_series_fit(
                 parameter_order[index]: float(coefficients[index])
                 for index in range(len(parameter_order))
             }
-            predictor = lambda values: model.model(  # noqa: E731
+            predictor = lambda values: nonlinear_model(  # noqa: E731
                 np.asarray(values, dtype=float),
                 *np.asarray(coefficients, dtype=float),
             )
@@ -499,6 +525,7 @@ def execute_series_fit(
             "r_squared": float(r_squared),
             "rmse": float(rmse),
             "fit_point_count": fit_point_count,
+            "point_count": fit_point_count,
             "display_point_count": display_point_count,
             "x_fit": x_fit.tolist(),
             "y_fit": y_fit.tolist(),
@@ -514,6 +541,7 @@ def execute_series_fit(
             "r_squared": None,
             "rmse": None,
             "fit_point_count": fit_point_count,
+            "point_count": fit_point_count,
             "display_point_count": display_point_count,
             "x_fit": [],
             "y_fit": [],

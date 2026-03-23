@@ -7,6 +7,7 @@ from copy import deepcopy
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from importlib.metadata import PackageNotFoundError, metadata as package_metadata
+import importlib
 import json
 import logging
 from math import isclose
@@ -21,12 +22,12 @@ import textwrap
 from time import perf_counter
 from typing import Any, Callable, TYPE_CHECKING
 
-import numpy as np
-
 from . import __version__
 from .runtime_threads import configure_native_thread_env
 
 _NATIVE_THREAD_ENV_CONFIGURATION = configure_native_thread_env()
+
+np = importlib.import_module("numpy")
 
 if TYPE_CHECKING:
     from ase import Atoms
@@ -3707,35 +3708,66 @@ def _build_potential_gui_context(
     *,
     sources: list[str],
 ) -> _GuiPlotRenderContext:
-    if len(sources) != 1:
-        raise ValueError("Potential plotting currently supports exactly one HDF5 source.")
-
     from .analysis.potential import load_potential_plot_profiles
 
-    source_path = Path(sources[0]).expanduser().resolve()
-    plot_profiles, summary = load_potential_plot_profiles(source_path)
-    fallback_labels_by_source = [[profile.default_label for profile in plot_profiles]]
-    series_id_segments_by_source = [[profile.series_id for profile in plot_profiles]]
-    origin_path_segments_by_source = [[str(source_path) for _profile in plot_profiles]]
+    resolved_sources = [Path(source).expanduser().resolve() for source in sources]
+    flattened_profiles: list[Any] = []
+    fallback_labels_by_source: list[list[str]] = []
+    series_id_segments_by_source: list[list[str]] = []
+    origin_path_segments_by_source: list[list[str]] = []
+    total_rows = 0
+    complete_rows = 0
+    incomplete_rows = 0
+    for source_path in resolved_sources:
+        plot_profiles, summary = load_potential_plot_profiles(source_path)
+        total_rows += int(summary.get("total_rows") or 0)
+        complete_rows += int(summary.get("complete_rows") or 0)
+        incomplete_rows += int(summary.get("incomplete_rows") or 0)
+        label_prefix = source_path.stem or source_path.name or str(source_path)
+        fallback_labels_by_source.append(
+            [f"{label_prefix}: {profile.default_label}" for profile in plot_profiles]
+        )
+        series_id_segments_by_source.append(
+            [f"{source_path}::{profile.series_id}" for profile in plot_profiles]
+        )
+        origin_path_segments_by_source.append([str(source_path) for _profile in plot_profiles])
+        for profile in plot_profiles:
+            flattened_profiles.append(
+                replace(
+                    profile,
+                    series_id=f"{source_path}::{profile.series_id}",
+                    default_label=f"{label_prefix}: {profile.default_label}",
+                    source_path=str(source_path),
+                )
+            )
     descriptors = _build_gui_series_descriptors(
-        sources=[str(source_path)],
+        sources=[str(source_path) for source_path in resolved_sources],
         fallback_labels_by_source=fallback_labels_by_source,
         series_id_segments_by_source=series_id_segments_by_source,
         origin_path_segments_by_source=origin_path_segments_by_source,
     )
     return _GuiPlotRenderContext(
-        profile=plot_profiles,
-        plot_source_label=str(source_path),
+        profile=flattened_profiles,
+        plot_source_label=(
+            str(resolved_sources[0]) if len(resolved_sources) == 1 else "multi_source_potential"
+        ),
         plotter_kwargs=None,
         fallback_labels_by_source=fallback_labels_by_source,
         default_series_labels=_resolve_gui_default_series_labels(
             args=args,
-            sources=[str(source_path)],
+            sources=[str(source_path) for source_path in resolved_sources],
             profile_key=_PLOT_PROFILE_POTENTIAL,
             fallback_labels_by_source=fallback_labels_by_source,
         ),
         series_descriptors=descriptors,
-        profile_filter_options={"potential_summary": summary},
+        profile_filter_options={
+            "potential_summary": {
+                "x_axis_label": "Record ID",
+                "total_rows": total_rows,
+                "complete_rows": complete_rows,
+                "incomplete_rows": incomplete_rows,
+            }
+        },
     )
 
 
@@ -5073,7 +5105,8 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help=(
-            "Number of threads for potential compute (default: auto; set 1 to disable parallelism)"
+            "Number of threads for potential compute "
+            "(default: auto=1; increase only if benchmarking shows a gain)"
         ),
     )
     execution_group.add_argument(
@@ -7657,25 +7690,27 @@ def _handle_plot_potential(args: argparse.Namespace) -> int:
     start = perf_counter()
     LOGGER.info("Starting potential plotting.")
     sources = _resolve_plot_hdf5_sources(args, command_name="linak plot")
-    if len(sources) != 1:
-        raise ValueError(
-            "Potential plotting currently supports exactly one HDF5 source. "
-            "Combine/overlay support is not implemented for potential yet."
+    settings_source_path = (
+        _resolve_plot_settings_source_path(
+            sources,
+            setting_source_token=getattr(args, "settings_source", None),
         )
-
-    settings_source_path = _resolve_plot_settings_source_path(
-        sources,
-        setting_source_token=getattr(args, "settings_source", None),
+        if len(sources) == 1
+        else None
     )
     default_args = deepcopy(args)
-    _apply_saved_plot_settings(
-        args=args,
-        source_path=settings_source_path,
-        profile_key=_PLOT_PROFILE_POTENTIAL,
-        keys=_PLOT_SETTINGS_POTENTIAL_KEYS,
-        profile_name=getattr(args, "settings_profile", None),
-    )
+    if len(sources) == 1:
+        assert settings_source_path is not None
+        _apply_saved_plot_settings(
+            args=args,
+            source_path=settings_source_path,
+            profile_key=_PLOT_PROFILE_POTENTIAL,
+            keys=_PLOT_SETTINGS_POTENTIAL_KEYS,
+            profile_name=getattr(args, "settings_profile", None),
+        )
     use_gui = _resolve_gui_mode(args)
+    if len(sources) > 1:
+        LOGGER.info("Processing %d potential HDF5 input file(s).", len(sources))
 
     if args.dry_run:
         if use_gui:
@@ -7688,17 +7723,21 @@ def _handle_plot_potential(args: argparse.Namespace) -> int:
             render_target = "no render target (--no-show without --output)"
         plan = [
             "input mode: HDF5 only",
-            f"source: {sources[0]}",
-            "series: Water bulk, Fermi, cSHE",
+            f"sources ({len(sources)}): {_summarize_sources(sources)}",
+            "series: Water bulk, Fermi, cSHE per source",
             "x-axis: record id",
             f"render target: {render_target}",
-            f"plot-settings source: {settings_source_path}",
+            (
+                f"plot-settings source: {settings_source_path}"
+                if settings_source_path is not None
+                else "plot-settings source: combined GUI/session context"
+            ),
         ]
         _log_dry_run_plan("plot potential", plan)
         LOGGER.info("Potential plotting dry run finished in %.2f s.", perf_counter() - start)
         return 0
 
-    from .analysis.potential import plot_potential_profiles
+    from .analysis.potential import combine_potential_hdf5_sources, plot_potential_profiles
 
     render_context = _build_potential_gui_context(args, sources=sources)
     _apply_effective_series_settings(
@@ -7712,10 +7751,23 @@ def _handle_plot_potential(args: argparse.Namespace) -> int:
     )
 
     if use_gui:
+        gui_settings_path = settings_source_path
+        if len(sources) > 1:
+            gui_settings_path = combine_potential_hdf5_sources(
+                sources=sources,
+                output=_resolve_non_overwriting_hdf5_path(
+                    _default_combined_analysis_hdf5_path(sources, analysis="potential")
+                ),
+            )
+            LOGGER.info(
+                "Created combined potential HDF5 for GUI controls: '%s'.",
+                gui_settings_path,
+            )
+        assert gui_settings_path is not None
         _launch_profile_plot_gui(
             args=args,
             default_args=default_args,
-            source_path=settings_source_path,
+            source_path=gui_settings_path,
             profile_key=_PLOT_PROFILE_POTENTIAL,
             setting_keys=_PLOT_SETTINGS_POTENTIAL_KEYS,
             gui_title="LiNaK Plot Controls: Hartree Potential",

@@ -825,6 +825,36 @@ def test_plot_density_profile_defaults_to_distance_axis(monkeypatch):
     assert captured["y_label"] == "Density (g/A)"
 
 
+def test_plot_density_profile_preserves_explicit_blank_axis_labels(monkeypatch):
+    from linak.analysis.density import DensityProfile, plot_density_profile
+
+    captured = {}
+
+    def _fake_plot_line_series(_x, _y, **kwargs):
+        captured["x_label"] = kwargs["x_label"]
+        captured["y_label"] = kwargs["y_label"]
+        return None
+
+    monkeypatch.setattr("linak.analysis.density.plot_line_series", _fake_plot_line_series)
+
+    profile = DensityProfile(
+        axis="z",
+        species="O",
+        bin_edges=np.array([0.0, 1.0]),
+        bin_centers=np.array([0.5]),
+        counts_per_frame=np.array([2.0e-6]),
+        density=np.array([2.0e-6]),
+        units="g/Angstrom",
+        n_frames=1,
+        surface_position=0.25,
+    )
+
+    plot_density_profile(profile, show=False, x_label="", y_label="")
+
+    assert captured["x_label"] == ""
+    assert captured["y_label"] == ""
+
+
 def test_plot_density_profiles_use_g_per_cm3_without_si_scaling(monkeypatch):
     from linak.analysis.density import DensityProfile, plot_density_profiles
 

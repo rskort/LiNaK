@@ -7,7 +7,6 @@ import difflib
 import logging
 import os
 from pathlib import Path
-import re
 import sys
 from typing import Any
 
@@ -85,30 +84,35 @@ class PlotStyle:
 
 DEFAULT_PLOT_STYLE = PlotStyle()
 
-_AXIS_LABEL_UNIT_PATTERN = re.compile(r"^(?P<prefix>.+?)\s+\((?P<units>[^()]*)\)\s*$")
-
 
 def format_axis_label_units(label: str) -> str:
-    """Wrap trailing unit text in mathmathrm for cleaner Matplotlib rendering."""
-    raw_label = str(label)
-    if "$" in raw_label:
-        return raw_label
+    """Return the axis label exactly as provided by the caller."""
+    return str(label)
 
-    match = _AXIS_LABEL_UNIT_PATTERN.match(raw_label.strip())
-    if match is None:
-        return raw_label
 
-    prefix = match.group("prefix").strip()
-    units = match.group("units").strip()
-    if not prefix or not units or "$" in units:
-        return raw_label
+def resolve_explicit_plot_text(value: str | None, default: str) -> str:
+    """Preserve explicit blank strings while still filling missing values from defaults."""
+    return default if value is None else str(value)
 
-    normalized_units = units.replace("Å", r"\AA")
-    lowered_units = normalized_units.lower()
-    if lowered_units == "a" or lowered_units == "angstrom":
-        normalized_units = r"\AA"
 
-    return f"{prefix} ($\\mathrm{{{normalized_units}}}$)"
+def _series_statistics(x_values: np.ndarray, y_values: np.ndarray) -> dict[str, float | int | None]:
+    finite_mask = np.isfinite(x_values) & np.isfinite(y_values)
+    finite_y = y_values[finite_mask]
+    if finite_y.size == 0:
+        return {
+            "point_count": 0,
+            "min": None,
+            "max": None,
+            "mean": None,
+            "std": None,
+        }
+    return {
+        "point_count": int(finite_y.size),
+        "min": float(np.min(finite_y)),
+        "max": float(np.max(finite_y)),
+        "mean": float(np.mean(finite_y)),
+        "std": float(np.std(finite_y, ddof=0)),
+    }
 
 
 def default_series_colors(count: int) -> list[str]:
@@ -791,6 +795,7 @@ def plot_line_series(
         line_artist = None
         fit_summary_key = str(series_id or "series")
         fit_summaries: dict[str, dict[str, Any]] = {}
+        series_stats: dict[str, dict[str, float | int | None]] = {}
         resolved_fit_config = resolve_series_fit_configs(
             series_count=1,
             series_fit_configs=[fit_config],
@@ -798,6 +803,13 @@ def plot_line_series(
             series_fit_labels=[fit_label],
             series_fit_show_in_legend=[fit_show_in_legend],
         )[0]
+        if not bool(resolved_fit_config.get("fit_enabled")):
+            fit_summaries[fit_summary_key] = {
+                "fit_enabled": False,
+                "status": "off",
+                "fit_type": str(resolved_fit_config.get("fit_type") or "linear"),
+                "point_count": 0,
+            }
         if line_visible:
             resolved_line_kwargs: dict[str, Any] = {
                 "lw": style.line_width
@@ -816,6 +828,7 @@ def plot_line_series(
                 y_plot,
                 **resolved_line_kwargs,
             )
+            series_stats[fit_summary_key] = _series_statistics(x_plot, y_plot)
 
         if line_artist is not None and bool(resolved_fit_config.get("fit_enabled")):
             fit_summary = execute_series_fit(
@@ -981,6 +994,7 @@ def plot_line_series(
         )
         if capture_state is not None:
             capture_state["series_fit_summaries"] = fit_summaries
+            capture_state["series_statistics"] = series_stats
 
         output_path = None
         if output is not None:
@@ -1158,6 +1172,7 @@ def plot_multi_line_series(
             series_fit_show_in_legend=series_fit_show_in_legend,
         )
         fit_summaries: dict[str, dict[str, Any]] = {}
+        series_stats: dict[str, dict[str, float | int | None]] = {}
         for index, (x_values, y_values, label) in enumerate(
             zip(transformed_x_series, transformed_y_series, labels)
         ):
@@ -1205,8 +1220,16 @@ def plot_multi_line_series(
             rendered_colors.append(str(artist.get_color()))
             rendered_markers.append(str(artist.get_marker()))
             rendered_labels.append(str(artist.get_label()))
+            fit_key = str(series_ids[index]) if series_ids is not None else f"series:{index}"
+            series_stats[fit_key] = _series_statistics(x_values, y_values)
             fit_config = resolved_fit_configs[index]
             if not bool(fit_config.get("fit_enabled")):
+                fit_summaries[fit_key] = {
+                    "fit_enabled": False,
+                    "status": "off",
+                    "fit_type": str(fit_config.get("fit_type") or "linear"),
+                    "point_count": 0,
+                }
                 continue
             fit_summary = execute_series_fit(
                 x_values,
@@ -1217,7 +1240,6 @@ def plot_multi_line_series(
             fit_render_label = (
                 str(fit_config.get("fit_label_override") or "").strip() or f"{label} fit"
             )
-            fit_key = str(series_ids[index]) if series_ids is not None else f"series:{index}"
             fit_summary["fit_enabled"] = True
             fit_summary["label"] = fit_render_label
             fit_summaries[fit_key] = fit_summary
@@ -1361,6 +1383,7 @@ def plot_multi_line_series(
         )
         if capture_state is not None:
             capture_state["series_fit_summaries"] = fit_summaries
+            capture_state["series_statistics"] = series_stats
 
         output_path = None
         if output is not None:

@@ -35,12 +35,6 @@ From the project root:
 pip install .
 ```
 
-Install the optional GUI dependency for the interactive LiNaK Studio:
-
-```bash
-pip install -e .[gui]
-```
-
 Install development tools:
 
 ```bash

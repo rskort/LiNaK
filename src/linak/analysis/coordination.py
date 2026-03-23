@@ -23,6 +23,7 @@ from ..plot.plotting import (
     format_axis_label_units,
     plot_line_series,
     plot_multi_line_series,
+    resolve_explicit_plot_text,
     resolve_series_labels,
 )
 from ..progress import ProgressBar
@@ -1593,8 +1594,14 @@ def _plot_coordination_time_distance_projection(
             xlabel_kwargs["labelpad"] = float(x_label_pad)
         if y_label_pad is not None:
             ylabel_kwargs["labelpad"] = float(y_label_pad)
-        ax.set_xlabel(format_axis_label_units(x_label or default_x_label), **xlabel_kwargs)
-        ax.set_ylabel(format_axis_label_units(y_label or default_y_label), **ylabel_kwargs)
+        ax.set_xlabel(
+            format_axis_label_units(resolve_explicit_plot_text(x_label, default_x_label)),
+            **xlabel_kwargs,
+        )
+        ax.set_ylabel(
+            format_axis_label_units(resolve_explicit_plot_text(y_label, default_y_label)),
+            **ylabel_kwargs,
+        )
         if title_visible is False:
             ax.set_title("", fontsize=style.title_font_size)
         else:
@@ -1825,8 +1832,8 @@ def plot_coordination_profile(
             ],
             labels if line_label is None else [line_label, *labels[1:]],
             title=title or f"{profile.species_a}-{profile.species_b} coordination vs time",
-            x_label=x_label or default_x,
-            y_label=y_label or "Coordination number",
+            x_label=resolve_explicit_plot_text(x_label, default_x),
+            y_label=resolve_explicit_plot_text(y_label, "Coordination number"),
             output=output,
             show=show,
             show_blocking=show_blocking,
@@ -1889,8 +1896,8 @@ def plot_coordination_profile(
         x_values,
         y_values,
         title=title or f"{profile.species_a}-{profile.species_b} coordination vs distance",
-        x_label=x_label or _coordination_distance_label(profile),
-        y_label=y_label or "Coordination number",
+        x_label=resolve_explicit_plot_text(x_label, _coordination_distance_label(profile)),
+        y_label=resolve_explicit_plot_text(y_label, "Coordination number"),
         output=output,
         show=show,
         show_blocking=show_blocking,
@@ -2136,8 +2143,8 @@ def plot_coordination_profiles(
             y_series,
             labels,
             title=title or "Continuous coordination vs time",
-            x_label=x_label or default_x_label,
-            y_label=y_label or "Coordination number",
+            x_label=resolve_explicit_plot_text(x_label, default_x_label),
+            y_label=resolve_explicit_plot_text(y_label, "Coordination number"),
             output=output,
             show=show,
             show_blocking=show_blocking,
@@ -2211,8 +2218,8 @@ def plot_coordination_profiles(
         y_series,
         labels,
         title=title or "Continuous coordination vs distance",
-        x_label=x_label or default_x_label,
-        y_label=y_label or "Coordination number",
+        x_label=resolve_explicit_plot_text(x_label, default_x_label),
+        y_label=resolve_explicit_plot_text(y_label, "Coordination number"),
         output=output,
         show=show,
         show_blocking=show_blocking,

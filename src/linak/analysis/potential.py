@@ -21,6 +21,7 @@ from ..plot.plotting import (
     DEFAULT_PLOT_STYLE,
     PlotStyle,
     plot_multi_line_series,
+    resolve_explicit_plot_text,
     resolve_series_labels,
 )
 from ..storage.hdf5_utils import (
@@ -37,7 +38,7 @@ LOGGER = logging.getLogger(__name__)
 BOHR_TO_ANG = 0.529177210903
 HARTREE_TO_EV = 27.211386245988
 DEFAULT_CSHE_OFFSET_EV = 0.81
-_DEFAULT_POTENTIAL_THREAD_CAP = 4
+_DEFAULT_POTENTIAL_THREAD_CAP = 1
 _WATER_ATOMIC_NUMBERS = {1, 8}
 
 FERMI_PATTERNS: list[tuple[re.Pattern[str], str]] = [
@@ -889,6 +890,73 @@ def summarize_potential_statistics(
     }
 
 
+def load_potential_records(source: str | Path) -> list[PotentialRecord]:
+    """Load the raw potential-record rows from one LiNaK potential HDF5 file."""
+    require_h5py()
+    import h5py
+
+    source_path = Path(source).expanduser().resolve()
+    if not source_path.exists():
+        raise FileNotFoundError(f"HDF5 file not found: {source_path}")
+
+    with h5py.File(source_path, "r") as handle:
+        if str(handle.attrs.get("analysis", "")) != "potential":
+            raise ValueError(f"HDF5 analysis mismatch for '{source_path}': expected 'potential'.")
+        if "records" not in handle:
+            raise ValueError(f"Potential HDF5 '{source_path}' is missing '/records'.")
+        records_group = handle["records"]
+        missing = [column for column in POTENTIAL_CSV_COLUMNS if column not in records_group]
+        if missing:
+            joined = ", ".join(missing)
+            raise ValueError(
+                f"Potential HDF5 '{source_path}' is missing required column(s): {joined}."
+            )
+        row_count = int(records_group["id"].shape[0])
+        ids = np.asarray(records_group["id"], dtype=np.int64)
+        sources = np.asarray(records_group["source"].asstr()[...], dtype=object)
+        source_dirs = np.asarray(records_group["source_dir"].asstr()[...], dtype=object)
+        output_out = np.asarray(records_group["output_out"].asstr()[...], dtype=object)
+        statuses = np.asarray(records_group["status"].asstr()[...], dtype=object)
+        errors = np.asarray(records_group["error"].asstr()[...], dtype=object)
+        efermi = np.asarray(records_group["efermi_ev"], dtype=float)
+        water_bulk = np.asarray(records_group["water_bulk_potential_ev"], dtype=float)
+        cshe = np.asarray(records_group["electrode_cshe_ev"], dtype=float)
+
+    loaded: list[PotentialRecord] = []
+    for index in range(row_count):
+        loaded.append(
+            PotentialRecord(
+                id=None if int(ids[index]) < 0 else int(ids[index]),
+                source=str(sources[index]),
+                source_dir=str(source_dirs[index]),
+                output_out=(str(output_out[index]).strip() or None),
+                efermi_ev=None if not np.isfinite(efermi[index]) else float(efermi[index]),
+                water_bulk_potential_ev=(
+                    None if not np.isfinite(water_bulk[index]) else float(water_bulk[index])
+                ),
+                electrode_cshe_ev=None if not np.isfinite(cshe[index]) else float(cshe[index]),
+                status=str(statuses[index]),
+                error=(str(errors[index]).strip() or None),
+            )
+        )
+    return loaded
+
+
+def combine_potential_hdf5_sources(
+    sources: Sequence[str | Path],
+    *,
+    output: str | Path,
+) -> Path:
+    """Write a combined potential HDF5 that contains rows from every source file."""
+    records: list[PotentialRecord] = []
+    for source in sources:
+        records.extend(load_potential_records(source))
+    if not records:
+        raise ValueError("No potential rows were available to combine.")
+    result = write_potential_records_csv(records, output=output, append=False, overwrite=True)
+    return result.path
+
+
 def load_potential_plot_profiles(
     source: str | Path,
 ) -> tuple[list[PotentialPlotSeries], dict[str, Any]]:
@@ -1045,8 +1113,8 @@ def plot_potential_profiles(
         y_series,
         labels,
         title=title or "Hartree potential summary",
-        x_label=x_label or "Record ID",
-        y_label=y_label or "Potential (eV)",
+        x_label=resolve_explicit_plot_text(x_label, "Record ID"),
+        y_label=resolve_explicit_plot_text(y_label, "Potential (eV)"),
         output=output,
         show=show,
         show_blocking=show_blocking,

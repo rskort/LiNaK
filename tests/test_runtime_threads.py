@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from linak.runtime_threads import configure_native_thread_env
 
 
@@ -64,3 +66,11 @@ def test_configure_native_thread_env_ignores_invalid_linak_num_threads():
     assert result.skipped_reason == "invalid_linak_num_threads"
     assert result.invalid_value == "abc"
     assert env == {"LINAK_NUM_THREADS": "abc"}
+
+
+def test_cli_configures_native_thread_env_before_numpy_import():
+    source = Path("src/linak/cli.py").read_text(encoding="utf-8")
+
+    assert source.index(
+        "_NATIVE_THREAD_ENV_CONFIGURATION = configure_native_thread_env()"
+    ) < source.index('np = importlib.import_module("numpy")')

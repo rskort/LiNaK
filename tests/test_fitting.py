@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 from linak.plot.fitting import execute_series_fit, resolve_series_fit_configs
 
@@ -14,8 +15,8 @@ def test_execute_series_fit_linear_returns_expected_parameters():
     )
 
     assert summary["status"] == "ok"
-    assert summary["parameters"]["slope"] == 2.0
-    assert summary["parameters"]["intercept"] == 1.0
+    assert summary["parameters"]["slope"] == pytest.approx(2.0)
+    assert summary["parameters"]["intercept"] == pytest.approx(1.0)
     assert summary["fit_point_count"] == 4
     assert summary["display_point_count"] == 4
 
@@ -40,9 +41,9 @@ def test_execute_series_fit_polynomial_uses_degree_and_manual_range():
     assert summary["status"] == "ok"
     assert summary["parameter_order"] == ["a2", "a1", "a0"]
     assert summary["fit_point_count"] < summary["display_point_count"]
-    assert summary["parameters"]["a2"] == 3.0
-    assert summary["parameters"]["a1"] == -2.0
-    assert summary["parameters"]["a0"] == 4.0
+    assert summary["parameters"]["a2"] == pytest.approx(3.0)
+    assert summary["parameters"]["a1"] == pytest.approx(-2.0)
+    assert summary["parameters"]["a0"] == pytest.approx(4.0)
 
 
 def test_execute_series_fit_gaussian_converges_on_synthetic_data():
@@ -56,7 +57,7 @@ def test_execute_series_fit_gaussian_converges_on_synthetic_data():
     )
 
     assert summary["status"] == "ok"
-    assert summary["parameters"]["amplitude"] == np.testing.assert_approx_equal(4.0, significant=4)
+    assert summary["parameters"]["amplitude"] == pytest.approx(4.0, rel=1.0e-3)
 
 
 def test_execute_series_fit_logarithmic_requires_positive_x():

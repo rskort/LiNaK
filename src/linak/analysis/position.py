@@ -31,6 +31,7 @@ from ..plot.plotting import (
     format_axis_label_units,
     plot_line_series,
     plot_multi_line_series,
+    resolve_explicit_plot_text,
     resolve_series_labels,
     resolve_single_series_options,
 )
@@ -917,8 +918,14 @@ def _plot_position_xy_z_projection(
             xlabel_kwargs["labelpad"] = float(x_label_pad)
         if y_label_pad is not None:
             ylabel_kwargs["labelpad"] = float(y_label_pad)
-        ax.set_xlabel(format_axis_label_units(x_label or "X (A)"), **xlabel_kwargs)
-        ax.set_ylabel(format_axis_label_units(y_label or "Y (A)"), **ylabel_kwargs)
+        ax.set_xlabel(
+            format_axis_label_units(resolve_explicit_plot_text(x_label, "X (A)")),
+            **xlabel_kwargs,
+        )
+        ax.set_ylabel(
+            format_axis_label_units(resolve_explicit_plot_text(y_label, "Y (A)")),
+            **ylabel_kwargs,
+        )
         if title_visible is False:
             ax.set_title("", fontsize=style.title_font_size)
         else:
@@ -1211,8 +1218,8 @@ def plot_position_profile(
             np.asarray(x_values, dtype=float),
             np.asarray(matrix[:, 0], dtype=float),
             title=title or default_title,
-            x_label=x_label or default_x_label,
-            y_label=y_label or default_y_label,
+            x_label=resolve_explicit_plot_text(x_label, default_x_label),
+            y_label=resolve_explicit_plot_text(y_label, default_y_label),
             output=output,
             show=show,
             show_blocking=show_blocking,
@@ -1274,8 +1281,8 @@ def plot_position_profile(
         [np.asarray(matrix[:, col], dtype=float) for col in range(matrix.shape[1])],
         labels,
         title=title or default_title,
-        x_label=x_label or default_x_label,
-        y_label=y_label or default_y_label,
+        x_label=resolve_explicit_plot_text(x_label, default_x_label),
+        y_label=resolve_explicit_plot_text(y_label, default_y_label),
         output=output,
         show=show,
         show_blocking=show_blocking,
@@ -1516,8 +1523,8 @@ def plot_position_profiles(
         y_series,
         labels,
         title=title or default_title,
-        x_label=x_label or default_x_label,
-        y_label=y_label or default_y_label,
+        x_label=resolve_explicit_plot_text(x_label, default_x_label),
+        y_label=resolve_explicit_plot_text(y_label, default_y_label),
         output=output,
         show=show,
         show_blocking=show_blocking,

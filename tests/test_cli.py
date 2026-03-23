@@ -979,7 +979,7 @@ def test_hdf5_plot_settings_accept_potential_profile():
     assert args.profile == "potential"
 
 
-def test_plot_potential_multi_source_returns_error(tmp_path):
+def test_plot_potential_multi_source_renders_successfully(tmp_path):
     source_a = tmp_path / "potential_a.h5"
     source_b = tmp_path / "potential_b.h5"
     _write_potential_hdf5(source_a)
@@ -998,7 +998,7 @@ def test_plot_potential_multi_source_returns_error(tmp_path):
         ]
     )
 
-    assert rc == 1
+    assert rc == 0
 
 
 def test_rewrite_implicit_plot_csv_detects_density_with_files_option(tmp_path):

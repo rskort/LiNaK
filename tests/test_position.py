@@ -292,10 +292,49 @@ def test_plot_position_profile_xy_z_applies_axis_label_padding(monkeypatch):
         y_label_pad=13.0,
     )
 
-    assert captured["x_label"] == "X ($\\mathrm{\\AA}$)"
-    assert captured["y_label"] == "Y ($\\mathrm{\\AA}$)"
+    assert captured["x_label"] == "X (A)"
+    assert captured["y_label"] == "Y (A)"
     assert captured["x_label_pad"] == pytest.approx(11.0)
     assert captured["y_label_pad"] == pytest.approx(13.0)
+
+
+def test_plot_position_profile_xy_z_preserves_explicit_blank_axis_labels(monkeypatch):
+    import matplotlib.axes
+
+    profile = compute_position_profile(
+        _surface_test_frames(),
+        species="O",
+        axis="z",
+        timestep_fs=2.0,
+        surface_mode="rough",
+        surface_elements=["Pt"],
+    )
+    captured: dict[str, object] = {}
+
+    original_set_xlabel = matplotlib.axes.Axes.set_xlabel
+    original_set_ylabel = matplotlib.axes.Axes.set_ylabel
+
+    def _capture_set_xlabel(self, xlabel, *args, **kwargs):
+        captured["x_label"] = xlabel
+        return original_set_xlabel(self, xlabel, *args, **kwargs)
+
+    def _capture_set_ylabel(self, ylabel, *args, **kwargs):
+        captured["y_label"] = ylabel
+        return original_set_ylabel(self, ylabel, *args, **kwargs)
+
+    monkeypatch.setattr(matplotlib.axes.Axes, "set_xlabel", _capture_set_xlabel)
+    monkeypatch.setattr(matplotlib.axes.Axes, "set_ylabel", _capture_set_ylabel)
+
+    plot_position_profile(
+        profile,
+        component="xy-z",
+        show=False,
+        x_label="",
+        y_label="",
+    )
+
+    assert captured["x_label"] == ""
+    assert captured["y_label"] == ""
 
 
 def test_build_xy_segments_breaks_periodic_jump_connectors():
