@@ -1,3 +1,4 @@
+from copy import deepcopy
 from pathlib import Path
 
 import h5py
@@ -1767,7 +1768,10 @@ def test_without_preview_series_state_drops_rendered_series_arrays():
         {
             "title": "Preview",
             "series_labels": ["Only rendered line"],
+            "line_color": "#1f77b4",
             "line_colors": ["#1f77b4"],
+            "line_kwargs": {"alpha": 0.5},
+            "markers": True,
             "series_enabled": [False, True],
         }
     )
@@ -2469,6 +2473,292 @@ def test_plot_density_gui_uses_requested_named_settings_profile(tmp_path, monkey
     assert isinstance(initial, dict)
     assert initial["title"] == "Paper title"
     assert initial["x_mode"] == "axis"
+
+
+def test_plot_density_gui_combined_hdf5_disables_named_profile_management(tmp_path, monkeypatch):
+    frame = Atoms(
+        "OO",
+        positions=[[0.0, 0.0, 0.10], [0.0, 0.0, 1.10]],
+        cell=[10.0, 10.0, 10.0],
+        pbc=True,
+    )
+    profile = compute_density_profile([frame], species="O", axis="z", bin_width=1.0)
+    source_h5_a = tmp_path / "source_a_density.h5"
+    source_h5_b = tmp_path / "source_b_density.h5"
+    combined_h5 = tmp_path / "combined_density.h5"
+    save_density_profile(profile, source_h5_a)
+    save_density_profile(profile, source_h5_b)
+    _combine_analysis_hdf5_sources(
+        sources=[str(source_h5_a), str(source_h5_b)],
+        analysis="density",
+        output=combined_h5,
+    )
+
+    captured: dict[str, object] = {}
+
+    def _fake_gui_launcher(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr("linak.cli._open_plot_settings_gui", _fake_gui_launcher)
+
+    rc = main(
+        [
+            "--log-level",
+            "ERROR",
+            "plot",
+            str(combined_h5),
+            "--gui",
+        ]
+    )
+
+    assert rc == 0
+    assert captured["allow_named_profiles"] is False
+    assert captured["available_profile_names"] == ["Default"]
+    assert captured["initial_profile_name"] == "Default"
+    assert captured["on_load_profile"] is None
+    assert captured["on_delete_profile"] is None
+    assert captured["on_set_active_profile"] is None
+
+
+def test_plot_density_gui_combined_hdf5_does_not_pass_reordered_series_lists_to_gui(
+    tmp_path, monkeypatch
+):
+    frame = Atoms(
+        "OO",
+        positions=[[0.0, 0.0, 0.10], [0.0, 0.0, 1.10]],
+        cell=[10.0, 10.0, 10.0],
+        pbc=True,
+    )
+    profile = compute_density_profile([frame], species="O", axis="z", bin_width=1.0)
+    source_h5_a = tmp_path / "source_a_density.h5"
+    source_h5_b = tmp_path / "source_b_density.h5"
+    combined_h5 = tmp_path / "combined_density.h5"
+    save_density_profile(profile, source_h5_a)
+    save_density_profile(profile, source_h5_b)
+    _combine_analysis_hdf5_sources(
+        sources=[str(source_h5_a), str(source_h5_b)],
+        analysis="density",
+        output=combined_h5,
+    )
+
+    args = cli_mod.build_parser().parse_args(["plot", str(combined_h5)])
+    args._runtime_argv = ("plot", str(combined_h5))
+    cli_mod._apply_saved_plot_settings(
+        args=args,
+        source_path=combined_h5,
+        profile_key="plot:density",
+        keys=cli_mod._PLOT_SETTINGS_DENSITY_KEYS,
+    )
+    context = _build_density_gui_context(args, sources=[str(combined_h5)])
+    cli_mod._apply_effective_series_settings(
+        args=args,
+        sources=[str(combined_h5)],
+        profile_key="plot:density",
+        fallback_labels_by_source=context.fallback_labels_by_source,
+        series_descriptors=context.series_descriptors,
+        allow_saved_multi_source_merge=True,
+    )
+    write_plot_profile(
+        combined_h5,
+        "plot:density",
+        {
+            "series_descriptors": context.series_descriptors,
+            "series_order": [context.series_descriptors[1]["series_id"], context.series_descriptors[0]["series_id"]],
+            "series_overrides": {
+                context.series_descriptors[0]["series_id"]: {"enabled": False},
+                context.series_descriptors[1]["series_id"]: {"label_override": "kept"},
+            },
+        },
+    )
+
+    captured: dict[str, object] = {}
+
+    def _fake_gui_launcher(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr("linak.cli._open_plot_settings_gui", _fake_gui_launcher)
+
+    rc = main(
+        [
+            "--log-level",
+            "ERROR",
+            "plot",
+            str(combined_h5),
+            "--gui",
+        ]
+    )
+
+    assert rc == 0
+    initial = captured["initial_settings"]
+    assert isinstance(initial, dict)
+    assert initial["series_overrides"] is not None
+    assert "series_enabled" not in initial
+    assert "series_labels" not in initial
+    assert "line_colors" not in initial
+
+
+def test_plot_density_gui_reopen_keeps_per_series_alpha_out_of_global_line_kwargs(
+    tmp_path, monkeypatch
+):
+    frame = Atoms(
+        "OO",
+        positions=[[0.0, 0.0, 0.10], [0.0, 0.0, 1.10]],
+        cell=[10.0, 10.0, 10.0],
+        pbc=True,
+    )
+    profile = compute_density_profile([frame], species="O", axis="z", bin_width=1.0)
+    source_h5_a = tmp_path / "source_a_density.h5"
+    source_h5_b = tmp_path / "source_b_density.h5"
+    combined_h5 = tmp_path / "combined_density.h5"
+    save_density_profile(profile, source_h5_a)
+    save_density_profile(profile, source_h5_b)
+    _combine_analysis_hdf5_sources(
+        sources=[str(source_h5_a), str(source_h5_b)],
+        analysis="density",
+        output=combined_h5,
+    )
+
+    args = cli_mod.build_parser().parse_args(["plot", str(combined_h5)])
+    args._runtime_argv = ("plot", str(combined_h5))
+    context = _build_density_gui_context(args, sources=[str(combined_h5)])
+    write_plot_profile(
+        combined_h5,
+        "plot:density",
+        {
+            "series_descriptors": context.series_descriptors,
+            "series_overrides": {
+                context.series_descriptors[0]["series_id"]: {"alpha": 0.5},
+            },
+        },
+    )
+
+    captured: dict[str, object] = {}
+
+    def _fake_gui_launcher(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr("linak.cli._open_plot_settings_gui", _fake_gui_launcher)
+
+    rc = main(
+        [
+            "--log-level",
+            "ERROR",
+            "plot",
+            str(combined_h5),
+            "--gui",
+        ]
+    )
+
+    assert rc == 0
+    initial = captured["initial_settings"]
+    assert isinstance(initial, dict)
+    assert initial["series_overrides"][context.series_descriptors[0]["series_id"]]["alpha"] == 0.5
+    assert initial.get("line_kwargs") is None or initial.get("line_kwargs") == {}
+
+
+def test_plot_density_gui_embedded_preview_round_trips_after_save_for_combined_hdf5(
+    tmp_path, monkeypatch
+):
+    frame = Atoms(
+        "OO",
+        positions=[[0.0, 0.0, 0.10], [0.0, 0.0, 1.10]],
+        cell=[10.0, 10.0, 10.0],
+        pbc=True,
+    )
+    profile = compute_density_profile([frame], species="O", axis="z", bin_width=1.0)
+    source_h5_a = tmp_path / "source_a_density.h5"
+    source_h5_b = tmp_path / "source_b_density.h5"
+    combined_h5 = tmp_path / "combined_density.h5"
+    save_density_profile(profile, source_h5_a)
+    save_density_profile(profile, source_h5_b)
+    _combine_analysis_hdf5_sources(
+        sources=[str(source_h5_a), str(source_h5_b)],
+        analysis="density",
+        output=combined_h5,
+    )
+
+    plot_calls: list[dict[str, object]] = []
+    preview_call_indices: list[int] = []
+    launch_count = {"value": 0}
+    expected: dict[str, object] = {}
+
+    def _fake_plot_density_profiles(_profiles, **kwargs):
+        output = kwargs.get("output")
+        if output is not None:
+            Path(output).write_text("preview", encoding="utf-8")
+        plot_calls.append(deepcopy(kwargs))
+        return Path(output) if output is not None else None
+
+    def _normalized_plot_call(payload: dict[str, object]) -> dict[str, object]:
+        return {
+            key: deepcopy(value)
+            for key, value in payload.items()
+            if key not in {"output", "capture_state"}
+        }
+
+    def _fake_gui_launcher(**kwargs):
+        preview_call_indices.append(len(plot_calls))
+        initial_settings = deepcopy(kwargs["initial_settings"])
+        descriptors = initial_settings["series_descriptors"]
+        reordered_ids = [descriptors[1]["series_id"], descriptors[0]["series_id"]]
+        if launch_count["value"] == 0:
+            expected["series_order"] = reordered_ids
+            expected["first_series_id"] = descriptors[0]["series_id"]
+            expected["second_series_id"] = descriptors[1]["series_id"]
+            initial_settings["series_order"] = reordered_ids
+            initial_settings["series_overrides"] = {
+                descriptors[0]["series_id"]: {
+                    "enabled": False,
+                    "alpha": 0.5,
+                    "color": "#ff0000",
+                },
+                descriptors[1]["series_id"]: {
+                    "label_override": "reordered",
+                    "line_width": 3.0,
+                    "marker": "o",
+                },
+            }
+            kwargs["on_save_figure"](initial_settings, str(tmp_path / "preview_before.png"))
+            kwargs["on_save"]("Default", initial_settings)
+        else:
+            kwargs["on_save_figure"](initial_settings, str(tmp_path / "preview_after.png"))
+        launch_count["value"] += 1
+
+    monkeypatch.setattr("linak.analysis.density.plot_density_profiles", _fake_plot_density_profiles)
+    monkeypatch.setattr("linak.cli._open_plot_settings_gui", _fake_gui_launcher)
+
+    rc_first = main(
+        [
+            "--log-level",
+            "ERROR",
+            "plot",
+            str(combined_h5),
+            "--gui",
+        ]
+    )
+    rc_second = main(
+        [
+            "--log-level",
+            "ERROR",
+            "plot",
+            str(combined_h5),
+            "--gui",
+        ]
+    )
+
+    assert rc_first == 0
+    assert rc_second == 0
+    assert len(preview_call_indices) == 2
+    before_preview = _normalized_plot_call(plot_calls[preview_call_indices[0]])
+    after_preview = _normalized_plot_call(plot_calls[preview_call_indices[1]])
+    assert after_preview == before_preview
+    saved = read_plot_profile(combined_h5, "plot:density")
+    assert saved is not None
+    assert saved["series_order"] == expected["series_order"]
+    assert saved["series_overrides"][expected["first_series_id"]]["alpha"] == 0.5
+    assert saved["series_overrides"][expected["first_series_id"]]["enabled"] is False
+    assert saved["series_overrides"][expected["second_series_id"]]["label_override"] == "reordered"
+    assert saved.get("line_kwargs") is None or saved.get("line_kwargs") == {}
 
 
 def test_hdf5_plot_settings_named_profile_copy_and_activate(tmp_path):

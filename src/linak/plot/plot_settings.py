@@ -183,17 +183,66 @@ def _read_profiles_map_with_store(
     path: str | Path,
 ) -> tuple[dict[str, Any], dict[str, PlotProfileStore]]:
     raw_profiles = read_plot_profiles_raw(path)
+    combined_source = is_combined_plot_settings_source(path)
     stores: dict[str, PlotProfileStore] = {}
     for key, value in raw_profiles.items():
-        store = _coerce_profile_store(value)
+        store = (
+            _coerce_single_profile_store(value)
+            if combined_source
+            else _coerce_profile_store(value)
+        )
         if store is not None:
             stores[str(key)] = store
     return raw_profiles, stores
 
 
+def _coerce_single_profile_store(value: Any) -> PlotProfileStore | None:
+    store = _coerce_profile_store(value)
+    if store is None or store.active_profile is None:
+        return None
+    active_settings = store.profiles.get(store.active_profile)
+    if not isinstance(active_settings, dict):
+        return None
+    return PlotProfileStore(
+        active_profile=DEFAULT_PLOT_PROFILE_NAME,
+        profiles={DEFAULT_PLOT_PROFILE_NAME: dict(active_settings)},
+    )
+
+
 def default_plot_profile_name() -> str:
     """Return the conventional default saved-profile name."""
     return DEFAULT_PLOT_PROFILE_NAME
+
+
+def is_combined_plot_settings_source(path: str | Path) -> bool:
+    """Return whether an HDF5 source should behave like one combined plot document."""
+    require_h5py()
+    import h5py
+
+    source_path = Path(path).expanduser().resolve()
+    if not source_path.exists() or not source_path.is_file():
+        return False
+    try:
+        with h5py.File(source_path, "r") as handle:
+            raw_metadata = handle.attrs.get("metadata_json", "{}")
+    except OSError:
+        return False
+
+    decoded = decode_hdf5_string(raw_metadata).strip()
+    if not decoded:
+        return False
+    try:
+        metadata = json.loads(decoded)
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(metadata, dict):
+        return False
+    return bool(metadata.get("combined"))
+
+
+def supports_named_plot_profiles(path: str | Path) -> bool:
+    """Return whether an HDF5 source supports multiple named plot-setting profiles."""
+    return not is_combined_plot_settings_source(path)
 
 
 def read_hdf5_analysis(path: str | Path) -> str | None:
@@ -279,9 +328,14 @@ def read_plot_profile(
     store = read_plot_profile_store(path, profile_key)
     if store is None:
         return None
-    selected_name = (
-        _normalize_profile_name(profile_name) if profile_name is not None else store.active_profile
-    )
+    if is_combined_plot_settings_source(path) and profile_name is not None:
+        selected_name = _normalize_profile_name(profile_name)
+        if selected_name != DEFAULT_PLOT_PROFILE_NAME:
+            return None
+    else:
+        selected_name = (
+            _normalize_profile_name(profile_name) if profile_name is not None else store.active_profile
+        )
     if selected_name is None:
         return None
     value = store.profiles.get(selected_name)
@@ -308,6 +362,7 @@ def write_plot_profile(
     settings_dict = _coerce_settings_dict(settings)
     if settings_dict is None:
         raise ValueError("Plot settings payload must be a JSON-like object.")
+    single_profile_source = is_combined_plot_settings_source(source_path)
 
     with h5py.File(source_path, "r+") as handle:
         group = _open_settings_group(handle, create=True)
@@ -316,6 +371,11 @@ def write_plot_profile(
         key = str(profile_key)
         existing_raw = profiles.get(key)
         existing_store = _coerce_profile_store(existing_raw)
+
+        if single_profile_source:
+            profiles[key] = settings_dict
+            _write_profiles_map(group, profiles)
+            return
 
         if profile_name is None and existing_raw is None:
             profiles[key] = settings_dict
@@ -398,6 +458,10 @@ def delete_named_plot_profile(
     if not source_path.exists():
         raise FileNotFoundError(f"HDF5 file not found: {source_path}")
     target_name = _normalize_profile_name(profile_name)
+    single_profile_source = is_combined_plot_settings_source(source_path)
+
+    if single_profile_source and target_name != DEFAULT_PLOT_PROFILE_NAME:
+        return False, read_active_plot_profile_name(source_path, profile_key)
 
     with h5py.File(source_path, "r+") as handle:
         group = _open_settings_group(handle, create=False)
@@ -405,6 +469,12 @@ def delete_named_plot_profile(
             return False, None
         profiles = _read_profiles_map(group)
         key = str(profile_key)
+        if single_profile_source:
+            if key not in profiles:
+                return False, None
+            del profiles[key]
+            _write_profiles_map(group, profiles)
+            return True, None
         store = _coerce_profile_store(profiles.get(key))
         if store is None or target_name not in store.profiles:
             return False, store.active_profile if store is not None else None
@@ -438,6 +508,16 @@ def set_active_plot_profile(path: str | Path, profile_key: str, profile_name: st
     if not source_path.exists():
         raise FileNotFoundError(f"HDF5 file not found: {source_path}")
     target_name = _normalize_profile_name(profile_name)
+    if is_combined_plot_settings_source(source_path):
+        if target_name != DEFAULT_PLOT_PROFILE_NAME:
+            raise ValueError(
+                f"Combined HDF5 plot settings use one fixed profile '{DEFAULT_PLOT_PROFILE_NAME}'."
+            )
+        if read_plot_profile(source_path, profile_key) is None:
+            raise ValueError(
+                f"No plot-setting profile '{profile_key}' found in '{source_path}'."
+            )
+        return
 
     with h5py.File(source_path, "r+") as handle:
         group = _open_settings_group(handle, create=False)
@@ -476,8 +556,15 @@ def copy_plot_profile(
     """Copy one profile from a source HDF5 file into a target HDF5 file."""
     source_path = Path(source).expanduser().resolve()
     resolved_target_key = target_key or source_key
+    source_supports_named = supports_named_plot_profiles(source_path)
+    target_supports_named = supports_named_plot_profiles(target)
 
-    if source_name is None and target_name is None:
+    if (
+        source_name is None
+        and target_name is None
+        and source_supports_named
+        and target_supports_named
+    ):
         store = read_plot_profile_store(source, source_key)
         if store is None:
             raise ValueError(f"No plot-setting profile '{source_key}' found in '{source_path}'.")
@@ -500,5 +587,9 @@ def copy_plot_profile(
         target,
         resolved_target_key,
         profile,
-        profile_name=target_name or source_name or DEFAULT_PLOT_PROFILE_NAME,
+        profile_name=(
+            None
+            if not target_supports_named
+            else (target_name or source_name or DEFAULT_PLOT_PROFILE_NAME)
+        ),
     )

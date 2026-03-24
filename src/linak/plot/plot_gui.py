@@ -671,6 +671,7 @@ def launch_plot_settings_panel(
     on_load_profile: Callable[[str], dict[str, Any]] | None = None,
     on_delete_profile: Callable[[str], tuple[str | None, str]] | None = None,
     on_set_active_profile: Callable[[str], str] | None = None,
+    allow_named_profiles: bool = True,
 ) -> None:
     """Open a PySide6 panel that previews and persists plot settings."""
     try:
@@ -920,6 +921,7 @@ def launch_plot_settings_panel(
             self.resize(980, 760)
             self.setAttribute(Qt.WidgetAttribute.WA_AlwaysShowToolTips, True)
             self._analysis_name = (analysis_name or "").strip().lower() or None
+            self._allow_named_profiles = bool(allow_named_profiles)
             self._on_resolve_series_defaults = on_resolve_series_defaults
             self._saved_signature: str | None = None
             self._profile_filter_options = _coerce_profile_filter_options(
@@ -1464,7 +1466,9 @@ def launch_plot_settings_panel(
             delete_button = getattr(self, "_profile_delete_button", None)
             if delete_button is not None:
                 delete_button.setEnabled(
-                    len(self._profile_names) > 1 and on_delete_profile is not None
+                    self._allow_named_profiles
+                    and len(self._profile_names) > 1
+                    and on_delete_profile is not None
                 )
 
         def _resolved_default_profile_settings(self) -> dict[str, Any]:
@@ -1583,6 +1587,8 @@ def launch_plot_settings_panel(
             raise ValueError("Could not find an available duplicate profile name.")
 
         def _handle_profile_selection_request(self, index: int) -> None:
+            if not self._allow_named_profiles:
+                return
             if self._profile_selector_syncing or index < 0:
                 return
             requested = self._profile_selector.itemText(index).strip()
@@ -1610,6 +1616,10 @@ def launch_plot_settings_panel(
                 self._report_error("Load profile failed", exc)
 
         def _handle_new_profile(self) -> None:
+            if not self._allow_named_profiles:
+                self._status_label.setText("Combined plot files use one saved settings document.")
+                self._refresh_shell_state()
+                return
             if not self._confirm_context_change(action_label="creating a new profile"):
                 return
             try:
@@ -1635,6 +1645,10 @@ def launch_plot_settings_panel(
                 self._report_error("Create profile failed", exc)
 
         def _handle_duplicate_profile(self) -> None:
+            if not self._allow_named_profiles:
+                self._status_label.setText("Combined plot files use one saved settings document.")
+                self._refresh_shell_state()
+                return
             try:
                 settings = self._collect_settings()
                 name = self._prompt_profile_name(
@@ -1658,6 +1672,10 @@ def launch_plot_settings_panel(
                 self._report_error("Duplicate profile failed", exc)
 
         def _handle_rename_profile(self) -> None:
+            if not self._allow_named_profiles:
+                self._status_label.setText("Combined plot files use one saved settings document.")
+                self._refresh_shell_state()
+                return
             if on_delete_profile is None:
                 self._status_label.setText("Rename profile is unavailable.")
                 return
@@ -1698,6 +1716,10 @@ def launch_plot_settings_panel(
                 self._report_error("Rename profile failed", exc)
 
         def _handle_delete_profile(self) -> None:
+            if not self._allow_named_profiles:
+                self._status_label.setText("Combined plot files use one saved settings document.")
+                self._refresh_shell_state()
+                return
             if on_delete_profile is None:
                 self._status_label.setText("Delete profile is unavailable.")
                 return
@@ -2716,6 +2738,7 @@ def launch_plot_settings_panel(
             self._profile_selector.currentIndexChanged.connect(
                 self._handle_profile_selection_request
             )
+            self._profile_selector.setEnabled(self._allow_named_profiles)
             self._add_form_row(
                 selection_form,
                 "Profile",
@@ -2730,6 +2753,8 @@ def launch_plot_settings_panel(
             self._profiles_current_label.setWordWrap(True)
             current_note = QLabel(
                 "Profiles store reusable plotting presets inside the current HDF5 source."
+                if self._allow_named_profiles
+                else "Combined plot files store one shared settings document for all plotted series."
             )
             current_note.setWordWrap(True)
             current_layout.addRow("Active profile", self._profiles_current_label)
@@ -2747,18 +2772,24 @@ def launch_plot_settings_panel(
             new_profile_button = _page_button("New Profile", self._handle_new_profile)
             self._register_tooltip(new_profile_button, "profiles.new")
             self._apply_widget_tooltip(new_profile_button)
+            new_profile_button.setEnabled(self._allow_named_profiles)
             manage_layout.addWidget(new_profile_button, 0, 0)
             rename_button = _page_button("Rename", self._handle_rename_profile)
             self._register_tooltip(rename_button, "profiles.rename")
             self._apply_widget_tooltip(rename_button)
+            rename_button.setEnabled(self._allow_named_profiles and on_delete_profile is not None)
             manage_layout.addWidget(rename_button, 0, 1)
             duplicate_button = _page_button("Duplicate", self._handle_duplicate_profile)
             self._register_tooltip(duplicate_button, "profiles.duplicate")
             self._apply_widget_tooltip(duplicate_button)
+            duplicate_button.setEnabled(self._allow_named_profiles)
             manage_layout.addWidget(duplicate_button, 1, 0)
             self._profile_delete_button = _page_button("Delete", self._handle_delete_profile)
             self._register_tooltip(self._profile_delete_button, "profiles.delete")
             self._apply_widget_tooltip(self._profile_delete_button)
+            self._profile_delete_button.setEnabled(
+                self._allow_named_profiles and len(self._profile_names) > 1 and on_delete_profile is not None
+            )
             manage_layout.addWidget(self._profile_delete_button, 1, 1)
             save_profile_button = _page_button("Save Profile", self._handle_save)
             self._register_tooltip(save_profile_button, "profiles.save")

@@ -1,3 +1,5 @@
+import pytest
+
 from linak.plot.plot_settings import (
     copy_plot_profile,
     delete_named_plot_profile,
@@ -7,7 +9,7 @@ from linak.plot.plot_settings import (
     set_active_plot_profile,
     write_plot_profile,
 )
-from linak.storage.hdf5_utils import write_linak_hdf5
+from linak.storage.hdf5_utils import write_linak_hdf5, write_linak_hdf5_profile_collection
 
 
 def _write_density_hdf5(path):
@@ -22,6 +24,39 @@ def _write_density_hdf5(path):
             "axis": "z",
             "species": "O",
         },
+    )
+
+
+def _write_combined_density_hdf5(path):
+    write_linak_hdf5_profile_collection(
+        path,
+        analysis="density",
+        profiles=[
+            {
+                "datasets": {
+                    "bin_centers_A": [0.5],
+                    "density": [1.0],
+                },
+                "metadata": {
+                    "axis": "z",
+                    "species": "O",
+                    "profile_uid": "series-a",
+                    "origin_hdf5_path": str(path.parent / "a_density.h5"),
+                },
+            },
+            {
+                "datasets": {
+                    "bin_centers_A": [0.5],
+                    "density": [2.0],
+                },
+                "metadata": {
+                    "axis": "z",
+                    "species": "H",
+                    "profile_uid": "series-b",
+                    "origin_hdf5_path": str(path.parent / "b_density.h5"),
+                },
+            },
+        ],
     )
 
 
@@ -87,3 +122,30 @@ def test_copy_plot_profile_without_name_copies_entire_named_store(tmp_path):
     assert read_plot_profile(target, "plot:density", profile_name="Publication") == {
         "title": "Publication title"
     }
+
+
+def test_combined_hdf5_plot_settings_collapse_named_profiles_to_one_document(tmp_path):
+    source = tmp_path / "combined_density.h5"
+    _write_combined_density_hdf5(source)
+
+    write_plot_profile(source, "plot:density", {"title": "Default title"})
+    write_plot_profile(
+        source,
+        "plot:density",
+        {"title": "Should overwrite default"},
+        profile_name="Publication",
+    )
+
+    assert read_plot_profile_names(source, "plot:density") == ["Default"]
+    assert read_active_plot_profile_name(source, "plot:density") == "Default"
+    assert read_plot_profile(source, "plot:density") == {"title": "Should overwrite default"}
+    assert read_plot_profile(source, "plot:density", profile_name="Publication") is None
+
+
+def test_combined_hdf5_plot_settings_reject_set_active_for_non_default_name(tmp_path):
+    source = tmp_path / "combined_density.h5"
+    _write_combined_density_hdf5(source)
+    write_plot_profile(source, "plot:density", {"title": "Saved"})
+
+    with pytest.raises(ValueError, match="fixed profile 'Default'"):
+        set_active_plot_profile(source, "plot:density", "Publication")

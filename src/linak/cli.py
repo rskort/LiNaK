@@ -3488,6 +3488,33 @@ def _merge_gui_only_plot_settings(
     return merged
 
 
+def _strip_redundant_series_lists_for_gui(settings: dict[str, Any]) -> dict[str, Any]:
+    """Drop positional per-series lists when ID-keyed overrides are present.
+
+    GUI initialization consumes `series_descriptors` in natural source order. When the CLI has already
+    materialized display-order lists like `series_enabled`, those positional lists no longer align with
+    descriptor order. The ID-keyed `series_overrides` payload is the authoritative representation.
+    """
+    if not isinstance(settings.get("series_overrides"), dict):
+        return settings
+    cleaned = dict(settings)
+    for key in (
+        "series_labels",
+        "line_colors",
+        "series_enabled",
+        "series_show_in_legend",
+        "series_alpha",
+        "series_line_widths",
+        "series_markers",
+        "series_line_kwargs",
+        "series_normalization_modes",
+        "series_normalization_values",
+        "series_normalization_x_refs",
+    ):
+        cleaned.pop(key, None)
+    return cleaned
+
+
 def _without_preview_series_state(settings: dict[str, Any] | None) -> dict[str, Any]:
     if not isinstance(settings, dict):
         return {}
@@ -3495,6 +3522,8 @@ def _without_preview_series_state(settings: dict[str, Any] | None) -> dict[str, 
         "series_order",
         "series_labels",
         "line_colors",
+        "line_color",
+        "line_kwargs",
         "series_enabled",
         "series_fit_configs",
         "series_line_widths",
@@ -3503,6 +3532,7 @@ def _without_preview_series_state(settings: dict[str, Any] | None) -> dict[str, 
         "series_normalization_modes",
         "series_normalization_values",
         "series_normalization_x_refs",
+        "markers",
     }
     return {key: deepcopy(value) for key, value in settings.items() if key not in blocked}
 
@@ -4094,6 +4124,7 @@ def _open_plot_settings_gui(
     on_load_profile: Callable[[str], dict[str, Any]] | None = None,
     on_delete_profile: Callable[[str], tuple[str | None, str]] | None = None,
     on_set_active_profile: Callable[[str], str] | None = None,
+    allow_named_profiles: bool = True,
 ) -> None:
     from .plot.plot_gui import launch_plot_settings_panel
 
@@ -4112,6 +4143,7 @@ def _open_plot_settings_gui(
         on_load_profile=on_load_profile,
         on_delete_profile=on_delete_profile,
         on_set_active_profile=on_set_active_profile,
+        allow_named_profiles=allow_named_profiles,
     )
 
 
@@ -4143,9 +4175,11 @@ def _launch_profile_plot_gui(
         read_plot_profile,
         read_plot_profile_names,
         set_active_plot_profile,
+        supports_named_plot_profiles,
         write_plot_profile,
     )
 
+    allow_named_profiles = supports_named_plot_profiles(source_path)
     initial_settings = _collect_plot_settings_for_persistence(args, keys=setting_keys)
     initial_settings["_gui_locked_fields"] = _derive_gui_locked_fields(initial_settings)
     initial_settings["_gui_sync_modes"] = _derive_gui_sync_modes(initial_settings)
@@ -4160,18 +4194,23 @@ def _launch_profile_plot_gui(
     default_settings["_profile_filter_options"] = deepcopy(initial_context.profile_filter_options)
     if initial_context.default_series_labels and not default_settings.get("series_labels"):
         default_settings["series_labels"] = list(initial_context.default_series_labels)
-    available_profile_names = read_plot_profile_names(source_path, profile_key)
+    available_profile_names = (
+        read_plot_profile_names(source_path, profile_key) if allow_named_profiles else ["Default"]
+    )
     if not available_profile_names:
         available_profile_names = ["Default"]
     initial_profile_name = (
         read_active_plot_profile_name(source_path, profile_key) or available_profile_names[0]
     )
+    if not allow_named_profiles:
+        initial_profile_name = "Default"
     initial_saved_profile = read_plot_profile(
         source_path,
         profile_key,
-        profile_name=initial_profile_name,
+        profile_name=(initial_profile_name if allow_named_profiles else None),
     )
     initial_settings = _merge_gui_only_plot_settings(initial_settings, initial_saved_profile)
+    initial_settings = _strip_redundant_series_lists_for_gui(initial_settings)
 
     initial_preview_args = deepcopy(args)
     initial_preview_args.show = False
@@ -4368,9 +4407,10 @@ def _launch_profile_plot_gui(
         initial_profile_name=initial_profile_name,
         available_profile_names=available_profile_names,
         default_profile_settings=default_settings,
-        on_load_profile=_load_profile,
-        on_delete_profile=_delete_profile,
-        on_set_active_profile=_set_active_profile,
+        on_load_profile=_load_profile if allow_named_profiles else None,
+        on_delete_profile=_delete_profile if allow_named_profiles else None,
+        on_set_active_profile=_set_active_profile if allow_named_profiles else None,
+        allow_named_profiles=allow_named_profiles,
     )
 
 
@@ -5703,10 +5743,20 @@ def _handle_csv_plot_settings(args: argparse.Namespace) -> int:
         read_plot_profile,
         read_plot_profile_stores,
         set_active_plot_profile,
+        supports_named_plot_profiles,
         write_plot_profile,
     )
 
+    named_profiles_supported = supports_named_plot_profiles(source_path)
     selected_name = getattr(args, "name", None)
+    if not named_profiles_supported and selected_name not in {None, "Default"}:
+        raise ValueError(
+            "Combined HDF5 plot settings use one fixed profile 'Default'; named profiles are unsupported."
+        )
+    if not named_profiles_supported and args.copy_name is not None:
+        raise ValueError("Combined HDF5 plot settings do not support creating named copies.")
+    if not named_profiles_supported and args.set_active is not None:
+        raise ValueError("Combined HDF5 plot settings always use the fixed profile 'Default'.")
     active_name = read_active_plot_profile_name(source_path, profile_key)
     resolved_name = selected_name or active_name
 
