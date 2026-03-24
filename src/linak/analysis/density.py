@@ -16,6 +16,7 @@ from ase.neighborlist import neighbor_list
 
 from ..storage.hdf5_utils import (
     is_hdf5_path,
+    read_linak_hdf5_profiles_by_index,
     read_linak_hdf5_profiles,
     write_linak_hdf5,
     write_linak_hdf5_profile_collection,
@@ -1708,6 +1709,156 @@ def load_density_profile(
     return profiles[0]
 
 
+def _load_density_profiles_from_payloads(
+    source_path: Path,
+    payloads: list[tuple[dict[str, np.ndarray], dict[str, Any]]],
+    *,
+    axis: str | None = None,
+    species: str | None = None,
+) -> list[DensityProfile]:
+    profiles: list[DensityProfile] = []
+    for datasets, metadata in payloads:
+        required = ("bin_centers_A", "density")
+        missing = [name for name in required if name not in datasets]
+        if missing:
+            raise ValueError(
+                f"Density HDF5 '{source_path}' is missing required dataset(s): {', '.join(missing)}."
+            )
+
+        axis_meta = str(metadata.get("axis", "")).strip()
+        if axis is not None and axis.strip():
+            axis_label = "xyz"[axis_to_index(axis)]
+        elif axis_meta:
+            axis_label = "xyz"[axis_to_index(axis_meta)]
+        else:
+            axis_label = "z"
+
+        species_meta = str(metadata.get("species", "")).strip()
+        if species is not None and species.strip():
+            _selection_mode, species_label = _normalize_species_query(species)
+        elif species_meta:
+            species_label = species_meta
+        else:
+            species_label = "UNKNOWN"
+
+        resolved_units = resolve_units_map(analysis="density", metadata=metadata)
+        units = str(metadata.get("units") or resolved_units.get("density") or "g/cm^3")
+        number_density_units_raw = metadata.get("number_density_units")
+        if number_density_units_raw is None:
+            number_density_units_raw = resolved_units.get("number_density")
+        number_density_units = (
+            str(number_density_units_raw).strip()
+            if number_density_units_raw is not None
+            else None
+        )
+        if number_density_units == "":
+            number_density_units = None
+        coordinate_mode = str(metadata.get("coordinate_mode", "axis")).strip().lower()
+        if coordinate_mode not in {"axis", "distance"}:
+            coordinate_mode = "axis"
+
+        surface_position_raw = metadata.get("surface_position")
+        surface_position = None
+        if surface_position_raw is not None:
+            value = float(surface_position_raw)
+            if np.isfinite(value):
+                surface_position = value
+
+        surface_std_raw = metadata.get("surface_position_std")
+        surface_position_std = None
+        if surface_std_raw is not None:
+            value = float(surface_std_raw)
+            if np.isfinite(value):
+                surface_position_std = value
+
+        number_density = None
+        if "number_density" in datasets:
+            number_density = np.asarray(datasets["number_density"], dtype=float)
+
+        canonical_density, canonical_units, canonical_number_density, canonical_number_units = (
+            canonicalize_density_units(
+                density=np.asarray(datasets["density"], dtype=float),
+                density_units=units,
+                number_density=number_density,
+                number_density_units=number_density_units,
+            )
+        )
+
+        entities_per_frame = None
+        if "entities_per_frame" in datasets:
+            entities_per_frame = np.asarray(datasets["entities_per_frame"], dtype=float)
+
+        bin_centers = np.asarray(datasets["bin_centers_A"], dtype=float)
+        if "bin_edges_A" in datasets:
+            bin_edges = np.asarray(datasets["bin_edges_A"], dtype=float)
+        else:
+            bin_width = resolve_uniform_bin_width_for_load(
+                metadata=metadata,
+                bin_centers=bin_centers,
+                source_path=source_path,
+                analysis_name="Density",
+            )
+            bin_edges = reconstruct_uniform_bin_edges_from_centers(
+                bin_centers,
+                bin_width=bin_width,
+            )
+        if bin_edges.size != bin_centers.size + 1:
+            raise ValueError(
+                f"Density HDF5 '{source_path}' has incompatible bin_edges_A/bin_centers_A sizes."
+            )
+
+        if "counts_per_frame" in datasets:
+            counts_per_frame = np.asarray(datasets["counts_per_frame"], dtype=float)
+        else:
+            counts_per_frame = np.full(bin_centers.shape, np.nan, dtype=float)
+
+        profiles.append(
+            DensityProfile(
+                axis=axis_label,
+                species=species_label,
+                bin_edges=bin_edges,
+                bin_centers=bin_centers,
+                counts_per_frame=counts_per_frame,
+                density=canonical_density,
+                units=canonical_units,
+                n_frames=int(metadata.get("n_frames", 0)),
+                entities_per_frame=entities_per_frame,
+                number_density=canonical_number_density,
+                number_density_units=canonical_number_units,
+                coordinate_mode=coordinate_mode,
+                surface_position=surface_position,
+                surface_position_std=surface_position_std,
+            )
+        )
+    return profiles
+
+
+def load_density_profiles_by_index(
+    path: str | Path,
+    profile_indices: list[int] | tuple[int, ...],
+    *,
+    axis: str | None = None,
+    species: str | None = None,
+) -> list[DensityProfile]:
+    """Load selected density profiles by profile index from LiNaK HDF5."""
+    source_path = Path(path).expanduser().resolve()
+    if not source_path.exists():
+        raise FileNotFoundError(f"Density profile not found: {source_path}")
+    if not is_hdf5_path(source_path):
+        raise ValueError(f"Unsupported density profile format for '{source_path}'. Use .h5/.hdf5.")
+    payloads = read_linak_hdf5_profiles_by_index(
+        source_path,
+        profile_indices,
+        expected_analysis="density",
+    )
+    return _load_density_profiles_from_payloads(
+        source_path,
+        payloads,
+        axis=axis,
+        species=species,
+    )
+
+
 def load_density_profiles(
     path: str | Path,
     *,
@@ -1721,121 +1872,12 @@ def load_density_profiles(
 
     if is_hdf5_path(source_path):
         payloads = read_linak_hdf5_profiles(source_path, expected_analysis="density")
-        profiles: list[DensityProfile] = []
-        for datasets, metadata in payloads:
-            required = ("bin_centers_A", "density")
-            missing = [name for name in required if name not in datasets]
-            if missing:
-                raise ValueError(
-                    f"Density HDF5 '{source_path}' is missing required dataset(s): {', '.join(missing)}."
-                )
-
-            axis_meta = str(metadata.get("axis", "")).strip()
-            if axis is not None and axis.strip():
-                axis_label = "xyz"[axis_to_index(axis)]
-            elif axis_meta:
-                axis_label = "xyz"[axis_to_index(axis_meta)]
-            else:
-                axis_label = "z"
-
-            species_meta = str(metadata.get("species", "")).strip()
-            if species is not None and species.strip():
-                _selection_mode, species_label = _normalize_species_query(species)
-            elif species_meta:
-                species_label = species_meta
-            else:
-                species_label = "UNKNOWN"
-
-            resolved_units = resolve_units_map(analysis="density", metadata=metadata)
-            units = str(metadata.get("units") or resolved_units.get("density") or "g/cm^3")
-            number_density_units_raw = metadata.get("number_density_units")
-            if number_density_units_raw is None:
-                number_density_units_raw = resolved_units.get("number_density")
-            number_density_units = (
-                str(number_density_units_raw).strip()
-                if number_density_units_raw is not None
-                else None
-            )
-            if number_density_units == "":
-                number_density_units = None
-            coordinate_mode = str(metadata.get("coordinate_mode", "axis")).strip().lower()
-            if coordinate_mode not in {"axis", "distance"}:
-                coordinate_mode = "axis"
-
-            surface_position_raw = metadata.get("surface_position")
-            surface_position = None
-            if surface_position_raw is not None:
-                value = float(surface_position_raw)
-                if np.isfinite(value):
-                    surface_position = value
-
-            surface_std_raw = metadata.get("surface_position_std")
-            surface_position_std = None
-            if surface_std_raw is not None:
-                value = float(surface_std_raw)
-                if np.isfinite(value):
-                    surface_position_std = value
-
-            number_density = None
-            if "number_density" in datasets:
-                number_density = np.asarray(datasets["number_density"], dtype=float)
-
-            canonical_density, canonical_units, canonical_number_density, canonical_number_units = (
-                canonicalize_density_units(
-                    density=np.asarray(datasets["density"], dtype=float),
-                    density_units=units,
-                    number_density=number_density,
-                    number_density_units=number_density_units,
-                )
-            )
-
-            entities_per_frame = None
-            if "entities_per_frame" in datasets:
-                entities_per_frame = np.asarray(datasets["entities_per_frame"], dtype=float)
-
-            bin_centers = np.asarray(datasets["bin_centers_A"], dtype=float)
-            if "bin_edges_A" in datasets:
-                bin_edges = np.asarray(datasets["bin_edges_A"], dtype=float)
-            else:
-                bin_width = resolve_uniform_bin_width_for_load(
-                    metadata=metadata,
-                    bin_centers=bin_centers,
-                    source_path=source_path,
-                    analysis_name="Density",
-                )
-                bin_edges = reconstruct_uniform_bin_edges_from_centers(
-                    bin_centers,
-                    bin_width=bin_width,
-                )
-            if bin_edges.size != bin_centers.size + 1:
-                raise ValueError(
-                    f"Density HDF5 '{source_path}' has incompatible bin_edges_A/bin_centers_A sizes."
-                )
-
-            if "counts_per_frame" in datasets:
-                counts_per_frame = np.asarray(datasets["counts_per_frame"], dtype=float)
-            else:
-                counts_per_frame = np.full(bin_centers.shape, np.nan, dtype=float)
-
-            profiles.append(
-                DensityProfile(
-                    axis=axis_label,
-                    species=species_label,
-                    bin_edges=bin_edges,
-                    bin_centers=bin_centers,
-                    counts_per_frame=counts_per_frame,
-                    density=canonical_density,
-                    units=canonical_units,
-                    n_frames=int(metadata.get("n_frames", 0)),
-                    entities_per_frame=entities_per_frame,
-                    number_density=canonical_number_density,
-                    number_density_units=canonical_number_units,
-                    coordinate_mode=coordinate_mode,
-                    surface_position=surface_position,
-                    surface_position_std=surface_position_std,
-                )
-            )
-        return profiles
+        return _load_density_profiles_from_payloads(
+            source_path,
+            payloads,
+            axis=axis,
+            species=species,
+        )
 
     raise ValueError(f"Unsupported density profile format for '{source_path}'. Use .h5/.hdf5.")
 

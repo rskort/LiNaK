@@ -14,6 +14,7 @@ from ase.geometry import find_mic
 
 from ..storage.hdf5_utils import (
     is_hdf5_path,
+    read_linak_hdf5_profiles_by_index,
     read_linak_hdf5_profiles,
     write_linak_hdf5,
 )
@@ -209,6 +210,66 @@ def load_msd_profile(path: str | Path, *, species: str | None = None) -> MSDProf
     return profiles[0]
 
 
+def _load_msd_profiles_from_payloads(
+    source_path: Path,
+    payloads: list[tuple[dict[str, np.ndarray], dict[str, Any]]],
+    *,
+    species: str | None = None,
+) -> list[MSDProfile]:
+    profiles: list[MSDProfile] = []
+    for datasets, metadata in payloads:
+        required = ("time_fs", "time_ps", "msd_A2")
+        missing = [name for name in required if name not in datasets]
+        if missing:
+            raise ValueError(
+                f"MSD HDF5 '{source_path}' is missing required dataset(s): {', '.join(missing)}."
+            )
+
+        meta_species = str(metadata.get("species", "")).strip()
+        if species is not None and species.strip():
+            resolved_species = _normalize_species(species)
+        elif meta_species:
+            resolved_species = meta_species
+        else:
+            resolved_species = "UNKNOWN"
+
+        time_fs = np.asarray(datasets["time_fs"], dtype=float)
+        time_ps = np.asarray(datasets["time_ps"], dtype=float)
+        msd = np.asarray(datasets["msd_A2"], dtype=float)
+        n_frames = int(metadata.get("n_frames", time_fs.size))
+
+        profiles.append(
+            MSDProfile(
+                species=resolved_species,
+                time_fs=time_fs,
+                time_ps=time_ps,
+                msd=msd,
+                n_frames=n_frames,
+            )
+        )
+    return profiles
+
+
+def load_msd_profiles_by_index(
+    path: str | Path,
+    profile_indices: list[int] | tuple[int, ...],
+    *,
+    species: str | None = None,
+) -> list[MSDProfile]:
+    """Load selected MSD profiles by profile index from LiNaK HDF5."""
+    source_path = Path(path).expanduser().resolve()
+    if not source_path.exists():
+        raise FileNotFoundError(f"MSD profile not found: {source_path}")
+    if not is_hdf5_path(source_path):
+        raise ValueError(f"Unsupported MSD profile format for '{source_path}'. Use .h5/.hdf5.")
+    payloads = read_linak_hdf5_profiles_by_index(
+        source_path,
+        profile_indices,
+        expected_analysis="msd",
+    )
+    return _load_msd_profiles_from_payloads(source_path, payloads, species=species)
+
+
 def load_msd_profiles(path: str | Path, *, species: str | None = None) -> list[MSDProfile]:
     """Load one or more MSD profiles from LiNaK HDF5."""
     source_path = Path(path).expanduser().resolve()
@@ -217,38 +278,7 @@ def load_msd_profiles(path: str | Path, *, species: str | None = None) -> list[M
 
     if is_hdf5_path(source_path):
         payloads = read_linak_hdf5_profiles(source_path, expected_analysis="msd")
-        profiles: list[MSDProfile] = []
-        for datasets, metadata in payloads:
-            required = ("time_fs", "time_ps", "msd_A2")
-            missing = [name for name in required if name not in datasets]
-            if missing:
-                raise ValueError(
-                    f"MSD HDF5 '{source_path}' is missing required dataset(s): {', '.join(missing)}."
-                )
-
-            meta_species = str(metadata.get("species", "")).strip()
-            if species is not None and species.strip():
-                resolved_species = _normalize_species(species)
-            elif meta_species:
-                resolved_species = meta_species
-            else:
-                resolved_species = "UNKNOWN"
-
-            time_fs = np.asarray(datasets["time_fs"], dtype=float)
-            time_ps = np.asarray(datasets["time_ps"], dtype=float)
-            msd = np.asarray(datasets["msd_A2"], dtype=float)
-            n_frames = int(metadata.get("n_frames", time_fs.size))
-
-            profiles.append(
-                MSDProfile(
-                    species=resolved_species,
-                    time_fs=time_fs,
-                    time_ps=time_ps,
-                    msd=msd,
-                    n_frames=n_frames,
-                )
-            )
-        return profiles
+        return _load_msd_profiles_from_payloads(source_path, payloads, species=species)
 
     raise ValueError(f"Unsupported MSD profile format for '{source_path}'. Use .h5/.hdf5.")
 

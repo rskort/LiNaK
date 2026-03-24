@@ -44,6 +44,7 @@ _FIT_TYPES = supported_fit_types()
 _FIT_RANGE_MODES = ("visible", "manual")
 _PROFILE_FILTER_METADATA_LABEL = "Use stored metadata"
 _PROFILE_FILTER_SPECIES_B_AUTO_LABEL = "Same as Species A / stored metadata"
+_AUTO_PREVIEW_DEBOUNCE_MS = 1000
 _TRI_STATE_SYNC_FIELD_KEYS = frozenset({"title", "x_label", "y_label"})
 _SERIES_SPECIFIC_SETTINGS = frozenset(
     {
@@ -249,6 +250,10 @@ def _lock_to_sync_mode(locked: bool) -> str:
 
 def _sync_mode_to_lock(value: str) -> bool:
     return str(value).strip().lower() == "manual"
+
+
+def _preview_button_enabled(*, auto_update_enabled: bool, preview_loading: bool) -> bool:
+    return (not auto_update_enabled) and (not preview_loading)
 
 
 def _explicit_text(value: str) -> str:
@@ -1033,6 +1038,7 @@ def launch_plot_settings_panel(
             self._preview_timer = QTimer(self)
             self._preview_timer.setSingleShot(True)
             self._preview_timer.timeout.connect(self._handle_debounced_preview)
+            self._preview_loading = False
             self._status_label = QLabel("Ready.")
             self._build_ui()
             self._suspend_preview_events = True
@@ -3270,7 +3276,7 @@ def launch_plot_settings_panel(
             self.series_show_in_legend = self._combo(("on", "off"))
             self.series_show_in_legend.currentTextChanged.connect(self._on_series_editor_changed)
             self.series_label = self._line()
-            self.series_label.textChanged.connect(self._on_series_editor_changed)
+            self.series_label.textChanged.connect(self._on_series_label_changed)
             series_color_row, self.series_color = self._color_field(
                 placeholder="#1f77b4",
                 tooltip_id="series.color",
@@ -3392,7 +3398,7 @@ def launch_plot_settings_panel(
                     tooltip_id="series.fit_show_in_legend",
                 )
                 self._series_fit_label = self._line()
-                self._series_fit_label.textChanged.connect(self._on_series_editor_changed)
+                self._series_fit_label.textChanged.connect(self._on_series_fit_label_changed)
                 self._add_form_row(
                     fit_form,
                     "Label",
@@ -4350,6 +4356,24 @@ def launch_plot_settings_panel(
             for index in range(self.series_list.count()):
                 self._apply_series_list_item_visuals(self.series_list.item(index), index)
 
+        def _refresh_active_series_list_widgets(self) -> None:
+            if not hasattr(self, "series_list") or self.series_list is None:
+                return
+            current_row = self.series_list.currentRow()
+            if current_row >= 0:
+                self._apply_series_list_item_visuals(self.series_list.item(current_row), current_row)
+            if (
+                self._series_active_index < len(self._series_fit_enabled_data)
+                and self._series_fit_enabled_data[self._series_active_index]
+                and self._fit_supported_for_current_view()
+            ):
+                fit_row = self._display_row_for_selection(
+                    self._series_active_index,
+                    is_fit_child=True,
+                )
+                if fit_row >= 0 and fit_row != current_row:
+                    self._apply_series_list_item_visuals(self.series_list.item(fit_row), fit_row)
+
         def _apply_series_list_item_visuals(self, item: Any, index: int) -> None:
             if item is None or index < 0:
                 return
@@ -5263,6 +5287,31 @@ def launch_plot_settings_panel(
             self._refresh_widget_states()
             self._schedule_preview_update()
 
+        def _on_series_label_changed(self, *_unused: object) -> None:
+            if self._series_syncing:
+                return
+            index = self._series_active_index
+            if index < 0 or index >= len(self._series_labels_data):
+                return
+            if self._series_active_is_fit_child:
+                self._series_fit_label_overrides_data[index] = self.series_label.text().strip()
+            else:
+                self._series_label_overrides_data[index] = self.series_label.text().strip()
+                if hasattr(self, "_series_fit_label") and self._series_fit_label is not None:
+                    self._series_fit_label.setPlaceholderText(self._fit_effective_label(index))
+            self._refresh_active_series_list_widgets()
+            self._schedule_preview_update()
+
+        def _on_series_fit_label_changed(self, *_unused: object) -> None:
+            if self._series_syncing:
+                return
+            index = self._series_active_index
+            if index < 0 or index >= len(self._series_fit_label_overrides_data):
+                return
+            self._series_fit_label_overrides_data[index] = self._series_fit_label.text().strip()
+            self._refresh_active_series_list_widgets()
+            self._schedule_preview_update()
+
         def _initialize_normalization_data(self, settings: dict[str, Any]) -> None:
             count = len(self._series_labels_data)
             if (
@@ -5655,10 +5704,36 @@ def launch_plot_settings_panel(
                 return
             if not self._auto_preview_checkbox.isChecked():
                 return
-            self._preview_timer.start(220)
+            if self._preview_loading:
+                return
+            self._preview_timer.start(_AUTO_PREVIEW_DEBOUNCE_MS)
 
         def _handle_debounced_preview(self) -> None:
+            if self._preview_loading:
+                return
             self._update_embedded_preview(interactive=False)
+
+        def _set_preview_loading(self, active: bool) -> None:
+            self._preview_loading = bool(active)
+            for widget in (
+                self._preview_frame,
+                self._preview_scroll,
+                self._preview_scroll.viewport() if self._preview_scroll is not None else None,
+                self._preview_label,
+            ):
+                if widget is None:
+                    continue
+                if active:
+                    widget.setCursor(Qt.CursorShape.WaitCursor)
+                else:
+                    widget.unsetCursor()
+            if self._preview_button is not None:
+                self._preview_button.setEnabled(
+                    _preview_button_enabled(
+                        auto_update_enabled=self._auto_preview_checkbox.isChecked(),
+                        preview_loading=self._preview_loading,
+                    )
+                )
 
         def _set_preview_zoom(self, value: float) -> None:
             self._preview_zoom_factor = max(0.2, min(20.0, float(value)))
@@ -5729,6 +5804,10 @@ def launch_plot_settings_panel(
             self._preview_label.resize(scaled.size())
 
         def _update_embedded_preview(self, *, interactive: bool) -> bool:
+            if self._preview_loading:
+                return False
+            self._preview_timer.stop()
+            self._set_preview_loading(True)
             if on_save_figure is None:
                 try:
                     settings = self._collect_settings()
@@ -5746,18 +5825,11 @@ def launch_plot_settings_panel(
                         self._preview_status.setText(f"Preview paused: {exc}")
                         self._refresh_shell_state()
                     return False
+                finally:
+                    self._set_preview_loading(False)
 
             try:
                 settings = self._collect_settings()
-            except Exception as exc:
-                if interactive:
-                    self._report_error("Preview failed", exc)
-                else:
-                    self._preview_status.setText(f"Preview paused: {exc}")
-                    self._refresh_shell_state()
-                return False
-
-            try:
                 save_result = on_save_figure(settings, str(self._preview_image_path))
                 render_state = None
                 if isinstance(save_result, tuple):
@@ -5782,6 +5854,8 @@ def launch_plot_settings_panel(
                     self._preview_status.setText(f"Preview paused: {exc}")
                     self._refresh_shell_state()
                 return False
+            finally:
+                self._set_preview_loading(False)
 
         def _set_combo_value(self, widget: QComboBox, value: str) -> None:
             if not value:
@@ -6464,7 +6538,12 @@ def launch_plot_settings_panel(
                 self._series_fit_show_in_legend.setEnabled(fit_supported and fit_active)
             if hasattr(self, "_series_fit_label"):
                 self._series_fit_label.setEnabled(fit_supported and fit_active)
-            self._preview_button.setEnabled(not self._auto_preview_checkbox.isChecked())
+            self._preview_button.setEnabled(
+                _preview_button_enabled(
+                    auto_update_enabled=self._auto_preview_checkbox.isChecked(),
+                    preview_loading=self._preview_loading,
+                )
+            )
             self._update_normalization_warning()
             self._update_series_fit_summary(self._series_active_index)
             self._sync_standard_controls_to_advanced_json()
@@ -7050,6 +7129,8 @@ def launch_plot_settings_panel(
 
         def _handle_preview(self) -> None:
             self._preview_timer.stop()
+            if self._preview_loading:
+                return
             self._update_embedded_preview(interactive=True)
 
         def _handle_save(self) -> None:

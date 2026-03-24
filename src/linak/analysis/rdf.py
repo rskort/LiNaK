@@ -19,6 +19,7 @@ from ase.neighborlist import neighbor_list
 
 from ..storage.hdf5_utils import (
     is_hdf5_path,
+    read_linak_hdf5_profiles_by_index,
     read_linak_hdf5_profiles,
     write_linak_hdf5,
 )
@@ -620,68 +621,103 @@ def load_rdf_profiles(
 
     if is_hdf5_path(source_path):
         payloads = read_linak_hdf5_profiles(source_path, expected_analysis="rdf")
-        profiles: list[RDFProfile] = []
-        wanted_species_a = (
-            None if species_a is None or not species_a.strip() else _normalize_species(species_a)
+        return _load_rdf_profiles_from_payloads(
+            source_path,
+            payloads,
+            species_a=species_a,
+            species_b=species_b,
         )
-        wanted_species_b = (
-            None if species_b is None or not species_b.strip() else _normalize_species(species_b)
-        )
-        for datasets, metadata in payloads:
-            required = ("bin_centers_A", "g_r")
-            missing = [name for name in required if name not in datasets]
-            if missing:
-                raise ValueError(
-                    f"RDF HDF5 '{source_path}' is missing required dataset(s): {', '.join(missing)}."
-                )
-
-            resolved_species_a = str(metadata.get("species_a", "")).strip() or "UNKNOWN"
-            resolved_species_b = str(metadata.get("species_b", "")).strip() or resolved_species_a
-            if (
-                wanted_species_a is not None
-                and _normalize_species(resolved_species_a) != wanted_species_a
-            ):
-                continue
-            if (
-                wanted_species_b is not None
-                and _normalize_species(resolved_species_b) != wanted_species_b
-            ):
-                continue
-
-            bin_centers = np.asarray(datasets["bin_centers_A"], dtype=float)
-            if "bin_edges_A" in datasets:
-                bin_edges = np.asarray(datasets["bin_edges_A"], dtype=float)
-            else:
-                bin_width = resolve_uniform_bin_width_for_load(
-                    metadata=metadata,
-                    bin_centers=bin_centers,
-                    source_path=source_path,
-                    analysis_name="RDF",
-                )
-                bin_edges = reconstruct_uniform_bin_edges_from_centers(
-                    bin_centers,
-                    bin_width=bin_width,
-                )
-            if bin_edges.size != bin_centers.size + 1:
-                raise ValueError(
-                    f"RDF HDF5 '{source_path}' has incompatible bin_edges_A/bin_centers_A sizes."
-                )
-            g_r = np.asarray(datasets["g_r"], dtype=float)
-            n_frames = int(metadata.get("n_frames", 0))
-
-            profiles.append(
-                RDFProfile(
-                    species_a=resolved_species_a,
-                    species_b=resolved_species_b,
-                    bin_edges=bin_edges,
-                    bin_centers=bin_centers,
-                    g_r=g_r,
-                    n_frames=n_frames,
-                )
-            )
-        return profiles
 
     raise ValueError(f"Unsupported RDF profile format for '{source_path}'. Use .h5/.hdf5.")
+
+
+def _load_rdf_profiles_from_payloads(
+    source_path: Path,
+    payloads: list[tuple[dict[str, np.ndarray], dict[str, Any]]],
+    *,
+    species_a: str | None = None,
+    species_b: str | None = None,
+) -> list[RDFProfile]:
+    profiles: list[RDFProfile] = []
+    wanted_species_a = (
+        None if species_a is None or not species_a.strip() else _normalize_species(species_a)
+    )
+    wanted_species_b = (
+        None if species_b is None or not species_b.strip() else _normalize_species(species_b)
+    )
+    for datasets, metadata in payloads:
+        required = ("bin_centers_A", "g_r")
+        missing = [name for name in required if name not in datasets]
+        if missing:
+            raise ValueError(
+                f"RDF HDF5 '{source_path}' is missing required dataset(s): {', '.join(missing)}."
+            )
+
+        resolved_species_a = str(metadata.get("species_a", "")).strip() or "UNKNOWN"
+        resolved_species_b = str(metadata.get("species_b", "")).strip() or resolved_species_a
+        if wanted_species_a is not None and _normalize_species(resolved_species_a) != wanted_species_a:
+            continue
+        if wanted_species_b is not None and _normalize_species(resolved_species_b) != wanted_species_b:
+            continue
+
+        bin_centers = np.asarray(datasets["bin_centers_A"], dtype=float)
+        if "bin_edges_A" in datasets:
+            bin_edges = np.asarray(datasets["bin_edges_A"], dtype=float)
+        else:
+            bin_width = resolve_uniform_bin_width_for_load(
+                metadata=metadata,
+                bin_centers=bin_centers,
+                source_path=source_path,
+                analysis_name="RDF",
+            )
+            bin_edges = reconstruct_uniform_bin_edges_from_centers(
+                bin_centers,
+                bin_width=bin_width,
+            )
+        if bin_edges.size != bin_centers.size + 1:
+            raise ValueError(
+                f"RDF HDF5 '{source_path}' has incompatible bin_edges_A/bin_centers_A sizes."
+            )
+        g_r = np.asarray(datasets["g_r"], dtype=float)
+        n_frames = int(metadata.get("n_frames", 0))
+
+        profiles.append(
+            RDFProfile(
+                species_a=resolved_species_a,
+                species_b=resolved_species_b,
+                bin_edges=bin_edges,
+                bin_centers=bin_centers,
+                g_r=g_r,
+                n_frames=n_frames,
+            )
+        )
+    return profiles
+
+
+def load_rdf_profiles_by_index(
+    path: str | Path,
+    profile_indices: list[int] | tuple[int, ...],
+    *,
+    species_a: str | None = None,
+    species_b: str | None = None,
+) -> list[RDFProfile]:
+    """Load selected RDF profiles by profile index from LiNaK HDF5."""
+    source_path = Path(path).expanduser().resolve()
+    if not source_path.exists():
+        raise FileNotFoundError(f"RDF profile not found: {source_path}")
+    if not is_hdf5_path(source_path):
+        raise ValueError(f"Unsupported RDF profile format for '{source_path}'. Use .h5/.hdf5.")
+    payloads = read_linak_hdf5_profiles_by_index(
+        source_path,
+        profile_indices,
+        expected_analysis="rdf",
+    )
+    return _load_rdf_profiles_from_payloads(
+        source_path,
+        payloads,
+        species_a=species_a,
+        species_b=species_b,
+    )
 
 
 def plot_rdf_profile(

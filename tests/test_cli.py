@@ -24,11 +24,13 @@ from linak.analysis.density import (
     compute_density_profile,
     load_density_profile,
     load_density_profiles,
+    load_density_profiles_by_index,
     save_density_profile,
 )
 from linak.analysis.position import (
     compute_position_profile,
     load_position_profile,
+    load_position_profiles_by_index,
     save_position_profile,
 )
 from linak.analysis.coordination import (
@@ -2276,6 +2278,69 @@ def test_plot_density_gui_multi_sources_use_default_series_labels_without_saved_
     assert merged_settings is None
 
 
+def test_plot_density_gui_multi_source_first_open_matches_reopened_combined_hdf5_defaults(
+    tmp_path, monkeypatch
+):
+    frame = Atoms(
+        "OO",
+        positions=[[0.0, 0.0, 0.10], [0.0, 0.0, 1.10]],
+        cell=[10.0, 10.0, 10.0],
+        pbc=True,
+    )
+    profile = compute_density_profile([frame], species="O", axis="z", bin_width=1.0)
+    source_h5_a = tmp_path / "source_a_density.h5"
+    source_h5_b = tmp_path / "source_b_density.h5"
+    save_density_profile(profile, source_h5_a)
+    save_density_profile(profile, source_h5_b)
+
+    first_launch: dict[str, object] = {}
+
+    def _fake_launch_profile_plot_gui(**kwargs):
+        first_launch.update(kwargs)
+
+    monkeypatch.setattr("linak.cli._launch_profile_plot_gui", _fake_launch_profile_plot_gui)
+
+    rc = main(
+        [
+            "--log-level",
+            "ERROR",
+            "plot",
+            "-f",
+            str(source_h5_a),
+            str(source_h5_b),
+            "--gui",
+        ]
+    )
+
+    assert rc == 0
+    combined_source = first_launch["source_path"]
+    assert isinstance(combined_source, Path)
+    assert first_launch["initial_context"].default_series_labels == [
+        f"{source_h5_a.name}:O",
+        f"{source_h5_b.name}:O",
+    ]
+
+    reopened_args = cli_mod.build_parser().parse_args(["plot", str(combined_source)])
+    reopened_args._runtime_argv = ("plot", str(combined_source))
+    reopened_catalog = cli_mod._build_density_gui_lazy_catalog(
+        reopened_args,
+        sources=[str(combined_source)],
+    )
+    reopened_catalog.default_series_labels = cli_mod._resolve_gui_default_series_labels(
+        args=reopened_args,
+        sources=[str(combined_source)],
+        profile_key=cli_mod._PLOT_PROFILE_DENSITY,
+        fallback_labels_by_source=reopened_catalog.fallback_labels_by_source,
+    )
+    reopened_context = reopened_catalog.build_initial_context()
+
+    assert reopened_context.default_series_labels == [
+        f"{source_h5_a.name}:O",
+        f"{source_h5_b.name}:O",
+    ]
+    assert reopened_context.series_descriptors == first_launch["initial_context"].series_descriptors
+
+
 def test_plot_density_gui_preview_renders_for_each_request(tmp_path, monkeypatch):
     frame = Atoms(
         "OO",
@@ -2759,6 +2824,157 @@ def test_plot_density_gui_embedded_preview_round_trips_after_save_for_combined_h
     assert saved["series_overrides"][expected["first_series_id"]]["enabled"] is False
     assert saved["series_overrides"][expected["second_series_id"]]["label_override"] == "reordered"
     assert saved.get("line_kwargs") is None or saved.get("line_kwargs") == {}
+
+
+def test_plot_density_gui_lazy_loading_only_reads_enabled_series_and_evicts_cache(
+    tmp_path, monkeypatch
+):
+    frame = Atoms(
+        "OO",
+        positions=[[0.0, 0.0, 0.10], [0.0, 0.0, 1.10]],
+        cell=[10.0, 10.0, 10.0],
+        pbc=True,
+    )
+    profile = compute_density_profile([frame], species="O", axis="z", bin_width=1.0)
+    source_h5_a = tmp_path / "source_a_density.h5"
+    source_h5_b = tmp_path / "source_b_density.h5"
+    combined_h5 = tmp_path / "combined_density.h5"
+    save_density_profile(profile, source_h5_a)
+    save_density_profile(profile, source_h5_b)
+    _combine_analysis_hdf5_sources(
+        sources=[str(source_h5_a), str(source_h5_b)],
+        analysis="density",
+        output=combined_h5,
+    )
+
+    args = cli_mod.build_parser().parse_args(["plot", str(combined_h5)])
+    args._runtime_argv = ("plot", str(combined_h5))
+    context = _build_density_gui_context(args, sources=[str(combined_h5)])
+    disabled_series_id = context.series_descriptors[0]["series_id"]
+    enabled_series_id = context.series_descriptors[1]["series_id"]
+    write_plot_profile(
+        combined_h5,
+        "plot:density",
+        {
+            "series_descriptors": context.series_descriptors,
+            "series_overrides": {
+                disabled_series_id: {"enabled": False},
+            },
+        },
+    )
+
+    load_calls: list[list[int]] = []
+
+    def _fake_load_density_profiles_by_index(path, indices, *, axis=None, species=None):
+        load_calls.append([int(index) for index in indices])
+        return load_density_profiles_by_index(path, indices, axis=axis, species=species)
+
+    def _fake_render_profile_plot(**_kwargs):
+        return None, {}
+
+    def _fake_gui_launcher(**kwargs):
+        initial_settings = deepcopy(kwargs["initial_settings"])
+        resolved = kwargs["on_resolve_series_defaults"](initial_settings)
+        assert resolved["series_count"] == 2
+        assert [item["series_id"] for item in resolved["series_descriptors"]] == [
+            disabled_series_id,
+            enabled_series_id,
+        ]
+
+        kwargs["on_preview"](deepcopy(initial_settings))
+
+        no_series = deepcopy(initial_settings)
+        no_series["series_overrides"] = {
+            disabled_series_id: {"enabled": False},
+            enabled_series_id: {"enabled": False},
+        }
+        with pytest.raises(ValueError, match="No series are enabled"):
+            kwargs["on_preview"](no_series)
+        with pytest.raises(ValueError, match="before exporting"):
+            kwargs["on_save_figure"](no_series, str(tmp_path / "disabled.png"))
+
+        kwargs["on_preview"](deepcopy(initial_settings))
+
+    monkeypatch.setattr(
+        "linak.analysis.density.load_density_profiles_by_index",
+        _fake_load_density_profiles_by_index,
+    )
+    monkeypatch.setattr("linak.cli._render_profile_plot", _fake_render_profile_plot)
+    monkeypatch.setattr("linak.cli._open_plot_settings_gui", _fake_gui_launcher)
+
+    rc = main(
+        [
+            "--log-level",
+            "ERROR",
+            "plot",
+            str(combined_h5),
+            "--gui",
+        ]
+    )
+
+    assert rc == 0
+    assert load_calls == [[1], [1]]
+
+
+def test_plot_position_gui_lazy_loading_only_reads_requested_parent_profile(
+    tmp_path, monkeypatch
+):
+    source_h5_a = tmp_path / "source_a_position.h5"
+    source_h5_b = tmp_path / "source_b_position.h5"
+    combined_h5 = tmp_path / "combined_position.h5"
+    _write_position_hdf5(source_h5_a)
+    _write_position_hdf5(source_h5_b)
+    _combine_analysis_hdf5_sources(
+        sources=[str(source_h5_a), str(source_h5_b)],
+        analysis="position",
+        output=combined_h5,
+    )
+
+    args = cli_mod.build_parser().parse_args(["plot", str(combined_h5)])
+    args._runtime_argv = ("plot", str(combined_h5))
+    context = cli_mod._build_position_gui_context(args, sources=[str(combined_h5)])
+    selected_series_id = context.series_descriptors[-1]["series_id"]
+    write_plot_profile(
+        combined_h5,
+        "plot:position",
+        {
+            "series_descriptors": context.series_descriptors,
+            "series_overrides": {
+                descriptor["series_id"]: {"enabled": descriptor["series_id"] == selected_series_id}
+                for descriptor in context.series_descriptors
+            },
+        },
+    )
+
+    load_calls: list[list[int]] = []
+
+    def _fake_load_position_profiles_by_index(path, indices, *, species=None, axis=None):
+        load_calls.append([int(index) for index in indices])
+        return load_position_profiles_by_index(path, indices, species=species, axis=axis)
+
+    def _fake_render_profile_plot(**kwargs):
+        assert len(kwargs["profile"]) == 1
+        return None, {}
+
+    monkeypatch.setattr(
+        "linak.analysis.position.load_position_profiles_by_index",
+        _fake_load_position_profiles_by_index,
+    )
+    monkeypatch.setattr("linak.cli._render_profile_plot", _fake_render_profile_plot)
+    monkeypatch.setattr("linak.cli._open_plot_settings_gui", lambda **_kwargs: None)
+
+    rc = main(
+        [
+            "--log-level",
+            "ERROR",
+            "plot",
+            str(combined_h5),
+            "--gui",
+        ]
+    )
+
+    assert rc == 0
+    assert load_calls == [[1]]
 
 
 def test_hdf5_plot_settings_named_profile_copy_and_activate(tmp_path):

@@ -231,6 +231,157 @@ def read_linak_hdf5_profiles(
         return [(datasets, root_metadata)]
 
 
+def read_linak_hdf5_profile_headers(
+    path: str | Path,
+    *,
+    expected_analysis: str | None = None,
+) -> list[dict[str, Any]]:
+    """Read LiNaK HDF5 profile metadata without materializing datasets."""
+    require_h5py()
+    hdf5_path = Path(path).expanduser().resolve()
+    if not hdf5_path.exists():
+        raise FileNotFoundError(f"HDF5 file not found: {hdf5_path}")
+
+    with h5py.File(hdf5_path, "r") as handle:
+        file_format = str(handle.attrs.get("linak_format", ""))
+        if file_format != LINAK_HDF5_FORMAT:
+            raise ValueError(f"File is not a LiNaK HDF5 analysis file: {hdf5_path}")
+
+        analysis = str(handle.attrs.get("analysis", ""))
+        if expected_analysis is not None and analysis != expected_analysis:
+            raise ValueError(
+                f"HDF5 analysis mismatch for '{hdf5_path}': expected '{expected_analysis}', got '{analysis}'."
+            )
+
+        root_metadata = _decode_metadata_json(handle.attrs.get("metadata_json", "{}"))
+        root_metadata.setdefault("analysis", analysis)
+
+        collection = handle.get(_COLLECTION_GROUP)
+        if collection is not None and hasattr(collection, "items"):
+            member_items = [
+                (str(name), node) for name, node in collection.items() if hasattr(node, "items")
+            ]
+            if member_items:
+
+                def _member_sort_key(item: tuple[str, Any]) -> tuple[int, int | str]:
+                    name = item[0]
+                    return (0, int(name)) if name.isdigit() else (1, name)
+
+                headers: list[dict[str, Any]] = []
+                for index, (_name, group) in enumerate(sorted(member_items, key=_member_sort_key)):
+                    profile_metadata = dict(root_metadata)
+                    profile_metadata.update(
+                        _decode_metadata_json(group.attrs.get("metadata_json", "{}"))
+                    )
+                    profile_metadata.setdefault("analysis", analysis)
+                    profile_metadata.setdefault("profile_index", index)
+                    headers.append(profile_metadata)
+                return headers
+
+        root_metadata.setdefault("profile_index", 0)
+        return [root_metadata]
+
+
+def read_linak_hdf5_profiles_by_index(
+    path: str | Path,
+    indices: Sequence[int],
+    *,
+    expected_analysis: str | None = None,
+    dataset_names: Sequence[str] | None = None,
+) -> list[tuple[dict[str, np.ndarray], dict[str, Any]]]:
+    """Read selected LiNaK HDF5 profiles by index, preserving the requested order."""
+    require_h5py()
+    hdf5_path = Path(path).expanduser().resolve()
+    if not hdf5_path.exists():
+        raise FileNotFoundError(f"HDF5 file not found: {hdf5_path}")
+
+    requested_indices = [int(index) for index in indices]
+    if not requested_indices:
+        return []
+    requested_dataset_names = (
+        {str(name) for name in dataset_names if str(name).strip()} if dataset_names is not None else None
+    )
+
+    with h5py.File(hdf5_path, "r") as handle:
+        file_format = str(handle.attrs.get("linak_format", ""))
+        if file_format != LINAK_HDF5_FORMAT:
+            raise ValueError(f"File is not a LiNaK HDF5 analysis file: {hdf5_path}")
+
+        analysis = str(handle.attrs.get("analysis", ""))
+        if expected_analysis is not None and analysis != expected_analysis:
+            raise ValueError(
+                f"HDF5 analysis mismatch for '{hdf5_path}': expected '{expected_analysis}', got '{analysis}'."
+            )
+
+        root_metadata = _decode_metadata_json(handle.attrs.get("metadata_json", "{}"))
+        root_metadata.setdefault("analysis", analysis)
+
+        collection = handle.get(_COLLECTION_GROUP)
+        if collection is not None and hasattr(collection, "items"):
+            member_items = [
+                (str(name), node) for name, node in collection.items() if hasattr(node, "items")
+            ]
+            if member_items:
+
+                def _member_sort_key(item: tuple[str, Any]) -> tuple[int, int | str]:
+                    name = item[0]
+                    return (0, int(name)) if name.isdigit() else (1, name)
+
+                sorted_members = [group for _name, group in sorted(member_items, key=_member_sort_key)]
+                profiles: list[tuple[dict[str, np.ndarray], dict[str, Any]]] = []
+                max_index = len(sorted_members) - 1
+                for requested_index in requested_indices:
+                    if requested_index < 0 or requested_index > max_index:
+                        raise IndexError(
+                            f"HDF5 profile index {requested_index} is out of range for '{hdf5_path}'."
+                        )
+                    group = sorted_members[requested_index]
+                    datasets = {
+                        dataset_name: np.asarray(dataset)
+                        for dataset_name, dataset in group.items()
+                        if hasattr(dataset, "shape")
+                        and (
+                            requested_dataset_names is None
+                            or str(dataset_name) in requested_dataset_names
+                        )
+                    }
+                    profile_metadata = dict(root_metadata)
+                    profile_metadata.update(
+                        _decode_metadata_json(group.attrs.get("metadata_json", "{}"))
+                    )
+                    profile_metadata.setdefault("analysis", analysis)
+                    profile_metadata.setdefault("profile_index", requested_index)
+                    profile_metadata["profile_uid"] = _stable_profile_uid(
+                        analysis=analysis,
+                        metadata=profile_metadata,
+                        datasets=datasets,
+                    )
+                    profiles.append((datasets, profile_metadata))
+                return profiles
+
+        profiles: list[tuple[dict[str, np.ndarray], dict[str, Any]]] = []
+        for requested_index in requested_indices:
+            if requested_index != 0:
+                raise IndexError(
+                    f"HDF5 profile index {requested_index} is out of range for '{hdf5_path}'."
+                )
+            datasets = {
+                name: np.asarray(dataset)
+                for name, dataset in handle.items()
+                if hasattr(dataset, "shape")
+                and (requested_dataset_names is None or str(name) in requested_dataset_names)
+            }
+            metadata = dict(root_metadata)
+            metadata.setdefault("profile_index", 0)
+            metadata["profile_uid"] = _stable_profile_uid(
+                analysis=analysis,
+                metadata=metadata,
+                datasets=datasets,
+            )
+            profiles.append((datasets, metadata))
+        return profiles
+
+
 def read_linak_hdf5(
     path: str | Path,
     *,

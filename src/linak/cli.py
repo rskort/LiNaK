@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 from copy import deepcopy
 from collections.abc import Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from importlib.metadata import PackageNotFoundError, metadata as package_metadata
 import importlib
 import json
@@ -76,6 +76,99 @@ class _GuiPlotRenderContext:
     @property
     def series_count(self) -> int:
         return len(self.series_descriptors)
+
+
+@dataclass
+class _LazyGuiSeriesCatalog:
+    sources: list[str]
+    plot_source_label: str
+    plotter_kwargs: dict[str, Any] | None
+    descriptor_segments_by_source: list[list[dict[str, Any]]]
+    profile_filter_options: dict[str, Any] | None
+    load_profiles: Callable[[list[dict[str, Any]]], list[Any]]
+    default_series_labels: list[str] = field(default_factory=list)
+    _active_profiles_by_series_id: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def series_descriptors(self) -> list[dict[str, Any]]:
+        return [
+            dict(descriptor)
+            for segment in self.descriptor_segments_by_source
+            for descriptor in segment
+        ]
+
+    @property
+    def fallback_labels_by_source(self) -> list[list[str]]:
+        return [
+            [
+                str(descriptor.get("default_label") or f"Series {index + 1}")
+                for index, descriptor in enumerate(segment)
+            ]
+            for segment in self.descriptor_segments_by_source
+        ]
+
+    def build_initial_context(self) -> _GuiPlotRenderContext:
+        return _GuiPlotRenderContext(
+            profile=[],
+            plot_source_label=self.plot_source_label,
+            plotter_kwargs=self.plotter_kwargs,
+            fallback_labels_by_source=self.fallback_labels_by_source,
+            default_series_labels=list(self.default_series_labels),
+            series_descriptors=self.series_descriptors,
+            profile_filter_options=deepcopy(self.profile_filter_options),
+        )
+
+    def build_render_context(self, args: argparse.Namespace) -> _GuiPlotRenderContext:
+        active_descriptors_by_source, active_ids = _filter_active_gui_descriptor_segments(
+            args=args,
+            descriptor_segments_by_source=self.descriptor_segments_by_source,
+        )
+        active_id_set = set(active_ids)
+        for series_id in list(self._active_profiles_by_series_id):
+            if series_id not in active_id_set:
+                self._active_profiles_by_series_id.pop(series_id, None)
+
+        active_descriptors = [
+            dict(descriptor)
+            for segment in active_descriptors_by_source
+            for descriptor in segment
+        ]
+        missing_descriptors = [
+            descriptor
+            for descriptor in active_descriptors
+            if str(descriptor.get("series_id") or "") not in self._active_profiles_by_series_id
+        ]
+        if missing_descriptors:
+            loaded_profiles = self.load_profiles(missing_descriptors)
+            if len(loaded_profiles) != len(missing_descriptors):
+                raise ValueError("Lazy GUI series loader returned mismatched profile count.")
+            for descriptor, profile in zip(missing_descriptors, loaded_profiles):
+                series_id = str(descriptor.get("series_id") or "").strip()
+                if not series_id:
+                    raise ValueError("Lazy GUI descriptor is missing a series_id.")
+                self._active_profiles_by_series_id[series_id] = profile
+
+        return _GuiPlotRenderContext(
+            profile=[
+                self._active_profiles_by_series_id[str(descriptor.get("series_id") or "")]
+                for descriptor in active_descriptors
+            ],
+            plot_source_label=self.plot_source_label,
+            plotter_kwargs=self.plotter_kwargs,
+            fallback_labels_by_source=[
+                [
+                    str(descriptor.get("default_label") or f"Series {index + 1}")
+                    for index, descriptor in enumerate(segment)
+                ]
+                for segment in active_descriptors_by_source
+            ],
+            default_series_labels=[
+                str(descriptor.get("default_label") or f"Series {index + 1}")
+                for index, descriptor in enumerate(active_descriptors)
+            ],
+            series_descriptors=active_descriptors,
+            profile_filter_options=deepcopy(self.profile_filter_options),
+        )
 
 
 _PERSISTED_PLOT_SETTING_OPTION_FLAGS = {
@@ -889,6 +982,27 @@ def _flatten_profiles_by_source(source_profiles: list[tuple[str, list[Any]]]) ->
     return flattened
 
 
+def _metadata_source_label(metadata: dict[str, Any], *, fallback_source: str) -> str:
+    origin_path = str(metadata.get("origin_hdf5_path") or "").strip()
+    if origin_path:
+        return Path(origin_path).name or origin_path
+    return Path(fallback_source).name or fallback_source
+
+
+def _should_prefix_combined_source_labels(
+    *,
+    sources: list[str],
+    metadata_items: list[dict[str, Any]],
+) -> bool:
+    if len(sources) > 1:
+        return True
+    source_labels = {
+        _metadata_source_label(metadata, fallback_source=sources[0])
+        for metadata in metadata_items
+    }
+    return len(source_labels) > 1
+
+
 def _position_series_labels_for_profile(profile: Any) -> list[str]:
     atom_indices = getattr(profile, "atom_indices", None)
     species = str(getattr(profile, "species", "UNKNOWN"))
@@ -969,6 +1083,48 @@ def _split_coordination_profile_into_atom_series(profile: Any) -> list[Any]:
             )
         )
     return split_profiles
+
+
+def _extract_position_profile_atom_series(profile: Any, atom_index: int) -> Any:
+    raw_atom_indices = getattr(profile, "atom_indices", None)
+    atom_indices = [] if raw_atom_indices is None else list(raw_atom_indices)
+    for column, raw_atom_index in enumerate(atom_indices):
+        try:
+            resolved_atom_index = int(raw_atom_index)
+        except (TypeError, ValueError):
+            continue
+        if resolved_atom_index != int(atom_index):
+            continue
+        return replace(
+            profile,
+            atom_indices=np.asarray([resolved_atom_index], dtype=int),
+            x=np.asarray(profile.x[:, [column]], dtype=float),
+            y=np.asarray(profile.y[:, [column]], dtype=float),
+            z=np.asarray(profile.z[:, [column]], dtype=float),
+            distance_to_surface=np.asarray(profile.distance_to_surface[:, [column]], dtype=float),
+            n_atoms=1,
+        )
+    raise ValueError(f"Position profile does not contain atom index {atom_index}.")
+
+
+def _extract_coordination_profile_atom_series(profile: Any, atom_index: int) -> Any:
+    raw_atom_indices = getattr(profile, "atom_indices", None)
+    atom_indices = [] if raw_atom_indices is None else list(raw_atom_indices)
+    for column, raw_atom_index in enumerate(atom_indices):
+        try:
+            resolved_atom_index = int(raw_atom_index)
+        except (TypeError, ValueError):
+            continue
+        if resolved_atom_index != int(atom_index):
+            continue
+        return replace(
+            profile,
+            atom_indices=np.asarray([resolved_atom_index], dtype=int),
+            distance_to_surface=np.asarray(profile.distance_to_surface[:, [column]], dtype=float),
+            coordination_number=np.asarray(profile.coordination_number[:, [column]], dtype=float),
+            n_atoms=1,
+        )
+    raise ValueError(f"Coordination profile does not contain atom index {atom_index}.")
 
 
 def _ordered_common_items_by_source(
@@ -1081,6 +1237,14 @@ def _load_density_plot_profiles(
         sources=sources,
         analysis="density",
     )
+    prefix_source_labels = _should_prefix_combined_source_labels(
+        sources=sources,
+        metadata_items=[
+            dict(payload.get("metadata", {}))
+            for _source, source_payloads in raw_payloads_by_source
+            for payload in source_payloads
+        ],
+    )
     profiles_by_source: list[tuple[str, list[Any]]] = []
     for source in sources:
         profiles = load_density_profiles(source, axis=axis, species=species)
@@ -1090,17 +1254,18 @@ def _load_density_plot_profiles(
     fallback_labels_by_source: list[list[str]] = []
     series_id_segments_by_source: list[list[str]] = []
     origin_path_segments_by_source: list[list[str]] = []
-    if len(sources) > 1:
+    if prefix_source_labels:
         for source_index, (source, profiles) in enumerate(profiles_by_source):
             raw_payloads = raw_payloads_by_source[source_index][1]
             if len(raw_payloads) != len(profiles):
                 raise ValueError("Density profile metadata does not match loaded profiles.")
-            source_label = Path(source).name or source
             source_labels: list[str] = []
             source_ids: list[str] = []
             source_origins: list[str] = []
             for profile_index, profile in enumerate(profiles):
                 payload = raw_payloads[profile_index]
+                metadata = dict(payload.get("metadata", {}))
+                source_label = _metadata_source_label(metadata, fallback_source=source)
                 rendered_species = f"{source_label}:{profile.species}"
                 source_labels.append(rendered_species)
                 source_ids.append(
@@ -1154,6 +1319,14 @@ def _load_msd_plot_profiles(
         sources=sources,
         analysis="msd",
     )
+    prefix_source_labels = _should_prefix_combined_source_labels(
+        sources=sources,
+        metadata_items=[
+            dict(payload.get("metadata", {}))
+            for _source, source_payloads in raw_payloads_by_source
+            for payload in source_payloads
+        ],
+    )
     profiles_by_source: list[tuple[str, list[Any]]] = []
     for source in sources:
         profiles = load_msd_profiles(source, species=species)
@@ -1163,17 +1336,18 @@ def _load_msd_plot_profiles(
     fallback_labels_by_source: list[list[str]] = []
     series_id_segments_by_source: list[list[str]] = []
     origin_path_segments_by_source: list[list[str]] = []
-    if len(sources) > 1:
+    if prefix_source_labels:
         for source_index, (source, profiles) in enumerate(profiles_by_source):
             raw_payloads = raw_payloads_by_source[source_index][1]
             if len(raw_payloads) != len(profiles):
                 raise ValueError("MSD profile metadata does not match loaded profiles.")
-            source_label = Path(source).name or source
             source_labels: list[str] = []
             source_ids: list[str] = []
             source_origins: list[str] = []
             for profile_index, profile in enumerate(profiles):
                 payload = raw_payloads[profile_index]
+                metadata = dict(payload.get("metadata", {}))
+                source_label = _metadata_source_label(metadata, fallback_source=source)
                 rendered_species = f"{source_label}:{profile.species}"
                 source_labels.append(rendered_species)
                 source_ids.append(
@@ -1256,6 +1430,14 @@ def _load_rdf_plot_profiles(
                 continue
             filtered_payloads.append(payload)
         filtered_raw_payloads_by_source.append((source, filtered_payloads))
+    prefix_source_labels = _should_prefix_combined_source_labels(
+        sources=sources,
+        metadata_items=[
+            dict(payload.get("metadata", {}))
+            for _source, source_payloads in filtered_raw_payloads_by_source
+            for payload in source_payloads
+        ],
+    )
     profiles_by_source: list[tuple[str, list[Any]]] = []
     for source in sources:
         profiles = load_rdf_profiles(source, species_a=species_a, species_b=resolved_species_b)
@@ -1265,17 +1447,18 @@ def _load_rdf_plot_profiles(
     fallback_labels_by_source: list[list[str]] = []
     series_id_segments_by_source: list[list[str]] = []
     origin_path_segments_by_source: list[list[str]] = []
-    if len(sources) > 1:
+    if prefix_source_labels:
         for source_index, (source, profiles) in enumerate(profiles_by_source):
             raw_payloads = filtered_raw_payloads_by_source[source_index][1]
             if len(raw_payloads) != len(profiles):
                 raise ValueError("RDF profile metadata does not match loaded profiles.")
-            source_label = Path(source).name or source
             source_labels: list[str] = []
             source_ids: list[str] = []
             source_origins: list[str] = []
             for profile_index, profile in enumerate(profiles):
                 payload = raw_payloads[profile_index]
+                metadata = dict(payload.get("metadata", {}))
+                source_label = _metadata_source_label(metadata, fallback_source=source)
                 rendered_species_a = f"{source_label}:{profile.species_a}"
                 source_labels.append(f"{rendered_species_a}-{profile.species_b}")
                 source_ids.append(
@@ -1330,6 +1513,14 @@ def _load_position_plot_profiles(
         sources=sources,
         analysis="position",
     )
+    prefix_source_labels = _should_prefix_combined_source_labels(
+        sources=sources,
+        metadata_items=[
+            dict(payload.get("metadata", {}))
+            for _source, source_payloads in raw_payloads_by_source
+            for payload in source_payloads
+        ],
+    )
     profiles_by_source: list[tuple[str, list[Any]]] = []
     for source in sources:
         profiles = load_position_profiles(source, species=species, axis=axis)
@@ -1339,17 +1530,18 @@ def _load_position_plot_profiles(
     fallback_labels_by_source: list[list[str]] = []
     series_id_segments_by_source: list[list[str]] = []
     origin_path_segments_by_source: list[list[str]] = []
-    if len(sources) > 1:
+    if prefix_source_labels:
         for source_index, (source, profiles) in enumerate(profiles_by_source):
             raw_payloads = raw_payloads_by_source[source_index][1]
             if len(raw_payloads) != len(profiles):
                 raise ValueError("Position profile metadata does not match loaded profiles.")
-            source_label = Path(source).name or source
             source_labels: list[str] = []
             source_ids: list[str] = []
             source_origins: list[str] = []
             for profile_index, profile in enumerate(profiles):
                 payload = raw_payloads[profile_index]
+                metadata = dict(payload.get("metadata", {}))
+                source_label = _metadata_source_label(metadata, fallback_source=source)
                 profile_uid = _profile_uid_from_payload(
                     payload,
                     fallback_prefix="position",
@@ -1480,6 +1672,14 @@ def _load_coordination_plot_profiles(
                 continue
             filtered_payloads.append(payload)
         filtered_raw_payloads_by_source.append((source, filtered_payloads))
+    prefix_source_labels = _should_prefix_combined_source_labels(
+        sources=sources,
+        metadata_items=[
+            dict(payload.get("metadata", {}))
+            for _source, source_payloads in filtered_raw_payloads_by_source
+            for payload in source_payloads
+        ],
+    )
     profiles_by_source: list[tuple[str, list[Any]]] = []
     for source in sources:
         profiles = load_coordination_profiles(
@@ -1494,17 +1694,18 @@ def _load_coordination_plot_profiles(
     fallback_labels_by_source: list[list[str]] = []
     series_id_segments_by_source: list[list[str]] = []
     origin_path_segments_by_source: list[list[str]] = []
-    if len(sources) > 1:
+    if prefix_source_labels:
         for source_index, (source, profiles) in enumerate(profiles_by_source):
             raw_payloads = filtered_raw_payloads_by_source[source_index][1]
             if len(raw_payloads) != len(profiles):
                 raise ValueError("Coordination profile metadata does not match loaded profiles.")
-            source_label = Path(source).name or source
             source_labels: list[str] = []
             source_ids: list[str] = []
             source_origins: list[str] = []
             for profile_index, profile in enumerate(profiles):
                 payload = raw_payloads[profile_index]
+                metadata = dict(payload.get("metadata", {}))
+                source_label = _metadata_source_label(metadata, fallback_source=source)
                 profile_uid = _profile_uid_from_payload(
                     payload,
                     fallback_prefix="coordination",
@@ -2973,6 +3174,55 @@ def _resolve_series_id_order(
     return resolved
 
 
+def _resolve_gui_series_enabled_by_id(
+    args: argparse.Namespace,
+    descriptors: list[dict[str, Any]],
+) -> dict[str, bool]:
+    overrides = _coerce_series_override_map(getattr(args, "series_overrides", None))
+    raw_enabled = getattr(args, "series_enabled", None)
+    enabled_list = raw_enabled if isinstance(raw_enabled, list) and len(raw_enabled) == len(descriptors) else None
+    enabled_by_id: dict[str, bool] = {}
+    for index, descriptor in enumerate(descriptors):
+        series_id = str(descriptor.get("series_id") or f"series:{index}")
+        entry = overrides.get(series_id, {})
+        if isinstance(entry, dict) and "enabled" in entry:
+            enabled_by_id[series_id] = bool(entry.get("enabled"))
+        elif enabled_list is not None:
+            enabled_by_id[series_id] = bool(enabled_list[index])
+        else:
+            enabled_by_id[series_id] = True
+    return enabled_by_id
+
+
+def _filter_active_gui_descriptor_segments(
+    *,
+    args: argparse.Namespace,
+    descriptor_segments_by_source: list[list[dict[str, Any]]],
+) -> tuple[list[list[dict[str, Any]]], list[str]]:
+    all_descriptors = [
+        dict(descriptor)
+        for segment in descriptor_segments_by_source
+        for descriptor in segment
+    ]
+    if not all_descriptors:
+        return [list() for _segment in descriptor_segments_by_source], []
+
+    natural_ids = [
+        str(descriptor.get("series_id") or f"series:{index}")
+        for index, descriptor in enumerate(all_descriptors)
+    ]
+    enabled_by_id = _resolve_gui_series_enabled_by_id(args, all_descriptors)
+    resolved_order = _resolve_series_id_order(natural_ids, getattr(args, "series_order", None))
+    active_ids = [series_id for series_id in resolved_order if enabled_by_id.get(series_id, True)]
+    active_id_set = set(active_ids)
+    filtered_segments: list[list[dict[str, Any]]] = []
+    for segment in descriptor_segments_by_source:
+        filtered_segments.append(
+            [dict(descriptor) for descriptor in segment if str(descriptor.get("series_id") or "") in active_id_set]
+        )
+    return filtered_segments, active_ids
+
+
 def _reorder_series_values(values: Any, indices: list[int]) -> Any:
     if not isinstance(values, list) or len(values) != len(indices):
         return values
@@ -3363,12 +3613,68 @@ def _flatten_series_labels_by_source(fallback_labels_by_source: list[list[str]])
     return [label for source_labels in fallback_labels_by_source for label in source_labels]
 
 
+def _segment_gui_series_descriptors(
+    descriptors: list[dict[str, Any]],
+    fallback_labels_by_source: list[list[str]],
+) -> list[list[dict[str, Any]]]:
+    segments: list[list[dict[str, Any]]] = []
+    offset = 0
+    for labels in fallback_labels_by_source:
+        count = len(labels)
+        segments.append([dict(item) for item in descriptors[offset : offset + count]])
+        offset += count
+    if offset != len(descriptors):
+        raise ValueError("Descriptor count does not match fallback_labels_by_source.")
+    return segments
+
+
+def _apply_descriptor_extra_segments(
+    descriptors: list[dict[str, Any]],
+    extra_segments_by_source: list[list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    flattened_extras = [
+        dict(extra)
+        for segment in extra_segments_by_source
+        for extra in segment
+    ]
+    if len(flattened_extras) != len(descriptors):
+        raise ValueError("Descriptor extras must align with the descriptor count.")
+    updated: list[dict[str, Any]] = []
+    for descriptor, extra in zip(descriptors, flattened_extras):
+        merged = dict(descriptor)
+        merged.update(extra)
+        updated.append(merged)
+    return updated
+
+
+def _build_gui_descriptor_segments(
+    *,
+    sources: list[str],
+    fallback_labels_by_source: list[list[str]],
+    series_id_segments_by_source: list[list[str]],
+    origin_path_segments_by_source: list[list[str]],
+    load_source_path_segments_by_source: list[list[str]],
+    extra_segments_by_source: list[list[dict[str, Any]]] | None = None,
+) -> list[list[dict[str, Any]]]:
+    descriptors = _build_gui_series_descriptors(
+        sources=sources,
+        fallback_labels_by_source=fallback_labels_by_source,
+        series_id_segments_by_source=series_id_segments_by_source,
+        origin_path_segments_by_source=origin_path_segments_by_source,
+        load_source_path_segments_by_source=load_source_path_segments_by_source,
+    )
+    if extra_segments_by_source is not None:
+        descriptors = _apply_descriptor_extra_segments(descriptors, extra_segments_by_source)
+    return _segment_gui_series_descriptors(descriptors, fallback_labels_by_source)
+
+
 def _build_gui_series_descriptors(
     *,
     sources: list[str],
     fallback_labels_by_source: list[list[str]],
     series_id_segments_by_source: list[list[str]] | None = None,
     origin_path_segments_by_source: list[list[str]] | None = None,
+    load_source_path_segments_by_source: list[list[str]] | None = None,
 ) -> list[dict[str, Any]]:
     if len(sources) != len(fallback_labels_by_source):
         raise ValueError("sources and fallback_labels_by_source must have equal lengths.")
@@ -3380,6 +3686,10 @@ def _build_gui_series_descriptors(
         sources
     ):
         raise ValueError("origin_path_segments_by_source must align with sources.")
+    if load_source_path_segments_by_source is not None and len(load_source_path_segments_by_source) != len(
+        sources
+    ):
+        raise ValueError("load_source_path_segments_by_source must align with sources.")
 
     descriptors: list[dict[str, Any]] = []
     source_group_indices: dict[str, int] = {}
@@ -3394,14 +3704,26 @@ def _build_gui_series_descriptors(
             if origin_path_segments_by_source is not None
             else None
         )
+        load_source_segment = (
+            load_source_path_segments_by_source[source_index]
+            if load_source_path_segments_by_source is not None
+            else None
+        )
         if id_segment is not None and len(id_segment) != len(labels):
             raise ValueError("series id segments must align with fallback labels.")
         if origin_segment is not None and len(origin_segment) != len(labels):
             raise ValueError("origin path segments must align with fallback labels.")
+        if load_source_segment is not None and len(load_source_segment) != len(labels):
+            raise ValueError("load source path segments must align with fallback labels.")
         for local_index, default_label in enumerate(labels):
             resolved_source_path = (
                 Path(origin_segment[local_index]).expanduser()
                 if origin_segment is not None
+                else Path(source).expanduser()
+            )
+            resolved_load_source_path = (
+                Path(load_source_segment[local_index]).expanduser()
+                if load_source_segment is not None
                 else Path(source).expanduser()
             )
             source_name = resolved_source_path.name or str(resolved_source_path)
@@ -3427,6 +3749,7 @@ def _build_gui_series_descriptors(
                     "source_name": source_name,
                     "source_directory": source_directory,
                     "source_path": str(resolved_source_path),
+                    "load_source_path": str(resolved_load_source_path),
                     "default_label": str(default_label).strip() or f"Series {len(descriptors) + 1}",
                 }
             )
@@ -3730,6 +4053,735 @@ def _build_coordination_gui_context(
             origin_path_segments_by_source=origin_path_segments_by_source,
         ),
         profile_filter_options=_build_coordination_profile_filter_options(raw_payloads_by_source),
+    )
+
+
+def _headers_by_source_as_metadata_payloads(
+    headers_by_source: list[tuple[str, list[dict[str, Any]]]],
+) -> list[tuple[str, list[dict[str, Any]]]]:
+    return [
+        (source, [{"metadata": dict(header)} for header in headers])
+        for source, headers in headers_by_source
+    ]
+
+
+def _group_descriptors_by_load_source(
+    descriptors: list[dict[str, Any]],
+) -> list[tuple[str, list[dict[str, Any]]]]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    order: list[str] = []
+    for descriptor in descriptors:
+        source_path = str(
+            descriptor.get("load_source_path") or descriptor.get("source_path") or ""
+        ).strip()
+        if source_path not in grouped:
+            grouped[source_path] = []
+            order.append(source_path)
+        grouped[source_path].append(descriptor)
+    return [(source_path, grouped[source_path]) for source_path in order]
+
+
+def _build_density_gui_lazy_catalog(
+    args: argparse.Namespace,
+    *,
+    sources: list[str],
+    active_profiles_by_series_id: dict[str, Any] | None = None,
+) -> _LazyGuiSeriesCatalog:
+    from .analysis.density import load_density_profiles_by_index, _normalize_species_query
+
+    headers_by_source = _read_analysis_profile_headers_by_source(
+        sources=sources,
+        analysis="density",
+    )
+    prefix_source_labels = _should_prefix_combined_source_labels(
+        sources=sources,
+        metadata_items=[
+            dict(header)
+            for _source, headers in headers_by_source
+            for header in headers
+        ],
+    )
+    resolved_species_label: str | None = None
+    if args.species is not None and str(args.species).strip():
+        _selection_mode, resolved_species_label = _normalize_species_query(args.species)
+
+    fallback_labels_by_source: list[list[str]] = []
+    series_id_segments_by_source: list[list[str]] = []
+    origin_path_segments_by_source: list[list[str]] = []
+    load_source_path_segments_by_source: list[list[str]] = []
+    extra_segments_by_source: list[list[dict[str, Any]]] = []
+    for source, headers in headers_by_source:
+        source_labels: list[str] = []
+        source_ids: list[str] = []
+        source_origins: list[str] = []
+        source_load_paths: list[str] = []
+        source_extras: list[dict[str, Any]] = []
+        for header in headers:
+            source_label = _metadata_source_label(header, fallback_source=source)
+            base_species = resolved_species_label or str(header.get("species", "")).strip() or "UNKNOWN"
+            rendered_species = (
+                f"{source_label}:{base_species}" if prefix_source_labels else base_species
+            )
+            profile_index = int(header.get("profile_index", len(source_labels)))
+            profile_uid = _profile_uid_from_payload(
+                {"metadata": header},
+                fallback_prefix="density",
+                index=profile_index,
+            )
+            source_labels.append(rendered_species)
+            source_ids.append(profile_uid)
+            source_origins.append(str(header.get("origin_hdf5_path") or source))
+            source_load_paths.append(str(header.get("source_path") or source))
+            source_extras.append(
+                {
+                    "profile_index": profile_index,
+                    "profile_uid": profile_uid,
+                    "rendered_species": rendered_species,
+                }
+            )
+        fallback_labels_by_source.append(source_labels)
+        series_id_segments_by_source.append(source_ids)
+        origin_path_segments_by_source.append(source_origins)
+        load_source_path_segments_by_source.append(source_load_paths)
+        extra_segments_by_source.append(source_extras)
+
+    descriptor_segments = _build_gui_descriptor_segments(
+        sources=sources,
+        fallback_labels_by_source=fallback_labels_by_source,
+        series_id_segments_by_source=series_id_segments_by_source,
+        origin_path_segments_by_source=origin_path_segments_by_source,
+        load_source_path_segments_by_source=load_source_path_segments_by_source,
+        extra_segments_by_source=extra_segments_by_source,
+    )
+
+    def _load_profiles(descriptors: list[dict[str, Any]]) -> list[Any]:
+        loaded_by_id: dict[str, Any] = {}
+        for load_source_path, source_descriptors in _group_descriptors_by_load_source(descriptors):
+            indices = [int(descriptor["profile_index"]) for descriptor in source_descriptors]
+            profiles = load_density_profiles_by_index(
+                load_source_path,
+                indices,
+                axis=args.axis,
+                species=args.species,
+            )
+            if len(profiles) != len(source_descriptors):
+                raise ValueError("Lazy density loader returned mismatched profile count.")
+            for descriptor, profile in zip(source_descriptors, profiles):
+                loaded_by_id[str(descriptor["series_id"])] = replace(
+                    profile,
+                    species=str(descriptor.get("rendered_species") or profile.species),
+                )
+        return [loaded_by_id[str(descriptor["series_id"])] for descriptor in descriptors]
+
+    return _LazyGuiSeriesCatalog(
+        sources=list(sources),
+        plot_source_label=sources[0] if len(sources) == 1 else "multi_source_density",
+        plotter_kwargs={
+            "x_mode": args.x_mode,
+            "quantity": args.quantity,
+        },
+        descriptor_segments_by_source=descriptor_segments,
+        profile_filter_options=None,
+        load_profiles=_load_profiles,
+        _active_profiles_by_series_id=(
+            active_profiles_by_series_id if active_profiles_by_series_id is not None else {}
+        ),
+    )
+
+
+def _build_msd_gui_lazy_catalog(
+    args: argparse.Namespace,
+    *,
+    sources: list[str],
+    active_profiles_by_series_id: dict[str, Any] | None = None,
+) -> _LazyGuiSeriesCatalog:
+    from .analysis.msd import load_msd_profiles_by_index, _normalize_species as _normalize_msd_species
+
+    headers_by_source = _read_analysis_profile_headers_by_source(
+        sources=sources,
+        analysis="msd",
+    )
+    prefix_source_labels = _should_prefix_combined_source_labels(
+        sources=sources,
+        metadata_items=[
+            dict(header)
+            for _source, headers in headers_by_source
+            for header in headers
+        ],
+    )
+    resolved_species = (
+        _normalize_msd_species(args.species)
+        if args.species is not None and str(args.species).strip()
+        else None
+    )
+
+    fallback_labels_by_source: list[list[str]] = []
+    series_id_segments_by_source: list[list[str]] = []
+    origin_path_segments_by_source: list[list[str]] = []
+    load_source_path_segments_by_source: list[list[str]] = []
+    extra_segments_by_source: list[list[dict[str, Any]]] = []
+    for source, headers in headers_by_source:
+        source_labels: list[str] = []
+        source_ids: list[str] = []
+        source_origins: list[str] = []
+        source_load_paths: list[str] = []
+        source_extras: list[dict[str, Any]] = []
+        for header in headers:
+            source_label = _metadata_source_label(header, fallback_source=source)
+            base_species = resolved_species or str(header.get("species", "")).strip() or "UNKNOWN"
+            rendered_species = (
+                f"{source_label}:{base_species}" if prefix_source_labels else base_species
+            )
+            profile_index = int(header.get("profile_index", len(source_labels)))
+            profile_uid = _profile_uid_from_payload(
+                {"metadata": header},
+                fallback_prefix="msd",
+                index=profile_index,
+            )
+            source_labels.append(rendered_species)
+            source_ids.append(profile_uid)
+            source_origins.append(str(header.get("origin_hdf5_path") or source))
+            source_load_paths.append(str(header.get("source_path") or source))
+            source_extras.append(
+                {
+                    "profile_index": profile_index,
+                    "profile_uid": profile_uid,
+                    "rendered_species": rendered_species,
+                }
+            )
+        fallback_labels_by_source.append(source_labels)
+        series_id_segments_by_source.append(source_ids)
+        origin_path_segments_by_source.append(source_origins)
+        load_source_path_segments_by_source.append(source_load_paths)
+        extra_segments_by_source.append(source_extras)
+
+    descriptor_segments = _build_gui_descriptor_segments(
+        sources=sources,
+        fallback_labels_by_source=fallback_labels_by_source,
+        series_id_segments_by_source=series_id_segments_by_source,
+        origin_path_segments_by_source=origin_path_segments_by_source,
+        load_source_path_segments_by_source=load_source_path_segments_by_source,
+        extra_segments_by_source=extra_segments_by_source,
+    )
+
+    def _load_profiles(descriptors: list[dict[str, Any]]) -> list[Any]:
+        loaded_by_id: dict[str, Any] = {}
+        for load_source_path, source_descriptors in _group_descriptors_by_load_source(descriptors):
+            indices = [int(descriptor["profile_index"]) for descriptor in source_descriptors]
+            profiles = load_msd_profiles_by_index(
+                load_source_path,
+                indices,
+                species=args.species,
+            )
+            if len(profiles) != len(source_descriptors):
+                raise ValueError("Lazy MSD loader returned mismatched profile count.")
+            for descriptor, profile in zip(source_descriptors, profiles):
+                loaded_by_id[str(descriptor["series_id"])] = replace(
+                    profile,
+                    species=str(descriptor.get("rendered_species") or profile.species),
+                )
+        return [loaded_by_id[str(descriptor["series_id"])] for descriptor in descriptors]
+
+    return _LazyGuiSeriesCatalog(
+        sources=list(sources),
+        plot_source_label=sources[0] if len(sources) == 1 else "multi_source_msd",
+        plotter_kwargs=None,
+        descriptor_segments_by_source=descriptor_segments,
+        profile_filter_options=None,
+        load_profiles=_load_profiles,
+        _active_profiles_by_series_id=(
+            active_profiles_by_series_id if active_profiles_by_series_id is not None else {}
+        ),
+    )
+
+
+def _build_rdf_gui_lazy_catalog(
+    args: argparse.Namespace,
+    *,
+    sources: list[str],
+    active_profiles_by_series_id: dict[str, Any] | None = None,
+) -> _LazyGuiSeriesCatalog:
+    from .analysis.rdf import (
+        _normalize_species as _normalize_rdf_species,
+        load_rdf_profiles_by_index,
+    )
+
+    resolved_species_b = args.species_b if args.species_b is not None else args.species_a
+    wanted_species_a = (
+        None
+        if args.species_a is None or not str(args.species_a).strip()
+        else _normalize_rdf_species(args.species_a)
+    )
+    wanted_species_b = (
+        None
+        if resolved_species_b is None or not str(resolved_species_b).strip()
+        else _normalize_rdf_species(resolved_species_b)
+    )
+    headers_by_source = _read_analysis_profile_headers_by_source(
+        sources=sources,
+        analysis="rdf",
+    )
+    prefix_source_labels = _should_prefix_combined_source_labels(
+        sources=sources,
+        metadata_items=[
+            dict(header)
+            for _source, headers in headers_by_source
+            for header in headers
+        ],
+    )
+
+    filtered_headers_by_source: list[tuple[str, list[dict[str, Any]]]] = []
+    fallback_labels_by_source: list[list[str]] = []
+    series_id_segments_by_source: list[list[str]] = []
+    origin_path_segments_by_source: list[list[str]] = []
+    load_source_path_segments_by_source: list[list[str]] = []
+    extra_segments_by_source: list[list[dict[str, Any]]] = []
+    for source, headers in headers_by_source:
+        filtered_headers: list[dict[str, Any]] = []
+        source_labels: list[str] = []
+        source_ids: list[str] = []
+        source_origins: list[str] = []
+        source_load_paths: list[str] = []
+        source_extras: list[dict[str, Any]] = []
+        for header in headers:
+            resolved_a = str(header.get("species_a", "")).strip() or "UNKNOWN"
+            resolved_b = str(header.get("species_b", "")).strip() or resolved_a
+            if wanted_species_a is not None and _normalize_rdf_species(resolved_a) != wanted_species_a:
+                continue
+            if wanted_species_b is not None and _normalize_rdf_species(resolved_b) != wanted_species_b:
+                continue
+            source_label = _metadata_source_label(header, fallback_source=source)
+            rendered_species_a = (
+                f"{source_label}:{resolved_a}" if prefix_source_labels else resolved_a
+            )
+            profile_index = int(header.get("profile_index", len(source_labels)))
+            profile_uid = _profile_uid_from_payload(
+                {"metadata": header},
+                fallback_prefix="rdf",
+                index=profile_index,
+            )
+            filtered_headers.append(header)
+            source_labels.append(f"{rendered_species_a}-{resolved_b}")
+            source_ids.append(profile_uid)
+            source_origins.append(str(header.get("origin_hdf5_path") or source))
+            source_load_paths.append(str(header.get("source_path") or source))
+            source_extras.append(
+                {
+                    "profile_index": profile_index,
+                    "profile_uid": profile_uid,
+                    "rendered_species_a": rendered_species_a,
+                    "rendered_species_b": resolved_b,
+                }
+            )
+        filtered_headers_by_source.append((source, filtered_headers))
+        fallback_labels_by_source.append(source_labels)
+        series_id_segments_by_source.append(source_ids)
+        origin_path_segments_by_source.append(source_origins)
+        load_source_path_segments_by_source.append(source_load_paths)
+        extra_segments_by_source.append(source_extras)
+
+    descriptor_segments = _build_gui_descriptor_segments(
+        sources=sources,
+        fallback_labels_by_source=fallback_labels_by_source,
+        series_id_segments_by_source=series_id_segments_by_source,
+        origin_path_segments_by_source=origin_path_segments_by_source,
+        load_source_path_segments_by_source=load_source_path_segments_by_source,
+        extra_segments_by_source=extra_segments_by_source,
+    )
+
+    def _load_profiles(descriptors: list[dict[str, Any]]) -> list[Any]:
+        loaded_by_id: dict[str, Any] = {}
+        for load_source_path, source_descriptors in _group_descriptors_by_load_source(descriptors):
+            indices = [int(descriptor["profile_index"]) for descriptor in source_descriptors]
+            profiles = load_rdf_profiles_by_index(
+                load_source_path,
+                indices,
+                species_a=args.species_a,
+                species_b=resolved_species_b,
+            )
+            if len(profiles) != len(source_descriptors):
+                raise ValueError("Lazy RDF loader returned mismatched profile count.")
+            for descriptor, profile in zip(source_descriptors, profiles):
+                loaded_by_id[str(descriptor["series_id"])] = replace(
+                    profile,
+                    species_a=str(descriptor.get("rendered_species_a") or profile.species_a),
+                    species_b=str(descriptor.get("rendered_species_b") or profile.species_b),
+                )
+        return [loaded_by_id[str(descriptor["series_id"])] for descriptor in descriptors]
+
+    return _LazyGuiSeriesCatalog(
+        sources=list(sources),
+        plot_source_label=sources[0] if len(sources) == 1 else "multi_source_rdf",
+        plotter_kwargs=None,
+        descriptor_segments_by_source=descriptor_segments,
+        profile_filter_options=_build_rdf_profile_filter_options(
+            _headers_by_source_as_metadata_payloads(filtered_headers_by_source)
+        ),
+        load_profiles=_load_profiles,
+        _active_profiles_by_series_id=(
+            active_profiles_by_series_id if active_profiles_by_series_id is not None else {}
+        ),
+    )
+
+
+def _build_position_gui_lazy_catalog(
+    args: argparse.Namespace,
+    *,
+    sources: list[str],
+    active_profiles_by_series_id: dict[str, Any] | None = None,
+) -> _LazyGuiSeriesCatalog:
+    from .analysis.position import _normalize_species as _normalize_position_species
+    from .analysis.position import load_position_profiles_by_index
+    from .storage.hdf5_utils import read_linak_hdf5_profiles_by_index
+
+    wanted_species = (
+        None
+        if args.species is None or not str(args.species).strip()
+        else _normalize_position_species(args.species)
+    )
+    wanted_axis = None if args.axis is None or not str(args.axis).strip() else str(args.axis).strip().lower()
+    headers_by_source = _read_analysis_profile_headers_by_source(
+        sources=sources,
+        analysis="position",
+    )
+    prefix_source_labels = _should_prefix_combined_source_labels(
+        sources=sources,
+        metadata_items=[
+            dict(header)
+            for _source, headers in headers_by_source
+            for header in headers
+        ],
+    )
+
+    fallback_labels_by_source: list[list[str]] = []
+    series_id_segments_by_source: list[list[str]] = []
+    origin_path_segments_by_source: list[list[str]] = []
+    load_source_path_segments_by_source: list[list[str]] = []
+    extra_segments_by_source: list[list[dict[str, Any]]] = []
+    for source, headers in headers_by_source:
+        source_path = Path(source).expanduser().resolve()
+        lightweight_payloads = read_linak_hdf5_profiles_by_index(
+            source_path,
+            list(range(len(headers))),
+            expected_analysis="position",
+            dataset_names=("atom_indices",),
+        )
+        source_labels: list[str] = []
+        source_ids: list[str] = []
+        source_origins: list[str] = []
+        source_load_paths: list[str] = []
+        source_extras: list[dict[str, Any]] = []
+        for header, (datasets, _metadata) in zip(headers, lightweight_payloads):
+            source_label = _metadata_source_label(header, fallback_source=str(source_path))
+            resolved_species = str(header.get("species", "")).strip() or "UNKNOWN"
+            resolved_axis = str(header.get("axis", "z")).strip().lower() or "z"
+            if wanted_species is not None and wanted_species != "ALL":
+                if _normalize_position_species(resolved_species) != wanted_species:
+                    continue
+            if wanted_axis is not None and resolved_axis != wanted_axis:
+                continue
+            rendered_species = (
+                f"{source_label}:{resolved_species}" if prefix_source_labels else resolved_species
+            )
+            profile_index = int(header.get("profile_index", 0))
+            profile_uid = _profile_uid_from_payload(
+                {"metadata": header},
+                fallback_prefix="position",
+                index=profile_index,
+            )
+            atom_indices = np.asarray(datasets.get("atom_indices", []), dtype=int)
+            for atom_index in atom_indices.tolist():
+                atom_token = int(atom_index)
+                source_labels.append(f"{rendered_species}[{atom_token}]")
+                source_ids.append(f"{profile_uid}:atom:{atom_token}")
+                source_origins.append(str(header.get("origin_hdf5_path") or source))
+                source_load_paths.append(str(header.get("source_path") or source))
+                source_extras.append(
+                    {
+                        "profile_index": profile_index,
+                        "profile_uid": profile_uid,
+                        "atom_index": atom_token,
+                        "rendered_species": rendered_species,
+                    }
+                )
+        fallback_labels_by_source.append(source_labels)
+        series_id_segments_by_source.append(source_ids)
+        origin_path_segments_by_source.append(source_origins)
+        load_source_path_segments_by_source.append(source_load_paths)
+        extra_segments_by_source.append(source_extras)
+
+    descriptor_segments = _build_gui_descriptor_segments(
+        sources=sources,
+        fallback_labels_by_source=fallback_labels_by_source,
+        series_id_segments_by_source=series_id_segments_by_source,
+        origin_path_segments_by_source=origin_path_segments_by_source,
+        load_source_path_segments_by_source=load_source_path_segments_by_source,
+        extra_segments_by_source=extra_segments_by_source,
+    )
+
+    def _load_profiles(descriptors: list[dict[str, Any]]) -> list[Any]:
+        loaded_by_id: dict[str, Any] = {}
+        for load_source_path, source_descriptors in _group_descriptors_by_load_source(descriptors):
+            grouped_parents: dict[int, list[dict[str, Any]]] = {}
+            parent_order: list[int] = []
+            for descriptor in source_descriptors:
+                profile_index = int(descriptor["profile_index"])
+                if profile_index not in grouped_parents:
+                    grouped_parents[profile_index] = []
+                    parent_order.append(profile_index)
+                grouped_parents[profile_index].append(descriptor)
+            parent_profiles = load_position_profiles_by_index(
+                load_source_path,
+                parent_order,
+                species=args.species,
+                axis=args.axis,
+            )
+            if len(parent_profiles) != len(parent_order):
+                raise ValueError("Lazy position loader returned mismatched parent profile count.")
+            parent_by_index = {
+                profile_index: profile for profile_index, profile in zip(parent_order, parent_profiles)
+            }
+            for profile_index in parent_order:
+                parent_profile = parent_by_index[profile_index]
+                for descriptor in grouped_parents[profile_index]:
+                    child_profile = _extract_position_profile_atom_series(
+                        parent_profile,
+                        int(descriptor["atom_index"]),
+                    )
+                    loaded_by_id[str(descriptor["series_id"])] = replace(
+                        child_profile,
+                        species=str(descriptor.get("rendered_species") or child_profile.species),
+                    )
+        return [loaded_by_id[str(descriptor["series_id"])] for descriptor in descriptors]
+
+    return _LazyGuiSeriesCatalog(
+        sources=list(sources),
+        plot_source_label=sources[0] if len(sources) == 1 else "multi_source_position",
+        plotter_kwargs={
+            "component": args.component,
+            "map_color": args.map_color,
+            "time_axis": args.time_axis,
+        },
+        descriptor_segments_by_source=descriptor_segments,
+        profile_filter_options=None,
+        load_profiles=_load_profiles,
+        _active_profiles_by_series_id=(
+            active_profiles_by_series_id if active_profiles_by_series_id is not None else {}
+        ),
+    )
+
+
+def _build_coordination_gui_lazy_catalog(
+    args: argparse.Namespace,
+    *,
+    sources: list[str],
+    active_profiles_by_series_id: dict[str, Any] | None = None,
+) -> _LazyGuiSeriesCatalog:
+    from .analysis.coordination import (
+        _normalize_axis as _normalize_coordination_axis,
+        _normalize_species as _normalize_coordination_species,
+        load_coordination_profiles_by_index,
+    )
+    from .storage.hdf5_utils import read_linak_hdf5_profiles_by_index
+
+    normalized_component = str(args.component).strip().lower().replace("_", "-")
+    resolved_species_b = args.species_b if args.species_b is not None else args.species_a
+    wanted_species_a = (
+        None
+        if args.species_a is None or not str(args.species_a).strip()
+        else _normalize_coordination_species(args.species_a)
+    )
+    wanted_species_b = (
+        None
+        if resolved_species_b is None or not str(resolved_species_b).strip()
+        else _normalize_coordination_species(resolved_species_b)
+    )
+    wanted_axis = (
+        None
+        if args.axis is None or not str(args.axis).strip()
+        else _normalize_coordination_axis(args.axis)
+    )
+    headers_by_source = _read_analysis_profile_headers_by_source(
+        sources=sources,
+        analysis="coordination",
+    )
+    prefix_source_labels = _should_prefix_combined_source_labels(
+        sources=sources,
+        metadata_items=[
+            dict(header)
+            for _source, headers in headers_by_source
+            for header in headers
+        ],
+    )
+
+    filtered_headers_by_source: list[tuple[str, list[dict[str, Any]]]] = []
+    fallback_labels_by_source: list[list[str]] = []
+    series_id_segments_by_source: list[list[str]] = []
+    origin_path_segments_by_source: list[list[str]] = []
+    load_source_path_segments_by_source: list[list[str]] = []
+    extra_segments_by_source: list[list[dict[str, Any]]] = []
+    for source, headers in headers_by_source:
+        source_path = Path(source).expanduser().resolve()
+        matching_headers: list[dict[str, Any]] = []
+        matching_indices: list[int] = []
+        for header in headers:
+            resolved_a = str(header.get("species_a", "")).strip() or "UNKNOWN"
+            resolved_b = str(header.get("species_b", "")).strip() or resolved_a
+            resolved_axis = str(header.get("axis", "z")).strip().lower() or "z"
+            if wanted_species_a is not None and _normalize_coordination_species(resolved_a) != wanted_species_a:
+                continue
+            if wanted_species_b is not None and _normalize_coordination_species(resolved_b) != wanted_species_b:
+                continue
+            if wanted_axis is not None and resolved_axis != wanted_axis:
+                continue
+            matching_headers.append(header)
+            matching_indices.append(int(header.get("profile_index", len(matching_headers) - 1)))
+
+        lightweight_payloads: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        if normalized_component != "distance" and matching_indices:
+            lightweight_payloads = read_linak_hdf5_profiles_by_index(
+                source_path,
+                matching_indices,
+                expected_analysis="coordination",
+                dataset_names=("atom_indices",),
+            )
+        payloads_by_index = {
+            int(metadata.get("profile_index", profile_index)): datasets
+            for profile_index, (datasets, metadata) in enumerate(lightweight_payloads)
+        }
+
+        source_labels: list[str] = []
+        source_ids: list[str] = []
+        source_origins: list[str] = []
+        source_load_paths: list[str] = []
+        source_extras: list[dict[str, Any]] = []
+        for header in matching_headers:
+            source_label = _metadata_source_label(header, fallback_source=str(source_path))
+            resolved_a = str(header.get("species_a", "")).strip() or "UNKNOWN"
+            resolved_b = str(header.get("species_b", "")).strip() or resolved_a
+            rendered_species_a = (
+                f"{source_label}:{resolved_a}" if prefix_source_labels else resolved_a
+            )
+            profile_index = int(header.get("profile_index", 0))
+            profile_uid = _profile_uid_from_payload(
+                {"metadata": header},
+                fallback_prefix="coordination",
+                index=profile_index,
+            )
+            if normalized_component == "distance":
+                source_labels.append(f"{rendered_species_a}-{resolved_b}")
+                source_ids.append(profile_uid)
+                source_origins.append(str(header.get("origin_hdf5_path") or source))
+                source_load_paths.append(str(header.get("source_path") or source))
+                source_extras.append(
+                    {
+                        "profile_index": profile_index,
+                        "profile_uid": profile_uid,
+                        "rendered_species_a": rendered_species_a,
+                        "rendered_species_b": resolved_b,
+                    }
+                )
+                continue
+
+            atom_indices = np.asarray(payloads_by_index.get(profile_index, {}).get("atom_indices", []), dtype=int)
+            for atom_index in atom_indices.tolist():
+                atom_token = int(atom_index)
+                source_labels.append(f"{rendered_species_a}[{atom_token}]")
+                source_ids.append(f"{profile_uid}:atom:{atom_token}")
+                source_origins.append(str(header.get("origin_hdf5_path") or source))
+                source_load_paths.append(str(header.get("source_path") or source))
+                source_extras.append(
+                    {
+                        "profile_index": profile_index,
+                        "profile_uid": profile_uid,
+                        "atom_index": atom_token,
+                        "rendered_species_a": rendered_species_a,
+                        "rendered_species_b": resolved_b,
+                    }
+                )
+        filtered_headers_by_source.append((source, matching_headers))
+        fallback_labels_by_source.append(source_labels)
+        series_id_segments_by_source.append(source_ids)
+        origin_path_segments_by_source.append(source_origins)
+        load_source_path_segments_by_source.append(source_load_paths)
+        extra_segments_by_source.append(source_extras)
+
+    descriptor_segments = _build_gui_descriptor_segments(
+        sources=sources,
+        fallback_labels_by_source=fallback_labels_by_source,
+        series_id_segments_by_source=series_id_segments_by_source,
+        origin_path_segments_by_source=origin_path_segments_by_source,
+        load_source_path_segments_by_source=load_source_path_segments_by_source,
+        extra_segments_by_source=extra_segments_by_source,
+    )
+
+    def _load_profiles(descriptors: list[dict[str, Any]]) -> list[Any]:
+        loaded_by_id: dict[str, Any] = {}
+        for load_source_path, source_descriptors in _group_descriptors_by_load_source(descriptors):
+            grouped_parents: dict[int, list[dict[str, Any]]] = {}
+            parent_order: list[int] = []
+            for descriptor in source_descriptors:
+                profile_index = int(descriptor["profile_index"])
+                if profile_index not in grouped_parents:
+                    grouped_parents[profile_index] = []
+                    parent_order.append(profile_index)
+                grouped_parents[profile_index].append(descriptor)
+            parent_profiles = load_coordination_profiles_by_index(
+                load_source_path,
+                parent_order,
+                species_a=args.species_a,
+                species_b=resolved_species_b,
+                axis=args.axis,
+            )
+            if len(parent_profiles) != len(parent_order):
+                raise ValueError("Lazy coordination loader returned mismatched parent profile count.")
+            parent_by_index = {
+                profile_index: profile for profile_index, profile in zip(parent_order, parent_profiles)
+            }
+            for profile_index in parent_order:
+                parent_profile = parent_by_index[profile_index]
+                for descriptor in grouped_parents[profile_index]:
+                    if normalized_component == "distance":
+                        loaded_by_id[str(descriptor["series_id"])] = replace(
+                            parent_profile,
+                            species_a=str(
+                                descriptor.get("rendered_species_a") or parent_profile.species_a
+                            ),
+                            species_b=str(
+                                descriptor.get("rendered_species_b") or parent_profile.species_b
+                            ),
+                        )
+                        continue
+                    child_profile = _extract_coordination_profile_atom_series(
+                        parent_profile,
+                        int(descriptor["atom_index"]),
+                    )
+                    loaded_by_id[str(descriptor["series_id"])] = replace(
+                        child_profile,
+                        species_a=str(
+                            descriptor.get("rendered_species_a") or child_profile.species_a
+                        ),
+                        species_b=str(
+                            descriptor.get("rendered_species_b") or child_profile.species_b
+                        ),
+                    )
+        return [loaded_by_id[str(descriptor["series_id"])] for descriptor in descriptors]
+
+    return _LazyGuiSeriesCatalog(
+        sources=list(sources),
+        plot_source_label=sources[0] if len(sources) == 1 else "multi_source_coordination",
+        plotter_kwargs={
+            "component": args.component,
+            "time_axis": args.time_axis,
+        },
+        descriptor_segments_by_source=descriptor_segments,
+        profile_filter_options=_build_coordination_profile_filter_options(
+            _headers_by_source_as_metadata_payloads(filtered_headers_by_source)
+        ),
+        load_profiles=_load_profiles,
+        _active_profiles_by_series_id=(
+            active_profiles_by_series_id if active_profiles_by_series_id is not None else {}
+        ),
     )
 
 
@@ -4100,6 +5152,21 @@ def _derive_gui_sync_modes(settings: dict[str, Any]) -> dict[str, str]:
 def _apply_gui_settings_to_args(args: argparse.Namespace, settings: dict[str, Any]) -> None:
     for key, value in settings.items():
         setattr(args, key, value)
+    if isinstance(settings.get("series_overrides"), dict):
+        for key in (
+            "series_labels",
+            "line_colors",
+            "series_enabled",
+            "series_show_in_legend",
+            "series_alpha",
+            "series_line_widths",
+            "series_markers",
+            "series_line_kwargs",
+            "series_normalization_modes",
+            "series_normalization_values",
+            "series_normalization_x_refs",
+        ):
+            setattr(args, key, None)
     if "x_bin_width" in settings and hasattr(args, "time_section_width"):
         args.time_section_width = settings.get("x_bin_width")
     if hasattr(args, "x_lim"):
@@ -4168,6 +5235,7 @@ def _launch_profile_plot_gui(
     plotter: Callable[..., Path | None],
     initial_context: _GuiPlotRenderContext,
     build_context: Callable[[argparse.Namespace], _GuiPlotRenderContext],
+    build_full_context: Callable[[argparse.Namespace], _GuiPlotRenderContext] | None = None,
 ) -> None:
     from .plot.plot_settings import (
         delete_named_plot_profile,
@@ -4180,6 +5248,8 @@ def _launch_profile_plot_gui(
     )
 
     allow_named_profiles = supports_named_plot_profiles(source_path)
+    if build_full_context is None:
+        build_full_context = build_context
     initial_settings = _collect_plot_settings_for_persistence(args, keys=setting_keys)
     initial_settings["_gui_locked_fields"] = _derive_gui_locked_fields(initial_settings)
     initial_settings["_gui_sync_modes"] = _derive_gui_sync_modes(initial_settings)
@@ -4211,30 +5281,36 @@ def _launch_profile_plot_gui(
     )
     initial_settings = _merge_gui_only_plot_settings(initial_settings, initial_saved_profile)
     initial_settings = _strip_redundant_series_lists_for_gui(initial_settings)
+    gui_render_sources = [
+        f"gui-series-source:{index}"
+        for index in range(len(initial_context.fallback_labels_by_source))
+    ]
 
     initial_preview_args = deepcopy(args)
     initial_preview_args.show = False
     initial_preview_args.output = None
     initial_preview_args._suppress_output_log = True
     initial_preview_context = build_context(initial_preview_args)
-    _apply_effective_series_settings(
-        args=initial_preview_args,
-        sources=[str(source_path)],
-        profile_key=profile_key,
-        fallback_labels_by_source=initial_preview_context.fallback_labels_by_source,
-        series_descriptors=initial_preview_context.series_descriptors,
-        allow_saved_multi_source_merge=False,
-        materialize_default_colors=True,
-    )
-    _initial_saved_path, initial_render_state = _render_profile_plot(
-        args=initial_preview_args,
-        source=initial_preview_context.plot_source_label,
-        analysis_name=analysis_name,
-        profile=initial_preview_context.profile,
-        plotter=plotter,
-        plotter_kwargs=initial_preview_context.plotter_kwargs,
-        series_descriptors=initial_preview_context.series_descriptors,
-    )
+    initial_render_state: dict[str, Any] = {}
+    if initial_preview_context.series_count > 0:
+        _apply_effective_series_settings(
+            args=initial_preview_args,
+            sources=gui_render_sources,
+            profile_key=profile_key,
+            fallback_labels_by_source=initial_preview_context.fallback_labels_by_source,
+            series_descriptors=initial_preview_context.series_descriptors,
+            allow_saved_multi_source_merge=False,
+            materialize_default_colors=True,
+        )
+        _initial_saved_path, initial_render_state = _render_profile_plot(
+            args=initial_preview_args,
+            source=initial_preview_context.plot_source_label,
+            analysis_name=analysis_name,
+            profile=initial_preview_context.profile,
+            plotter=plotter,
+            plotter_kwargs=initial_preview_context.plotter_kwargs,
+            series_descriptors=initial_preview_context.series_descriptors,
+        )
     if initial_render_state:
         initial_settings.update(_without_preview_series_state(initial_render_state))
 
@@ -4244,9 +5320,11 @@ def _launch_profile_plot_gui(
         preview_args.show = True
         preview_args.output = None
         context = build_context(preview_args)
+        if context.series_count <= 0:
+            raise ValueError("No series are enabled. Turn on at least one series to preview.")
         _apply_effective_series_settings(
             args=preview_args,
-            sources=[str(source_path)],
+            sources=gui_render_sources,
             profile_key=profile_key,
             fallback_labels_by_source=context.fallback_labels_by_source,
             series_descriptors=context.series_descriptors,
@@ -4268,8 +5346,11 @@ def _launch_profile_plot_gui(
         save_args = deepcopy(args)
         _apply_gui_settings_to_args(save_args, gui_settings)
         candidate = _collect_plot_settings_for_persistence(save_args, keys=setting_keys)
-        save_context = build_context(save_args)
-        candidate["series_descriptors"] = deepcopy(save_context.series_descriptors)
+        if isinstance(gui_settings.get("series_descriptors"), list):
+            candidate["series_descriptors"] = deepcopy(gui_settings["series_descriptors"])
+        else:
+            save_context = build_full_context(save_args)
+            candidate["series_descriptors"] = deepcopy(save_context.series_descriptors)
         if gui_settings.get("series_order") is not None:
             candidate["series_order"] = deepcopy(gui_settings["series_order"])
         else:
@@ -4309,9 +5390,11 @@ def _launch_profile_plot_gui(
         save_args.output = output_path
         save_args._suppress_output_log = _is_gui_preview_output_path(output_path)
         context = build_context(save_args)
+        if context.series_count <= 0:
+            raise ValueError("No series are enabled. Turn on at least one series before exporting.")
         _apply_effective_series_settings(
             args=save_args,
-            sources=[str(source_path)],
+            sources=gui_render_sources,
             profile_key=profile_key,
             fallback_labels_by_source=context.fallback_labels_by_source,
             series_descriptors=context.series_descriptors,
@@ -4356,10 +5439,10 @@ def _launch_profile_plot_gui(
         load_args = deepcopy(args)
         for key, value in loaded.items():
             setattr(load_args, key, deepcopy(value))
-        context = build_context(load_args)
+        context = build_full_context(load_args)
         merged = _merge_gui_only_plot_settings(loaded, loaded)
         merged["series_descriptors"] = deepcopy(context.series_descriptors)
-        merged["_profile_filter_options"] = deepcopy(initial_context.profile_filter_options)
+        merged["_profile_filter_options"] = deepcopy(context.profile_filter_options)
         return merged
 
     def _delete_profile(profile_name: str) -> tuple[str | None, str]:
@@ -4387,12 +5470,12 @@ def _launch_profile_plot_gui(
     def _resolve_series_defaults(gui_settings: dict[str, Any]) -> dict[str, Any]:
         resolved_args = deepcopy(args)
         _apply_gui_settings_to_args(resolved_args, gui_settings)
-        context = build_context(resolved_args)
+        context = build_full_context(resolved_args)
         return {
             "series_count": context.series_count,
             "series_labels": list(context.default_series_labels),
             "series_descriptors": deepcopy(context.series_descriptors),
-            "_profile_filter_options": deepcopy(initial_context.profile_filter_options),
+            "_profile_filter_options": deepcopy(context.profile_filter_options),
         }
 
     _open_plot_settings_gui(
@@ -7085,6 +8168,34 @@ def _read_analysis_profile_payloads_by_source(
     return payloads_by_source
 
 
+def _read_analysis_profile_headers_by_source(
+    *,
+    sources: list[str],
+    analysis: str,
+) -> list[tuple[str, list[dict[str, Any]]]]:
+    from .storage.hdf5_utils import read_linak_hdf5_profile_headers
+
+    headers_by_source: list[tuple[str, list[dict[str, Any]]]] = []
+    for source_index, source in enumerate(sources):
+        source_path = Path(source).expanduser().resolve()
+        headers = read_linak_hdf5_profile_headers(source_path, expected_analysis=analysis)
+        if not headers:
+            raise ValueError(f"No '{analysis}' profiles found in '{source_path}'.")
+        source_headers: list[dict[str, Any]] = []
+        for profile_index, metadata in enumerate(headers):
+            merged_metadata = dict(metadata)
+            merged_metadata["origin_hdf5_path"] = str(
+                merged_metadata.get("origin_hdf5_path") or source_path
+            )
+            merged_metadata["source_path"] = str(source_path)
+            merged_metadata.setdefault("source_index", source_index)
+            merged_metadata.setdefault("source_profile_index", profile_index)
+            merged_metadata.setdefault("profile_index", profile_index)
+            source_headers.append(merged_metadata)
+        headers_by_source.append((source, source_headers))
+    return headers_by_source
+
+
 def _combine_analysis_hdf5_sources(
     *,
     sources: list[str],
@@ -7227,6 +8338,69 @@ def _handle_plot_density(args: argparse.Namespace) -> int:
         LOGGER.info("Density plotting dry run finished in %.2f s.", perf_counter() - start)
         return 0
 
+    if use_gui:
+        from .analysis.density import plot_density_profiles
+
+        gui_sources = list(sources)
+        gui_settings_path = settings_source_path
+        if len(sources) > 1:
+            gui_settings_path = _combine_analysis_hdf5_sources(
+                sources=sources,
+                analysis="density",
+                output=None,
+            )
+            gui_sources = [str(gui_settings_path)]
+            LOGGER.info(
+                "Created combined density HDF5 for GUI controls: '%s'.",
+                gui_settings_path,
+            )
+        assert gui_settings_path is not None
+
+        active_profiles_by_series_id: dict[str, Any] = {}
+
+        def _build_catalog(current_args: argparse.Namespace) -> _LazyGuiSeriesCatalog:
+            catalog = _build_density_gui_lazy_catalog(
+                current_args,
+                sources=gui_sources,
+                active_profiles_by_series_id=active_profiles_by_series_id,
+            )
+            catalog.default_series_labels = _resolve_gui_default_series_labels(
+                args=current_args,
+                sources=gui_sources,
+                profile_key=_PLOT_PROFILE_DENSITY,
+                fallback_labels_by_source=catalog.fallback_labels_by_source,
+            )
+            return catalog
+
+        initial_catalog = _build_catalog(args)
+        initial_context = initial_catalog.build_initial_context()
+        _apply_effective_series_settings(
+            args=args,
+            sources=gui_sources,
+            profile_key=_PLOT_PROFILE_DENSITY,
+            fallback_labels_by_source=initial_context.fallback_labels_by_source,
+            series_descriptors=initial_context.series_descriptors,
+            allow_saved_multi_source_merge=not (use_gui and len(sources) > 1),
+            materialize_default_colors=False,
+        )
+        _launch_profile_plot_gui(
+            args=args,
+            default_args=default_args,
+            source_path=gui_settings_path,
+            profile_key=_PLOT_PROFILE_DENSITY,
+            setting_keys=_PLOT_SETTINGS_DENSITY_KEYS,
+            gui_title="LiNaK Plot Controls: Density",
+            analysis_name="density",
+            plotter=plot_density_profiles,
+            initial_context=initial_context,
+            build_context=lambda current_args: _build_catalog(current_args).build_render_context(
+                current_args
+            ),
+            build_full_context=lambda current_args: _build_catalog(current_args).build_initial_context(),
+        )
+        LOGGER.info("Density GUI plotting session finished in %.2f s.", perf_counter() - start)
+        return 0
+
     from .analysis.density import plot_density_profiles
 
     render_context = _build_density_gui_context(args, sources=sources)
@@ -7237,40 +8411,9 @@ def _handle_plot_density(args: argparse.Namespace) -> int:
         profile_key=_PLOT_PROFILE_DENSITY,
         fallback_labels_by_source=render_context.fallback_labels_by_source,
         series_descriptors=render_context.series_descriptors,
-        allow_saved_multi_source_merge=not (use_gui and len(sources) > 1),
-        materialize_default_colors=not use_gui,
+        allow_saved_multi_source_merge=True,
+        materialize_default_colors=True,
     )
-
-    if use_gui:
-        gui_settings_path = settings_source_path
-        if len(sources) > 1:
-            gui_settings_path = _combine_analysis_hdf5_sources(
-                sources=sources,
-                analysis="density",
-                output=None,
-            )
-            LOGGER.info(
-                "Created combined density HDF5 for GUI controls: '%s'.",
-                gui_settings_path,
-            )
-        assert gui_settings_path is not None
-        _launch_profile_plot_gui(
-            args=args,
-            default_args=default_args,
-            source_path=gui_settings_path,
-            profile_key=_PLOT_PROFILE_DENSITY,
-            setting_keys=_PLOT_SETTINGS_DENSITY_KEYS,
-            gui_title="LiNaK Plot Controls: Density",
-            analysis_name="density",
-            plotter=plot_density_profiles,
-            initial_context=render_context,
-            build_context=lambda current_args: _build_density_gui_context(
-                current_args,
-                sources=sources,
-            ),
-        )
-        LOGGER.info("Density GUI plotting session finished in %.2f s.", perf_counter() - start)
-        return 0
 
     _saved_path, _rendered_state = _render_profile_plot(
         args=args,
@@ -7334,6 +8477,69 @@ def _handle_plot_msd(args: argparse.Namespace) -> int:
         LOGGER.info("MSD plotting dry run finished in %.2f s.", perf_counter() - start)
         return 0
 
+    if use_gui:
+        from .analysis.msd import plot_msd_profiles
+
+        gui_sources = list(sources)
+        gui_settings_path = settings_source_path
+        if len(sources) > 1:
+            gui_settings_path = _combine_analysis_hdf5_sources(
+                sources=sources,
+                analysis="msd",
+                output=None,
+            )
+            gui_sources = [str(gui_settings_path)]
+            LOGGER.info(
+                "Created combined MSD HDF5 for GUI controls: '%s'.",
+                gui_settings_path,
+            )
+        assert gui_settings_path is not None
+
+        active_profiles_by_series_id: dict[str, Any] = {}
+
+        def _build_catalog(current_args: argparse.Namespace) -> _LazyGuiSeriesCatalog:
+            catalog = _build_msd_gui_lazy_catalog(
+                current_args,
+                sources=gui_sources,
+                active_profiles_by_series_id=active_profiles_by_series_id,
+            )
+            catalog.default_series_labels = _resolve_gui_default_series_labels(
+                args=current_args,
+                sources=gui_sources,
+                profile_key=_PLOT_PROFILE_MSD,
+                fallback_labels_by_source=catalog.fallback_labels_by_source,
+            )
+            return catalog
+
+        initial_catalog = _build_catalog(args)
+        initial_context = initial_catalog.build_initial_context()
+        _apply_effective_series_settings(
+            args=args,
+            sources=gui_sources,
+            profile_key=_PLOT_PROFILE_MSD,
+            fallback_labels_by_source=initial_context.fallback_labels_by_source,
+            series_descriptors=initial_context.series_descriptors,
+            allow_saved_multi_source_merge=not (use_gui and len(sources) > 1),
+            materialize_default_colors=False,
+        )
+        _launch_profile_plot_gui(
+            args=args,
+            default_args=default_args,
+            source_path=gui_settings_path,
+            profile_key=_PLOT_PROFILE_MSD,
+            setting_keys=_PLOT_SETTINGS_MSD_KEYS,
+            gui_title="LiNaK Plot Controls: MSD",
+            analysis_name="msd",
+            plotter=plot_msd_profiles,
+            initial_context=initial_context,
+            build_context=lambda current_args: _build_catalog(current_args).build_render_context(
+                current_args
+            ),
+            build_full_context=lambda current_args: _build_catalog(current_args).build_initial_context(),
+        )
+        LOGGER.info("MSD GUI plotting session finished in %.2f s.", perf_counter() - start)
+        return 0
+
     from .analysis.msd import plot_msd_profiles
 
     render_context = _build_msd_gui_context(args, sources=sources)
@@ -7344,40 +8550,9 @@ def _handle_plot_msd(args: argparse.Namespace) -> int:
         profile_key=_PLOT_PROFILE_MSD,
         fallback_labels_by_source=render_context.fallback_labels_by_source,
         series_descriptors=render_context.series_descriptors,
-        allow_saved_multi_source_merge=not (use_gui and len(sources) > 1),
-        materialize_default_colors=not use_gui,
+        allow_saved_multi_source_merge=True,
+        materialize_default_colors=True,
     )
-
-    if use_gui:
-        gui_settings_path = settings_source_path
-        if len(sources) > 1:
-            gui_settings_path = _combine_analysis_hdf5_sources(
-                sources=sources,
-                analysis="msd",
-                output=None,
-            )
-            LOGGER.info(
-                "Created combined MSD HDF5 for GUI controls: '%s'.",
-                gui_settings_path,
-            )
-        assert gui_settings_path is not None
-        _launch_profile_plot_gui(
-            args=args,
-            default_args=default_args,
-            source_path=gui_settings_path,
-            profile_key=_PLOT_PROFILE_MSD,
-            setting_keys=_PLOT_SETTINGS_MSD_KEYS,
-            gui_title="LiNaK Plot Controls: MSD",
-            analysis_name="msd",
-            plotter=plot_msd_profiles,
-            initial_context=render_context,
-            build_context=lambda current_args: _build_msd_gui_context(
-                current_args,
-                sources=sources,
-            ),
-        )
-        LOGGER.info("MSD GUI plotting session finished in %.2f s.", perf_counter() - start)
-        return 0
 
     _saved_path, _rendered_state = _render_profile_plot(
         args=args,
@@ -7442,6 +8617,69 @@ def _handle_plot_rdf(args: argparse.Namespace) -> int:
         LOGGER.info("RDF plotting dry run finished in %.2f s.", perf_counter() - start)
         return 0
 
+    if use_gui:
+        from .analysis.rdf import plot_rdf_profiles
+
+        gui_sources = list(sources)
+        gui_settings_path = settings_source_path
+        if len(sources) > 1:
+            gui_settings_path = _combine_analysis_hdf5_sources(
+                sources=sources,
+                analysis="rdf",
+                output=None,
+            )
+            gui_sources = [str(gui_settings_path)]
+            LOGGER.info(
+                "Created combined RDF HDF5 for GUI controls: '%s'.",
+                gui_settings_path,
+            )
+        assert gui_settings_path is not None
+
+        active_profiles_by_series_id: dict[str, Any] = {}
+
+        def _build_catalog(current_args: argparse.Namespace) -> _LazyGuiSeriesCatalog:
+            catalog = _build_rdf_gui_lazy_catalog(
+                current_args,
+                sources=gui_sources,
+                active_profiles_by_series_id=active_profiles_by_series_id,
+            )
+            catalog.default_series_labels = _resolve_gui_default_series_labels(
+                args=current_args,
+                sources=gui_sources,
+                profile_key=_PLOT_PROFILE_RDF,
+                fallback_labels_by_source=catalog.fallback_labels_by_source,
+            )
+            return catalog
+
+        initial_catalog = _build_catalog(args)
+        initial_context = initial_catalog.build_initial_context()
+        _apply_effective_series_settings(
+            args=args,
+            sources=gui_sources,
+            profile_key=_PLOT_PROFILE_RDF,
+            fallback_labels_by_source=initial_context.fallback_labels_by_source,
+            series_descriptors=initial_context.series_descriptors,
+            allow_saved_multi_source_merge=not (use_gui and len(sources) > 1),
+            materialize_default_colors=False,
+        )
+        _launch_profile_plot_gui(
+            args=args,
+            default_args=default_args,
+            source_path=gui_settings_path,
+            profile_key=_PLOT_PROFILE_RDF,
+            setting_keys=_PLOT_SETTINGS_RDF_KEYS,
+            gui_title="LiNaK Plot Controls: RDF",
+            analysis_name="rdf",
+            plotter=plot_rdf_profiles,
+            initial_context=initial_context,
+            build_context=lambda current_args: _build_catalog(current_args).build_render_context(
+                current_args
+            ),
+            build_full_context=lambda current_args: _build_catalog(current_args).build_initial_context(),
+        )
+        LOGGER.info("RDF GUI plotting session finished in %.2f s.", perf_counter() - start)
+        return 0
+
     from .analysis.rdf import plot_rdf_profiles
 
     render_context = _build_rdf_gui_context(args, sources=sources)
@@ -7452,40 +8690,9 @@ def _handle_plot_rdf(args: argparse.Namespace) -> int:
         profile_key=_PLOT_PROFILE_RDF,
         fallback_labels_by_source=render_context.fallback_labels_by_source,
         series_descriptors=render_context.series_descriptors,
-        allow_saved_multi_source_merge=not (use_gui and len(sources) > 1),
-        materialize_default_colors=not use_gui,
+        allow_saved_multi_source_merge=True,
+        materialize_default_colors=True,
     )
-
-    if use_gui:
-        gui_settings_path = settings_source_path
-        if len(sources) > 1:
-            gui_settings_path = _combine_analysis_hdf5_sources(
-                sources=sources,
-                analysis="rdf",
-                output=None,
-            )
-            LOGGER.info(
-                "Created combined RDF HDF5 for GUI controls: '%s'.",
-                gui_settings_path,
-            )
-        assert gui_settings_path is not None
-        _launch_profile_plot_gui(
-            args=args,
-            default_args=default_args,
-            source_path=gui_settings_path,
-            profile_key=_PLOT_PROFILE_RDF,
-            setting_keys=_PLOT_SETTINGS_RDF_KEYS,
-            gui_title="LiNaK Plot Controls: RDF",
-            analysis_name="rdf",
-            plotter=plot_rdf_profiles,
-            initial_context=render_context,
-            build_context=lambda current_args: _build_rdf_gui_context(
-                current_args,
-                sources=sources,
-            ),
-        )
-        LOGGER.info("RDF GUI plotting session finished in %.2f s.", perf_counter() - start)
-        return 0
 
     _saved_path, _rendered_state = _render_profile_plot(
         args=args,
@@ -7566,6 +8773,69 @@ def _handle_plot_position(args: argparse.Namespace) -> int:
         LOGGER.info("Position plotting dry run finished in %.2f s.", perf_counter() - start)
         return 0
 
+    if use_gui:
+        from .analysis.position import plot_position_profiles
+
+        gui_sources = list(sources)
+        gui_settings_path = settings_source_path
+        if len(sources) > 1:
+            gui_settings_path = _combine_analysis_hdf5_sources(
+                sources=sources,
+                analysis="position",
+                output=None,
+            )
+            gui_sources = [str(gui_settings_path)]
+            LOGGER.info(
+                "Created combined position HDF5 for GUI controls: '%s'.",
+                gui_settings_path,
+            )
+        assert gui_settings_path is not None
+
+        active_profiles_by_series_id: dict[str, Any] = {}
+
+        def _build_catalog(current_args: argparse.Namespace) -> _LazyGuiSeriesCatalog:
+            catalog = _build_position_gui_lazy_catalog(
+                current_args,
+                sources=gui_sources,
+                active_profiles_by_series_id=active_profiles_by_series_id,
+            )
+            catalog.default_series_labels = _resolve_gui_default_series_labels(
+                args=current_args,
+                sources=gui_sources,
+                profile_key=_PLOT_PROFILE_POSITION,
+                fallback_labels_by_source=catalog.fallback_labels_by_source,
+            )
+            return catalog
+
+        initial_catalog = _build_catalog(args)
+        initial_context = initial_catalog.build_initial_context()
+        _apply_effective_series_settings(
+            args=args,
+            sources=gui_sources,
+            profile_key=_PLOT_PROFILE_POSITION,
+            fallback_labels_by_source=initial_context.fallback_labels_by_source,
+            series_descriptors=initial_context.series_descriptors,
+            allow_saved_multi_source_merge=not (use_gui and len(sources) > 1),
+            materialize_default_colors=False,
+        )
+        _launch_profile_plot_gui(
+            args=args,
+            default_args=default_args,
+            source_path=gui_settings_path,
+            profile_key=_PLOT_PROFILE_POSITION,
+            setting_keys=_PLOT_SETTINGS_POSITION_KEYS,
+            gui_title="LiNaK Plot Controls: Position",
+            analysis_name="position",
+            plotter=plot_position_profiles,
+            initial_context=initial_context,
+            build_context=lambda current_args: _build_catalog(current_args).build_render_context(
+                current_args
+            ),
+            build_full_context=lambda current_args: _build_catalog(current_args).build_initial_context(),
+        )
+        LOGGER.info("Position GUI plotting session finished in %.2f s.", perf_counter() - start)
+        return 0
+
     from .analysis.position import plot_position_profiles
 
     render_context = _build_position_gui_context(args, sources=sources)
@@ -7576,40 +8846,9 @@ def _handle_plot_position(args: argparse.Namespace) -> int:
         profile_key=_PLOT_PROFILE_POSITION,
         fallback_labels_by_source=render_context.fallback_labels_by_source,
         series_descriptors=render_context.series_descriptors,
-        allow_saved_multi_source_merge=not (use_gui and len(sources) > 1),
-        materialize_default_colors=not use_gui,
+        allow_saved_multi_source_merge=True,
+        materialize_default_colors=True,
     )
-
-    if use_gui:
-        gui_settings_path = settings_source_path
-        if len(sources) > 1:
-            gui_settings_path = _combine_analysis_hdf5_sources(
-                sources=sources,
-                analysis="position",
-                output=None,
-            )
-            LOGGER.info(
-                "Created combined position HDF5 for GUI controls: '%s'.",
-                gui_settings_path,
-            )
-        assert gui_settings_path is not None
-        _launch_profile_plot_gui(
-            args=args,
-            default_args=default_args,
-            source_path=gui_settings_path,
-            profile_key=_PLOT_PROFILE_POSITION,
-            setting_keys=_PLOT_SETTINGS_POSITION_KEYS,
-            gui_title="LiNaK Plot Controls: Position",
-            analysis_name="position",
-            plotter=plot_position_profiles,
-            initial_context=render_context,
-            build_context=lambda current_args: _build_position_gui_context(
-                current_args,
-                sources=sources,
-            ),
-        )
-        LOGGER.info("Position GUI plotting session finished in %.2f s.", perf_counter() - start)
-        return 0
 
     _saved_path, _rendered_state = _render_profile_plot(
         args=args,
@@ -7677,6 +8916,69 @@ def _handle_plot_coordination(args: argparse.Namespace) -> int:
         LOGGER.info("Coordination plotting dry run finished in %.2f s.", perf_counter() - start)
         return 0
 
+    if use_gui:
+        from .analysis.coordination import plot_coordination_profiles
+
+        gui_sources = list(sources)
+        gui_settings_path = settings_source_path
+        if len(sources) > 1:
+            gui_settings_path = _combine_analysis_hdf5_sources(
+                sources=sources,
+                analysis="coordination",
+                output=None,
+            )
+            gui_sources = [str(gui_settings_path)]
+            LOGGER.info(
+                "Created combined coordination HDF5 for GUI controls: '%s'.",
+                gui_settings_path,
+            )
+        assert gui_settings_path is not None
+
+        active_profiles_by_series_id: dict[str, Any] = {}
+
+        def _build_catalog(current_args: argparse.Namespace) -> _LazyGuiSeriesCatalog:
+            catalog = _build_coordination_gui_lazy_catalog(
+                current_args,
+                sources=gui_sources,
+                active_profiles_by_series_id=active_profiles_by_series_id,
+            )
+            catalog.default_series_labels = _resolve_gui_default_series_labels(
+                args=current_args,
+                sources=gui_sources,
+                profile_key=_PLOT_PROFILE_COORDINATION,
+                fallback_labels_by_source=catalog.fallback_labels_by_source,
+            )
+            return catalog
+
+        initial_catalog = _build_catalog(args)
+        initial_context = initial_catalog.build_initial_context()
+        _apply_effective_series_settings(
+            args=args,
+            sources=gui_sources,
+            profile_key=_PLOT_PROFILE_COORDINATION,
+            fallback_labels_by_source=initial_context.fallback_labels_by_source,
+            series_descriptors=initial_context.series_descriptors,
+            allow_saved_multi_source_merge=not (use_gui and len(sources) > 1),
+            materialize_default_colors=False,
+        )
+        _launch_profile_plot_gui(
+            args=args,
+            default_args=default_args,
+            source_path=gui_settings_path,
+            profile_key=_PLOT_PROFILE_COORDINATION,
+            setting_keys=_PLOT_SETTINGS_COORDINATION_KEYS,
+            gui_title="LiNaK Plot Controls: Coordination",
+            analysis_name="coordination",
+            plotter=plot_coordination_profiles,
+            initial_context=initial_context,
+            build_context=lambda current_args: _build_catalog(current_args).build_render_context(
+                current_args
+            ),
+            build_full_context=lambda current_args: _build_catalog(current_args).build_initial_context(),
+        )
+        LOGGER.info("Coordination GUI plotting session finished in %.2f s.", perf_counter() - start)
+        return 0
+
     from .analysis.coordination import plot_coordination_profiles
 
     render_context = _build_coordination_gui_context(args, sources=sources)
@@ -7687,40 +8989,9 @@ def _handle_plot_coordination(args: argparse.Namespace) -> int:
         profile_key=_PLOT_PROFILE_COORDINATION,
         fallback_labels_by_source=render_context.fallback_labels_by_source,
         series_descriptors=render_context.series_descriptors,
-        allow_saved_multi_source_merge=not (use_gui and len(sources) > 1),
-        materialize_default_colors=not use_gui,
+        allow_saved_multi_source_merge=True,
+        materialize_default_colors=True,
     )
-
-    if use_gui:
-        gui_settings_path = settings_source_path
-        if len(sources) > 1:
-            gui_settings_path = _combine_analysis_hdf5_sources(
-                sources=sources,
-                analysis="coordination",
-                output=None,
-            )
-            LOGGER.info(
-                "Created combined coordination HDF5 for GUI controls: '%s'.",
-                gui_settings_path,
-            )
-        assert gui_settings_path is not None
-        _launch_profile_plot_gui(
-            args=args,
-            default_args=default_args,
-            source_path=gui_settings_path,
-            profile_key=_PLOT_PROFILE_COORDINATION,
-            setting_keys=_PLOT_SETTINGS_COORDINATION_KEYS,
-            gui_title="LiNaK Plot Controls: Coordination",
-            analysis_name="coordination",
-            plotter=plot_coordination_profiles,
-            initial_context=render_context,
-            build_context=lambda current_args: _build_coordination_gui_context(
-                current_args,
-                sources=sources,
-            ),
-        )
-        LOGGER.info("Coordination GUI plotting session finished in %.2f s.", perf_counter() - start)
-        return 0
 
     _saved_path, _rendered_state = _render_profile_plot(
         args=args,

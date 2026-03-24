@@ -13,6 +13,7 @@ from ase import Atoms
 
 from ..storage.hdf5_utils import (
     is_hdf5_path,
+    read_linak_hdf5_profiles_by_index,
     read_linak_hdf5_profiles,
     write_linak_hdf5,
 )
@@ -450,9 +451,24 @@ def load_position_profiles(
     if not is_hdf5_path(source_path):
         raise ValueError(f"Unsupported position profile format for '{source_path}'. Use .h5/.hdf5.")
 
+    payloads = read_linak_hdf5_profiles(source_path, expected_analysis="position")
+    return _load_position_profiles_from_payloads(
+        source_path,
+        payloads,
+        species=species,
+        axis=axis,
+    )
+
+
+def _load_position_profiles_from_payloads(
+    source_path: Path,
+    payloads: list[tuple[dict[str, np.ndarray], dict[str, Any]]],
+    *,
+    species: str | None = None,
+    axis: str | None = None,
+) -> list[PositionProfile]:
     wanted_species = None if species is None or not species.strip() else _normalize_species(species)
     wanted_axis = None if axis is None or not axis.strip() else axis.strip().lower()
-    payloads = read_linak_hdf5_profiles(source_path, expected_analysis="position")
     profiles: list[PositionProfile] = []
     for datasets, metadata in payloads:
         required = (
@@ -557,6 +573,32 @@ def load_position_profiles(
             )
         )
     return profiles
+
+
+def load_position_profiles_by_index(
+    path: str | Path,
+    profile_indices: list[int] | tuple[int, ...],
+    *,
+    species: str | None = None,
+    axis: str | None = None,
+) -> list[PositionProfile]:
+    """Load selected position profiles by profile index from LiNaK HDF5."""
+    source_path = Path(path).expanduser().resolve()
+    if not source_path.exists():
+        raise FileNotFoundError(f"Position profile not found: {source_path}")
+    if not is_hdf5_path(source_path):
+        raise ValueError(f"Unsupported position profile format for '{source_path}'. Use .h5/.hdf5.")
+    payloads = read_linak_hdf5_profiles_by_index(
+        source_path,
+        profile_indices,
+        expected_analysis="position",
+    )
+    return _load_position_profiles_from_payloads(
+        source_path,
+        payloads,
+        species=species,
+        axis=axis,
+    )
 
 
 def _position_time_data(

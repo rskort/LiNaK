@@ -1,9 +1,11 @@
 from linak.plot.plot_gui import (
+    _AUTO_PREVIEW_DEBOUNCE_MS,
     _coerce_series_order,
     _coerce_series_descriptors,
     _coerce_series_overrides,
     _derive_synced_field_locks,
     _derive_warning_messages,
+    _preview_button_enabled,
     _extract_limit,
     _extract_dict_mode,
     _format_series_display_text,
@@ -36,6 +38,16 @@ def test_without_series_specific_settings_removes_per_series_keys():
     assert "series_labels" not in filtered
     assert "line_colors" not in filtered
     assert "series_normalization_modes" not in filtered
+
+
+def test_auto_preview_debounce_matches_gui_default():
+    assert _AUTO_PREVIEW_DEBOUNCE_MS == 1000
+
+
+def test_preview_button_enabled_only_when_manual_and_not_loading():
+    assert _preview_button_enabled(auto_update_enabled=False, preview_loading=False) is True
+    assert _preview_button_enabled(auto_update_enabled=True, preview_loading=False) is False
+    assert _preview_button_enabled(auto_update_enabled=False, preview_loading=True) is False
 
 
 def test_without_series_specific_settings_keeps_non_series_limits():
