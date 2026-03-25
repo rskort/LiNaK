@@ -1,5 +1,9 @@
+import re
+from pathlib import Path
+
 from linak.plot.plot_gui import (
     _AUTO_PREVIEW_DEBOUNCE_MS,
+    _TOOLTIPS,
     _coerce_series_order,
     _coerce_series_descriptors,
     _coerce_series_overrides,
@@ -48,6 +52,12 @@ def test_preview_button_enabled_only_when_manual_and_not_loading():
     assert _preview_button_enabled(auto_update_enabled=False, preview_loading=False) is True
     assert _preview_button_enabled(auto_update_enabled=True, preview_loading=False) is False
     assert _preview_button_enabled(auto_update_enabled=False, preview_loading=True) is False
+
+
+def test_all_plot_gui_tooltip_ids_have_registered_messages():
+    source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+    used_tooltip_ids = set(re.findall(r'tooltip_id="([^"]+)"', source))
+    assert sorted(used_tooltip_ids - set(_TOOLTIPS)) == []
 
 
 def test_without_series_specific_settings_keeps_non_series_limits():

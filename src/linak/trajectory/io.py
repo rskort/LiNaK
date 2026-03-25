@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from typing import cast
 
@@ -349,7 +350,11 @@ def read_trajectory(path: str | Path) -> list[Atoms]:
         If no frames can be read.
     """
     trajectory_path = Path(path).expanduser().resolve()
-    LOGGER.info("Loading trajectory from '%s'.", trajectory_path)
+    try:
+        _display = os.path.relpath(trajectory_path)
+    except ValueError:
+        _display = str(trajectory_path)
+    LOGGER.info("Loading trajectory from '%s'.", _display)
     if not trajectory_path.exists():
         raise FileNotFoundError(f"Trajectory file not found: {trajectory_path}")
 
@@ -364,7 +369,7 @@ def read_trajectory(path: str | Path) -> list[Atoms]:
     if not frames:
         raise ValueError(f"No frames were read from: {trajectory_path}")
 
-    LOGGER.info("Loaded %d frame(s) from '%s'.", len(frames), trajectory_path)
+    LOGGER.info("Loaded %d frame(s) from '%s'.", len(frames), _display)
     if frames:
         LOGGER.debug("Atoms per frame (frame 0): %d", len(frames[0]))
 

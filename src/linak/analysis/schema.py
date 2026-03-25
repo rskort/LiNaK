@@ -90,6 +90,24 @@ _ANALYSIS_SCHEMAS: dict[str, AnalysisSchema] = {
         },
         default_plot_labels=("Distance to surface (Angstrom)", "Coordination number"),
     ),
+    "orientation": AnalysisSchema(
+        analysis="orientation",
+        version=1,
+        default_units_map={
+            "bin_centers_A": "Angstrom",
+            "bin_edges_A": "Angstrom",
+            "cos_polar_mean": "dimensionless",
+            "cos_azimuthal_mean": "dimensionless",
+            "cos_polar_density": "1/Angstrom^3",
+            "cos_azimuthal_density": "1/Angstrom^3",
+            "density": "1/Angstrom^3",
+            "heatmap_polar": "counts",
+            "heatmap_azimuthal": "counts",
+            "heatmap_angle_bin_centers": "dimensionless",
+            "heatmap_angle_bin_edges": "dimensionless",
+        },
+        default_plot_labels=("Distance to surface (Angstrom)", "cos(theta)"),
+    ),
 }
 
 

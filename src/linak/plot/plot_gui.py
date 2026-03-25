@@ -126,12 +126,16 @@ _TOOLTIPS: dict[str, str] = {
     "data.position.time_axis": "Chooses the time unit on the x-axis.",
     "data.coordination.component": "Chooses which coordination view to plot.",
     "data.coordination.time_axis": "Chooses the time unit on the x-axis.",
+    "data.orientation.component": "Chooses the averaging mode: mean cos(angle), density-weighted, or 2-D heatmap.",
+    "data.orientation.angle": "Chooses which angle to display: polar (bisector vs surface normal) or azimuthal (molecular-plane normal).",
     "data.potential.x_axis": "Shows which value is used on the x-axis.",
     "data.potential.total_rows": "Shows how many records were loaded.",
     "data.potential.complete_rows": "Shows how many records have complete values.",
     "data.potential.incomplete_rows": "Shows how many records have missing values.",
     "data.section.width": "Groups nearby x-values into wider sections.",
     "data.section.reducer": "Chooses how each section is summarized.",
+    "data.section.y_width": "Groups nearby y-values (angle bins) into wider sections. Only used for heatmaps.",
+    "data.section.y_reducer": "Chooses how each y-section is summarized.",
     "series.all_on": "Turns every series on.",
     "series.all_off": "Turns every series off.",
     "series.show_in_legend": "Shows or hides this series in the legend.",
@@ -197,6 +201,27 @@ _TOOLTIPS: dict[str, str] = {
     "figure.lines.alpha": "Sets the default line transparency.",
     "figure.lines.markers": "Shows or hides markers on lines.",
     "figure.lines.marker_size": "Sets the default marker size.",
+    "figure.heatmap.vmin": "Minimum value for the colorbar range. Leave blank for auto.",
+    "figure.heatmap.vmax": "Maximum value for the colorbar range. Leave blank for auto.",
+    "figure.heatmap.cmap": "Matplotlib colormap name for the heatmap.",
+    "figure.heatmap.normalize": "Normalize each distance bin to a probability distribution.",
+    "figure.heatmap.colorbar_enabled": "Show or hide the colorbar.",
+    "figure.heatmap.colorbar_label": "Colorbar label text. 'none' hides the label; blank uses the default.",
+    "figure.heatmap.colorbar_label_size": "Font size for the colorbar label.",
+    "figure.heatmap.colorbar_tick_size": "Font size for the colorbar tick labels.",
+    "figure.heatmap.colorbar_position": "Where the colorbar is placed relative to the plot.",
+    "figure.heatmap.colorbar_pad": "Space between the plot and the colorbar.",
+    "figure.heatmap.colorbar_shrink": "Fraction of the axes height (or width) used by the colorbar.",
+    "figure.heatmap.colorbar_aspect": "Ratio of the long to short dimension of the colorbar.",
+    "figure.heatmap.normalize": "Chooses the heatmap color normalization mode.",
+    "figure.heatmap.colorbar_enabled": "Shows or hides the heatmap colorbar.",
+    "figure.heatmap.colorbar_label": "Sets the heatmap colorbar label.",
+    "figure.heatmap.colorbar_label_size": "Sets the heatmap colorbar label font size.",
+    "figure.heatmap.colorbar_tick_size": "Sets the heatmap colorbar tick font size.",
+    "figure.heatmap.colorbar_position": "Chooses where the heatmap colorbar is placed.",
+    "figure.heatmap.colorbar_pad": "Sets the gap between the heatmap and colorbar.",
+    "figure.heatmap.colorbar_shrink": "Scales the heatmap colorbar length.",
+    "figure.heatmap.colorbar_aspect": "Sets the heatmap colorbar aspect ratio.",
     "figure.canvas.width": "Sets the figure width.",
     "figure.canvas.height": "Sets the figure height.",
     "figure.canvas.dpi": "Sets the render resolution.",
@@ -860,18 +885,22 @@ def launch_plot_settings_panel(
             self.setToolTip(tooltip_text)
             self.text_label.setToolTip(tooltip_text)
 
-            swatch_color = QColor(color_token)
-            if swatch_color.isValid():
-                self.color_swatch.setStyleSheet(
-                    f"background-color: {swatch_color.name()}; border: none; border-radius: 6px;"
-                )
+            if not color_token:
+                self.color_swatch.setVisible(False)
             else:
-                border = self.palette().color(QPalette.ColorRole.Mid).name()
-                background = self.palette().color(QPalette.ColorRole.Base).name()
-                self.color_swatch.setStyleSheet(
-                    "background-color: "
-                    f"{background}; border: 1px solid {border}; border-radius: 6px;"
-                )
+                self.color_swatch.setVisible(True)
+                swatch_color = QColor(color_token)
+                if swatch_color.isValid():
+                    self.color_swatch.setStyleSheet(
+                        f"background-color: {swatch_color.name()}; border: none; border-radius: 6px;"
+                    )
+                else:
+                    border = self.palette().color(QPalette.ColorRole.Mid).name()
+                    background = self.palette().color(QPalette.ColorRole.Base).name()
+                    self.color_swatch.setStyleSheet(
+                        "background-color: "
+                        f"{background}; border: 1px solid {border}; border-radius: 6px;"
+                    )
 
             text_color = self.palette().color(QPalette.ColorRole.Text)
             if not enabled:
@@ -1029,6 +1058,11 @@ def launch_plot_settings_panel(
             self._series_fit_warning: QLabel | None = None
             self._series_fit_style_note: QLabel | None = None
             self._normalization_copy_button: QPushButton | None = None
+            self._heatmap_tab_is_shown: bool = False
+            self._pre_heatmap_grid_mode: str = "On"
+            self._figure_tabs: QTabWidget | None = None
+            self._y_bin_width_row: tuple[QFormLayout, QWidget] | None = None
+            self._y_bin_reducer_row: tuple[QFormLayout, QWidget] | None = None
             self._tooltip_disabled_reasons: dict[int, str | None] = {}
             self._gui_artwork_path = _default_gui_artwork_path()
             self._figure_save_filters, self._figure_default_name = _figure_filetype_filters()
@@ -1039,6 +1073,7 @@ def launch_plot_settings_panel(
             self._preview_timer.setSingleShot(True)
             self._preview_timer.timeout.connect(self._handle_debounced_preview)
             self._preview_loading = False
+            self._preview_error: str | None = None
             self._status_label = QLabel("Ready.")
             self._build_ui()
             self._suspend_preview_events = True
@@ -1951,13 +1986,11 @@ def launch_plot_settings_panel(
             preview_frame_layout.addWidget(self._preview_scroll, stretch=1)
             right_layout.addWidget(self._preview_frame, stretch=1)
 
-            status_row = QHBoxLayout()
-            status_row.addStretch(1)
+            self._status_label.setObjectName("statusBar")
             self._status_label.setAlignment(
-                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
             )
-            status_row.addWidget(self._status_label)
-            right_layout.addLayout(status_row)
+            right_layout.addWidget(self._status_label)
 
             splitter.addWidget(left_panel)
             splitter.addWidget(right_panel)
@@ -2184,6 +2217,11 @@ def launch_plot_settings_panel(
                 f"  background-color: {colors['warning_bg']};"
                 f"  color: {colors['warning_text']};"
                 f"}}"
+                f"QLabel#statusBar {{"
+                f"  color: {colors['muted_text']};"
+                f"  font-size: 12px;"
+                f"  padding: 4px 6px 2px 6px;"
+                f"}}"
                 f"QFrame#inspectorPanel QStackedWidget {{"
                 f"  background: transparent;"
                 f"}}"
@@ -2239,6 +2277,11 @@ def launch_plot_settings_panel(
                 f"}}"
                 f"QTabWidget#plotSubtabs QTabBar::tab:!selected {{"
                 f"  margin-top: 4px;"
+                f"}}"
+                f"QTabWidget#plotSubtabs QTabBar::tab:disabled {{"
+                f"  color: {colors['disabled_text']};"
+                f"  background-color: transparent;"
+                f"  border-color: transparent;"
                 f"}}"
                 f"QListWidget#navList {{ border: none; background: transparent; padding: 4px; }}"
                 f"QListWidget#navList::item {{"
@@ -2567,6 +2610,8 @@ def launch_plot_settings_panel(
                 return
             settings, error = self._safe_collect_settings()
             warnings = _derive_warning_messages(settings, error=error)
+            if self._preview_error:
+                warnings = [f"Preview paused: {self._preview_error}"] + list(warnings)
             if warnings:
                 self._warning_summary_label.setText(
                     "\n".join(f"- {message}" for message in warnings[:4])
@@ -2704,6 +2749,12 @@ def launch_plot_settings_panel(
             tabs.addTab(self._tab_ticks_grid, "Ticks && Grid")
             tabs.addTab(self._tab_lines, "Lines && Markers")
             tabs.addTab(self._tab_canvas, "Canvas")
+            self._figure_tabs = tabs
+            self._lines_tab_index = tabs.indexOf(self._tab_lines)
+            self._legend_tab_index = tabs.indexOf(self._tab_legend)
+
+            self._tab_heatmap = QWidget()
+            self._tab_heatmap.setObjectName("plotSubtabPage")
 
             self._tab_text_content = self._make_scrollable_tab(self._tab_text)
             self._tab_text_content.setObjectName("plotSubtabContent")
@@ -2715,6 +2766,8 @@ def launch_plot_settings_panel(
             self._tab_ticks_grid_content.setObjectName("plotSubtabContent")
             self._tab_lines_content = self._make_scrollable_tab(self._tab_lines)
             self._tab_lines_content.setObjectName("plotSubtabContent")
+            self._tab_heatmap_content = self._make_scrollable_tab(self._tab_heatmap)
+            self._tab_heatmap_content.setObjectName("plotSubtabContent")
             self._tab_canvas_content = self._make_scrollable_tab(self._tab_canvas)
             self._tab_canvas_content.setObjectName("plotSubtabContent")
 
@@ -2723,6 +2776,7 @@ def launch_plot_settings_panel(
             self._build_axes_tab()
             self._build_ticks_grid_tab()
             self._build_lines_tab()
+            self._build_heatmap_tab()
             self._build_canvas_tab()
             layout.addWidget(tabs, stretch=1)
             return page
@@ -3198,6 +3252,57 @@ def launch_plot_settings_panel(
             layout.addWidget(lines)
             layout.addStretch(1)
             self._marker_rows = [(lines_form, self.marker_size)]
+
+        def _build_heatmap_tab(self) -> None:
+            layout = QVBoxLayout(self._tab_heatmap_content)
+            group = QGroupBox("Heatmap Rendering")
+            form = QFormLayout(group)
+            self.heatmap_cmap = self._combo(
+                ("viridis", "plasma", "inferno", "magma", "cividis", "coolwarm", "RdBu_r", "seismic"),
+                editable=True,
+            )
+            self.heatmap_cmap.currentTextChanged.connect(self._schedule_preview_update)
+            self.heatmap_vmin = self._line("auto")
+            self.heatmap_vmin.textChanged.connect(self._schedule_preview_update)
+            self.heatmap_vmax = self._line("auto")
+            self.heatmap_vmax.textChanged.connect(self._schedule_preview_update)
+            self._add_form_row(form, "Colormap", self.heatmap_cmap, tooltip_id="figure.heatmap.cmap")
+            self._add_form_row(form, "Color min", self.heatmap_vmin, tooltip_id="figure.heatmap.vmin")
+            self._add_form_row(form, "Color max", self.heatmap_vmax, tooltip_id="figure.heatmap.vmax")
+            self.heatmap_normalize = QCheckBox("Normalize to probability")
+            self.heatmap_normalize.stateChanged.connect(self._schedule_preview_update)
+            self._add_form_row(form, "Normalize", self.heatmap_normalize, tooltip_id="figure.heatmap.normalize")
+            layout.addWidget(group)
+
+            cb_group = QGroupBox("Colorbar")
+            cb_form = QFormLayout(cb_group)
+            self.heatmap_colorbar_enabled = QCheckBox("Show colorbar")
+            self.heatmap_colorbar_enabled.setChecked(True)
+            self.heatmap_colorbar_enabled.stateChanged.connect(self._schedule_preview_update)
+            self._add_form_row(cb_form, "", self.heatmap_colorbar_enabled, tooltip_id="figure.heatmap.colorbar_enabled")
+            self.heatmap_colorbar_label = self._line("auto")
+            self.heatmap_colorbar_label.textChanged.connect(self._schedule_preview_update)
+            self.heatmap_colorbar_label_size = self._line("")
+            self.heatmap_colorbar_label_size.textChanged.connect(self._schedule_preview_update)
+            self.heatmap_colorbar_tick_size = self._line("")
+            self.heatmap_colorbar_tick_size.textChanged.connect(self._schedule_preview_update)
+            self.heatmap_colorbar_position = self._combo(("right", "left", "top", "bottom"))
+            self.heatmap_colorbar_position.currentTextChanged.connect(self._schedule_preview_update)
+            self.heatmap_colorbar_pad = self._line("0.05")
+            self.heatmap_colorbar_pad.textChanged.connect(self._schedule_preview_update)
+            self.heatmap_colorbar_shrink = self._line("1.0")
+            self.heatmap_colorbar_shrink.textChanged.connect(self._schedule_preview_update)
+            self.heatmap_colorbar_aspect = self._line("20")
+            self.heatmap_colorbar_aspect.textChanged.connect(self._schedule_preview_update)
+            self._add_form_row(cb_form, "Label", self.heatmap_colorbar_label, tooltip_id="figure.heatmap.colorbar_label")
+            self._add_form_row(cb_form, "Label size", self.heatmap_colorbar_label_size, tooltip_id="figure.heatmap.colorbar_label_size")
+            self._add_form_row(cb_form, "Tick size", self.heatmap_colorbar_tick_size, tooltip_id="figure.heatmap.colorbar_tick_size")
+            self._add_form_row(cb_form, "Position", self.heatmap_colorbar_position, tooltip_id="figure.heatmap.colorbar_position")
+            self._add_form_row(cb_form, "Padding", self.heatmap_colorbar_pad, tooltip_id="figure.heatmap.colorbar_pad")
+            self._add_form_row(cb_form, "Shrink", self.heatmap_colorbar_shrink, tooltip_id="figure.heatmap.colorbar_shrink")
+            self._add_form_row(cb_form, "Aspect", self.heatmap_colorbar_aspect, tooltip_id="figure.heatmap.colorbar_aspect")
+            layout.addWidget(cb_group)
+            layout.addStretch(1)
 
         def _build_canvas_tab(self) -> None:
             form = QFormLayout(self._tab_canvas_content)
@@ -3754,6 +3859,33 @@ def launch_plot_settings_panel(
                 self._coordination_time_axis_row = (view_form, self.coordination_time_axis)
                 layout.addWidget(view)
 
+            if analysis == "orientation":
+                view = QGroupBox("Orientation View")
+                view_form = QFormLayout(view)
+                self.orientation_component = self._combo(
+                    ("average", "density-weighted", "heatmap")
+                )
+                self.orientation_component.currentTextChanged.connect(
+                    self._handle_series_identity_change
+                )
+                self.orientation_angle = self._combo(("polar", "azimuthal"))
+                self.orientation_angle.currentTextChanged.connect(
+                    self._schedule_preview_update
+                )
+                self._add_form_row(
+                    view_form,
+                    "Component",
+                    self.orientation_component,
+                    tooltip_id="data.orientation.component",
+                )
+                self._add_form_row(
+                    view_form,
+                    "Angle",
+                    self.orientation_angle,
+                    tooltip_id="data.orientation.angle",
+                )
+                layout.addWidget(view)
+
         def _resize_list_with_defaults(
             self,
             values: list[Any],
@@ -4224,6 +4356,10 @@ def launch_plot_settings_panel(
                 ):
                     self._series_active_is_fit_child = False
             else:
+                if checked and self._is_orientation_heatmap_mode():
+                    for i in range(len(self._series_enabled_data)):
+                        if i != index:
+                            self._series_enabled_data[i] = False
                 self._series_enabled_data[index] = checked
                 self._apply_series_id_order(self._enabled_partitioned_series_id_order())
                 self._restore_active_series_from_id(selected_id)
@@ -4404,12 +4540,13 @@ def launch_plot_settings_panel(
             item.setText("")
             row_widget = self.series_list.itemWidget(item)
             if isinstance(row_widget, _SeriesRowWidget):
+                heatmap_active = self._is_orientation_heatmap_mode()
                 row_widget.update_content(
                     text=self._display_row_text(index).replace("·", "-"),
                     checked=enabled,
                     enabled=enabled,
                     selected=self.series_list.currentRow() == index,
-                    color_token=self._effective_series_color(base_index),
+                    color_token="" if heatmap_active else self._effective_series_color(base_index),
                     is_fit_child=kind == "fit",
                     can_move_up=base_index > 0,
                     can_move_down=base_index < len(self._series_labels_data) - 1,
@@ -4525,6 +4662,26 @@ def launch_plot_settings_panel(
                 tooltip_id="data.section.reducer",
             )
             self._x_bin_reducer_row = (binning_form, self.x_bin_reducer)
+
+            if self._analysis_name == "orientation":
+                self.y_bin_width = self._line("Leave blank to use the data width")
+                self.y_bin_width.textChanged.connect(self._refresh_widget_states)
+                self.y_bin_reducer = self._combo(_BIN_REDUCERS)
+                self._add_form_row(
+                    binning_form,
+                    "Y section width",
+                    self.y_bin_width,
+                    tooltip_id="data.section.y_width",
+                )
+                self._add_form_row(
+                    binning_form,
+                    "Y reducer",
+                    self.y_bin_reducer,
+                    tooltip_id="data.section.y_reducer",
+                )
+                self._y_bin_width_row = (binning_form, self.y_bin_width)
+                self._y_bin_reducer_row = (binning_form, self.y_bin_reducer)
+
             layout.addWidget(binning)
 
         def _build_data_tab(self) -> None:
@@ -5667,6 +5824,8 @@ def launch_plot_settings_panel(
             )
             for widget in line_widgets:
                 widget.textChanged.connect(self._schedule_preview_update)
+            if hasattr(self, "y_bin_width"):
+                self.y_bin_width.textChanged.connect(self._schedule_preview_update)
 
             combo_widgets = (
                 self.legend_mode,
@@ -5688,6 +5847,8 @@ def launch_plot_settings_panel(
             )
             for widget in combo_widgets:
                 widget.currentTextChanged.connect(self._schedule_preview_update)
+            if hasattr(self, "y_bin_reducer"):
+                self.y_bin_reducer.currentTextChanged.connect(self._schedule_preview_update)
 
         def _handle_auto_preview_toggle(self, checked: bool) -> None:
             if not checked:
@@ -5814,7 +5975,7 @@ def launch_plot_settings_panel(
                     render_state = on_preview(settings)
                     if isinstance(render_state, dict) and render_state:
                         self._apply_preview_state_to_synced_fields(render_state)
-                    self._status_label.setText("Preview opened.")
+                    self._preview_error = None
                     self._preview_status.setText("External preview opened.")
                     self._refresh_shell_state()
                     return True
@@ -5822,7 +5983,8 @@ def launch_plot_settings_panel(
                     if interactive:
                         self._report_error("Preview failed", exc)
                     else:
-                        self._preview_status.setText(f"Preview paused: {exc}")
+                        self._preview_error = str(exc)
+                        self._preview_status.setText("Preview paused.")
                         self._refresh_shell_state()
                     return False
                 finally:
@@ -5843,7 +6005,7 @@ def launch_plot_settings_panel(
                     raise RuntimeError("Could not load rendered preview image.")
                 self._preview_pixmap = pixmap
                 self._refresh_preview_pixmap()
-                self._status_label.setText("Preview updated.")
+                self._preview_error = None
                 self._preview_status.setText("Preview updated.")
                 self._refresh_shell_state()
                 return True
@@ -5851,7 +6013,8 @@ def launch_plot_settings_panel(
                 if interactive:
                     self._report_error("Preview failed", exc)
                 else:
-                    self._preview_status.setText(f"Preview paused: {exc}")
+                    self._preview_error = str(exc)
+                    self._preview_status.setText("Preview paused.")
                     self._refresh_shell_state()
                 return False
             finally:
@@ -6255,8 +6418,79 @@ def launch_plot_settings_panel(
                     self.coordination_time_axis,
                     str(settings.get("time_axis") or "ps"),
                 )
+            if hasattr(self, "orientation_component"):
+                self.orientation_component.blockSignals(True)
+                try:
+                    self._set_combo_value(
+                        self.orientation_component,
+                        str(settings.get("component") or "average"),
+                    )
+                finally:
+                    self.orientation_component.blockSignals(False)
+            if hasattr(self, "orientation_angle"):
+                self._set_combo_value(
+                    self.orientation_angle,
+                    str(settings.get("angle") or "polar"),
+                )
+            if hasattr(self, "heatmap_vmin"):
+                vmin_raw = settings.get("heatmap_vmin")
+                self.heatmap_vmin.setText(str(vmin_raw) if vmin_raw is not None else "")
+            if hasattr(self, "heatmap_vmax"):
+                vmax_raw = settings.get("heatmap_vmax")
+                self.heatmap_vmax.setText(str(vmax_raw) if vmax_raw is not None else "")
+            if hasattr(self, "heatmap_cmap"):
+                self._set_combo_value(
+                    self.heatmap_cmap,
+                    str(settings.get("heatmap_cmap") or "viridis"),
+                )
+            if hasattr(self, "heatmap_normalize"):
+                self.heatmap_normalize.setChecked(bool(settings.get("heatmap_normalize", False)))
+            if hasattr(self, "heatmap_colorbar_label"):
+                raw_cb_label = settings.get("heatmap_colorbar_label")
+                if raw_cb_label is None:
+                    self.heatmap_colorbar_label.setText("")
+                elif raw_cb_label == "":
+                    self.heatmap_colorbar_label.setText("none")
+                else:
+                    self.heatmap_colorbar_label.setText(str(raw_cb_label))
+            if hasattr(self, "heatmap_colorbar_label_size"):
+                raw = settings.get("heatmap_colorbar_label_size")
+                self.heatmap_colorbar_label_size.setText(str(raw) if raw is not None else "")
+            if hasattr(self, "heatmap_colorbar_tick_size"):
+                raw = settings.get("heatmap_colorbar_tick_size")
+                self.heatmap_colorbar_tick_size.setText(str(raw) if raw is not None else "")
+            if hasattr(self, "heatmap_colorbar_enabled"):
+                self.heatmap_colorbar_enabled.setChecked(
+                    bool(settings.get("heatmap_colorbar_enabled", True))
+                )
+            if hasattr(self, "heatmap_colorbar_position"):
+                self._set_combo_value(
+                    self.heatmap_colorbar_position,
+                    str(settings.get("heatmap_colorbar_position") or "right"),
+                )
+            if hasattr(self, "heatmap_colorbar_pad"):
+                raw = settings.get("heatmap_colorbar_pad")
+                self.heatmap_colorbar_pad.setText(
+                    str(raw) if raw is not None else "0.05"
+                )
+            if hasattr(self, "heatmap_colorbar_shrink"):
+                raw = settings.get("heatmap_colorbar_shrink")
+                self.heatmap_colorbar_shrink.setText(
+                    str(raw) if raw is not None else "1.0"
+                )
+            if hasattr(self, "heatmap_colorbar_aspect"):
+                raw = settings.get("heatmap_colorbar_aspect")
+                self.heatmap_colorbar_aspect.setText(
+                    str(raw) if raw is not None else "20"
+                )
             self.x_bin_width.setText(str(settings.get("x_bin_width") or ""))
             self._set_combo_value(self.x_bin_reducer, str(settings.get("x_bin_reducer") or "mean"))
+            if hasattr(self, "y_bin_width"):
+                self.y_bin_width.setText(str(settings.get("y_bin_width") or ""))
+            if hasattr(self, "y_bin_reducer"):
+                self._set_combo_value(
+                    self.y_bin_reducer, str(settings.get("y_bin_reducer") or "mean")
+                )
             self._initialize_series_data(settings)
             self._initialize_normalization_data(settings)
             self._update_potential_summary_panel(settings)
@@ -6281,6 +6515,13 @@ def launch_plot_settings_panel(
                 else:
                     self._set_synced_field_lock(key, synced_locks.get(key, False))
             self._apply_preview_state_to_synced_fields(settings)
+
+        def _is_orientation_heatmap_mode(self) -> bool:
+            return (
+                self._analysis_name == "orientation"
+                and hasattr(self, "orientation_component")
+                and self.orientation_component.currentText().strip().lower() == "heatmap"
+            )
 
         def _refresh_widget_states(self, *_unused: object) -> None:
             title_enabled = self._synced_field_mode("title") != "off"
@@ -6390,6 +6631,94 @@ def launch_plot_settings_panel(
                     ""
                     if not coordination_time_distance
                     else "Normalization is unavailable for the time-distance view."
+                )
+            # ── orientation heatmap mode ──────────────────────────────
+            is_heatmap = self._is_orientation_heatmap_mode()
+            if self._figure_tabs is not None:
+                if is_heatmap and not self._heatmap_tab_is_shown:
+                    idx = self._figure_tabs.indexOf(self._tab_lines)
+                    if idx >= 0:
+                        self._figure_tabs.removeTab(idx)
+                    canvas_idx = self._figure_tabs.indexOf(self._tab_canvas)
+                    insert_pos = canvas_idx if canvas_idx >= 0 else self._figure_tabs.count()
+                    self._figure_tabs.insertTab(insert_pos, self._tab_heatmap, "Heatmap")
+                    self._heatmap_tab_is_shown = True
+                    self._pre_heatmap_grid_mode = self.grid_mode.currentText()
+                    self._set_combo_value(self.grid_mode, "Off")
+                elif not is_heatmap and self._heatmap_tab_is_shown:
+                    idx = self._figure_tabs.indexOf(self._tab_heatmap)
+                    if idx >= 0:
+                        self._figure_tabs.removeTab(idx)
+                    canvas_idx = self._figure_tabs.indexOf(self._tab_canvas)
+                    insert_pos = canvas_idx if canvas_idx >= 0 else self._figure_tabs.count()
+                    self._figure_tabs.insertTab(insert_pos, self._tab_lines, "Lines && Markers")
+                    self._heatmap_tab_is_shown = False
+                    restored = getattr(self, "_pre_heatmap_grid_mode", "On")
+                    self._set_combo_value(self.grid_mode, restored)
+                legend_tab_idx = self._figure_tabs.indexOf(self._tab_legend)
+                if legend_tab_idx >= 0:
+                    self._figure_tabs.setTabEnabled(legend_tab_idx, not is_heatmap)
+                    self._figure_tabs.setTabToolTip(
+                        legend_tab_idx,
+                        "" if not is_heatmap else "Legend is unavailable for heatmap views.",
+                    )
+            if self._data_transform_group is not None and self._analysis_name == "orientation":
+                self._data_transform_group.setEnabled(True)
+                self._data_transform_group.setToolTip("")
+            if self._y_bin_width_row is not None:
+                self._set_form_row_visible(
+                    self._y_bin_width_row[0],
+                    self._y_bin_width_row[1],
+                    is_heatmap,
+                )
+            if self._y_bin_reducer_row is not None:
+                y_rebin_enabled = (
+                    is_heatmap
+                    and bool(getattr(self, "y_bin_width", None))
+                    and bool(self.y_bin_width.text().strip())
+                )
+                self._set_form_row_visible(
+                    self._y_bin_reducer_row[0],
+                    self._y_bin_reducer_row[1],
+                    is_heatmap,
+                )
+                if is_heatmap:
+                    self._set_form_row_enabled(
+                        self._y_bin_reducer_row[0],
+                        self._y_bin_reducer_row[1],
+                        y_rebin_enabled,
+                        disabled_reason="set a Y section width first.",
+                    )
+            if self._normalization_group is not None and self._analysis_name == "orientation":
+                self._normalization_group.setEnabled(not is_heatmap)
+                self._normalization_group.setToolTip(
+                    ""
+                    if not is_heatmap
+                    else "Normalization is unavailable for heatmap views."
+                )
+            if is_heatmap:
+                heatmap_tip = "This control applies to line plots only."
+                for widget_name in (
+                    "series_color",
+                    "series_alpha",
+                    "series_line_width",
+                    "series_marker",
+                    "series_show_in_legend",
+                    "series_line_kwargs_json",
+                ):
+                    widget = getattr(self, widget_name, None)
+                    if widget is not None:
+                        widget.setEnabled(False)
+                        self._apply_widget_tooltip(widget, disabled_reason=heatmap_tip)
+                self._set_rows_enabled(
+                    self._legend_rows,
+                    False,
+                    disabled_reason="legend is unavailable for heatmap views.",
+                )
+                self._set_rows_enabled(
+                    self._marker_rows,
+                    False,
+                    disabled_reason="markers are unavailable for heatmap views.",
                 )
             if self._x_bin_reducer_row is not None:
                 self._set_form_row_enabled(
@@ -6977,6 +7306,12 @@ def launch_plot_settings_panel(
             if x_bin_width is not None and x_bin_width <= 0:
                 raise ValueError("x-bin-width must be positive.")
 
+            y_bin_width: float | None = None
+            if hasattr(self, "y_bin_width"):
+                y_bin_width = _optional_float(self.y_bin_width.text(), field_name="y-bin-width")
+                if y_bin_width is not None and y_bin_width <= 0:
+                    raise ValueError("y-bin-width must be positive.")
+
             x_min = _synced_float("x_lim", self.x_min, field_name="x-min")
             x_max = _synced_float("x_lim", self.x_max, field_name="x-max")
             y_min = _synced_float("y_lim", self.y_min, field_name="y-min")
@@ -7055,6 +7390,10 @@ def launch_plot_settings_panel(
                 "x_bin_reducer": (self.x_bin_reducer.currentText().strip() or "mean")
                 if x_bin_width is not None
                 else None,
+                "y_bin_width": y_bin_width,
+                "y_bin_reducer": (self.y_bin_reducer.currentText().strip() or "mean")
+                if hasattr(self, "y_bin_reducer") and y_bin_width is not None
+                else None,
                 "grid_linestyle": _explicit_text(self.grid_linestyle.currentText()) or None,
                 "grid_linewidth": _optional_float(
                     self.grid_linewidth.text(), field_name="grid-linewidth"
@@ -7120,6 +7459,61 @@ def launch_plot_settings_panel(
                 )
             if hasattr(self, "coordination_time_axis"):
                 settings["time_axis"] = self.coordination_time_axis.currentText().strip() or "ps"
+            if hasattr(self, "orientation_component"):
+                settings["component"] = (
+                    self.orientation_component.currentText().strip() or "average"
+                )
+            if hasattr(self, "orientation_angle"):
+                settings["angle"] = (
+                    self.orientation_angle.currentText().strip() or "polar"
+                )
+            if hasattr(self, "heatmap_vmin"):
+                settings["heatmap_vmin"] = _optional_float(
+                    self.heatmap_vmin.text(), field_name="heatmap vmin"
+                )
+            if hasattr(self, "heatmap_vmax"):
+                settings["heatmap_vmax"] = _optional_float(
+                    self.heatmap_vmax.text(), field_name="heatmap vmax"
+                )
+            if hasattr(self, "heatmap_cmap"):
+                settings["heatmap_cmap"] = (
+                    self.heatmap_cmap.currentText().strip() or None
+                )
+            if hasattr(self, "heatmap_normalize"):
+                settings["heatmap_normalize"] = self.heatmap_normalize.isChecked()
+            if hasattr(self, "heatmap_colorbar_label"):
+                raw = self.heatmap_colorbar_label.text().strip()
+                if raw.lower() in {"none", "off"}:
+                    settings["heatmap_colorbar_label"] = ""
+                elif raw and raw.lower() != "auto":
+                    settings["heatmap_colorbar_label"] = raw
+                else:
+                    settings["heatmap_colorbar_label"] = None
+            if hasattr(self, "heatmap_colorbar_label_size"):
+                settings["heatmap_colorbar_label_size"] = _optional_positive_int_or_none(
+                    self.heatmap_colorbar_label_size.text(), field_name="colorbar label size"
+                )
+            if hasattr(self, "heatmap_colorbar_tick_size"):
+                settings["heatmap_colorbar_tick_size"] = _optional_positive_int_or_none(
+                    self.heatmap_colorbar_tick_size.text(), field_name="colorbar tick size"
+                )
+            if hasattr(self, "heatmap_colorbar_enabled"):
+                settings["heatmap_colorbar_enabled"] = self.heatmap_colorbar_enabled.isChecked()
+            if hasattr(self, "heatmap_colorbar_position"):
+                val = self.heatmap_colorbar_position.currentText().strip().lower()
+                settings["heatmap_colorbar_position"] = val if val in {"right", "left", "top", "bottom"} else "right"
+            if hasattr(self, "heatmap_colorbar_pad"):
+                settings["heatmap_colorbar_pad"] = _optional_float(
+                    self.heatmap_colorbar_pad.text(), field_name="colorbar padding"
+                )
+            if hasattr(self, "heatmap_colorbar_shrink"):
+                settings["heatmap_colorbar_shrink"] = _optional_float(
+                    self.heatmap_colorbar_shrink.text(), field_name="colorbar shrink"
+                )
+            if hasattr(self, "heatmap_colorbar_aspect"):
+                settings["heatmap_colorbar_aspect"] = _optional_float(
+                    self.heatmap_colorbar_aspect.text(), field_name="colorbar aspect"
+                )
             return settings
 
         def _report_error(self, title_text: str, exc: Exception) -> None:
@@ -7362,13 +7756,17 @@ def launch_plot_settings_panel(
             event.accept()
 
     app = QApplication.instance()
-    created_app = False
     if app is None:
         app = QApplication([])
-        created_app = True
 
     window = _PlotSettingsWindow()
     window.show()
 
-    if created_app:
-        app.exec()
+    # Ensure window is on a visible screen (guards against stale geometry).
+    if QApplication.screenAt(window.geometry().center()) is None:
+        primary = QApplication.primaryScreen()
+        if primary is not None:
+            avail = primary.availableGeometry()
+            window.move(avail.x() + 50, avail.y() + 50)
+
+    app.exec()

@@ -64,6 +64,11 @@ linak plot traj_coordination_o_h.h5
 
 Run `linak` for information or `linak --help` for the full CLI overview.
 
+Method documentation for the compute analyses lives under
+[`docs/`](docs/README.md). Those notes explain
+what each analysis actually computes, which assumptions are made, and what is
+written into the HDF5 output.
+
 
 Python API example:
 
@@ -190,6 +195,19 @@ Many `linak hdf5` commands are semi-interactive: if required columns or options
 are omitted, LiNaK can prompt with available choices.
 
 ## Analysis Notes
+
+Detailed method notes:
+
+- [Density](docs/density.md)
+- [MSD](docs/msd.md)
+- [Position](docs/position.md)
+- [RDF](docs/rdf.md)
+- [Coordination](docs/coordination.md)
+- [Potential](docs/potential.md)
+- [Orientation](docs/orientation.md)
+- [Surface Estimation](docs/surface-estimation.md)
+- [Water Detection And Water Geometry](docs/water-detection.md)
+- [HDF5 Data Model And Metadata Conventions](docs/hdf5-data-model.md)
 
 ### Density
 

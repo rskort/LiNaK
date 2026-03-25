@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 import re
 
@@ -174,19 +175,14 @@ def extract_cell_from_cp2k_input(path: str | Path) -> tuple[float, float, float]
                 f"{angle_line_number}, but LiNaK PBC handling currently supports "
                 "orthorhombic cells only (90 90 90)."
             )
-        LOGGER.info(
-            "Validated CP2K ALPHA_BETA_GAMMA from '%s' line %d: %.6g %.6g %.6g deg.",
-            input_path,
-            angle_line_number,
-            angles[0],
-            angles[1],
-            angles[2],
-        )
 
+    try:
+        display = os.path.relpath(input_path)
+    except ValueError:
+        display = str(input_path)
     LOGGER.info(
-        "Parsed CP2K ABC cell from '%s' line %d: %.6g %.6g %.6g Angstrom.",
-        input_path,
-        abc_line_number,
+        "Parsed CP2K cell from '%s': %.6g \u00d7 %.6g \u00d7 %.6g \u00c5 (90\u00b0 90\u00b0 90\u00b0).",
+        display,
         cell[0],
         cell[1],
         cell[2],

@@ -7,6 +7,7 @@ from ase.constraints import FixAtoms
 import h5py
 
 import linak.analysis.density as density_module
+import linak.analysis.water as water_module
 from linak.analysis.density import (
     available_element_species,
     compute_density_profiles,
@@ -458,7 +459,7 @@ def test_compute_density_profiles_all_reuses_cached_h2o_topology(monkeypatch):
         ],
     )
     frames = [frame.copy() for _ in range(density_module.H2O_VALIDATION_STRIDE + 1)]
-    original = density_module._water_molecule_triplets
+    original = water_module.water_molecule_triplets
     call_count = 0
 
     def counting_water_molecule_triplets(*args, **kwargs):
@@ -467,8 +468,8 @@ def test_compute_density_profiles_all_reuses_cached_h2o_topology(monkeypatch):
         return original(*args, **kwargs)
 
     monkeypatch.setattr(
-        density_module,
-        "_water_molecule_triplets",
+        water_module,
+        "water_molecule_triplets",
         counting_water_molecule_triplets,
     )
 
@@ -747,7 +748,7 @@ def test_density_surface_logging_explains_reference_estimator_and_fill(caplog):
         pbc=True,
     )
 
-    caplog.set_level(logging.INFO, logger="linak.analysis.density")
+    caplog.set_level(logging.DEBUG, logger="linak.analysis.density")
     compute_density_profile(
         frames=[frame1, frame2, frame3, frame4],
         species="O",

@@ -44,6 +44,15 @@ from ..plot.plotting import (
 )
 from ..progress import ProgressBar
 from ..utils import axis_to_index, ensure_positive
+from .water import (
+    water_molecule_triplets as _water_molecule_triplets,
+    water_triplet_axis_values_with_masses as _water_triplet_axis_values_with_masses,
+    water_axis_values_per_frame as _water_axis_values_per_frame_impl,
+    water_oxygen_indices as _water_oxygen_indices_impl,
+    H2O_OH_CUTOFF_A as _WATER_OH_CUTOFF_A,
+    H2O_VALIDATION_STRIDE as _WATER_VALIDATION_STRIDE,
+    AMU_TO_G as _WATER_AMU_TO_G,
+)
 
 LOGGER = logging.getLogger(__name__)
 H2O_VALIDATION_STRIDE = 100
@@ -777,7 +786,7 @@ def _select_surface_estimate(
     resolved_element_set = set(resolved_elements)
 
     selection_label = "auto-detected" if element_source == "auto" else "user-selected"
-    LOGGER.info(
+    LOGGER.debug(
         "Surface reference along %s: %s %s.",
         axis.upper(),
         selection_label,
@@ -835,14 +844,14 @@ def _select_surface_estimate(
         axis=axis,
         reference_elements=resolved_elements,
     )
-    LOGGER.info(
+    LOGGER.debug(
         "Surface estimator along %s: %s.",
         axis.upper(),
         selected_method_description,
     )
     tracked_fill_count = _extract_surface_method_argument(selected_estimate.method, key="n")
     if "+tracked_top_layer_fill" in selected_estimate.method and tracked_fill_count is not None:
-        LOGGER.info(
+        LOGGER.debug(
             "Surface estimator gaps along %s: filled %s missing frame values with tracked "
             "top-layer mean from nearest valid layered frames.",
             axis.upper(),
@@ -864,7 +873,7 @@ def _select_surface_estimate(
         )
         missing_after = int(np.count_nonzero(~np.isfinite(selected_estimate.per_frame)))
         if missing_after < missing_before:
-            LOGGER.info(
+            LOGGER.debug(
                 "Surface estimator gaps along %s: filled %d/%d missing frame values with "
                 "per-frame %s q%d of %s after %s left them undefined.",
                 axis.upper(),
@@ -1009,127 +1018,31 @@ def _select_water_axis_values_with_masses(
     frame: Atoms, axis_index: int, oh_cutoff: float = H2O_OH_CUTOFF_A
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return COM axis positions and molecular masses for detected water molecules."""
-    water_triplets = _water_molecule_triplets(frame, oh_cutoff=oh_cutoff)
-    if water_triplets.size == 0:
+    triplets = _water_molecule_triplets(frame, oh_cutoff=oh_cutoff)
+    if triplets.size == 0:
         return np.array([], dtype=float), np.array([], dtype=float)
-    return _select_water_triplet_axis_values_with_masses(frame, water_triplets, axis_index)
-
-
-def _water_molecule_triplets(frame: Atoms, oh_cutoff: float = H2O_OH_CUTOFF_A) -> np.ndarray:
-    """Return unique ``(O, H1, H2)`` triplets for genuine water molecules."""
-    oxygen_indices, hydrogen_indices = neighbor_list("ij", frame, {("O", "H"): oh_cutoff})
-    if oxygen_indices.size == 0:
-        return np.empty((0, 3), dtype=int)
-
-    oxygen_to_hydrogen: dict[int, set[int]] = {}
-    hydrogen_to_oxygen: dict[int, set[int]] = {}
-    for oxygen_index, hydrogen_index in zip(
-        oxygen_indices.astype(int, copy=False),
-        hydrogen_indices.astype(int, copy=False),
-    ):
-        oxygen_key = int(oxygen_index)
-        hydrogen_key = int(hydrogen_index)
-        oxygen_to_hydrogen.setdefault(oxygen_key, set()).add(hydrogen_key)
-        hydrogen_to_oxygen.setdefault(hydrogen_key, set()).add(oxygen_key)
-
-    water_triplets: list[tuple[int, int, int]] = []
-    for oxygen_index in sorted(oxygen_to_hydrogen):
-        bonded_hydrogen_indices = sorted(oxygen_to_hydrogen[oxygen_index])
-        if len(bonded_hydrogen_indices) != 2:
-            continue
-        if any(
-            len(hydrogen_to_oxygen[hydrogen_index]) != 1
-            for hydrogen_index in bonded_hydrogen_indices
-        ):
-            continue
-        water_triplets.append(
-            (oxygen_index, bonded_hydrogen_indices[0], bonded_hydrogen_indices[1])
-        )
-
-    if not water_triplets:
-        return np.empty((0, 3), dtype=int)
-    return np.asarray(water_triplets, dtype=int)
+    return _water_triplet_axis_values_with_masses(frame, triplets, axis_index)
 
 
 def _select_water_triplet_axis_values_with_masses(
     frame: Atoms, water_triplets: np.ndarray, axis_index: int
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return PBC-aware water COM axis positions and molecular masses."""
-    if water_triplets.size == 0:
-        return np.array([], dtype=float), np.array([], dtype=float)
-
-    oxygen_indices = water_triplets[:, 0]
-    hydrogen1_indices = water_triplets[:, 1]
-    hydrogen2_indices = water_triplets[:, 2]
-    positions = np.asarray(frame.positions, dtype=float)
-    oxygen_positions = positions[oxygen_indices]
-    hydrogen1_vectors, _ = find_mic(
-        positions[hydrogen1_indices] - oxygen_positions,
-        frame.cell,
-        pbc=frame.pbc,
-    )
-    hydrogen2_vectors, _ = find_mic(
-        positions[hydrogen2_indices] - oxygen_positions,
-        frame.cell,
-        pbc=frame.pbc,
-    )
-    hydrogen1_positions = oxygen_positions + hydrogen1_vectors
-    hydrogen2_positions = oxygen_positions + hydrogen2_vectors
-
-    atomic_masses_amu = np.asarray(frame.get_masses(), dtype=float)
-    oxygen_masses = atomic_masses_amu[oxygen_indices]
-    hydrogen1_masses = atomic_masses_amu[hydrogen1_indices]
-    hydrogen2_masses = atomic_masses_amu[hydrogen2_indices]
-    molecular_masses_amu = oxygen_masses + hydrogen1_masses + hydrogen2_masses
-    com_positions = (
-        oxygen_positions * oxygen_masses[:, None]
-        + hydrogen1_positions * hydrogen1_masses[:, None]
-        + hydrogen2_positions * hydrogen2_masses[:, None]
-    ) / molecular_masses_amu[:, None]
-    axis_values = np.asarray(com_positions[:, axis_index], dtype=float)
-    molecular_masses = np.asarray(molecular_masses_amu * AMU_TO_G, dtype=float)
-    return axis_values, molecular_masses
+    return _water_triplet_axis_values_with_masses(frame, water_triplets, axis_index)
 
 
 def _select_water_axis_values_per_frame(
     frames: list[Atoms], axis_index: int
 ) -> tuple[list[np.ndarray], list[np.ndarray]]:
     """Select water-molecule COM axis values with periodic cached-topology validation."""
-    selected_per_frame: list[np.ndarray] = []
-    selected_masses_per_frame: list[np.ndarray] = []
-    cached_water_triplets: np.ndarray | None = None
-
-    with ProgressBar(desc="Selecting H2O for density", total=len(frames), unit="frame") as progress:
-        for frame_index, frame in enumerate(frames):
-            if cached_water_triplets is None:
-                cached_water_triplets = _water_molecule_triplets(frame)
-            elif frame_index % H2O_VALIDATION_STRIDE == 0:
-                validated_water_triplets = _water_molecule_triplets(frame)
-                if not np.array_equal(validated_water_triplets, cached_water_triplets):
-                    LOGGER.warning(
-                        "Detected H2O topology change at frame %d; refreshing cached water triplets.",
-                        frame_index,
-                    )
-                    cached_water_triplets = validated_water_triplets
-
-            axis_values, masses = _select_water_triplet_axis_values_with_masses(
-                frame,
-                cached_water_triplets,
-                axis_index,
-            )
-            selected_per_frame.append(axis_values)
-            selected_masses_per_frame.append(masses)
-            progress.update()
-
-    return selected_per_frame, selected_masses_per_frame
+    return _water_axis_values_per_frame_impl(
+        frames, axis_index, progress_desc="Selecting H2O for density",
+    )
 
 
 def _water_oxygen_indices(frame: Atoms, oh_cutoff: float = H2O_OH_CUTOFF_A) -> np.ndarray:
     """Return oxygen indices classified as water oxygens (exactly two unique H neighbors)."""
-    water_triplets = _water_molecule_triplets(frame, oh_cutoff=oh_cutoff)
-    if water_triplets.size == 0:
-        return np.array([], dtype=int)
-    return water_triplets[:, 0].astype(int, copy=False)
+    return _water_oxygen_indices_impl(frame, oh_cutoff=oh_cutoff)
 
 
 def _compute_density_profile_from_selected(

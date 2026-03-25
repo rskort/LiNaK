@@ -49,6 +49,7 @@ _PLOT_PROFILE_RDF = "plot:rdf"
 _PLOT_PROFILE_POSITION = "plot:position"
 _PLOT_PROFILE_COORDINATION = "plot:coordination"
 _PLOT_PROFILE_POTENTIAL = "plot:potential"
+_PLOT_PROFILE_ORIENTATION = "plot:orientation"
 _PLOT_PROFILE_TABLE = "plot:table"
 _ANALYSIS_TO_PROFILE_KEY = {
     "density": _PLOT_PROFILE_DENSITY,
@@ -57,6 +58,7 @@ _ANALYSIS_TO_PROFILE_KEY = {
     "position": _PLOT_PROFILE_POSITION,
     "coordination": _PLOT_PROFILE_COORDINATION,
     "potential": _PLOT_PROFILE_POTENTIAL,
+    "orientation": _PLOT_PROFILE_ORIENTATION,
     "table": _PLOT_PROFILE_TABLE,
 }
 _PROFILE_KEY_TO_ANALYSIS = {value: key for key, value in _ANALYSIS_TO_PROFILE_KEY.items()}
@@ -316,6 +318,25 @@ _PLOT_SETTINGS_COORDINATION_KEYS = (
     *_PLOT_SETTINGS_COMMON_KEYS,
 )
 _PLOT_SETTINGS_POTENTIAL_KEYS = (*_PLOT_SETTINGS_COMMON_KEYS,)
+_PLOT_SETTINGS_ORIENTATION_KEYS = (
+    "component",
+    "angle",
+    "heatmap_vmin",
+    "heatmap_vmax",
+    "heatmap_cmap",
+    "heatmap_normalize",
+    "heatmap_colorbar_enabled",
+    "heatmap_colorbar_label",
+    "heatmap_colorbar_label_size",
+    "heatmap_colorbar_tick_size",
+    "heatmap_colorbar_position",
+    "heatmap_colorbar_pad",
+    "heatmap_colorbar_shrink",
+    "heatmap_colorbar_aspect",
+    "y_bin_width",
+    "y_bin_reducer",
+    *_PLOT_SETTINGS_COMMON_KEYS,
+)
 _PLOT_SETTINGS_TABLE_KEYS = (
     "kind",
     "group",
@@ -515,6 +536,16 @@ def _compact_path_for_log(path: str | Path, *, max_chars: int = 36) -> str:
     return "..." + text[-(max_chars - 3) :]
 
 
+def _display_path(path: str | Path) -> str:
+    """Return a human-friendly path for log messages, preferring relative form."""
+    try:
+        rel = os.path.relpath(path)
+    except ValueError:
+        return str(path)
+    abs_str = str(path)
+    return rel if len(rel) <= len(abs_str) else abs_str
+
+
 def _describe_cell_resolution(
     cell_arg: tuple[float, float, float] | None, input_path: str | None
 ) -> str:
@@ -702,6 +733,25 @@ def _density_hdf5_output_path(
     return _resolve_single_analysis_hdf5_output_path(
         base_output,
         _default_density_hdf5_output_path(source, species, axis),
+    )
+
+
+def _default_orientation_hdf5_output_path(source: str | Path, axis: str) -> Path:
+    source_path = Path(source).expanduser().resolve()
+    stem = source_path.stem or "trajectory"
+    filename = f"{stem}_orientation_{axis.lower()}.h5"
+    return _linak_output_dir_for_source(source_path) / filename
+
+
+def _orientation_hdf5_output_path(
+    base_output: str | None,
+    source: str | Path,
+    *,
+    axis: str,
+) -> Path:
+    return _resolve_single_analysis_hdf5_output_path(
+        base_output,
+        _default_orientation_hdf5_output_path(source, axis),
     )
 
 
@@ -1290,6 +1340,91 @@ def _load_density_plot_profiles(
         series_id_segments_by_source.append(
             [
                 _profile_uid_from_payload(payload, fallback_prefix="density", index=profile_index)
+                for profile_index, payload in enumerate(raw_payloads)
+            ]
+        )
+        origin_path_segments_by_source.append(
+            [
+                str(payload.get("metadata", {}).get("origin_hdf5_path") or sources[0])
+                for payload in raw_payloads
+            ]
+        )
+
+    return (
+        plot_profiles,
+        fallback_labels_by_source,
+        series_id_segments_by_source,
+        origin_path_segments_by_source,
+    )
+
+
+def _load_orientation_plot_profiles(
+    *,
+    sources: list[str],
+) -> tuple[list[Any], list[list[str]], list[list[str]], list[list[str]]]:
+    from .analysis.orientation import load_orientation_profiles
+
+    raw_payloads_by_source = _read_analysis_profile_payloads_by_source(
+        sources=sources,
+        analysis="orientation",
+    )
+    prefix_source_labels = _should_prefix_combined_source_labels(
+        sources=sources,
+        metadata_items=[
+            dict(payload.get("metadata", {}))
+            for _source, source_payloads in raw_payloads_by_source
+            for payload in source_payloads
+        ],
+    )
+    profiles_by_source: list[tuple[str, list[Any]]] = []
+    for source in sources:
+        profiles = load_orientation_profiles(source)
+        profiles_by_source.append((source, profiles))
+
+    plot_profiles: list[Any] = []
+    fallback_labels_by_source: list[list[str]] = []
+    series_id_segments_by_source: list[list[str]] = []
+    origin_path_segments_by_source: list[list[str]] = []
+    if prefix_source_labels:
+        for source_index, (source, profiles) in enumerate(profiles_by_source):
+            raw_payloads = raw_payloads_by_source[source_index][1]
+            if len(raw_payloads) != len(profiles):
+                raise ValueError("Orientation profile metadata does not match loaded profiles.")
+            source_labels: list[str] = []
+            source_ids: list[str] = []
+            source_origins: list[str] = []
+            for profile_index, profile in enumerate(profiles):
+                payload = raw_payloads[profile_index]
+                metadata = dict(payload.get("metadata", {}))
+                source_label = _metadata_source_label(metadata, fallback_source=source)
+                rendered_label = f"{source_label}:orientation"
+                source_labels.append(rendered_label)
+                source_ids.append(
+                    _profile_uid_from_payload(
+                        payload, fallback_prefix="orientation", index=profile_index
+                    )
+                )
+                source_origins.append(
+                    str(payload.get("metadata", {}).get("origin_hdf5_path") or source)
+                )
+                plot_profiles.append(profile)
+            fallback_labels_by_source.append(source_labels)
+            series_id_segments_by_source.append(source_ids)
+            origin_path_segments_by_source.append(source_origins)
+    else:
+        flattened = _flatten_profiles_by_source(profiles_by_source)
+        plot_profiles.extend(flattened)
+        fallback_labels_by_source.append(
+            [f"orientation [{i}]" for i in range(len(flattened))]
+        )
+        raw_payloads = raw_payloads_by_source[0][1]
+        if len(raw_payloads) != len(flattened):
+            raise ValueError("Orientation profile metadata does not match loaded profiles.")
+        series_id_segments_by_source.append(
+            [
+                _profile_uid_from_payload(
+                    payload, fallback_prefix="orientation", index=profile_index
+                )
                 for profile_index, payload in enumerate(raw_payloads)
             ]
         )
@@ -2328,6 +2463,8 @@ def _profile_key_from_analysis(analysis: str | None) -> str:
         return _PLOT_PROFILE_COORDINATION
     if normalized == "potential":
         return _PLOT_PROFILE_POTENTIAL
+    if normalized == "orientation":
+        return _PLOT_PROFILE_ORIENTATION
     return _PLOT_PROFILE_TABLE
 
 
@@ -2354,6 +2491,8 @@ def _resolve_plot_profile_key(
         return _PLOT_PROFILE_COORDINATION
     if normalized == "potential":
         return _PLOT_PROFILE_POTENTIAL
+    if normalized == "orientation":
+        return _PLOT_PROFILE_ORIENTATION
     if normalized in {"table", "hdf5"}:
         return _PLOT_PROFILE_TABLE
     raise ValueError(f"Unsupported plot profile '{profile_token}'.")
@@ -2918,6 +3057,7 @@ def _maybe_apply_density_cell(
     input_path: str | None,
     pre_resolved: Any | None = None,
     preflight_error: Exception | None = None,
+    analysis_label: str = "density analysis",
 ) -> tuple[tuple[float, float, float] | None, str, str | None]:
     """Try to resolve/apply a periodic cell for density; return None on fallback."""
     from .resolution import resolve_analysis_cell
@@ -2926,8 +3066,9 @@ def _maybe_apply_density_cell(
     if cell is None and input_path is None and has_trajectory_cell:
         resolved = _cell_lengths_from_frame(frames[0])
         LOGGER.info(
-            "Using periodic cell already present in trajectory for density analysis: "
+            "Using periodic cell already present in trajectory for %s: "
             "A=%.6g, B=%.6g, C=%.6g Angstrom.",
+            analysis_label,
             resolved[0],
             resolved[1],
             resolved[2],
@@ -2950,19 +3091,22 @@ def _maybe_apply_density_cell(
         if cell is None and has_trajectory_cell:
             resolved = _cell_lengths_from_frame(frames[0])
             LOGGER.info(
-                "Could not resolve cell from simulation input for density analysis; using "
+                "Could not resolve cell from simulation input for %s; using "
                 "periodic cell already present in trajectory. %s",
+                analysis_label,
                 resolved_error,
             )
             return resolved, "trajectory metadata", None
         LOGGER.info(
-            "No periodic cell resolved for density analysis; using linear density. %s",
+            "No periodic cell resolved for %s; using linear density. %s",
+            analysis_label,
             resolved_error,
         )
         return None, "unresolved", None
     resolved_cell = cell_resolution.cell_angstrom
     LOGGER.info(
-        "Using cell for density analysis: A=%.6g, B=%.6g, C=%.6g Angstrom.",
+        "Using cell for %s: A=%.6g, B=%.6g, C=%.6g Angstrom.",
+        analysis_label,
         resolved_cell[0],
         resolved_cell[1],
         resolved_cell[2],
@@ -4853,6 +4997,60 @@ def _build_potential_gui_context(
     )
 
 
+def _build_orientation_gui_context(
+    args: argparse.Namespace,
+    *,
+    sources: list[str],
+) -> _GuiPlotRenderContext:
+    (
+        plot_profiles,
+        fallback_labels_by_source,
+        series_id_segments_by_source,
+        origin_path_segments_by_source,
+    ) = _load_orientation_plot_profiles(sources=sources)
+    raw_component = getattr(args, "component", "average")
+    orientation_component = (
+        raw_component
+        if raw_component in {"average", "density-weighted", "heatmap"}
+        else "average"
+    )
+    return _GuiPlotRenderContext(
+        profile=plot_profiles,
+        plot_source_label=sources[0] if len(sources) == 1 else "multi_source_orientation",
+        plotter_kwargs={
+            "component": orientation_component,
+            "angle": getattr(args, "angle", "polar"),
+            "heatmap_vmin": getattr(args, "heatmap_vmin", None),
+            "heatmap_vmax": getattr(args, "heatmap_vmax", None),
+            "heatmap_cmap": getattr(args, "heatmap_cmap", None),
+            "y_bin_width": getattr(args, "y_bin_width", None),
+            "y_bin_reducer": getattr(args, "y_bin_reducer", None),
+            "heatmap_normalize": getattr(args, "heatmap_normalize", False),
+            "heatmap_colorbar_enabled": getattr(args, "heatmap_colorbar_enabled", True),
+            "heatmap_colorbar_label": getattr(args, "heatmap_colorbar_label", None),
+            "heatmap_colorbar_label_size": getattr(args, "heatmap_colorbar_label_size", None),
+            "heatmap_colorbar_tick_size": getattr(args, "heatmap_colorbar_tick_size", None),
+            "heatmap_colorbar_position": getattr(args, "heatmap_colorbar_position", "right"),
+            "heatmap_colorbar_pad": getattr(args, "heatmap_colorbar_pad", None),
+            "heatmap_colorbar_shrink": getattr(args, "heatmap_colorbar_shrink", None),
+            "heatmap_colorbar_aspect": getattr(args, "heatmap_colorbar_aspect", None),
+        },
+        fallback_labels_by_source=fallback_labels_by_source,
+        default_series_labels=_resolve_gui_default_series_labels(
+            args=args,
+            sources=sources,
+            profile_key=_PLOT_PROFILE_ORIENTATION,
+            fallback_labels_by_source=fallback_labels_by_source,
+        ),
+        series_descriptors=_build_gui_series_descriptors(
+            sources=sources,
+            fallback_labels_by_source=fallback_labels_by_source,
+            series_id_segments_by_source=series_id_segments_by_source,
+            origin_path_segments_by_source=origin_path_segments_by_source,
+        ),
+    )
+
+
 def _parse_toggle_state(raw: str) -> bool | None:
     token = raw.strip().lower()
     if token in {"on", "true", "yes", "1"}:
@@ -5381,7 +5579,7 @@ def _launch_profile_plot_gui(
             candidate,
             profile_name=profile_name,
         )
-        return f"Saved profile '{profile_name}' to '{source_path.name}' ({profile_key})."
+        return f"Saved '{profile_name}' to {source_path.name}."
 
     def _save_figure(gui_settings: dict[str, Any], output_path: str) -> tuple[str, dict[str, Any]]:
         save_args = deepcopy(args)
@@ -5693,7 +5891,7 @@ def build_parser() -> argparse.ArgumentParser:
         "plot",
         help="Generate plots from precomputed LiNaK HDF5 data.",
         description=(
-            "Plot LiNaK analysis HDF5 data by auto-detecting density, MSD, RDF, position, coordination, or potential from HDF5 "
+            "Plot LiNaK analysis HDF5 data by auto-detecting density, MSD, RDF, position, coordination, potential, or orientation from HDF5 "
             "metadata. If the input HDF5 is not a supported LiNaK analysis file, LiNaK falls "
             f"back to `{_TABULAR_COMMAND} plot`."
         ),
@@ -5750,11 +5948,15 @@ def build_parser() -> argparse.ArgumentParser:
     position_group = plot_parser.add_argument_group("Position plot options")
     position_group.add_argument(
         "--component",
-        choices=["distance", "x", "y", "z", "xy-z", "time", "time-distance"],
+        choices=[
+            "distance", "x", "y", "z", "xy-z", "time", "time-distance",
+            "average", "density-weighted", "heatmap",
+        ],
         default="distance",
         help=(
             "Plot component. Position supports distance/x/y/z and xy-z. "
-            "Coordination supports distance, time, and time-distance."
+            "Coordination supports distance, time, and time-distance. "
+            "Orientation supports average, density-weighted, and heatmap."
         ),
     )
     position_group.add_argument(
@@ -5779,6 +5981,16 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Optional time-section width for display-only rebinning in position plots. "
             "Equivalent to x-bin width."
+        ),
+    )
+    orientation_group = plot_parser.add_argument_group("Orientation plot options")
+    orientation_group.add_argument(
+        "--angle",
+        choices=["polar", "azimuthal"],
+        default="polar",
+        help=(
+            "Which angle component to plot for orientation analysis "
+            "(default: polar). Ignored by non-orientation analyses."
         ),
     )
     _add_dry_run_option(plot_parser)
@@ -6278,6 +6490,96 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_dry_run_option(compute_potential)
     compute_potential.set_defaults(handler=_handle_compute_potential)
+
+    # ── compute orientation ───────────────────────────────────────────
+    compute_orientation = compute_commands.add_parser(
+        "orientation",
+        help="Compute H2O orientation vs distance-to-surface and save HDF5.",
+    )
+    compute_orientation.add_argument(
+        "trajectory",
+        nargs="?",
+        help=(
+            "Path to trajectory file (ASE-supported; .dump supported) or LAMMPS input .lmp "
+            "(legacy positional form)"
+        ),
+    )
+    compute_orientation.add_argument(
+        "-f",
+        "--files",
+        nargs="+",
+        metavar="PATH",
+        help=(
+            "Trajectory source path(s). Use -f/--files even for one file; "
+            "this command accepts exactly one source."
+        ),
+    )
+    compute_orientation.add_argument(
+        "--axis",
+        choices=["x", "y", "z"],
+        default="z",
+        help="Spatial axis for distance binning (default: z).",
+    )
+    compute_orientation.add_argument(
+        "--reference-axis",
+        choices=["x", "y", "z"],
+        default="z",
+        help=(
+            "Axis treated as the surface normal for angle computation (default: z). "
+            "The polar angle (cos(theta)) is measured between the water bisector and this axis."
+        ),
+    )
+    compute_orientation.add_argument(
+        "--bin-width",
+        type=_positive_float,
+        default=0.01,
+        help="Distance histogram bin width in Angstrom (default: 0.01).",
+    )
+    compute_orientation.add_argument(
+        "--angle-bins",
+        type=int,
+        default=100,
+        help="Number of cos(angle) bins for heatmaps over [-1, +1] (default: 100).",
+    )
+    compute_orientation.add_argument(
+        "--surface-mode",
+        choices=["auto", "layered", "rough"],
+        default="auto",
+        help=(
+            "Surface detection mode (default: auto). "
+            "'layered' uses top-layer mean; 'rough' uses low-mobility frame-wise mean."
+        ),
+    )
+    compute_orientation.add_argument(
+        "--surface-elements",
+        nargs="+",
+        metavar="ELEM",
+        help="Element symbols used to detect the reference surface (default: auto).",
+    )
+    compute_orientation.add_argument(
+        "--include-fixed-surface-atoms",
+        action="store_true",
+        help=(
+            "Allow atoms marked by ASE constraints to be used in surface detection "
+            "(default: constrained atoms are excluded)."
+        ),
+    )
+    compute_orientation.add_argument(
+        "--oh-cutoff",
+        type=_positive_float,
+        default=1.25,
+        help="O-H cutoff in Angstrom for water-molecule detection (default: 1.25).",
+    )
+    _add_cell_resolution_options(compute_orientation)
+    compute_orientation.add_argument(
+        "-o",
+        "--output",
+        "--save-data",
+        dest="output",
+        help="HDF5 output path (default: auto-generated .h5).",
+    )
+    _add_dry_run_option(compute_orientation)
+    compute_orientation.set_defaults(handler=_handle_compute_orientation)
 
     apply_parser = commands.add_parser(
         "apply",
@@ -8052,7 +8354,7 @@ def _detect_plot_analysis_from_hdf5_source(source: str | Path) -> str | None:
 
     source_path = Path(source).expanduser().resolve()
     analysis = read_hdf5_analysis(source_path)
-    if analysis in {"density", "msd", "rdf", "position", "coordination", "potential", "table"}:
+    if analysis in {"density", "msd", "rdf", "position", "coordination", "potential", "orientation", "table"}:
         return analysis
 
     try:
@@ -8066,6 +8368,7 @@ def _detect_plot_analysis_from_hdf5_source(source: str | Path) -> str | None:
         _PLOT_PROFILE_POSITION,
         _PLOT_PROFILE_COORDINATION,
         _PLOT_PROFILE_POTENTIAL,
+        _PLOT_PROFILE_ORIENTATION,
         _PLOT_PROFILE_TABLE,
     ):
         if profile_key in profiles:
@@ -8280,9 +8583,12 @@ def _handle_plot(args: argparse.Namespace) -> int:
     if detected_analysis == "potential":
         args.plot_command = "potential"
         return _handle_plot_potential(args)
+    if detected_analysis == "orientation":
+        args.plot_command = "orientation"
+        return _handle_plot_orientation(args)
 
     raise ValueError(
-        "Could not detect a LiNaK density/MSD/RDF/position/coordination/potential analysis from the provided HDF5 input. "
+        "Could not detect a LiNaK density/MSD/RDF/position/coordination/potential/orientation analysis from the provided HDF5 input. "
         f"Use `linak {_TABULAR_COMMAND} plot ...` for generic HDF5 plotting."
     )
 
@@ -9114,6 +9420,115 @@ def _handle_plot_potential(args: argparse.Namespace) -> int:
     )
 
     LOGGER.info("Potential plotting finished in %.2f s.", perf_counter() - start)
+    return 0
+
+
+def _handle_plot_orientation(args: argparse.Namespace) -> int:
+    start = perf_counter()
+    LOGGER.info("Starting orientation plotting.")
+    sources = _resolve_plot_hdf5_sources(args, command_name="linak plot")
+    settings_source_path = (
+        _resolve_plot_settings_source_path(
+            sources,
+            setting_source_token=getattr(args, "settings_source", None),
+        )
+        if len(sources) == 1
+        else None
+    )
+    default_args = deepcopy(args)
+    if len(sources) == 1:
+        assert settings_source_path is not None
+        _apply_saved_plot_settings(
+            args=args,
+            source_path=settings_source_path,
+            profile_key=_PLOT_PROFILE_ORIENTATION,
+            keys=_PLOT_SETTINGS_ORIENTATION_KEYS,
+            profile_name=getattr(args, "settings_profile", None),
+        )
+    use_gui = _resolve_gui_mode(args)
+    if len(sources) > 1:
+        LOGGER.info("Processing %d orientation HDF5 input file(s).", len(sources))
+
+    if args.dry_run:
+        if use_gui:
+            render_target = "interactive GUI controls"
+        elif args.output:
+            render_target = f"save plot to {Path(args.output).expanduser()}"
+        elif args.show:
+            render_target = f"interactive display via backend {args.backend}"
+        else:
+            render_target = "no render target (--no-show without --output)"
+        component = getattr(args, "component", "average")
+        angle = getattr(args, "angle", "polar")
+        plan = [
+            "input mode: HDF5 only",
+            f"sources ({len(sources)}): {_summarize_sources(sources)}",
+            f"component={component}, angle={angle}",
+            f"render target: {render_target}",
+        ]
+        if settings_source_path is not None:
+            plan.insert(-1, f"plot-settings source: {settings_source_path}")
+        _log_dry_run_plan("plot orientation", plan)
+        LOGGER.info("Orientation plotting dry run finished in %.2f s.", perf_counter() - start)
+        return 0
+
+    from .analysis.orientation import plot_orientation_profiles
+
+    render_context = _build_orientation_gui_context(args, sources=sources)
+    _apply_effective_series_settings(
+        args=args,
+        sources=sources,
+        profile_key=_PLOT_PROFILE_ORIENTATION,
+        fallback_labels_by_source=render_context.fallback_labels_by_source,
+        series_descriptors=render_context.series_descriptors,
+        allow_saved_multi_source_merge=False,
+        materialize_default_colors=not use_gui,
+    )
+
+    if use_gui:
+        gui_settings_path = settings_source_path
+        if len(sources) > 1:
+            gui_settings_path = _combine_analysis_hdf5_sources(
+                sources=sources,
+                analysis="orientation",
+                output=None,
+            )
+            LOGGER.info(
+                "Created combined orientation HDF5 for GUI controls: '%s'.",
+                gui_settings_path,
+            )
+        assert gui_settings_path is not None
+        _launch_profile_plot_gui(
+            args=args,
+            default_args=default_args,
+            source_path=gui_settings_path,
+            profile_key=_PLOT_PROFILE_ORIENTATION,
+            setting_keys=_PLOT_SETTINGS_ORIENTATION_KEYS,
+            gui_title="LiNaK Plot Controls: Water Orientation",
+            analysis_name="orientation",
+            plotter=plot_orientation_profiles,
+            initial_context=render_context,
+            build_context=lambda current_args: _build_orientation_gui_context(
+                current_args,
+                sources=sources,
+            ),
+        )
+        LOGGER.info(
+            "Orientation GUI plotting session finished in %.2f s.", perf_counter() - start
+        )
+        return 0
+
+    _saved_path, _rendered_state = _render_profile_plot(
+        args=args,
+        source=render_context.plot_source_label,
+        analysis_name="orientation",
+        profile=render_context.profile,
+        plotter=plot_orientation_profiles,
+        plotter_kwargs=render_context.plotter_kwargs,
+        series_descriptors=render_context.series_descriptors,
+    )
+
+    LOGGER.info("Orientation plotting finished in %.2f s.", perf_counter() - start)
     return 0
 
 
@@ -9967,6 +10382,112 @@ def _handle_compute_potential(args: argparse.Namespace) -> int:
     return 0
 
 
+def _handle_compute_orientation(args: argparse.Namespace) -> int:
+    start = perf_counter()
+    LOGGER.info("Starting orientation compute.")
+    _resolve_single_source_argument(
+        args,
+        positional_attr="trajectory",
+        source_label="trajectory input file",
+    )
+
+    if args.dry_run:
+        source_path = Path(args.trajectory).expanduser().resolve()
+        cell_preview = _describe_cell_resolution_preview(
+            args.trajectory,
+            cell=_normalize_cell_args(args),
+            input_path=args.input,
+        )
+        output_preview = str(
+            _orientation_hdf5_output_path(
+                args.output,
+                args.trajectory,
+                axis=args.axis,
+            )
+        )
+        plan = [
+            f"trajectory source: {source_path}",
+            (
+                f"axis={args.axis}, reference_axis={args.reference_axis}, "
+                f"bin_width={args.bin_width}, angle_bins={args.angle_bins}, "
+                f"oh_cutoff={args.oh_cutoff}, "
+                f"surface_mode={args.surface_mode}, "
+                f"surface_elements={args.surface_elements if args.surface_elements else 'auto'}, "
+                f"include_fixed_surface_atoms={args.include_fixed_surface_atoms}"
+            ),
+            f"cell resolution: {cell_preview}",
+            f"output HDF5 target: {output_preview}",
+        ]
+        _log_dry_run_plan("compute orientation", plan)
+        LOGGER.info("Orientation compute dry run finished in %.2f s.", perf_counter() - start)
+        return 0
+
+    from .analysis.orientation import compute_orientation_profile, save_orientation_profile
+    from .trajectory.io import read_trajectory
+
+    source_path = Path(args.trajectory).expanduser().resolve()
+    pre_resolved_cell, preflight_cell_error = _preflight_resolve_cell(
+        args.trajectory,
+        cell=_normalize_cell_args(args),
+        input_path=args.input,
+        analysis_name="orientation",
+    )
+    frames = read_trajectory(args.trajectory)
+    resolved_cell, cell_source, cell_input_path = _maybe_apply_density_cell(
+        frames,
+        args.trajectory,
+        cell=_normalize_cell_args(args),
+        input_path=args.input,
+        pre_resolved=pre_resolved_cell,
+        preflight_error=preflight_cell_error,
+        analysis_label="orientation analysis",
+    )
+    profile = compute_orientation_profile(
+        frames=frames,
+        axis=args.axis,
+        reference_axis=args.reference_axis,
+        bin_width=args.bin_width,
+        angle_bin_count=args.angle_bins,
+        surface_mode=args.surface_mode,
+        surface_elements=args.surface_elements,
+        include_fixed_surface_atoms=args.include_fixed_surface_atoms,
+        oh_cutoff=args.oh_cutoff,
+    )
+    LOGGER.info(
+        "Orientation result: %d frames, %d H\u2082O/frame, %d distance bins "
+        "(%.2f\u2013%.2f \u00c5, width %.2g), %d angle bins, mode=%s.",
+        profile.n_frames,
+        profile.n_molecules_per_frame,
+        len(profile.bin_centers),
+        float(profile.bin_edges[0]),
+        float(profile.bin_edges[-1]),
+        args.bin_width,
+        len(profile.heatmap_angle_bin_centers),
+        profile.coordinate_mode,
+    )
+    output_path = _orientation_hdf5_output_path(
+        args.output,
+        args.trajectory,
+        axis=args.axis,
+    )
+    orientation_metadata: dict[str, Any] = {
+        "source_path": str(source_path),
+        "cell_source": cell_source,
+    }
+    if cell_input_path is not None:
+        orientation_metadata["input_path"] = cell_input_path
+    if resolved_cell is not None:
+        orientation_metadata["resolved_cell_angstrom"] = list(resolved_cell)
+    save_orientation_profile(
+        profile,
+        output_path,
+        additional_metadata=orientation_metadata,
+    )
+
+    LOGGER.info("Orientation compute finished in %.2f s.", perf_counter() - start)
+    return 0
+
+
 def _handle_apply_pbc(args: argparse.Namespace) -> int:
     start = perf_counter()
     LOGGER.info("Starting PBC application.")
@@ -10181,6 +10702,7 @@ def _rewrite_implicit_plot_csv(argv: list[str]) -> list[str]:
         "position",
         "coordination",
         "potential",
+        "orientation",
     }:
         return rewritten
 
