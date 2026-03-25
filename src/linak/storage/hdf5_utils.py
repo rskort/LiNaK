@@ -209,7 +209,9 @@ def read_linak_hdf5_profiles(
                         _decode_metadata_json(group.attrs.get("metadata_json", "{}"))
                     )
                     profile_metadata.setdefault("analysis", analysis)
-                    profile_metadata.setdefault("profile_index", index)
+                    if "profile_index" in profile_metadata and "source_profile_index" not in profile_metadata:
+                        profile_metadata["source_profile_index"] = profile_metadata["profile_index"]
+                    profile_metadata["profile_index"] = index
                     profile_metadata["profile_uid"] = _stable_profile_uid(
                         analysis=analysis,
                         metadata=profile_metadata,
@@ -274,7 +276,9 @@ def read_linak_hdf5_profile_headers(
                         _decode_metadata_json(group.attrs.get("metadata_json", "{}"))
                     )
                     profile_metadata.setdefault("analysis", analysis)
-                    profile_metadata.setdefault("profile_index", index)
+                    if "profile_index" in profile_metadata and "source_profile_index" not in profile_metadata:
+                        profile_metadata["source_profile_index"] = profile_metadata["profile_index"]
+                    profile_metadata["profile_index"] = index
                     headers.append(profile_metadata)
                 return headers
 
@@ -350,7 +354,9 @@ def read_linak_hdf5_profiles_by_index(
                         _decode_metadata_json(group.attrs.get("metadata_json", "{}"))
                     )
                     profile_metadata.setdefault("analysis", analysis)
-                    profile_metadata.setdefault("profile_index", requested_index)
+                    if "profile_index" in profile_metadata and "source_profile_index" not in profile_metadata:
+                        profile_metadata["source_profile_index"] = profile_metadata["profile_index"]
+                    profile_metadata["profile_index"] = requested_index
                     profile_metadata["profile_uid"] = _stable_profile_uid(
                         analysis=analysis,
                         metadata=profile_metadata,
