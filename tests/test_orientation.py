@@ -461,6 +461,25 @@ def test_plot_orientation_profile_density_weighted(tmp_path):
     assert result is not None
 
 
+def test_plot_orientation_profile_density_weighted_uses_unicode_auto_label(tmp_path):
+    from linak.analysis.orientation import plot_orientation_profile
+
+    profile = compute_orientation_profile(
+        frames=_multi_frame_trajectory(2), axis="z", bin_width=2.0
+    )
+    capture_state: dict[str, object] = {}
+    result = plot_orientation_profile(
+        profile,
+        output=str(tmp_path / "orient_dens_label.png"),
+        show=False,
+        component="density-weighted",
+        angle="polar",
+        capture_state=capture_state,
+    )
+    assert result is not None
+    assert capture_state["y_label"] == "H2O density-weighted ⟨cos(θ)⟩"
+
+
 def test_plot_orientation_profile_heatmap(tmp_path):
     from linak.analysis.orientation import plot_orientation_profile
 
