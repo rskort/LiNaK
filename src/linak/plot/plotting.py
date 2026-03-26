@@ -517,6 +517,35 @@ def _capture_plot_state(
     )
 
 
+def _capture_heatmap_state(
+    *,
+    ax: Any,
+    style: PlotStyle,
+    capture_state: dict[str, Any] | None,
+    mesh: Any,
+    colorbar: Any,
+    legend_loc: str = "best",
+    extra_state: dict[str, Any] | None = None,
+) -> None:
+    _capture_plot_state(
+        ax=ax,
+        style=style,
+        line_colors=[],
+        line_labels=[],
+        line_markers=[],
+        legend_loc=legend_loc,
+        capture_state=capture_state,
+    )
+    if capture_state is None:
+        return
+    capture_state["figure"] = ax.figure
+    capture_state["axes"] = ax
+    capture_state["heatmap_artist"] = mesh
+    capture_state["heatmap_colorbar"] = colorbar
+    if extra_state is not None:
+        capture_state.update(dict(extra_state))
+
+
 def _resolve_reducer_name(value: str | None) -> str:
     token = "mean" if value is None else str(value).strip().lower()
     if token not in {"mean", "median", "sum", "min", "max"}:
@@ -1022,6 +1051,248 @@ def plot_line_series(
             plt.show(block=show_blocking)
             if not show_blocking:
                 # Ensure the window is realized in GUI-preview mode.
+                plt.pause(0.001)
+
+        if not (show and not show_blocking):
+            plt.close(fig)
+        return output_path
+
+
+def plot_heatmap_series(
+    x_edges: np.ndarray,
+    y_edges: np.ndarray,
+    z_values: np.ndarray,
+    *,
+    title: str,
+    x_label: str,
+    y_label: str,
+    output: str | Path | None = None,
+    show: bool = True,
+    show_blocking: bool = True,
+    preferred_backend: str | None = None,
+    style: PlotStyle = DEFAULT_PLOT_STYLE,
+    x_lim: tuple[float | None, float | None] | list[float | None] | None = None,
+    y_lim: tuple[float | None, float | None] | list[float | None] | None = None,
+    x_ticks: list[float] | tuple[float, ...] | None = None,
+    y_ticks: list[float] | tuple[float, ...] | None = None,
+    x_tick_rotation: float | None = None,
+    y_tick_rotation: float | None = None,
+    x_label_pad: float | None = None,
+    y_label_pad: float | None = None,
+    title_visible: bool | None = None,
+    ticks_visible: bool | None = None,
+    capture_state: dict[str, Any] | None = None,
+    matplotlib_rc: dict[str, Any] | None = None,
+    figure_kwargs: dict[str, Any] | None = None,
+    axes_kwargs: dict[str, Any] | None = None,
+    grid_kwargs: dict[str, Any] | None = None,
+    tick_params_kwargs: dict[str, Any] | None = None,
+    tight_layout_kwargs: dict[str, Any] | None = None,
+    savefig_kwargs: dict[str, Any] | None = None,
+    suppress_output_log: bool = False,
+    heatmap_vmin: float | None = None,
+    heatmap_vmax: float | None = None,
+    heatmap_cmap: str | None = None,
+    heatmap_log_scale: bool = False,
+    heatmap_colorbar_enabled: bool = True,
+    heatmap_colorbar_label: str | None = None,
+    heatmap_colorbar_label_size: int | None = None,
+    heatmap_colorbar_tick_size: int | None = None,
+    heatmap_colorbar_position: str = "right",
+    heatmap_colorbar_pad: float | None = None,
+    heatmap_colorbar_shrink: float | None = None,
+    heatmap_colorbar_aspect: float | None = None,
+    capture_state_extra: dict[str, Any] | None = None,
+) -> Path | None:
+    """Plot a pcolormesh heatmap using the shared LiNaK plot contract."""
+    from matplotlib.colors import LogNorm
+
+    active_backend = configure_matplotlib_backend(
+        interactive=show,
+        preferred_backend=preferred_backend,
+    )
+    plt = _import_pyplot()
+
+    rc_context_args: dict[str, Any] = {"font.family": style.font_family, "text.parse_math": True}
+    if matplotlib_rc is not None:
+        rc_context_args.update(dict(matplotlib_rc))
+    with plt.rc_context(rc_context_args):
+        fig, ax = plt.subplots(figsize=style.figure_size)
+        if figure_kwargs is not None:
+            fig.set(**dict(figure_kwargs))
+
+        heatmap_array = np.asarray(z_values, dtype=float)
+        mesh_kwargs: dict[str, Any] = {
+            "shading": "flat",
+            "cmap": heatmap_cmap or "viridis",
+        }
+        resolved_vmin = None if heatmap_vmin is None else float(heatmap_vmin)
+        resolved_vmax = None if heatmap_vmax is None else float(heatmap_vmax)
+        if heatmap_log_scale:
+            if resolved_vmin is not None and resolved_vmin <= 0.0:
+                raise ValueError("Heatmap log scale requires a positive heatmap_vmin.")
+            if resolved_vmax is not None and resolved_vmax <= 0.0:
+                raise ValueError("Heatmap log scale requires a positive heatmap_vmax.")
+            positive = heatmap_array[np.isfinite(heatmap_array) & (heatmap_array > 0.0)]
+            if positive.size == 0:
+                raise ValueError("Heatmap log scale requires at least one positive heatmap value.")
+            if resolved_vmin is None:
+                resolved_vmin = float(np.min(positive))
+            if resolved_vmax is None:
+                resolved_vmax = float(np.max(positive))
+            if resolved_vmax < resolved_vmin:
+                raise ValueError("Heatmap log scale requires heatmap_vmax >= heatmap_vmin.")
+            mesh_kwargs["norm"] = LogNorm(vmin=resolved_vmin, vmax=resolved_vmax)
+            heatmap_array = np.ma.masked_less_equal(np.ma.masked_invalid(heatmap_array), 0.0)
+        else:
+            mesh_kwargs["vmin"] = resolved_vmin
+            mesh_kwargs["vmax"] = resolved_vmax
+
+        mesh = ax.pcolormesh(
+            np.asarray(x_edges, dtype=float),
+            np.asarray(y_edges, dtype=float),
+            heatmap_array.T,
+            **mesh_kwargs,
+        )
+
+        colorbar = None
+        if heatmap_colorbar_enabled:
+            cb_kw: dict[str, Any] = {}
+            position = (
+                heatmap_colorbar_position
+                if heatmap_colorbar_position in {"right", "left", "top", "bottom"}
+                else "right"
+            )
+            cb_kw["location"] = position
+            if heatmap_colorbar_pad is not None:
+                cb_kw["pad"] = float(heatmap_colorbar_pad)
+            if heatmap_colorbar_shrink is not None:
+                cb_kw["shrink"] = float(heatmap_colorbar_shrink)
+            if heatmap_colorbar_aspect is not None:
+                cb_kw["aspect"] = float(heatmap_colorbar_aspect)
+            colorbar = fig.colorbar(
+                mesh,
+                ax=ax,
+                label=heatmap_colorbar_label,
+                **cb_kw,
+            )
+            cb_is_vertical = position in {"right", "left"}
+            if heatmap_colorbar_label_size is not None:
+                colorbar.set_label(
+                    colorbar.ax.get_ylabel() if cb_is_vertical else colorbar.ax.get_xlabel(),
+                    fontsize=heatmap_colorbar_label_size,
+                )
+            if heatmap_colorbar_tick_size is not None:
+                colorbar.ax.tick_params(labelsize=heatmap_colorbar_tick_size)
+
+        xlabel_kwargs: dict[str, Any] = {"fontsize": style.label_font_size}
+        ylabel_kwargs: dict[str, Any] = {"fontsize": style.label_font_size}
+        if x_label_pad is not None:
+            xlabel_kwargs["labelpad"] = float(x_label_pad)
+        if y_label_pad is not None:
+            ylabel_kwargs["labelpad"] = float(y_label_pad)
+        ax.set_xlabel(format_axis_label_units(x_label), **xlabel_kwargs)
+        ax.set_ylabel(format_axis_label_units(y_label), **ylabel_kwargs)
+        if title_visible is False:
+            ax.set_title("", fontsize=style.title_font_size)
+        else:
+            ax.set_title(title, fontsize=style.title_font_size)
+        ax.tick_params(axis="both", labelsize=style.tick_font_size)
+        resolved_tick_params_kwargs, tick_axis_hint, minor_ticks_mode = _extract_tick_controls(
+            tick_params_kwargs
+        )
+
+        if style.grid:
+            resolved_grid_kwargs: dict[str, Any] = {
+                "linestyle": style.grid_linestyle,
+                "linewidth": style.grid_linewidth,
+                "alpha": style.grid_alpha,
+            }
+            if grid_kwargs is not None:
+                resolved_grid_kwargs.update(dict(grid_kwargs))
+            ax.grid(True, **resolved_grid_kwargs)
+        else:
+            ax.grid(False)
+        if ticks_visible is False:
+            if tick_axis_hint in {"both", "x"}:
+                ax.tick_params(axis="x", which="both", bottom=False, top=False, labelbottom=False)
+            if tick_axis_hint in {"both", "y"}:
+                ax.tick_params(axis="y", which="both", left=False, right=False, labelleft=False)
+        else:
+            if ticks_visible is True and tick_axis_hint in {"x", "y"}:
+                if tick_axis_hint == "x":
+                    ax.tick_params(axis="y", which="both", left=False, right=False, labelleft=False)
+                else:
+                    ax.tick_params(
+                        axis="x",
+                        which="both",
+                        bottom=False,
+                        top=False,
+                        labelbottom=False,
+                    )
+            if x_tick_rotation is not None:
+                ax.tick_params(axis="x", rotation=float(x_tick_rotation))
+            if y_tick_rotation is not None:
+                ax.tick_params(axis="y", rotation=float(y_tick_rotation))
+        if minor_ticks_mode == "on":
+            ax.minorticks_on()
+        elif minor_ticks_mode == "off":
+            ax.minorticks_off()
+        if resolved_tick_params_kwargs:
+            ax.tick_params(**resolved_tick_params_kwargs)
+        if x_ticks is not None:
+            ax.set_xticks([float(value) for value in x_ticks])
+        if y_ticks is not None:
+            ax.set_yticks([float(value) for value in y_ticks])
+        if x_lim is not None:
+            left = None if x_lim[0] is None else float(x_lim[0])
+            right = None if x_lim[1] is None else float(x_lim[1])
+            ax.set_xlim(left=left, right=right)
+        if y_lim is not None:
+            bottom = None if y_lim[0] is None else float(y_lim[0])
+            top = None if y_lim[1] is None else float(y_lim[1])
+            ax.set_ylim(bottom=bottom, top=top)
+        if axes_kwargs is not None:
+            ax.set(**dict(axes_kwargs))
+
+        if tight_layout_kwargs is not None:
+            fig.tight_layout(**dict(tight_layout_kwargs))
+        else:
+            fig.tight_layout()
+        _capture_heatmap_state(
+            ax=ax,
+            style=style,
+            capture_state=capture_state,
+            mesh=mesh,
+            colorbar=colorbar,
+            extra_state=capture_state_extra,
+        )
+
+        output_path = None
+        if output is not None:
+            output_path = Path(output).expanduser().resolve()
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            save_kwargs: dict[str, Any] = {}
+            if savefig_kwargs is not None:
+                save_kwargs.update(dict(savefig_kwargs))
+            save_kwargs.setdefault("dpi", style.dpi)
+            fig.savefig(output_path, **save_kwargs)
+            if not suppress_output_log:
+                LOGGER.info("Saved plot to '%s'.", output_path)
+
+        if show:
+            if show_blocking:
+                LOGGER.info(
+                    "Showing interactive plot window using backend '%s'. Close the window to continue.",
+                    active_backend,
+                )
+            else:
+                LOGGER.info(
+                    "Showing interactive plot window using backend '%s'.",
+                    active_backend,
+                )
+            plt.show(block=show_blocking)
+            if not show_blocking:
                 plt.pause(0.001)
 
         if not (show and not show_blocking):

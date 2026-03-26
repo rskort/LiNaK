@@ -55,6 +55,7 @@ from .water import (
 from ..plot.plotting import (
     DEFAULT_PLOT_STYLE,
     PlotStyle,
+    plot_heatmap_series,
     plot_line_series,
     plot_multi_line_series,
     resolve_explicit_plot_text,
@@ -74,7 +75,7 @@ _OH_LENGTH_SANITY_TOLERANCE: float = 1.0e-8
 _HEATMAP_BULK_DENSITY_FRACTION: float = 0.8
 
 
-# ───────────────────────────── dataclass ──────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ dataclass â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 
 @dataclass(frozen=True)
@@ -90,31 +91,31 @@ class OrientationProfile:
     n_frames: int
     n_molecules_per_frame: int
 
-    # 1-D distance bins (Å) ─────────────────────────────────────────────
+    # 1-D distance bins (Ã…) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     bin_edges: np.ndarray
     bin_centers: np.ndarray
 
-    # Mean cos(angle) per distance bin ──────────────────────────────────
+    # Mean cos(angle) per distance bin â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     cos_polar_mean: np.ndarray
     cos_azimuthal_mean: np.ndarray
     count_total: np.ndarray
     count_polar_valid: np.ndarray
     count_azimuthal_valid: np.ndarray
 
-    # Density-weighted: cos(angle) × number-density per distance bin ───
+    # Density-weighted: cos(angle) Ã— number-density per distance bin â”€â”€â”€
     cos_polar_density: np.ndarray
     cos_azimuthal_density: np.ndarray
 
-    # H₂O number-density per distance bin (molecules / Å³ or Å⁻¹) ─────
+    # Hâ‚‚O number-density per distance bin (molecules / Ã…Â³ or Ã…â»Â¹) â”€â”€â”€â”€â”€
     density: np.ndarray
 
-    # 2-D heatmaps (n_dist_bins × n_angle_bins) ────────────────────────
+    # 2-D heatmaps (n_dist_bins Ã— n_angle_bins) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     heatmap_polar: np.ndarray
     heatmap_azimuthal: np.ndarray
     heatmap_angle_bin_edges: np.ndarray
     heatmap_angle_bin_centers: np.ndarray
 
-    # Surface / coordinate metadata ─────────────────────────────────────
+    # Surface / coordinate metadata â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     coordinate_mode: str  # "distance" or "axis"
     surface_position: float | None = None
     surface_position_std: float | None = None
@@ -131,7 +132,7 @@ class _OrientationFrameData:
     azimuthal_valid: np.ndarray
 
 
-# ───────────────────────────── compute ────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ compute â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 
 def _legacy_compute_orientation_profile(
@@ -159,15 +160,15 @@ def _legacy_compute_orientation_profile(
     reference_axis
         Axis treated as the surface normal (default ``"z"``).
     bin_width
-        Spatial bin width in Å (default 0.1).
+        Spatial bin width in Ã… (default 0.1).
     angle_bin_count
-        Number of bins over ``cos(angle) ∈ [-1, +1]`` for heatmaps.
+        Number of bins over ``cos(angle) âˆˆ [-1, +1]`` for heatmaps.
     surface_mode / surface_elements / include_fixed_surface_atoms
         Forwarded to the surface estimator in *density.py*.
     binning
         ``"cell"`` (span full cell) or ``"observed"`` (data range only).
     oh_cutoff
-        O–H cutoff for water-molecule detection.
+        Oâ€“H cutoff for water-molecule detection.
 
     Returns
     -------
@@ -181,7 +182,7 @@ def _legacy_compute_orientation_profile(
     ref_vec = np.zeros(3, dtype=float)
     ref_vec[ref_index] = 1.0
 
-    # ── surface estimation (reuse density machinery) ──────────────────
+    # â”€â”€ surface estimation (reuse density machinery) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     from .density import _select_surface_estimate
 
     surface_estimate, _method = _select_surface_estimate(
@@ -204,7 +205,7 @@ def _legacy_compute_orientation_profile(
 
     coordinate_mode = "distance" if surface_per_frame is not None else "axis"
 
-    # ── determine histogram bounds ────────────────────────────────────
+    # â”€â”€ determine histogram bounds â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     dist_min, dist_max = _legacy_determine_distance_bounds(
         frames,
         axis_index,
@@ -221,21 +222,21 @@ def _legacy_compute_orientation_profile(
         )
     dist_bin_centers = 0.5 * (dist_bin_edges[:-1] + dist_bin_edges[1:])
 
-    # ── angle (cos) bin edges ─────────────────────────────────────────
+    # â”€â”€ angle (cos) bin edges â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     angle_bin_edges = np.linspace(-1.0, 1.0, angle_bin_count + 1)
     angle_bin_centers = 0.5 * (angle_bin_edges[:-1] + angle_bin_edges[1:])
 
-    # ── accumulators ──────────────────────────────────────────────────
+    # â”€â”€ accumulators â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     cos_polar_sum = np.zeros(n_dist_bins, dtype=float)
     cos_azimuthal_sum = np.zeros(n_dist_bins, dtype=float)
     count = np.zeros(n_dist_bins, dtype=float)
     heatmap_polar = np.zeros((n_dist_bins, angle_bin_count), dtype=float)
     heatmap_azimuthal = np.zeros((n_dist_bins, angle_bin_count), dtype=float)
 
-    # ── cell lengths for volume normalisation ─────────────────────────
+    # â”€â”€ cell lengths for volume normalisation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     cell_lengths = _extract_cell_lengths(frames[0], axis_index)
 
-    # ── frame loop ────────────────────────────────────────────────────
+    # â”€â”€ frame loop â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     cached_triplets: np.ndarray | None = None
     n_molecules_per_frame = 0
 
@@ -278,7 +279,7 @@ def _legacy_compute_orientation_profile(
 
             bisector = oh1_norm + oh2_norm  # unnormalised bisector
             bisector_len = np.linalg.norm(bisector, axis=1, keepdims=True)
-            # guard against degenerate geometry (180° H-O-H)
+            # guard against degenerate geometry (180Â° H-O-H)
             bisector_len = np.maximum(bisector_len, 1.0e-12)
             bisector = bisector / bisector_len
 
@@ -287,10 +288,10 @@ def _legacy_compute_orientation_profile(
             pn_len = np.maximum(pn_len, 1.0e-12)
             plane_normal = plane_normal / pn_len
 
-            # cos(polar) = bisector · ref_axis
+            # cos(polar) = bisector Â· ref_axis
             cos_polar = bisector @ ref_vec  # (n_mol,)
 
-            # cos(azimuthal): project plane_normal onto plane ⊥ ref_axis,
+            # cos(azimuthal): project plane_normal onto plane âŠ¥ ref_axis,
             # then measure cos of angle from first in-plane Cartesian axis.
             # Pick the two Cartesian axes that span the perpendicular plane.
             in_plane_axes = [i for i in range(3) if i != ref_index]
@@ -322,7 +323,7 @@ def _legacy_compute_orientation_profile(
 
             progress.update()
 
-    # ── finalise averages ─────────────────────────────────────────────
+    # â”€â”€ finalise averages â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     n_frames = len(frames)
     safe_count = np.where(count > 0, count, 1.0)
     count_total = np.asarray(count, dtype=int)
@@ -371,7 +372,7 @@ def _legacy_compute_orientation_profile(
     )
 
 
-# ─────────────────────── internal helpers ─────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ internal helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 
 def _legacy_determine_distance_bounds(
@@ -432,7 +433,7 @@ def _legacy_compute_number_density(
     cell_lengths: tuple[float, float, float] | None,
     axis_index: int,
 ) -> np.ndarray:
-    """Convert raw molecule counts into number density (molecules / Å³ or Å⁻¹).
+    """Convert raw molecule counts into number density (molecules / Ã…Â³ or Ã…â»Â¹).
 
     If cell dimensions are known the volume of each bin slab is used;
     otherwise only bin-width normalisation is applied (linear density).
@@ -448,7 +449,7 @@ def _legacy_compute_number_density(
     return density
 
 
-# ─────────────────────── HDF5 save / load ─────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ HDF5 save / load â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 
 def _in_plane_reference_vector(ref_index: int) -> np.ndarray:
@@ -1067,7 +1068,7 @@ def load_orientation_profiles_by_index(
     return [_build_orientation_profile_from_hdf5(datasets, metadata) for datasets, metadata in raw]
 
 
-# ──────────────────────── plotting helpers ────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ plotting helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 _ANGLE_CHOICES = ("polar", "azimuthal")
 _COMPONENT_CHOICES = ("average", "density-weighted", "heatmap")
@@ -1089,16 +1090,16 @@ def _normalize_component_token(component: str | None) -> str:
 
 def _distance_label(profile: OrientationProfile) -> str:
     if profile.coordinate_mode == "distance":
-        return f"Distance to surface along {profile.axis.upper()} (Å)"
-    return f"{profile.axis.upper()} (Å)"
+        return f"Distance to surface along {profile.axis.upper()} (Ã…)"
+    return f"{profile.axis.upper()} (Ã…)"
 
 
 def _y_label_for_component(component: str, angle: str) -> str:
-    angle_label = "θ" if angle == "polar" else "φ"
+    angle_label = "Î¸" if angle == "polar" else "Ï†"
     if component == "average":
-        return f"⟨cos({angle_label})⟩"
+        return f"âŸ¨cos({angle_label})âŸ©"
     if component == "density-weighted":
-        return f"H2O density-weighted ⟨cos({angle_label})⟩"
+        return f"H2O density-weighted âŸ¨cos({angle_label})âŸ©"
     return f"cos({angle_label})"
 
 
@@ -1126,7 +1127,7 @@ def _select_heatmap_data(
     return profile.heatmap_azimuthal
 
 
-# ─────────────────── public plot functions ────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ public plot functions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 
 def plot_orientation_profile(
@@ -1234,7 +1235,6 @@ def plot_orientation_profile(
             y_bin_reducer=y_bin_reducer,
             heatmap_normalize=heatmap_normalize,
             heatmap_normalization_mode=heatmap_normalization_mode,
-            heatmap_shrink_strength=heatmap_shrink_strength,
             heatmap_log_scale=heatmap_log_scale,
             heatmap_colorbar_enabled=heatmap_colorbar_enabled,
             heatmap_colorbar_label=heatmap_colorbar_label,
@@ -1246,15 +1246,19 @@ def plot_orientation_profile(
             heatmap_colorbar_aspect=heatmap_colorbar_aspect,
             x_ticks=x_ticks,
             y_ticks=y_ticks,
+            x_label_pad=x_label_pad,
+            y_label_pad=y_label_pad,
             capture_state=capture_state,
             suppress_output_log=suppress_output_log,
             matplotlib_rc=matplotlib_rc,
             figure_kwargs=figure_kwargs,
+            axes_kwargs=axes_kwargs,
+            tight_layout_kwargs=tight_layout_kwargs,
             savefig_kwargs=savefig_kwargs,
         )
 
     x, y = _select_1d_data(profile, norm_component, norm_angle)
-    default_title = f"H₂O orientation ({norm_angle})"
+    default_title = f"Hâ‚‚O orientation ({norm_angle})"
     default_y = _y_label_for_component(norm_component, norm_angle)
     return plot_line_series(
         x,
@@ -1427,7 +1431,6 @@ def plot_orientation_profiles(
             y_bin_reducer=y_bin_reducer,
             heatmap_normalize=heatmap_normalize,
             heatmap_normalization_mode=heatmap_normalization_mode,
-            heatmap_shrink_strength=heatmap_shrink_strength,
             heatmap_log_scale=heatmap_log_scale,
             heatmap_colorbar_enabled=heatmap_colorbar_enabled,
             heatmap_colorbar_label=heatmap_colorbar_label,
@@ -1439,10 +1442,14 @@ def plot_orientation_profiles(
             heatmap_colorbar_aspect=heatmap_colorbar_aspect,
             x_ticks=x_ticks,
             y_ticks=y_ticks,
+            x_label_pad=x_label_pad,
+            y_label_pad=y_label_pad,
             capture_state=capture_state,
             suppress_output_log=suppress_output_log,
             matplotlib_rc=matplotlib_rc,
             figure_kwargs=figure_kwargs,
+            axes_kwargs=axes_kwargs,
+            tight_layout_kwargs=tight_layout_kwargs,
             savefig_kwargs=savefig_kwargs,
         )
 
@@ -1459,7 +1466,7 @@ def plot_orientation_profiles(
     if series_labels is not None:
         labels = list(series_labels) + labels[len(series_labels) :]
 
-    default_title = f"H₂O orientation ({norm_angle})"
+    default_title = f"Hâ‚‚O orientation ({norm_angle})"
     ref_profile = profiles[0]
     default_y = _y_label_for_component(norm_component, norm_angle)
     return plot_multi_line_series(
@@ -1519,7 +1526,7 @@ def plot_orientation_profiles(
     )
 
 
-# ──────────────────── heatmap rebinning ───────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ heatmap rebinning â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 _REDUCERS: dict[str, Any] = {
     "sum": np.sum,
@@ -1672,7 +1679,7 @@ def _select_bulk_water_reference_rows(
     return np.asarray(best_segment, dtype=int)
 
 
-# ──────────────────── heatmap renderer ────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ heatmap renderer â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 
 def _plot_orientation_heatmap(
@@ -1704,7 +1711,6 @@ def _plot_orientation_heatmap(
     y_bin_reducer: str | None,
     heatmap_normalize: bool,
     heatmap_normalization_mode: str | None,
-    heatmap_shrink_strength: float | None,
     heatmap_log_scale: bool,
     heatmap_colorbar_label: str | None,
     heatmap_colorbar_label_size: int | None,
@@ -1716,22 +1722,17 @@ def _plot_orientation_heatmap(
     heatmap_colorbar_aspect: float | None,
     x_ticks: list[float] | tuple[float, ...] | None,
     y_ticks: list[float] | tuple[float, ...] | None,
+    x_label_pad: float | None,
+    y_label_pad: float | None,
     capture_state: dict[str, Any] | None,
     suppress_output_log: bool,
     matplotlib_rc: dict[str, Any] | None,
     figure_kwargs: dict[str, Any] | None,
+    axes_kwargs: dict[str, Any] | None,
+    tight_layout_kwargs: dict[str, Any] | None,
     savefig_kwargs: dict[str, Any] | None,
 ) -> Path | None:
     """Render a 2-D heatmap of orientation frequency vs distance."""
-    import matplotlib
-    import matplotlib.pyplot as plt
-    from matplotlib.colors import LogNorm
-
-    if preferred_backend:
-        matplotlib.use(preferred_backend)
-    if matplotlib_rc:
-        plt.rcParams.update(matplotlib_rc)
-
     normalization_mode = _resolve_heatmap_normalization_mode(
         heatmap_normalization_mode=heatmap_normalization_mode,
         heatmap_normalize=heatmap_normalize,
@@ -1809,189 +1810,66 @@ def _plot_orientation_heatmap(
     else:
         heatmap_plot = heatmap
 
-    mesh_kwargs: dict[str, Any] = {
-        "shading": "flat",
-        "cmap": heatmap_cmap or "viridis",
-    }
-    if heatmap_log_scale:
-        if heatmap_vmin is not None and heatmap_vmin <= 0.0:
-            raise ValueError("Heatmap log scale requires a positive heatmap_vmin.")
-        if heatmap_vmax is not None and heatmap_vmax <= 0.0:
-            raise ValueError("Heatmap log scale requires a positive heatmap_vmax.")
-        positive = np.asarray(heatmap_plot, dtype=float)
-        positive = positive[np.isfinite(positive) & (positive > 0.0)]
-        if positive.size == 0:
-            raise ValueError("Heatmap log scale requires at least one positive heatmap value.")
-        resolved_vmin = float(heatmap_vmin) if heatmap_vmin is not None else float(np.min(positive))
-        resolved_vmax = float(heatmap_vmax) if heatmap_vmax is not None else float(np.max(positive))
-        if resolved_vmax < resolved_vmin:
-            raise ValueError("Heatmap log scale requires heatmap_vmax >= heatmap_vmin.")
-        mesh_kwargs["norm"] = LogNorm(vmin=resolved_vmin, vmax=resolved_vmax)
-        heatmap_plot = np.ma.masked_less_equal(np.ma.masked_invalid(heatmap_plot), 0.0)
-    else:
-        mesh_kwargs["vmin"] = heatmap_vmin
-        mesh_kwargs["vmax"] = heatmap_vmax
-
-    fig_kw = dict(figsize=style.figure_size, dpi=style.dpi)
-    if figure_kwargs:
-        fig_kw.update(figure_kwargs)
-    fig, ax = plt.subplots(**fig_kw)
-
-    angle_symbol = "θ" if angle == "polar" else "φ"
-    default_title = f"H₂O orientation heatmap ({angle})"
+    angle_symbol = "ÃŽÂ¸" if angle == "polar" else "Ãâ€ "
+    default_title = f"HÃ¢â€šâ€šO orientation heatmap ({angle})"
     default_x = _distance_label(ref)
     default_y = f"cos({angle_symbol})"
-
-    mesh = ax.pcolormesh(
-        x_edges,
-        y_edges,
-        heatmap_plot.T,
-        **mesh_kwargs,
-    )
     if normalization_mode == "counts":
         default_cb_label = "Frequency"
     elif normalization_mode == "global_probability":
         default_cb_label = "Global probability"
     else:
         default_cb_label = "Bulk-normalized frequency (bulk mean = 1)"
-    if heatmap_colorbar_enabled:
-        cb_kw: dict[str, Any] = {}
-        position = (
-            heatmap_colorbar_position
-            if heatmap_colorbar_position in {"right", "left", "top", "bottom"}
-            else "right"
-        )
-        cb_kw["location"] = position
-        if heatmap_colorbar_pad is not None:
-            cb_kw["pad"] = heatmap_colorbar_pad
-        if heatmap_colorbar_shrink is not None:
-            cb_kw["shrink"] = heatmap_colorbar_shrink
-        if heatmap_colorbar_aspect is not None:
-            cb_kw["aspect"] = heatmap_colorbar_aspect
-        cbar = fig.colorbar(
-            mesh,
-            ax=ax,
-            label=heatmap_colorbar_label
-            if heatmap_colorbar_label is not None
-            else default_cb_label,
-            **cb_kw,
-        )
-        cb_is_vertical = position in {"right", "left"}
-        if heatmap_colorbar_label_size is not None:
-            cbar.set_label(
-                cbar.ax.get_ylabel() if cb_is_vertical else cbar.ax.get_xlabel(),
-                fontsize=heatmap_colorbar_label_size,
-            )
-        if heatmap_colorbar_tick_size is not None:
-            cbar.ax.tick_params(labelsize=heatmap_colorbar_tick_size)
-
-    ax.set_xlabel(x_label or default_x, fontsize=style.label_font_size)
-    ax.set_ylabel(y_label or default_y, fontsize=style.label_font_size)
-    if title_visible is not False:
-        ax.set_title(title or default_title, fontsize=style.title_font_size)
-    if x_lim is not None:
-        ax.set_xlim(x_lim)
-    if y_lim is not None:
-        ax.set_ylim(y_lim)
-    if x_ticks is not None:
-        ax.set_xticks([float(v) for v in x_ticks])
-    if y_ticks is not None:
-        ax.set_yticks([float(v) for v in y_ticks])
-
-    # Ticks
-    ax.tick_params(axis="both", labelsize=style.tick_font_size)
-    tick_axis_hint = "both"
-    minor_ticks_mode = "off"
-    cleaned_tick_kw: dict[str, Any] = {}
-    if isinstance(tick_params_kwargs, dict):
-        cleaned_tick_kw = {k: v for k, v in tick_params_kwargs.items() if not k.startswith("_")}
-        raw_axis = tick_params_kwargs.get("_ticks_axis")
-        if raw_axis in {"both", "x", "y"}:
-            tick_axis_hint = raw_axis
-        raw_minor = tick_params_kwargs.get("_minor_ticks_mode")
-        if raw_minor in {"on", "off"}:
-            minor_ticks_mode = raw_minor
-
-    if ticks_visible is False:
-        if tick_axis_hint in {"both", "x"}:
-            ax.tick_params(
-                axis="x",
-                which="both",
-                bottom=False,
-                top=False,
-                labelbottom=False,
-            )
-        if tick_axis_hint in {"both", "y"}:
-            ax.tick_params(
-                axis="y",
-                which="both",
-                left=False,
-                right=False,
-                labelleft=False,
-            )
-    else:
-        if ticks_visible is True and tick_axis_hint in {"x", "y"}:
-            if tick_axis_hint == "x":
-                ax.tick_params(
-                    axis="y",
-                    which="both",
-                    left=False,
-                    right=False,
-                    labelleft=False,
-                )
-            else:
-                ax.tick_params(
-                    axis="x",
-                    which="both",
-                    bottom=False,
-                    top=False,
-                    labelbottom=False,
-                )
-        if x_tick_rotation is not None:
-            ax.tick_params(axis="x", rotation=float(x_tick_rotation))
-        if y_tick_rotation is not None:
-            ax.tick_params(axis="y", rotation=float(y_tick_rotation))
-    if minor_ticks_mode == "on":
-        ax.minorticks_on()
-    elif minor_ticks_mode == "off":
-        ax.minorticks_off()
-    if cleaned_tick_kw:
-        ax.tick_params(**cleaned_tick_kw)
-
-    # Grid (default off for heatmaps)
-    if style.grid:
-        resolved_grid_kw: dict[str, Any] = {
-            "linestyle": style.grid_linestyle,
-            "linewidth": style.grid_linewidth,
-            "alpha": style.grid_alpha,
-        }
-        if grid_kwargs is not None:
-            resolved_grid_kw.update(dict(grid_kwargs))
-        ax.grid(True, **resolved_grid_kw)
-    else:
-        ax.grid(False)
-
-    fig.tight_layout()
-
-    saved_path: Path | None = None
-    if output is not None:
-        output_path = Path(output).expanduser().resolve()
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        sfig_kw: dict[str, Any] = {}
-        if savefig_kwargs:
-            sfig_kw.update(savefig_kwargs)
-        fig.savefig(str(output_path), **sfig_kw)
-        if not suppress_output_log:
-            LOGGER.info("Saved orientation heatmap to '%s'.", output_path)
-        saved_path = output_path
-
-    if capture_state is not None:
-        capture_state["figure"] = fig
-        capture_state["axes"] = ax
-
-    if show:
-        plt.show(block=show_blocking)
-    else:
-        plt.close(fig)
-
-    return saved_path
+    resolved_colorbar_label = (
+        heatmap_colorbar_label if heatmap_colorbar_label is not None else default_cb_label
+    )
+    return plot_heatmap_series(
+        x_edges,
+        y_edges,
+        heatmap_plot,
+        title=title or default_title,
+        x_label=resolve_explicit_plot_text(x_label, default_x),
+        y_label=resolve_explicit_plot_text(y_label, default_y),
+        output=output,
+        show=show,
+        show_blocking=show_blocking,
+        preferred_backend=preferred_backend,
+        style=style,
+        x_lim=x_lim,
+        y_lim=y_lim,
+        x_ticks=x_ticks,
+        y_ticks=y_ticks,
+        x_tick_rotation=x_tick_rotation,
+        y_tick_rotation=y_tick_rotation,
+        x_label_pad=x_label_pad,
+        y_label_pad=y_label_pad,
+        title_visible=title_visible,
+        ticks_visible=ticks_visible,
+        capture_state=capture_state,
+        matplotlib_rc=matplotlib_rc,
+        figure_kwargs=figure_kwargs,
+        axes_kwargs=axes_kwargs,
+        grid_kwargs=grid_kwargs,
+        tick_params_kwargs=tick_params_kwargs,
+        tight_layout_kwargs=tight_layout_kwargs,
+        savefig_kwargs=savefig_kwargs,
+        suppress_output_log=suppress_output_log,
+        heatmap_vmin=heatmap_vmin,
+        heatmap_vmax=heatmap_vmax,
+        heatmap_cmap=heatmap_cmap,
+        heatmap_log_scale=heatmap_log_scale,
+        heatmap_colorbar_enabled=heatmap_colorbar_enabled,
+        heatmap_colorbar_label=resolved_colorbar_label,
+        heatmap_colorbar_label_size=heatmap_colorbar_label_size,
+        heatmap_colorbar_tick_size=heatmap_colorbar_tick_size,
+        heatmap_colorbar_position=heatmap_colorbar_position,
+        heatmap_colorbar_pad=heatmap_colorbar_pad,
+        heatmap_colorbar_shrink=heatmap_colorbar_shrink,
+        heatmap_colorbar_aspect=heatmap_colorbar_aspect,
+        capture_state_extra={
+            "heatmap_normalization_mode": normalization_mode,
+            "heatmap_log_scale": bool(heatmap_log_scale),
+            "heatmap_colorbar_enabled": bool(heatmap_colorbar_enabled),
+            "heatmap_colorbar_label": resolved_colorbar_label,
+        },
+    )

@@ -701,3 +701,103 @@ def test_plot_orientation_profile_heatmap_log_scale_rejects_nonpositive_vmin(tmp
             heatmap_log_scale=True,
             heatmap_vmin=0.0,
         )
+
+
+def test_plot_orientation_profile_heatmap_honors_shared_plot_settings(tmp_path):
+    from linak.analysis.orientation import plot_orientation_profile
+    from linak.plot.plotting import with_style_overrides
+
+    profile = compute_orientation_profile(
+        frames=_multi_frame_trajectory(2), axis="z", bin_width=2.0
+    )
+    capture_state: dict[str, object] = {}
+    style = with_style_overrides(font_family="serif")
+
+    result = plot_orientation_profile(
+        profile,
+        output=str(tmp_path / "orient_heat_style.png"),
+        show=False,
+        component="heatmap",
+        angle="polar",
+        style=style,
+        x_label_pad=13.0,
+        y_label_pad=17.0,
+        axes_kwargs={"xmargin": 0.125},
+        tight_layout_kwargs={"pad": 0.3},
+        capture_state=capture_state,
+    )
+
+    assert result is not None
+    ax = capture_state["axes"]
+    cbar = capture_state["heatmap_colorbar"]
+    assert ax.xaxis.label.get_fontfamily()[0].lower() == "serif"
+    assert ax.yaxis.label.get_fontfamily()[0].lower() == "serif"
+    assert cbar.ax.yaxis.label.get_fontfamily()[0].lower() == "serif"
+    assert ax.xaxis.labelpad == pytest.approx(13.0)
+    assert ax.yaxis.labelpad == pytest.approx(17.0)
+    assert ax.get_xmargin() == pytest.approx(0.125)
+    assert capture_state["font_family"] == "serif"
+    assert capture_state["x_label_pad"] == pytest.approx(13.0)
+    assert capture_state["y_label_pad"] == pytest.approx(17.0)
+    assert capture_state["heatmap_normalization_mode"] == "counts"
+    assert capture_state["heatmap_colorbar_enabled"] is True
+
+
+def test_plot_orientation_profile_heatmap_matplotlib_rc_is_scoped(tmp_path):
+    import matplotlib
+    import matplotlib.colors as mcolors
+
+    from linak.analysis.orientation import plot_orientation_profile
+
+    profile = compute_orientation_profile(
+        frames=_multi_frame_trajectory(2), axis="z", bin_width=2.0
+    )
+    capture_state: dict[str, object] = {}
+    previous_axes_facecolor = matplotlib.rcParams["axes.facecolor"]
+
+    result = plot_orientation_profile(
+        profile,
+        output=str(tmp_path / "orient_heat_rc.png"),
+        show=False,
+        component="heatmap",
+        angle="polar",
+        matplotlib_rc={"axes.facecolor": "#abcdef"},
+        capture_state=capture_state,
+    )
+
+    assert result is not None
+    ax = capture_state["axes"]
+    assert mcolors.to_hex(ax.get_facecolor(), keep_alpha=False) == "#abcdef"
+    assert matplotlib.rcParams["axes.facecolor"] == previous_axes_facecolor
+
+
+def test_plot_orientation_profile_heatmap_uses_shared_backend_configuration(
+    tmp_path,
+    monkeypatch,
+):
+    import linak.plot.plotting as plotting_mod
+
+    from linak.analysis.orientation import plot_orientation_profile
+
+    profile = compute_orientation_profile(
+        frames=_multi_frame_trajectory(2), axis="z", bin_width=2.0
+    )
+    backend_calls: list[tuple[bool, str | None]] = []
+
+    def _fake_configure_backend(*, interactive, preferred_backend=None):
+        backend_calls.append((bool(interactive), preferred_backend))
+        return "Agg"
+
+    monkeypatch.setattr(plotting_mod, "configure_matplotlib_backend", _fake_configure_backend)
+
+    result = plot_orientation_profile(
+        profile,
+        output=str(tmp_path / "orient_heat_backend.png"),
+        show=False,
+        component="heatmap",
+        angle="polar",
+        preferred_backend="Agg",
+    )
+
+    assert result is not None
+    assert backend_calls == [(False, "Agg")]
