@@ -85,14 +85,43 @@ class PlotStyle:
 DEFAULT_PLOT_STYLE = PlotStyle()
 
 
+_MOJIBAKE_MARKERS = ("Ã", "â", "Î", "Ï", "Â")
+
+
+def repair_legacy_plot_text(value: str) -> str:
+    """Repair common UTF-8 mojibake in legacy saved plot labels/titles.
+
+    Some older plot settings were persisted after UTF-8 text had been decoded with
+    a Windows single-byte code page. That produces strings such as ``Hâ‚‚O``,
+    ``Ã…``, or ``âŸ¨cos(Î¸)âŸ©``. When such settings are re-applied, they override
+    clean defaults. This helper repairs those strings conservatively.
+    """
+    text = str(value)
+    if not any(marker in text for marker in _MOJIBAKE_MARKERS):
+        return text
+
+    best = text
+    best_score = sum(best.count(marker) for marker in _MOJIBAKE_MARKERS)
+    for encoding in ("cp1252", "latin-1"):
+        try:
+            candidate = text.encode(encoding).decode("utf-8")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            continue
+        candidate_score = sum(candidate.count(marker) for marker in _MOJIBAKE_MARKERS)
+        if candidate_score < best_score:
+            best = candidate
+            best_score = candidate_score
+    return best
+
+
 def format_axis_label_units(label: str) -> str:
     """Return the axis label exactly as provided by the caller."""
-    return str(label)
+    return repair_legacy_plot_text(str(label))
 
 
 def resolve_explicit_plot_text(value: str | None, default: str) -> str:
     """Preserve explicit blank strings while still filling missing values from defaults."""
-    return default if value is None else str(value)
+    return repair_legacy_plot_text(default if value is None else str(value))
 
 
 def _series_statistics(x_values: np.ndarray, y_values: np.ndarray) -> dict[str, float | int | None]:
@@ -491,7 +520,7 @@ def _capture_plot_state(
             "markers": any(
                 marker not in {"", "None", "none", " ", "NoneType"} for marker in line_markers
             ),
-            "series_labels": list(line_labels),
+            "series_labels": [repair_legacy_plot_text(str(label)) for label in line_labels],
             "figsize": [float(style.figure_size[0]), float(style.figure_size[1])],
             "dpi": int(style.dpi),
             "font_family": style.font_family,
@@ -845,13 +874,17 @@ def plot_line_series(
                 if line_width_override is None
                 else float(line_width_override),
                 "color": color,
-                "label": line_label if show_in_legend else "_nolegend_",
+                "label": (
+                    repair_legacy_plot_text(str(line_label))
+                    if show_in_legend and line_label is not None
+                    else "_nolegend_"
+                ),
                 "marker": marker,
             }
             if line_kwargs is not None:
                 resolved_line_kwargs.update(dict(line_kwargs))
             if line_label is not None:
-                resolved_line_kwargs["label"] = line_label
+                resolved_line_kwargs["label"] = repair_legacy_plot_text(str(line_label))
             (line_artist,) = ax.plot(
                 x_plot,
                 y_plot,
@@ -926,7 +959,7 @@ def plot_line_series(
         if title_visible is False:
             ax.set_title("", fontsize=style.title_font_size)
         else:
-            ax.set_title(title, fontsize=style.title_font_size)
+            ax.set_title(repair_legacy_plot_text(title), fontsize=style.title_font_size)
         ax.tick_params(axis="both", labelsize=style.tick_font_size)
         resolved_tick_params_kwargs, tick_axis_hint, minor_ticks_mode = _extract_tick_controls(
             tick_params_kwargs
@@ -1196,7 +1229,7 @@ def plot_heatmap_series(
         if title_visible is False:
             ax.set_title("", fontsize=style.title_font_size)
         else:
-            ax.set_title(title, fontsize=style.title_font_size)
+            ax.set_title(repair_legacy_plot_text(title), fontsize=style.title_font_size)
         ax.tick_params(axis="both", labelsize=style.tick_font_size)
         resolved_tick_params_kwargs, tick_axis_hint, minor_ticks_mode = _extract_tick_controls(
             tick_params_kwargs
@@ -1559,7 +1592,7 @@ def plot_multi_line_series(
         if title_visible is False:
             ax.set_title("", fontsize=style.title_font_size)
         else:
-            ax.set_title(title, fontsize=style.title_font_size)
+            ax.set_title(repair_legacy_plot_text(title), fontsize=style.title_font_size)
         ax.tick_params(axis="both", labelsize=style.tick_font_size)
         resolved_tick_params_kwargs, tick_axis_hint, minor_ticks_mode = _extract_tick_controls(
             tick_params_kwargs

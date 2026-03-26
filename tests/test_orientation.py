@@ -480,6 +480,37 @@ def test_plot_orientation_profile_density_weighted_uses_unicode_auto_label(tmp_p
     assert capture_state["y_label"] == "H2O density-weighted ⟨cos(θ)⟩"
 
 
+def test_plot_orientation_profile_repairs_legacy_mojibake_labels(tmp_path):
+    from linak.analysis.orientation import plot_orientation_profile
+
+    profile = compute_orientation_profile(
+        frames=_multi_frame_trajectory(2), axis="z", bin_width=2.0
+    )
+    capture_state: dict[str, object] = {}
+
+    def _mojibake(text: str) -> str:
+        return text.encode("utf-8").decode("cp1252")
+
+    result = plot_orientation_profile(
+        profile,
+        output=str(tmp_path / "orient_mojibake_repair.png"),
+        show=False,
+        component="average",
+        angle="polar",
+        title=_mojibake("H₂O orientation (polar)"),
+        x_label=_mojibake("Distance to surface along Z (Å)"),
+        y_label=_mojibake("⟨cos(θ)⟩"),
+        line_label=_mojibake("⟨cos(θ)⟩"),
+        capture_state=capture_state,
+    )
+
+    assert result is not None
+    assert capture_state["title"] == "H₂O orientation (polar)"
+    assert capture_state["x_label"] == "Distance to surface along Z (Å)"
+    assert capture_state["y_label"] == "⟨cos(θ)⟩"
+    assert capture_state["series_labels"] == ["⟨cos(θ)⟩"]
+
+
 def test_plot_orientation_profile_heatmap(tmp_path):
     from linak.analysis.orientation import plot_orientation_profile
 
