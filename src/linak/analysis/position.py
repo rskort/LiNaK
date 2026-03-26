@@ -216,6 +216,7 @@ def _resolve_surface_distance_values(
     if _surface_estimate_supports_distance_mode(
         surface_estimate, frame_count=axis_values_all.shape[0]
     ):
+        assert surface_estimate.position is not None
         _log_framewise_surface_alignment(
             logger=LOGGER,
             axis=axis,
@@ -226,7 +227,7 @@ def _resolve_surface_distance_values(
             axis_values_all - surface_per_frame[:, np.newaxis],
             "distance",
             float(surface_estimate.position),
-            float(surface_estimate.std),
+            None if surface_estimate.std is None else float(surface_estimate.std),
             surface_per_frame,
             surface_estimate,
         )

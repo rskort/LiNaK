@@ -477,3 +477,227 @@ def test_plot_orientation_profile_heatmap(tmp_path):
     )
     assert result is not None
     assert out.exists()
+
+
+def test_plot_orientation_profile_heatmap_normalize_uses_global_probability(tmp_path):
+    from linak.analysis.orientation import plot_orientation_profile
+
+    profile = compute_orientation_profile(
+        frames=_multi_frame_trajectory(2), axis="z", bin_width=2.0
+    )
+    capture_state: dict[str, object] = {}
+    out = tmp_path / "orient_heat_prob.png"
+    result = plot_orientation_profile(
+        profile,
+        output=str(out),
+        show=False,
+        component="heatmap",
+        angle="polar",
+        heatmap_normalize=True,
+        capture_state=capture_state,
+    )
+    assert result is not None
+    assert out.exists()
+    ax = capture_state["axes"]
+    mesh = ax.collections[0]
+    values = np.asarray(mesh.get_array(), dtype=float)
+    finite_values = values[np.isfinite(values)]
+    assert finite_values.size > 0
+    np.testing.assert_allclose(np.sum(finite_values), 1.0)
+
+
+def test_plot_orientation_profile_heatmap_legacy_shrunk_mode_maps_to_global_probability(tmp_path):
+    from linak.analysis.orientation import plot_orientation_profile
+
+    profile = compute_orientation_profile(
+        frames=_multi_frame_trajectory(2), axis="z", bin_width=2.0
+    )
+    capture_state: dict[str, object] = {}
+    out = tmp_path / "orient_heat_shrunk.png"
+    result = plot_orientation_profile(
+        profile,
+        output=str(out),
+        show=False,
+        component="heatmap",
+        angle="polar",
+        heatmap_normalization_mode="shrunk_row_probability",
+        capture_state=capture_state,
+    )
+    assert result is not None
+    assert out.exists()
+    ax = capture_state["axes"]
+    mesh = ax.collections[0]
+    values = np.asarray(mesh.get_array(), dtype=float)
+    finite_values = values[np.isfinite(values)]
+    assert finite_values.size > 0
+    np.testing.assert_allclose(np.sum(finite_values), 1.0)
+
+
+def test_plot_orientation_profile_heatmap_bulk_water_reference_normalizes_bulk_mean_to_one(
+    tmp_path,
+):
+    from linak.analysis.orientation import plot_orientation_profile
+
+    profile = OrientationProfile(
+        axis="z",
+        reference_axis="z",
+        n_frames=1,
+        n_molecules_per_frame=1,
+        bin_edges=np.asarray([0.0, 1.0, 2.0, 3.0, 4.0, 5.0], dtype=float),
+        bin_centers=np.asarray([0.5, 1.5, 2.5, 3.5, 4.5], dtype=float),
+        cos_polar_mean=np.zeros(5, dtype=float),
+        cos_azimuthal_mean=np.zeros(5, dtype=float),
+        count_total=np.zeros(5, dtype=int),
+        count_polar_valid=np.zeros(5, dtype=int),
+        count_azimuthal_valid=np.zeros(5, dtype=int),
+        cos_polar_density=np.zeros(5, dtype=float),
+        cos_azimuthal_density=np.zeros(5, dtype=float),
+        density=np.asarray([8.0, 8.0, 1.0, 8.0, 8.0], dtype=float),
+        heatmap_polar=np.asarray(
+            [
+                [2.0, 2.0],
+                [2.0, 2.0],
+                [0.0, 0.0],
+                [4.0, 4.0],
+                [4.0, 4.0],
+            ],
+            dtype=float,
+        ),
+        heatmap_azimuthal=np.zeros((5, 2), dtype=float),
+        heatmap_angle_bin_edges=np.asarray([-1.0, 0.0, 1.0], dtype=float),
+        heatmap_angle_bin_centers=np.asarray([-0.5, 0.5], dtype=float),
+        coordinate_mode="distance",
+    )
+    capture_state: dict[str, object] = {}
+    out = tmp_path / "orient_heat_bulk.png"
+    result = plot_orientation_profile(
+        profile,
+        output=str(out),
+        show=False,
+        component="heatmap",
+        angle="polar",
+        heatmap_normalization_mode="bulk_water_reference",
+        capture_state=capture_state,
+    )
+    assert result is not None
+    assert out.exists()
+    mesh = capture_state["axes"].collections[0]
+    values = np.asarray(mesh.get_array(), dtype=float)
+    np.testing.assert_allclose(np.mean(values[:, 3:5]), 1.0)
+    np.testing.assert_allclose(np.mean(values[:, 0:2]), 0.5)
+
+
+def test_plot_orientation_profile_heatmap_bulk_water_reference_requires_distance_mode(tmp_path):
+    from linak.analysis.orientation import plot_orientation_profile
+
+    profile = OrientationProfile(
+        axis="z",
+        reference_axis="z",
+        n_frames=1,
+        n_molecules_per_frame=1,
+        bin_edges=np.asarray([0.0, 1.0, 2.0], dtype=float),
+        bin_centers=np.asarray([0.5, 1.5], dtype=float),
+        cos_polar_mean=np.zeros(2, dtype=float),
+        cos_azimuthal_mean=np.zeros(2, dtype=float),
+        count_total=np.zeros(2, dtype=int),
+        count_polar_valid=np.zeros(2, dtype=int),
+        count_azimuthal_valid=np.zeros(2, dtype=int),
+        cos_polar_density=np.zeros(2, dtype=float),
+        cos_azimuthal_density=np.zeros(2, dtype=float),
+        density=np.asarray([1.0, 1.0], dtype=float),
+        heatmap_polar=np.asarray([[1.0, 1.0], [1.0, 1.0]], dtype=float),
+        heatmap_azimuthal=np.zeros((2, 2), dtype=float),
+        heatmap_angle_bin_edges=np.asarray([-1.0, 0.0, 1.0], dtype=float),
+        heatmap_angle_bin_centers=np.asarray([-0.5, 0.5], dtype=float),
+        coordinate_mode="axis",
+    )
+
+    with pytest.raises(ValueError, match="distance-aligned profile"):
+        plot_orientation_profile(
+            profile,
+            output=str(tmp_path / "orient_heat_bulk_axis.png"),
+            show=False,
+            component="heatmap",
+            angle="polar",
+            heatmap_normalization_mode="bulk_water_reference",
+        )
+
+
+def test_plot_orientation_profile_heatmap_bulk_water_reference_requires_bulk_plateau(tmp_path):
+    from linak.analysis.orientation import plot_orientation_profile
+
+    profile = OrientationProfile(
+        axis="z",
+        reference_axis="z",
+        n_frames=1,
+        n_molecules_per_frame=1,
+        bin_edges=np.asarray([0.0, 1.0, 2.0], dtype=float),
+        bin_centers=np.asarray([-0.5, -1.5], dtype=float),
+        cos_polar_mean=np.zeros(2, dtype=float),
+        cos_azimuthal_mean=np.zeros(2, dtype=float),
+        count_total=np.zeros(2, dtype=int),
+        count_polar_valid=np.zeros(2, dtype=int),
+        count_azimuthal_valid=np.zeros(2, dtype=int),
+        cos_polar_density=np.zeros(2, dtype=float),
+        cos_azimuthal_density=np.zeros(2, dtype=float),
+        density=np.asarray([0.0, 0.0], dtype=float),
+        heatmap_polar=np.asarray([[1.0, 1.0], [1.0, 1.0]], dtype=float),
+        heatmap_azimuthal=np.zeros((2, 2), dtype=float),
+        heatmap_angle_bin_edges=np.asarray([-1.0, 0.0, 1.0], dtype=float),
+        heatmap_angle_bin_centers=np.asarray([-0.5, 0.5], dtype=float),
+        coordinate_mode="distance",
+    )
+
+    with pytest.raises(ValueError, match="water-bulk density plateau"):
+        plot_orientation_profile(
+            profile,
+            output=str(tmp_path / "orient_heat_bulk_missing.png"),
+            show=False,
+            component="heatmap",
+            angle="polar",
+            heatmap_normalization_mode="bulk_water_reference",
+        )
+
+
+def test_plot_orientation_profile_heatmap_log_scale_masks_zero_cells(tmp_path):
+    from matplotlib.colors import LogNorm
+
+    from linak.analysis.orientation import plot_orientation_profile
+
+    profile = compute_orientation_profile(
+        frames=_multi_frame_trajectory(2), axis="z", bin_width=2.0
+    )
+    capture_state: dict[str, object] = {}
+    out = tmp_path / "orient_heat_log.png"
+    result = plot_orientation_profile(
+        profile,
+        output=str(out),
+        show=False,
+        component="heatmap",
+        angle="polar",
+        heatmap_log_scale=True,
+        capture_state=capture_state,
+    )
+    assert result is not None
+    assert out.exists()
+    ax = capture_state["axes"]
+    assert isinstance(ax.collections[0].norm, LogNorm)
+
+
+def test_plot_orientation_profile_heatmap_log_scale_rejects_nonpositive_vmin(tmp_path):
+    from linak.analysis.orientation import plot_orientation_profile
+
+    profile = compute_orientation_profile(
+        frames=_multi_frame_trajectory(2), axis="z", bin_width=2.0
+    )
+
+    with pytest.raises(ValueError, match="positive heatmap_vmin"):
+        plot_orientation_profile(
+            profile,
+            output=str(tmp_path / "orient_heat_log_invalid.png"),
+            show=False,
+            component="heatmap",
+            angle="polar",
+            heatmap_log_scale=True,
+            heatmap_vmin=0.0,
+        )

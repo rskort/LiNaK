@@ -6,7 +6,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 import logging
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 import warnings
 
 import numpy as np
@@ -497,8 +497,8 @@ def _validate_surface_options(
 
     return SurfaceEstimatorOptions(
         mode=mode,
-        side=side,
-        reduction_mode=reduction_mode,
+        side=cast(Literal["top", "bottom"], side),
+        reduction_mode=cast(Literal["median", "trimmed_mean", "legacy_mean"], reduction_mode),
         trim_fraction=trim_fraction,
         gap_min_A=float(options.gap_min_A),
         gap_factor=float(options.gap_factor),
@@ -1308,44 +1308,6 @@ def _build_surface_summary(
         method_label=method_label,
         composite_score=float(np.clip(composite_score, 0.0, 1.0)),
     )
-
-
-def _surface_temporal_component(
-    values: np.ndarray,
-    valid_mask: np.ndarray,
-    *,
-    tolerance_A: float,
-) -> np.ndarray:
-    component = np.zeros(values.shape, dtype=float)
-    for index, value in enumerate(values):
-        if not valid_mask[index] or not np.isfinite(value):
-            continue
-        neighbors: list[float] = []
-        for offset in (-1, 1):
-            cursor = index + offset
-            while 0 <= cursor < values.size:
-                if valid_mask[cursor] and np.isfinite(values[cursor]):
-                    neighbors.append(float(values[cursor]))
-                    break
-                cursor += offset
-        if not neighbors:
-            component[index] = 0.5
-            continue
-        delta = max(abs(float(value) - neighbor) for neighbor in neighbors)
-        component[index] = float(np.clip(1.0 - delta / max(tolerance_A, 1.0e-12), 0.0, 1.0))
-    return component
-
-
-def _surface_smoothness_score(
-    values: np.ndarray, valid_mask: np.ndarray, *, tolerance_A: float
-) -> float:
-    valid_values = np.asarray(values[valid_mask], dtype=float)
-    if valid_values.size <= 1:
-        return 1.0 if valid_values.size == values.size and valid_values.size > 0 else 0.0
-    deltas = np.abs(np.diff(valid_values))
-    if deltas.size == 0:
-        return 1.0
-    return float(np.clip(1.0 - np.median(deltas) / max(tolerance_A, 1.0e-12), 0.0, 1.0))
 
 
 def _estimate_composite_score(
@@ -2862,7 +2824,7 @@ def compute_density_profile(
     if normalized_binning == "cell":
         surface_per_frame = (
             None
-            if coordinate_mode != "distance" or surface_estimate is None
+            if coordinate_mode != "distance" or trusted_surface_estimate is None
             else trusted_surface_estimate.per_frame
         )
         histogram_bounds = _cell_histogram_bounds(

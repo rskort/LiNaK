@@ -71,6 +71,7 @@ _BISECTOR_NORM_EPSILON: float = 1.0e-12
 _PLANE_NORMAL_NORM_EPSILON: float = 1.0e-12
 _PROJECTED_NORMAL_NORM_EPSILON: float = 1.0e-12
 _OH_LENGTH_SANITY_TOLERANCE: float = 1.0e-8
+_HEATMAP_BULK_DENSITY_FRACTION: float = 0.8
 
 
 # ───────────────────────────── dataclass ──────────────────────────────────
@@ -324,22 +325,20 @@ def _legacy_compute_orientation_profile(
     # ── finalise averages ─────────────────────────────────────────────
     n_frames = len(frames)
     safe_count = np.where(count > 0, count, 1.0)
+    count_total = np.asarray(count, dtype=int)
+    count_polar_valid = np.asarray(count, dtype=int)
+    count_azimuthal_valid = np.asarray(count, dtype=int)
 
     cos_polar_mean = cos_polar_sum / safe_count
     cos_azimuthal_mean = cos_azimuthal_sum / safe_count
 
     # number density: count / (n_frames * bin_volume_or_length)
     density = _legacy_compute_number_density(
-        count_total=count,
+        count=count,
         n_frames=n_frames,
         bin_width=bin_width,
-        slab_volumes=None
-        if cell_lengths is None
-        else np.array(
-            [np.prod([cell_lengths[i] for i in range(3) if i != axis_index]) * bin_width],
-            dtype=float,
-        ),
-        framewise_density_sum=None,
+        cell_lengths=cell_lengths,
+        axis_index=axis_index,
     )
 
     cos_polar_density = cos_polar_mean * density
@@ -354,6 +353,9 @@ def _legacy_compute_orientation_profile(
         bin_centers=dist_bin_centers,
         cos_polar_mean=cos_polar_mean,
         cos_azimuthal_mean=cos_azimuthal_mean,
+        count_total=count_total,
+        count_polar_valid=count_polar_valid,
+        count_azimuthal_valid=count_azimuthal_valid,
         cos_polar_density=cos_polar_density,
         cos_azimuthal_density=cos_azimuthal_density,
         density=density,
@@ -575,7 +577,11 @@ def _representative_cell_lengths(frames: list[Atoms]) -> tuple[float, float, flo
         if pbc.size != 3 or not bool(np.all(pbc)):
             return None
         cell = np.asarray(frame.cell.array, dtype=float)
-        frame_lengths = tuple(float(np.linalg.norm(cell[i])) for i in range(3))
+        frame_lengths: tuple[float, float, float] = (
+            float(np.linalg.norm(cell[0])),
+            float(np.linalg.norm(cell[1])),
+            float(np.linalg.norm(cell[2])),
+        )
         if any(length <= 0.0 or not np.isfinite(length) for length in frame_lengths):
             return None
         lengths.append(frame_lengths)
@@ -1172,6 +1178,9 @@ def plot_orientation_profile(
     y_bin_width: float | None = None,
     y_bin_reducer: str | None = None,
     heatmap_normalize: bool = False,
+    heatmap_normalization_mode: str | None = None,
+    heatmap_shrink_strength: float | None = None,
+    heatmap_log_scale: bool = False,
     heatmap_colorbar_label: str | None = None,
     heatmap_colorbar_label_size: int | None = None,
     heatmap_colorbar_tick_size: int | None = None,
@@ -1224,6 +1233,9 @@ def plot_orientation_profile(
             y_bin_width=y_bin_width,
             y_bin_reducer=y_bin_reducer,
             heatmap_normalize=heatmap_normalize,
+            heatmap_normalization_mode=heatmap_normalization_mode,
+            heatmap_shrink_strength=heatmap_shrink_strength,
+            heatmap_log_scale=heatmap_log_scale,
             heatmap_colorbar_enabled=heatmap_colorbar_enabled,
             heatmap_colorbar_label=heatmap_colorbar_label,
             heatmap_colorbar_label_size=heatmap_colorbar_label_size,
@@ -1355,6 +1367,9 @@ def plot_orientation_profiles(
     y_bin_width: float | None = None,
     y_bin_reducer: str | None = None,
     heatmap_normalize: bool = False,
+    heatmap_normalization_mode: str | None = None,
+    heatmap_shrink_strength: float | None = None,
+    heatmap_log_scale: bool = False,
     heatmap_colorbar_label: str | None = None,
     heatmap_colorbar_label_size: int | None = None,
     heatmap_colorbar_tick_size: int | None = None,
@@ -1411,6 +1426,9 @@ def plot_orientation_profiles(
             y_bin_width=y_bin_width,
             y_bin_reducer=y_bin_reducer,
             heatmap_normalize=heatmap_normalize,
+            heatmap_normalization_mode=heatmap_normalization_mode,
+            heatmap_shrink_strength=heatmap_shrink_strength,
+            heatmap_log_scale=heatmap_log_scale,
             heatmap_colorbar_enabled=heatmap_colorbar_enabled,
             heatmap_colorbar_label=heatmap_colorbar_label,
             heatmap_colorbar_label_size=heatmap_colorbar_label_size,
@@ -1558,6 +1576,102 @@ def _rebin_heatmap_axis(
     return rebinned, np.array(new_edges)
 
 
+def _resolve_heatmap_normalization_mode(
+    *,
+    heatmap_normalization_mode: str | None,
+    heatmap_normalize: bool,
+) -> str:
+    normalization_mode = "global_probability" if heatmap_normalize else "counts"
+    if heatmap_normalization_mode is None:
+        return normalization_mode
+
+    candidate_mode = str(heatmap_normalization_mode).strip().lower()
+    if candidate_mode == "shrunk_row_probability":
+        return "global_probability"
+    if candidate_mode not in {"counts", "global_probability", "bulk_water_reference"}:
+        raise ValueError(
+            "heatmap_normalization_mode must be one of: "
+            "counts, global_probability, bulk_water_reference."
+        )
+    return candidate_mode
+
+
+def _rebin_heatmap_density_for_display(
+    density: np.ndarray,
+    edges: np.ndarray,
+    *,
+    x_bin_width: float | None,
+) -> np.ndarray:
+    density_array = np.asarray(density, dtype=float)
+    if x_bin_width is None or x_bin_width <= 0.0:
+        return density_array
+    rebinned, _new_edges = _rebin_heatmap_axis(
+        density_array[:, np.newaxis],
+        edges,
+        x_bin_width,
+        axis=0,
+        reducer="mean",
+    )
+    return np.asarray(rebinned[:, 0], dtype=float)
+
+
+def _select_bulk_water_reference_rows(
+    *,
+    bin_centers: np.ndarray,
+    density: np.ndarray,
+) -> np.ndarray:
+    centers = np.asarray(bin_centers, dtype=float)
+    density_values = np.asarray(density, dtype=float)
+    candidate_mask = (
+        np.isfinite(centers)
+        & np.isfinite(density_values)
+        & (centers > 0.0)
+        & (density_values > 0.0)
+    )
+    if not np.any(candidate_mask):
+        raise ValueError(
+            "Bulk heatmap normalization requires a distance-aligned profile with a resolvable "
+            "water-bulk density plateau."
+        )
+
+    rho_max = float(np.max(density_values[candidate_mask]))
+    if not np.isfinite(rho_max) or rho_max <= 0.0:
+        raise ValueError(
+            "Bulk heatmap normalization requires a distance-aligned profile with a resolvable "
+            "water-bulk density plateau."
+        )
+
+    bulk_mask = candidate_mask & (density_values >= (_HEATMAP_BULK_DENSITY_FRACTION * rho_max))
+    candidate_indices = np.flatnonzero(bulk_mask)
+    if candidate_indices.size == 0:
+        raise ValueError(
+            "Bulk heatmap normalization requires a distance-aligned profile with a resolvable "
+            "water-bulk density plateau."
+        )
+
+    best_segment: np.ndarray | None = None
+    segment_start = 0
+    for index in range(1, candidate_indices.size + 1):
+        end_of_segment = index == candidate_indices.size or (
+            candidate_indices[index] != candidate_indices[index - 1] + 1
+        )
+        if not end_of_segment:
+            continue
+        segment = candidate_indices[segment_start:index]
+        segment_start = index
+        if best_segment is None or segment.size > best_segment.size:
+            best_segment = segment
+            continue
+        if best_segment is not None and segment.size == best_segment.size:
+            current_mean_distance = float(np.mean(centers[segment]))
+            best_mean_distance = float(np.mean(centers[best_segment]))
+            if current_mean_distance > best_mean_distance:
+                best_segment = segment
+
+    assert best_segment is not None
+    return np.asarray(best_segment, dtype=int)
+
+
 # ──────────────────── heatmap renderer ────────────────────────────────────
 
 
@@ -1589,6 +1703,9 @@ def _plot_orientation_heatmap(
     y_bin_width: float | None,
     y_bin_reducer: str | None,
     heatmap_normalize: bool,
+    heatmap_normalization_mode: str | None,
+    heatmap_shrink_strength: float | None,
+    heatmap_log_scale: bool,
     heatmap_colorbar_label: str | None,
     heatmap_colorbar_label_size: int | None,
     heatmap_colorbar_tick_size: int | None,
@@ -1608,22 +1725,41 @@ def _plot_orientation_heatmap(
     """Render a 2-D heatmap of orientation frequency vs distance."""
     import matplotlib
     import matplotlib.pyplot as plt
+    from matplotlib.colors import LogNorm
 
     if preferred_backend:
         matplotlib.use(preferred_backend)
     if matplotlib_rc:
         plt.rcParams.update(matplotlib_rc)
 
+    normalization_mode = _resolve_heatmap_normalization_mode(
+        heatmap_normalization_mode=heatmap_normalization_mode,
+        heatmap_normalize=heatmap_normalize,
+    )
+
     # Sum heatmaps if multiple profiles
     ref = profiles[0]
     heatmap = _select_heatmap_data(ref, angle).copy()
+    density_accumulator = np.asarray(ref.density, dtype=float).copy()
+    density_contributors = 1
     for p in profiles[1:]:
         extra = _select_heatmap_data(p, angle)
         if extra.shape == heatmap.shape:
             heatmap += extra
+            if (
+                np.asarray(p.density).shape == density_accumulator.shape
+                and np.asarray(p.bin_edges).shape == np.asarray(ref.bin_edges).shape
+                and np.allclose(
+                    np.asarray(p.bin_edges, dtype=float), np.asarray(ref.bin_edges, dtype=float)
+                )
+            ):
+                density_accumulator += np.asarray(p.density, dtype=float)
+                density_contributors += 1
 
     x_edges = ref.bin_edges
     y_edges = ref.heatmap_angle_bin_edges
+    x_centers = np.asarray(ref.bin_centers, dtype=float)
+    density_reference = density_accumulator / float(density_contributors)
 
     # Rebin distance axis (x)
     if x_bin_width is not None and x_bin_width > 0:
@@ -1633,6 +1769,12 @@ def _plot_orientation_heatmap(
             x_bin_width,
             axis=0,
             reducer=x_bin_reducer or "sum",
+        )
+        x_centers = 0.5 * (x_edges[:-1] + x_edges[1:])
+        density_reference = _rebin_heatmap_density_for_display(
+            density_reference,
+            np.asarray(ref.bin_edges, dtype=float),
+            x_bin_width=x_bin_width,
         )
     # Rebin angle axis (y)
     if y_bin_width is not None and y_bin_width > 0:
@@ -1644,13 +1786,51 @@ def _plot_orientation_heatmap(
             reducer=y_bin_reducer or "sum",
         )
 
-    # Optionally normalise each distance bin to a probability distribution
-    if heatmap_normalize:
-        row_sums = heatmap.sum(axis=1, keepdims=True)
-        row_sums = np.where(row_sums > 0, row_sums, 1.0)
-        heatmap_plot = heatmap / row_sums
+    if normalization_mode == "global_probability":
+        total = float(np.sum(heatmap))
+        heatmap_plot = heatmap if total <= 0.0 else heatmap / total
+    elif normalization_mode == "bulk_water_reference":
+        if ref.coordinate_mode != "distance":
+            raise ValueError(
+                "Bulk heatmap normalization requires a distance-aligned profile with a "
+                "resolvable water-bulk density plateau."
+            )
+        bulk_rows = _select_bulk_water_reference_rows(
+            bin_centers=x_centers,
+            density=density_reference,
+        )
+        bulk_mean = float(np.mean(heatmap[bulk_rows, :], dtype=float))
+        if not np.isfinite(bulk_mean) or bulk_mean <= 0.0:
+            raise ValueError(
+                "Bulk heatmap normalization requires a distance-aligned profile with a "
+                "resolvable water-bulk density plateau."
+            )
+        heatmap_plot = heatmap / bulk_mean
     else:
         heatmap_plot = heatmap
+
+    mesh_kwargs: dict[str, Any] = {
+        "shading": "flat",
+        "cmap": heatmap_cmap or "viridis",
+    }
+    if heatmap_log_scale:
+        if heatmap_vmin is not None and heatmap_vmin <= 0.0:
+            raise ValueError("Heatmap log scale requires a positive heatmap_vmin.")
+        if heatmap_vmax is not None and heatmap_vmax <= 0.0:
+            raise ValueError("Heatmap log scale requires a positive heatmap_vmax.")
+        positive = np.asarray(heatmap_plot, dtype=float)
+        positive = positive[np.isfinite(positive) & (positive > 0.0)]
+        if positive.size == 0:
+            raise ValueError("Heatmap log scale requires at least one positive heatmap value.")
+        resolved_vmin = float(heatmap_vmin) if heatmap_vmin is not None else float(np.min(positive))
+        resolved_vmax = float(heatmap_vmax) if heatmap_vmax is not None else float(np.max(positive))
+        if resolved_vmax < resolved_vmin:
+            raise ValueError("Heatmap log scale requires heatmap_vmax >= heatmap_vmin.")
+        mesh_kwargs["norm"] = LogNorm(vmin=resolved_vmin, vmax=resolved_vmax)
+        heatmap_plot = np.ma.masked_less_equal(np.ma.masked_invalid(heatmap_plot), 0.0)
+    else:
+        mesh_kwargs["vmin"] = heatmap_vmin
+        mesh_kwargs["vmax"] = heatmap_vmax
 
     fig_kw = dict(figsize=style.figure_size, dpi=style.dpi)
     if figure_kwargs:
@@ -1666,12 +1846,14 @@ def _plot_orientation_heatmap(
         x_edges,
         y_edges,
         heatmap_plot.T,
-        shading="flat",
-        cmap=heatmap_cmap or "viridis",
-        vmin=heatmap_vmin,
-        vmax=heatmap_vmax,
+        **mesh_kwargs,
     )
-    default_cb_label = "Probability" if heatmap_normalize else "Frequency"
+    if normalization_mode == "counts":
+        default_cb_label = "Frequency"
+    elif normalization_mode == "global_probability":
+        default_cb_label = "Global probability"
+    else:
+        default_cb_label = "Bulk-normalized frequency (bulk mean = 1)"
     if heatmap_colorbar_enabled:
         cb_kw: dict[str, Any] = {}
         position = (

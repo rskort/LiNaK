@@ -342,7 +342,7 @@ def read_linak_hdf5_profiles_by_index(
                 sorted_members = [
                     group for _name, group in sorted(member_items, key=_member_sort_key)
                 ]
-                profiles: list[tuple[dict[str, np.ndarray], dict[str, Any]]] = []
+                selected_profiles: list[tuple[dict[str, np.ndarray], dict[str, Any]]] = []
                 max_index = len(sorted_members) - 1
                 for requested_index in requested_indices:
                     if requested_index < 0 or requested_index > max_index:
@@ -375,10 +375,10 @@ def read_linak_hdf5_profiles_by_index(
                         metadata=profile_metadata,
                         datasets=datasets,
                     )
-                    profiles.append((datasets, profile_metadata))
-                return profiles
+                    selected_profiles.append((datasets, profile_metadata))
+                return selected_profiles
 
-        profiles: list[tuple[dict[str, np.ndarray], dict[str, Any]]] = []
+        root_profiles: list[tuple[dict[str, np.ndarray], dict[str, Any]]] = []
         for requested_index in requested_indices:
             if requested_index != 0:
                 raise IndexError(
@@ -397,8 +397,8 @@ def read_linak_hdf5_profiles_by_index(
                 metadata=metadata,
                 datasets=datasets,
             )
-            profiles.append((datasets, metadata))
-        return profiles
+            root_profiles.append((datasets, metadata))
+        return root_profiles
 
 
 def read_linak_hdf5(

@@ -326,6 +326,7 @@ def read_plot_profile(
     store = read_plot_profile_store(path, profile_key)
     if store is None:
         return None
+    selected_name: str | None
     if is_combined_plot_settings_source(path) and profile_name is not None:
         selected_name = _normalize_profile_name(profile_name)
         if selected_name != DEFAULT_PLOT_PROFILE_NAME:

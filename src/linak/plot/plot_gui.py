@@ -45,6 +45,14 @@ _FIT_RANGE_MODES = ("visible", "manual")
 _PROFILE_FILTER_METADATA_LABEL = "Use stored metadata"
 _PROFILE_FILTER_SPECIES_B_AUTO_LABEL = "Same as Species A / stored metadata"
 _AUTO_PREVIEW_DEBOUNCE_MS = 1000
+_HEATMAP_NORMALIZATION_LABEL_BY_MODE = {
+    "counts": "Raw frequencies",
+    "global_probability": "Global normalization",
+    "bulk_water_reference": "Normalize to water bulk",
+}
+_HEATMAP_NORMALIZATION_MODE_BY_LABEL = {
+    label: mode for mode, label in _HEATMAP_NORMALIZATION_LABEL_BY_MODE.items()
+}
 _TRI_STATE_SYNC_FIELD_KEYS = frozenset({"title", "x_label", "y_label"})
 _SERIES_SPECIFIC_SETTINGS = frozenset(
     {
@@ -204,7 +212,8 @@ _TOOLTIPS: dict[str, str] = {
     "figure.heatmap.vmin": "Minimum value for the colorbar range. Leave blank for auto.",
     "figure.heatmap.vmax": "Maximum value for the colorbar range. Leave blank for auto.",
     "figure.heatmap.cmap": "Matplotlib colormap name for the heatmap.",
-    "figure.heatmap.normalize": "Normalize each distance bin to a probability distribution.",
+    "figure.heatmap.normalize_mode": "Choose raw frequencies, whole-heatmap global probability, or bulk-water-referenced normalization.",
+    "figure.heatmap.log_scale": "Use a logarithmic color scale. Zero and negative cells are masked.",
     "figure.heatmap.colorbar_enabled": "Show or hide the colorbar.",
     "figure.heatmap.colorbar_label": "Colorbar label text. 'none' hides the label; blank uses the default.",
     "figure.heatmap.colorbar_label_size": "Font size for the colorbar label.",
@@ -3277,10 +3286,22 @@ def launch_plot_settings_panel(
             self._add_form_row(
                 form, "Color max", self.heatmap_vmax, tooltip_id="figure.heatmap.vmax"
             )
-            self.heatmap_normalize = QCheckBox("Normalize to probability")
-            self.heatmap_normalize.stateChanged.connect(self._schedule_preview_update)
+            self.heatmap_normalization_mode = self._combo(
+                tuple(_HEATMAP_NORMALIZATION_LABEL_BY_MODE.values())
+            )
+            self.heatmap_normalization_mode.currentTextChanged.connect(
+                self._schedule_preview_update
+            )
             self._add_form_row(
-                form, "Normalize", self.heatmap_normalize, tooltip_id="figure.heatmap.normalize"
+                form,
+                "Normalization",
+                self.heatmap_normalization_mode,
+                tooltip_id="figure.heatmap.normalize_mode",
+            )
+            self.heatmap_log_scale = QCheckBox("Use log color scale")
+            self.heatmap_log_scale.stateChanged.connect(self._schedule_preview_update)
+            self._add_form_row(
+                form, "Color scale", self.heatmap_log_scale, tooltip_id="figure.heatmap.log_scale"
             )
             layout.addWidget(group)
 
@@ -6491,8 +6512,25 @@ def launch_plot_settings_panel(
                     self.heatmap_cmap,
                     str(settings.get("heatmap_cmap") or "viridis"),
                 )
-            if hasattr(self, "heatmap_normalize"):
-                self.heatmap_normalize.setChecked(bool(settings.get("heatmap_normalize", False)))
+            if hasattr(self, "heatmap_normalization_mode"):
+                raw_mode = settings.get("heatmap_normalization_mode")
+                if raw_mode is None:
+                    raw_mode = (
+                        "global_probability"
+                        if bool(settings.get("heatmap_normalize", False))
+                        else "counts"
+                    )
+                elif str(raw_mode).strip().lower() == "shrunk_row_probability":
+                    raw_mode = "global_probability"
+                self._set_combo_value(
+                    self.heatmap_normalization_mode,
+                    _HEATMAP_NORMALIZATION_LABEL_BY_MODE.get(
+                        str(raw_mode).strip().lower(),
+                        _HEATMAP_NORMALIZATION_LABEL_BY_MODE["counts"],
+                    ),
+                )
+            if hasattr(self, "heatmap_log_scale"):
+                self.heatmap_log_scale.setChecked(bool(settings.get("heatmap_log_scale", False)))
             if hasattr(self, "heatmap_colorbar_label"):
                 raw_cb_label = settings.get("heatmap_colorbar_label")
                 if raw_cb_label is None:
@@ -7515,8 +7553,16 @@ def launch_plot_settings_panel(
                 )
             if hasattr(self, "heatmap_cmap"):
                 settings["heatmap_cmap"] = self.heatmap_cmap.currentText().strip() or None
-            if hasattr(self, "heatmap_normalize"):
-                settings["heatmap_normalize"] = self.heatmap_normalize.isChecked()
+            if hasattr(self, "heatmap_normalization_mode"):
+                normalization_label = self.heatmap_normalization_mode.currentText().strip()
+                normalization_mode = _HEATMAP_NORMALIZATION_MODE_BY_LABEL.get(
+                    normalization_label,
+                    "counts",
+                )
+                settings["heatmap_normalization_mode"] = normalization_mode
+                settings["heatmap_normalize"] = normalization_mode == "global_probability"
+            if hasattr(self, "heatmap_log_scale"):
+                settings["heatmap_log_scale"] = self.heatmap_log_scale.isChecked()
             if hasattr(self, "heatmap_colorbar_label"):
                 raw = self.heatmap_colorbar_label.text().strip()
                 if raw.lower() in {"none", "off"}:
