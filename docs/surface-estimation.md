@@ -1,85 +1,127 @@
 # Surface Estimation
 
 Several LiNaK analyses can express coordinates relative to a surface instead of
-raw Cartesian position. This page documents the shared estimator used by
-density, position, coordination, and orientation.
+raw Cartesian position. This page documents the shared surface-reference
+estimator used by density, position, coordination, and orientation.
 
-The current implementation lives primarily in `src/linak/analysis/density.py`.
+The implementation lives primarily in
+`src/linak/analysis/density.py`.
 
 ## Goal
 
-For each frame `t`, LiNaK attempts to estimate a surface position
-`s_t` along a chosen axis. Downstream analyses can then shift raw coordinates
-`x_t` into surface-relative coordinates:
+For each frame `t`, LiNaK attempts to construct a scalar surface reference
+coordinate `s_t` along a chosen axis. Downstream analyses can then convert raw
+axis coordinates `x_t` into surface-relative coordinates
 
 `d_t = x_t - s_t`
 
-If LiNaK cannot build a reliable frame-wise surface array `{s_t}`, it falls
-back to raw axis coordinates rather than inventing a misleading distance.
+This is a scalar alignment reference, not a full geometric reconstruction of a
+surface mesh.
 
-## Step 1: Choose Surface Reference Elements
+If LiNaK cannot construct a complete and sufficiently trustworthy frame-wise
+surface-reference array, downstream analyses do not silently force
+surface-relative coordinates. They fall back to raw axis coordinates and record
+the surface diagnostics as metadata.
 
-The estimator first decides which atoms are allowed to define the surface.
+## User Controls
 
-### User Override
+The shared estimator exposes advanced Python options through
+`SurfaceEstimatorOptions`. The most important user-facing controls are:
 
-If `--surface-elements` is provided, LiNaK uses exactly those element symbols
-after normalization and validation against the trajectory.
+- `mode = "auto" | "layered" | "rough"`
+- `side = "top" | "bottom"`
+- `reduction_mode = "median" | "trimmed_mean" | "legacy_mean"`
+- `low_confidence_threshold`
+- layer-gap and layer-size thresholds
+- rough-reference selection fraction, quantile, and optional
+  `rough_surface_envelope_A`
+- conservative fill limits and neighbor-consistency tolerances
+
+The default reduction is robust:
+
+- layered direct estimates use the median of the detected layer
+- rough low-mobility estimates use the median of the selected reference
+  coordinates
+- tracked fills use the same robust reducer
+
+Legacy mean-based reductions still exist, but only through explicit advanced
+Python options.
+
+LiNaK stores effective surface-estimation settings in nested HDF5 metadata under
+`surface.effective_options` for reproducibility.
+
+## Candidate Surface-Defining Atoms
+
+Before estimating the surface reference, LiNaK decides which atoms are allowed
+to define it. These are the *surface-defining atoms*. They are distinct from
+the *analysis target atoms* whose density, position, coordination, or
+orientation is later measured relative to the surface.
+
+### Explicit Selection
+
+LiNaK supports three explicit selection styles:
+
+- `surface_elements`
+- `surface_atom_indices`
+- `surface_atom_mask`
+
+`surface_atom_indices` and `surface_atom_mask` are advanced Python-only
+controls. They require a stable atom layout across frames, because the same atom
+identity must exist in every frame.
+
+If fixed atoms are excluded, LiNaK removes constrained atoms from the
+surface-defining set before estimation.
+
+This only works when ASE constraint metadata is still present in the loaded
+frames. Plain XYZ trajectories often do not preserve those constraints, so
+"fixed-layer" knowledge may be lost before analysis.
 
 ### Automatic Selection
 
-If there is no override, LiNaK applies a heuristic.
+If no explicit selection is provided, LiNaK chooses element types
+automatically.
 
-1. Hydrogen is excluded when non-hydrogen atoms are available.
-2. LiNaK counts the abundance of each remaining symbol.
-3. It prefers elements that are both abundant and low-mobility.
+The automatic path:
 
-When the atom layout is stable across frames, LiNaK computes a mobility score
-for each candidate atom:
+1. excludes hydrogen when non-hydrogen atoms are present
+2. prefers sufficiently abundant species
+3. prefers structurally stable species over merely heavy species
 
-`m_i = median_t |x_{t,i}^{unwrap} - median_t(x_{t,i}^{unwrap})|`
+When the atom layout is stable across frames, LiNaK computes a
+translation-corrected 3D mobility diagnostic.
 
-where `x_{t,i}^{unwrap}` is the axis coordinate after periodic unwrapping when
-possible.
+For candidate atom `i` and frame `t`, let `r_{t,i}` be the Cartesian position.
+LiNaK first subtracts a per-frame translation vector based on the median
+candidate position:
 
-For each element symbol `E`, LiNaK then reduces the atomic mobilities to one
-symbol-level mobility:
+`r'_{t,i} = r_{t,i} - median_j(r_{t,j})`
 
-`m_E = median_{i in E}(m_i)`
+It then computes a per-atom mobility as the median Euclidean deviation from the
+atom's median translated position:
 
-It keeps element symbols with:
+`m_i = median_t ||r'_{t,i} - median_t(r'_{t,i})||`
 
-- sufficiently low mobility relative to the minimum mobility
-- sufficient abundance in the frame
+When LiNaK aggregates that information to element level, mass is only used as a
+weak tie-breaker. Structural stability dominates.
 
-If that mobility-based selection is unavailable or degenerate, LiNaK falls back
-to a simpler abundance-and-mass heuristic: keep abundant heavy species and cap
-the final selection to a few element types.
-
-## Step 2: Evaluate Surface Modes
-
-LiNaK currently implements two concrete surface estimators:
-
-- `layered`
-- `rough`
-
-`auto` evaluates both and chooses between them.
+LiNaK can also reject candidate populations that are too dispersed along the
+chosen axis to look like a plausible substrate population.
 
 ## Layered Mode
 
-Layered mode is intended for slab-like surfaces with clear layer separation.
+Layered mode is intended for slab-like systems where the surface-defining atoms
+form separable layers along the chosen axis.
 
-### 2.1 Per-Frame Candidate Coordinates
+### Per-Frame Layer Detection
 
-For one frame, LiNaK collects the axis coordinates of all atoms belonging to the
-selected surface elements. If fixed atoms are disallowed, constrained atoms are
-removed first.
+For one frame, LiNaK extracts the selected axis coordinates of the
+surface-defining atoms:
 
-Call the resulting sorted coordinates:
+`z_1, z_2, ..., z_N`
+
+After sorting them in ascending order,
 
 `z_(1) <= z_(2) <= ... <= z_(N)`
-
-### 2.2 Gap Analysis
 
 LiNaK computes adjacent gaps:
 
@@ -87,190 +129,343 @@ LiNaK computes adjacent gaps:
 
 for `k = 1, ..., N-1`.
 
-It then estimates a baseline gap from the lower half of the gap distribution:
+It estimates a baseline gap from the lower half of the gap distribution:
 
-- take the smallest half of the `Delta_k`
-- compute their median
-
-Call that baseline `b`.
+`b = median(smallest half of {Delta_k})`
 
 The significance threshold for a layer break is:
 
+`gap_threshold = max(gap_min_A, gap_factor * b)`
+
+With current defaults:
+
 `gap_threshold = max(0.25 Angstrom, 3.0 * b)`
 
-Any gap satisfying:
+Any gap above this threshold is treated as a significant layer separation.
 
-`Delta_k >= gap_threshold`
+### Side-Aware Layer Selection
 
-is treated as a significant separation between layers.
+`side="top"` selects the atoms above the last significant gap.
 
-### 2.3 Define The Top Layer
+`side="bottom"` selects the atoms below the first significant gap.
 
-If at least one significant gap exists, LiNaK takes the atoms above the last
-such gap as the top layer.
+If there is no significant gap, LiNaK still checks the single largest gap. If
+that largest gap is at least `2 * gap_min_A`, it treats the frame as a
+two-layer split. Otherwise the frame is rejected as not clearly layered.
 
-If no significant gap exists, LiNaK checks the single largest gap. If that
-largest gap is at least `2 * 0.25 = 0.5 Angstrom`, it still treats the atoms
-above that gap as a two-layer split. Otherwise the frame is considered
-insufficiently layered.
+### Per-Frame Rejection Checks
 
-### 2.4 Top-Layer Size Filter
+Even if a split is found, LiNaK rejects the frame when:
 
-Even if a top cluster is found, LiNaK rejects it if it is too small.
+- there are too few candidate atoms
+- the selected layer is too small
+- the selected layer is too broad along the chosen axis
+- the selected layer overlaps too much with the bulk candidate distribution
+- the selected layer implies an unphysical jump relative to neighboring valid
+  frames
 
-The minimum accepted top-layer size is:
+The minimum accepted layer size is
+
+`n_min = max(minimum_top_layer_atoms, ceil(minimum_top_layer_fraction * N))`
+
+with current defaults:
 
 `n_min = max(2, ceil(0.03 * N))`
 
-where `N` is the number of candidate surface atoms in that frame.
+The current broadness threshold is controlled by `layered_max_spread_A`.
 
-### 2.5 Per-Frame Surface Value
+### Per-Frame Layered Estimate
 
-If the top layer passes the size test, the frame-wise surface value is the mean
-axis coordinate of that layer:
+For a valid frame, the direct layered surface reference is the robust reduction
+of the selected layer coordinates:
 
-`s_t = mean(z_i for i in top layer)`
+`s_t = median({z_i in selected layer})`
 
-### 2.6 Global Acceptance Criterion
+when `reduction_mode="median"`.
 
-Layered mode must succeed often enough across the trajectory.
+If `reduction_mode="trimmed_mean"`, LiNaK trims the configured fraction from
+both tails before averaging. `legacy_mean` restores the older mean-based
+behavior.
 
-Let:
+### Layered Confidence
 
-`success_ratio = (# frames with valid layered estimate) / (# total frames)`
+For each valid layered frame, LiNaK computes a confidence score in `[0, 1]`.
+The score depends on:
 
-LiNaK requires:
+- the largest detected gap relative to the required threshold
+- the selected-layer size relative to the minimum accepted size
+- the spread of the selected-layer coordinates
+- temporal consistency with the nearest neighboring valid frames
 
-`success_ratio >= 0.60`
+So a frame with a clean layer break, a compact layer, and a stable time-series
+position receives higher confidence than a marginal layer split.
 
-Otherwise layered mode is rejected as a whole.
+### Tracked Fill
 
-### 2.7 Summary Metadata
+If a short missing run remains, LiNaK can attempt a tracked fill by reusing the
+nearest valid layer identities from neighboring valid frames.
 
-For accepted layered mode, LiNaK stores summary metadata from the valid
-frame-wise values:
+If the nearest previous and next valid layer atom sets overlap, the overlap is
+preferred. Otherwise LiNaK reuses the previous valid set.
 
-- representative position: `median_t(s_t)`
-- spread: `std_t(s_t)`
+For a candidate fill frame, LiNaK computes:
 
-So the stored scalar `surface_position` is the median of the valid per-frame
-surface positions, not their mean.
+`s_t = robust_reduce({z_i for tracked layer atoms})`
 
-### 2.8 Tracked-Layer Gap Filling
+but only accepts the fill if the resulting value is consistent with neighboring
+valid frames within the configured fill tolerance. Otherwise the frame remains
+missing and records a rejection reason such as `tracked_fill_inconsistent`.
 
-If some frames fail after layered mode is accepted overall, LiNaK attempts to
-fill those missing frames using the nearest valid top-layer atom identities from
-neighboring frames. If the previous and next valid top-layer atom sets overlap,
-their intersection is preferred; otherwise the previous valid set is reused.
-
-For a filled frame, the value becomes:
-
-`s_t = mean(z_i for i in tracked top-layer indices)`
-
-This preserves continuity when the layered identification is momentarily
-ambiguous but the slab atoms remain consistent.
+Tracked fills are assigned lower confidence than direct layered detections.
 
 ## Rough Mode
 
-Rough mode is intended for surfaces without a clean layer gap.
+Rough mode is intended for systems where no clean layer break exists or where a
+layer-based interpretation is unreliable.
 
-### 3.1 Stable-Layout Branch
+### Stable-Layout Low-Mobility Branch
 
-If the atom layout is stable across frames, LiNaK computes a per-atom mobility
-using the same median absolute deviation style measure described earlier:
+If the atom layout is stable across frames, rough mode prefers a persistent,
+low-mobility reference set.
 
-`m_i = median_t |x_{t,i}^{unwrap} - median_t(x_{t,i}^{unwrap})|`
+LiNaK starts from the translation-corrected 3D mobility values `m_i` described
+earlier. It also computes the median axis coordinate of each candidate atom over
+time.
 
-It then combines mobility and atomic mass into a ranking score. The code uses:
+Before it ranks atoms by mobility, it first enforces a geometric *surface
+envelope* on the requested side:
 
-`score_i = mobility_rank_i + 0.35 * heavy_rank_i`
+- `side="top"` keeps only atoms near the outermost top-side candidate median
+- `side="bottom"` keeps only atoms near the outermost bottom-side candidate
+  median
 
-where lower mobility rank is better and higher mass is favored through the
-heavy-rank contribution.
+The envelope depth is controlled by `rough_surface_envelope_A`. If this option
+is omitted, LiNaK derives an adaptive default from the outer candidate spacing.
 
-LiNaK chooses a reference set of the lowest-scoring atoms. The number of
-reference atoms is:
+If the resulting envelope population becomes too small, LiNaK widens the
+envelope conservatively before falling back.
 
-`n_ref = max(min_ref, ceil(0.35 * N))`
+Among the remaining candidates, LiNaK ranks atoms primarily by mobility and only
+weakly by mass. In simplified form:
 
-with:
+`score_i = mobility_rank_i + mass_tiebreak_weight * heavy_rank_i`
 
-`min_ref = min(6, max(3, floor(N / 2)))`
+Lower mobility rank is better. Higher mass only nudges the ordering.
 
-and `N` the number of candidate atoms after filtering.
+LiNaK then selects a reference subset whose size is controlled by:
 
-The frame-wise surface value is then:
+- `rough_reference_fraction`
+- `rough_reference_min_atoms`
+- `rough_reference_max_soft_cap`
 
-`s_t = mean(x_{t,i} for i in reference set)`
+For each frame, the rough low-mobility surface reference is:
 
-This produces a low-mobility mean surface reference.
+`s_t = median({z_i in selected reference set})`
 
-### 3.2 Quantile Fallback Branch
+under the default robust reduction.
 
-If the stable-layout low-mobility branch is unavailable, LiNaK falls back to a
-purely geometric per-frame quantile:
+### Rough Quantile Fallback
 
-`s_t = q_0.90({x_{t,i}})`
+If the stable-layout low-mobility branch is unavailable or not usable, LiNaK
+falls back to a purely geometric side-aware quantile.
 
-using the 90th percentile of the candidate surface-atom coordinates in each
-frame.
+For `side="top"`:
 
-This is the origin of the rough-mode fallback label
-`rough_axis_quantile:q90`.
+`s_t = q_q({z_i})`
 
-### 3.3 Summary Metadata
+For `side="bottom"`:
 
-As with layered mode, the stored scalar summary is based on the valid per-frame
-surface values:
+`s_t = q_(1-q)({z_i})`
 
-- representative position: `median_t(s_t)`
-- spread: `std_t(s_t)`
+with current default `q = 0.90`.
+
+LiNaK uses the internal labels:
+
+- `upper_reference_quantile`
+- `lower_reference_quantile`
+
+instead of the older `rough_axis_quantile:q90` naming.
+
+### Rough Confidence
+
+For each valid rough frame, LiNaK computes a confidence score in `[0, 1]`
+based on:
+
+- the spread of the selected reference coordinates
+- temporal consistency with neighboring valid frames
+- whether the frame came from the preferred low-mobility branch or only from
+  the geometric quantile fallback
+
+Low-mobility reference frames are scored more strongly than pure quantile
+fallback frames. Rough estimates are also down-ranked when their chosen
+reference set sits too far below the geometric outer envelope, which helps
+prevent a buried fixed-like subsurface layer from beating the true exposed
+surface purely because it is smoother in time.
 
 ## Auto Mode
 
-`auto` evaluates both layered and rough estimates and chooses between them.
+`auto` is not a separate estimator. LiNaK first builds both:
 
-The current preference logic is:
+- a layered estimate
+- a rough estimate
 
-- choose layered if layered succeeded and either:
-  - `layered.success_ratio >= 0.75`, or
-  - rough failed entirely
-- otherwise choose rough if rough succeeded
-- otherwise fall back to layered if only layered succeeded
-- otherwise declare surface estimation unavailable
+It then compares them using a composite score rather than using success ratio
+alone.
 
-So `auto` is not a black box. It prefers layered behavior only when the layered
-signal is sufficiently strong.
+The composite comparison currently combines:
 
-## Missing-Frame Filling
+- valid fraction
+- median confidence
+- temporal smoothness
+- within-frame spread quality
 
-After selecting the final estimator, LiNaK checks whether the frame-wise surface
-array still has missing values. If so, it computes a frame-local fallback from
-the 90th percentile of the selected surface-atom coordinates and fills only the
-missing entries where that fallback is finite.
+The estimate with the stronger composite score is selected. In practice this
+means layered mode is preferred only when it is clearly reliable, not merely
+barely valid.
 
-This is a postprocessing step on the chosen estimator, not a third primary
-surface mode.
+## Conservative Gap Filling
 
-## How Downstream Analyses Use The Result
+After LiNaK constructs the direct estimate, it applies a conservative fill pass.
 
-If the final per-frame array `{s_t}` is fully finite and aligned with the frame
-count, downstream analyses switch into surface-distance mode:
+The current fill policy is intentionally limited:
 
-`d_t = x_t - s_t`
+- only short missing runs are considered
+- fills must stay consistent with neighboring valid frames within a configured
+  absolute tolerance
+- long invalid stretches are not silently invented
 
-Otherwise they keep raw axis coordinates and record
-`coordinate_mode = "axis"`.
+If LiNaK cannot justify a fill, the frame stays missing.
+
+This is why a surface estimate may still carry a valid scalar summary
+`surface_position`, while downstream analyses still decline to use
+surface-relative coordinates.
+
+## Safe Failure Mode
+
+Downstream analyses only switch into
+
+`coordinate_mode = "distance"`
+
+when the selected surface estimate is complete and trusted.
+
+In practical terms, LiNaK requires:
+
+- a frame-wise surface array with the correct length
+- no missing frames after conservative filling
+- valid fraction `= 1`
+- median confidence at least `low_confidence_threshold`
+
+If those conditions are not met, downstream analyses keep
+
+`coordinate_mode = "axis"`
+
+and treat the surface estimate as advisory metadata rather than a reliable
+alignment reference.
+
+So `surface_position` and `surface_position_std` may still be present even when
+distance-mode was not used.
+
+## Per-Frame Metadata And Diagnostics
+
+The in-memory `SurfaceEstimate` object contains:
+
+- `frame_values`
+- `valid_mask`
+- `confidence`
+- `provenance`
+- `candidate_indices` when stable/common across frames
+- `selected_elements`
+- `mode`
+- `side`
+- `summary`
+- `diagnostics`
+
+The diagnostics currently include:
+
+- `candidate_count_per_frame`
+- `top_layer_size_per_frame`
+- `largest_gap_A_per_frame`
+- `baseline_gap_A_per_frame`
+- `reference_spread_A_per_frame`
+- `jump_rejection_mask`
+- `rejection_reason`
+- `effective_options`
+
+### Provenance Labels
+
+Current provenance labels include:
+
+- `direct_layered`
+- `direct_rough_low_mobility`
+- `direct_rough_quantile`
+- `tracked_fill`
+- `quantile_fill`
+- `missing`
+
+### Rejection Reasons
+
+Current rejection reasons are implementation-facing diagnostics. Common values
+include:
+
+- `insufficient_candidates`
+- `no_layer_break`
+- `top_layer_too_small`
+- `top_layer_too_broad`
+- `top_layer_overlaps_bulk`
+- `bottom_layer_overlaps_bulk`
+- `jump_reject`
+- `tracked_fill_inconsistent`
+- `quantile_fill_inconsistent`
+
+Additional reasons may appear as the implementation evolves.
+
+## What Gets Stored
+
+Surface-aware analyses can persist the following surface datasets in HDF5 when a
+surface estimate exists:
+
+- `surface_position_per_frame_A`
+- `surface_valid_mask`
+- `surface_confidence`
+- `surface_provenance`
+- `surface_candidate_count`
+- `surface_top_layer_size`
+- `surface_largest_gap_A`
+- `surface_baseline_gap_A`
+- `surface_reference_spread_A`
+- `surface_jump_rejection_mask`
+- `surface_rejection_reason`
+
+They can also persist nested summary metadata under `surface`, including keys
+such as:
+
+- `surface.position`
+- `surface.position_std`
+- `surface.mode`
+- `surface.side`
+- `surface.selected_elements`
+- `surface.candidate_indices`
+- `surface.method_label`
+- `surface.valid_fraction`
+- `surface.median_confidence`
+- `surface.composite_score`
+- `surface.low_confidence_threshold`
+- `surface.effective_options`
+
+Older files may still contain flat summary keys such as `surface_position` or
+`surface_mode`. LiNaK loaders accept both the older flat form and the newer
+nested surface metadata.
 
 ## Important Limitations
 
-- Layered mode assumes a meaningful top-layer gap in the sorted axis
-  coordinates.
-- Rough mode assumes that low-mobility or high-quantile atoms represent the
-  surface.
-- Both modes depend on the chosen reference elements.
-- The scalar `surface_position` is summary metadata only; the actual alignment
-  uses the full frame-wise surface array whenever possible.
+- The estimator produces a scalar reference coordinate along one axis, not a
+  full surface geometry.
+- The result depends strongly on the selected surface-defining atoms.
+- Layered mode assumes a physically meaningful gap-separated layer structure.
+- Rough mode assumes that a compact, persistent reference population or a
+  side-aware quantile is a useful surface proxy.
+- Surface-relative interpretation remains conditional on completeness and
+  confidence.
 
 ## Related Documentation
 
@@ -278,3 +473,4 @@ Otherwise they keep raw axis coordinates and record
 - [Position](position.md)
 - [Coordination](coordination.md)
 - [Orientation](orientation.md)
+- [HDF5 Data Model And Metadata Conventions](hdf5-data-model.md)

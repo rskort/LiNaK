@@ -32,6 +32,7 @@ AMU_TO_G: float = 1.66053906660e-24
 # Water molecule detection
 # ---------------------------------------------------------------------------
 
+
 def water_molecule_triplets(
     frame: Atoms,
     oh_cutoff: float = H2O_OH_CUTOFF_A,
@@ -46,9 +47,7 @@ def water_molecule_triplets(
     np.ndarray
         Integer array of shape ``(n_molecules, 3)``.
     """
-    oxygen_indices, hydrogen_indices = neighbor_list(
-        "ij", frame, {("O", "H"): oh_cutoff}
-    )
+    oxygen_indices, hydrogen_indices = neighbor_list("ij", frame, {("O", "H"): oh_cutoff})
     if oxygen_indices.size == 0:
         return np.empty((0, 3), dtype=int)
 
@@ -85,6 +84,7 @@ def water_molecule_triplets(
 # ---------------------------------------------------------------------------
 # PBC-aware geometry helpers
 # ---------------------------------------------------------------------------
+
 
 class WaterGeometry(NamedTuple):
     """PBC-corrected water molecule geometry for a single frame.
@@ -219,7 +219,9 @@ def water_axis_values_per_frame(
                     cached_water_triplets = validated
 
             axis_values, masses = water_triplet_axis_values_with_masses(
-                frame, cached_water_triplets, axis_index,
+                frame,
+                cached_water_triplets,
+                axis_index,
             )
             selected_per_frame.append(axis_values)
             selected_masses_per_frame.append(masses)

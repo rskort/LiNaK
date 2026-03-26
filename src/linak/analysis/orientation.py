@@ -1,18 +1,19 @@
 """Water orientation analysis.
 
-Computes the orientation of water molecules (polar and azimuthal angles)
-as a function of distance to a surface.  The primary quantity is
-``cos(polar)``, the cosine of the angle between the water bisector and
-the surface-normal direction:
+Computes water-orientation observables as a function of either distance to a
+trusted frame-wise surface reference or, when no trusted surface reference is
+available, along a raw Cartesian axis.
 
-* ``+1`` → H-atoms pointing **away** from the surface
-* ``−1`` → H-atoms pointing **toward** the surface
-* ``0``  → bisector parallel to the surface
+The primary observable is ``cos_polar = b . e_ref``, where ``b`` is the
+normalized water-bisector vector and ``e_ref`` is the chosen Cartesian
+reference axis. Positive and negative values therefore track the positive and
+negative reference-axis directions directly; the sign is not auto-flipped by
+surface-side inference.
 
-An azimuthal angle (molecular-plane normal projected onto the plane
-perpendicular to the reference axis) is also computed and stored for
-potential future use, but it is secondary and has no unique in-plane
-reference direction.
+LiNaK also stores an azimuthal descriptor derived from the water-plane normal.
+That quantity is mathematically well defined for a chosen Cartesian in-plane
+reference axis, but it is not a unique laboratory-frame observable unless the
+system itself defines a preferred in-plane direction.
 """
 
 from __future__ import annotations
@@ -33,6 +34,17 @@ from ..storage.hdf5_utils import (
     write_linak_hdf5,
 )
 from .schema import build_profile_metadata
+from .density import (
+    _cell_histogram_bounds,
+    _frame_has_usable_cell,
+    _surface_estimate_datasets,
+    _surface_estimate_from_payload,
+    _surface_estimate_supports_distance_mode,
+    _surface_metadata_payload,
+    _surface_metadata_view,
+    SurfaceEstimate,
+    SurfaceEstimatorOptions,
+)
 from .water import (
     H2O_OH_CUTOFF_A,
     H2O_VALIDATION_STRIDE,
@@ -54,9 +66,15 @@ LOGGER = logging.getLogger(__name__)
 
 # Default number of equally-spaced bins over the cos(angle) range [-1, +1].
 _DEFAULT_ANGLE_BIN_COUNT: int = 50
+_OH_NORM_EPSILON: float = 1.0e-12
+_BISECTOR_NORM_EPSILON: float = 1.0e-12
+_PLANE_NORMAL_NORM_EPSILON: float = 1.0e-12
+_PROJECTED_NORMAL_NORM_EPSILON: float = 1.0e-12
+_OH_LENGTH_SANITY_TOLERANCE: float = 1.0e-8
 
 
 # ───────────────────────────── dataclass ──────────────────────────────────
+
 
 @dataclass(frozen=True)
 class OrientationProfile:
@@ -78,6 +96,9 @@ class OrientationProfile:
     # Mean cos(angle) per distance bin ──────────────────────────────────
     cos_polar_mean: np.ndarray
     cos_azimuthal_mean: np.ndarray
+    count_total: np.ndarray
+    count_polar_valid: np.ndarray
+    count_azimuthal_valid: np.ndarray
 
     # Density-weighted: cos(angle) × number-density per distance bin ───
     cos_polar_density: np.ndarray
@@ -96,12 +117,23 @@ class OrientationProfile:
     coordinate_mode: str  # "distance" or "axis"
     surface_position: float | None = None
     surface_position_std: float | None = None
+    surface_estimate: SurfaceEstimate | None = None
     cell_lengths_angstrom: tuple[float, float, float] | None = None
+
+
+@dataclass(frozen=True)
+class _OrientationFrameData:
+    distances: np.ndarray
+    cos_polar: np.ndarray
+    polar_valid: np.ndarray
+    cos_azimuthal: np.ndarray
+    azimuthal_valid: np.ndarray
 
 
 # ───────────────────────────── compute ────────────────────────────────────
 
-def compute_orientation_profile(
+
+def _legacy_compute_orientation_profile(
     frames: list[Atoms],
     *,
     axis: str = "z",
@@ -111,6 +143,7 @@ def compute_orientation_profile(
     surface_mode: str = "auto",
     surface_elements: list[str] | None = None,
     include_fixed_surface_atoms: bool = False,
+    surface_options: SurfaceEstimatorOptions | None = None,
     binning: str = "cell",
     oh_cutoff: float = H2O_OH_CUTOFF_A,
 ) -> OrientationProfile:
@@ -156,6 +189,7 @@ def compute_orientation_profile(
         mode=surface_mode,
         surface_elements=surface_elements,
         include_fixed_surface_atoms=include_fixed_surface_atoms,
+        surface_options=surface_options,
     )
     surface_position: float | None = None
     surface_position_std: float | None = None
@@ -164,14 +198,18 @@ def compute_orientation_profile(
         surface_position = surface_estimate.position
         surface_position_std = surface_estimate.std
         surface_per_frame = surface_estimate.per_frame
-        if not np.all(np.isfinite(surface_per_frame)):
+        if not _surface_estimate_supports_distance_mode(surface_estimate, frame_count=len(frames)):
             surface_per_frame = None
 
     coordinate_mode = "distance" if surface_per_frame is not None else "axis"
 
     # ── determine histogram bounds ────────────────────────────────────
-    dist_min, dist_max = _determine_distance_bounds(
-        frames, axis_index, binning, coordinate_mode, surface_per_frame,
+    dist_min, dist_max = _legacy_determine_distance_bounds(
+        frames,
+        axis_index,
+        binning,
+        coordinate_mode,
+        surface_per_frame,
     )
     dist_bin_edges = np.arange(dist_min, dist_max + bin_width, bin_width)
     n_dist_bins = len(dist_bin_edges) - 1
@@ -201,7 +239,9 @@ def compute_orientation_profile(
     n_molecules_per_frame = 0
 
     with ProgressBar(
-        desc="Computing orientation", total=len(frames), unit="frame",
+        desc="Computing orientation",
+        total=len(frames),
+        unit="frame",
     ) as progress:
         for frame_idx, frame in enumerate(frames):
             # water detection (cached, periodic re-validation)
@@ -289,7 +329,18 @@ def compute_orientation_profile(
     cos_azimuthal_mean = cos_azimuthal_sum / safe_count
 
     # number density: count / (n_frames * bin_volume_or_length)
-    density = _compute_number_density(count, n_frames, bin_width, cell_lengths, axis_index)
+    density = _legacy_compute_number_density(
+        count_total=count,
+        n_frames=n_frames,
+        bin_width=bin_width,
+        slab_volumes=None
+        if cell_lengths is None
+        else np.array(
+            [np.prod([cell_lengths[i] for i in range(3) if i != axis_index]) * bin_width],
+            dtype=float,
+        ),
+        framewise_density_sum=None,
+    )
 
     cos_polar_density = cos_polar_mean * density
     cos_azimuthal_density = cos_azimuthal_mean * density
@@ -313,13 +364,15 @@ def compute_orientation_profile(
         coordinate_mode=coordinate_mode,
         surface_position=surface_position,
         surface_position_std=surface_position_std,
+        surface_estimate=surface_estimate,
         cell_lengths_angstrom=cell_lengths,
     )
 
 
 # ─────────────────────── internal helpers ─────────────────────────────────
 
-def _determine_distance_bounds(
+
+def _legacy_determine_distance_bounds(
     frames: list[Atoms],
     axis_index: int,
     binning: str,
@@ -357,7 +410,8 @@ def _determine_distance_bounds(
 
 
 def _extract_cell_lengths(
-    frame: Atoms, axis_index: int,
+    frame: Atoms,
+    axis_index: int,
 ) -> tuple[float, float, float] | None:
     """Extract cell lengths from a frame; return None if not periodic."""
     if not bool(np.all(frame.get_pbc())):
@@ -369,7 +423,7 @@ def _extract_cell_lengths(
     return (lengths[0], lengths[1], lengths[2])
 
 
-def _compute_number_density(
+def _legacy_compute_number_density(
     count: np.ndarray,
     n_frames: int,
     bin_width: float,
@@ -394,6 +448,454 @@ def _compute_number_density(
 
 # ─────────────────────── HDF5 save / load ─────────────────────────────────
 
+
+def _in_plane_reference_vector(ref_index: int) -> np.ndarray:
+    vector = np.zeros(3, dtype=float)
+    for axis_index in range(3):
+        if axis_index == ref_index:
+            continue
+        vector[axis_index] = 1.0
+        return vector
+    raise ValueError("reference axis must leave at least one in-plane Cartesian axis")
+
+
+def _build_orientation_frame_data(
+    geom: WaterGeometry,
+    *,
+    axis_index: int,
+    surface_position: float | None,
+    ref_vec: np.ndarray,
+    in_plane_ref_vec: np.ndarray,
+    oh_cutoff: float,
+) -> _OrientationFrameData:
+    distances = np.asarray(geom.com_positions[:, axis_index], dtype=float)
+    if surface_position is not None and np.isfinite(surface_position):
+        distances = distances - float(surface_position)
+
+    count = geom.com_positions.shape[0]
+    if count == 0:
+        empty_float = np.array([], dtype=float)
+        empty_bool = np.array([], dtype=bool)
+        return _OrientationFrameData(
+            distances=empty_float,
+            cos_polar=empty_float,
+            polar_valid=empty_bool,
+            cos_azimuthal=empty_float,
+            azimuthal_valid=empty_bool,
+        )
+
+    oh1 = np.asarray(geom.hydrogen1_positions - geom.oxygen_positions, dtype=float)
+    oh2 = np.asarray(geom.hydrogen2_positions - geom.oxygen_positions, dtype=float)
+    oh1_norm = np.linalg.norm(oh1, axis=1)
+    oh2_norm = np.linalg.norm(oh2, axis=1)
+    bond_valid = (
+        np.isfinite(oh1_norm)
+        & np.isfinite(oh2_norm)
+        & (oh1_norm > _OH_NORM_EPSILON)
+        & (oh2_norm > _OH_NORM_EPSILON)
+        & (oh1_norm <= float(oh_cutoff) + _OH_LENGTH_SANITY_TOLERANCE)
+        & (oh2_norm <= float(oh_cutoff) + _OH_LENGTH_SANITY_TOLERANCE)
+    )
+
+    oh1_unit = np.zeros_like(oh1)
+    oh2_unit = np.zeros_like(oh2)
+    if np.any(bond_valid):
+        oh1_unit[bond_valid] = oh1[bond_valid] / oh1_norm[bond_valid, np.newaxis]
+        oh2_unit[bond_valid] = oh2[bond_valid] / oh2_norm[bond_valid, np.newaxis]
+
+    bisector_raw = oh1_unit + oh2_unit
+    bisector_norm = np.linalg.norm(bisector_raw, axis=1)
+    polar_valid = bond_valid & np.isfinite(bisector_norm) & (bisector_norm > _BISECTOR_NORM_EPSILON)
+    cos_polar = np.full(count, np.nan, dtype=float)
+    if np.any(polar_valid):
+        bisector_unit = np.zeros_like(bisector_raw)
+        bisector_unit[polar_valid] = (
+            bisector_raw[polar_valid] / bisector_norm[polar_valid, np.newaxis]
+        )
+        cos_polar[polar_valid] = bisector_unit[polar_valid] @ ref_vec
+
+    plane_normal = np.cross(oh1, oh2)
+    plane_normal_norm = np.linalg.norm(plane_normal, axis=1)
+    plane_normal_valid = (
+        bond_valid
+        & np.isfinite(plane_normal_norm)
+        & (plane_normal_norm > _PLANE_NORMAL_NORM_EPSILON)
+    )
+    plane_normal_unit = np.zeros_like(plane_normal)
+    if np.any(plane_normal_valid):
+        plane_normal_unit[plane_normal_valid] = (
+            plane_normal[plane_normal_valid] / plane_normal_norm[plane_normal_valid, np.newaxis]
+        )
+
+    projection_along_ref = np.sum(plane_normal_unit * ref_vec[np.newaxis, :], axis=1)
+    projected_normal = (
+        plane_normal_unit - projection_along_ref[:, np.newaxis] * ref_vec[np.newaxis, :]
+    )
+    projected_norm = np.linalg.norm(projected_normal, axis=1)
+    azimuthal_valid = (
+        plane_normal_valid
+        & np.isfinite(projected_norm)
+        & (projected_norm > _PROJECTED_NORMAL_NORM_EPSILON)
+    )
+    cos_azimuthal = np.full(count, np.nan, dtype=float)
+    if np.any(azimuthal_valid):
+        projected_unit = np.zeros_like(projected_normal)
+        projected_unit[azimuthal_valid] = (
+            projected_normal[azimuthal_valid] / projected_norm[azimuthal_valid, np.newaxis]
+        )
+        cos_azimuthal[azimuthal_valid] = projected_unit[azimuthal_valid] @ in_plane_ref_vec
+
+    return _OrientationFrameData(
+        distances=distances,
+        cos_polar=cos_polar,
+        polar_valid=np.asarray(polar_valid, dtype=bool),
+        cos_azimuthal=cos_azimuthal,
+        azimuthal_valid=np.asarray(azimuthal_valid, dtype=bool),
+    )
+
+
+def _build_uniform_bin_edges(lower: float, upper: float, *, bin_width: float) -> np.ndarray:
+    start = float(lower)
+    stop = float(upper)
+    if np.isclose(start, stop):
+        stop = start + float(bin_width)
+    n_bins = max(1, int(np.ceil((stop - start) / float(bin_width))))
+    edges = start + np.arange(n_bins + 1, dtype=float) * float(bin_width)
+    if edges[-1] <= stop:
+        edges = np.append(edges, edges[-1] + float(bin_width))
+    return edges
+
+
+def _representative_cell_lengths(frames: list[Atoms]) -> tuple[float, float, float] | None:
+    if not frames:
+        return None
+    lengths: list[tuple[float, float, float]] = []
+    for frame in frames:
+        pbc = np.asarray(frame.get_pbc(), dtype=bool)
+        if pbc.size != 3 or not bool(np.all(pbc)):
+            return None
+        cell = np.asarray(frame.cell.array, dtype=float)
+        frame_lengths = tuple(float(np.linalg.norm(cell[i])) for i in range(3))
+        if any(length <= 0.0 or not np.isfinite(length) for length in frame_lengths):
+            return None
+        lengths.append(frame_lengths)
+    first = lengths[0]
+    if all(
+        np.allclose(frame_lengths, first, rtol=0.0, atol=1.0e-12) for frame_lengths in lengths[1:]
+    ):
+        return first
+    return None
+
+
+def _per_frame_slab_volumes(
+    frames: list[Atoms],
+    *,
+    axis_index: int,
+    bin_width: float,
+) -> np.ndarray | None:
+    if not frames:
+        return None
+    if not all(_frame_has_usable_cell(frame, axis_index) for frame in frames):
+        return None
+    slab_volumes = np.empty(len(frames), dtype=float)
+    for frame_index, frame in enumerate(frames):
+        cell = np.asarray(frame.cell.array, dtype=float)
+        axis_length = float(np.linalg.norm(cell[axis_index]))
+        volume = abs(float(np.linalg.det(cell)))
+        cross_section = volume / axis_length
+        slab_volumes[frame_index] = cross_section * float(bin_width)
+    return slab_volumes
+
+
+def _distance_bin_membership_mask(values: np.ndarray, bin_edges: np.ndarray) -> np.ndarray:
+    indices = np.searchsorted(bin_edges, values, side="right") - 1
+    return (indices >= 0) & (indices < (bin_edges.size - 1)) & np.isfinite(values)
+
+
+def _distance_bin_indices(values: np.ndarray, bin_edges: np.ndarray) -> np.ndarray:
+    return np.searchsorted(bin_edges, values, side="right") - 1
+
+
+def _angle_bin_indices(values: np.ndarray, bin_edges: np.ndarray) -> np.ndarray:
+    indices = np.searchsorted(bin_edges, values, side="right") - 1
+    return np.clip(indices, 0, bin_edges.size - 2)
+
+
+def _mean_with_nan(sum_values: np.ndarray, count_values: np.ndarray) -> np.ndarray:
+    mean = np.full(sum_values.shape, np.nan, dtype=float)
+    valid = np.asarray(count_values, dtype=int) > 0
+    if np.any(valid):
+        mean[valid] = np.asarray(sum_values[valid], dtype=float) / np.asarray(
+            count_values[valid],
+            dtype=float,
+        )
+    return mean
+
+
+def _determine_distance_bounds(
+    *,
+    frames: list[Atoms],
+    axis_index: int,
+    frame_data: list[_OrientationFrameData],
+    binning: str,
+    coordinate_mode: str,
+    surface_per_frame: np.ndarray | None,
+    bin_width: float,
+) -> tuple[float, float]:
+    """Return ``(min, max)`` of the cached water-COM distance coordinate."""
+    normalized_binning = binning.strip().lower()
+    if normalized_binning == "cell":
+        bounds = _cell_histogram_bounds(
+            frames=frames,
+            axis_index=axis_index,
+            coordinate_mode=coordinate_mode,
+            surface_per_frame=surface_per_frame,
+        )
+        if bounds is not None:
+            return bounds
+        LOGGER.warning(
+            "Cell binning requested for orientation along %s, but a usable cell was unavailable. "
+            "Falling back to observed-data bounds.",
+            "xyz"[axis_index],
+        )
+
+    global_min = float("inf")
+    global_max = float("-inf")
+    for data in frame_data:
+        distances = np.asarray(data.distances, dtype=float)
+        finite = distances[np.isfinite(distances)]
+        if finite.size > 0:
+            global_min = min(global_min, float(np.min(finite)))
+            global_max = max(global_max, float(np.max(finite)))
+    if not np.isfinite(global_min):
+        global_min = 0.0
+    if not np.isfinite(global_max):
+        global_max = global_min + float(bin_width)
+    return global_min, global_max
+
+
+def _compute_number_density(
+    *,
+    count_total: np.ndarray,
+    n_frames: int,
+    bin_width: float,
+    slab_volumes: np.ndarray | None,
+    framewise_density_sum: np.ndarray | None,
+) -> np.ndarray:
+    """Convert raw water counts into volumetric or linear molecular density."""
+    if slab_volumes is not None:
+        if framewise_density_sum is not None:
+            return framewise_density_sum / float(n_frames)
+        return np.asarray(count_total, dtype=float) / (float(n_frames) * float(slab_volumes[0]))
+    return np.asarray(count_total, dtype=float) / (float(n_frames) * float(bin_width))
+
+
+def compute_orientation_profile(
+    frames: list[Atoms],
+    *,
+    axis: str = "z",
+    reference_axis: str = "z",
+    bin_width: float = 0.1,
+    angle_bin_count: int = _DEFAULT_ANGLE_BIN_COUNT,
+    surface_mode: str = "auto",
+    surface_elements: list[str] | None = None,
+    include_fixed_surface_atoms: bool = False,
+    surface_options: SurfaceEstimatorOptions | None = None,
+    binning: str = "cell",
+    oh_cutoff: float = H2O_OH_CUTOFF_A,
+) -> OrientationProfile:
+    """Compute water-orientation profiles from a trajectory."""
+    if not frames:
+        raise ValueError("At least one trajectory frame is required.")
+
+    axis_index = axis_to_index(axis)
+    ref_index = axis_to_index(reference_axis)
+    ref_vec = np.zeros(3, dtype=float)
+    ref_vec[ref_index] = 1.0
+    in_plane_ref_vec = _in_plane_reference_vector(ref_index)
+
+    from .density import _select_surface_estimate
+
+    surface_estimate, _method = _select_surface_estimate(
+        frames,
+        axis,
+        mode=surface_mode,
+        surface_elements=surface_elements,
+        include_fixed_surface_atoms=include_fixed_surface_atoms,
+        surface_options=surface_options,
+    )
+    surface_position: float | None = None
+    surface_position_std: float | None = None
+    surface_per_frame: np.ndarray | None = None
+    if surface_estimate is not None:
+        surface_position = surface_estimate.position
+        surface_position_std = surface_estimate.std
+        surface_per_frame = surface_estimate.per_frame
+        if not _surface_estimate_supports_distance_mode(surface_estimate, frame_count=len(frames)):
+            surface_per_frame = None
+
+    coordinate_mode = "distance" if surface_per_frame is not None else "axis"
+    cached_triplets: np.ndarray | None = None
+    n_molecules_per_frame = 0
+    frame_data: list[_OrientationFrameData] = []
+
+    with ProgressBar(desc="Computing orientation", total=len(frames), unit="frame") as progress:
+        for frame_idx, frame in enumerate(frames):
+            if cached_triplets is None:
+                cached_triplets = water_molecule_triplets(frame, oh_cutoff=oh_cutoff)
+            elif frame_idx % H2O_VALIDATION_STRIDE == 0:
+                validated = water_molecule_triplets(frame, oh_cutoff=oh_cutoff)
+                if not np.array_equal(validated, cached_triplets):
+                    LOGGER.warning(
+                        "H2O topology change at frame %d; refreshing water triplets.",
+                        frame_idx,
+                    )
+                    cached_triplets = validated
+
+            geom = water_triplet_geometry(frame, cached_triplets)
+            n_mol = geom.com_positions.shape[0]
+            if frame_idx == 0 or (n_molecules_per_frame == 0 and n_mol > 0):
+                n_molecules_per_frame = n_mol
+            frame_data.append(
+                _build_orientation_frame_data(
+                    geom,
+                    axis_index=axis_index,
+                    surface_position=None
+                    if surface_per_frame is None
+                    else surface_per_frame[frame_idx],
+                    ref_vec=ref_vec,
+                    in_plane_ref_vec=in_plane_ref_vec,
+                    oh_cutoff=oh_cutoff,
+                )
+            )
+            progress.update()
+
+    histogram_bounds = _determine_distance_bounds(
+        frames=frames,
+        axis_index=axis_index,
+        frame_data=frame_data,
+        binning=binning,
+        coordinate_mode=coordinate_mode,
+        surface_per_frame=surface_per_frame,
+        bin_width=bin_width,
+    )
+    dist_bin_edges = _build_uniform_bin_edges(
+        histogram_bounds[0],
+        histogram_bounds[1],
+        bin_width=bin_width,
+    )
+    n_dist_bins = len(dist_bin_edges) - 1
+    if n_dist_bins < 1:
+        raise ValueError(
+            "No distance bins produced "
+            f"(range [{histogram_bounds[0]:.3f}, {histogram_bounds[1]:.3f}], "
+            f"bin_width={bin_width})."
+        )
+    dist_bin_centers = 0.5 * (dist_bin_edges[:-1] + dist_bin_edges[1:])
+
+    angle_bin_edges = np.linspace(-1.0, 1.0, angle_bin_count + 1)
+    angle_bin_centers = 0.5 * (angle_bin_edges[:-1] + angle_bin_edges[1:])
+
+    cos_polar_sum = np.zeros(n_dist_bins, dtype=float)
+    cos_azimuthal_sum = np.zeros(n_dist_bins, dtype=float)
+    count_total = np.zeros(n_dist_bins, dtype=int)
+    count_polar_valid = np.zeros(n_dist_bins, dtype=int)
+    count_azimuthal_valid = np.zeros(n_dist_bins, dtype=int)
+    heatmap_polar = np.zeros((n_dist_bins, angle_bin_count), dtype=float)
+    heatmap_azimuthal = np.zeros((n_dist_bins, angle_bin_count), dtype=float)
+
+    slab_volumes = _per_frame_slab_volumes(frames, axis_index=axis_index, bin_width=bin_width)
+    variable_slab_volume = (
+        slab_volumes is not None
+        and slab_volumes.size > 1
+        and not np.allclose(slab_volumes, slab_volumes[0], rtol=0.0, atol=1.0e-12)
+    )
+    framewise_density_sum = (
+        np.zeros(n_dist_bins, dtype=float)
+        if slab_volumes is not None and variable_slab_volume
+        else None
+    )
+    cell_lengths = _representative_cell_lengths(frames)
+
+    for frame_idx, data in enumerate(frame_data):
+        total_mask = _distance_bin_membership_mask(data.distances, dist_bin_edges)
+        if np.any(total_mask):
+            dist_idx_total = _distance_bin_indices(data.distances[total_mask], dist_bin_edges)
+            frame_total_hist = np.bincount(dist_idx_total, minlength=n_dist_bins).astype(int)
+            count_total += frame_total_hist
+            if framewise_density_sum is not None and slab_volumes is not None:
+                framewise_density_sum += frame_total_hist / float(slab_volumes[frame_idx])
+
+        polar_mask = total_mask & data.polar_valid
+        if np.any(polar_mask):
+            dist_idx_polar = _distance_bin_indices(data.distances[polar_mask], dist_bin_edges)
+            polar_values = np.asarray(data.cos_polar[polar_mask], dtype=float)
+            count_polar_valid += np.bincount(dist_idx_polar, minlength=n_dist_bins).astype(int)
+            cos_polar_sum += np.bincount(
+                dist_idx_polar,
+                weights=polar_values,
+                minlength=n_dist_bins,
+            )
+            angle_idx_polar = _angle_bin_indices(polar_values, angle_bin_edges)
+            np.add.at(heatmap_polar, (dist_idx_polar, angle_idx_polar), 1.0)
+
+        azimuthal_mask = total_mask & data.azimuthal_valid
+        if np.any(azimuthal_mask):
+            dist_idx_azimuthal = _distance_bin_indices(
+                data.distances[azimuthal_mask],
+                dist_bin_edges,
+            )
+            azimuthal_values = np.asarray(data.cos_azimuthal[azimuthal_mask], dtype=float)
+            count_azimuthal_valid += np.bincount(
+                dist_idx_azimuthal,
+                minlength=n_dist_bins,
+            ).astype(int)
+            cos_azimuthal_sum += np.bincount(
+                dist_idx_azimuthal,
+                weights=azimuthal_values,
+                minlength=n_dist_bins,
+            )
+            angle_idx_azimuthal = _angle_bin_indices(azimuthal_values, angle_bin_edges)
+            np.add.at(heatmap_azimuthal, (dist_idx_azimuthal, angle_idx_azimuthal), 1.0)
+
+    n_frames = len(frames)
+    cos_polar_mean = _mean_with_nan(cos_polar_sum, count_polar_valid)
+    cos_azimuthal_mean = _mean_with_nan(cos_azimuthal_sum, count_azimuthal_valid)
+    density = _compute_number_density(
+        count_total=count_total,
+        n_frames=n_frames,
+        bin_width=bin_width,
+        slab_volumes=slab_volumes,
+        framewise_density_sum=framewise_density_sum,
+    )
+
+    return OrientationProfile(
+        axis=axis,
+        reference_axis=reference_axis,
+        n_frames=n_frames,
+        n_molecules_per_frame=n_molecules_per_frame,
+        bin_edges=dist_bin_edges,
+        bin_centers=dist_bin_centers,
+        cos_polar_mean=cos_polar_mean,
+        cos_azimuthal_mean=cos_azimuthal_mean,
+        count_total=count_total,
+        count_polar_valid=count_polar_valid,
+        count_azimuthal_valid=count_azimuthal_valid,
+        cos_polar_density=cos_polar_mean * density,
+        cos_azimuthal_density=cos_azimuthal_mean * density,
+        density=density,
+        heatmap_polar=heatmap_polar,
+        heatmap_azimuthal=heatmap_azimuthal,
+        heatmap_angle_bin_edges=angle_bin_edges,
+        heatmap_angle_bin_centers=angle_bin_centers,
+        coordinate_mode=coordinate_mode,
+        surface_position=surface_position,
+        surface_position_std=surface_position_std,
+        surface_estimate=surface_estimate,
+        cell_lengths_angstrom=cell_lengths,
+    )
+
+
 _ANALYSIS_NAME = "orientation"
 
 
@@ -409,12 +911,15 @@ def _orientation_profile_hdf5_payload(
             "n_frames": int(profile.n_frames),
             "n_molecules_per_frame": int(profile.n_molecules_per_frame),
             "coordinate_mode": profile.coordinate_mode,
-            "surface_position": profile.surface_position,
-            "surface_position_std": profile.surface_position_std,
             "cell_lengths_angstrom": (
                 None
                 if profile.cell_lengths_angstrom is None
                 else [float(v) for v in profile.cell_lengths_angstrom]
+            ),
+            **_surface_metadata_payload(
+                surface_position=profile.surface_position,
+                surface_position_std=profile.surface_position_std,
+                estimate=profile.surface_estimate,
             ),
         },
     )
@@ -423,6 +928,9 @@ def _orientation_profile_hdf5_payload(
         "bin_centers_A": profile.bin_centers,
         "cos_polar_mean": profile.cos_polar_mean,
         "cos_azimuthal_mean": profile.cos_azimuthal_mean,
+        "count_total": np.asarray(profile.count_total, dtype=int),
+        "count_polar_valid": np.asarray(profile.count_polar_valid, dtype=int),
+        "count_azimuthal_valid": np.asarray(profile.count_azimuthal_valid, dtype=int),
         "cos_polar_density": profile.cos_polar_density,
         "cos_azimuthal_density": profile.cos_azimuthal_density,
         "density": profile.density,
@@ -430,6 +938,7 @@ def _orientation_profile_hdf5_payload(
         "heatmap_azimuthal": profile.heatmap_azimuthal,
         "heatmap_angle_bin_edges": profile.heatmap_angle_bin_edges,
         "heatmap_angle_bin_centers": profile.heatmap_angle_bin_centers,
+        **_surface_estimate_datasets(profile.surface_estimate),
     }
     return {"datasets": datasets, "metadata": metadata}
 
@@ -476,6 +985,22 @@ def _build_orientation_profile_from_hdf5(
             cell_lengths = (float(cell_raw[0]), float(cell_raw[1]), float(cell_raw[2]))
         except (TypeError, IndexError, ValueError):
             cell_lengths = None
+    surface_estimate = _surface_estimate_from_payload(datasets=datasets, metadata=metadata)
+    surface_metadata = _surface_metadata_view(metadata)
+    heatmap_polar = _get("heatmap_polar")
+    heatmap_azimuthal = _get("heatmap_azimuthal")
+    count_total = np.asarray(
+        datasets.get("count_total", np.sum(heatmap_polar, axis=1)),
+        dtype=int,
+    )
+    count_polar_valid = np.asarray(
+        datasets.get("count_polar_valid", np.sum(heatmap_polar, axis=1)),
+        dtype=int,
+    )
+    count_azimuthal_valid = np.asarray(
+        datasets.get("count_azimuthal_valid", np.sum(heatmap_azimuthal, axis=1)),
+        dtype=int,
+    )
 
     return OrientationProfile(
         axis=str(metadata.get("axis", "z")),
@@ -486,16 +1011,22 @@ def _build_orientation_profile_from_hdf5(
         bin_centers=_get("bin_centers_A"),
         cos_polar_mean=_get("cos_polar_mean"),
         cos_azimuthal_mean=_get("cos_azimuthal_mean"),
+        count_total=count_total,
+        count_polar_valid=count_polar_valid,
+        count_azimuthal_valid=count_azimuthal_valid,
         cos_polar_density=_get("cos_polar_density"),
         cos_azimuthal_density=_get("cos_azimuthal_density"),
         density=_get("density"),
-        heatmap_polar=_get("heatmap_polar"),
-        heatmap_azimuthal=_get("heatmap_azimuthal"),
+        heatmap_polar=heatmap_polar,
+        heatmap_azimuthal=heatmap_azimuthal,
         heatmap_angle_bin_edges=_get("heatmap_angle_bin_edges"),
         heatmap_angle_bin_centers=_get("heatmap_angle_bin_centers"),
         coordinate_mode=str(metadata.get("coordinate_mode", "axis")),
-        surface_position=metadata.get("surface_position"),
-        surface_position_std=metadata.get("surface_position_std"),
+        surface_position=surface_metadata.get("position", metadata.get("surface_position")),
+        surface_position_std=surface_metadata.get(
+            "position_std", metadata.get("surface_position_std")
+        ),
+        surface_estimate=surface_estimate,
         cell_lengths_angstrom=cell_lengths,
     )
 
@@ -523,12 +1054,11 @@ def load_orientation_profiles_by_index(
 ) -> list[OrientationProfile]:
     """Load selected orientation profiles by index."""
     raw = read_linak_hdf5_profiles_by_index(
-        path, indices, expected_analysis=_ANALYSIS_NAME,
+        path,
+        indices,
+        expected_analysis=_ANALYSIS_NAME,
     )
-    return [
-        _build_orientation_profile_from_hdf5(datasets, metadata)
-        for datasets, metadata in raw
-    ]
+    return [_build_orientation_profile_from_hdf5(datasets, metadata) for datasets, metadata in raw]
 
 
 # ──────────────────────── plotting helpers ────────────────────────────────
@@ -562,7 +1092,7 @@ def _y_label_for_component(component: str, angle: str) -> str:
     if component == "average":
         return f"⟨cos({angle_label})⟩"
     if component == "density-weighted":
-        return f"ρ · ⟨cos({angle_label})⟩ (Å⁻³)"
+        return f"H2O density-weighted ⟨cos({angle_label})⟩"
     return f"cos({angle_label})"
 
 
@@ -591,6 +1121,7 @@ def _select_heatmap_data(
 
 
 # ─────────────────── public plot functions ────────────────────────────────
+
 
 def plot_orientation_profile(
     profile: OrientationProfile,
@@ -908,7 +1439,7 @@ def plot_orientation_profiles(
         labels.append(f"cos({norm_angle}) [{i}]" if len(profiles) > 1 else f"cos({norm_angle})")
 
     if series_labels is not None:
-        labels = list(series_labels) + labels[len(series_labels):]
+        labels = list(series_labels) + labels[len(series_labels) :]
 
     default_title = f"H₂O orientation ({norm_angle})"
     ref_profile = profiles[0]
@@ -1029,6 +1560,7 @@ def _rebin_heatmap_axis(
 
 # ──────────────────── heatmap renderer ────────────────────────────────────
 
+
 def _plot_orientation_heatmap(
     profiles: list[OrientationProfile],
     *,
@@ -1096,12 +1628,20 @@ def _plot_orientation_heatmap(
     # Rebin distance axis (x)
     if x_bin_width is not None and x_bin_width > 0:
         heatmap, x_edges = _rebin_heatmap_axis(
-            heatmap, x_edges, x_bin_width, axis=0, reducer=x_bin_reducer or "sum",
+            heatmap,
+            x_edges,
+            x_bin_width,
+            axis=0,
+            reducer=x_bin_reducer or "sum",
         )
     # Rebin angle axis (y)
     if y_bin_width is not None and y_bin_width > 0:
         heatmap, y_edges = _rebin_heatmap_axis(
-            heatmap, y_edges, y_bin_width, axis=1, reducer=y_bin_reducer or "sum",
+            heatmap,
+            y_edges,
+            y_bin_width,
+            axis=1,
+            reducer=y_bin_reducer or "sum",
         )
 
     # Optionally normalise each distance bin to a probability distribution
@@ -1134,7 +1674,11 @@ def _plot_orientation_heatmap(
     default_cb_label = "Probability" if heatmap_normalize else "Frequency"
     if heatmap_colorbar_enabled:
         cb_kw: dict[str, Any] = {}
-        position = heatmap_colorbar_position if heatmap_colorbar_position in {"right", "left", "top", "bottom"} else "right"
+        position = (
+            heatmap_colorbar_position
+            if heatmap_colorbar_position in {"right", "left", "top", "bottom"}
+            else "right"
+        )
         cb_kw["location"] = position
         if heatmap_colorbar_pad is not None:
             cb_kw["pad"] = heatmap_colorbar_pad
@@ -1142,10 +1686,20 @@ def _plot_orientation_heatmap(
             cb_kw["shrink"] = heatmap_colorbar_shrink
         if heatmap_colorbar_aspect is not None:
             cb_kw["aspect"] = heatmap_colorbar_aspect
-        cbar = fig.colorbar(mesh, ax=ax, label=heatmap_colorbar_label if heatmap_colorbar_label is not None else default_cb_label, **cb_kw)
+        cbar = fig.colorbar(
+            mesh,
+            ax=ax,
+            label=heatmap_colorbar_label
+            if heatmap_colorbar_label is not None
+            else default_cb_label,
+            **cb_kw,
+        )
         cb_is_vertical = position in {"right", "left"}
         if heatmap_colorbar_label_size is not None:
-            cbar.set_label(cbar.ax.get_ylabel() if cb_is_vertical else cbar.ax.get_xlabel(), fontsize=heatmap_colorbar_label_size)
+            cbar.set_label(
+                cbar.ax.get_ylabel() if cb_is_vertical else cbar.ax.get_xlabel(),
+                fontsize=heatmap_colorbar_label_size,
+            )
         if heatmap_colorbar_tick_size is not None:
             cbar.ax.tick_params(labelsize=heatmap_colorbar_tick_size)
 
@@ -1179,25 +1733,37 @@ def _plot_orientation_heatmap(
     if ticks_visible is False:
         if tick_axis_hint in {"both", "x"}:
             ax.tick_params(
-                axis="x", which="both",
-                bottom=False, top=False, labelbottom=False,
+                axis="x",
+                which="both",
+                bottom=False,
+                top=False,
+                labelbottom=False,
             )
         if tick_axis_hint in {"both", "y"}:
             ax.tick_params(
-                axis="y", which="both",
-                left=False, right=False, labelleft=False,
+                axis="y",
+                which="both",
+                left=False,
+                right=False,
+                labelleft=False,
             )
     else:
         if ticks_visible is True and tick_axis_hint in {"x", "y"}:
             if tick_axis_hint == "x":
                 ax.tick_params(
-                    axis="y", which="both",
-                    left=False, right=False, labelleft=False,
+                    axis="y",
+                    which="both",
+                    left=False,
+                    right=False,
+                    labelleft=False,
                 )
             else:
                 ax.tick_params(
-                    axis="x", which="both",
-                    bottom=False, top=False, labelbottom=False,
+                    axis="x",
+                    which="both",
+                    bottom=False,
+                    top=False,
+                    labelbottom=False,
                 )
         if x_tick_rotation is not None:
             ax.tick_params(axis="x", rotation=float(x_tick_rotation))

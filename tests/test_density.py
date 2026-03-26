@@ -9,9 +9,11 @@ import h5py
 import linak.analysis.density as density_module
 import linak.analysis.water as water_module
 from linak.analysis.density import (
+    SurfaceEstimatorOptions,
     available_element_species,
     compute_density_profiles,
     compute_density_profile,
+    estimate_surface_reference,
     estimate_surface_position,
     load_density_profile,
     load_density_profiles,
@@ -33,15 +35,14 @@ def test_density_profile_linear_density_without_cell():
         bin_width=0.1,
     )
 
+    np.testing.assert_allclose(profile.counts_per_frame, np.array([oxygen_mass_g, oxygen_mass_g]))
     np.testing.assert_allclose(
-        np.sort(profile.counts_per_frame),
-        np.sort(np.array([1.5 * oxygen_mass_g, 0.5 * oxygen_mass_g])),
-    )
-    np.testing.assert_allclose(
-        np.sort(profile.density),
-        np.sort(np.array([15.0 * oxygen_mass_g, 5.0 * oxygen_mass_g])),
+        profile.density,
+        np.array([10.0 * oxygen_mass_g, 10.0 * oxygen_mass_g]),
     )
     assert profile.coordinate_mode == "distance"
+    assert profile.surface_estimate is not None
+    assert profile.surface_estimate.summary.valid_fraction == pytest.approx(1.0)
     assert profile.units == "g/Angstrom"
     assert profile.axis == "z"
 
@@ -76,6 +77,43 @@ def test_density_profile_volumetric_density_with_cell():
     assert profile.units == "g/cm^3"
 
 
+def test_density_profile_variable_cell_averages_framewise_normalized_density():
+    frame1 = Atoms(
+        "O",
+        positions=[[0.0, 0.0, 0.10]],
+        cell=[10.0, 10.0, 10.0],
+        pbc=True,
+    )
+    frame2 = Atoms(
+        "O",
+        positions=[[0.0, 0.0, 0.10]],
+        cell=[20.0, 10.0, 10.0],
+        pbc=True,
+    )
+    oxygen_mass_g = float(frame1.get_masses()[0]) * 1.66053906660e-24
+
+    profile = density_module._compute_density_profile_from_selected(
+        frames=[frame1, frame2],
+        selected_per_frame=[np.array([0.10]), np.array([0.10])],
+        selected_masses_per_frame=[
+            np.array([oxygen_mass_g], dtype=float),
+            np.array([oxygen_mass_g], dtype=float),
+        ],
+        axis="z",
+        axis_index=2,
+        species_label="O",
+        count_label="atoms",
+        bin_width=1.0,
+    )
+
+    expected_density = (0.5 * ((oxygen_mass_g / 100.0) + (oxygen_mass_g / 200.0))) * 1.0e24
+    expected_number_density = 0.5 * ((1.0 / 100.0) + (1.0 / 200.0)) * 1.0e3
+
+    np.testing.assert_allclose(profile.density, np.array([expected_density, 0.0]))
+    np.testing.assert_allclose(profile.number_density, np.array([expected_number_density, 0.0]))
+    assert profile.number_density_units == "atom/nm^3"
+
+
 def test_density_profile_cell_binning_extends_to_empty_bins():
     frame = Atoms(
         "OO",
@@ -105,6 +143,33 @@ def test_density_profile_cell_binning_extends_to_empty_bins():
         np.sum(cell_binned.counts_per_frame),
         np.sum(observed.counts_per_frame),
     )
+
+
+def test_density_histogram_edges_follow_numpy_convention():
+    frame = Atoms("OOO", positions=[[0.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 0.0, 2.0]])
+    oxygen_mass_g = float(frame.get_masses()[0]) * 1.66053906660e-24
+
+    profile = density_module._compute_density_profile_from_selected(
+        frames=[frame],
+        selected_per_frame=[np.array([0.0, 1.0, 2.0], dtype=float)],
+        selected_masses_per_frame=[
+            np.array([oxygen_mass_g, oxygen_mass_g, oxygen_mass_g], dtype=float)
+        ],
+        axis="z",
+        axis_index=2,
+        species_label="O",
+        count_label="atoms",
+        bin_width=1.0,
+    )
+
+    np.testing.assert_allclose(
+        profile.counts_per_frame,
+        np.array([oxygen_mass_g, oxygen_mass_g, oxygen_mass_g]),
+    )
+    np.testing.assert_allclose(profile.entities_per_frame, np.array([1.0, 1.0, 1.0]))
+
+    histogram, _edges = np.histogram(np.array([0.0, 1.0, 2.0]), bins=np.array([0.0, 1.0, 2.0]))
+    np.testing.assert_array_equal(histogram, np.array([1, 2]))
 
 
 def test_density_profile_estimates_surface_from_low_mobility_atoms():
@@ -184,7 +249,7 @@ def test_density_profile_surface_elements_override_changes_layer_reference():
     assert au_only_profile.surface_position == pytest.approx(1.60)
 
 
-def test_density_profile_rough_surface_uses_framewise_mean_of_reference_atoms():
+def test_density_profile_rough_surface_respects_surface_side_selection():
     frame1 = Atoms(
         "PtPtPtPtPtPtHH",
         positions=[
@@ -216,7 +281,7 @@ def test_density_profile_rough_surface_uses_framewise_mean_of_reference_atoms():
         pbc=True,
     )
 
-    profile = compute_density_profile(
+    top_profile = compute_density_profile(
         frames=[frame1, frame2],
         species="H",
         axis="z",
@@ -224,9 +289,26 @@ def test_density_profile_rough_surface_uses_framewise_mean_of_reference_atoms():
         surface_mode="rough",
         surface_elements=["Pt"],
     )
+    bottom_profile = compute_density_profile(
+        frames=[frame1, frame2],
+        species="H",
+        axis="z",
+        bin_width=0.2,
+        surface_mode="rough",
+        surface_elements=["Pt"],
+        surface_options=SurfaceEstimatorOptions(
+            mode="rough",
+            side="bottom",
+            surface_elements=("Pt",),
+        ),
+    )
 
-    assert profile.surface_position is not None
-    assert profile.surface_position == pytest.approx(2.05, abs=1e-8)
+    assert top_profile.surface_position is not None
+    assert bottom_profile.surface_position is not None
+    assert top_profile.coordinate_mode == "axis"
+    assert bottom_profile.coordinate_mode == "distance"
+    assert top_profile.surface_position > bottom_profile.surface_position
+    assert bottom_profile.surface_position == pytest.approx(2.05, abs=1e-8)
 
 
 def test_density_profile_rough_surface_excludes_fixed_atoms_by_default():
@@ -271,6 +353,11 @@ def test_density_profile_rough_surface_excludes_fixed_atoms_by_default():
         bin_width=0.2,
         surface_mode="rough",
         surface_elements=["Pt"],
+        surface_options=SurfaceEstimatorOptions(
+            mode="rough",
+            side="bottom",
+            surface_elements=("Pt",),
+        ),
     )
     with_fixed = compute_density_profile(
         frames=[frame1, frame2],
@@ -280,12 +367,100 @@ def test_density_profile_rough_surface_excludes_fixed_atoms_by_default():
         surface_mode="rough",
         surface_elements=["Pt"],
         include_fixed_surface_atoms=True,
+        surface_options=SurfaceEstimatorOptions(
+            mode="rough",
+            side="bottom",
+            surface_elements=("Pt",),
+            include_fixed_surface_atoms=True,
+        ),
     )
 
     assert without_fixed.surface_position is not None
     assert with_fixed.surface_position is not None
     assert without_fixed.surface_position > 2.2
     assert with_fixed.surface_position < 0.5
+    assert without_fixed.coordinate_mode == "distance"
+    assert with_fixed.coordinate_mode == "distance"
+
+
+def test_density_profile_rough_surface_prefers_outer_relaxed_layers_over_buried_fixed_like_layer():
+    layer_z = [0.0, 2.0, 4.0, 6.0, 8.0, 10.0]
+    xy_positions = [(0.0, 0.0), (1.5, 0.0), (0.75, 1.2)]
+    symbols = "Au" * (len(layer_z) * len(xy_positions)) + "H"
+    frame1_positions: list[list[float]] = []
+    frame2_positions: list[list[float]] = []
+    for layer_index, z_value in enumerate(layer_z):
+        for atom_index, (x_value, y_value) in enumerate(xy_positions):
+            frame1_positions.append([x_value, y_value, z_value])
+            frame2_positions.append([x_value, y_value, z_value])
+            if layer_index >= 4:
+                displacement = 0.18 if atom_index % 2 == 0 else -0.16
+                frame2_positions[-1][2] += displacement * (layer_index - 3)
+    frame1_positions.append([0.5, 0.5, 12.0])
+    frame2_positions.append([0.5, 0.5, 12.1])
+
+    frames = [
+        Atoms(
+            symbols,
+            positions=frame1_positions,
+            cell=[14.0, 14.0, 24.0],
+            pbc=True,
+        ),
+        Atoms(
+            symbols,
+            positions=frame2_positions,
+            cell=[14.0, 14.0, 24.0],
+            pbc=True,
+        ),
+    ]
+
+    estimate = estimate_surface_reference(
+        frames,
+        axis="z",
+        mode="rough",
+        surface_elements=["Au"],
+    )
+
+    assert estimate is not None
+    assert estimate.position is not None
+    assert estimate.position > 7.5
+    assert estimate.method.startswith("rough_low_mobility")
+
+
+def test_density_profile_auto_surface_avoids_buried_fixed_like_layer():
+    layer_z = [0.0, 2.0, 4.0, 6.0, 8.0, 10.0]
+    xy_positions = [(0.0, 0.0), (1.5, 0.0), (0.75, 1.2)]
+    symbols = "Au" * (len(layer_z) * len(xy_positions)) + "H"
+    frames: list[Atoms] = []
+    for frame_index in range(3):
+        positions: list[list[float]] = []
+        for layer_index, z_value in enumerate(layer_z):
+            for atom_index, (x_value, y_value) in enumerate(xy_positions):
+                offset = 0.0
+                if layer_index >= 4:
+                    offset = (0.10 + 0.05 * frame_index) * (1 if atom_index != 1 else -1)
+                    offset *= layer_index - 3
+                positions.append([x_value, y_value, z_value + offset])
+        positions.append([0.5, 0.5, 12.0 + 0.05 * frame_index])
+        frames.append(
+            Atoms(
+                symbols,
+                positions=positions,
+                cell=[14.0, 14.0, 24.0],
+                pbc=True,
+            )
+        )
+
+    estimate = estimate_surface_reference(
+        frames,
+        axis="z",
+        mode="auto",
+        surface_elements=["Au"],
+    )
+
+    assert estimate is not None
+    assert estimate.position is not None
+    assert estimate.position > 7.5
 
 
 def test_density_layered_mode_auto_surface_elements_ignore_mobile_water_oxygen():
@@ -328,7 +503,7 @@ def test_density_layered_mode_auto_surface_elements_ignore_mobile_water_oxygen()
 
     assert position is not None
     assert position == pytest.approx(1.61, abs=0.05)
-    assert method.startswith("layered_top_layer_mean")
+    assert method.startswith("layered_top_layer_median")
 
 
 def test_density_profile_raises_for_missing_species():
@@ -387,8 +562,10 @@ def test_density_profile_h2o_counts_water_molecules():
 
     np.testing.assert_allclose(profile.counts_per_frame, np.array([h2o_mass_g, h2o_mass_g]))
     np.testing.assert_allclose(profile.density, np.array([h2o_mass_g / 0.5, h2o_mass_g / 0.5]))
+    np.testing.assert_allclose(profile.number_density, np.array([2.0, 2.0]))
     assert profile.species == "H2O"
     assert profile.units == "g/Angstrom"
+    assert profile.number_density_units == "molecule/Angstrom"
 
 
 def test_select_water_axis_values_with_masses_uses_com_and_pbc():
@@ -549,8 +726,141 @@ def test_save_and_load_density_profile(tmp_path):
         assert loaded.surface_position is None
     else:
         assert loaded.surface_position == pytest.approx(profile.surface_position)
+    if profile.surface_estimate is None:
+        assert loaded.surface_estimate is None
+    else:
+        assert loaded.surface_estimate is not None
+        np.testing.assert_allclose(
+            loaded.surface_estimate.frame_values,
+            profile.surface_estimate.frame_values,
+            equal_nan=True,
+        )
+        np.testing.assert_allclose(
+            loaded.surface_estimate.confidence,
+            profile.surface_estimate.confidence,
+            equal_nan=True,
+        )
+        np.testing.assert_array_equal(
+            loaded.surface_estimate.provenance.astype(str),
+            profile.surface_estimate.provenance.astype(str),
+        )
     assert loaded.species == "O"
     assert loaded.axis == "z"
+
+
+def test_save_density_profile_writes_nested_surface_metadata(tmp_path):
+    frame1 = Atoms(
+        "PtPtPtH",
+        positions=[
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [0.5, 0.0, 1.5],
+        ],
+        cell=[8.0, 8.0, 8.0],
+        pbc=True,
+    )
+    frame2 = Atoms(
+        "PtPtPtH",
+        positions=[
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [0.5, 0.0, 1.6],
+        ],
+        cell=[8.0, 8.0, 8.0],
+        pbc=True,
+    )
+    profile = compute_density_profile(
+        frames=[frame1, frame2],
+        species="H",
+        axis="z",
+        bin_width=0.2,
+        surface_mode="rough",
+        surface_elements=["Pt"],
+    )
+
+    out = tmp_path / "density_surface_nested.h5"
+    save_density_profile(profile, out)
+
+    with h5py.File(out, "r") as handle:
+        metadata = json.loads(str(handle.attrs["metadata_json"]))
+    assert "surface" in metadata
+    assert "surface_position" not in metadata
+    assert "surface_position_std" not in metadata
+    assert metadata["surface"]["position"] == pytest.approx(profile.surface_position)
+    assert metadata["surface"]["mode"] == profile.surface_estimate.mode
+
+    loaded = load_density_profile(out, axis="z", species="H")
+    assert loaded.surface_position == pytest.approx(profile.surface_position)
+    assert loaded.surface_estimate is not None
+    assert loaded.surface_estimate.mode == profile.surface_estimate.mode
+
+
+def test_load_density_profile_accepts_legacy_flat_surface_metadata(tmp_path):
+    out = tmp_path / "legacy_density_surface.h5"
+    with h5py.File(out, "w") as handle:
+        handle.attrs["linak_format"] = "linak-hdf5"
+        handle.attrs["analysis"] = "density"
+        handle.attrs["metadata_json"] = json.dumps(
+            {
+                "axis": "z",
+                "species": "O",
+                "units": "g/cm^3",
+                "n_frames": 2,
+                "coordinate_mode": "distance",
+                "surface_position": 1.25,
+                "surface_position_std": 0.05,
+                "surface_mode": "rough",
+                "surface_side": "top",
+                "surface_method_label": "rough_low_mobility_median",
+                "surface_valid_fraction": 1.0,
+                "surface_median_confidence": 0.8,
+                "surface_composite_score": 0.75,
+            }
+        )
+        handle.create_dataset("bin_centers_A", data=np.array([0.5, 1.5], dtype=float))
+        handle.create_dataset("density", data=np.array([0.1, 0.2], dtype=float))
+        handle.create_dataset(
+            "surface_position_per_frame_A", data=np.array([1.2, 1.3], dtype=float)
+        )
+        handle.create_dataset("surface_valid_mask", data=np.array([True, True], dtype=bool))
+        handle.create_dataset("surface_confidence", data=np.array([0.8, 0.8], dtype=float))
+
+    loaded = load_density_profile(out, axis="z", species="O")
+    assert loaded.surface_position == pytest.approx(1.25)
+    assert loaded.surface_position_std == pytest.approx(0.05)
+    assert loaded.surface_estimate is not None
+    assert loaded.surface_estimate.mode == "rough"
+
+
+def test_save_and_load_density_profile_preserves_molecular_number_density_units(tmp_path):
+    frame = Atoms(
+        "OHHOHH",
+        positions=[
+            [0.0, 0.0, 0.10],
+            [0.95, 0.0, 0.10],
+            [-0.30, 0.90, 0.10],
+            [0.0, 0.0, 1.10],
+            [0.95, 0.0, 1.10],
+            [-0.30, 0.90, 1.10],
+        ],
+        cell=[10.0, 10.0, 10.0],
+        pbc=True,
+    )
+    profile = compute_density_profile(
+        frames=[frame],
+        species="H2O",
+        axis="z",
+        bin_width=1.0,
+    )
+    out = tmp_path / "density_h2o.h5"
+
+    save_density_profile(profile, out)
+    loaded = load_density_profile(out, axis="z", species="H2O")
+
+    np.testing.assert_allclose(loaded.number_density, profile.number_density)
+    assert loaded.number_density_units == "molecule/nm^3"
 
 
 def test_save_density_profiles_writes_hdf5_collection(tmp_path):
@@ -693,9 +1003,11 @@ def test_density_profile_auto_mode_fills_missing_framewise_surface_with_quantile
             surface_elements=["Pt"],
         )
 
-    assert profile.coordinate_mode == "distance"
+    assert profile.coordinate_mode == "axis"
     assert profile.surface_position is not None
-    assert "frame-wise surface alignment was unavailable" not in caplog.text
+    assert profile.surface_estimate is not None
+    assert profile.surface_estimate.summary.valid_fraction < 1.0
+    assert "quantile_fill_inconsistent" in profile.surface_estimate.diagnostics.rejection_reason
 
 
 def test_density_surface_logging_explains_reference_estimator_and_fill(caplog):
@@ -760,16 +1072,66 @@ def test_density_surface_logging_explains_reference_estimator_and_fill(caplog):
 
     assert "Surface reference along Z: user-selected Pt reference atoms." in caplog.text
     assert (
-        "Surface estimator along Z: layered top-layer mean on Z using Pt reference atoms"
+        "Surface estimator along Z: layered top-layer median on Z using Pt reference atoms"
         in caplog.text
     )
-    assert (
-        "Surface estimator gaps along Z: filled 1 missing frame values with tracked "
-        "top-layer mean from nearest valid layered frames."
-    ) in caplog.text
-    assert "per-frame Z q90 of Pt reference atoms" not in caplog.text
-    assert "Frame-wise Z surface alignment active:" in caplog.text
-    assert "summary of per-frame surface estimates:" in caplog.text
+    assert "frame-wise surface alignment was unavailable" in caplog.text
+
+
+def test_estimate_surface_reference_exposes_provenance_and_confidence():
+    frames = [
+        Atoms(
+            "PtPtPtPtO",
+            positions=[
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.1],
+                [2.0, 0.0, 1.2],
+                [3.0, 0.0, 1.3],
+                [0.5, 0.0, 2.0],
+            ],
+            cell=[12.0, 12.0, 14.0],
+            pbc=True,
+        ),
+        Atoms(
+            "PtPtPtPtO",
+            positions=[
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.1],
+                [2.0, 0.0, 0.2],
+                [3.0, 0.0, 0.3],
+                [0.5, 0.0, 2.1],
+            ],
+            cell=[12.0, 12.0, 14.0],
+            pbc=True,
+        ),
+        Atoms(
+            "PtPtPtPtO",
+            positions=[
+                [0.0, 0.0, 0.05],
+                [1.0, 0.0, 0.15],
+                [2.0, 0.0, 1.25],
+                [3.0, 0.0, 1.35],
+                [0.5, 0.0, 2.05],
+            ],
+            cell=[12.0, 12.0, 14.0],
+            pbc=True,
+        ),
+    ]
+    estimate = estimate_surface_reference(
+        frames,
+        axis="z",
+        mode="auto",
+        surface_elements=["Pt"],
+    )
+
+    assert estimate is not None
+    assert estimate.confidence.shape == (3,)
+    assert estimate.provenance.shape == (3,)
+    assert np.all((estimate.confidence >= 0.0) & (estimate.confidence <= 1.0))
+    assert estimate.summary.method_label in {
+        "layered_top_layer_median(median_layers=2)",
+        "rough_low_mobility_median",
+    }
 
 
 def test_load_density_profile_rejects_csv_input(tmp_path):
@@ -981,7 +1343,7 @@ def test_plot_density_profile_supports_number_density(monkeypatch):
 
     plot_density_profile(profile, show=False, quantity="number")
     np.testing.assert_allclose(captured["y"], np.array([250.0]))
-    assert captured["y_label"] == "Number density (atom/nm^3)"
+    assert captured["y_label"] == "Entity density (atom/nm^3)"
 
 
 def test_plot_line_series_keeps_explicit_y_limits_when_ticks_are_outside_range():

@@ -1,15 +1,15 @@
 # Orientation
 
 `linak compute orientation` computes water-orientation observables as a function
-of distance to a surface or, when surface alignment is unavailable, along a raw
-Cartesian axis.
+of distance to a trusted shared surface reference or, when no trusted surface
+reference is available, along a raw Cartesian axis.
 
 ## What Is Being Computed
 
-LiNaK identifies water molecules, computes water geometry for each frame, and
-then stores orientation statistics in distance bins.
+LiNaK identifies water molecules, computes PBC-aware water geometry for each
+frame, and accumulates orientation statistics in distance bins.
 
-The primary outputs are:
+The primary stored outputs are:
 
 - `cos_polar_mean`
 - `cos_azimuthal_mean`
@@ -22,128 +22,161 @@ This analysis is water-specific.
 
 ## Water Geometry Used
 
-LiNaK first identifies water molecules and computes PBC-aware positions for:
+LiNaK reuses the shared water-geometry pipeline from
+[Water Detection And Water Geometry](water-detection.md).
 
-- oxygen
-- hydrogen 1
-- hydrogen 2
+For each detected water molecule the shared geometry builder returns:
+
+- oxygen position `O`
+- hydrogen positions `H1` and `H2`
 - water center of mass
 
-That shared logic is described in
-[Water Detection And Water Geometry](water-detection.md).
+The O-H vectors used by orientation are explicitly:
+
+- `OH1 = H1 - O`
+- `OH2 = H2 - O`
+
+Those vectors come from the shared PBC-aware water geometry routine, which uses
+minimum-image handling so each hydrogen is associated with the correct image of
+its oxygen.
 
 ## Distance Coordinate
 
 Each water molecule is assigned a distance-bin coordinate using its center of
 mass along the selected axis.
 
-If a valid frame-wise surface reference exists, LiNaK uses:
+If the shared surface estimator returns a complete and sufficiently trustworthy
+frame-wise surface reference, LiNaK uses:
 
-`distance = COM_axis - surface_position(frame)`
+`distance_t = COM_axis,t - s_t`
 
-Otherwise it bins the raw axis coordinate and marks the result as
-`coordinate_mode = "axis"`.
+where `s_t` is the scalar surface reference coordinate for frame `t`.
 
-Surface estimation is described in [Surface Estimation](surface-estimation.md).
+If the surface estimate is incomplete or below the trust threshold, orientation
+does not silently use it anyway. Instead, LiNaK bins the raw center-of-mass
+axis coordinate and stores:
+
+`coordinate_mode = "axis"`
+
+Surface estimation shifts only the distance coordinate. It does not redefine the
+sign of the orientation observables.
 
 ## Polar Orientation
 
-LiNaK builds the water bisector from the two normalized O-H vectors and compares
-that bisector to the chosen reference axis.
+LiNaK builds the polar bisector from the two normalized O-H vectors:
 
-The stored quantity is:
+`u_1 = OH1 / ||OH1||`
 
-`cos_polar = bisector dot reference_axis`
+`u_2 = OH2 / ||OH2||`
 
-If the normalized O-H bond vectors are `u_1` and `u_2`, LiNaK builds the
-normalized bisector
+`b = (u_1 + u_2) / ||u_1 + u_2||`
 
-`b = (u_1 + u_2) / |u_1 + u_2|`
-
-and then computes:
+It then computes:
 
 `cos_polar = b . e_ref`
 
-where `e_ref` is the unit vector along the chosen reference axis.
+where `e_ref` is the unit vector along the chosen Cartesian reference axis.
 
 Interpretation:
 
-- `+1`: H atoms point away from the reference direction
-- `-1`: H atoms point toward the reference direction
-- `0`: the water bisector is perpendicular to the reference direction
+- `+1`: hydrogens point in the positive reference-axis direction
+- `-1`: hydrogens point in the negative reference-axis direction
+- `0`: the water bisector is perpendicular to the reference axis
+
+This sign convention is tied to `reference_axis`. It is not automatically
+re-labeled as "toward" or "away from" the surface, because that would be
+ambiguous for different surface sides and symmetric slabs.
+
+If either O-H vector is degenerate or if the bisector norm is too small, that
+sample is marked invalid for polar statistics.
 
 ## Azimuthal Orientation
 
-LiNaK also computes the water-plane normal from:
+LiNaK also computes a normal to the molecular plane:
 
-`plane_normal = OH1 x OH2`
+`n = OH1 x OH2`
 
-After normalization, that normal is projected into the plane perpendicular to
-the reference axis. If the remaining in-plane components are `(p_1, p_2)`,
-LiNaK stores:
+The order `OH1 x OH2` is intentional and follows the stable `H1`, `H2` ordering
+from the shared water triplet builder. The sign of this azimuthal descriptor
+therefore depends on that deterministic hydrogen ordering.
 
-`cos_azimuthal = p_1 / sqrt(p_1^2 + p_2^2)`
+LiNaK then removes the component of `n` along the reference axis:
 
-It then projects that normal into the plane perpendicular to the reference axis
-and stores:
+`p = n - (n . e_ref) e_ref`
 
-`cos_azimuthal`
+After normalization, it stores the cosine of the angle between the projected
+vector and the first available Cartesian axis perpendicular to `reference_axis`.
 
-relative to the first available Cartesian in-plane axis.
+That makes `cos_azimuthal` a descriptive in-plane orientation observable, not a
+unique physically absolute laboratory-frame azimuth unless the system itself
+defines a preferred in-plane direction.
 
-This is useful as an orientation descriptor, but it does not define a unique
-global in-plane physical direction in the same strong sense as the polar
-quantity.
+If the projected plane normal is too small, that sample is marked invalid for
+azimuthal statistics.
 
 ## Distance-Bin Accumulation
 
 For each water molecule in each frame, LiNaK:
 
-1. assigns the molecule to a distance bin
-2. accumulates `cos_polar`
-3. accumulates `cos_azimuthal`
-4. increments the molecule count in that bin
+1. computes the COM position
+2. computes `cos_polar`
+3. computes `cos_azimuthal`
+4. assigns the molecule to a distance bin
+5. accumulates separate counts for total, polar-valid, and azimuthal-valid
+   samples
 
-At the end, LiNaK divides the accumulated angle sums by the count per bin to
-obtain:
+Each distance bin stores:
 
-- `cos_polar_mean`
-- `cos_azimuthal_mean`
+- `count_total`
+- `count_polar_valid`
+- `count_azimuthal_valid`
 
-Explicitly, for distance bin `k`:
+The bin means are then:
 
-- `cos_polar_mean(k) = sum cos_polar / count_k`
-- `cos_azimuthal_mean(k) = sum cos_azimuthal / count_k`
+- `cos_polar_mean = sum(cos_polar over polar-valid samples) / count_polar_valid`
+- `cos_azimuthal_mean = sum(cos_azimuthal over azimuthal-valid samples) / count_azimuthal_valid`
+
+Bins with zero valid samples are stored as `NaN`, not as `0`.
 
 ## Density-Weighted Orientation
 
-LiNaK also computes a water number density profile over the same distance bins.
+LiNaK also computes a water molecular density profile over the same distance
+bins using the water COM assignments.
 
 It then forms:
 
 - `cos_polar_density = cos_polar_mean * density`
 - `cos_azimuthal_density = cos_azimuthal_mean * density`
 
-These density-weighted quantities are useful when you want orientational bias
-and molecular population to be represented together.
+These are density-weighted orientation-bias profiles. They are not pure
+orientation observables.
+
+If a usable periodic cell is available, LiNaK stores a volumetric molecular
+density using the slab volume:
+
+- `axis_length = ||cell[axis_index]||`
+- `cross_section = |det(cell)| / axis_length`
+- `bin_volume = cross_section * bin_width`
+
+If the cell varies across frames, LiNaK averages per-frame volume-normalized
+histograms. If no usable cell is available, it falls back to a linear molecular
+density along the chosen axis.
 
 ## 2D Orientation Heatmaps
 
-In addition to 1D averages, LiNaK bins the orientation cosines into a second
-angle axis running from `-1` to `+1`.
+The orientation heatmaps use `cos(angle)` on the second axis, not the angle in
+radians or degrees.
 
-This yields two 2D histograms:
+LiNaK stores:
 
-- `heatmap_polar[distance_bin, angle_bin]`
-- `heatmap_azimuthal[distance_bin, angle_bin]`
+- `heatmap_polar[distance_bin, cosine_bin]`
+- `heatmap_azimuthal[distance_bin, cosine_bin]`
 
-The heatmaps store counts, not normalized probabilities.
+These heatmaps store raw counts. Any normalization to probabilities happens
+only at plotting time when explicitly requested.
 
-## Density Normalization
-
-If a usable periodic cell is known, LiNaK normalizes the water count per
-distance bin by the corresponding slab volume and stores a volumetric number
-density. Otherwise it falls back to a linear density along the chosen axis.
+Values exactly equal to `-1` and `+1` are handled deterministically and are
+assigned to the first and last cosine bins respectively.
 
 ## What Gets Stored
 
@@ -153,6 +186,9 @@ The orientation HDF5 profile stores:
 - `bin_centers_A`
 - `cos_polar_mean`
 - `cos_azimuthal_mean`
+- `count_total`
+- `count_polar_valid`
+- `count_azimuthal_valid`
 - `cos_polar_density`
 - `cos_azimuthal_density`
 - `density`
@@ -161,7 +197,7 @@ The orientation HDF5 profile stores:
 - `heatmap_angle_bin_edges`
 - `heatmap_angle_bin_centers`
 
-and metadata such as:
+It also stores metadata such as:
 
 - `analysis = orientation`
 - `axis`
@@ -169,16 +205,22 @@ and metadata such as:
 - `n_frames`
 - `n_molecules_per_frame`
 - `coordinate_mode`
-- optional surface summary metadata
-- optional cell lengths
+- optional representative cell lengths
+
+When a surface estimate exists, orientation may additionally persist the shared
+surface datasets and metadata described in
+[Surface Estimation](surface-estimation.md).
 
 ## Important Assumptions And Limitations
 
 - The analysis only applies to water molecules.
 - Water identification depends on the O-H cutoff and topology-validation logic.
-- Azimuthal orientation is reference-frame-dependent in the in-plane direction.
+- Polar sign follows the chosen Cartesian `reference_axis`.
+- Surface estimation affects the distance coordinate only.
+- Azimuthal orientation depends on the chosen in-plane Cartesian reference axis.
+- Azimuthal sign also depends on the stable `H1`, `H2` ordering inherited from
+  the shared water triplet builder.
 - Heatmaps store counts rather than automatically normalized probabilities.
-- Surface-aware interpretation depends on the success of the surface estimator.
 
 ## Related Documentation
 

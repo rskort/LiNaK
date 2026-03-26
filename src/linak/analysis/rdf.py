@@ -86,6 +86,7 @@ class _RDFWorkerConfig:
     shell_volumes: np.ndarray
     max_sphere_volume: float
     selection_cache: _RDFSelectionCache | None = None
+    strategy_override: str | None = None
 
 
 def _normalize_species(species: str | None) -> str:
@@ -113,6 +114,9 @@ def _select_mask(numbers: np.ndarray, species: str) -> np.ndarray:
 
 def _frame_volume(frame: Atoms) -> float:
     """Return absolute frame volume and validate it is usable."""
+    pbc = np.asarray(frame.get_pbc(), dtype=bool)
+    if pbc.shape != (3,) or not bool(np.all(pbc)):
+        raise ValueError("RDF requires fully periodic boundary conditions in all frames.")
     cell = np.asarray(frame.cell.array, dtype=float)
     if cell.shape != (3, 3):
         raise ValueError("RDF requires valid periodic cell vectors in all frames.")
@@ -123,6 +127,27 @@ def _frame_volume(frame: Atoms) -> float:
     return volume
 
 
+def _frame_perpendicular_heights(frame: Atoms) -> tuple[float, float, float]:
+    """Return perpendicular cell heights for one periodic cell."""
+    cell = np.asarray(frame.cell.array, dtype=float)
+    if cell.shape != (3, 3):
+        raise ValueError("RDF requires valid periodic cell vectors in all frames.")
+    volume = _frame_volume(frame)
+    a_vec, b_vec, c_vec = np.asarray(cell, dtype=float)
+    face_areas = np.asarray(
+        [
+            np.linalg.norm(np.cross(b_vec, c_vec)),
+            np.linalg.norm(np.cross(c_vec, a_vec)),
+            np.linalg.norm(np.cross(a_vec, b_vec)),
+        ],
+        dtype=float,
+    )
+    if np.any(~np.isfinite(face_areas)) or np.any(face_areas <= 0.0):
+        raise ValueError("RDF requires valid periodic cell vectors in all frames.")
+    heights = volume / face_areas
+    return float(heights[0]), float(heights[1]), float(heights[2])
+
+
 def _sample_distances_neighbor_list(
     frame: Atoms,
     mask_a: np.ndarray,
@@ -130,11 +155,12 @@ def _sample_distances_neighbor_list(
     *,
     r_max: float,
 ) -> np.ndarray:
-    """Collect selected pair distances using a cutoff neighbor list."""
+    """Collect selected ordered-pair distances using a cutoff neighbor list."""
     i_pairs, j_pairs, pair_distances = neighbor_list(
         "ijd", frame, float(np.nextafter(r_max, np.inf))
     )
-    pair_mask = mask_a[i_pairs] & mask_b[j_pairs] & (i_pairs != j_pairs) & (pair_distances > 0.0)
+    # Keep ordered i->j pairs and exclude only literal self-pairs.
+    pair_mask = mask_a[i_pairs] & mask_b[j_pairs] & (i_pairs != j_pairs)
     if not np.any(pair_mask):
         return np.empty(0, dtype=float)
 
@@ -153,7 +179,8 @@ def _sample_distances_neighbor_list(
         unique_starts[0] = True
         unique_starts[1:] = sorted_ids[1:] != sorted_ids[:-1]
         sampled_distances = np.minimum.reduceat(sorted_distances, np.flatnonzero(unique_starts))
-    return sampled_distances[sampled_distances <= r_max]
+    finite = np.isfinite(sampled_distances)
+    return sampled_distances[finite & (sampled_distances >= 0.0) & (sampled_distances <= r_max)]
 
 
 def _sample_distances_selected_matrix(
@@ -164,18 +191,18 @@ def _sample_distances_selected_matrix(
     same_selection: bool,
     r_max: float,
 ) -> np.ndarray:
-    """Collect selected pair distances using only the relevant submatrix."""
+    """Collect selected ordered-pair distances using only the relevant submatrix."""
     _, pair_distances = get_distances(
         frame.positions[indices_a],
         frame.positions[indices_b],
         cell=frame.cell.array,
         pbc=frame.get_pbc(),
     )
-    if same_selection:
-        pair_distances = pair_distances[~np.eye(indices_a.size, dtype=bool)]
-    else:
-        pair_distances = pair_distances.ravel()
-    return pair_distances[(pair_distances > 0.0) & (pair_distances <= r_max)]
+    same_atom_mask = indices_a[:, np.newaxis] != indices_b[np.newaxis, :]
+    pair_distances = pair_distances[same_atom_mask]
+    return pair_distances[
+        np.isfinite(pair_distances) & (pair_distances >= 0.0) & (pair_distances <= r_max)
+    ]
 
 
 def _sample_distances_full_matrix(
@@ -186,14 +213,14 @@ def _sample_distances_full_matrix(
     same_selection: bool,
     r_max: float,
 ) -> np.ndarray:
-    """Collect selected pair distances from full MIC matrix."""
+    """Collect selected ordered-pair distances from a full MIC matrix."""
     all_distances = np.asarray(frame.get_all_distances(mic=True), dtype=float)
     pair_distances = all_distances[np.ix_(indices_a, indices_b)]
-    if same_selection:
-        pair_distances = pair_distances[~np.eye(indices_a.size, dtype=bool)]
-    else:
-        pair_distances = pair_distances.ravel()
-    return pair_distances[(pair_distances > 0.0) & (pair_distances <= r_max)]
+    same_atom_mask = indices_a[:, np.newaxis] != indices_b[np.newaxis, :]
+    pair_distances = pair_distances[same_atom_mask]
+    return pair_distances[
+        np.isfinite(pair_distances) & (pair_distances >= 0.0) & (pair_distances <= r_max)
+    ]
 
 
 def _resolve_rdf_worker_count(threads: int | None, n_frames: int) -> int:
@@ -229,6 +256,31 @@ def _build_uniform_rdf_bins(
     effective_bin_width = float(r_max) / float(n_bins)
     bin_edges = np.linspace(0.0, float(r_max), n_bins + 1, dtype=float)
     return bin_edges, effective_bin_width
+
+
+def _shell_volumes_from_edges(bin_edges: np.ndarray) -> np.ndarray:
+    """Return exact spherical shell volumes for uniform RDF bins."""
+    edges = np.asarray(bin_edges, dtype=float)
+    return (4.0 / 3.0) * np.pi * (edges[1:] ** 3 - edges[:-1] ** 3)
+
+
+def _auto_r_max_from_frames(frames: list[Atoms]) -> float:
+    """Return a safe default RDF cutoff from the minimum periodic cell height."""
+    if not frames:
+        raise ValueError("At least one trajectory frame is required.")
+    min_height = float(min(min(_frame_perpendicular_heights(frame)) for frame in frames))
+    return 0.5 * min_height
+
+
+def _normalize_strategy_override(strategy_override: str | None) -> str | None:
+    if strategy_override is None:
+        return None
+    token = str(strategy_override).strip().lower()
+    if token not in {"neighbor_list", "selected_matrix", "full_matrix"}:
+        raise ValueError(
+            "RDF strategy override must be one of: neighbor_list, selected_matrix, full_matrix."
+        )
+    return token
 
 
 def _resolve_rdf_chunk_size(n_frames: int, worker_count: int) -> int:
@@ -310,6 +362,7 @@ def _compute_rdf_frame_contribution(
     shell_volumes: np.ndarray,
     max_sphere_volume: float,
     selection_cache: _RDFSelectionCache | None = None,
+    strategy_override: str | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return histogram counts and expected shell counts for one frame."""
     volume = _frame_volume(frame)
@@ -333,8 +386,15 @@ def _compute_rdf_frame_contribution(
             )
         else:
             all_distances = np.asarray(frame.get_all_distances(mic=True), dtype=float)
-            sampled_distances = all_distances[(all_distances > 0.0) & (all_distances <= r_max)]
+            off_diagonal = ~np.eye(n_atoms, dtype=bool)
+            sampled_distances = all_distances[off_diagonal]
+            sampled_distances = sampled_distances[
+                np.isfinite(sampled_distances)
+                & (sampled_distances >= 0.0)
+                & (sampled_distances <= r_max)
+            ]
         counts = np.histogram(sampled_distances, bins=bin_edges)[0].astype(float)
+        # Both observed and expected counts use ordered pairs: i->j and j->i are distinct.
         rho_b = (n_atoms - 1) / volume
         expected = (n_atoms * rho_b) * shell_volumes
         return counts, expected
@@ -360,9 +420,17 @@ def _compute_rdf_frame_contribution(
         )
 
     pair_fraction = (count_a * count_b) / float(n_atoms * n_atoms)
-    use_neighbor_list = neighbor_density <= _NEIGHBORLIST_DENSITY_THRESHOLD
-    use_selected_matrix = pair_fraction <= _SELECTED_MATRIX_FRACTION_THRESHOLD
-    if use_neighbor_list:
+    resolved_strategy = strategy_override
+    if resolved_strategy is None:
+        use_neighbor_list = neighbor_density <= _NEIGHBORLIST_DENSITY_THRESHOLD
+        use_selected_matrix = pair_fraction <= _SELECTED_MATRIX_FRACTION_THRESHOLD
+        if use_neighbor_list:
+            resolved_strategy = "neighbor_list"
+        elif use_selected_matrix:
+            resolved_strategy = "selected_matrix"
+        else:
+            resolved_strategy = "full_matrix"
+    if resolved_strategy == "neighbor_list":
         sampled_distances = _sample_distances_neighbor_list(
             frame,
             mask_a,
@@ -370,7 +438,7 @@ def _compute_rdf_frame_contribution(
             r_max=r_max,
         )
     else:
-        if use_selected_matrix:
+        if resolved_strategy == "selected_matrix":
             sampled_distances = _sample_distances_selected_matrix(
                 frame,
                 indices_a,
@@ -388,6 +456,7 @@ def _compute_rdf_frame_contribution(
             )
 
     counts = np.histogram(sampled_distances, bins=bin_edges)[0].astype(float)
+    # Expected counts must match the same ordered-pair convention used above.
     if same_selection:
         rho_b = (count_b - 1) / volume
     else:
@@ -415,6 +484,7 @@ def _compute_rdf_chunk_contributions(
             shell_volumes=config.shell_volumes,
             max_sphere_volume=config.max_sphere_volume,
             selection_cache=config.selection_cache,
+            strategy_override=config.strategy_override,
         )
         counts_accum += counts
         expected_accum += expected
@@ -428,6 +498,7 @@ def compute_rdf(
     r_max: float | None = None,
     bin_width: float = 0.05,
     threads: int | None = None,
+    _strategy_override: str | None = None,
 ) -> RDFProfile:
     """Compute a radial distribution function averaged across frames."""
     if not frames:
@@ -436,16 +507,10 @@ def compute_rdf(
     ensure_positive("bin_width", bin_width)
     label_a = _normalize_species(species_a)
     label_b = _normalize_species(species_b if species_b is not None else species_a)
+    strategy_override = _normalize_strategy_override(_strategy_override)
 
     if r_max is None:
-        min_cell_lengths = []
-        for frame in frames:
-            cell = np.asarray(frame.cell.array, dtype=float)
-            if cell.shape != (3, 3):
-                raise ValueError("RDF requires valid periodic cell vectors in all frames.")
-            cell_lengths = np.linalg.norm(cell, axis=1)
-            min_cell_lengths.append(float(np.min(cell_lengths)))
-        r_max = 0.5 * min(min_cell_lengths)
+        r_max = _auto_r_max_from_frames(frames)
 
     ensure_positive("r_max", r_max)
 
@@ -465,7 +530,7 @@ def compute_rdf(
     counts_accum = np.zeros(bin_edges.size - 1, dtype=float)
     expected_accum = np.zeros_like(counts_accum)
     same_selection = label_a == label_b
-    shell_volumes = (4.0 / 3.0) * np.pi * (bin_edges[1:] ** 3 - bin_edges[:-1] ** 3)
+    shell_volumes = _shell_volumes_from_edges(bin_edges)
 
     LOGGER.info(
         "Computing RDF (species_a=%s, species_b=%s, r_max=%.6g, bin_width=%.6g).",
@@ -487,6 +552,7 @@ def compute_rdf(
         shell_volumes=shell_volumes,
         max_sphere_volume=max_sphere_volume,
         selection_cache=selection_cache,
+        strategy_override=strategy_override,
     )
 
     use_parallel = _should_parallelize_rdf(len(frames), worker_count)
@@ -513,6 +579,7 @@ def compute_rdf(
                     shell_volumes=config.shell_volumes,
                     max_sphere_volume=config.max_sphere_volume,
                     selection_cache=config.selection_cache,
+                    strategy_override=config.strategy_override,
                 )
                 counts_accum += counts
                 expected_accum += expected
@@ -529,7 +596,7 @@ def compute_rdf(
                     expected_accum += expected
                     progress.update(processed_frames)
 
-    g_r = np.zeros_like(counts_accum)
+    g_r = np.full_like(counts_accum, np.nan, dtype=float)
     non_zero = expected_accum > 0.0
     g_r[non_zero] = counts_accum[non_zero] / expected_accum[non_zero]
     bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
@@ -655,9 +722,15 @@ def _load_rdf_profiles_from_payloads(
 
         resolved_species_a = str(metadata.get("species_a", "")).strip() or "UNKNOWN"
         resolved_species_b = str(metadata.get("species_b", "")).strip() or resolved_species_a
-        if wanted_species_a is not None and _normalize_species(resolved_species_a) != wanted_species_a:
+        if (
+            wanted_species_a is not None
+            and _normalize_species(resolved_species_a) != wanted_species_a
+        ):
             continue
-        if wanted_species_b is not None and _normalize_species(resolved_species_b) != wanted_species_b:
+        if (
+            wanted_species_b is not None
+            and _normalize_species(resolved_species_b) != wanted_species_b
+        ):
             continue
 
         bin_centers = np.asarray(datasets["bin_centers_A"], dtype=float)

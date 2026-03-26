@@ -27,12 +27,17 @@ class AnalysisSchema:
 _ANALYSIS_SCHEMAS: dict[str, AnalysisSchema] = {
     "density": AnalysisSchema(
         analysis="density",
-        version=1,
+        version=3,
         default_units_map={
             "bin_width_A": "Angstrom",
             "bin_centers_A": "Angstrom",
             "density": "g/cm^3",
             "number_density": "atom/nm^3",
+            "surface_position_per_frame_A": "Angstrom",
+            "surface_confidence": "dimensionless",
+            "surface_largest_gap_A": "Angstrom",
+            "surface_baseline_gap_A": "Angstrom",
+            "surface_reference_spread_A": "Angstrom",
         },
     ),
     "msd": AnalysisSchema(
@@ -57,7 +62,7 @@ _ANALYSIS_SCHEMAS: dict[str, AnalysisSchema] = {
     ),
     "position": AnalysisSchema(
         analysis="position",
-        version=1,
+        version=3,
         default_units_map={
             "frame_index": "index",
             "step": "step",
@@ -68,12 +73,16 @@ _ANALYSIS_SCHEMAS: dict[str, AnalysisSchema] = {
             "z_A": "Angstrom",
             "distance_to_surface_A": "Angstrom",
             "surface_position_per_frame_A": "Angstrom",
+            "surface_confidence": "dimensionless",
+            "surface_largest_gap_A": "Angstrom",
+            "surface_baseline_gap_A": "Angstrom",
+            "surface_reference_spread_A": "Angstrom",
         },
         default_plot_labels=("Time (ps)", "Distance to surface (Angstrom)"),
     ),
     "coordination": AnalysisSchema(
         analysis="coordination",
-        version=1,
+        version=3,
         default_units_map={
             "frame_index": "index",
             "step": "step",
@@ -82,6 +91,10 @@ _ANALYSIS_SCHEMAS: dict[str, AnalysisSchema] = {
             "distance_to_surface_A": "Angstrom",
             "coordination_number": "dimensionless",
             "surface_position_per_frame_A": "Angstrom",
+            "surface_confidence": "dimensionless",
+            "surface_largest_gap_A": "Angstrom",
+            "surface_baseline_gap_A": "Angstrom",
+            "surface_reference_spread_A": "Angstrom",
             "cutoff_A": "Angstrom",
             "cutoff_smoothing_width_A": "Angstrom",
             "cutoff_rdf_bin_centers_A": "Angstrom",
@@ -92,12 +105,15 @@ _ANALYSIS_SCHEMAS: dict[str, AnalysisSchema] = {
     ),
     "orientation": AnalysisSchema(
         analysis="orientation",
-        version=1,
+        version=4,
         default_units_map={
             "bin_centers_A": "Angstrom",
             "bin_edges_A": "Angstrom",
             "cos_polar_mean": "dimensionless",
             "cos_azimuthal_mean": "dimensionless",
+            "count_total": "counts",
+            "count_polar_valid": "counts",
+            "count_azimuthal_valid": "counts",
             "cos_polar_density": "1/Angstrom^3",
             "cos_azimuthal_density": "1/Angstrom^3",
             "density": "1/Angstrom^3",
@@ -105,6 +121,11 @@ _ANALYSIS_SCHEMAS: dict[str, AnalysisSchema] = {
             "heatmap_azimuthal": "counts",
             "heatmap_angle_bin_centers": "dimensionless",
             "heatmap_angle_bin_edges": "dimensionless",
+            "surface_position_per_frame_A": "Angstrom",
+            "surface_confidence": "dimensionless",
+            "surface_largest_gap_A": "Angstrom",
+            "surface_baseline_gap_A": "Angstrom",
+            "surface_reference_spread_A": "Angstrom",
         },
         default_plot_labels=("Distance to surface (Angstrom)", "cos(theta)"),
     ),
@@ -183,6 +204,12 @@ _NUMBER_UNIT_TO_ATOM_PER_NM3 = {
     "atom/Angstrom^3": 1.0e3,
     "atoms/Angstrom^3": 1.0e3,
 }
+_NUMBER_UNIT_TO_MOLECULE_PER_NM3 = {
+    "molecule/nm^3": 1.0,
+    "molecules/nm^3": 1.0,
+    "molecule/Angstrom^3": 1.0e3,
+    "molecules/Angstrom^3": 1.0e3,
+}
 
 
 def canonicalize_density_units(
@@ -211,6 +238,11 @@ def canonicalize_density_units(
         if number_factor is not None:
             canonical_number_density = canonical_number_density * number_factor
             canonical_number_density_units = "atom/nm^3"
+        else:
+            molecule_factor = _NUMBER_UNIT_TO_MOLECULE_PER_NM3.get(canonical_number_density_units)
+            if molecule_factor is not None:
+                canonical_number_density = canonical_number_density * molecule_factor
+                canonical_number_density_units = "molecule/nm^3"
 
     return (
         canonical_density,

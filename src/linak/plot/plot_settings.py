@@ -187,9 +187,7 @@ def _read_profiles_map_with_store(
     stores: dict[str, PlotProfileStore] = {}
     for key, value in raw_profiles.items():
         store = (
-            _coerce_single_profile_store(value)
-            if combined_source
-            else _coerce_profile_store(value)
+            _coerce_single_profile_store(value) if combined_source else _coerce_profile_store(value)
         )
         if store is not None:
             stores[str(key)] = store
@@ -334,7 +332,9 @@ def read_plot_profile(
             return None
     else:
         selected_name = (
-            _normalize_profile_name(profile_name) if profile_name is not None else store.active_profile
+            _normalize_profile_name(profile_name)
+            if profile_name is not None
+            else store.active_profile
         )
     if selected_name is None:
         return None
@@ -514,9 +514,7 @@ def set_active_plot_profile(path: str | Path, profile_key: str, profile_name: st
                 f"Combined HDF5 plot settings use one fixed profile '{DEFAULT_PLOT_PROFILE_NAME}'."
             )
         if read_plot_profile(source_path, profile_key) is None:
-            raise ValueError(
-                f"No plot-setting profile '{profile_key}' found in '{source_path}'."
-            )
+            raise ValueError(f"No plot-setting profile '{profile_key}' found in '{source_path}'.")
         return
 
     with h5py.File(source_path, "r+") as handle:

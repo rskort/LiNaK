@@ -34,6 +34,15 @@ As a result, coordination inherits the same:
 - timestep handling
 - surface-distance logic
 
+The coordination matrix columns are aligned to that tracked center-atom order.
+If LiNaK stores:
+
+- `coordination_number[T, N_center]`
+- `distance_to_surface_A[T, N_center]`
+
+then column `j` in both arrays refers to the same `species_a` atom at every
+frame.
+
 documented in [Position](position.md) and [Surface Estimation](surface-estimation.md).
 
 ## Step 2: Resolve Neighbor Atoms
@@ -43,6 +52,9 @@ given, it defaults to the same species token as `species_a`.
 
 If `A == B`, self-pairs are excluded when computing neighbor contributions for a
 given center atom.
+
+Same-species coordination is therefore self-excluded, but still atom-resolved:
+each center atom receives its own continuous CN trajectory.
 
 ## Step 3: Resolve The Coordination Cutoff
 
@@ -94,7 +106,10 @@ normalized so that the kernel sum is `1`.
 
 The smoothing width in bins is computed from:
 
-`sigma_bins = max(smoothing_sigma_A / mean_bin_width, 1.0)`
+`sigma_bins = smoothing_sigma_A / mean_bin_width`
+
+If `sigma_bins` is effectively zero, LiNaK skips Gaussian blurring instead of
+forcing a minimum one-bin smoothing width.
 
 LiNaK then:
 
@@ -104,19 +119,40 @@ LiNaK then:
 4. uses the vertex of that quadratic, clipped to the local fit window, as the
    refined cutoff
 
+LiNaK requires the resolved cutoff to be:
+
+- finite
+- positive
+- inside the finite RDF range
+- strictly after the first peak
+
+If no valid post-peak minimum can be resolved, LiNaK fails explicitly instead of
+silently accepting an endpoint artifact.
+
 ## Step 4: Convert Pair Distances To Continuous Weights
 
-LiNaK does not use a hard integer cutoff. Instead, each pair distance `r`
-contributes a smooth weight controlled by:
+LiNaK does not use a hard integer cutoff by default. Instead, each pair
+distance `r` contributes a smooth weight controlled by:
 
 - `cutoff_A`
 - `cutoff_smoothing_width_A`
 
-Conceptually:
+With:
 
-- distances well inside the cutoff contribute approximately `1`
-- distances well outside contribute approximately `0`
-- distances near the cutoff contribute a fractional weight
+- `r_c = cutoff_A`
+- `Delta = cutoff_smoothing_width_A`
+
+LiNaK uses the cosine-taper weight:
+
+- `w(r) = 1` for `r <= r_c - Delta/2`
+- `w(r) = 0.5 * (1 + cos(pi * (r - (r_c - Delta/2)) / Delta))`
+  for `r_c - Delta/2 < r < r_c + Delta/2`
+- `w(r) = 0` for `r >= r_c + Delta/2`
+
+If `Delta = 0`, LiNaK uses the hard-cutoff limit:
+
+- `w(r) = 1` for `r <= r_c`
+- `w(r) = 0` for `r > r_c`
 
 The coordination number for one center atom in one frame is the sum of those
 weights over all selected neighbors.
@@ -136,14 +172,19 @@ LiNaK uses one of two internal kernels.
 
 For smaller or less favorable workloads, LiNaK computes one frame at a time.
 When a usable periodic cell exists, it uses a neighbor-list-based distance
-search up to the support cutoff. Otherwise it falls back to direct Cartesian
-distances.
+search up to the full support cutoff `r_c + Delta/2`. Otherwise it falls back
+to direct Cartesian distances.
 
 ### Chunked Vectorized Kernel
 
 For larger but still vectorizable workloads, LiNaK stacks multiple frames,
-builds center-neighbor distance blocks, optionally applies minimum-image
-correction, and evaluates the continuous weights in chunks.
+builds center-neighbor distance blocks, and evaluates the continuous weights in
+chunks.
+
+This chunked kernel is only used when its distance logic is mathematically safe
+for the frame set. In particular, general triclinic periodic cells fall back to
+the framewise kernel so LiNaK does not apply an invalid component-wise wrapping
+approximation.
 
 Both kernels target the same quantity. The difference is computational strategy,
 not method definition.

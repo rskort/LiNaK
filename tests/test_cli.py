@@ -1286,6 +1286,7 @@ def test_compute_density_defaults_surface_detection_options():
     assert args.surface_mode == "auto"
     assert args.surface_elements is None
     assert args.include_fixed_surface_atoms is False
+    assert args.rough_surface_envelope is None
 
 
 def test_compute_position_defaults_surface_detection_options():
@@ -1295,6 +1296,7 @@ def test_compute_position_defaults_surface_detection_options():
     assert args.surface_mode == "auto"
     assert args.surface_elements is None
     assert args.include_fixed_surface_atoms is False
+    assert args.rough_surface_envelope is None
 
 
 def test_compute_msd_accepts_uppercase_alias():
@@ -2628,7 +2630,10 @@ def test_plot_density_gui_combined_hdf5_does_not_pass_reordered_series_lists_to_
         "plot:density",
         {
             "series_descriptors": context.series_descriptors,
-            "series_order": [context.series_descriptors[1]["series_id"], context.series_descriptors[0]["series_id"]],
+            "series_order": [
+                context.series_descriptors[1]["series_id"],
+                context.series_descriptors[0]["series_id"],
+            ],
             "series_overrides": {
                 context.series_descriptors[0]["series_id"]: {"enabled": False},
                 context.series_descriptors[1]["series_id"]: {"label_override": "kept"},
@@ -2916,9 +2921,7 @@ def test_plot_density_gui_lazy_loading_only_reads_enabled_series_and_evicts_cach
     assert load_calls == [[1], [1]]
 
 
-def test_plot_position_gui_lazy_loading_only_reads_requested_parent_profile(
-    tmp_path, monkeypatch
-):
+def test_plot_position_gui_lazy_loading_only_reads_requested_parent_profile(tmp_path, monkeypatch):
     source_h5_a = tmp_path / "source_a_position.h5"
     source_h5_b = tmp_path / "source_b_position.h5"
     combined_h5 = tmp_path / "combined_position.h5"
@@ -3133,6 +3136,7 @@ def test_compute_density_passes_surface_options_to_density_engine(tmp_path, monk
         captured["surface_mode"] = kwargs["surface_mode"]
         captured["surface_elements"] = kwargs["surface_elements"]
         captured["include_fixed_surface_atoms"] = kwargs["include_fixed_surface_atoms"]
+        captured["surface_options"] = kwargs["surface_options"]
         profile = compute_density_profile(
             [frame],
             species=kwargs["species"],
@@ -3161,6 +3165,8 @@ def test_compute_density_passes_surface_options_to_density_engine(tmp_path, monk
             "Au",
             "Pt",
             "--include-fixed-surface-atoms",
+            "--rough-surface-envelope",
+            "2.5",
         ]
     )
 
@@ -3168,6 +3174,8 @@ def test_compute_density_passes_surface_options_to_density_engine(tmp_path, monk
     assert captured["surface_mode"] == "layered"
     assert captured["surface_elements"] == ["Au", "Pt"]
     assert captured["include_fixed_surface_atoms"] is True
+    assert captured["surface_options"] is not None
+    assert captured["surface_options"].rough_surface_envelope_A == pytest.approx(2.5)
 
 
 def test_plot_density_rejects_trajectory_input(tmp_path, capsys):
@@ -4645,9 +4653,9 @@ def test_compute_coordination_logs_coordination_timestep_without_backend_noise(
         RDFProfile(
             species_a="O",
             species_b="H",
-            bin_edges=np.array([0.0, 0.5, 1.0, 1.5], dtype=float),
-            bin_centers=np.array([0.25, 0.75, 1.25], dtype=float),
-            g_r=np.array([0.2, 1.8, 0.4], dtype=float),
+            bin_edges=np.array([0.0, 0.5, 1.0, 1.5, 2.0], dtype=float),
+            bin_centers=np.array([0.25, 0.75, 1.25, 1.75], dtype=float),
+            g_r=np.array([0.2, 1.8, 0.35, 0.7], dtype=float),
             n_frames=4,
         ),
         rdf_path,

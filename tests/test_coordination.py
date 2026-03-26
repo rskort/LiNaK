@@ -45,6 +45,47 @@ def _coordination_test_frames() -> list[Atoms]:
     return [frame0, frame1]
 
 
+def _orthorhombic_cn_frames() -> list[Atoms]:
+    frame0 = Atoms(
+        "OOHH",
+        positions=[
+            [0.2, 0.0, 0.0],
+            [5.0, 0.0, 1.0],
+            [9.8, 0.0, 0.0],
+            [5.8, 0.0, 1.0],
+        ],
+        cell=[10.0, 10.0, 10.0],
+        pbc=True,
+    )
+    frame1 = frame0.copy()
+    frame1.positions[2] = [9.6, 0.0, 0.0]
+    frame1.positions[3] = [5.6, 0.0, 1.0]
+    return [frame0, frame1]
+
+
+def _triclinic_cn_frames() -> list[Atoms]:
+    cell = np.array(
+        [
+            [8.0, 0.0, 0.0],
+            [2.0, 7.5, 0.0],
+            [1.0, 0.5, 9.0],
+        ],
+        dtype=float,
+    )
+    frame0 = Atoms(
+        "OH",
+        positions=[
+            [0.3, 0.2, 0.1],
+            [0.9, 0.2, 0.1],
+        ],
+        cell=cell,
+        pbc=True,
+    )
+    frame1 = frame0.copy()
+    frame1.positions[1] = [1.0, 0.2, 0.1]
+    return [frame0, frame1]
+
+
 def test_compute_coordination_profile_tracks_continuous_cn_and_surface_distance():
     profile = compute_coordination_profile(
         _coordination_test_frames(),
@@ -69,6 +110,331 @@ def test_compute_coordination_profile_tracks_continuous_cn_and_surface_distance(
     assert profile.coordination_number.shape == (2, 1)
     assert profile.coordination_number[0, 0] == pytest.approx(1.0)
     assert 0.0 < profile.coordination_number[1, 0] < 1.0
+
+
+def test_continuous_coordination_weights_follow_cosine_taper():
+    cutoff = 2.0
+    width = 0.4
+    distances = np.array([1.8, 2.0, 2.2], dtype=float)
+
+    weights = coordination_module._continuous_coordination_weights(
+        distances,
+        cutoff_A=cutoff,
+        smoothing_width_A=width,
+    )
+
+    np.testing.assert_allclose(weights[0], 1.0)
+    np.testing.assert_allclose(weights[1], 0.5)
+    np.testing.assert_allclose(weights[2], 0.0)
+
+
+def test_continuous_coordination_weights_are_monotonic_and_support_hard_cutoff():
+    distances = np.linspace(1.8, 2.2, 9, dtype=float)
+    smoothed = coordination_module._continuous_coordination_weights(
+        distances,
+        cutoff_A=2.0,
+        smoothing_width_A=0.4,
+    )
+    assert np.all(np.diff(smoothed) <= 1.0e-12)
+
+    hard = coordination_module._continuous_coordination_weights(
+        np.array([1.9, 2.0, 2.1], dtype=float),
+        cutoff_A=2.0,
+        smoothing_width_A=0.0,
+    )
+    np.testing.assert_allclose(hard, np.array([1.0, 1.0, 0.0], dtype=float))
+
+
+def test_continuous_coordination_weights_handle_tiny_positive_smoothing_width():
+    weights = coordination_module._continuous_coordination_weights(
+        np.array([1.999999999999, 2.0, 2.000000000001], dtype=float),
+        cutoff_A=2.0,
+        smoothing_width_A=1.0e-16,
+    )
+    np.testing.assert_allclose(weights, np.array([1.0, 1.0, 0.0], dtype=float))
+
+
+def test_same_species_self_pairs_are_excluded_in_framewise_kernel():
+    frame = Atoms(
+        "OO",
+        positions=[[0.0, 0.0, 0.0], [0.8, 0.0, 0.0]],
+        cell=[10.0, 10.0, 10.0],
+        pbc=True,
+    )
+    indices = np.array([0, 1], dtype=int)
+
+    values = coordination_module._compute_coordination_frame_values(
+        frame,
+        center_indices=indices,
+        neighbor_indices=indices,
+        same_selection=True,
+        cutoff_A=1.0,
+        smoothing_width_A=0.0,
+    )
+
+    np.testing.assert_allclose(values, np.array([1.0, 1.0], dtype=float))
+
+
+def test_same_species_self_pairs_are_excluded_in_chunked_kernel():
+    frames = [
+        Atoms(
+            "OO",
+            positions=[[0.0, 0.0, 0.0], [0.8, 0.0, 0.0]],
+            cell=[10.0, 10.0, 10.0],
+            pbc=True,
+        ),
+        Atoms(
+            "OO",
+            positions=[[0.0, 0.0, 0.0], [0.9, 0.0, 0.0]],
+            cell=[10.0, 10.0, 10.0],
+            pbc=True,
+        ),
+    ]
+    indices = np.array([0, 1], dtype=int)
+
+    values = coordination_module._compute_coordination_values_chunked(
+        frames,
+        center_indices=indices,
+        neighbor_indices=indices,
+        same_selection=True,
+        cutoff_A=1.0,
+        smoothing_width_A=0.0,
+    )
+
+    np.testing.assert_allclose(values, np.ones((2, 2), dtype=float))
+
+
+def test_cross_species_zero_distance_pair_is_counted_in_framewise_kernel(monkeypatch):
+    monkeypatch.setattr(
+        coordination_module, "_can_vectorize_coordination_kernel", lambda *_args, **_kwargs: False
+    )
+
+    frame = Atoms(
+        "OH",
+        positions=[[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+        cell=[10.0, 10.0, 10.0],
+        pbc=True,
+    )
+    profile = compute_coordination_profile(
+        [frame],
+        species_a="O",
+        species_b="H",
+        axis="z",
+        timestep_fs=1.0,
+        cutoff_resolution=CoordinationCutoffResolution(
+            cutoff_A=0.5,
+            smoothing_width_A=0.0,
+            mode="direct",
+        ),
+    )
+
+    assert profile.coordination_number[0, 0] == pytest.approx(1.0)
+
+
+def test_framewise_and_chunked_kernels_agree_for_orthorhombic_periodic_system():
+    frames = _orthorhombic_cn_frames()
+    center_indices = np.array([0, 1], dtype=int)
+    neighbor_indices = np.array([2, 3], dtype=int)
+    framewise = np.vstack(
+        [
+            coordination_module._compute_coordination_frame_values(
+                frame,
+                center_indices=center_indices,
+                neighbor_indices=neighbor_indices,
+                same_selection=False,
+                cutoff_A=0.9,
+                smoothing_width_A=0.2,
+            )
+            for frame in frames
+        ]
+    )
+    chunked = coordination_module._compute_coordination_values_chunked(
+        frames,
+        center_indices=center_indices,
+        neighbor_indices=neighbor_indices,
+        same_selection=False,
+        cutoff_A=0.9,
+        smoothing_width_A=0.2,
+    )
+
+    np.testing.assert_allclose(chunked, framewise, rtol=0.0, atol=1.0e-6)
+
+
+def test_periodic_minimum_image_is_applied_across_box_boundary():
+    frame = Atoms(
+        "OH",
+        positions=[[0.2, 0.0, 0.0], [9.8, 0.0, 0.0]],
+        cell=[10.0, 10.0, 10.0],
+        pbc=True,
+    )
+    values = coordination_module._compute_coordination_frame_values(
+        frame,
+        center_indices=np.array([0], dtype=int),
+        neighbor_indices=np.array([1], dtype=int),
+        same_selection=False,
+        cutoff_A=0.5,
+        smoothing_width_A=0.0,
+    )
+    np.testing.assert_allclose(values, np.array([1.0], dtype=float))
+
+
+def test_triclinic_periodic_frames_fall_back_to_framewise_kernel(monkeypatch):
+    monkeypatch.setattr(
+        coordination_module,
+        "_compute_coordination_values_chunked",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("chunked kernel used")),
+    )
+
+    profile = compute_coordination_profile(
+        _triclinic_cn_frames(),
+        species_a="O",
+        species_b="H",
+        axis="z",
+        timestep_fs=1.0,
+        cutoff_resolution=CoordinationCutoffResolution(
+            cutoff_A=1.0,
+            smoothing_width_A=0.0,
+            mode="direct",
+        ),
+    )
+
+    assert profile.coordination_number.shape == (2, 1)
+    assert np.all(profile.coordination_number[:, 0] > 0.0)
+
+
+def test_coordination_profile_preserves_center_column_alignment():
+    frames = [
+        Atoms(
+            "OOHH",
+            positions=[
+                [0.0, 0.0, 0.2],
+                [0.0, 0.0, 1.4],
+                [0.3, 0.0, 0.2],
+                [4.0, 0.0, 1.4],
+            ],
+            cell=[10.0, 10.0, 10.0],
+            pbc=True,
+        ),
+        Atoms(
+            "OOHH",
+            positions=[
+                [0.0, 0.0, 0.3],
+                [0.0, 0.0, 1.5],
+                [0.4, 0.0, 0.3],
+                [4.0, 0.0, 1.5],
+            ],
+            cell=[10.0, 10.0, 10.0],
+            pbc=True,
+        ),
+    ]
+
+    profile = compute_coordination_profile(
+        frames,
+        species_a="O",
+        species_b="H",
+        axis="z",
+        timestep_fs=1.0,
+        cutoff_resolution=CoordinationCutoffResolution(
+            cutoff_A=0.6,
+            smoothing_width_A=0.0,
+            mode="direct",
+        ),
+    )
+
+    np.testing.assert_array_equal(profile.atom_indices, np.array([0, 1], dtype=int))
+    assert profile.coordination_number.shape == profile.distance_to_surface.shape
+    np.testing.assert_allclose(
+        profile.distance_to_surface[:, 1] - profile.distance_to_surface[:, 0],
+        np.array([1.2, 1.2], dtype=float),
+    )
+    np.testing.assert_allclose(profile.coordination_number[:, 0], np.array([1.0, 1.0]))
+    np.testing.assert_allclose(profile.coordination_number[:, 1], np.array([0.0, 0.0]))
+
+
+def test_coordination_profile_fails_for_unstable_atom_layout():
+    frames = [
+        Atoms(
+            "OH", positions=[[0.0, 0.0, 0.0], [0.8, 0.0, 0.0]], cell=[10.0, 10.0, 10.0], pbc=True
+        ),
+        Atoms(
+            "HO", positions=[[0.8, 0.0, 0.0], [0.0, 0.0, 0.0]], cell=[10.0, 10.0, 10.0], pbc=True
+        ),
+    ]
+
+    with pytest.raises(ValueError, match="stable atom ordering|stable atom count"):
+        compute_coordination_profile(
+            frames,
+            species_a="O",
+            species_b="H",
+            axis="z",
+            timestep_fs=1.0,
+            cutoff_resolution=CoordinationCutoffResolution(
+                cutoff_A=1.0,
+                smoothing_width_A=0.0,
+                mode="direct",
+            ),
+        )
+
+
+def test_coordination_profile_fails_for_empty_center_selection():
+    frame = Atoms(
+        "OH", positions=[[0.0, 0.0, 0.0], [0.8, 0.0, 0.0]], cell=[10.0, 10.0, 10.0], pbc=True
+    )
+
+    with pytest.raises(ValueError, match="No atoms found for species 'Pt'"):
+        compute_coordination_profile(
+            [frame],
+            species_a="Pt",
+            species_b="H",
+            axis="z",
+            timestep_fs=1.0,
+            cutoff_resolution=CoordinationCutoffResolution(
+                cutoff_A=1.0,
+                smoothing_width_A=0.0,
+                mode="direct",
+            ),
+        )
+
+
+def test_coordination_profile_returns_zero_for_empty_neighbor_contributions():
+    frame = Atoms(
+        "OH",
+        positions=[[0.0, 0.0, 0.0], [5.0, 0.0, 0.0]],
+        cell=[10.0, 10.0, 10.0],
+        pbc=True,
+    )
+    profile = compute_coordination_profile(
+        [frame],
+        species_a="O",
+        species_b="H",
+        axis="z",
+        timestep_fs=1.0,
+        cutoff_resolution=CoordinationCutoffResolution(
+            cutoff_A=1.0,
+            smoothing_width_A=0.0,
+            mode="direct",
+        ),
+    )
+
+    np.testing.assert_allclose(profile.coordination_number, np.zeros((1, 1), dtype=float))
+
+
+def test_same_species_single_center_has_zero_coordination():
+    frame = Atoms("O", positions=[[0.0, 0.0, 0.0]], cell=[10.0, 10.0, 10.0], pbc=True)
+    profile = compute_coordination_profile(
+        [frame],
+        species_a="O",
+        species_b="O",
+        axis="z",
+        timestep_fs=1.0,
+        cutoff_resolution=CoordinationCutoffResolution(
+            cutoff_A=1.0,
+            smoothing_width_A=0.0,
+            mode="direct",
+        ),
+    )
+
+    np.testing.assert_allclose(profile.coordination_number, np.zeros((1, 1), dtype=float))
 
 
 def test_coordination_analysis_reports_progress_for_cutoff_and_values(monkeypatch):
@@ -186,6 +552,94 @@ def test_resolve_coordination_cutoff_defaults_to_sampled_rdf(monkeypatch):
     assert resolution.mode == "sampled_rdf"
     assert resolution.rdf_sampled_frame_index is not None
     assert resolution.cutoff_A == pytest.approx(resolution.rdf_minimum_A)
+
+
+def test_resolve_coordination_cutoff_accepts_zero_smoothing_width():
+    resolution = resolve_coordination_cutoff(
+        frames=[],
+        species_a="O",
+        species_b="H",
+        cutoff_A=2.0,
+        cutoff_rdf_path=None,
+        cutoff_from_rdf=False,
+        cutoff_smoothing_width_A=0.0,
+    )
+
+    assert resolution.cutoff_A == pytest.approx(2.0)
+    assert resolution.smoothing_width_A == pytest.approx(0.0)
+
+
+def test_resolve_cutoff_from_rdf_curve_raises_when_no_post_peak_minimum_exists():
+    with pytest.raises(ValueError, match="first RDF minimum"):
+        coordination_module._resolve_cutoff_from_rdf_curve(
+            bin_centers_A=np.array([0.25, 0.75, 1.25, 1.75], dtype=float),
+            g_r=np.array([0.2, 1.5, 1.2, 1.0], dtype=float),
+            smoothing_sigma_A=0.0,
+        )
+
+
+def test_fit_local_quadratic_minimum_falls_back_for_ill_conditioned_fit(monkeypatch):
+    monkeypatch.setattr(
+        coordination_module.np,
+        "polyfit",
+        lambda *_args, **_kwargs: np.array([0.0, 1.0, 0.0], dtype=float),
+    )
+
+    result = coordination_module._fit_local_quadratic_minimum(
+        np.array([0.0, 1.0, 2.0], dtype=float),
+        np.array([2.0, 1.0, 2.0], dtype=float),
+        center_index=1,
+    )
+
+    assert result == pytest.approx(1.0)
+
+
+def test_coordination_reference_rdf_rmax_uses_shared_safe_periodic_rule():
+    frames = [
+        Atoms(
+            "OH",
+            positions=[[0.0, 0.0, 0.0], [0.8, 0.0, 0.0]],
+            cell=[[8.0, 0.0, 0.0], [2.0, 7.5, 0.0], [1.0, 0.5, 9.0]],
+            pbc=True,
+        )
+    ]
+
+    resolved = coordination_module._resolve_reference_rdf_r_max(frames, r_max=None)
+    expected = coordination_module._auto_r_max_from_frames(frames)
+    assert resolved == pytest.approx(expected)
+
+
+def test_compute_reference_rdf_uses_nan_for_zero_expected_bins(monkeypatch):
+    bin_edges = np.array([0.0, 0.5, 1.0], dtype=float)
+    monkeypatch.setattr(
+        coordination_module,
+        "_build_reference_rdf_config",
+        lambda *args, **kwargs: (
+            bin_edges,
+            SimpleNamespace(bin_edges=bin_edges),
+        ),
+    )
+    monkeypatch.setattr(
+        coordination_module,
+        "_accumulate_reference_rdf_contributions",
+        lambda *args, **kwargs: (
+            np.array([0.0, 2.0], dtype=float),
+            np.array([0.0, 1.0], dtype=float),
+        ),
+    )
+
+    centers, g_r = coordination_module._compute_reference_rdf(
+        frames=_coordination_test_frames(),
+        species_a="O",
+        species_b="H",
+        frame_indices=np.array([0, 1], dtype=int),
+        r_max=None,
+        bin_width=0.5,
+    )
+
+    np.testing.assert_allclose(centers, np.array([0.25, 0.75], dtype=float))
+    assert np.isnan(g_r[0])
+    assert g_r[1] == pytest.approx(2.0)
 
 
 def test_resolve_coordination_cutoff_converges_in_random_batches(monkeypatch):

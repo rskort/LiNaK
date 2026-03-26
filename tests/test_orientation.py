@@ -1,10 +1,16 @@
 """Tests for ``linak.analysis.orientation``."""
 
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+import h5py
 import numpy as np
 import pytest
 from ase import Atoms
-import h5py
 
+import linak.analysis.density as density_mod
+import linak.analysis.orientation as orientation_mod
 from linak.analysis.orientation import (
     OrientationProfile,
     compute_orientation_profile,
@@ -14,32 +20,78 @@ from linak.analysis.orientation import (
 )
 
 
-# ──────────────────────── helper builders ──────────────────────────────────
-
 def _water_frame(
     positions: list[list[float]] | None = None,
     cell: list[float] | None = None,
 ) -> Atoms:
-    """Return a single-water-molecule Atoms frame."""
+    """Return a single-water-molecule frame."""
     if positions is None:
-        # O at origin, two H's in +z hemisphere ⇒ bisector points +z
         positions = [
-            [5.0, 5.0, 5.0],  # O
-            [5.8, 5.0, 5.4],  # H1
-            [4.2, 5.0, 5.4],  # H2
+            [5.0, 5.0, 5.0],
+            [5.8, 5.0, 5.4],
+            [4.2, 5.0, 5.4],
         ]
     if cell is None:
         cell = [10.0, 10.0, 10.0]
-    frame = Atoms("OHH", positions=positions, cell=cell, pbc=True)
-    return frame
+    return Atoms("OHH", positions=positions, cell=cell, pbc=True)
 
 
 def _multi_frame_trajectory(n_frames: int = 5) -> list[Atoms]:
-    """Return a short trajectory of identical water frames."""
     return [_water_frame() for _ in range(n_frames)]
 
 
-# ──────────────────────── basic compute tests ─────────────────────────────
+def _occupied_bins(profile: OrientationProfile) -> np.ndarray:
+    return np.flatnonzero(profile.count_total > 0)
+
+
+def _single_occupied_bin(profile: OrientationProfile) -> int:
+    occupied = _occupied_bins(profile)
+    assert occupied.size == 1
+    return int(occupied[0])
+
+
+def _rotation_matrix(rng: np.random.Generator) -> np.ndarray:
+    u1, u2, u3 = rng.random(3)
+    q1 = np.sqrt(1.0 - u1) * np.sin(2.0 * np.pi * u2)
+    q2 = np.sqrt(1.0 - u1) * np.cos(2.0 * np.pi * u2)
+    q3 = np.sqrt(u1) * np.sin(2.0 * np.pi * u3)
+    q4 = np.sqrt(u1) * np.cos(2.0 * np.pi * u3)
+    return np.asarray(
+        [
+            [1.0 - 2.0 * (q2 * q2 + q3 * q3), 2.0 * (q1 * q2 - q3 * q4), 2.0 * (q1 * q3 + q2 * q4)],
+            [2.0 * (q1 * q2 + q3 * q4), 1.0 - 2.0 * (q1 * q1 + q3 * q3), 2.0 * (q2 * q3 - q1 * q4)],
+            [2.0 * (q1 * q3 - q2 * q4), 2.0 * (q2 * q3 + q1 * q4), 1.0 - 2.0 * (q1 * q1 + q2 * q2)],
+        ],
+        dtype=float,
+    )
+
+
+def _random_water_frames(n_frames: int, *, seed: int = 0) -> list[Atoms]:
+    rng = np.random.default_rng(seed)
+    base_vectors = np.asarray(
+        [
+            [0.8, 0.0, 0.4],
+            [-0.8, 0.0, 0.4],
+        ],
+        dtype=float,
+    )
+    origin = np.asarray([15.0, 15.0, 15.0], dtype=float)
+    frames: list[Atoms] = []
+    for _ in range(n_frames):
+        rotation = _rotation_matrix(rng)
+        rotated = base_vectors @ rotation.T
+        positions = np.vstack([origin, origin + rotated[0], origin + rotated[1]])
+        frames.append(Atoms("OHH", positions=positions, cell=[30.0, 30.0, 30.0], pbc=True))
+    return frames
+
+
+def _mock_surface_estimate(per_frame: np.ndarray) -> SimpleNamespace:
+    return SimpleNamespace(
+        position=float(np.median(per_frame)),
+        std=float(np.std(per_frame, ddof=0)),
+        per_frame=np.asarray(per_frame, dtype=float),
+    )
+
 
 def test_compute_orientation_basic():
     frames = _multi_frame_trajectory(3)
@@ -51,8 +103,9 @@ def test_compute_orientation_basic():
     assert profile.n_frames == 3
     assert profile.n_molecules_per_frame == 1
     assert len(profile.bin_centers) == len(profile.cos_polar_mean)
-    assert len(profile.cos_polar_mean) == len(profile.cos_azimuthal_mean)
-    assert len(profile.density) == len(profile.cos_polar_mean)
+    assert len(profile.count_total) == len(profile.bin_centers)
+    assert len(profile.count_polar_valid) == len(profile.bin_centers)
+    assert len(profile.count_azimuthal_valid) == len(profile.bin_centers)
     assert profile.heatmap_polar.shape[0] == len(profile.bin_centers)
     assert profile.heatmap_azimuthal.shape[0] == len(profile.bin_centers)
 
@@ -62,50 +115,137 @@ def test_compute_orientation_empty_raises():
         compute_orientation_profile(frames=[], axis="z")
 
 
-def test_compute_orientation_no_water():
-    """Frame with no H₂O should produce flat-zero profiles."""
+def test_compute_orientation_no_water_returns_nan_means():
     frame = Atoms("Au4", positions=[[0, 0, i] for i in range(4)], cell=[10, 10, 10], pbc=True)
     profile = compute_orientation_profile(frames=[frame, frame], axis="z", bin_width=1.0)
+
     assert profile.n_molecules_per_frame == 0
-    np.testing.assert_array_equal(profile.cos_polar_mean, 0.0)
-    np.testing.assert_array_equal(profile.cos_azimuthal_mean, 0.0)
+    np.testing.assert_array_equal(profile.count_total, 0)
+    np.testing.assert_array_equal(profile.count_polar_valid, 0)
+    np.testing.assert_array_equal(profile.count_azimuthal_valid, 0)
+    assert np.all(np.isnan(profile.cos_polar_mean))
+    assert np.all(np.isnan(profile.cos_azimuthal_mean))
+    np.testing.assert_array_equal(profile.heatmap_polar, 0.0)
+    np.testing.assert_array_equal(profile.heatmap_azimuthal, 0.0)
 
 
 def test_compute_orientation_bisector_up():
-    """H atoms above O ⇒ bisector pointing +z ⇒ cos(polar) > 0."""
     positions = [
-        [5.0, 5.0, 3.0],  # O
-        [5.6, 5.0, 3.7],  # H1
-        [4.4, 5.0, 3.7],  # H2
+        [5.0, 5.0, 3.0],
+        [5.6, 5.0, 3.7],
+        [4.4, 5.0, 3.7],
     ]
     frames = [_water_frame(positions) for _ in range(5)]
     profile = compute_orientation_profile(
-        frames=frames, axis="z", reference_axis="z", bin_width=2.0,
+        frames=frames, axis="z", reference_axis="z", bin_width=2.0
     )
-    # Distance bin containing ~3.0 Å should show positive cos(polar)
-    occupied = profile.cos_polar_mean != 0
-    assert np.any(occupied)
-    assert np.all(profile.cos_polar_mean[occupied] > 0)
+
+    occupied = _occupied_bins(profile)
+    assert occupied.size == 1
+    assert profile.cos_polar_mean[occupied[0]] > 0.0
 
 
 def test_compute_orientation_bisector_down():
-    """H atoms below O ⇒ bisector pointing −z ⇒ cos(polar) < 0."""
     positions = [
-        [5.0, 5.0, 5.0],  # O
-        [5.6, 5.0, 4.3],  # H1
-        [4.4, 5.0, 4.3],  # H2
+        [5.0, 5.0, 5.0],
+        [5.6, 5.0, 4.3],
+        [4.4, 5.0, 4.3],
     ]
     frames = [_water_frame(positions) for _ in range(5)]
     profile = compute_orientation_profile(
-        frames=frames, axis="z", reference_axis="z", bin_width=2.0,
+        frames=frames, axis="z", reference_axis="z", bin_width=2.0
     )
-    occupied = profile.cos_polar_mean != 0
-    assert np.any(occupied)
-    assert np.all(profile.cos_polar_mean[occupied] < 0)
+
+    occupied = _occupied_bins(profile)
+    assert occupied.size == 1
+    assert profile.cos_polar_mean[occupied[0]] < 0.0
+
+
+def test_compute_orientation_exact_polar_and_azimuthal():
+    positions = [
+        [5.0, 5.0, 5.0],
+        [5.0, 5.7, 5.7],
+        [5.0, 4.3, 5.7],
+    ]
+    profile = compute_orientation_profile(
+        frames=[_water_frame(positions)],
+        axis="z",
+        reference_axis="z",
+        bin_width=2.0,
+    )
+
+    occupied = _single_occupied_bin(profile)
+    assert profile.count_total[occupied] == 1
+    assert profile.count_polar_valid[occupied] == 1
+    assert profile.count_azimuthal_valid[occupied] == 1
+    assert profile.cos_polar_mean[occupied] == pytest.approx(1.0)
+    assert profile.cos_azimuthal_mean[occupied] == pytest.approx(1.0)
+
+
+def test_compute_orientation_projected_normal_degeneracy_skips_only_azimuthal():
+    positions = [
+        [5.0, 5.0, 5.0],
+        [6.0, 5.0, 5.0],
+        [5.0, 6.0, 5.0],
+    ]
+    profile = compute_orientation_profile(
+        frames=[_water_frame(positions)],
+        axis="z",
+        reference_axis="z",
+        bin_width=2.0,
+    )
+
+    occupied = _single_occupied_bin(profile)
+    assert profile.count_total[occupied] == 1
+    assert profile.count_polar_valid[occupied] == 1
+    assert profile.count_azimuthal_valid[occupied] == 0
+    assert np.isfinite(profile.cos_polar_mean[occupied])
+    assert np.isnan(profile.cos_azimuthal_mean[occupied])
+    assert np.sum(profile.heatmap_polar[occupied]) == pytest.approx(1.0)
+    assert np.sum(profile.heatmap_azimuthal[occupied]) == pytest.approx(0.0)
+
+
+def test_compute_orientation_bisector_degeneracy_marks_sample_invalid():
+    positions = [
+        [5.0, 5.0, 5.0],
+        [6.0, 5.0, 5.0],
+        [4.0, 5.0, 5.0],
+    ]
+    profile = compute_orientation_profile(
+        frames=[_water_frame(positions)],
+        axis="z",
+        reference_axis="z",
+        bin_width=2.0,
+    )
+
+    occupied = _single_occupied_bin(profile)
+    assert profile.count_total[occupied] == 1
+    assert profile.count_polar_valid[occupied] == 0
+    assert profile.count_azimuthal_valid[occupied] == 0
+    assert np.isnan(profile.cos_polar_mean[occupied])
+    assert np.isnan(profile.cos_azimuthal_mean[occupied])
+
+
+def test_compute_orientation_tiny_oh_length_is_invalid():
+    positions = [
+        [5.0, 5.0, 5.0],
+        [5.0, 5.0, 5.0],
+        [5.0, 5.0, 5.96],
+    ]
+    profile = compute_orientation_profile(
+        frames=[_water_frame(positions)],
+        axis="z",
+        reference_axis="z",
+        bin_width=2.0,
+    )
+
+    occupied = _single_occupied_bin(profile)
+    assert profile.count_total[occupied] == 1
+    assert profile.count_polar_valid[occupied] == 0
+    assert profile.count_azimuthal_valid[occupied] == 0
 
 
 def test_compute_orientation_different_axes():
-    """Compute should work for x and y axes too."""
     frames = _multi_frame_trajectory(2)
     for axis in ("x", "y"):
         profile = compute_orientation_profile(frames=frames, axis=axis, bin_width=2.0)
@@ -114,18 +254,94 @@ def test_compute_orientation_different_axes():
 
 
 def test_compute_orientation_angle_bins():
-    """The angle_bin_count controls heatmap columns."""
     frames = _multi_frame_trajectory(2)
     for n_bins in (10, 30):
         profile = compute_orientation_profile(
-            frames=frames, axis="z", bin_width=2.0, angle_bin_count=n_bins,
+            frames=frames, axis="z", bin_width=2.0, angle_bin_count=n_bins
         )
         assert profile.heatmap_polar.shape[1] == n_bins
         assert profile.heatmap_azimuthal.shape[1] == n_bins
         assert len(profile.heatmap_angle_bin_centers) == n_bins
 
 
-# ──────────────────────── save / load round-trip ──────────────────────────
+def test_heatmap_boundary_values_land_in_first_and_last_bins():
+    up_positions = [
+        [5.0, 5.0, 5.0],
+        [5.7, 5.0, 5.7],
+        [4.3, 5.0, 5.7],
+    ]
+    down_positions = [
+        [5.0, 5.0, 5.0],
+        [5.7, 5.0, 4.3],
+        [4.3, 5.0, 4.3],
+    ]
+    frames = [_water_frame(up_positions), _water_frame(down_positions)]
+    profile = compute_orientation_profile(
+        frames=frames,
+        axis="z",
+        reference_axis="z",
+        bin_width=2.0,
+        angle_bin_count=4,
+    )
+
+    occupied = _single_occupied_bin(profile)
+    row = profile.heatmap_polar[occupied]
+    assert row[0] == pytest.approx(1.0)
+    assert row[-1] == pytest.approx(1.0)
+    assert np.sum(row) == pytest.approx(2.0)
+
+
+def test_variable_cell_density_uses_framewise_slab_volume():
+    frames = [
+        _water_frame(cell=[10.0, 10.0, 10.0]),
+        _water_frame(cell=[20.0, 20.0, 10.0]),
+    ]
+    profile = compute_orientation_profile(frames=frames, axis="z", bin_width=1.0)
+
+    occupied = _single_occupied_bin(profile)
+    expected_density = 0.5 * ((1.0 / 100.0) + (1.0 / 400.0))
+    assert profile.density[occupied] == pytest.approx(expected_density)
+
+
+def test_surface_shifted_distance_mode_uses_framewise_offsets_and_cell_bounds(monkeypatch):
+    positions = [
+        [5.0, 5.0, 6.0],
+        [5.6, 5.0, 6.7],
+        [4.4, 5.0, 6.7],
+    ]
+    frames = [_water_frame(positions), _water_frame(positions)]
+    fake_estimate = _mock_surface_estimate(np.array([2.0, 8.0], dtype=float))
+
+    monkeypatch.setattr(
+        density_mod, "_select_surface_estimate", lambda *args, **kwargs: (fake_estimate, "mock")
+    )
+    monkeypatch.setattr(
+        orientation_mod, "_surface_estimate_supports_distance_mode", lambda *args, **kwargs: True
+    )
+
+    profile = compute_orientation_profile(
+        frames=frames, axis="z", reference_axis="z", bin_width=2.0, binning="cell"
+    )
+
+    assert profile.coordinate_mode == "distance"
+    assert profile.bin_edges[0] <= -8.0
+    assert profile.bin_edges[-1] >= 8.0
+    assert np.sum(profile.count_total) == 2
+    occupied_centers = profile.bin_centers[_occupied_bins(profile)]
+    assert np.any(occupied_centers < 0.0)
+    assert np.any(occupied_centers > 0.0)
+
+
+def test_isotropic_random_ensemble_has_small_mean_bias():
+    frames = _random_water_frames(200, seed=123)
+    profile = compute_orientation_profile(
+        frames=frames, axis="z", reference_axis="z", bin_width=2.0
+    )
+
+    occupied = _single_occupied_bin(profile)
+    assert abs(profile.cos_polar_mean[occupied]) < 0.15
+    assert abs(profile.cos_azimuthal_mean[occupied]) < 0.15
+
 
 def test_save_load_round_trip(tmp_path):
     frames = _multi_frame_trajectory(3)
@@ -145,10 +361,17 @@ def test_save_load_round_trip(tmp_path):
     assert loaded.n_frames == profile.n_frames
     assert loaded.n_molecules_per_frame == profile.n_molecules_per_frame
     np.testing.assert_allclose(loaded.bin_centers, profile.bin_centers)
-    np.testing.assert_allclose(loaded.cos_polar_mean, profile.cos_polar_mean)
-    np.testing.assert_allclose(loaded.cos_azimuthal_mean, profile.cos_azimuthal_mean)
-    np.testing.assert_allclose(loaded.cos_polar_density, profile.cos_polar_density)
-    np.testing.assert_allclose(loaded.cos_azimuthal_density, profile.cos_azimuthal_density)
+    np.testing.assert_allclose(loaded.cos_polar_mean, profile.cos_polar_mean, equal_nan=True)
+    np.testing.assert_allclose(
+        loaded.cos_azimuthal_mean, profile.cos_azimuthal_mean, equal_nan=True
+    )
+    np.testing.assert_array_equal(loaded.count_total, profile.count_total)
+    np.testing.assert_array_equal(loaded.count_polar_valid, profile.count_polar_valid)
+    np.testing.assert_array_equal(loaded.count_azimuthal_valid, profile.count_azimuthal_valid)
+    np.testing.assert_allclose(loaded.cos_polar_density, profile.cos_polar_density, equal_nan=True)
+    np.testing.assert_allclose(
+        loaded.cos_azimuthal_density, profile.cos_azimuthal_density, equal_nan=True
+    )
     np.testing.assert_allclose(loaded.density, profile.density)
     np.testing.assert_allclose(loaded.heatmap_polar, profile.heatmap_polar)
     np.testing.assert_allclose(loaded.heatmap_azimuthal, profile.heatmap_azimuthal)
@@ -166,24 +389,49 @@ def test_load_orientation_profiles_list(tmp_path):
     assert isinstance(profiles[0], OrientationProfile)
 
 
+def test_load_orientation_profile_without_count_datasets(tmp_path):
+    profile = compute_orientation_profile(
+        frames=_multi_frame_trajectory(2), axis="z", bin_width=1.0
+    )
+    out = tmp_path / "orientation_legacy_counts.h5"
+    save_orientation_profile(profile, out)
+
+    with h5py.File(out, "a") as handle:
+        dataset_paths: list[str] = []
+        handle.visititems(
+            lambda name, obj: dataset_paths.append(name) if isinstance(obj, h5py.Dataset) else None
+        )
+        for suffix in ("count_total", "count_polar_valid", "count_azimuthal_valid"):
+            target = next(path for path in dataset_paths if path.endswith(suffix))
+            del handle[target]
+
+    loaded = load_orientation_profile(out)
+    np.testing.assert_array_equal(
+        loaded.count_total, np.sum(loaded.heatmap_polar, axis=1).astype(int)
+    )
+    np.testing.assert_array_equal(
+        loaded.count_polar_valid, np.sum(loaded.heatmap_polar, axis=1).astype(int)
+    )
+    np.testing.assert_array_equal(
+        loaded.count_azimuthal_valid, np.sum(loaded.heatmap_azimuthal, axis=1).astype(int)
+    )
+
+
 def test_save_with_additional_metadata(tmp_path):
     frames = _multi_frame_trajectory(2)
     profile = compute_orientation_profile(frames=frames, axis="z", bin_width=1.0)
     out = tmp_path / "orientation_meta.h5"
-    save_orientation_profile(
-        profile, out, additional_metadata={"source_path": "/test/traj.xyz"}
-    )
+    save_orientation_profile(profile, out, additional_metadata={"source_path": "/test/traj.xyz"})
     with h5py.File(out, "r") as handle:
         assert handle.attrs["analysis"] == "orientation"
 
 
-# ──────────────────────── plot smoke tests ────────────────────────────────
-
 def test_plot_orientation_profile_average(tmp_path):
     from linak.analysis.orientation import plot_orientation_profile
 
-    frames = _multi_frame_trajectory(2)
-    profile = compute_orientation_profile(frames=frames, axis="z", bin_width=2.0)
+    profile = compute_orientation_profile(
+        frames=_multi_frame_trajectory(2), axis="z", bin_width=2.0
+    )
     out = tmp_path / "orient_avg.png"
     result = plot_orientation_profile(
         profile,
@@ -199,8 +447,9 @@ def test_plot_orientation_profile_average(tmp_path):
 def test_plot_orientation_profile_density_weighted(tmp_path):
     from linak.analysis.orientation import plot_orientation_profile
 
-    frames = _multi_frame_trajectory(2)
-    profile = compute_orientation_profile(frames=frames, axis="z", bin_width=2.0)
+    profile = compute_orientation_profile(
+        frames=_multi_frame_trajectory(2), axis="z", bin_width=2.0
+    )
     out = tmp_path / "orient_dens.png"
     result = plot_orientation_profile(
         profile,
@@ -215,8 +464,9 @@ def test_plot_orientation_profile_density_weighted(tmp_path):
 def test_plot_orientation_profile_heatmap(tmp_path):
     from linak.analysis.orientation import plot_orientation_profile
 
-    frames = _multi_frame_trajectory(2)
-    profile = compute_orientation_profile(frames=frames, axis="z", bin_width=2.0)
+    profile = compute_orientation_profile(
+        frames=_multi_frame_trajectory(2), axis="z", bin_width=2.0
+    )
     out = tmp_path / "orient_heat.png"
     result = plot_orientation_profile(
         profile,
@@ -226,40 +476,4 @@ def test_plot_orientation_profile_heatmap(tmp_path):
         angle="polar",
     )
     assert result is not None
-
-
-def test_plot_heatmap_with_vmin_vmax_cmap(tmp_path):
-    from linak.analysis.orientation import plot_orientation_profile
-
-    frames = _multi_frame_trajectory(2)
-    profile = compute_orientation_profile(frames=frames, axis="z", bin_width=2.0)
-    out = tmp_path / "orient_heat_custom.png"
-    result = plot_orientation_profile(
-        profile,
-        output=str(out),
-        show=False,
-        component="heatmap",
-        angle="polar",
-        heatmap_vmin=0.0,
-        heatmap_vmax=0.5,
-        heatmap_cmap="plasma",
-    )
-    assert result is not None
     assert out.exists()
-
-
-def test_plot_orientation_profiles_multi(tmp_path):
-    from linak.analysis.orientation import plot_orientation_profiles
-
-    frames = _multi_frame_trajectory(2)
-    p1 = compute_orientation_profile(frames=frames, axis="z", bin_width=2.0)
-    p2 = compute_orientation_profile(frames=frames, axis="z", bin_width=2.0)
-    out = tmp_path / "orient_multi.png"
-    result = plot_orientation_profiles(
-        [p1, p2],
-        output=str(out),
-        show=False,
-        component="average",
-        angle="polar",
-    )
-    assert result is not None

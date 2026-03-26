@@ -131,7 +131,6 @@ def extract_cell_from_cp2k_input(path: str | Path) -> tuple[float, float, float]
 
     cell: tuple[float, float, float] | None = None
     angles: tuple[float, float, float] | None = None
-    abc_line_number: int | None = None
     angle_line_number: int | None = None
     with input_path.open("r", encoding="utf-8") as handle:
         for line_number, line in enumerate(handle, start=1):
@@ -145,7 +144,6 @@ def extract_cell_from_cp2k_input(path: str | Path) -> tuple[float, float, float]
                     float(abc_match.group(2)),
                     float(abc_match.group(3)),
                 )
-                abc_line_number = line_number
                 continue
 
             angle_match = _ALPHA_BETA_GAMMA_PATTERN.match(no_comment)

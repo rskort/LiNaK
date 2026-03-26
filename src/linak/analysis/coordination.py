@@ -38,8 +38,17 @@ from .position import (
     _build_xy_segments,
     compute_position_profile,
 )
+from .density import (
+    _surface_estimate_datasets,
+    _surface_estimate_from_payload,
+    _surface_metadata_payload,
+    _surface_metadata_view,
+    SurfaceEstimate,
+    SurfaceEstimatorOptions,
+)
 from .rdf import (
     _RDFWorkerConfig,
+    _auto_r_max_from_frames,
     _build_uniform_rdf_bins,
     _compute_rdf_chunk_contributions,
     _compute_rdf_frame_contribution,
@@ -60,7 +69,7 @@ _DEFAULT_RDF_CONVERGENCE_BATCH_SIZE = 250
 _DEFAULT_RDF_CONVERGENCE_MIN_FRAMES = 1_000
 _DEFAULT_RDF_CONVERGENCE_MAX_FRAMES = 5_000
 _DEFAULT_RDF_CONVERGENCE_WINDOW = 3
-_DEFAULT_RDF_CONVERGENCE_TOLERANCE_A = 1.0e-3
+_DEFAULT_RDF_CONVERGENCE_TOLERANCE_A = 2.5e-3
 _MIN_FIT_POINTS = 3
 _FIT_HALF_WINDOW_POINTS = 3
 _COORD_VECTORIZE_PAIR_THRESHOLD = 50_000
@@ -104,6 +113,7 @@ class CoordinationProfile:
     surface_position: float | None = None
     surface_position_std: float | None = None
     surface_position_per_frame: np.ndarray | None = None
+    surface_estimate: SurfaceEstimate | None = None
     cell_lengths_angstrom: tuple[float, float, float] | None = None
     cutoff_A: float | None = None
     cutoff_smoothing_width_A: float | None = None
@@ -170,6 +180,13 @@ def _optional_finite_float(value: Any) -> float | None:
     return parsed
 
 
+def _ensure_nonnegative(name: str, value: float) -> float:
+    parsed = float(value)
+    if not np.isfinite(parsed) or parsed < 0.0:
+        raise ValueError(f"{name} must be >= 0.")
+    return parsed
+
+
 def _optional_cell_lengths(value: Any) -> tuple[float, float, float] | None:
     if value is None:
         return None
@@ -204,6 +221,8 @@ def _gaussian_kernel(*, sigma_bins: float) -> np.ndarray:
 def _gaussian_smooth(values: np.ndarray, *, sigma_bins: float) -> np.ndarray:
     if values.size <= 2:
         return np.asarray(values, dtype=float)
+    if float(sigma_bins) <= 1.0e-12:
+        return np.asarray(values, dtype=float)
     kernel = _gaussian_kernel(sigma_bins=sigma_bins)
     padded = np.pad(np.asarray(values, dtype=float), (kernel.size // 2,), mode="edge")
     return np.convolve(padded, kernel, mode="valid")
@@ -223,7 +242,7 @@ def _find_first_peak_index(x: np.ndarray, y: np.ndarray) -> int:
     return positive_candidates[0] if positive_candidates else candidates[0]
 
 
-def _find_first_minimum_index(y: np.ndarray, *, start_index: int) -> int:
+def _find_first_minimum_index(y: np.ndarray, *, start_index: int) -> int | None:
     if y.size < 3:
         raise ValueError("Need at least three RDF points to resolve a minimum.")
     candidates = [
@@ -233,9 +252,38 @@ def _find_first_minimum_index(y: np.ndarray, *, start_index: int) -> int:
     ]
     if candidates:
         return candidates[0]
-    if start_index + 1 >= y.size:
-        return y.size - 1
-    return int(start_index + 1 + np.argmin(y[start_index + 1 :]))
+    if start_index + 1 >= y.size - 1:
+        return None
+    discrete_minimum = int(start_index + 1 + np.argmin(y[start_index + 1 :]))
+    if discrete_minimum >= y.size - 1:
+        return None
+    return discrete_minimum
+
+
+def _validate_resolved_cutoff(
+    *,
+    x: np.ndarray,
+    smoothed: np.ndarray,
+    peak_index: int,
+    minimum_index: int | None,
+    cutoff_A: float,
+) -> None:
+    if peak_index < 0 or peak_index >= x.size - 1:
+        raise ValueError("Unable to resolve a valid first RDF peak before the cutoff region.")
+    if minimum_index is None:
+        raise ValueError("Unable to resolve a valid first RDF minimum after the first peak.")
+    if minimum_index <= peak_index:
+        raise ValueError("Resolved RDF minimum does not lie after the first peak.")
+    if not np.isfinite(cutoff_A) or cutoff_A <= 0.0:
+        raise ValueError("Resolved coordination cutoff must be finite and positive.")
+    lower = float(np.min(x))
+    upper = float(np.max(x))
+    if cutoff_A < lower or cutoff_A > upper:
+        raise ValueError("Resolved coordination cutoff lies outside the RDF range.")
+    if cutoff_A <= float(x[peak_index]):
+        raise ValueError("Resolved coordination cutoff must lie after the first RDF peak.")
+    if not np.all(np.isfinite(smoothed)):
+        raise ValueError("Smoothed RDF contains non-finite values in the cutoff-resolution window.")
 
 
 def _fit_local_quadratic_minimum(
@@ -301,10 +349,10 @@ def _resolve_converged_sampled_rdf(
     counts_accum = np.zeros(bin_edges.size - 1, dtype=float)
     expected_accum = np.zeros_like(counts_accum)
     final_bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
-    final_g_r = np.zeros_like(counts_accum)
+    final_g_r = np.full_like(counts_accum, np.nan, dtype=float)
     final_smoothed = np.empty(0, dtype=float)
-    final_peak_A = 0.0
-    final_minimum_A = 0.0
+    final_peak_A: float | None = None
+    final_minimum_A: float | None = None
     max_batch_frames = min(int(batch_size), max_sampled_frames)
     worker_count = _resolve_rdf_worker_count(None, max_batch_frames)
     use_parallel = _should_parallelize_rdf(max_batch_frames, worker_count)
@@ -331,13 +379,22 @@ def _resolve_converged_sampled_rdf(
             selected_index_batches.append(next_batch.astype(int))
             sampled_frame_count += int(next_batch.size)
             non_zero = expected_accum > 0.0
-            final_g_r = np.zeros_like(counts_accum)
+            final_g_r = np.full_like(counts_accum, np.nan, dtype=float)
             final_g_r[non_zero] = counts_accum[non_zero] / expected_accum[non_zero]
-            final_smoothed, final_peak_A, final_minimum_A = _resolve_cutoff_from_rdf_curve(
-                bin_centers_A=final_bin_centers,
-                g_r=final_g_r,
-                smoothing_sigma_A=float(_DEFAULT_RDF_SMOOTHING_SIGMA_A),
-            )
+            try:
+                final_smoothed, final_peak_A, final_minimum_A = _resolve_cutoff_from_rdf_curve(
+                    bin_centers_A=final_bin_centers,
+                    g_r=final_g_r,
+                    smoothing_sigma_A=float(_DEFAULT_RDF_SMOOTHING_SIGMA_A),
+                )
+            except ValueError as exc:
+                LOGGER.info(
+                    "Coordination cutoff RDF step %d: sampled=%d frame(s), cutoff unresolved (%s).",
+                    step_index,
+                    sampled_frame_count,
+                    exc,
+                )
+                continue
             delta_A = (
                 None
                 if previous_cutoff_A is None
@@ -374,6 +431,11 @@ def _resolve_converged_sampled_rdf(
                     float(final_minimum_A),
                 )
 
+    if final_peak_A is None or final_minimum_A is None:
+        raise ValueError(
+            "Unable to resolve a coordination cutoff from the sampled RDF; no valid first peak/minimum pair was found."
+        )
+
     LOGGER.info(
         "Coordination cutoff RDF did not converge within %.6g A after sampling %d frame(s); using the final sampled cutoff.",
         float(tolerance_A),
@@ -397,14 +459,7 @@ def _resolve_reference_rdf_r_max(
     if r_max is not None:
         ensure_positive("r_max", r_max)
         return float(r_max)
-    min_cell_lengths = []
-    for frame in frames:
-        cell = np.asarray(frame.cell.array, dtype=float)
-        if cell.shape != (3, 3):
-            raise ValueError("RDF cutoff detection requires valid periodic cell vectors.")
-        cell_lengths = np.linalg.norm(cell, axis=1)
-        min_cell_lengths.append(float(np.min(cell_lengths)))
-    resolved_r_max = 0.5 * min(min_cell_lengths)
+    resolved_r_max = _auto_r_max_from_frames(frames)
     ensure_positive("r_max", resolved_r_max)
     return float(resolved_r_max)
 
@@ -551,7 +606,7 @@ def _compute_reference_rdf(
             progress=progress,
         )
 
-    g_r = np.zeros_like(counts_accum)
+    g_r = np.full_like(counts_accum, np.nan, dtype=float)
     non_zero = expected_accum > 0.0
     g_r[non_zero] = counts_accum[non_zero] / expected_accum[non_zero]
     bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
@@ -566,23 +621,39 @@ def _resolve_cutoff_from_rdf_curve(
 ) -> tuple[np.ndarray, float, float]:
     if bin_centers_A.size != g_r.size:
         raise ValueError("RDF bin centers and g(r) arrays must have matching sizes.")
-    if bin_centers_A.size < 3:
-        raise ValueError("Need at least three RDF bins to resolve a coordination cutoff.")
+    finite_mask = np.isfinite(bin_centers_A) & np.isfinite(g_r)
+    finite_bin_centers = np.asarray(bin_centers_A[finite_mask], dtype=float)
+    finite_g_r = np.asarray(g_r[finite_mask], dtype=float)
+    if finite_bin_centers.size < 3:
+        raise ValueError("Need at least three finite RDF bins to resolve a coordination cutoff.")
 
-    diffs = np.diff(bin_centers_A)
+    diffs = np.diff(finite_bin_centers)
     if diffs.size == 0:
         raise ValueError("Need at least two RDF bins to resolve smoothing width.")
+    if np.any(~np.isfinite(diffs)) or np.any(diffs <= 0.0):
+        raise ValueError("RDF bin centers must be strictly increasing in the valid cutoff region.")
     mean_bin_width = float(np.mean(diffs))
-    sigma_bins = max(float(smoothing_sigma_A) / max(mean_bin_width, 1.0e-12), 1.0)
-    smoothed = _gaussian_smooth(np.asarray(g_r, dtype=float), sigma_bins=sigma_bins)
-    peak_index = _find_first_peak_index(bin_centers_A, smoothed)
+    sigma_bins = float(smoothing_sigma_A) / max(mean_bin_width, 1.0e-12)
+    smoothed = _gaussian_smooth(finite_g_r, sigma_bins=sigma_bins)
+    peak_index = _find_first_peak_index(finite_bin_centers, smoothed)
     minimum_index = _find_first_minimum_index(smoothed, start_index=peak_index)
+    if minimum_index is None:
+        raise ValueError("Unable to resolve a valid first RDF minimum after the first peak.")
     cutoff_A = _fit_local_quadratic_minimum(
-        np.asarray(bin_centers_A, dtype=float),
+        finite_bin_centers,
         np.asarray(smoothed, dtype=float),
         center_index=minimum_index,
     )
-    return np.asarray(smoothed, dtype=float), float(bin_centers_A[peak_index]), cutoff_A
+    _validate_resolved_cutoff(
+        x=finite_bin_centers,
+        smoothed=np.asarray(smoothed, dtype=float),
+        peak_index=peak_index,
+        minimum_index=minimum_index,
+        cutoff_A=cutoff_A,
+    )
+    full_smoothed = np.full(g_r.shape, np.nan, dtype=float)
+    full_smoothed[finite_mask] = smoothed
+    return full_smoothed, float(finite_bin_centers[peak_index]), cutoff_A
 
 
 def _save_cutoff_diagnostic_plot(
@@ -656,7 +727,9 @@ def resolve_coordination_cutoff(
     cutoff_smoothing_width_A: float = _DEFAULT_CUTOFF_SMOOTHING_WIDTH_A,
     diagnostic_plot_output: str | Path | None = None,
 ) -> CoordinationCutoffResolution:
-    ensure_positive("cutoff_smoothing_width_A", cutoff_smoothing_width_A)
+    cutoff_smoothing_width_A = _ensure_nonnegative(
+        "cutoff_smoothing_width_A", cutoff_smoothing_width_A
+    )
 
     label_a = _normalize_species(species_a)
     label_b = _normalize_species(species_b if species_b is not None else species_a)
@@ -752,12 +825,22 @@ def _continuous_coordination_weights(
     cutoff_A: float,
     smoothing_width_A: float,
 ) -> np.ndarray:
+    """Return cosine-taper coordination weights for pair distances.
+
+    With ``Delta = smoothing_width_A`` the weight is:
+    - ``1`` for ``r <= cutoff_A - Delta/2``
+    - ``0.5 * (1 + cos(pi * (r - (cutoff_A - Delta/2)) / Delta))`` inside the
+      transition interval
+    - ``0`` for ``r >= cutoff_A + Delta/2``
+
+    ``Delta <= eps`` is treated as the hard-cutoff limit.
+    """
     distances = np.asarray(distances, dtype=float)
     weights = np.zeros(distances.shape, dtype=float)
     half_width = 0.5 * float(smoothing_width_A)
     lower = float(cutoff_A) - half_width
     upper = float(cutoff_A) + half_width
-    if half_width <= 0.0:
+    if half_width <= 1.0e-12:
         weights[distances <= float(cutoff_A)] = 1.0
         return weights
 
@@ -807,6 +890,10 @@ def _compute_coordination_frame_values(
     n_centers = int(center_indices.size)
     if n_centers == 0:
         raise ValueError("Coordination calculation requires at least one center atom.")
+    if same_selection and not np.array_equal(center_indices, neighbor_indices):
+        raise ValueError(
+            "Same-species coordination requires identical center and neighbor index ordering."
+        )
     support_cutoff = float(cutoff_A) + 0.5 * float(smoothing_width_A)
     if support_cutoff <= 0.0:
         raise ValueError("Coordination support cutoff must be positive.")
@@ -826,7 +913,7 @@ def _compute_coordination_frame_values(
             frame,
             float(np.nextafter(support_cutoff, np.inf)),
         )
-        mask = center_mask[i_pairs] & neighbor_mask[j_pairs] & (pair_distances > 0.0)
+        mask = center_mask[i_pairs] & neighbor_mask[j_pairs]
         if same_selection:
             mask &= i_pairs != j_pairs
         if np.any(mask):
@@ -890,7 +977,38 @@ def _can_vectorize_coordination_kernel(
     if not frames:
         return False
     usable_pbc = [_frame_has_usable_cell(frame) for frame in frames]
-    return all(usable_pbc) or not any(usable_pbc)
+    if all(usable_pbc):
+        return all(_frame_has_axis_aligned_orthorhombic_cell(frame) for frame in frames)
+    return not any(usable_pbc)
+
+
+def _frame_has_axis_aligned_orthorhombic_cell(frame: Atoms) -> bool:
+    if not _frame_has_usable_cell(frame):
+        return False
+    cell = np.asarray(frame.cell.array, dtype=float)
+    diagonal = np.diag(np.diag(cell))
+    if not np.allclose(cell, diagonal, rtol=0.0, atol=1.0e-12):
+        return False
+    return bool(np.all(np.diag(diagonal) > 0.0))
+
+
+def _validate_coordination_matrix(
+    values: np.ndarray,
+    *,
+    frame_count: int,
+    center_count: int,
+) -> np.ndarray:
+    matrix = np.asarray(values, dtype=float)
+    if matrix.shape != (frame_count, center_count):
+        raise ValueError(
+            "Coordination matrix shape mismatch: "
+            f"expected {(frame_count, center_count)}, got {matrix.shape}."
+        )
+    if not np.all(np.isfinite(matrix)):
+        raise ValueError("Coordination matrix contains non-finite values.")
+    if np.any(matrix < 0.0):
+        raise ValueError("Coordination matrix contains negative values.")
+    return matrix
 
 
 def _compute_coordination_values_chunked(
@@ -908,6 +1026,10 @@ def _compute_coordination_values_chunked(
     pair_count = max(0, center_count * neighbor_count - (center_count if same_selection else 0))
     chunk_size = _resolve_coordination_chunk_size(frame_count=frame_count, pair_count=pair_count)
     use_mic = bool(frames) and all(_frame_has_usable_cell(frame) for frame in frames)
+    if same_selection and not np.array_equal(center_indices, neighbor_indices):
+        raise ValueError(
+            "Same-species coordination requires identical center and neighbor index ordering."
+        )
 
     coordination = np.zeros((frame_count, center_count), dtype=np.float32)
     with ProgressBar(
@@ -934,7 +1056,10 @@ def _compute_coordination_values_chunked(
             deltas = center_positions[:, :, np.newaxis, :] - neighbor_positions[:, np.newaxis, :, :]
             if use_mic:
                 cell_lengths = np.stack(
-                    [np.asarray(frame.cell.lengths(), dtype=float) for frame in frames[start:stop]],
+                    [
+                        np.asarray(np.diag(frame.cell.array), dtype=float)
+                        for frame in frames[start:stop]
+                    ],
                     axis=0,
                 )
                 deltas -= cell_lengths[:, np.newaxis, np.newaxis, :] * np.round(
@@ -967,6 +1092,7 @@ def compute_coordination_profile(
     surface_mode: str = "auto",
     surface_elements: list[str] | tuple[str, ...] | None = None,
     include_fixed_surface_atoms: bool = False,
+    surface_options: SurfaceEstimatorOptions | None = None,
     cutoff_resolution: CoordinationCutoffResolution,
 ) -> CoordinationProfile:
     if not frames:
@@ -990,6 +1116,7 @@ def compute_coordination_profile(
         surface_mode=surface_mode,
         surface_elements=surface_elements,
         include_fixed_surface_atoms=include_fixed_surface_atoms,
+        surface_options=surface_options,
     )
 
     neighbor_indices = _select_indices(frames[0], label_b)
@@ -1050,6 +1177,22 @@ def compute_coordination_profile(
                 )
                 progress.update()
 
+    coordination = _validate_coordination_matrix(
+        coordination,
+        frame_count=len(frames),
+        center_count=center_count,
+    )
+    distance_to_surface = np.asarray(position_profile.distance_to_surface, dtype=float)
+    if distance_to_surface.shape != coordination.shape:
+        raise ValueError(
+            "Coordination/position alignment failed: distance-to-surface shape "
+            f"{distance_to_surface.shape} does not match coordination shape {coordination.shape}."
+        )
+    if not np.array_equal(center_indices, np.asarray(position_profile.atom_indices, dtype=int)):
+        raise ValueError(
+            "Coordination center ordering no longer matches the tracked position profile."
+        )
+
     return CoordinationProfile(
         species_a=label_a,
         species_b=label_b,
@@ -1059,7 +1202,7 @@ def compute_coordination_profile(
         step=np.asarray(position_profile.step, dtype=float),
         time_fs=np.asarray(position_profile.time_fs, dtype=float),
         time_ps=np.asarray(position_profile.time_ps, dtype=float),
-        distance_to_surface=np.asarray(position_profile.distance_to_surface, dtype=np.float32),
+        distance_to_surface=np.asarray(distance_to_surface, dtype=np.float32),
         coordination_number=np.asarray(coordination, dtype=np.float32),
         n_frames=int(position_profile.n_frames),
         n_atoms=int(position_profile.n_atoms),
@@ -1071,6 +1214,7 @@ def compute_coordination_profile(
             if position_profile.surface_position_per_frame is None
             else np.asarray(position_profile.surface_position_per_frame, dtype=float)
         ),
+        surface_estimate=position_profile.surface_estimate,
         cell_lengths_angstrom=position_profile.cell_lengths_angstrom,
         cutoff_A=float(cutoff_resolution.cutoff_A),
         cutoff_smoothing_width_A=float(cutoff_resolution.smoothing_width_A),
@@ -1117,8 +1261,6 @@ def save_coordination_profile(
             "n_frames": int(profile.n_frames),
             "n_atoms": int(profile.n_atoms),
             "coordinate_mode": profile.coordinate_mode,
-            "surface_position": profile.surface_position,
-            "surface_position_std": profile.surface_position_std,
             "cell_lengths_angstrom": (
                 None
                 if profile.cell_lengths_angstrom is None
@@ -1131,6 +1273,11 @@ def save_coordination_profile(
             "cutoff_rdf_minimum_A": profile.cutoff_rdf_minimum_A,
             "cutoff_rdf_source_path": profile.cutoff_rdf_source_path,
             "cutoff_diagnostic_plot_path": profile.cutoff_diagnostic_plot_path,
+            **_surface_metadata_payload(
+                surface_position=profile.surface_position,
+                surface_position_std=profile.surface_position_std,
+                estimate=profile.surface_estimate,
+            ),
         },
     )
     if additional_metadata:
@@ -1152,6 +1299,7 @@ def save_coordination_profile(
             "cutoff_rdf_g_r": profile.cutoff_rdf_g_r,
             "cutoff_rdf_g_r_smoothed": profile.cutoff_rdf_g_r_smoothed,
             "cutoff_rdf_sampled_frame_index": profile.cutoff_rdf_sampled_frame_index,
+            **_surface_estimate_datasets(profile.surface_estimate),
         },
         metadata=metadata,
     )
@@ -1283,6 +1431,10 @@ def _load_coordination_profiles_from_payloads(
             candidate = np.asarray(datasets["surface_position_per_frame_A"], dtype=float)
             if candidate.shape == (distance_values.shape[0],):
                 surface_per_frame = candidate
+        surface_estimate = _surface_estimate_from_payload(
+            datasets=datasets,
+            metadata=metadata,
+        )
 
         cutoff_rdf_bin_centers = (
             np.asarray(datasets["cutoff_rdf_bin_centers_A"], dtype=float)
@@ -1304,6 +1456,7 @@ def _load_coordination_profiles_from_payloads(
             if "cutoff_rdf_sampled_frame_index" in datasets
             else None
         )
+        surface_metadata = _surface_metadata_view(metadata)
         profiles.append(
             CoordinationProfile(
                 species_a=resolved_species_a,
@@ -1320,9 +1473,14 @@ def _load_coordination_profiles_from_payloads(
                 n_atoms=int(metadata.get("n_atoms", distance_values.shape[1])),
                 coordinate_mode=str(metadata.get("coordinate_mode", "axis")).strip().lower()
                 or "axis",
-                surface_position=_optional_finite_float(metadata.get("surface_position")),
-                surface_position_std=_optional_finite_float(metadata.get("surface_position_std")),
+                surface_position=_optional_finite_float(
+                    surface_metadata.get("position", metadata.get("surface_position"))
+                ),
+                surface_position_std=_optional_finite_float(
+                    surface_metadata.get("position_std", metadata.get("surface_position_std"))
+                ),
                 surface_position_per_frame=surface_per_frame,
+                surface_estimate=surface_estimate,
                 cell_lengths_angstrom=(
                     _optional_cell_lengths(metadata.get("cell_lengths_angstrom"))
                     or _optional_cell_lengths(metadata.get("pbc_cell_angstrom"))
@@ -1345,8 +1503,8 @@ def _load_coordination_profiles_from_payloads(
                     metadata.get("cutoff_diagnostic_plot_path", "")
                 ).strip()
                 or None,
-                )
             )
+        )
     return profiles
 
 

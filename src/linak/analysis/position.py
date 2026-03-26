@@ -18,9 +18,15 @@ from ..storage.hdf5_utils import (
     write_linak_hdf5,
 )
 from .density import (
-    _coordinate_mode_from_surface_per_frame,
     _log_framewise_surface_alignment,
     _select_surface_estimate,
+    _surface_estimate_datasets,
+    _surface_estimate_from_payload,
+    _surface_estimate_supports_distance_mode,
+    _surface_metadata_payload,
+    _surface_metadata_view,
+    SurfaceEstimate,
+    SurfaceEstimatorOptions,
     available_element_species,
 )
 from .schema import build_profile_metadata, default_plot_labels
@@ -62,6 +68,7 @@ class PositionProfile:
     surface_position: float | None = None
     surface_position_std: float | None = None
     surface_position_per_frame: np.ndarray | None = None
+    surface_estimate: SurfaceEstimate | None = None
     cell_lengths_angstrom: tuple[float, float, float] | None = None
 
 
@@ -186,13 +193,15 @@ def _resolve_surface_distance_values(
     surface_mode: str,
     surface_elements: list[str] | tuple[str, ...] | None,
     include_fixed_surface_atoms: bool,
-) -> tuple[np.ndarray, str, float | None, float | None, np.ndarray | None]:
+    surface_options: SurfaceEstimatorOptions | None,
+) -> tuple[np.ndarray, str, float | None, float | None, np.ndarray | None, SurfaceEstimate | None]:
     surface_estimate, _surface_method = _select_surface_estimate(
         frames,
         axis,
         mode=surface_mode,
         surface_elements=surface_elements,
         include_fixed_surface_atoms=include_fixed_surface_atoms,
+        surface_options=surface_options,
     )
     if surface_estimate is None:
         LOGGER.warning(
@@ -201,14 +210,12 @@ def _resolve_surface_distance_values(
             axis.lower(),
             axis.lower(),
         )
-        return np.array(axis_values_all, copy=True), "axis", None, None, None
+        return np.array(axis_values_all, copy=True), "axis", None, None, None, None
 
     surface_per_frame = np.asarray(surface_estimate.per_frame, dtype=float)
-    coordinate_mode = _coordinate_mode_from_surface_per_frame(
-        surface_per_frame=surface_per_frame,
-        frame_count=axis_values_all.shape[0],
-    )
-    if coordinate_mode == "distance":
+    if _surface_estimate_supports_distance_mode(
+        surface_estimate, frame_count=axis_values_all.shape[0]
+    ):
         _log_framewise_surface_alignment(
             logger=LOGGER,
             axis=axis,
@@ -221,6 +228,7 @@ def _resolve_surface_distance_values(
             float(surface_estimate.position),
             float(surface_estimate.std),
             surface_per_frame,
+            surface_estimate,
         )
 
     LOGGER.warning(
@@ -229,7 +237,7 @@ def _resolve_surface_distance_values(
         axis.lower(),
         axis.lower(),
     )
-    return np.array(axis_values_all, copy=True), "axis", None, None, None
+    return np.array(axis_values_all, copy=True), "axis", None, None, None, surface_estimate
 
 
 def _compute_position_profiles_for_labels(
@@ -241,6 +249,7 @@ def _compute_position_profiles_for_labels(
     surface_mode: str,
     surface_elements: list[str] | tuple[str, ...] | None,
     include_fixed_surface_atoms: bool,
+    surface_options: SurfaceEstimatorOptions | None,
 ) -> list[PositionProfile]:
     ensure_positive("timestep_fs", timestep_fs)
     symbols = _validate_stable_atom_layout(frames)
@@ -254,6 +263,7 @@ def _compute_position_profiles_for_labels(
         surface_position,
         surface_position_std,
         surface_position_per_frame,
+        surface_estimate,
     ) = _resolve_surface_distance_values(
         frames=frames,
         axis=axis,
@@ -261,6 +271,7 @@ def _compute_position_profiles_for_labels(
         surface_mode=surface_mode,
         surface_elements=surface_elements,
         include_fixed_surface_atoms=include_fixed_surface_atoms,
+        surface_options=surface_options,
     )
 
     frame_index = np.arange(len(frames), dtype=int)
@@ -304,6 +315,7 @@ def _compute_position_profiles_for_labels(
                     if surface_position_per_frame is None
                     else np.asarray(surface_position_per_frame, dtype=float)
                 ),
+                surface_estimate=surface_estimate,
                 cell_lengths_angstrom=cell_lengths_angstrom,
             )
         )
@@ -319,6 +331,7 @@ def compute_position_profile(
     surface_mode: str = "auto",
     surface_elements: list[str] | tuple[str, ...] | None = None,
     include_fixed_surface_atoms: bool = False,
+    surface_options: SurfaceEstimatorOptions | None = None,
 ) -> PositionProfile:
     """Compute one atom-resolved position profile."""
     species_label = _normalize_species(species)
@@ -330,6 +343,7 @@ def compute_position_profile(
         surface_mode=surface_mode,
         surface_elements=surface_elements,
         include_fixed_surface_atoms=include_fixed_surface_atoms,
+        surface_options=surface_options,
     )
     return profiles[0]
 
@@ -343,6 +357,7 @@ def compute_position_profiles(
     surface_mode: str = "auto",
     surface_elements: list[str] | tuple[str, ...] | None = None,
     include_fixed_surface_atoms: bool = False,
+    surface_options: SurfaceEstimatorOptions | None = None,
 ) -> list[PositionProfile]:
     """Compute one or more atom-resolved position profiles."""
     species_label = _normalize_species(species)
@@ -356,6 +371,7 @@ def compute_position_profiles(
                 surface_mode=surface_mode,
                 surface_elements=surface_elements,
                 include_fixed_surface_atoms=include_fixed_surface_atoms,
+                surface_options=surface_options,
             )
         ]
 
@@ -370,6 +386,7 @@ def compute_position_profiles(
         surface_mode=surface_mode,
         surface_elements=surface_elements,
         include_fixed_surface_atoms=include_fixed_surface_atoms,
+        surface_options=surface_options,
     )
 
 
@@ -388,12 +405,15 @@ def save_position_profile(
             "n_frames": int(profile.n_frames),
             "n_atoms": int(profile.n_atoms),
             "coordinate_mode": profile.coordinate_mode,
-            "surface_position": profile.surface_position,
-            "surface_position_std": profile.surface_position_std,
             "cell_lengths_angstrom": (
                 None
                 if profile.cell_lengths_angstrom is None
                 else [float(value) for value in profile.cell_lengths_angstrom]
+            ),
+            **_surface_metadata_payload(
+                surface_position=profile.surface_position,
+                surface_position_std=profile.surface_position_std,
+                estimate=profile.surface_estimate,
             ),
         },
     )
@@ -414,6 +434,7 @@ def save_position_profile(
             "z_A": profile.z,
             "distance_to_surface_A": profile.distance_to_surface,
             "surface_position_per_frame_A": profile.surface_position_per_frame,
+            **_surface_estimate_datasets(profile.surface_estimate),
         },
         metadata=metadata,
     )
@@ -542,6 +563,10 @@ def _load_position_profiles_from_payloads(
             candidate = np.asarray(datasets["surface_position_per_frame_A"], dtype=float)
             if candidate.shape == (expected_shape[0],):
                 surface_per_frame = candidate
+        surface_estimate = _surface_estimate_from_payload(
+            datasets=datasets,
+            metadata=metadata,
+        )
 
         n_frames = int(metadata.get("n_frames", expected_shape[0]))
         n_atoms = int(metadata.get("n_atoms", expected_shape[1]))
@@ -550,6 +575,7 @@ def _load_position_profiles_from_payloads(
             or _optional_cell_lengths(metadata.get("pbc_cell_angstrom"))
             or _optional_cell_lengths(metadata.get("resolved_cell_angstrom"))
         )
+        surface_metadata = _surface_metadata_view(metadata)
         profiles.append(
             PositionProfile(
                 species=resolved_species,
@@ -566,9 +592,14 @@ def _load_position_profiles_from_payloads(
                 n_frames=n_frames,
                 n_atoms=n_atoms,
                 coordinate_mode=coordinate_mode,
-                surface_position=_optional_finite_float(metadata.get("surface_position")),
-                surface_position_std=_optional_finite_float(metadata.get("surface_position_std")),
+                surface_position=_optional_finite_float(
+                    surface_metadata.get("position", metadata.get("surface_position"))
+                ),
+                surface_position_std=_optional_finite_float(
+                    surface_metadata.get("position_std", metadata.get("surface_position_std"))
+                ),
                 surface_position_per_frame=surface_per_frame,
+                surface_estimate=surface_estimate,
                 cell_lengths_angstrom=cell_lengths_angstrom,
             )
         )

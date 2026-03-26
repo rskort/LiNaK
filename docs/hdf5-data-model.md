@@ -1,24 +1,23 @@
 # HDF5 Data Model And Metadata Conventions
 
 LiNaK stores analysis outputs in HDF5 together with analysis-specific metadata.
-This page explains the general storage model shared by the analysis workflows.
+This page explains the general storage model shared by the analysis workflows,
+including the newer structured surface diagnostics.
 
 ## Core Design
 
-LiNaK does not treat an HDF5 file as just a generic dump of arrays. It stores:
+LiNaK does not treat an HDF5 file as just a generic dump of arrays. A LiNaK
+analysis file can store:
 
-- analysis datasets
+- scientific datasets
 - profile metadata
 - units metadata
 - stable profile identifiers
 - optional plot settings and plot profiles
 
-The goal is that a LiNaK HDF5 file is self-describing enough to be:
-
-- inspected later
-- plotted later
-- combined with other LiNaK outputs
-- interpreted correctly without reconstructing hidden assumptions from memory
+The goal is that a LiNaK HDF5 file is self-describing enough to be inspected,
+plotted, compared, and reopened without reconstructing hidden assumptions from
+memory.
 
 ## Profiles
 
@@ -29,19 +28,22 @@ A profile is one logical analysis result, for example:
 - one density profile for species `O`
 - one RDF profile for `O-H`
 - one position profile for species `Pt`
+- one orientation profile for water
 
 Each profile carries its own metadata and stable `profile_uid`.
 
 ## Single-Profile vs Multi-Profile Files
 
-Some workflows naturally produce one profile per file. Others can produce
-multiple profiles in one file, for example:
+Files written by a single analysis command may contain one profile or a profile
+collection.
 
-- multi-species density output
+Examples of multi-profile storage include:
+
+- element-resolved density output
 - combined HDF5 files
-- files containing multiple stored profiles of the same analysis type
+- files that contain several profiles of the same analysis type
 
-LiNaK plotting code is built around this profile model.
+LiNaK plotting and settings persistence are built around this profile model.
 
 ## Analysis Metadata
 
@@ -62,12 +64,12 @@ LiNaK also stores:
 - `analysis`
 - `analysis_schema_version`
 
-These fields are used to identify the analysis type and the intended schema.
+These identify the analysis family and the intended schema revision.
 
 ## Units Map
 
 LiNaK stores a `units_map` inside profile metadata. This maps dataset names to
-units such as:
+their intended units, for example:
 
 - `Angstrom`
 - `ps`
@@ -75,8 +77,8 @@ units such as:
 - `atom/nm^3`
 - `dimensionless`
 
-This makes the file more self-describing and helps later plotting and export
-logic label the data correctly.
+This makes the file self-describing enough for later plotting and export logic
+to label data correctly.
 
 ## Stable Profile Identity
 
@@ -86,13 +88,13 @@ Each stored profile receives a stable `profile_uid`. This is important for:
 - persistent plot settings
 - stable series identity in the GUI
 
-The goal is that settings can refer to a profile by identity rather than by only
+The goal is that settings refer to a logical profile identity rather than only
 its current position in a list.
 
 ## Combined Files
 
 Combined LiNaK HDF5 files store multiple profiles in one physical file. They do
-not flatten all underlying analysis outputs into one single dataset.
+not flatten all underlying analysis outputs into one merged dataset.
 
 That means:
 
@@ -100,14 +102,104 @@ That means:
 - each profile keeps its own metadata
 - plotting can render them together as multiple series
 
-This is the intended storage model for multi-source comparison.
+## Structured Surface Diagnostics
+
+Surface-aware analyses such as density, position, coordination, and orientation
+can now persist both surface *summary metadata* and *per-frame surface
+diagnostics*.
+
+This is important because a profile may have a meaningful scalar summary
+surface position while still not being trustworthy enough to use
+surface-relative coordinates in the analysis itself.
+
+### Surface Summary Metadata
+
+Newer LiNaK files store profile-level surface summary metadata inside a nested
+`surface` object in `metadata_json`.
+
+Common nested keys can include:
+
+- `surface.position`
+- `surface.position_std`
+- `surface.mode`
+- `surface.side`
+- `surface.selected_elements`
+- `surface.candidate_indices`
+- `surface.method_label`
+- `surface.valid_fraction`
+- `surface.median_confidence`
+- `surface.composite_score`
+- `surface.low_confidence_threshold`
+
+These describe the chosen surface estimate at profile level.
+
+### Per-Frame Surface Diagnostics
+
+Common stored per-frame surface datasets can include:
+
+- `surface_position_per_frame_A`
+- `surface_valid_mask`
+- `surface_confidence`
+- `surface_provenance`
+- `surface_candidate_count`
+- `surface_top_layer_size`
+- `surface_largest_gap_A`
+- `surface_baseline_gap_A`
+- `surface_reference_spread_A`
+- `surface_jump_rejection_mask`
+- `surface_rejection_reason`
+
+Together, these allow a later reader to reconstruct not only the chosen surface
+reference coordinate `s_t`, but also how reliable each frame was and how the
+estimate was obtained.
+
+### Effective Options
+
+LiNaK also stores `surface.effective_options`, which captures the effective
+advanced surface-estimation parameters used for that analysis.
+
+This matters for reproducibility because the estimator behavior depends on
+thresholds such as:
+
+- gap thresholds
+- top-layer size limits
+- rough-reference fractions
+- quantile settings
+- low-confidence cutoffs
+- conservative fill tolerances
+
+## Coordinate Mode Semantics
+
+Surface-aware analyses also store `coordinate_mode`.
+
+- `coordinate_mode = "distance"` means the analysis actually used the stored
+  frame-wise surface reference for alignment.
+- `coordinate_mode = "axis"` means the analysis kept raw axis coordinates.
+
+This distinction matters because a file may still contain rich surface metadata
+and diagnostics even when the final analysis did not trust the surface estimate
+enough to use distance-to-surface coordinates.
+
+## Backward Compatibility
+
+Older LiNaK HDF5 files may contain only flat summary surface metadata such as
+`surface_position` and `surface_position_std`, with no structured per-frame
+surface datasets and no nested `surface` object.
+
+Current LiNaK loaders accept both:
+
+- older summary-only files
+- newer files with structured surface diagnostics
+
+So the newer surface datasets are additive, not a requirement for loading older
+results.
 
 ## Plot Settings
 
 LiNaK can also store plot settings inside HDF5 files. These are separate from
 the scientific datasets themselves.
 
-In practice this means one file can contain:
+In practice, one file can contain:
 
 - the computed scientific result
 - persisted plotting preferences for how to display that result
@@ -123,6 +215,8 @@ not just say "here are some numbers." It should also say:
 - what units they use
 - how many frames contributed
 - which species or coordinates they correspond to
+- whether a surface estimate was used directly or only stored as advisory
+  metadata
 
 ## Related Documentation
 
@@ -133,3 +227,4 @@ not just say "here are some numbers." It should also say:
 - [Coordination](coordination.md)
 - [Potential](potential.md)
 - [Orientation](orientation.md)
+- [Surface Estimation](surface-estimation.md)

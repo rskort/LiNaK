@@ -209,7 +209,10 @@ def read_linak_hdf5_profiles(
                         _decode_metadata_json(group.attrs.get("metadata_json", "{}"))
                     )
                     profile_metadata.setdefault("analysis", analysis)
-                    if "profile_index" in profile_metadata and "source_profile_index" not in profile_metadata:
+                    if (
+                        "profile_index" in profile_metadata
+                        and "source_profile_index" not in profile_metadata
+                    ):
                         profile_metadata["source_profile_index"] = profile_metadata["profile_index"]
                     profile_metadata["profile_index"] = index
                     profile_metadata["profile_uid"] = _stable_profile_uid(
@@ -276,7 +279,10 @@ def read_linak_hdf5_profile_headers(
                         _decode_metadata_json(group.attrs.get("metadata_json", "{}"))
                     )
                     profile_metadata.setdefault("analysis", analysis)
-                    if "profile_index" in profile_metadata and "source_profile_index" not in profile_metadata:
+                    if (
+                        "profile_index" in profile_metadata
+                        and "source_profile_index" not in profile_metadata
+                    ):
                         profile_metadata["source_profile_index"] = profile_metadata["profile_index"]
                     profile_metadata["profile_index"] = index
                     headers.append(profile_metadata)
@@ -303,7 +309,9 @@ def read_linak_hdf5_profiles_by_index(
     if not requested_indices:
         return []
     requested_dataset_names = (
-        {str(name) for name in dataset_names if str(name).strip()} if dataset_names is not None else None
+        {str(name) for name in dataset_names if str(name).strip()}
+        if dataset_names is not None
+        else None
     )
 
     with h5py.File(hdf5_path, "r") as handle:
@@ -331,7 +339,9 @@ def read_linak_hdf5_profiles_by_index(
                     name = item[0]
                     return (0, int(name)) if name.isdigit() else (1, name)
 
-                sorted_members = [group for _name, group in sorted(member_items, key=_member_sort_key)]
+                sorted_members = [
+                    group for _name, group in sorted(member_items, key=_member_sort_key)
+                ]
                 profiles: list[tuple[dict[str, np.ndarray], dict[str, Any]]] = []
                 max_index = len(sorted_members) - 1
                 for requested_index in requested_indices:
@@ -354,7 +364,10 @@ def read_linak_hdf5_profiles_by_index(
                         _decode_metadata_json(group.attrs.get("metadata_json", "{}"))
                     )
                     profile_metadata.setdefault("analysis", analysis)
-                    if "profile_index" in profile_metadata and "source_profile_index" not in profile_metadata:
+                    if (
+                        "profile_index" in profile_metadata
+                        and "source_profile_index" not in profile_metadata
+                    ):
                         profile_metadata["source_profile_index"] = profile_metadata["profile_index"]
                     profile_metadata["profile_index"] = requested_index
                     profile_metadata["profile_uid"] = _stable_profile_uid(

@@ -131,9 +131,7 @@ class _LazyGuiSeriesCatalog:
                 self._active_profiles_by_series_id.pop(series_id, None)
 
         active_descriptors = [
-            dict(descriptor)
-            for segment in active_descriptors_by_source
-            for descriptor in segment
+            dict(descriptor) for segment in active_descriptors_by_source for descriptor in segment
         ]
         missing_descriptors = [
             descriptor
@@ -1047,8 +1045,7 @@ def _should_prefix_combined_source_labels(
     if len(sources) > 1:
         return True
     source_labels = {
-        _metadata_source_label(metadata, fallback_source=sources[0])
-        for metadata in metadata_items
+        _metadata_source_label(metadata, fallback_source=sources[0]) for metadata in metadata_items
     }
     return len(source_labels) > 1
 
@@ -1414,9 +1411,7 @@ def _load_orientation_plot_profiles(
     else:
         flattened = _flatten_profiles_by_source(profiles_by_source)
         plot_profiles.extend(flattened)
-        fallback_labels_by_source.append(
-            [f"orientation [{i}]" for i in range(len(flattened))]
-        )
+        fallback_labels_by_source.append([f"orientation [{i}]" for i in range(len(flattened))])
         raw_payloads = raw_payloads_by_source[0][1]
         if len(raw_payloads) != len(flattened):
             raise ValueError("Orientation profile metadata does not match loaded profiles.")
@@ -3324,7 +3319,11 @@ def _resolve_gui_series_enabled_by_id(
 ) -> dict[str, bool]:
     overrides = _coerce_series_override_map(getattr(args, "series_overrides", None))
     raw_enabled = getattr(args, "series_enabled", None)
-    enabled_list = raw_enabled if isinstance(raw_enabled, list) and len(raw_enabled) == len(descriptors) else None
+    enabled_list = (
+        raw_enabled
+        if isinstance(raw_enabled, list) and len(raw_enabled) == len(descriptors)
+        else None
+    )
     enabled_by_id: dict[str, bool] = {}
     for index, descriptor in enumerate(descriptors):
         series_id = str(descriptor.get("series_id") or f"series:{index}")
@@ -3344,9 +3343,7 @@ def _filter_active_gui_descriptor_segments(
     descriptor_segments_by_source: list[list[dict[str, Any]]],
 ) -> tuple[list[list[dict[str, Any]]], list[str]]:
     all_descriptors = [
-        dict(descriptor)
-        for segment in descriptor_segments_by_source
-        for descriptor in segment
+        dict(descriptor) for segment in descriptor_segments_by_source for descriptor in segment
     ]
     if not all_descriptors:
         return [list() for _segment in descriptor_segments_by_source], []
@@ -3362,7 +3359,11 @@ def _filter_active_gui_descriptor_segments(
     filtered_segments: list[list[dict[str, Any]]] = []
     for segment in descriptor_segments_by_source:
         filtered_segments.append(
-            [dict(descriptor) for descriptor in segment if str(descriptor.get("series_id") or "") in active_id_set]
+            [
+                dict(descriptor)
+                for descriptor in segment
+                if str(descriptor.get("series_id") or "") in active_id_set
+            ]
         )
     return filtered_segments, active_ids
 
@@ -3776,11 +3777,7 @@ def _apply_descriptor_extra_segments(
     descriptors: list[dict[str, Any]],
     extra_segments_by_source: list[list[dict[str, Any]]],
 ) -> list[dict[str, Any]]:
-    flattened_extras = [
-        dict(extra)
-        for segment in extra_segments_by_source
-        for extra in segment
-    ]
+    flattened_extras = [dict(extra) for segment in extra_segments_by_source for extra in segment]
     if len(flattened_extras) != len(descriptors):
         raise ValueError("Descriptor extras must align with the descriptor count.")
     updated: list[dict[str, Any]] = []
@@ -3830,9 +3827,9 @@ def _build_gui_series_descriptors(
         sources
     ):
         raise ValueError("origin_path_segments_by_source must align with sources.")
-    if load_source_path_segments_by_source is not None and len(load_source_path_segments_by_source) != len(
-        sources
-    ):
+    if load_source_path_segments_by_source is not None and len(
+        load_source_path_segments_by_source
+    ) != len(sources):
         raise ValueError("load_source_path_segments_by_source must align with sources.")
 
     descriptors: list[dict[str, Any]] = []
@@ -4240,9 +4237,7 @@ def _build_density_gui_lazy_catalog(
     prefix_source_labels = _should_prefix_combined_source_labels(
         sources=sources,
         metadata_items=[
-            dict(header)
-            for _source, headers in headers_by_source
-            for header in headers
+            dict(header) for _source, headers in headers_by_source for header in headers
         ],
     )
     resolved_species_label: str | None = None
@@ -4262,7 +4257,9 @@ def _build_density_gui_lazy_catalog(
         source_extras: list[dict[str, Any]] = []
         for header in headers:
             source_label = _metadata_source_label(header, fallback_source=source)
-            base_species = resolved_species_label or str(header.get("species", "")).strip() or "UNKNOWN"
+            base_species = (
+                resolved_species_label or str(header.get("species", "")).strip() or "UNKNOWN"
+            )
             rendered_species = (
                 f"{source_label}:{base_species}" if prefix_source_labels else base_species
             )
@@ -4339,7 +4336,10 @@ def _build_msd_gui_lazy_catalog(
     sources: list[str],
     active_profiles_by_series_id: dict[str, Any] | None = None,
 ) -> _LazyGuiSeriesCatalog:
-    from .analysis.msd import load_msd_profiles_by_index, _normalize_species as _normalize_msd_species
+    from .analysis.msd import (
+        load_msd_profiles_by_index,
+        _normalize_species as _normalize_msd_species,
+    )
 
     headers_by_source = _read_analysis_profile_headers_by_source(
         sources=sources,
@@ -4348,9 +4348,7 @@ def _build_msd_gui_lazy_catalog(
     prefix_source_labels = _should_prefix_combined_source_labels(
         sources=sources,
         metadata_items=[
-            dict(header)
-            for _source, headers in headers_by_source
-            for header in headers
+            dict(header) for _source, headers in headers_by_source for header in headers
         ],
     )
     resolved_species = (
@@ -4468,9 +4466,7 @@ def _build_rdf_gui_lazy_catalog(
     prefix_source_labels = _should_prefix_combined_source_labels(
         sources=sources,
         metadata_items=[
-            dict(header)
-            for _source, headers in headers_by_source
-            for header in headers
+            dict(header) for _source, headers in headers_by_source for header in headers
         ],
     )
 
@@ -4490,9 +4486,15 @@ def _build_rdf_gui_lazy_catalog(
         for header in headers:
             resolved_a = str(header.get("species_a", "")).strip() or "UNKNOWN"
             resolved_b = str(header.get("species_b", "")).strip() or resolved_a
-            if wanted_species_a is not None and _normalize_rdf_species(resolved_a) != wanted_species_a:
+            if (
+                wanted_species_a is not None
+                and _normalize_rdf_species(resolved_a) != wanted_species_a
+            ):
                 continue
-            if wanted_species_b is not None and _normalize_rdf_species(resolved_b) != wanted_species_b:
+            if (
+                wanted_species_b is not None
+                and _normalize_rdf_species(resolved_b) != wanted_species_b
+            ):
                 continue
             source_label = _metadata_source_label(header, fallback_source=source)
             rendered_species_a = (
@@ -4583,7 +4585,9 @@ def _build_position_gui_lazy_catalog(
         if args.species is None or not str(args.species).strip()
         else _normalize_position_species(args.species)
     )
-    wanted_axis = None if args.axis is None or not str(args.axis).strip() else str(args.axis).strip().lower()
+    wanted_axis = (
+        None if args.axis is None or not str(args.axis).strip() else str(args.axis).strip().lower()
+    )
     headers_by_source = _read_analysis_profile_headers_by_source(
         sources=sources,
         analysis="position",
@@ -4591,9 +4595,7 @@ def _build_position_gui_lazy_catalog(
     prefix_source_labels = _should_prefix_combined_source_labels(
         sources=sources,
         metadata_items=[
-            dict(header)
-            for _source, headers in headers_by_source
-            for header in headers
+            dict(header) for _source, headers in headers_by_source for header in headers
         ],
     )
 
@@ -4683,7 +4685,8 @@ def _build_position_gui_lazy_catalog(
             if len(parent_profiles) != len(parent_order):
                 raise ValueError("Lazy position loader returned mismatched parent profile count.")
             parent_by_index = {
-                profile_index: profile for profile_index, profile in zip(parent_order, parent_profiles)
+                profile_index: profile
+                for profile_index, profile in zip(parent_order, parent_profiles)
             }
             for profile_index in parent_order:
                 parent_profile = parent_by_index[profile_index]
@@ -4752,9 +4755,7 @@ def _build_coordination_gui_lazy_catalog(
     prefix_source_labels = _should_prefix_combined_source_labels(
         sources=sources,
         metadata_items=[
-            dict(header)
-            for _source, headers in headers_by_source
-            for header in headers
+            dict(header) for _source, headers in headers_by_source for header in headers
         ],
     )
 
@@ -4772,9 +4773,15 @@ def _build_coordination_gui_lazy_catalog(
             resolved_a = str(header.get("species_a", "")).strip() or "UNKNOWN"
             resolved_b = str(header.get("species_b", "")).strip() or resolved_a
             resolved_axis = str(header.get("axis", "z")).strip().lower() or "z"
-            if wanted_species_a is not None and _normalize_coordination_species(resolved_a) != wanted_species_a:
+            if (
+                wanted_species_a is not None
+                and _normalize_coordination_species(resolved_a) != wanted_species_a
+            ):
                 continue
-            if wanted_species_b is not None and _normalize_coordination_species(resolved_b) != wanted_species_b:
+            if (
+                wanted_species_b is not None
+                and _normalize_coordination_species(resolved_b) != wanted_species_b
+            ):
                 continue
             if wanted_axis is not None and resolved_axis != wanted_axis:
                 continue
@@ -4827,7 +4834,9 @@ def _build_coordination_gui_lazy_catalog(
                 )
                 continue
 
-            atom_indices = np.asarray(payloads_by_index.get(profile_index, {}).get("atom_indices", []), dtype=int)
+            atom_indices = np.asarray(
+                payloads_by_index.get(profile_index, {}).get("atom_indices", []), dtype=int
+            )
             for atom_index in atom_indices.tolist():
                 atom_token = int(atom_index)
                 source_labels.append(f"{rendered_species_a}[{atom_token}]")
@@ -4878,9 +4887,12 @@ def _build_coordination_gui_lazy_catalog(
                 axis=args.axis,
             )
             if len(parent_profiles) != len(parent_order):
-                raise ValueError("Lazy coordination loader returned mismatched parent profile count.")
+                raise ValueError(
+                    "Lazy coordination loader returned mismatched parent profile count."
+                )
             parent_by_index = {
-                profile_index: profile for profile_index, profile in zip(parent_order, parent_profiles)
+                profile_index: profile
+                for profile_index, profile in zip(parent_order, parent_profiles)
             }
             for profile_index in parent_order:
                 parent_profile = parent_by_index[profile_index]
@@ -5010,9 +5022,7 @@ def _build_orientation_gui_context(
     ) = _load_orientation_plot_profiles(sources=sources)
     raw_component = getattr(args, "component", "average")
     orientation_component = (
-        raw_component
-        if raw_component in {"average", "density-weighted", "heatmap"}
-        else "average"
+        raw_component if raw_component in {"average", "density-weighted", "heatmap"} else "average"
     )
     return _GuiPlotRenderContext(
         profile=plot_profiles,
@@ -5949,8 +5959,16 @@ def build_parser() -> argparse.ArgumentParser:
     position_group.add_argument(
         "--component",
         choices=[
-            "distance", "x", "y", "z", "xy-z", "time", "time-distance",
-            "average", "density-weighted", "heatmap",
+            "distance",
+            "x",
+            "y",
+            "z",
+            "xy-z",
+            "time",
+            "time-distance",
+            "average",
+            "density-weighted",
+            "heatmap",
         ],
         default="distance",
         help=(
@@ -6072,6 +6090,15 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Allow atoms marked by ASE constraints to be used in surface detection "
             "(default: constrained atoms are excluded)."
+        ),
+    )
+    compute_density.add_argument(
+        "--rough-surface-envelope",
+        type=_positive_float,
+        default=None,
+        help=(
+            "Restrict rough-mode reference selection to atoms within this depth from the "
+            "outer surface in Angstrom (default: adaptive)."
         ),
     )
     _add_cell_resolution_options(compute_density)
@@ -6202,6 +6229,15 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Allow atoms marked by ASE constraints to be used in surface detection "
             "(default: constrained atoms are excluded)."
+        ),
+    )
+    compute_position.add_argument(
+        "--rough-surface-envelope",
+        type=_positive_float,
+        default=None,
+        help=(
+            "Restrict rough-mode reference selection to atoms within this depth from the "
+            "outer surface in Angstrom (default: adaptive)."
         ),
     )
     _add_cell_resolution_options(compute_position)
@@ -6349,6 +6385,15 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Allow atoms marked by ASE constraints to be used in surface detection "
             "(default: constrained atoms are excluded)."
+        ),
+    )
+    compute_coordination.add_argument(
+        "--rough-surface-envelope",
+        type=_positive_float,
+        default=None,
+        help=(
+            "Restrict rough-mode reference selection to atoms within this depth from the "
+            "outer surface in Angstrom (default: adaptive)."
         ),
     )
     compute_coordination.add_argument(
@@ -6562,6 +6607,15 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Allow atoms marked by ASE constraints to be used in surface detection "
             "(default: constrained atoms are excluded)."
+        ),
+    )
+    compute_orientation.add_argument(
+        "--rough-surface-envelope",
+        type=_positive_float,
+        default=None,
+        help=(
+            "Restrict rough-mode reference selection to atoms within this depth from the "
+            "outer surface in Angstrom (default: adaptive)."
         ),
     )
     compute_orientation.add_argument(
@@ -8354,7 +8408,16 @@ def _detect_plot_analysis_from_hdf5_source(source: str | Path) -> str | None:
 
     source_path = Path(source).expanduser().resolve()
     analysis = read_hdf5_analysis(source_path)
-    if analysis in {"density", "msd", "rdf", "position", "coordination", "potential", "orientation", "table"}:
+    if analysis in {
+        "density",
+        "msd",
+        "rdf",
+        "position",
+        "coordination",
+        "potential",
+        "orientation",
+        "table",
+    }:
         return analysis
 
     try:
@@ -8702,7 +8765,9 @@ def _handle_plot_density(args: argparse.Namespace) -> int:
             build_context=lambda current_args: _build_catalog(current_args).build_render_context(
                 current_args
             ),
-            build_full_context=lambda current_args: _build_catalog(current_args).build_initial_context(),
+            build_full_context=lambda current_args: _build_catalog(
+                current_args
+            ).build_initial_context(),
         )
         LOGGER.info("Density GUI plotting session finished in %.2f s.", perf_counter() - start)
         return 0
@@ -8841,7 +8906,9 @@ def _handle_plot_msd(args: argparse.Namespace) -> int:
             build_context=lambda current_args: _build_catalog(current_args).build_render_context(
                 current_args
             ),
-            build_full_context=lambda current_args: _build_catalog(current_args).build_initial_context(),
+            build_full_context=lambda current_args: _build_catalog(
+                current_args
+            ).build_initial_context(),
         )
         LOGGER.info("MSD GUI plotting session finished in %.2f s.", perf_counter() - start)
         return 0
@@ -8981,7 +9048,9 @@ def _handle_plot_rdf(args: argparse.Namespace) -> int:
             build_context=lambda current_args: _build_catalog(current_args).build_render_context(
                 current_args
             ),
-            build_full_context=lambda current_args: _build_catalog(current_args).build_initial_context(),
+            build_full_context=lambda current_args: _build_catalog(
+                current_args
+            ).build_initial_context(),
         )
         LOGGER.info("RDF GUI plotting session finished in %.2f s.", perf_counter() - start)
         return 0
@@ -9137,7 +9206,9 @@ def _handle_plot_position(args: argparse.Namespace) -> int:
             build_context=lambda current_args: _build_catalog(current_args).build_render_context(
                 current_args
             ),
-            build_full_context=lambda current_args: _build_catalog(current_args).build_initial_context(),
+            build_full_context=lambda current_args: _build_catalog(
+                current_args
+            ).build_initial_context(),
         )
         LOGGER.info("Position GUI plotting session finished in %.2f s.", perf_counter() - start)
         return 0
@@ -9280,7 +9351,9 @@ def _handle_plot_coordination(args: argparse.Namespace) -> int:
             build_context=lambda current_args: _build_catalog(current_args).build_render_context(
                 current_args
             ),
-            build_full_context=lambda current_args: _build_catalog(current_args).build_initial_context(),
+            build_full_context=lambda current_args: _build_catalog(
+                current_args
+            ).build_initial_context(),
         )
         LOGGER.info("Coordination GUI plotting session finished in %.2f s.", perf_counter() - start)
         return 0
@@ -9513,9 +9586,7 @@ def _handle_plot_orientation(args: argparse.Namespace) -> int:
                 sources=sources,
             ),
         )
-        LOGGER.info(
-            "Orientation GUI plotting session finished in %.2f s.", perf_counter() - start
-        )
+        LOGGER.info("Orientation GUI plotting session finished in %.2f s.", perf_counter() - start)
         return 0
 
     _saved_path, _rendered_state = _render_profile_plot(
@@ -9530,6 +9601,37 @@ def _handle_plot_orientation(args: argparse.Namespace) -> int:
 
     LOGGER.info("Orientation plotting finished in %.2f s.", perf_counter() - start)
     return 0
+
+
+def _surface_options_from_cli_args(args: argparse.Namespace):
+    rough_surface_envelope = getattr(args, "rough_surface_envelope", None)
+    if rough_surface_envelope is None:
+        return None
+    from .analysis.density import SurfaceEstimatorOptions
+
+    return SurfaceEstimatorOptions(
+        mode=str(getattr(args, "surface_mode", "auto")),
+        surface_elements=(
+            None
+            if getattr(args, "surface_elements", None) is None
+            else tuple(str(value) for value in args.surface_elements)
+        ),
+        include_fixed_surface_atoms=bool(getattr(args, "include_fixed_surface_atoms", False)),
+        rough_surface_envelope_A=float(rough_surface_envelope),
+    )
+
+
+def _describe_surface_cli_options(args: argparse.Namespace) -> str:
+    rough_surface_envelope = getattr(args, "rough_surface_envelope", None)
+    rough_surface_text = (
+        "adaptive" if rough_surface_envelope is None else f"{float(rough_surface_envelope):.6g}"
+    )
+    return (
+        f"surface_mode={args.surface_mode}, "
+        f"surface_elements={args.surface_elements if args.surface_elements else 'auto'}, "
+        f"include_fixed_surface_atoms={args.include_fixed_surface_atoms}, "
+        f"rough_surface_envelope_A={rough_surface_text}"
+    )
 
 
 def _handle_compute_density(args: argparse.Namespace) -> int:
@@ -9566,9 +9668,7 @@ def _handle_compute_density(args: argparse.Namespace) -> int:
             f"trajectory source: {source_path}",
             (
                 f"species={args.species}, axis={args.axis}, bin_width={args.bin_width}, "
-                f"surface_mode={args.surface_mode}, "
-                f"surface_elements={args.surface_elements if args.surface_elements else 'auto'}, "
-                f"include_fixed_surface_atoms={args.include_fixed_surface_atoms}"
+                f"{_describe_surface_cli_options(args)}"
             ),
             (
                 "density mode: volumetric if a periodic cell is available after resolution, "
@@ -9609,6 +9709,7 @@ def _handle_compute_density(args: argparse.Namespace) -> int:
         surface_elements=args.surface_elements,
         include_fixed_surface_atoms=args.include_fixed_surface_atoms,
         binning="cell",
+        surface_options=_surface_options_from_cli_args(args),
     )
     output_path = _density_hdf5_output_path(
         args.output,
@@ -9802,9 +9903,7 @@ def _handle_compute_position(args: argparse.Namespace) -> int:
             f"trajectory source: {source_path}",
             (
                 f"species={species_token}, axis={args.axis}, timestep_fs={args.timestep_fs or 'auto'}, "
-                f"surface_mode={args.surface_mode}, "
-                f"surface_elements={args.surface_elements if args.surface_elements else 'auto'}, "
-                f"include_fixed_surface_atoms={args.include_fixed_surface_atoms}"
+                f"{_describe_surface_cli_options(args)}"
             ),
             f"cell resolution: {cell_preview}",
             (
@@ -9882,6 +9981,7 @@ def _handle_compute_position(args: argparse.Namespace) -> int:
         surface_mode=args.surface_mode,
         surface_elements=args.surface_elements,
         include_fixed_surface_atoms=args.include_fixed_surface_atoms,
+        surface_options=_surface_options_from_cli_args(args),
     )
     outputs = _position_hdf5_output_paths(
         args.output,
@@ -9946,7 +10046,7 @@ def _handle_compute_rdf(args: argparse.Namespace) -> int:
             r_max_preview = (
                 f"{args.r_max:.6g} (explicit)"
                 if args.r_max is not None
-                else f"{0.5 * min(resolved_cell):.6g} (half min resolved cell length)"
+                else f"{0.5 * min(resolved_cell):.6g} (half min resolved perpendicular cell height)"
             )
         species_b = args.species_b if args.species_b is not None else args.species_a
         output_preview = str(
@@ -10055,16 +10155,12 @@ def _handle_compute_coordination(args: argparse.Namespace) -> int:
         elif args.cutoff_rdf:
             cutoff_preview = f"RDF file={Path(args.cutoff_rdf).expanduser().resolve()}"
         else:
-            cutoff_preview = (
-                "sampled RDF convergence (random 100-frame batches until cutoff stabilizes)"
-            )
+            cutoff_preview = "sampled RDF convergence (random batches until cutoff stabilizes)"
         plan = [
             f"trajectory source: {source_path}",
             (
                 f"species_a={args.species_a}, species_b={species_b}, axis={args.axis}, "
-                f"surface_mode={args.surface_mode}, "
-                f"surface_elements={args.surface_elements if args.surface_elements else 'auto'}, "
-                f"include_fixed_surface_atoms={args.include_fixed_surface_atoms}"
+                f"{_describe_surface_cli_options(args)}"
             ),
             (
                 f"coordination cutoff: {cutoff_preview}, smoothing_width="
@@ -10156,6 +10252,7 @@ def _handle_compute_coordination(args: argparse.Namespace) -> int:
         surface_mode=args.surface_mode,
         surface_elements=args.surface_elements,
         include_fixed_surface_atoms=args.include_fixed_surface_atoms,
+        surface_options=_surface_options_from_cli_args(args),
         cutoff_resolution=cutoff_resolution,
     )
     coordination_metadata: dict[str, Any] = {
@@ -10411,9 +10508,7 @@ def _handle_compute_orientation(args: argparse.Namespace) -> int:
                 f"axis={args.axis}, reference_axis={args.reference_axis}, "
                 f"bin_width={args.bin_width}, angle_bins={args.angle_bins}, "
                 f"oh_cutoff={args.oh_cutoff}, "
-                f"surface_mode={args.surface_mode}, "
-                f"surface_elements={args.surface_elements if args.surface_elements else 'auto'}, "
-                f"include_fixed_surface_atoms={args.include_fixed_surface_atoms}"
+                f"{_describe_surface_cli_options(args)}"
             ),
             f"cell resolution: {cell_preview}",
             f"output HDF5 target: {output_preview}",
@@ -10451,6 +10546,7 @@ def _handle_compute_orientation(args: argparse.Namespace) -> int:
         surface_mode=args.surface_mode,
         surface_elements=args.surface_elements,
         include_fixed_surface_atoms=args.include_fixed_surface_atoms,
+        surface_options=_surface_options_from_cli_args(args),
         oh_cutoff=args.oh_cutoff,
     )
     LOGGER.info(
