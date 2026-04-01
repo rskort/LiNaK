@@ -8,6 +8,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from importlib.metadata import PackageNotFoundError, metadata as package_metadata
 import importlib
+import inspect
 import json
 import logging
 from math import isclose
@@ -179,6 +180,8 @@ _PERSISTED_PLOT_SETTING_OPTION_FLAGS = {
     "figsize": ("--figsize",),
     "file_labels": ("--file-labels",),
     "font_family": ("--font-family",),
+    "font_size": ("--font-size",),
+    "border": ("--border", "--no-border"),
     "grid": ("--grid", "--no-grid"),
     "grid_alpha": ("--grid-alpha",),
     "grid_linestyle": ("--grid-linestyle",),
@@ -250,8 +253,10 @@ _PLOT_SETTINGS_COMMON_KEYS = (
     "series_normalization_modes",
     "series_normalization_values",
     "series_normalization_x_refs",
+    "annotations",
     "x_bin_width",
     "x_bin_reducer",
+    "min_bin_points",
     "matplotlib_rc",
     "figure_kwargs",
     "axes_kwargs",
@@ -270,6 +275,7 @@ _PLOT_SETTINGS_COMMON_KEYS = (
     "figsize",
     "dpi",
     "font_family",
+    "font_size",
     "title_font_size",
     "label_font_size",
     "tick_font_size",
@@ -277,6 +283,7 @@ _PLOT_SETTINGS_COMMON_KEYS = (
     "line_width",
     "line_color",
     "line_colors",
+    "border",
     "grid",
     "grid_linestyle",
     "grid_linewidth",
@@ -562,27 +569,14 @@ def _preview_resolve_cell_without_trajectory_read(
     cell: tuple[float, float, float] | None,
     input_path: str | None,
 ) -> tuple[tuple[float, float, float] | None, str]:
-    """Resolve cell for dry-run using explicit, input, or auto-detected sources."""
-    from .pbc import extract_cell_from_simulation_input, find_unique_simulation_input
-
-    if cell is not None:
-        return cell, "explicit --cell"
-
-    if input_path is not None:
-        resolved_input = Path(input_path).expanduser().resolve()
-        return extract_cell_from_simulation_input(
-            resolved_input
-        ), f"explicit --input ({resolved_input})"
-
-    trajectory_path = Path(trajectory).expanduser().resolve()
+    """Resolve cell for dry-run without loading trajectory frames."""
+    from .resolution import resolve_analysis_cell
 
     try:
-        auto_input = find_unique_simulation_input(trajectory_path.parent)
-        return extract_cell_from_simulation_input(auto_input), f"auto-detected ({auto_input})"
+        resolved = resolve_analysis_cell(trajectory, cell=cell, input_path=input_path)
     except (FileNotFoundError, ValueError):
-        pass
-
-    return None, "unresolved from input sources"
+        return None, "unresolved from input and trajectory HDF5 metadata"
+    return resolved.cell_angstrom, resolved.source
 
 
 def _preview_resolve_msd_timestep_without_trajectory_read(
@@ -592,26 +586,17 @@ def _preview_resolve_msd_timestep_without_trajectory_read(
     input_path: str | None,
 ) -> tuple[float, str]:
     """Resolve MSD timestep for dry-run without loading trajectory frames."""
-    from .pbc import extract_frame_timestep_fs_from_simulation_input, find_unique_simulation_input
-
-    if timestep_fs is not None:
-        return float(timestep_fs), "explicit --timestep-fs"
-
-    if input_path is not None:
-        resolved_input = Path(input_path).expanduser().resolve()
-        frame_timestep_fs, _, _ = extract_frame_timestep_fs_from_simulation_input(resolved_input)
-        return frame_timestep_fs, f"explicit --input ({resolved_input})"
-
-    trajectory_path = Path(trajectory).expanduser().resolve()
+    from .resolution import resolve_analysis_timestep_fs
 
     try:
-        auto_input = find_unique_simulation_input(trajectory_path.parent)
-        frame_timestep_fs, _, _ = extract_frame_timestep_fs_from_simulation_input(auto_input)
-        return frame_timestep_fs, f"auto-detected ({auto_input})"
-    except (FileNotFoundError, ValueError):
-        pass
-
-    return 1.0, "fallback default"
+        resolved = resolve_analysis_timestep_fs(
+            trajectory,
+            timestep_fs=timestep_fs,
+            input_path=input_path,
+        )
+    except ValueError:
+        return 1.0, "fallback default"
+    return resolved.frame_timestep_fs, resolved.source
 
 
 def _format_cell_values(cell: tuple[float, float, float]) -> str:
@@ -917,6 +902,12 @@ def _default_rdf_hdf5_output_path(source: str | Path, species_a: str, species_b:
     )
 
 
+def _default_rdf_collection_hdf5_output_path(source: str | Path) -> Path:
+    source_path = Path(source).expanduser().resolve()
+    stem = source_path.stem or "trajectory"
+    return _linak_output_dir_for_source(source_path) / f"{stem}_rdf.h5"
+
+
 def _default_coordination_hdf5_output_path(
     source: str | Path,
     species_a: str,
@@ -927,6 +918,12 @@ def _default_coordination_hdf5_output_path(
     return _linak_output_dir_for_source(source_path) / (
         f"{stem}_coordination_{_sanitize_token(species_a)}_{_sanitize_token(species_b)}.h5"
     )
+
+
+def _default_coordination_collection_hdf5_output_path(source: str | Path) -> Path:
+    source_path = Path(source).expanduser().resolve()
+    stem = source_path.stem or "trajectory"
+    return _linak_output_dir_for_source(source_path) / f"{stem}_coordination.h5"
 
 
 def _default_potential_hdf5_output_path(source: str | Path) -> Path:
@@ -978,12 +975,129 @@ def _default_pbc_output_path(trajectory: str | Path) -> Path:
     return input_path.with_name(output_name)
 
 
+def _default_apply_convert_output_path(trajectory: str | Path) -> Path:
+    from .trajectory.io import default_trajectory_hdf5_output_path
+
+    return default_trajectory_hdf5_output_path(trajectory)
+
+
 def _is_csv_source(path: str | Path) -> bool:
     return _is_hdf5_source(path)
 
 
 def _is_hdf5_source(path: str | Path) -> bool:
     return Path(path).suffix.lower() in {".h5", ".hdf5"}
+
+
+def _is_raw_text_trajectory_source(path: str | Path) -> bool:
+    return Path(path).suffix.lower() in {".xyz", ".extxyz", ".dump", ".lmp"}
+
+
+def _maybe_log_trajectory_convert_hint(path: str | Path) -> None:
+    source_path = Path(path).expanduser().resolve()
+    if not _is_raw_text_trajectory_source(source_path):
+        return
+    LOGGER.info(
+        "For faster repeated analysis, convert once with "
+        "`linak apply convert %s` and compute from the resulting `.traj.h5`.",
+        _display_path(source_path),
+    )
+
+
+def _collect_trajectory_conversion_metadata(
+    trajectory: str | Path,
+    *,
+    input_path: str | None,
+) -> tuple[Any | None, list[str]]:
+    from .pbc import (
+        extract_cell_from_simulation_input,
+        extract_fixed_atom_indices_from_simulation_input,
+        extract_frame_timestep_fs_from_simulation_input,
+        find_unique_simulation_input,
+    )
+    from .trajectory.io import TrajectoryStoredMetadata
+
+    trajectory_path = Path(trajectory).expanduser().resolve()
+    resolved_input: Path | None = None
+    metadata_notes: list[str] = []
+    if input_path is not None:
+        resolved_input = Path(input_path).expanduser().resolve()
+        metadata_notes.append(f"input metadata source: explicit --input ({resolved_input})")
+    else:
+        try:
+            resolved_input = find_unique_simulation_input(trajectory_path.parent)
+            metadata_notes.append(f"input metadata source: auto-detected ({resolved_input})")
+        except (FileNotFoundError, ValueError) as exc:
+            metadata_notes.append(f"input metadata source: none ({exc})")
+
+    if resolved_input is None:
+        metadata_notes.extend(
+            [
+                "cell metadata: not found",
+                "timestep metadata: not found",
+                "fixed atoms metadata: not found",
+            ]
+        )
+        return None, metadata_notes
+
+    input_format = resolved_input.suffix.lower().lstrip(".") or None
+    cell_angstrom: tuple[float, float, float] | None = None
+    frame_timestep_fs: float | None = None
+    md_timestep_fs: float | None = None
+    trajectory_stride_md: int | None = None
+    fixed_atom_indices: tuple[int, ...] = ()
+
+    try:
+        cell_angstrom = extract_cell_from_simulation_input(resolved_input)
+        metadata_notes.append(
+            "cell metadata: found "
+            f"({cell_angstrom[0]:.6g} {cell_angstrom[1]:.6g} {cell_angstrom[2]:.6g} Angstrom)"
+        )
+    except Exception as exc:
+        metadata_notes.append(f"cell metadata: not found ({exc})")
+
+    try:
+        frame_timestep_fs, md_timestep_fs, trajectory_stride_md = (
+            extract_frame_timestep_fs_from_simulation_input(resolved_input)
+        )
+        metadata_notes.append(
+            "timestep metadata: found "
+            f"(frame={frame_timestep_fs:.6g} fs, md={md_timestep_fs:.6g} fs, stride={trajectory_stride_md})"
+        )
+    except Exception as exc:
+        metadata_notes.append(f"timestep metadata: not found ({exc})")
+
+    try:
+        parsed_fixed = extract_fixed_atom_indices_from_simulation_input(resolved_input)
+        if parsed_fixed:
+            fixed_atom_indices = parsed_fixed
+            metadata_notes.append(
+                f"fixed atoms metadata: found ({len(fixed_atom_indices)} atom(s))"
+            )
+        else:
+            metadata_notes.append("fixed atoms metadata: not found")
+    except Exception as exc:
+        metadata_notes.append(f"fixed atoms metadata: not found ({exc})")
+
+    metadata = TrajectoryStoredMetadata(
+        input_path=resolved_input,
+        input_format=input_format,
+        cell_angstrom=cell_angstrom,
+        cell_source="simulation input",
+        frame_timestep_fs=frame_timestep_fs,
+        md_timestep_fs=md_timestep_fs,
+        trajectory_stride_md=trajectory_stride_md,
+        timestep_source="simulation input",
+        fixed_atom_indices=fixed_atom_indices,
+        fixed_atoms_source="simulation input" if fixed_atom_indices else None,
+    )
+    if (
+        metadata.cell_angstrom is None
+        and metadata.frame_timestep_fs is None
+        and not metadata.fixed_atom_indices
+    ):
+        return None, metadata_notes
+    return metadata, metadata_notes
 
 
 def _parse_backend(value: str) -> str:
@@ -1205,7 +1319,7 @@ def _build_rdf_profile_filter_options(
             species_b = str(metadata.get("species_b", "")).strip() or species_a
             if not species_a:
                 continue
-            source_pairs.append((species_a, species_b))
+            source_pairs.extend(_rdf_pair_aliases(species_a, species_b))
         pairs_by_source.append(source_pairs)
 
     common_pairs = _ordered_common_items_by_source(pairs_by_source)
@@ -1550,14 +1664,11 @@ def _load_rdf_plot_profiles(
             metadata = payload.get("metadata", {})
             meta_species_a = str(metadata.get("species_a", "")).strip() or "UNKNOWN"
             meta_species_b = str(metadata.get("species_b", "")).strip() or meta_species_a
-            if (
-                wanted_species_a is not None
-                and _normalize_rdf_species(meta_species_a) != wanted_species_a
-            ):
-                continue
-            if (
-                wanted_species_b is not None
-                and _normalize_rdf_species(meta_species_b) != wanted_species_b
+            if not _rdf_pair_matches_cli_filter(
+                stored_species_a=meta_species_a,
+                stored_species_b=meta_species_b,
+                wanted_species_a=wanted_species_a,
+                wanted_species_b=wanted_species_b,
             ):
                 continue
             filtered_payloads.append(payload)
@@ -1592,14 +1703,21 @@ def _load_rdf_plot_profiles(
                 metadata = dict(payload.get("metadata", {}))
                 source_label = _metadata_source_label(metadata, fallback_source=source)
                 rendered_species_a = f"{source_label}:{profile.species_a}"
-                source_labels.append(f"{rendered_species_a}-{profile.species_b}")
+                rendered_species_b = profile.species_b
+                source_labels.append(f"{rendered_species_a}-{rendered_species_b}")
                 source_ids.append(
                     _profile_uid_from_payload(payload, fallback_prefix="rdf", index=profile_index)
                 )
                 source_origins.append(
                     str(payload.get("metadata", {}).get("origin_hdf5_path") or source)
                 )
-                plot_profiles.append(replace(profile, species_a=rendered_species_a))
+                plot_profiles.append(
+                    replace(
+                        profile,
+                        species_a=rendered_species_a,
+                        species_b=rendered_species_b,
+                    )
+                )
             fallback_labels_by_source.append(source_labels)
             series_id_segments_by_source.append(source_ids)
             origin_path_segments_by_source.append(source_origins)
@@ -2188,24 +2306,29 @@ def _add_csv_plot_options(parser: argparse.ArgumentParser) -> None:
         help="Matplotlib font family (default: DejaVu Sans)",
     )
     style_group.add_argument(
+        "--font-size",
+        type=_positive_int,
+        help="Base font size used when title/label/tick/legend font sizes are unset (default: 12)",
+    )
+    style_group.add_argument(
         "--title-font-size",
         type=_positive_int,
-        help="Title font size (default: 14)",
+        help="Title font size (default: inherited from base font size, normally 14)",
     )
     style_group.add_argument(
         "--label-font-size",
         type=_positive_int,
-        help="Axis label font size (default: 12)",
+        help="Axis label font size (default: inherited from base font size, normally 12)",
     )
     style_group.add_argument(
         "--tick-font-size",
         type=_positive_int,
-        help="Tick label font size (default: 10)",
+        help="Tick label font size (default: inherited from base font size, normally 10)",
     )
     style_group.add_argument(
         "--legend-font-size",
         type=_positive_int,
-        help="Legend font size (default: 10)",
+        help="Legend font size (default: inherited from base font size, normally 10)",
     )
     style_group.add_argument(
         "--line-width",
@@ -2218,6 +2341,18 @@ def _add_csv_plot_options(parser: argparse.ArgumentParser) -> None:
         nargs="+",
         metavar="COLOR",
         help="Per-series line colors (count must match rendered series count).",
+    )
+    _add_toggle_state_argument(
+        style_group,
+        flag="border",
+        dest="border",
+        feature_name="Plot border",
+    )
+    style_group.add_argument(
+        "--no-border",
+        dest="border",
+        action="store_false",
+        help=argparse.SUPPRESS,
     )
     _add_toggle_state_argument(
         style_group,
@@ -2362,6 +2497,51 @@ def _runtime_option_was_provided(args: argparse.Namespace, setting_key: str) -> 
             if token == flag or token.startswith(f"{flag}="):
                 return True
     return False
+
+
+def _runtime_flag_was_provided(args: argparse.Namespace, *flags: str) -> bool:
+    runtime_argv = tuple(getattr(args, "_runtime_argv", ()))
+    for token in runtime_argv:
+        for flag in flags:
+            if token == flag or token.startswith(f"{flag}="):
+                return True
+    return False
+
+
+def _normalize_rdf_pair_tokens(species_a: str, species_b: str) -> tuple[str, str]:
+    from .analysis.rdf import _normalize_species as _normalize_rdf_species
+
+    return _normalize_rdf_species(species_a), _normalize_rdf_species(species_b)
+
+
+def _rdf_pair_aliases(species_a: str, species_b: str) -> list[tuple[str, str]]:
+    normalized_a, normalized_b = _normalize_rdf_pair_tokens(species_a, species_b)
+    if normalized_a == normalized_b:
+        return [(normalized_a, normalized_b)]
+    return [(normalized_a, normalized_b), (normalized_b, normalized_a)]
+
+
+def _rdf_pair_matches_cli_filter(
+    *,
+    stored_species_a: str,
+    stored_species_b: str,
+    wanted_species_a: str | None,
+    wanted_species_b: str | None,
+) -> bool:
+    normalized_a, normalized_b = _normalize_rdf_pair_tokens(stored_species_a, stored_species_b)
+    if wanted_species_a is not None and wanted_species_b is not None:
+        if normalized_a == wanted_species_a and normalized_b == wanted_species_b:
+            return True
+        return (
+            wanted_species_a != wanted_species_b
+            and normalized_a == wanted_species_b
+            and normalized_b == wanted_species_a
+        )
+    if wanted_species_a is not None and normalized_a != wanted_species_a:
+        return False
+    if wanted_species_b is not None and normalized_b != wanted_species_b:
+        return False
+    return True
 
 
 def _json_ready_setting(value: Any) -> Any:
@@ -2832,24 +3012,29 @@ def _add_plot_common_options(parser: argparse.ArgumentParser) -> None:
         help="Matplotlib font family (default: DejaVu Sans)",
     )
     style_group.add_argument(
+        "--font-size",
+        type=_positive_int,
+        help="Base font size used when title/label/tick/legend font sizes are unset (default: 12)",
+    )
+    style_group.add_argument(
         "--title-font-size",
         type=_positive_int,
-        help="Title font size (default: 14)",
+        help="Title font size (default: inherited from base font size, normally 14)",
     )
     style_group.add_argument(
         "--label-font-size",
         type=_positive_int,
-        help="Axis label font size (default: 12)",
+        help="Axis label font size (default: inherited from base font size, normally 12)",
     )
     style_group.add_argument(
         "--tick-font-size",
         type=_positive_int,
-        help="Tick label font size (default: 10)",
+        help="Tick label font size (default: inherited from base font size, normally 10)",
     )
     style_group.add_argument(
         "--legend-font-size",
         type=_positive_int,
-        help="Legend font size (default: 10)",
+        help="Legend font size (default: inherited from base font size, normally 10)",
     )
     style_group.add_argument(
         "--line-width",
@@ -2865,6 +3050,18 @@ def _add_plot_common_options(parser: argparse.ArgumentParser) -> None:
             "Per-series line colors (count must match rendered series count). For multi-file "
             "plots, stored per-source colors are merged automatically unless this flag is provided."
         ),
+    )
+    _add_toggle_state_argument(
+        style_group,
+        flag="border",
+        dest="border",
+        feature_name="Plot border",
+    )
+    style_group.add_argument(
+        "--no-border",
+        dest="border",
+        action="store_false",
+        help=argparse.SUPPRESS,
     )
     _add_toggle_state_argument(
         style_group,
@@ -2973,8 +3170,8 @@ def _preflight_resolve_cell(
         if cell is not None:
             raise
         LOGGER.info(
-            "Could not resolve cell from simulation input before loading trajectory for %s "
-            "analysis; checking trajectory metadata after load. %s",
+            "Could not resolve cell from trajectory HDF5 metadata or simulation input before "
+            "loading trajectory for %s analysis; checking loaded-frame metadata after load. %s",
             analysis_name,
             exc,
         )
@@ -2994,17 +3191,6 @@ def _resolve_and_apply_required_cell(
     from .resolution import resolve_analysis_cell
 
     has_trajectory_cell = _frames_have_usable_periodic_cell(frames)
-    if cell is None and input_path is None and has_trajectory_cell:
-        resolved = _cell_lengths_from_frame(frames[0])
-        LOGGER.info(
-            "Using periodic cell already present in trajectory for %s analysis: "
-            "A=%.6g, B=%.6g, C=%.6g Angstrom.",
-            analysis_name,
-            resolved[0],
-            resolved[1],
-            resolved[2],
-        )
-        return resolved, "trajectory metadata", None
 
     cell_resolution = pre_resolved
     if cell_resolution is None and preflight_error is None:
@@ -3016,6 +3202,18 @@ def _resolve_and_apply_required_cell(
             )
         except (FileNotFoundError, ValueError) as exc:
             preflight_error = exc
+
+    if cell_resolution is None and cell is None and input_path is None and has_trajectory_cell:
+        resolved = _cell_lengths_from_frame(frames[0])
+        LOGGER.info(
+            "Using periodic cell already present in trajectory for %s analysis: "
+            "A=%.6g, B=%.6g, C=%.6g Angstrom.",
+            analysis_name,
+            resolved[0],
+            resolved[1],
+            resolved[2],
+        )
+        return resolved, "trajectory metadata", None
 
     if cell_resolution is None:
         resolved_error = preflight_error or ValueError("Could not resolve analysis cell.")
@@ -3060,17 +3258,6 @@ def _maybe_apply_density_cell(
     from .resolution import resolve_analysis_cell
 
     has_trajectory_cell = _frames_have_usable_periodic_cell(frames)
-    if cell is None and input_path is None and has_trajectory_cell:
-        resolved = _cell_lengths_from_frame(frames[0])
-        LOGGER.info(
-            "Using periodic cell already present in trajectory for %s: "
-            "A=%.6g, B=%.6g, C=%.6g Angstrom.",
-            analysis_label,
-            resolved[0],
-            resolved[1],
-            resolved[2],
-        )
-        return resolved, "trajectory metadata", None
 
     cell_resolution = pre_resolved
     if cell_resolution is None and preflight_error is None:
@@ -3082,6 +3269,18 @@ def _maybe_apply_density_cell(
             )
         except (FileNotFoundError, ValueError) as exc:
             preflight_error = exc
+
+    if cell_resolution is None and cell is None and input_path is None and has_trajectory_cell:
+        resolved = _cell_lengths_from_frame(frames[0])
+        LOGGER.info(
+            "Using periodic cell already present in trajectory for %s: "
+            "A=%.6g, B=%.6g, C=%.6g Angstrom.",
+            analysis_label,
+            resolved[0],
+            resolved[1],
+            resolved[2],
+        )
+        return resolved, "trajectory metadata", None
 
     if cell_resolution is None:
         resolved_error = preflight_error or ValueError("Could not resolve density cell.")
@@ -3138,8 +3337,9 @@ def _preflight_resolve_analysis_timestep_fs(
         if timestep_fs is not None:
             raise
         LOGGER.info(
-            "Could not resolve timestep from simulation input before loading trajectory for %s "
-            "analysis; checking trajectory metadata after load. %s",
+            "Could not resolve timestep from trajectory HDF5 metadata or simulation input "
+            "before loading trajectory for %s analysis; checking loaded-frame metadata after "
+            "load. %s",
             analysis_name,
             exc,
         )
@@ -3236,12 +3436,14 @@ def _build_plot_style(args: argparse.Namespace) -> PlotStyle:
         figure_size=figure_size,
         dpi=args.dpi,
         font_family=args.font_family,
+        font_size=getattr(args, "font_size", None),
         title_font_size=args.title_font_size,
         label_font_size=args.label_font_size,
         tick_font_size=args.tick_font_size,
         legend_font_size=args.legend_font_size,
         line_width=args.line_width,
         line_color=args.line_color,
+        axes_border=getattr(args, "border", None),
         grid=args.grid,
         grid_linestyle=args.grid_linestyle,
         grid_linewidth=args.grid_linewidth,
@@ -3538,6 +3740,7 @@ def _apply_effective_series_settings(
         override_fit_enabled: list[bool] = []
         override_fit_labels: list[str | None] = []
         override_fit_show_in_legend: list[bool] = []
+        override_error_configs: list[dict[str, Any] | None] = []
         override_widths: list[float | None] = []
         override_markers: list[str | None] = []
         override_line_kwargs: list[dict[str, Any] | None] = []
@@ -3550,6 +3753,7 @@ def _apply_effective_series_settings(
         any_fit = False
         any_fit_label = False
         any_fit_hidden_in_legend = False
+        any_error = False
         any_width = False
         any_marker = False
         any_line_kwargs = False
@@ -3592,6 +3796,11 @@ def _apply_effective_series_settings(
 
             override_fit_show_in_legend.append(fit_show_in_legend)
             any_fit_hidden_in_legend = any_fit_hidden_in_legend or (fit_show_in_legend is False)
+
+            error_config = entry.get("error")
+            error_config_value = dict(error_config) if isinstance(error_config, dict) else None
+            override_error_configs.append(error_config_value)
+            any_error = any_error or (error_config_value is not None)
 
             raw_width = entry.get("line_width")
             width_value = None if raw_width in {None, ""} else float(str(raw_width))
@@ -3638,6 +3847,7 @@ def _apply_effective_series_settings(
         args.series_fit_show_in_legend = (
             override_fit_show_in_legend if any_fit_hidden_in_legend else None
         )
+        args.series_error_configs = override_error_configs if any_error else None
         args.series_line_widths = override_widths if any_width else None
         args.series_markers = override_markers if any_marker else None
         args.series_line_kwargs = override_line_kwargs if any_line_kwargs else None
@@ -3649,6 +3859,7 @@ def _apply_effective_series_settings(
         args.series_fit_enabled = None
         args.series_fit_labels = None
         args.series_fit_show_in_legend = None
+        args.series_error_configs = None
 
     if not explicit_labels:
         if merged_labels is not None:
@@ -4488,19 +4699,28 @@ def _build_rdf_gui_lazy_catalog(
         for header in headers:
             resolved_a = str(header.get("species_a", "")).strip() or "UNKNOWN"
             resolved_b = str(header.get("species_b", "")).strip() or resolved_a
+            if not _rdf_pair_matches_cli_filter(
+                stored_species_a=resolved_a,
+                stored_species_b=resolved_b,
+                wanted_species_a=wanted_species_a,
+                wanted_species_b=wanted_species_b,
+            ):
+                continue
+            display_a = resolved_a
+            display_b = resolved_b
             if (
                 wanted_species_a is not None
-                and _normalize_rdf_species(resolved_a) != wanted_species_a
+                and wanted_species_b is not None
+                and wanted_species_a != wanted_species_b
             ):
-                continue
-            if (
-                wanted_species_b is not None
-                and _normalize_rdf_species(resolved_b) != wanted_species_b
-            ):
-                continue
+                normalized_a = _normalize_rdf_species(resolved_a)
+                normalized_b = _normalize_rdf_species(resolved_b)
+                if normalized_a == wanted_species_b and normalized_b == wanted_species_a:
+                    display_a = wanted_species_a
+                    display_b = wanted_species_b
             source_label = _metadata_source_label(header, fallback_source=source)
             rendered_species_a = (
-                f"{source_label}:{resolved_a}" if prefix_source_labels else resolved_a
+                f"{source_label}:{display_a}" if prefix_source_labels else display_a
             )
             profile_index = int(header.get("profile_index", len(source_labels)))
             profile_uid = _profile_uid_from_payload(
@@ -4509,7 +4729,7 @@ def _build_rdf_gui_lazy_catalog(
                 index=profile_index,
             )
             filtered_headers.append(header)
-            source_labels.append(f"{rendered_species_a}-{resolved_b}")
+            source_labels.append(f"{rendered_species_a}-{display_b}")
             source_ids.append(profile_uid)
             source_origins.append(str(header.get("origin_hdf5_path") or source))
             source_load_paths.append(str(header.get("source_path") or source))
@@ -4518,7 +4738,7 @@ def _build_rdf_gui_lazy_catalog(
                     "profile_index": profile_index,
                     "profile_uid": profile_uid,
                     "rendered_species_a": rendered_species_a,
-                    "rendered_species_b": resolved_b,
+                    "rendered_species_b": display_b,
                 }
             )
         filtered_headers_by_source.append((source, filtered_headers))
@@ -5143,6 +5363,38 @@ def _resolve_gui_mode(args: argparse.Namespace) -> bool:
     return use_gui
 
 
+def _filter_plotter_kwargs(
+    plotter: Callable[..., Path | None], kwargs: dict[str, Any]
+) -> dict[str, Any]:
+    """Return kwargs accepted by the target plotter signature."""
+    try:
+        signature = inspect.signature(plotter)
+    except (TypeError, ValueError):
+        return kwargs
+
+    if any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in signature.parameters.values()
+    ):
+        return kwargs
+
+    accepted = {
+        name
+        for name, parameter in signature.parameters.items()
+        if parameter.kind
+        in {inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY}
+    }
+    filtered = {name: value for name, value in kwargs.items() if name in accepted}
+    dropped = sorted(set(kwargs) - set(filtered))
+    if dropped:
+        LOGGER.debug(
+            "Dropping unsupported plot kwargs for %s: %s",
+            getattr(plotter, "__name__", repr(plotter)),
+            ", ".join(dropped),
+        )
+    return filtered
+
+
 def _render_profile_plot(
     *,
     args: argparse.Namespace,
@@ -5223,10 +5475,12 @@ def _render_profile_plot(
         "series_normalization_modes": getattr(args, "series_normalization_modes", None),
         "series_normalization_values": getattr(args, "series_normalization_values", None),
         "series_normalization_x_refs": getattr(args, "series_normalization_x_refs", None),
+        "annotations": getattr(args, "annotations", None),
         "x_bin_width": getattr(args, "x_bin_width", None)
         if getattr(args, "x_bin_width", None) is not None
         else getattr(args, "time_section_width", None),
         "x_bin_reducer": getattr(args, "x_bin_reducer", None),
+        "min_bin_points": getattr(args, "min_bin_points", None),
         "matplotlib_rc": getattr(args, "matplotlib_rc", None),
         "figure_kwargs": getattr(args, "figure_kwargs", None),
         "axes_kwargs": getattr(args, "axes_kwargs", None),
@@ -5256,6 +5510,9 @@ def _render_profile_plot(
         "series_fit_show_in_legend",
         None,
     )
+    shared_kwargs["series_error_configs"] = getattr(args, "series_error_configs", None)
+    shared_kwargs["render_series_descriptors"] = ordered_descriptors or None
+    shared_kwargs["series_overrides_by_id"] = getattr(args, "series_overrides", None)
 
     def _render_with_options(show: bool, output: str | Path | None) -> Path | None:
         call_kwargs = dict(shared_kwargs)
@@ -5285,6 +5542,24 @@ def _render_profile_plot(
             fit_show_in_legend = call_kwargs.pop("series_fit_show_in_legend", None)
             if isinstance(fit_show_in_legend, list) and fit_show_in_legend:
                 call_kwargs["fit_show_in_legend"] = bool(fit_show_in_legend[0])
+            error_configs = call_kwargs.pop("series_error_configs", None)
+            if isinstance(error_configs, list) and error_configs:
+                first_error_config = error_configs[0]
+                if isinstance(first_error_config, dict):
+                    call_kwargs["error_config"] = dict(first_error_config)
+            render_descriptors = call_kwargs.get("render_series_descriptors")
+            override_map = call_kwargs.get("series_overrides_by_id")
+            if (
+                isinstance(render_descriptors, list)
+                and render_descriptors
+                and isinstance(override_map, dict)
+            ):
+                first_series_id = str(render_descriptors[0].get("series_id") or "").strip()
+                first_override = override_map.get(first_series_id)
+                if isinstance(first_override, dict) and isinstance(
+                    first_override.get("cumulative"), dict
+                ):
+                    call_kwargs["cumulative_config"] = dict(first_override["cumulative"])
             per_series_line_kwargs = call_kwargs.pop("series_line_kwargs", None)
             if isinstance(per_series_line_kwargs, list) and per_series_line_kwargs:
                 first_kwargs = per_series_line_kwargs[0]
@@ -5294,14 +5569,15 @@ def _render_profile_plot(
                         merged_line_kwargs.update(dict(call_kwargs["line_kwargs"]))
                     merged_line_kwargs.update(first_kwargs)
                     call_kwargs["line_kwargs"] = merged_line_kwargs
+        merged_kwargs = dict(extra_kwargs)
+        merged_kwargs.update(call_kwargs)
         return plotter(
             ordered_profile,
             output=output,
             show=show,
             preferred_backend=args.backend,
             style=style,
-            **extra_kwargs,
-            **call_kwargs,
+            **_filter_plotter_kwargs(plotter, merged_kwargs),
         )
 
     if args.show:
@@ -5394,7 +5670,8 @@ def _open_plot_settings_gui(
     on_preview: Callable[[dict[str, Any]], dict[str, Any] | None],
     on_save: Callable[[str, dict[str, Any]], str],
     on_save_figure: Callable[[dict[str, Any], str], str | tuple[str, dict[str, Any]]] | None = None,
-    on_import_hdf5: Callable[[str, str], dict[str, Any]] | None = None,
+    on_import_hdf5: Callable[[str, str | None], dict[str, Any]] | None = None,
+    on_list_import_hdf5_profiles: Callable[[str], dict[str, Any]] | None = None,
     analysis_name: str | None = None,
     on_resolve_series_defaults: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
     initial_profile_name: str | None = None,
@@ -5414,6 +5691,7 @@ def _open_plot_settings_gui(
         on_save=on_save,
         on_save_figure=on_save_figure,
         on_import_hdf5=on_import_hdf5,
+        on_list_import_hdf5_profiles=on_list_import_hdf5_profiles,
         analysis_name=analysis_name,
         on_resolve_series_defaults=on_resolve_series_defaults,
         initial_profile_name=initial_profile_name,
@@ -5484,12 +5762,10 @@ def _launch_profile_plot_gui(
     initial_profile_name = (
         read_active_plot_profile_name(source_path, profile_key) or available_profile_names[0]
     )
-    if not allow_named_profiles:
-        initial_profile_name = "Default"
     initial_saved_profile = read_plot_profile(
         source_path,
         profile_key,
-        profile_name=(initial_profile_name if allow_named_profiles else None),
+        profile_name=initial_profile_name,
     )
     initial_settings = _merge_gui_only_plot_settings(initial_settings, initial_saved_profile)
     initial_settings = _strip_redundant_series_lists_for_gui(initial_settings)
@@ -5626,14 +5902,29 @@ def _launch_profile_plot_gui(
             raise ValueError("No output was generated for the requested figure path.")
         return f"Saved figure to '{saved_path}'.", render_state
 
-    def _import_hdf5(source_hdf5_path: str, profile_name: str) -> dict[str, Any]:
+    def _list_import_hdf5_profiles(source_hdf5_path: str) -> dict[str, Any]:
+        imported_path = Path(source_hdf5_path).expanduser().resolve()
+        available_names = read_plot_profile_names(imported_path, profile_key)
+        if not available_names:
+            if read_plot_profile(imported_path, profile_key) is None:
+                raise ValueError(
+                    f"No plot settings profile '{profile_key}' found in '{imported_path}'."
+                )
+            available_names = ["Default"]
+        active_name = read_active_plot_profile_name(imported_path, profile_key)
+        if active_name is None and "Default" in available_names:
+            active_name = "Default"
+        return {
+            "available_names": available_names,
+            "active_name": active_name,
+        }
+
+    def _import_hdf5(source_hdf5_path: str, profile_name: str | None) -> dict[str, Any]:
         imported_path = Path(source_hdf5_path).expanduser().resolve()
         imported = read_plot_profile(imported_path, profile_key, profile_name=profile_name)
         if imported is None:
-            imported = read_plot_profile(imported_path, profile_key)
-        if imported is None:
             raise ValueError(
-                f"No plot settings profile '{profile_key}' found in '{imported_path}'."
+                f"No plot settings profile '{profile_name or profile_key}' found in '{imported_path}'."
             )
         LOGGER.info(
             "Loaded plot settings template from '%s' (%s).",
@@ -5697,14 +5988,15 @@ def _launch_profile_plot_gui(
         on_save=_save,
         on_save_figure=_save_figure,
         on_import_hdf5=_import_hdf5,
+        on_list_import_hdf5_profiles=_list_import_hdf5_profiles,
         analysis_name=analysis_name,
         on_resolve_series_defaults=_resolve_series_defaults,
         initial_profile_name=initial_profile_name,
         available_profile_names=available_profile_names,
         default_profile_settings=default_settings,
-        on_load_profile=_load_profile if allow_named_profiles else None,
-        on_delete_profile=_delete_profile if allow_named_profiles else None,
-        on_set_active_profile=_set_active_profile if allow_named_profiles else None,
+        on_load_profile=_load_profile,
+        on_delete_profile=_delete_profile,
+        on_set_active_profile=_set_active_profile,
         allow_named_profiles=allow_named_profiles,
     )
 
@@ -5825,10 +6117,12 @@ def _handle_apply_overview(_args: argparse.Namespace) -> int:
                 "Apply commands transform trajectory files and related simulation artifacts.",
                 "",
                 "Examples",
+                "  linak apply convert /path/to/traj.xyz",
                 "  linak apply pbc /path/to/traj.xyz --cell 10 10 10",
                 "  linak apply compress /path/to/output.out",
                 "",
                 "Need command options?",
+                "  linak apply convert --help",
                 "  linak apply pbc --help",
                 "  linak apply compress --help",
             ]
@@ -6067,8 +6361,8 @@ def build_parser() -> argparse.ArgumentParser:
     compute_density.add_argument(
         "--bin-width",
         type=_positive_float,
-        default=0.1,
-        help="Histogram bin width in Angstrom (default: 0.1)",
+        default=0.05,
+        help="Histogram bin width in Angstrom (default: 0.05)",
     )
     compute_density.add_argument(
         "--surface-mode",
@@ -6342,13 +6636,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     compute_coordination.add_argument(
         "--species-a",
-        default="all",
-        help="Center species for coordination analysis (default: all)",
+        required=True,
+        help="Center species for coordination analysis.",
     )
     compute_coordination.add_argument(
         "--species-b",
-        default=None,
-        help="Neighbor species for coordination analysis (default: same as species-a)",
+        required=True,
+        help="Neighbor species for coordination analysis.",
     )
     compute_coordination.add_argument(
         "--axis",
@@ -6415,7 +6709,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--cutoff-from-rdf",
         action="store_true",
         help=(
-            "Recompute an average RDF from sampled frames and determine the coordination cutoff "
+            "Recompute an average RDF from all frames and determine the coordination cutoff "
             "(used automatically when neither --cutoff nor --cutoff-rdf is provided)."
         ),
     )
@@ -6646,6 +6940,48 @@ def build_parser() -> argparse.ArgumentParser:
     )
     apply_parser.set_defaults(handler=_handle_apply_overview)
     apply_commands = apply_parser.add_subparsers(dest="apply_command", required=False)
+
+    apply_convert = apply_commands.add_parser(
+        "convert",
+        help="Convert a trajectory into LiNaK's fast trajectory HDF5 format.",
+        description=(
+            "Convert a trajectory into LiNaK trajectory HDF5 (`*.traj.h5`) for faster "
+            "repeated analysis while preserving exact frame counts for progress reporting."
+        ),
+    )
+    apply_convert.add_argument(
+        "trajectory", nargs="?", help="Input trajectory path (legacy positional form)"
+    )
+    apply_convert.add_argument(
+        "-f",
+        "--files",
+        nargs="+",
+        metavar="PATH",
+        help=(
+            "Trajectory source path(s). Use -f/--files even for one file; "
+            "this command accepts exactly one source."
+        ),
+    )
+    apply_convert.add_argument(
+        "-o",
+        "--output",
+        help="Output trajectory HDF5 path (default: <input-stem>.traj.h5 next to input)",
+    )
+    apply_convert.add_argument(
+        "--input",
+        help=(
+            "Optional simulation input file used to embed cell/timestep/fixed-atom metadata "
+            "into the converted trajectory HDF5."
+        ),
+    )
+    apply_convert.add_argument(
+        "--format",
+        choices=("hdf5",),
+        default="hdf5",
+        help="Converted trajectory format (currently only: hdf5).",
+    )
+    _add_dry_run_option(apply_convert)
+    apply_convert.set_defaults(handler=_handle_apply_convert)
 
     apply_pbc = apply_commands.add_parser(
         "pbc",
@@ -8093,6 +8429,7 @@ def _render_csv_plot(
                 "figsize": [float(style.figure_size[0]), float(style.figure_size[1])],
                 "dpi": int(style.dpi),
                 "font_family": style.font_family,
+                "font_size": int(style.base_font_size),
                 "title_font_size": int(style.title_font_size),
                 "label_font_size": int(style.label_font_size),
                 "tick_font_size": int(style.tick_font_size),
@@ -8375,6 +8712,7 @@ def _handle_csv_interactive(args: argparse.Namespace) -> int:
             figsize=None,
             dpi=None,
             font_family=None,
+            font_size=None,
             title_font_size=None,
             label_font_size=None,
             tick_font_size=None,
@@ -9689,6 +10027,7 @@ def _handle_compute_density(args: argparse.Namespace) -> int:
     from .trajectory.io import read_trajectory
 
     source_path = Path(args.trajectory).expanduser().resolve()
+    _maybe_log_trajectory_convert_hint(source_path)
     pre_resolved_cell, preflight_cell_error = _preflight_resolve_cell(
         args.trajectory,
         cell=_normalize_cell_args(args),
@@ -9795,6 +10134,7 @@ def _handle_compute_msd(args: argparse.Namespace) -> int:
     from .analysis.msd import compute_msd, save_msd_profile
 
     source_path = Path(args.trajectory).expanduser().resolve()
+    _maybe_log_trajectory_convert_hint(source_path)
     pre_resolved_cell, preflight_cell_error = _preflight_resolve_cell(
         args.trajectory,
         cell=_normalize_cell_args(args),
@@ -9926,6 +10266,7 @@ def _handle_compute_position(args: argparse.Namespace) -> int:
     from .trajectory.io import read_trajectory
 
     source_path = Path(args.trajectory).expanduser().resolve()
+    _maybe_log_trajectory_convert_hint(source_path)
     pre_resolved_cell, preflight_cell_error = _preflight_resolve_cell(
         args.trajectory,
         cell=_normalize_cell_args(args),
@@ -10028,6 +10369,10 @@ def _handle_compute_rdf(args: argparse.Namespace) -> int:
         source_label="trajectory input file",
     )
 
+    explicit_species_a = _runtime_flag_was_provided(args, "--species-a")
+    explicit_species_b = _runtime_flag_was_provided(args, "--species-b")
+    pairwise_default_mode = not explicit_species_a and not explicit_species_b
+
     if args.dry_run:
         source_path = Path(args.trajectory).expanduser().resolve()
         resolved_cell, cell_source = _preview_resolve_cell_without_trajectory_read(
@@ -10050,21 +10395,35 @@ def _handle_compute_rdf(args: argparse.Namespace) -> int:
             r_max_preview = (
                 f"{args.r_max:.6g} (explicit)"
                 if args.r_max is not None
-                else f"{0.5 * min(resolved_cell):.6g} (half min resolved perpendicular cell height)"
+                else (
+                    f"{(max(1, int(np.floor((0.5 * min(resolved_cell)) / args.bin_width))) * args.bin_width):.6g} "
+                    f"(auto rounded down from {0.5 * min(resolved_cell):.6g} to match bin_width={args.bin_width:.6g})"
+                )
             )
         species_b = args.species_b if args.species_b is not None else args.species_a
+        default_output = (
+            _default_rdf_collection_hdf5_output_path(args.trajectory)
+            if pairwise_default_mode
+            else _default_rdf_hdf5_output_path(args.trajectory, args.species_a, species_b)
+        )
         output_preview = str(
             _resolve_single_analysis_hdf5_output_path(
                 args.output,
-                _default_rdf_hdf5_output_path(args.trajectory, args.species_a, species_b),
+                default_output,
             )
         )
         plan = [
             f"trajectory source: {source_path}",
             (
-                f"species_a={args.species_a}, species_b={species_b}, r_max="
-                f"{args.r_max if args.r_max is not None else 'auto'}, bin_width={args.bin_width}, "
-                f"threads={args.threads if args.threads is not None else 'auto'}"
+                "mode=pairwise element collection, species resolved from trajectory at execution, "
+                f"r_max={args.r_max if args.r_max is not None else 'auto'}, "
+                f"bin_width={args.bin_width}, threads={args.threads if args.threads is not None else 'auto'}"
+                if pairwise_default_mode
+                else (
+                    f"mode=single pair, species_a={args.species_a}, species_b={species_b}, r_max="
+                    f"{args.r_max if args.r_max is not None else 'auto'}, bin_width={args.bin_width}, "
+                    f"threads={args.threads if args.threads is not None else 'auto'}"
+                )
             ),
             f"cell resolution: {cell_preview}",
             f"r_max resolution: {r_max_preview}",
@@ -10075,9 +10434,15 @@ def _handle_compute_rdf(args: argparse.Namespace) -> int:
         return 0
 
     from .trajectory.io import read_trajectory
-    from .analysis.rdf import compute_rdf, save_rdf_profile
+    from .analysis.rdf import (
+        compute_rdf,
+        compute_rdf_profiles,
+        save_rdf_profile,
+        save_rdf_profiles,
+    )
 
     source_path = Path(args.trajectory).expanduser().resolve()
+    _maybe_log_trajectory_convert_hint(source_path)
     pre_resolved_cell, preflight_cell_error = _preflight_resolve_cell(
         args.trajectory,
         cell=_normalize_cell_args(args),
@@ -10094,18 +10459,6 @@ def _handle_compute_rdf(args: argparse.Namespace) -> int:
         pre_resolved=pre_resolved_cell,
         preflight_error=preflight_cell_error,
     )
-    profile = compute_rdf(
-        frames=frames,
-        species_a=args.species_a,
-        species_b=args.species_b,
-        r_max=args.r_max,
-        bin_width=args.bin_width,
-        threads=args.threads,
-    )
-    output = _resolve_single_analysis_hdf5_output_path(
-        args.output,
-        _default_rdf_hdf5_output_path(args.trajectory, profile.species_a, profile.species_b),
-    )
     rdf_metadata: dict[str, Any] = {
         "source_path": str(source_path),
         "cell_source": cell_source,
@@ -10113,7 +10466,32 @@ def _handle_compute_rdf(args: argparse.Namespace) -> int:
     }
     if cell_input_path is not None:
         rdf_metadata["input_path"] = cell_input_path
-    save_rdf_profile(profile, output, additional_metadata=rdf_metadata)
+    if pairwise_default_mode:
+        profiles = compute_rdf_profiles(
+            frames=frames,
+            r_max=args.r_max,
+            bin_width=args.bin_width,
+            threads=args.threads,
+        )
+        output = _resolve_single_analysis_hdf5_output_path(
+            args.output,
+            _default_rdf_collection_hdf5_output_path(args.trajectory),
+        )
+        save_rdf_profiles(profiles, output, additional_metadata=rdf_metadata)
+    else:
+        profile = compute_rdf(
+            frames=frames,
+            species_a=args.species_a,
+            species_b=args.species_b,
+            r_max=args.r_max,
+            bin_width=args.bin_width,
+            threads=args.threads,
+        )
+        output = _resolve_single_analysis_hdf5_output_path(
+            args.output,
+            _default_rdf_hdf5_output_path(args.trajectory, profile.species_a, profile.species_b),
+        )
+        save_rdf_profile(profile, output, additional_metadata=rdf_metadata)
 
     LOGGER.info("RDF compute finished in %.2f s.", perf_counter() - start)
     return 0
@@ -10127,8 +10505,7 @@ def _handle_compute_coordination(args: argparse.Namespace) -> int:
         positional_attr="trajectory",
         source_label="trajectory input file",
     )
-
-    species_b = args.species_b if args.species_b is not None else args.species_a
+    species_b = args.species_b
     output_path = _resolve_single_analysis_hdf5_output_path(
         args.output,
         _default_coordination_hdf5_output_path(args.trajectory, args.species_a, species_b),
@@ -10159,7 +10536,7 @@ def _handle_compute_coordination(args: argparse.Namespace) -> int:
         elif args.cutoff_rdf:
             cutoff_preview = f"RDF file={Path(args.cutoff_rdf).expanduser().resolve()}"
         else:
-            cutoff_preview = "sampled RDF convergence (random batches until cutoff stabilizes)"
+            cutoff_preview = "full-trajectory RDF cutoff"
         plan = [
             f"trajectory source: {source_path}",
             (
@@ -10176,7 +10553,7 @@ def _handle_compute_coordination(args: argparse.Namespace) -> int:
             (
                 "cutoff diagnostic PNG: none"
                 if diagnostic_plot_output is None
-                else str(diagnostic_plot_output)
+                else f"cutoff diagnostic PNG: {diagnostic_plot_output}"
             ),
         ]
         _log_dry_run_plan("compute coordination", plan)
@@ -10192,6 +10569,7 @@ def _handle_compute_coordination(args: argparse.Namespace) -> int:
     from .trajectory.io import read_trajectory
 
     source_path = Path(args.trajectory).expanduser().resolve()
+    _maybe_log_trajectory_convert_hint(source_path)
     pre_resolved_cell, preflight_cell_error = _preflight_resolve_cell(
         args.trajectory,
         cell=_normalize_cell_args(args),
@@ -10237,6 +10615,25 @@ def _handle_compute_coordination(args: argparse.Namespace) -> int:
             preflight_error=preflight_timestep_error,
         )
     )
+    coordination_metadata: dict[str, Any] = {
+        "source_path": str(source_path),
+        "cell_source": cell_source,
+        "timestep_source": timestep_source,
+        "frame_timestep_fs": float(timestep_fs),
+        "positions_pbc_corrected": bool(pbc_corrected_positions),
+    }
+    if pbc_cell is not None:
+        coordination_metadata["pbc_cell_angstrom"] = list(pbc_cell)
+    if resolved_cell is not None:
+        coordination_metadata["resolved_cell_angstrom"] = list(resolved_cell)
+    if cell_input_path is not None:
+        coordination_metadata["cell_input_path"] = cell_input_path
+    if timestep_input_path is not None:
+        coordination_metadata["timestep_input_path"] = timestep_input_path
+    if md_timestep_fs is not None:
+        coordination_metadata["md_timestep_fs"] = float(md_timestep_fs)
+    if trajectory_stride_md is not None:
+        coordination_metadata["trajectory_stride_md"] = int(trajectory_stride_md)
     cutoff_resolution = resolve_coordination_cutoff(
         frames=analysis_frames,
         species_a=args.species_a,
@@ -10259,25 +10656,6 @@ def _handle_compute_coordination(args: argparse.Namespace) -> int:
         surface_options=_surface_options_from_cli_args(args),
         cutoff_resolution=cutoff_resolution,
     )
-    coordination_metadata: dict[str, Any] = {
-        "source_path": str(source_path),
-        "cell_source": cell_source,
-        "timestep_source": timestep_source,
-        "frame_timestep_fs": float(timestep_fs),
-        "positions_pbc_corrected": bool(pbc_corrected_positions),
-    }
-    if pbc_cell is not None:
-        coordination_metadata["pbc_cell_angstrom"] = list(pbc_cell)
-    if resolved_cell is not None:
-        coordination_metadata["resolved_cell_angstrom"] = list(resolved_cell)
-    if cell_input_path is not None:
-        coordination_metadata["cell_input_path"] = cell_input_path
-    if timestep_input_path is not None:
-        coordination_metadata["timestep_input_path"] = timestep_input_path
-    if md_timestep_fs is not None:
-        coordination_metadata["md_timestep_fs"] = float(md_timestep_fs)
-    if trajectory_stride_md is not None:
-        coordination_metadata["trajectory_stride_md"] = int(trajectory_stride_md)
     save_coordination_profile(profile, output_path, additional_metadata=coordination_metadata)
 
     LOGGER.info("Coordination compute finished in %.2f s.", perf_counter() - start)
@@ -10525,6 +10903,7 @@ def _handle_compute_orientation(args: argparse.Namespace) -> int:
     from .trajectory.io import read_trajectory
 
     source_path = Path(args.trajectory).expanduser().resolve()
+    _maybe_log_trajectory_convert_hint(source_path)
     pre_resolved_cell, preflight_cell_error = _preflight_resolve_cell(
         args.trajectory,
         cell=_normalize_cell_args(args),
@@ -10646,6 +11025,75 @@ def _handle_apply_pbc(args: argparse.Namespace) -> int:
     write_trajectory(wrapped_frames, output_path)
 
     LOGGER.info("PBC application finished in %.2f s.", perf_counter() - start)
+    return 0
+
+
+def _handle_apply_convert(args: argparse.Namespace) -> int:
+    start = perf_counter()
+    LOGGER.info("Starting trajectory conversion.")
+    _resolve_single_source_argument(
+        args,
+        positional_attr="trajectory",
+        source_label="trajectory input file",
+    )
+
+    source_path = Path(args.trajectory).expanduser().resolve()
+    if args.format != "hdf5":
+        raise ValueError(f"Unsupported conversion format '{args.format}'.")
+
+    if args.output:
+        output_path = Path(args.output).expanduser().resolve()
+    else:
+        output_path = _default_apply_convert_output_path(args.trajectory)
+        if output_path.exists():
+            output_path = _unique_path_with_numeric_suffix(output_path)
+
+    if args.dry_run:
+        stored_metadata, metadata_notes = _collect_trajectory_conversion_metadata(
+            source_path,
+            input_path=args.input,
+        )
+        plan = [
+            f"input trajectory: {source_path}",
+            f"output trajectory HDF5: {output_path}",
+            "format marker: linak-trajectory-hdf5",
+            "storage: chunked HDF5 datasets with lightweight compression",
+            "topology policy: fixed atom count and ordering required across all frames",
+            "workflow: converted trajectory remains a direct input to `linak compute ...`",
+        ]
+        if stored_metadata is not None:
+            plan.append(
+                "embedded metadata precedence: explicit CLI > trajectory HDF5 > input discovery"
+            )
+        plan.extend(metadata_notes)
+        _log_dry_run_plan("apply convert", plan)
+        LOGGER.info("Trajectory conversion dry run finished in %.2f s.", perf_counter() - start)
+        return 0
+
+    from .trajectory.io import read_trajectory, write_trajectory
+
+    frames = read_trajectory(source_path)
+    stored_metadata, metadata_notes = _collect_trajectory_conversion_metadata(
+        source_path,
+        input_path=args.input,
+    )
+    for note in metadata_notes:
+        LOGGER.info("%s", note)
+    converted_path = write_trajectory(
+        frames,
+        output_path,
+        source_path=source_path,
+        source_format=source_path.suffix.lower().lstrip("."),
+        metadata=stored_metadata,
+    )
+    LOGGER.info(
+        "Trajectory conversion finished in %.2f s. frames=%d atoms/frame=%d output=%s",
+        perf_counter() - start,
+        len(frames),
+        len(frames[0]),
+        converted_path,
+    )
+    print(converted_path)
     return 0
 
 

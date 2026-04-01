@@ -73,6 +73,42 @@ def _resolve_path(input_path: Path, value: str) -> Path:
     return (input_path.parent / raw).resolve()
 
 
+def _expand_lammps_id_tokens(tokens: list[str], *, input_path: Path, line_number: int) -> list[int]:
+    indices: list[int] = []
+    for token in tokens:
+        stripped = token.strip().rstrip(",")
+        if not stripped:
+            continue
+        if ":" in stripped:
+            parts = [part.strip() for part in stripped.split(":")]
+            if len(parts) not in {2, 3} or any(not part for part in parts):
+                raise ValueError(
+                    f"Unsupported LAMMPS group id range '{token}' in '{input_path}' line {line_number}."
+                )
+            try:
+                start = int(parts[0])
+                stop = int(parts[1])
+                step = int(parts[2]) if len(parts) == 3 else 1
+            except ValueError as exc:
+                raise ValueError(
+                    f"Invalid LAMMPS group id range '{token}' in '{input_path}' line {line_number}."
+                ) from exc
+            if step == 0:
+                raise ValueError(
+                    f"Invalid zero step in LAMMPS group id range '{token}' in '{input_path}' line {line_number}."
+                )
+            stop_inclusive = stop + (1 if step > 0 else -1)
+            indices.extend(range(start, stop_inclusive, step))
+            continue
+        try:
+            indices.append(int(stripped))
+        except ValueError as exc:
+            raise ValueError(
+                f"Unsupported LAMMPS group id token '{token}' in '{input_path}' line {line_number}."
+            ) from exc
+    return indices
+
+
 def parse_lammps_input(path: str | Path) -> LammpsInputMetadata:
     """Parse key metadata from a LAMMPS ``.lmp`` input script."""
     input_path = Path(path).expanduser().resolve()
@@ -298,3 +334,48 @@ def extract_frame_timestep_fs_from_lammps_input(path: str | Path) -> tuple[float
     frame_timestep_fs = md_timestep_fs * float(stride_md)
     ensure_positive("frame_timestep_fs", frame_timestep_fs)
     return frame_timestep_fs, md_timestep_fs, stride_md
+
+
+def extract_fixed_atom_indices_from_lammps_input(path: str | Path) -> tuple[int, ...] | None:
+    """Extract fixed atom indices from simple LAMMPS ``group ... id`` + ``fix ... setforce``."""
+    input_path = Path(path).expanduser().resolve()
+    if not input_path.exists():
+        raise FileNotFoundError(f"LAMMPS input file not found: {input_path}")
+    if not input_path.is_file():
+        raise ValueError(f"LAMMPS input path is not a file: {input_path}")
+
+    group_indices_by_name: dict[str, tuple[int, ...]] = {}
+    fixed_atom_indices: set[int] = set()
+
+    with input_path.open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            tokens = _tokenize_lammps_line(line)
+            if not tokens:
+                continue
+
+            command = tokens[0].lower()
+            if command == "group" and len(tokens) >= 4 and tokens[2].lower() == "id":
+                indices = _expand_lammps_id_tokens(
+                    tokens[3:], input_path=input_path, line_number=line_number
+                )
+                if indices:
+                    zero_based = tuple(sorted({index - 1 for index in indices if index > 0}))
+                    if zero_based:
+                        group_indices_by_name[tokens[1]] = zero_based
+                continue
+
+            if command != "fix" or len(tokens) < 6:
+                continue
+            if tokens[3].lower() != "setforce":
+                continue
+            try:
+                forces = tuple(float(tokens[position]) for position in range(4, 7))
+            except (IndexError, ValueError):
+                continue
+            if any(abs(value) > 1e-12 for value in forces):
+                continue
+            fixed_atom_indices.update(group_indices_by_name.get(tokens[2], ()))
+
+    if not fixed_atom_indices:
+        return None
+    return tuple(sorted(fixed_atom_indices))

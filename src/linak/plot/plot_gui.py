@@ -4,17 +4,26 @@ from __future__ import annotations
 
 import json
 from copy import deepcopy
+from dataclasses import dataclass
 import html
 from pathlib import Path
 import re
 import tempfile
+from collections.abc import Sequence
 from typing import Any, Callable
 from uuid import uuid4
 
 import numpy as np
 
 from .fitting import coerce_fit_config, default_fit_config, supported_fit_types
-from .plotting import DEFAULT_PLOT_STYLE, default_series_colors
+from .plotting import (
+    _describe_error_provenance,
+    _coerce_plot_annotations,
+    DEFAULT_PLOT_STYLE,
+    default_plot_font_sizes,
+    default_series_colors,
+    resolve_series_error_availability,
+)
 
 _LEGEND_LOCATIONS = (
     "best",
@@ -42,6 +51,15 @@ _SYNC_MODES = ("Auto", "Manual")
 _TEXT_SYNC_MODES = ("Auto", "Manual", "Off")
 _FIT_TYPES = supported_fit_types()
 _FIT_RANGE_MODES = ("visible", "manual")
+_ERROR_STATS = ("sample_sem", "sample_std", "block_sem", "block_std")
+_ERROR_STYLES = ("band", "whiskers")
+_GROUP_REDUCERS = ("mean", "median", "sum", "min", "max")
+_ANNOTATION_TYPES = ("text", "line", "arrow")
+_ANNOTATION_COORD_SYSTEMS = ("data", "axes")
+_ANNOTATION_LINE_STYLES = ("-", "--", "-.", ":")
+_ANNOTATION_ARROW_STYLES = ("->", "-|>", "<->", "simple", "fancy")
+_ANNOTATION_HORIZONTAL_ALIGN = ("left", "center", "right")
+_ANNOTATION_VERTICAL_ALIGN = ("top", "center", "bottom", "baseline")
 _PROFILE_FILTER_METADATA_LABEL = "Use stored metadata"
 _PROFILE_FILTER_SPECIES_B_AUTO_LABEL = "Same as Species A / stored metadata"
 _AUTO_PREVIEW_DEBOUNCE_MS = 1000
@@ -142,16 +160,24 @@ _TOOLTIPS: dict[str, str] = {
     "data.potential.incomplete_rows": "Shows how many records have missing values.",
     "data.section.width": "Groups nearby x-values into wider sections.",
     "data.section.reducer": "Chooses how each section is summarized.",
+    "data.section.min_points": "Requires at least this many contributing raw points in a plotted bin before LiNaK shows the value, uncertainty, or fit input for that bin.",
     "data.section.y_width": "Groups nearby y-values (angle bins) into wider sections. Only used for heatmaps.",
     "data.section.y_reducer": "Chooses how each y-section is summarized.",
     "series.all_on": "Turns every series on.",
     "series.all_off": "Turns every series off.",
+    "series.duplicate": "Duplicates the selected base or grouped series.",
+    "series.add_group": "Adds a grouped series that can aggregate several loaded base series.",
     "series.show_in_legend": "Shows or hides this series in the legend.",
     "series.label": "Sets the legend name for this series.",
     "series.color": "Sets the line color for this series.",
     "series.alpha": "Sets the line transparency for this series.",
     "series.line_width": "Sets the line width for this series.",
     "series.marker": "Sets the marker shape for this series.",
+    "series.error_enabled": "Turns uncertainty display for this series on or off.",
+    "series.error_stat": "Chooses the uncertainty statistic. sample_* uses sample spread or SEM, block_* uses contiguous frame-block spread or SEM when saved by the analysis.",
+    "series.error_style": "Chooses whether uncertainty is shown as a shaded band or whiskers around the current series.",
+    "series.error_color": "Sets a separate error-overlay color. Leave blank to follow the base series color.",
+    "series.error.summary": "Shows which uncertainty is currently rendered, what data it is computed from, and any fallback or availability reason.",
     "series.fit_enabled": "Turns fitting for this series on or off.",
     "series.fit_type": "Chooses the fitting model.",
     "series.fit_degree": "Sets the polynomial degree.",
@@ -170,6 +196,43 @@ _TOOLTIPS: dict[str, str] = {
     "series.meta.series_id": "Shows the internal ID of this series.",
     "series.fit.summary": "Shows the current fit result for this series.",
     "series.fit.warning": "Shows why the fit could not be made.",
+    "series.cumulative_enabled": "Turns the cumulative-average derived line for this series on or off.",
+    "series.cumulative_show_in_legend": "Shows or hides the cumulative-average line in the legend.",
+    "series.cumulative_label": "Sets the legend name for the cumulative-average line.",
+    "series.cumulative.summary": "Shows the current cumulative-average derived-line status for this series.",
+    "series.group.reducer": "Chooses how the selected member series are aggregated into one grouped line.",
+    "series.group.members": "Chooses which loaded non-group base series contribute to this grouped line.",
+    "annotations.list": "Shows the figure-level annotations applied on top of the current plot.",
+    "annotations.add_text": "Adds a new text annotation.",
+    "annotations.add_line": "Adds a new line annotation.",
+    "annotations.add_arrow": "Adds a new arrow annotation.",
+    "annotations.duplicate": "Duplicates the selected annotation.",
+    "annotations.delete": "Deletes the selected annotation.",
+    "annotations.move_up": "Moves the selected annotation earlier in the draw order.",
+    "annotations.move_down": "Moves the selected annotation later in the draw order.",
+    "annotations.enabled": "Shows or hides this annotation.",
+    "annotations.type": "Chooses whether the annotation is text, a line, or an arrow.",
+    "annotations.name": "Sets the annotation name shown in the list.",
+    "annotations.coord_system": "Chooses whether coordinates follow the data axes or the axes frame.",
+    "annotations.color": "Sets the annotation color.",
+    "annotations.alpha": "Sets the annotation opacity between 0 and 1.",
+    "annotations.zorder": "Sets the annotation draw order. Higher values render on top.",
+    "annotations.text": "Text shown by this annotation.",
+    "annotations.x": "X position for a text annotation.",
+    "annotations.y": "Y position for a text annotation.",
+    "annotations.font_size": "Font size used by the text annotation.",
+    "annotations.rotation": "Text rotation in degrees.",
+    "annotations.horizontal_align": "Horizontal alignment for the text anchor.",
+    "annotations.vertical_align": "Vertical alignment for the text anchor.",
+    "annotations.x1": "Start x position for a line or arrow.",
+    "annotations.y1": "Start y position for a line or arrow.",
+    "annotations.x2": "End x position for a line or arrow.",
+    "annotations.y2": "End y position for a line or arrow.",
+    "annotations.line_width": "Line width for a line or arrow.",
+    "annotations.line_style": "Line style for a line or arrow.",
+    "annotations.arrow_style": "Arrow head style for an arrow annotation.",
+    "annotations.mutation_scale": "Arrow head size for an arrow annotation.",
+    "annotations.summary": "Shows the current preview summary for the selected annotation.",
     "figure.text.title": "Sets the plot title.",
     "figure.text.x_label": "Sets the x-axis label.",
     "figure.text.y_label": "Sets the y-axis label.",
@@ -183,6 +246,8 @@ _TOOLTIPS: dict[str, str] = {
     "figure.legend.font": "Sets the legend font size.",
     "figure.axes.x_scale": "Chooses the x-axis scale.",
     "figure.axes.y_scale": "Chooses the y-axis scale.",
+    "figure.axes.border": "Shows or hides the full plot border (all four axes spines).",
+    "figure.axes.label_font": "Sets the axis label font size.",
     "figure.axes.x_limits": "Sets the x-axis limits.",
     "figure.axes.y_limits": "Sets the y-axis limits.",
     "figure.axes.x_label_pad": "Sets the space below the x-axis label.",
@@ -226,6 +291,7 @@ _TOOLTIPS: dict[str, str] = {
     "figure.canvas.height": "Sets the figure height.",
     "figure.canvas.dpi": "Sets the render resolution.",
     "figure.canvas.font_family": "Sets the main font family.",
+    "figure.canvas.font_size": "Sets the default font size used when title, label, tick, and legend font fields are left blank.",
     "figure.canvas.facecolor": "Sets the figure background color.",
     "advanced.matplotlib_guide_link": "Opens the official Matplotlib user guide.",
     "advanced.rcparams": "Sets raw Matplotlib rcParams.",
@@ -313,6 +379,199 @@ def _display_positive_int(value: Any, *, fallback: int) -> str:
     if parsed <= 0:
         parsed = fallback
     return str(parsed)
+
+
+def _display_optional_positive_int(value: Any) -> str:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return ""
+    return str(parsed) if parsed > 0 else ""
+
+
+def _font_size_placeholder_text(size: int) -> str:
+    return f"Auto ({int(size)})"
+
+
+def _annotation_type_label(annotation_type: str) -> str:
+    token = str(annotation_type).strip().lower()
+    if token == "text":
+        return "Text"
+    if token == "line":
+        return "Line"
+    if token == "arrow":
+        return "Arrow"
+    return "Annotation"
+
+
+def _default_annotation_name(annotation_type: str, *, index: int) -> str:
+    return f"{_annotation_type_label(annotation_type)} {index}"
+
+
+def _annotation_defaults_for_gui(annotation_type: str, *, index: int) -> dict[str, Any]:
+    normalized_type = str(annotation_type).strip().lower()
+    if normalized_type not in _ANNOTATION_TYPES:
+        normalized_type = "text"
+    defaults: dict[str, Any] = {
+        "id": f"annotation:{uuid4().hex}",
+        "type": normalized_type,
+        "enabled": True,
+        "name": _default_annotation_name(normalized_type, index=index),
+        "coord_system": "axes" if normalized_type == "text" else "data",
+        "color": "#000000",
+        "alpha": "1.0",
+        "zorder": "5",
+        "text": "",
+        "x": "0.5",
+        "y": "0.5",
+        "font_size": "12",
+        "rotation": "0",
+        "horizontal_align": "center",
+        "vertical_align": "center",
+        "x1": "0",
+        "y1": "0",
+        "x2": "1",
+        "y2": "1",
+        "line_width": "1.5",
+        "line_style": "-",
+        "arrow_style": "->",
+        "mutation_scale": "12",
+    }
+    if normalized_type == "text":
+        defaults["text"] = defaults["name"]
+    return defaults
+
+
+def _annotation_string(value: Any) -> str:
+    return "" if value is None else str(value).strip()
+
+
+def _truncate_annotation_label(value: str, *, limit: int = 42) -> str:
+    text = " ".join(str(value).split())
+    if len(text) <= limit:
+        return text
+    return f"{text[: max(0, limit - 1)].rstrip()}..."
+
+
+def _annotation_fallback_title(entry: dict[str, Any], *, index: int) -> str:
+    annotation_type = str(entry.get("type") or "text").strip().lower()
+    if annotation_type == "text":
+        text_value = _annotation_string(entry.get("text"))
+        if text_value:
+            return _truncate_annotation_label(text_value)
+        return _default_annotation_name(annotation_type, index=index)
+    if annotation_type in {"line", "arrow"}:
+        return (
+            f"{_annotation_type_label(annotation_type)} "
+            f"({_annotation_string(entry.get('x1') or '0')}, {_annotation_string(entry.get('y1') or '0')} -> "
+            f"{_annotation_string(entry.get('x2') or '1')}, {_annotation_string(entry.get('y2') or '1')})"
+        )
+    return _default_annotation_name(annotation_type, index=index)
+
+
+def _annotation_primary_title(entry: dict[str, Any], *, index: int) -> str:
+    name = str(entry.get("name") or "").strip()
+    if name:
+        return _truncate_annotation_label(name)
+    return _annotation_fallback_title(entry, index=index)
+
+
+def _annotation_display_text_from_entry(entry: dict[str, Any], *, index: int) -> str:
+    if index < 0:
+        index = 0
+    suffix = "" if bool(entry.get("enabled", True)) else " (off)"
+    title = _annotation_primary_title(entry, index=index + 1)
+    annotation_type = _annotation_type_label(str(entry.get("type") or "text"))
+    return f"{index + 1}: {title} [{annotation_type}]{suffix}"
+
+
+def _current_error_statistics_mode(
+    *,
+    analysis_name: str | None,
+    error_supported: bool,
+    x_bin_width_active: bool,
+) -> str | None:
+    if not error_supported:
+        return None
+    normalized = str(analysis_name or "").strip().lower()
+    if normalized in {"position", "coordination", "potential"}:
+        return "raw_grouped"
+    if x_bin_width_active:
+        return "saved_rebinned_sample"
+    return "direct"
+
+
+def _inferred_available_error_stats(
+    *,
+    analysis_name: str | None,
+    error_supported: bool,
+    x_bin_width_active: bool,
+) -> list[str]:
+    statistics_mode = _current_error_statistics_mode(
+        analysis_name=analysis_name,
+        error_supported=error_supported,
+        x_bin_width_active=x_bin_width_active,
+    )
+    if statistics_mode is None:
+        return []
+    if statistics_mode in {"raw_grouped", "saved_rebinned_sample"}:
+        return ["sample_std", "sample_sem"]
+    if str(analysis_name or "").strip().lower() == "msd":
+        return ["sample_std", "sample_sem"]
+    return ["sample_std", "sample_sem", "block_std", "block_sem"]
+
+
+def _coerce_annotation_for_gui(value: Any, *, index: int) -> dict[str, Any]:
+    normalized_type = "text"
+    if isinstance(value, dict):
+        candidate_type = str(value.get("type") or "text").strip().lower()
+        if candidate_type in _ANNOTATION_TYPES:
+            normalized_type = candidate_type
+    entry = _annotation_defaults_for_gui(normalized_type, index=index)
+    if not isinstance(value, dict):
+        return entry
+
+    if value.get("id") is not None:
+        entry["id"] = _annotation_string(value.get("id")) or entry["id"]
+    if value.get("enabled") is not None:
+        entry["enabled"] = bool(value.get("enabled"))
+    if value.get("name") is not None:
+        entry["name"] = _annotation_string(value.get("name")) or entry["name"]
+    coord_system = _annotation_string(value.get("coord_system")).lower()
+    if coord_system in _ANNOTATION_COORD_SYSTEMS:
+        entry["coord_system"] = coord_system
+    if value.get("color") is not None:
+        entry["color"] = _annotation_string(value.get("color")) or entry["color"]
+    for key in (
+        "alpha",
+        "zorder",
+        "text",
+        "x",
+        "y",
+        "font_size",
+        "rotation",
+        "x1",
+        "y1",
+        "x2",
+        "y2",
+        "line_width",
+        "mutation_scale",
+    ):
+        if value.get(key) is not None:
+            entry[key] = _annotation_string(value.get(key))
+    horizontal = _annotation_string(value.get("horizontal_align")).lower()
+    if horizontal in _ANNOTATION_HORIZONTAL_ALIGN:
+        entry["horizontal_align"] = horizontal
+    vertical = _annotation_string(value.get("vertical_align")).lower()
+    if vertical in _ANNOTATION_VERTICAL_ALIGN:
+        entry["vertical_align"] = vertical
+    line_style = _annotation_string(value.get("line_style"))
+    if line_style in _ANNOTATION_LINE_STYLES:
+        entry["line_style"] = line_style
+    arrow_style = _annotation_string(value.get("arrow_style"))
+    if arrow_style in _ANNOTATION_ARROW_STYLES:
+        entry["arrow_style"] = arrow_style
+    return entry
 
 
 def _optional_float_list(value: str, *, field_name: str) -> list[float] | None:
@@ -415,6 +674,54 @@ def _resolve_series_id_order(series_ids: list[str], requested_order: list[str] |
     return resolved
 
 
+def _partition_series_ids_by_enabled_state(
+    series_ids: list[str], enabled_by_id: dict[str, bool]
+) -> list[str]:
+    enabled_ids = [series_id for series_id in series_ids if enabled_by_id.get(series_id, True)]
+    disabled_ids = [series_id for series_id in series_ids if not enabled_by_id.get(series_id, True)]
+    return enabled_ids + disabled_ids
+
+
+def _capture_series_list_view_anchor(
+    rows: list[tuple[str, int, int]], *, viewport_height: int, scroll_value: int
+) -> dict[str, int | str] | None:
+    for row_id, top, bottom in rows:
+        if bottom > 0 and top < viewport_height:
+            return {
+                "row_id": row_id,
+                "offset": int(top),
+                "scroll_value": int(scroll_value),
+            }
+    if scroll_value > 0:
+        return {
+            "row_id": "",
+            "offset": 0,
+            "scroll_value": int(scroll_value),
+        }
+    return None
+
+
+def _restore_series_list_anchor_scroll_value(
+    anchor: dict[str, int | str] | None,
+    *,
+    row_tops: dict[str, int],
+    current_scroll_value: int,
+    maximum: int,
+) -> int | None:
+    if anchor is None:
+        return None
+    fallback = min(max(int(anchor.get("scroll_value", 0)), 0), max(0, int(maximum)))
+    row_id = str(anchor.get("row_id") or "").strip()
+    if not row_id:
+        return fallback
+    top = row_tops.get(row_id)
+    if top is None:
+        return fallback
+    offset = int(anchor.get("offset", 0))
+    content_top = int(top) + int(current_scroll_value)
+    return min(max(content_top - offset, 0), max(0, int(maximum)))
+
+
 def _format_series_display_text(index: int, label: str, *, enabled: bool) -> str:
     resolved_label = str(label).strip() or f"Series {index + 1}"
     suffix = "" if enabled else " (off)"
@@ -434,6 +741,20 @@ def _coerce_series_descriptors(value: Any) -> list[dict[str, Any]]:
             {
                 "series_id": series_id,
                 "default_label": default_label,
+                "source_kind": (
+                    "group" if str(raw.get("source_kind") or "").strip().lower() == "group" else "source"
+                ),
+                "source_series_id": str(raw.get("source_series_id") or "").strip() or None,
+                "member_series_ids": [
+                    str(item).strip()
+                    for item in raw.get("member_series_ids", [])
+                    if str(item).strip()
+                ]
+                if isinstance(raw.get("member_series_ids"), (list, tuple))
+                else [],
+                "group_reducer": (
+                    str(raw.get("group_reducer") or "mean").strip().lower() or "mean"
+                ),
                 "source_name": str(raw.get("source_name") or "").strip(),
                 "source_directory": str(raw.get("source_directory") or "").strip(),
                 "source_path": str(raw.get("source_path") or "").strip(),
@@ -489,6 +810,27 @@ def _fit_defaults_for_gui() -> dict[str, Any]:
     return config
 
 
+def _cumulative_defaults_for_gui() -> dict[str, Any]:
+    return {
+        "enabled": False,
+        "label_override": None,
+        "show_in_legend": True,
+    }
+
+
+def _coerce_series_cumulative_config(value: Any) -> dict[str, Any]:
+    config = _cumulative_defaults_for_gui()
+    if not isinstance(value, dict):
+        return config
+    if "enabled" in value:
+        config["enabled"] = bool(value.get("enabled"))
+    if value.get("label_override") is not None:
+        config["label_override"] = str(value.get("label_override")).strip() or None
+    if "show_in_legend" in value:
+        config["show_in_legend"] = bool(value.get("show_in_legend"))
+    return config
+
+
 def _coerce_series_fit_config(value: Any) -> dict[str, Any]:
     config = _fit_defaults_for_gui()
     coerced = coerce_fit_config(value)
@@ -496,6 +838,132 @@ def _coerce_series_fit_config(value: Any) -> dict[str, Any]:
     if config.get("fit_type") == "polynomial" and not config.get("fit_degree"):
         config["fit_degree"] = 2
     return config
+
+
+def _error_defaults_for_gui() -> dict[str, Any]:
+    return {
+        "enabled": False,
+        "stat": "block_sem",
+        "style": "band",
+        "color": None,
+        "label_override": None,
+        "show_in_legend": False,
+    }
+
+
+def _coerce_series_error_config(value: Any) -> dict[str, Any]:
+    config = _error_defaults_for_gui()
+    if not isinstance(value, dict):
+        return config
+    if "enabled" in value:
+        config["enabled"] = bool(value.get("enabled"))
+    stat = str(value.get("stat") or "").strip().lower()
+    if stat in _ERROR_STATS:
+        config["stat"] = stat
+    style = str(value.get("style") or "").strip().lower()
+    if style in _ERROR_STYLES:
+        config["style"] = style
+    if value.get("color") is not None:
+        config["color"] = str(value.get("color")).strip() or None
+    if value.get("label_override") is not None:
+        config["label_override"] = str(value.get("label_override")).strip() or None
+    if "show_in_legend" in value:
+        config["show_in_legend"] = bool(value.get("show_in_legend"))
+    return config
+
+
+def _resolve_error_stat_for_available(
+    configured_stat: str | None,
+    available_stats: Sequence[str] | None,
+) -> str:
+    """Return the effective error statistic for one series and available-stat set."""
+    configured = str(configured_stat or "").strip().lower()
+    available = [
+        token
+        for token in (str(value).strip().lower() for value in (available_stats or ()))
+        if token in _ERROR_STATS
+    ]
+    if available:
+        if configured in available:
+            return configured
+        for candidate in ("block_sem", "sample_sem", "block_std", "sample_std"):
+            if candidate in available:
+                return candidate
+        return available[0]
+    if configured in _ERROR_STATS:
+        return configured
+    return "sample_sem"
+
+
+def _default_error_series_label(base_label: str, stat: str) -> str:
+    """Return the default derived label for one error-bar child series."""
+    resolved_label = str(base_label).strip() or "Series"
+    resolved_stat = _resolve_error_stat_for_available(stat, None)
+    return f"{resolved_label} {resolved_stat}"
+
+
+def _error_supported_for_view(
+    analysis: str,
+    *,
+    orientation_heatmap: bool = False,
+    position_component: str = "distance",
+    coordination_component: str = "distance",
+) -> bool:
+    """Return whether one GUI view supports 1-D error overlays and min-bin masking."""
+    normalized_analysis = str(analysis).strip().lower()
+    if normalized_analysis in {"density", "msd", "rdf", "potential"}:
+        return True
+    if normalized_analysis == "orientation":
+        return not bool(orientation_heatmap)
+    if normalized_analysis == "position":
+        return str(position_component).strip().lower() != "xy-z"
+    if normalized_analysis == "coordination":
+        return str(coordination_component).strip().lower() != "time-distance"
+    return False
+
+
+@dataclass(frozen=True)
+class _LayerInspectorCapabilities:
+    plot_family: str
+    layer_kind: str
+    show_visibility_label: bool
+    show_style: bool
+    show_markers: bool
+    show_derived_lines: bool
+    show_uncertainty: bool
+    show_normalization: bool
+    show_group_members: bool
+    show_metadata: bool
+    show_fit_editor: bool
+    show_cumulative_editor: bool
+
+
+@dataclass(frozen=True)
+class _FigureInspectorCapabilities:
+    plot_family: str
+    show_legend: bool
+    show_lines: bool
+    show_heatmap: bool
+    show_colorbar: bool
+
+
+def _plot_family_for_view(
+    analysis: str,
+    *,
+    orientation_heatmap: bool = False,
+    position_component: str = "distance",
+    coordination_component: str = "distance",
+) -> str:
+    normalized_analysis = str(analysis).strip().lower()
+    if normalized_analysis == "orientation" and orientation_heatmap:
+        return "heatmap"
+    if normalized_analysis == "position" and str(position_component).strip().lower() == "xy-z":
+        return "projection2d"
+    if normalized_analysis == "coordination":
+        component = str(coordination_component).strip().lower()
+        if component == "time-distance":
+            return "time-distance"
+    return "line"
 
 
 def _coerce_degree_text(value: Any) -> int | None:
@@ -692,7 +1160,8 @@ def launch_plot_settings_panel(
     on_preview: Callable[[dict[str, Any]], dict[str, Any] | None],
     on_save: Callable[[str, dict[str, Any]], str],
     on_save_figure: Callable[[dict[str, Any], str], str | tuple[str, dict[str, Any]]] | None = None,
-    on_import_hdf5: Callable[[str, str], dict[str, Any]] | None = None,
+    on_import_hdf5: Callable[[str, str | None], dict[str, Any]] | None = None,
+    on_list_import_hdf5_profiles: Callable[[str], dict[str, Any]] | None = None,
     analysis_name: str | None = None,
     on_resolve_series_defaults: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
     initial_profile_name: str | None = None,
@@ -871,7 +1340,7 @@ def launch_plot_settings_panel(
             enabled: bool,
             selected: bool,
             color_token: str,
-            is_fit_child: bool,
+            kind: str,
             can_move_up: bool,
             can_move_down: bool,
             tooltip_text: str,
@@ -933,7 +1402,13 @@ def launch_plot_settings_panel(
             )
 
             label_font_style = "italic" if not enabled else "normal"
-            label_font_weight = "700" if is_fit_child else "400"
+            label_font_weight = (
+                "700"
+                if kind == "fit"
+                else "600"
+                if kind in {"error", "cumulative"}
+                else "400"
+            )
             self.text_label.setStyleSheet(
                 "border: none;"
                 f"color: {text_color.name()};"
@@ -941,7 +1416,7 @@ def launch_plot_settings_panel(
                 f"font-weight: {label_font_weight};"
             )
 
-            control_enabled = not is_fit_child
+            control_enabled = kind == "base"
             self.move_up_button.setEnabled(control_enabled and can_move_up)
             self.move_down_button.setEnabled(control_enabled and can_move_down)
             self.move_up_button.setVisible(control_enabled)
@@ -1005,6 +1480,12 @@ def launch_plot_settings_panel(
             self._series_enabled_data: list[bool] = []
             self._series_show_in_legend_data: list[bool] = []
             self._series_alpha_data: list[str] = []
+            self._series_error_enabled_data: list[bool] = []
+            self._series_error_stats_data: list[str] = []
+            self._series_error_styles_data: list[str] = []
+            self._series_error_colors_data: list[str] = []
+            self._series_error_label_overrides_data: list[str] = []
+            self._series_error_show_in_legend_data: list[bool] = []
             self._series_fit_enabled_data: list[bool] = []
             self._series_fit_label_overrides_data: list[str] = []
             self._series_fit_show_in_legend_data: list[bool] = []
@@ -1013,6 +1494,9 @@ def launch_plot_settings_panel(
             self._series_fit_range_modes_data: list[str] = []
             self._series_fit_x_mins_data: list[str] = []
             self._series_fit_x_maxs_data: list[str] = []
+            self._series_cumulative_enabled_data: list[bool] = []
+            self._series_cumulative_label_overrides_data: list[str] = []
+            self._series_cumulative_show_in_legend_data: list[bool] = []
             self._series_line_widths_data: list[str] = []
             self._series_markers_data: list[str] = []
             self._series_line_kwargs_data: list[str] = []
@@ -1020,7 +1504,12 @@ def launch_plot_settings_panel(
             self._series_normalization_modes_data: list[str] = []
             self._series_normalization_values_data: list[str] = []
             self._series_normalization_x_refs_data: list[str] = []
+            self._annotations_data: list[dict[str, Any]] = []
+            self._annotation_active_index = 0
+            self._annotation_syncing = False
+            self._series_active_is_error_child = False
             self._series_active_is_fit_child = False
+            self._series_active_is_cumulative_child = False
             self._series_display_rows: list[dict[str, Any]] = []
             self._last_preview_state: dict[str, Any] = {}
             self._synced_field_locks: dict[str, bool] = {}
@@ -1035,15 +1524,16 @@ def launch_plot_settings_panel(
             self._nav_list: QListWidget | None = None
             self._page_stack: QStackedWidget | None = None
             self._page_title_label: QLabel | None = None
+            self._page_note_label: QLabel | None = None
+            self._layers_tabs: QTabWidget | None = None
             self._header_state_label: QLabel | None = None
-            self._overview_session_label: QLabel | None = None
-            self._overview_analysis_label: QLabel | None = None
-            self._overview_profile_label: QLabel | None = None
-            self._overview_series_label: QLabel | None = None
-            self._overview_preview_label: QLabel | None = None
-            self._overview_override_label: QLabel | None = None
-            self._overview_warning_label: QLabel | None = None
             self._warning_summary_label: QLabel | None = None
+            self._status_source_badge: QLabel | None = None
+            self._status_mode_badge: QLabel | None = None
+            self._status_layers_badge: QLabel | None = None
+            self._status_preview_badge: QLabel | None = None
+            self._status_profile_badge: QLabel | None = None
+            self._status_warning_badge: QLabel | None = None
             self._potential_summary_x_axis_label: QLabel | None = None
             self._potential_summary_total_rows_label: QLabel | None = None
             self._potential_summary_complete_rows_label: QLabel | None = None
@@ -1057,12 +1547,22 @@ def launch_plot_settings_panel(
             self._series_fit_summary: QLabel | None = None
             self._series_fit_warning: QLabel | None = None
             self._series_fit_style_note: QLabel | None = None
+            self._series_visibility_group: QGroupBox | None = None
+            self._series_style_group: QGroupBox | None = None
+            self._series_uncertainty_group: QGroupBox | None = None
+            self._series_derived_group: QGroupBox | None = None
+            self._series_metadata_group: QGroupBox | None = None
+            self._series_fit_group: QGroupBox | None = None
+            self._series_cumulative_group: QGroupBox | None = None
             self._normalization_copy_button: QPushButton | None = None
-            self._heatmap_tab_is_shown: bool = False
-            self._pre_heatmap_grid_mode: str = "On"
             self._figure_tabs: QTabWidget | None = None
+            self._figure_legend_section: QWidget | None = None
+            self._figure_lines_group: QGroupBox | None = None
+            self._figure_heatmap_group: QGroupBox | None = None
+            self._figure_colorbar_group: QGroupBox | None = None
             self._y_bin_width_row: tuple[QFormLayout, QWidget] | None = None
             self._y_bin_reducer_row: tuple[QFormLayout, QWidget] | None = None
+            self._min_bin_points_row: tuple[QFormLayout, QWidget] | None = None
             self._tooltip_disabled_reasons: dict[int, str | None] = {}
             self._gui_artwork_path = _default_gui_artwork_path()
             self._figure_save_filters, self._figure_default_name = _figure_filetype_filters()
@@ -1420,9 +1920,13 @@ def launch_plot_settings_panel(
                     self.y_label_pad.setText("" if y_label_pad is None else str(y_label_pad))
             finally:
                 self._suspend_preview_events = False
+            if 0 <= self._series_active_index < len(self._series_labels_data):
+                self._refresh_error_stat_choices(self._series_active_index)
             self._update_potential_summary_panel(settings)
             self._update_series_metadata_panel(self._series_active_index)
+            self._update_series_error_summary(self._series_active_index)
             self._update_series_fit_summary(self._series_active_index)
+            self._update_annotation_preview_summary(self._annotation_active_index)
 
         def _handle_synced_field_edit(self, key: str) -> None:
             if key in _TRI_STATE_SYNC_FIELD_KEYS:
@@ -1885,15 +2389,15 @@ def launch_plot_settings_panel(
             inspector_layout = QVBoxLayout(inspector_panel)
             inspector_layout.setContentsMargins(14, 14, 14, 14)
             inspector_layout.setSpacing(10)
-            self._page_title_label = QLabel("Overview")
+            self._page_title_label = QLabel("Data")
             self._page_title_label.setObjectName("pageTitle")
             inspector_layout.addWidget(self._page_title_label)
-            inspector_note = QLabel(
-                "Preview-first controls grouped by task: data, series, figure, profiles, export, and advanced overrides."
+            self._page_note_label = QLabel(
+                "Choose which stored data and view mode are sent into the plot."
             )
-            inspector_note.setWordWrap(True)
-            inspector_note.setObjectName("sectionNote")
-            inspector_layout.addWidget(inspector_note)
+            self._page_note_label.setWordWrap(True)
+            self._page_note_label.setObjectName("sectionNote")
+            inspector_layout.addWidget(self._page_note_label)
             self._page_stack = QStackedWidget(inspector_panel)
             self._page_stack.setMinimumWidth(0)
             self._page_stack.setSizePolicy(
@@ -1903,12 +2407,11 @@ def launch_plot_settings_panel(
             inspector_layout.addWidget(self._page_stack, stretch=1)
             left_layout.addWidget(inspector_panel, stretch=1)
 
-            self._register_workspace_page("Overview", self._build_overview_page())
             self._register_workspace_page("Data", self._build_content_page())
-            self._register_workspace_page("Series", self._build_series_page())
+            self._register_workspace_page("Layers", self._build_layers_page())
             self._register_workspace_page("Figure", self._build_figure_page())
-            self._register_workspace_page("Profiles", self._build_profiles_page())
             self._register_workspace_page("Export", self._build_export_page())
+            self._register_workspace_page("Profiles", self._build_profiles_page())
             self._register_workspace_page("Advanced", self._build_advanced_page())
             self._sync_profile_selector()
             if self._nav_list is not None:
@@ -1964,6 +2467,32 @@ def launch_plot_settings_panel(
             self._warning_summary_label.setObjectName("warningSummary")
             self._warning_summary_label.hide()
             right_layout.addWidget(self._warning_summary_label)
+
+            status_strip = QFrame(right_panel)
+            status_strip.setObjectName("appHeader")
+            status_strip_layout = QHBoxLayout(status_strip)
+            status_strip_layout.setContentsMargins(10, 8, 10, 8)
+            status_strip_layout.setSpacing(8)
+            self._status_source_badge = QLabel("")
+            self._status_source_badge.setObjectName("stateBadge")
+            status_strip_layout.addWidget(self._status_source_badge)
+            self._status_mode_badge = QLabel("")
+            self._status_mode_badge.setObjectName("stateBadge")
+            status_strip_layout.addWidget(self._status_mode_badge)
+            self._status_layers_badge = QLabel("")
+            self._status_layers_badge.setObjectName("stateBadge")
+            status_strip_layout.addWidget(self._status_layers_badge)
+            self._status_preview_badge = QLabel("")
+            self._status_preview_badge.setObjectName("stateBadge")
+            status_strip_layout.addWidget(self._status_preview_badge)
+            self._status_profile_badge = QLabel("")
+            self._status_profile_badge.setObjectName("stateBadge")
+            status_strip_layout.addWidget(self._status_profile_badge)
+            self._status_warning_badge = QLabel("")
+            self._status_warning_badge.setObjectName("stateBadge")
+            status_strip_layout.addWidget(self._status_warning_badge)
+            status_strip_layout.addStretch(1)
+            right_layout.addWidget(status_strip)
 
             self._preview_frame = QFrame(right_panel)
             self._preview_frame.setObjectName("previewFrame")
@@ -2345,13 +2874,30 @@ def launch_plot_settings_panel(
             self._page_stack.addWidget(page)
             self._nav_list.addItem(label)
 
+        @staticmethod
+        def _workspace_note(label: str) -> str:
+            notes = {
+                "Data": "Choose which stored data and view mode are sent into the plot.",
+                "Layers": (
+                    "Edit plotted layers here. Unsupported controls stay hidden so the inspector only shows meaningful options."
+                ),
+                "Figure": "Adjust figure-wide styling, layout, axes, and heatmap presentation.",
+                "Export": "Write the current preview to an image file.",
+                "Profiles": "Save, load, duplicate, import, or export plot presets.",
+                "Advanced": "Use raw Matplotlib overrides only when the standard controls are not enough.",
+            }
+            return notes.get(label, "")
+
         def _handle_navigation_change(self, index: int) -> None:
             if self._page_stack is None or self._nav_list is None or index < 0:
                 return
             self._page_stack.setCurrentIndex(index)
             item = self._nav_list.item(index)
-            if item is not None and self._page_title_label is not None:
-                self._page_title_label.setText(item.text())
+            if item is not None:
+                if self._page_title_label is not None:
+                    self._page_title_label.setText(item.text())
+                if self._page_note_label is not None:
+                    self._page_note_label.setText(self._workspace_note(item.text()))
 
         def _humanized_analysis_name(self) -> str:
             if self._analysis_name is None:
@@ -2551,7 +3097,7 @@ def launch_plot_settings_panel(
 
         def _refresh_shell_state(self) -> None:
             self._update_header_state()
-            self._update_overview_panel()
+            self._update_status_strip()
             self._update_warning_panel()
             profiles_label = getattr(self, "_profiles_current_label", None)
             if profiles_label is not None:
@@ -2573,37 +3119,54 @@ def launch_plot_settings_panel(
                 self._saved_signature is None or signature != self._saved_signature
             )
 
-        def _update_overview_panel(self) -> None:
-            if (
-                self._overview_session_label is None
-                or self._overview_analysis_label is None
-                or self._overview_profile_label is None
-                or self._overview_series_label is None
-                or self._overview_preview_label is None
-                or self._overview_override_label is None
+        def _update_status_strip(self) -> None:
+            source_badge = self._status_source_badge
+            mode_badge = self._status_mode_badge
+            layers_badge = self._status_layers_badge
+            preview_badge = self._status_preview_badge
+            profile_badge = self._status_profile_badge
+            warning_badge = self._status_warning_badge
+            if any(
+                label is None
+                for label in (
+                    source_badge,
+                    mode_badge,
+                    layers_badge,
+                    preview_badge,
+                    profile_badge,
+                    warning_badge,
+                )
             ):
                 return
+            assert source_badge is not None
+            assert mode_badge is not None
+            assert layers_badge is not None
+            assert preview_badge is not None
+            assert profile_badge is not None
+            assert warning_badge is not None
             settings, error = self._safe_collect_settings()
-            self._overview_session_label.setText(title)
-            self._overview_analysis_label.setText(self._humanized_analysis_name())
-            self._overview_profile_label.setText(self._current_profile_name)
+            descriptor = self._series_descriptor(self._series_active_index)
+            source_name = str(descriptor.get("source_name") or "").strip() or "Current session"
+            plot_family = self._current_plot_family()
             series_count = len(self._series_labels_data)
             visible_count = sum(1 for value in self._series_enabled_data if value)
-            if series_count:
-                self._overview_series_label.setText(f"{visible_count} of {series_count} visible")
-            else:
-                self._overview_series_label.setText("No series detected yet")
+            layer_count = series_count + len(self._annotations_data)
             preview_mode = "Auto" if self._auto_preview_checkbox.isChecked() else "Manual"
-            self._overview_preview_label.setText(preview_mode)
-            manual_overrides = sum(1 for value in self._synced_field_locks.values() if value)
-            self._overview_override_label.setText(f"{manual_overrides} manual axis/label overrides")
             warnings = _derive_warning_messages(settings, error=error)
-            if self._overview_warning_label is not None:
-                self._overview_warning_label.setText(
-                    "\n".join(f"- {message}" for message in warnings[:4])
-                    if warnings
-                    else "No active warnings."
-                )
+            if self._preview_error:
+                warnings = [f"Preview paused: {self._preview_error}"] + list(warnings)
+            source_badge.setText(f"Source: {source_name}")
+            mode_badge.setText(f"Mode: {self._humanized_analysis_name()} / {plot_family}")
+            layers_badge.setText(
+                f"Layers: {visible_count}/{series_count} series on, {len(self._annotations_data)} annotations"
+                if series_count
+                else f"Layers: {layer_count}"
+            )
+            preview_badge.setText(f"Preview: {preview_mode}")
+            profile_badge.setText(f"Profile: {self._current_profile_name}")
+            warning_badge.setText(
+                f"Warnings: {len(warnings)}" if warnings else "Warnings: 0"
+            )
 
         def _update_warning_panel(self) -> None:
             if self._warning_summary_label is None:
@@ -2645,75 +3208,38 @@ def launch_plot_settings_panel(
             self._refresh_preview_pixmap()
             self._preview_status.setText("Preview shown at 100%.")
 
-        def _build_overview_page(self) -> QWidget:
-            page = QWidget()
-            content = self._make_scrollable_tab(page)
-            layout = QVBoxLayout(content)
-            layout.setSpacing(12)
-
-            intro = QLabel(
-                "LiNaK Studio keeps the preview visible while data, series, styling, profiles, and export actions stay grouped by task."
-            )
-            intro.setWordWrap(True)
-            layout.addWidget(intro)
-
-            summary = QGroupBox("Session Summary")
-            summary_grid = QGridLayout(summary)
-            summary_grid.addWidget(QLabel("Session"), 0, 0)
-            self._overview_session_label = QLabel(title)
-            self._overview_session_label.setWordWrap(True)
-            summary_grid.addWidget(self._overview_session_label, 0, 1)
-            summary_grid.addWidget(QLabel("Analysis"), 1, 0)
-            self._overview_analysis_label = QLabel(self._humanized_analysis_name())
-            summary_grid.addWidget(self._overview_analysis_label, 1, 1)
-            summary_grid.addWidget(QLabel("Profile"), 2, 0)
-            self._overview_profile_label = QLabel(self._current_profile_name)
-            summary_grid.addWidget(self._overview_profile_label, 2, 1)
-            summary_grid.addWidget(QLabel("Series"), 3, 0)
-            self._overview_series_label = QLabel("")
-            summary_grid.addWidget(self._overview_series_label, 3, 1)
-            summary_grid.addWidget(QLabel("Preview mode"), 4, 0)
-            self._overview_preview_label = QLabel("")
-            summary_grid.addWidget(self._overview_preview_label, 4, 1)
-            summary_grid.addWidget(QLabel("Manual overrides"), 5, 0)
-            self._overview_override_label = QLabel("")
-            summary_grid.addWidget(self._overview_override_label, 5, 1)
-            layout.addWidget(summary)
-
-            quick_actions = QGroupBox("Quick Actions")
-            quick_layout = QGridLayout(quick_actions)
-
-            def _action_button(label: str, callback: Callable[[], None]) -> QPushButton:
-                button = QPushButton(label)
-                button.clicked.connect(callback)
-                return button
-
-            quick_layout.addWidget(_action_button("Refresh Preview", self._handle_preview), 0, 0)
-            quick_layout.addWidget(_action_button("Save Profile", self._handle_save), 0, 1)
-            quick_layout.addWidget(_action_button("Export Figure", self._handle_save_figure), 1, 0)
-            quick_layout.addWidget(_action_button("Reset Defaults", self._handle_reset), 1, 1)
-            layout.addWidget(quick_actions)
-
-            warnings_group = QGroupBox("Warnings")
-            warnings_layout = QVBoxLayout(warnings_group)
-            self._overview_warning_label = QLabel("No active warnings.")
-            self._overview_warning_label.setWordWrap(True)
-            warnings_layout.addWidget(self._overview_warning_label)
-            layout.addWidget(warnings_group)
-            layout.addStretch(1)
-            return page
-
         def _build_content_page(self) -> QWidget:
             self._tab_data = QWidget()
             self._tab_data_content = self._make_scrollable_tab(self._tab_data)
             self._build_data_tab()
             return self._tab_data
 
-        def _build_series_page(self) -> QWidget:
+        def _build_layers_page(self) -> QWidget:
+            page = QWidget()
+            layout = QVBoxLayout(page)
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.setSpacing(8)
+            hint = QLabel(
+                "Layers collect plotted series, grouped series, derived lines, and annotations. The inspector only shows controls that matter for the selected layer."
+            )
+            hint.setWordWrap(True)
+            hint.setObjectName("sectionNote")
+            layout.addWidget(hint)
+            tabs = QTabWidget(page)
+            tabs.setObjectName("plotSubtabs")
+            tabs.setDocumentMode(True)
+            self._layers_tabs = tabs
             self._tab_series = QWidget()
             self._tab_series_content = self._make_scrollable_tab(self._tab_series)
             self._build_series_tab()
-            return self._tab_series
+            self._tab_annotations = QWidget()
+            self._tab_annotations_content = self._make_scrollable_tab(self._tab_annotations)
+            self._build_annotations_tab()
+            tabs.addTab(self._tab_series, "Plot Layers")
+            tabs.addTab(self._tab_annotations, "Annotations")
+            tabs.currentChanged.connect(self._refresh_widget_states)
+            layout.addWidget(tabs, stretch=1)
+            return page
 
         def _build_figure_page(self) -> QWidget:
             page = QWidget()
@@ -2721,7 +3247,7 @@ def launch_plot_settings_panel(
             layout.setContentsMargins(0, 0, 0, 0)
             layout.setSpacing(8)
             hint = QLabel(
-                "Figure controls chart structure and visual treatment. Use Auto and Manual on synced fields to follow or keep preview-derived values."
+                "Figure controls the visual presentation of the current plot. Only figure-wide options are shown here."
             )
             hint.setWordWrap(True)
             hint.setObjectName("sectionNote")
@@ -2730,46 +3256,61 @@ def launch_plot_settings_panel(
             tabs.setObjectName("plotSubtabs")
             tabs.setDocumentMode(True)
 
-            self._tab_text = QWidget()
-            self._tab_text.setObjectName("plotSubtabPage")
-            self._tab_legend = QWidget()
-            self._tab_legend.setObjectName("plotSubtabPage")
-            self._tab_axes = QWidget()
-            self._tab_axes.setObjectName("plotSubtabPage")
-            self._tab_ticks_grid = QWidget()
-            self._tab_ticks_grid.setObjectName("plotSubtabPage")
-            self._tab_lines = QWidget()
-            self._tab_lines.setObjectName("plotSubtabPage")
-            self._tab_canvas = QWidget()
-            self._tab_canvas.setObjectName("plotSubtabPage")
+            text_legend_tab = QWidget()
+            text_legend_tab.setObjectName("plotSubtabPage")
+            axes_limits_tab = QWidget()
+            axes_limits_tab.setObjectName("plotSubtabPage")
+            ticks_grid_tab = QWidget()
+            ticks_grid_tab.setObjectName("plotSubtabPage")
+            style_tab = QWidget()
+            style_tab.setObjectName("plotSubtabPage")
 
-            tabs.addTab(self._tab_text, "Text")
-            tabs.addTab(self._tab_legend, "Legend")
-            tabs.addTab(self._tab_axes, "Axes")
-            tabs.addTab(self._tab_ticks_grid, "Ticks && Grid")
-            tabs.addTab(self._tab_lines, "Lines && Markers")
-            tabs.addTab(self._tab_canvas, "Canvas")
+            tabs.addTab(text_legend_tab, "Text && Legend")
+            tabs.addTab(axes_limits_tab, "Axes && Limits")
+            tabs.addTab(ticks_grid_tab, "Ticks && Grid")
+            tabs.addTab(style_tab, "Style")
             self._figure_tabs = tabs
-            self._lines_tab_index = tabs.indexOf(self._tab_lines)
-            self._legend_tab_index = tabs.indexOf(self._tab_legend)
 
-            self._tab_heatmap = QWidget()
-            self._tab_heatmap.setObjectName("plotSubtabPage")
-
-            self._tab_text_content = self._make_scrollable_tab(self._tab_text)
+            text_legend_content = self._make_scrollable_tab(text_legend_tab)
+            text_legend_content.setObjectName("plotSubtabContent")
+            text_legend_layout = QVBoxLayout(text_legend_content)
+            self._tab_text_content = QWidget(text_legend_content)
             self._tab_text_content.setObjectName("plotSubtabContent")
-            self._tab_legend_content = self._make_scrollable_tab(self._tab_legend)
+            text_legend_layout.addWidget(self._tab_text_content)
+            self._tab_legend_content = QWidget(text_legend_content)
             self._tab_legend_content.setObjectName("plotSubtabContent")
-            self._tab_axes_content = self._make_scrollable_tab(self._tab_axes)
+            text_legend_layout.addWidget(self._tab_legend_content)
+            text_legend_layout.addStretch(1)
+
+            axes_limits_content = self._make_scrollable_tab(axes_limits_tab)
+            axes_limits_content.setObjectName("plotSubtabContent")
+            axes_limits_layout = QVBoxLayout(axes_limits_content)
+            self._tab_axes_content = QWidget(axes_limits_content)
             self._tab_axes_content.setObjectName("plotSubtabContent")
-            self._tab_ticks_grid_content = self._make_scrollable_tab(self._tab_ticks_grid)
+            axes_limits_layout.addWidget(self._tab_axes_content)
+            axes_limits_layout.addStretch(1)
+
+            ticks_grid_content = self._make_scrollable_tab(ticks_grid_tab)
+            ticks_grid_content.setObjectName("plotSubtabContent")
+            ticks_grid_layout = QVBoxLayout(ticks_grid_content)
+            self._tab_ticks_grid_content = QWidget(ticks_grid_content)
             self._tab_ticks_grid_content.setObjectName("plotSubtabContent")
-            self._tab_lines_content = self._make_scrollable_tab(self._tab_lines)
+            ticks_grid_layout.addWidget(self._tab_ticks_grid_content)
+            ticks_grid_layout.addStretch(1)
+
+            style_content = self._make_scrollable_tab(style_tab)
+            style_content.setObjectName("plotSubtabContent")
+            style_layout = QVBoxLayout(style_content)
+            self._tab_lines_content = QWidget(style_content)
             self._tab_lines_content.setObjectName("plotSubtabContent")
-            self._tab_heatmap_content = self._make_scrollable_tab(self._tab_heatmap)
+            style_layout.addWidget(self._tab_lines_content)
+            self._tab_heatmap_content = QWidget(style_content)
             self._tab_heatmap_content.setObjectName("plotSubtabContent")
-            self._tab_canvas_content = self._make_scrollable_tab(self._tab_canvas)
+            style_layout.addWidget(self._tab_heatmap_content)
+            self._tab_canvas_content = QWidget(style_content)
             self._tab_canvas_content.setObjectName("plotSubtabContent")
+            style_layout.addWidget(self._tab_canvas_content)
+            style_layout.addStretch(1)
 
             self._build_text_tab()
             self._build_legend_tab()
@@ -2941,7 +3482,6 @@ def launch_plot_settings_panel(
             self._connect_lockable_line("x_label", self.x_label, x_label_lock, allow_off=True)
             self._connect_lockable_line("y_label", self.y_label, y_label_lock, allow_off=True)
             self.title_font = self._line()
-            self.label_font = self._line()
 
             self._add_form_row(form, "Title", title_row, tooltip_id="figure.text.title")
             self._add_form_row(form, "X label", x_label_row, tooltip_id="figure.text.x_label")
@@ -2952,12 +3492,6 @@ def launch_plot_settings_panel(
                 self.title_font,
                 tooltip_id="figure.text.title_font",
             )
-            self._add_form_row(
-                form,
-                "Label font",
-                self.label_font,
-                tooltip_id="figure.text.label_font",
-            )
             math_hint = QLabel("Math labels: e.g. $cm^3$, $\\Delta G$, $\\rho$.")
             math_hint.setWordWrap(True)
             self._add_form_row(form, "", math_hint)
@@ -2965,6 +3499,7 @@ def launch_plot_settings_panel(
 
         def _build_legend_tab(self) -> None:
             form = QFormLayout(self._tab_legend_content)
+            self._figure_legend_section = self._tab_legend_content
             self.legend_mode = self._combo(_TOGGLE_MODES)
             self.legend_mode.currentTextChanged.connect(self._refresh_widget_states)
             self.legend_title = self._line()
@@ -3016,9 +3551,16 @@ def launch_plot_settings_panel(
             layout = QVBoxLayout(self._tab_axes_content)
             self.x_scale = self._combo(("linear", "log", "symlog", "logit"))
             self.y_scale = self._combo(("linear", "log", "symlog", "logit"))
+            self.axes_border_mode = self._combo(_TOGGLE_MODES)
             top_form = QFormLayout()
             self._add_form_row(top_form, "X scale", self.x_scale, tooltip_id="figure.axes.x_scale")
             self._add_form_row(top_form, "Y scale", self.y_scale, tooltip_id="figure.axes.y_scale")
+            self._add_form_row(
+                top_form,
+                "Plot border",
+                self.axes_border_mode,
+                tooltip_id="figure.axes.border",
+            )
             layout.addLayout(top_form)
 
             limits = QGroupBox("Limits")
@@ -3064,6 +3606,13 @@ def launch_plot_settings_panel(
                 "Y label pad",
                 y_label_pad_row,
                 tooltip_id="figure.axes.y_label_pad",
+            )
+            self.label_font = self._line()
+            self._add_form_row(
+                label_spacing_form,
+                "Label font",
+                self.label_font,
+                tooltip_id="figure.axes.label_font",
             )
             layout.addWidget(label_spacing)
             layout.addStretch(1)
@@ -3214,6 +3763,7 @@ def launch_plot_settings_panel(
         def _build_lines_tab(self) -> None:
             layout = QVBoxLayout(self._tab_lines_content)
             lines = QGroupBox("Lines and Markers")
+            self._figure_lines_group = lines
             lines_form = QFormLayout(lines)
             self.line_width = self._line()
             self.line_style = self._combo(("-", "--", "-.", ":", ""), editable=True)
@@ -3258,9 +3808,11 @@ def launch_plot_settings_panel(
         def _build_heatmap_tab(self) -> None:
             layout = QVBoxLayout(self._tab_heatmap_content)
             group = QGroupBox("Heatmap Rendering")
+            self._figure_heatmap_group = group
             form = QFormLayout(group)
             self.heatmap_cmap = self._combo(
                 (
+                    "turbo",
                     "viridis",
                     "plasma",
                     "inferno",
@@ -3306,6 +3858,7 @@ def launch_plot_settings_panel(
             layout.addWidget(group)
 
             cb_group = QGroupBox("Colorbar")
+            self._figure_colorbar_group = cb_group
             cb_form = QFormLayout(cb_group)
             self.heatmap_colorbar_enabled = QCheckBox("Show colorbar")
             self.heatmap_colorbar_enabled.setChecked(True)
@@ -3381,6 +3934,9 @@ def launch_plot_settings_panel(
             self.fig_height = self._line()
             self.dpi = self._line()
             self.font_family = self._line()
+            self.base_font_size = self._line()
+            self.base_font_size.setPlaceholderText(str(DEFAULT_PLOT_STYLE.base_font_size))
+            self.base_font_size.textChanged.connect(self._handle_base_font_size_changed)
             figure_facecolor_row, self.figure_facecolor = self._color_field(
                 placeholder="#ffffff",
                 tooltip_id="figure.canvas.facecolor",
@@ -3406,16 +3962,52 @@ def launch_plot_settings_panel(
             )
             self._add_form_row(
                 form,
+                "Base font size",
+                self.base_font_size,
+                tooltip_id="figure.canvas.font_size",
+            )
+            self._add_form_row(
+                form,
                 "Figure facecolor",
                 figure_facecolor_row,
                 tooltip_id="figure.canvas.facecolor",
             )
 
+        def _resolved_base_font_size_value(self) -> int:
+            raw = self.base_font_size.text().strip()
+            if not raw:
+                return int(DEFAULT_PLOT_STYLE.base_font_size)
+            try:
+                parsed = int(raw)
+            except ValueError:
+                return int(DEFAULT_PLOT_STYLE.base_font_size)
+            return max(1, parsed)
+
+        def _refresh_font_size_placeholders(self) -> None:
+            defaults = default_plot_font_sizes(self._resolved_base_font_size_value())
+            self.title_font.setPlaceholderText(
+                _font_size_placeholder_text(defaults["title_font_size"])
+            )
+            self.label_font.setPlaceholderText(
+                _font_size_placeholder_text(defaults["label_font_size"])
+            )
+            self.tick_font.setPlaceholderText(
+                _font_size_placeholder_text(defaults["tick_font_size"])
+            )
+            self.legend_font.setPlaceholderText(
+                _font_size_placeholder_text(defaults["legend_font_size"])
+            )
+
+        def _handle_base_font_size_changed(self, *_unused: object) -> None:
+            self._refresh_font_size_placeholders()
+
         def _build_series_tab(self) -> None:
             layout = QVBoxLayout(self._tab_series_content)
 
             selector_row = QHBoxLayout()
-            hint = QLabel("Drag rows to reorder series and legend entries.")
+            hint = QLabel(
+                "Edit the currently loaded plot layers here. Use Data to choose which stored profiles and view modes are loaded."
+            )
             hint.setObjectName("sectionNote")
             hint.setWordWrap(True)
             selector_row.addWidget(hint, stretch=1)
@@ -3429,6 +4021,16 @@ def launch_plot_settings_panel(
             self._apply_widget_tooltip(disable_all_button)
             selector_row.addWidget(enable_all_button)
             selector_row.addWidget(disable_all_button)
+            self._series_duplicate_button = QPushButton("Duplicate")
+            self._series_duplicate_button.clicked.connect(self._duplicate_selected_series)
+            self._register_tooltip(self._series_duplicate_button, "series.duplicate")
+            self._apply_widget_tooltip(self._series_duplicate_button)
+            selector_row.addWidget(self._series_duplicate_button)
+            self._series_add_group_button = QPushButton("Add Group")
+            self._series_add_group_button.clicked.connect(self._add_group_series)
+            self._register_tooltip(self._series_add_group_button, "series.add_group")
+            self._apply_widget_tooltip(self._series_add_group_button)
+            selector_row.addWidget(self._series_add_group_button)
             layout.addLayout(selector_row)
 
             self.series_list = QListWidget()
@@ -3446,13 +4048,40 @@ def launch_plot_settings_panel(
             self.series_list.model().rowsMoved.connect(self._handle_series_list_rows_moved)
             layout.addWidget(self.series_list)
 
-            panel = QGroupBox("Selected Series")
+            panel = QGroupBox("Selected Layer")
             panel_layout = QVBoxLayout(panel)
-            panel_form = QFormLayout()
+            panel_note = QLabel(
+                "Only controls that apply to the selected layer and current plot mode are shown."
+            )
+            panel_note.setWordWrap(True)
+            panel_layout.addWidget(panel_note)
+            visibility_group = QGroupBox("Visibility & Label")
+            self._series_visibility_group = visibility_group
+            visibility_form = QFormLayout(visibility_group)
             self.series_show_in_legend = self._combo(("on", "off"))
             self.series_show_in_legend.currentTextChanged.connect(self._on_series_editor_changed)
             self.series_label = self._line()
             self.series_label.textChanged.connect(self._on_series_label_changed)
+            self._add_form_row(
+                visibility_form,
+                "Show in legend",
+                self.series_show_in_legend,
+                tooltip_id="series.show_in_legend",
+            )
+            self._add_form_row(
+                visibility_form, "Label", self.series_label, tooltip_id="series.label"
+            )
+            panel_layout.addWidget(visibility_group)
+
+            style_group = QGroupBox("Style")
+            self._series_style_group = style_group
+            style_layout = QVBoxLayout(style_group)
+            style_note = QLabel(
+                "Style affects the selected layer only. Derived fit and cumulative rows inherit their base-series styling."
+            )
+            style_note.setWordWrap(True)
+            style_layout.addWidget(style_note)
+            style_form = QFormLayout()
             series_color_row, self.series_color = self._color_field(
                 placeholder="#1f77b4",
                 tooltip_id="series.color",
@@ -3472,28 +4101,184 @@ def launch_plot_settings_panel(
             self._configure_horizontal_growth(self.series_line_kwargs_json)
             self.series_line_kwargs_json.textChanged.connect(self._on_series_editor_changed)
             self._add_form_row(
-                panel_form,
-                "Show in legend",
-                self.series_show_in_legend,
-                tooltip_id="series.show_in_legend",
+                style_form, "Color", series_color_row, tooltip_id="series.color"
             )
-            self._add_form_row(panel_form, "Label", self.series_label, tooltip_id="series.label")
-            self._add_form_row(panel_form, "Color", series_color_row, tooltip_id="series.color")
-            self._add_form_row(panel_form, "Alpha", self.series_alpha, tooltip_id="series.alpha")
+            self._add_form_row(style_form, "Alpha", self.series_alpha, tooltip_id="series.alpha")
             self._add_form_row(
-                panel_form,
+                style_form,
                 "Line width",
                 self.series_line_width,
                 tooltip_id="series.line_width",
             )
-            self._add_form_row(panel_form, "Marker", self.series_marker, tooltip_id="series.marker")
             self._add_form_row(
-                panel_form,
+                style_form, "Marker", self.series_marker, tooltip_id="series.marker"
+            )
+            self._add_form_row(
+                style_form,
                 "Extra line kwargs (JSON)",
                 self.series_line_kwargs_json,
                 tooltip_id="series.line_kwargs_json",
             )
-            panel_layout.addLayout(panel_form)
+            style_layout.addLayout(style_form)
+            panel_layout.addWidget(style_group)
+            derived_group = QGroupBox("Derived Lines")
+            self._series_derived_group = derived_group
+            derived_layout = QVBoxLayout(derived_group)
+            derived_note = QLabel(
+                "Derived lines are computed from the currently displayed data after transforms, sectioning, and masking."
+            )
+            derived_note.setWordWrap(True)
+            derived_layout.addWidget(derived_note)
+
+            if self._analysis_name in {
+                "density",
+                "msd",
+                "rdf",
+                "potential",
+                "position",
+                "coordination",
+                "orientation",
+            }:
+                error_group = QGroupBox("Uncertainty")
+                self._series_uncertainty_group = error_group
+                error_layout = QVBoxLayout(error_group)
+                error_note = QLabel(
+                    "Error overlays belong to the base series. Leave the error color blank to follow the base series color."
+                )
+                error_note.setWordWrap(True)
+                error_layout.addWidget(error_note)
+                error_form = QFormLayout()
+                self._series_error_mode = self._combo(_TOGGLE_MODES)
+                self._series_error_mode.currentTextChanged.connect(self._on_series_editor_changed)
+                self._add_form_row(
+                    error_form,
+                    "Enabled",
+                    self._series_error_mode,
+                    tooltip_id="series.error_enabled",
+                )
+                self._series_error_stat = self._combo(_ERROR_STATS)
+                self._series_error_stat.currentTextChanged.connect(self._on_series_editor_changed)
+                self._add_form_row(
+                    error_form,
+                    "Statistic",
+                    self._series_error_stat,
+                    tooltip_id="series.error_stat",
+                )
+                self._series_error_style = self._combo(_ERROR_STYLES)
+                self._series_error_style.currentTextChanged.connect(self._on_series_editor_changed)
+                self._add_form_row(
+                    error_form,
+                    "Style",
+                    self._series_error_style,
+                    tooltip_id="series.error_style",
+                )
+                error_color_row, self._series_error_color = self._color_field(
+                    placeholder="Blank: follow series color",
+                    tooltip_id="series.error_color",
+                )
+                self._series_error_color.textChanged.connect(self._on_series_editor_changed)
+                self._add_form_row(
+                    error_form,
+                    "Color",
+                    error_color_row,
+                    tooltip_id="series.error_color",
+                )
+                self._series_error_show_in_legend = self._combo(("on", "off"))
+                self._series_error_show_in_legend.currentTextChanged.connect(
+                    self._on_series_editor_changed
+                )
+                self._add_form_row(
+                    error_form,
+                    "Show in legend",
+                    self._series_error_show_in_legend,
+                    tooltip_id="series.show_in_legend",
+                )
+                self._series_error_label = self._line()
+                self._series_error_label.textChanged.connect(self._on_series_editor_changed)
+                self._add_form_row(
+                    error_form,
+                    "Label",
+                    self._series_error_label,
+                    tooltip_id="series.label",
+                )
+                error_layout.addLayout(error_form)
+                self._series_error_summary = QLabel("No error overlay configured for this series.")
+                self._series_error_summary.setWordWrap(True)
+                self._register_tooltip(self._series_error_summary, "series.error.summary")
+                self._apply_widget_tooltip(self._series_error_summary)
+                error_layout.addWidget(self._series_error_summary)
+                self._series_error_explanation = QLabel("")
+                self._series_error_explanation.setWordWrap(True)
+                self._register_tooltip(self._series_error_explanation, "series.error.summary")
+                self._apply_widget_tooltip(self._series_error_explanation)
+                error_layout.addWidget(self._series_error_explanation)
+                self._series_error_warning = QLabel("")
+                self._series_error_warning.setObjectName("inlineWarning")
+                self._series_error_warning.setWordWrap(True)
+                self._series_error_warning.hide()
+                self._register_tooltip(self._series_error_warning, "series.error.summary")
+                self._apply_widget_tooltip(self._series_error_warning)
+                error_layout.addWidget(self._series_error_warning)
+                self._series_error_style_note = QLabel(
+                    "Bands use the default transparency and whiskers use the default capsize."
+                )
+                self._series_error_style_note.setWordWrap(True)
+                self._series_error_style_note.hide()
+                error_layout.addWidget(self._series_error_style_note)
+                panel_layout.addWidget(error_group)
+            else:
+                self._series_uncertainty_group = None
+
+            cumulative_group = QGroupBox("Cumulative Average")
+            self._series_cumulative_group = cumulative_group
+            cumulative_layout = QVBoxLayout(cumulative_group)
+            cumulative_note = QLabel(
+                "Cumulative lines are running means of the currently displayed y-values, ordered by plotted x."
+            )
+            cumulative_note.setWordWrap(True)
+            cumulative_layout.addWidget(cumulative_note)
+            cumulative_form = QFormLayout()
+            self._series_cumulative_mode = self._combo(_TOGGLE_MODES)
+            self._series_cumulative_mode.currentTextChanged.connect(self._on_series_editor_changed)
+            self._add_form_row(
+                cumulative_form,
+                "Enabled",
+                self._series_cumulative_mode,
+                tooltip_id="series.cumulative_enabled",
+            )
+            self._series_cumulative_show_in_legend = self._combo(_TOGGLE_MODES)
+            self._series_cumulative_show_in_legend.currentTextChanged.connect(
+                self._on_series_editor_changed
+            )
+            self._add_form_row(
+                cumulative_form,
+                "Show in legend",
+                self._series_cumulative_show_in_legend,
+                tooltip_id="series.cumulative_show_in_legend",
+            )
+            self._series_cumulative_label = self._line()
+            self._series_cumulative_label.textChanged.connect(self._on_series_editor_changed)
+            self._add_form_row(
+                cumulative_form,
+                "Label",
+                self._series_cumulative_label,
+                tooltip_id="series.cumulative_label",
+            )
+            cumulative_layout.addLayout(cumulative_form)
+            self._series_cumulative_summary = QLabel(
+                "No cumulative-average line configured for this series."
+            )
+            self._series_cumulative_summary.setWordWrap(True)
+            self._register_tooltip(self._series_cumulative_summary, "series.cumulative.summary")
+            self._apply_widget_tooltip(self._series_cumulative_summary)
+            cumulative_layout.addWidget(self._series_cumulative_summary)
+            self._series_cumulative_style_note = QLabel(
+                "Cumulative rows inherit color, alpha, and width from their base series."
+            )
+            self._series_cumulative_style_note.setWordWrap(True)
+            self._series_cumulative_style_note.hide()
+            cumulative_layout.addWidget(self._series_cumulative_style_note)
+            derived_layout.addWidget(cumulative_group)
 
             if self._analysis_name in {
                 "density",
@@ -3504,6 +4289,7 @@ def launch_plot_settings_panel(
                 "coordination",
             }:
                 fit_group = QGroupBox("Fit")
+                self._series_fit_group = fit_group
                 fit_layout = QVBoxLayout(fit_group)
                 fit_note = QLabel(
                     "Fits are derived child series based on the currently displayed data."
@@ -3604,7 +4390,40 @@ def launch_plot_settings_panel(
                 self._series_fit_style_note.hide()
                 fit_summary_layout.addWidget(self._series_fit_style_note)
                 fit_layout.addWidget(fit_summary)
-                panel_layout.addWidget(fit_group)
+                derived_layout.addWidget(fit_group)
+
+            panel_layout.addWidget(derived_group)
+
+            group_group = QGroupBox("Group Members")
+            self._series_group_group = group_group
+            group_layout = QVBoxLayout(group_group)
+            group_note = QLabel(
+                "Grouped series aggregate several loaded base series after their current plot transforms. Grouped lines do not show error overlays in this pass."
+            )
+            group_note.setWordWrap(True)
+            group_layout.addWidget(group_note)
+            group_form = QFormLayout()
+            self._series_group_reducer = self._combo(_GROUP_REDUCERS)
+            self._series_group_reducer.currentTextChanged.connect(self._on_series_editor_changed)
+            self._add_form_row(
+                group_form,
+                "Reducer",
+                self._series_group_reducer,
+                tooltip_id="series.group.reducer",
+            )
+            group_layout.addLayout(group_form)
+            self._series_group_members = QListWidget()
+            self._series_group_members.setSelectionMode(
+                QAbstractItemView.SelectionMode.MultiSelection
+            )
+            self._series_group_members.itemSelectionChanged.connect(self._on_series_editor_changed)
+            self._register_tooltip(self._series_group_members, "series.group.members")
+            self._apply_widget_tooltip(self._series_group_members)
+            group_layout.addWidget(self._series_group_members)
+            self._series_group_summary = QLabel("This series is not grouped.")
+            self._series_group_summary.setWordWrap(True)
+            group_layout.addWidget(self._series_group_summary)
+            panel_layout.addWidget(group_group)
 
             normalize_group = QGroupBox("Normalization")
             self._normalization_group = normalize_group
@@ -3659,9 +4478,9 @@ def launch_plot_settings_panel(
             norm_hint.setWordWrap(True)
             normalize_layout.addWidget(norm_hint)
             panel_layout.addWidget(normalize_group)
-            layout.addWidget(panel)
 
             metadata_group = QGroupBox("Source Metadata")
+            self._series_metadata_group = metadata_group
             metadata_form = QFormLayout(metadata_group)
             self._series_meta_default_label = QLabel("")
             self._series_meta_default_label.setWordWrap(True)
@@ -3698,8 +4517,615 @@ def launch_plot_settings_panel(
             self._series_stats_label = QLabel("No series statistics available yet.")
             self._series_stats_label.setWordWrap(True)
             metadata_form.addRow(QLabel("Series stats"), self._series_stats_label)
-            layout.addWidget(metadata_group)
+            panel_layout.addWidget(metadata_group)
+            layout.addWidget(panel)
             layout.addStretch(1)
+
+        def _build_annotations_tab(self) -> None:
+            layout = QVBoxLayout(self._tab_annotations_content)
+
+            hint = QLabel(
+                "Annotations are figure-level overlays drawn on top of the current axes. Use data coordinates for plot-tied callouts and axes coordinates for labels that stay fixed to the frame."
+            )
+            hint.setObjectName("sectionNote")
+            hint.setWordWrap(True)
+            layout.addWidget(hint)
+
+            actions = QHBoxLayout()
+            add_text_button = QPushButton("Add Text")
+            add_text_button.clicked.connect(lambda: self._add_annotation("text"))
+            self._register_tooltip(add_text_button, "annotations.add_text")
+            self._apply_widget_tooltip(add_text_button)
+            actions.addWidget(add_text_button)
+            add_line_button = QPushButton("Add Line")
+            add_line_button.clicked.connect(lambda: self._add_annotation("line"))
+            self._register_tooltip(add_line_button, "annotations.add_line")
+            self._apply_widget_tooltip(add_line_button)
+            actions.addWidget(add_line_button)
+            add_arrow_button = QPushButton("Add Arrow")
+            add_arrow_button.clicked.connect(lambda: self._add_annotation("arrow"))
+            self._register_tooltip(add_arrow_button, "annotations.add_arrow")
+            self._apply_widget_tooltip(add_arrow_button)
+            actions.addWidget(add_arrow_button)
+            actions.addStretch(1)
+            self._annotation_duplicate_button = QPushButton("Duplicate")
+            self._annotation_duplicate_button.clicked.connect(self._duplicate_annotation)
+            self._register_tooltip(self._annotation_duplicate_button, "annotations.duplicate")
+            self._apply_widget_tooltip(self._annotation_duplicate_button)
+            actions.addWidget(self._annotation_duplicate_button)
+            self._annotation_delete_button = QPushButton("Delete")
+            self._annotation_delete_button.clicked.connect(self._delete_annotation)
+            self._register_tooltip(self._annotation_delete_button, "annotations.delete")
+            self._apply_widget_tooltip(self._annotation_delete_button)
+            actions.addWidget(self._annotation_delete_button)
+            self._annotation_move_up_button = QPushButton("Move Up")
+            self._annotation_move_up_button.clicked.connect(lambda: self._move_annotation(-1))
+            self._register_tooltip(self._annotation_move_up_button, "annotations.move_up")
+            self._apply_widget_tooltip(self._annotation_move_up_button)
+            actions.addWidget(self._annotation_move_up_button)
+            self._annotation_move_down_button = QPushButton("Move Down")
+            self._annotation_move_down_button.clicked.connect(lambda: self._move_annotation(1))
+            self._register_tooltip(self._annotation_move_down_button, "annotations.move_down")
+            self._apply_widget_tooltip(self._annotation_move_down_button)
+            actions.addWidget(self._annotation_move_down_button)
+            layout.addLayout(actions)
+
+            self.annotation_list = QListWidget()
+            self.annotation_list.setObjectName("seriesList")
+            self.annotation_list.setAlternatingRowColors(True)
+            self.annotation_list.setMinimumHeight(180)
+            self.annotation_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+            self.annotation_list.currentRowChanged.connect(
+                self._handle_annotation_list_selection_change
+            )
+            self._register_tooltip(self.annotation_list, "annotations.list")
+            self._apply_widget_tooltip(self.annotation_list)
+            list_group = QGroupBox("Annotations")
+            list_layout = QVBoxLayout(list_group)
+            list_layout.addWidget(self.annotation_list)
+
+            panel = QGroupBox("Selected Annotation")
+            panel_layout = QVBoxLayout(panel)
+            panel_form = QFormLayout()
+
+            self._annotation_enabled_mode = self._combo(_TOGGLE_MODES)
+            self._annotation_enabled_mode.currentTextChanged.connect(
+                self._on_annotation_editor_changed
+            )
+            self._add_form_row(
+                panel_form,
+                "Enabled",
+                self._annotation_enabled_mode,
+                tooltip_id="annotations.enabled",
+            )
+            self._annotation_type = self._combo(_ANNOTATION_TYPES)
+            self._annotation_type.currentTextChanged.connect(self._on_annotation_type_changed)
+            self._add_form_row(
+                panel_form,
+                "Type",
+                self._annotation_type,
+                tooltip_id="annotations.type",
+            )
+            self._annotation_name = self._line()
+            self._annotation_name.textChanged.connect(self._on_annotation_editor_changed)
+            self._add_form_row(
+                panel_form,
+                "Name",
+                self._annotation_name,
+                tooltip_id="annotations.name",
+            )
+            self._annotation_coord_system = self._combo(_ANNOTATION_COORD_SYSTEMS)
+            self._annotation_coord_system.currentTextChanged.connect(
+                self._on_annotation_editor_changed
+            )
+            self._add_form_row(
+                panel_form,
+                "Coordinates",
+                self._annotation_coord_system,
+                tooltip_id="annotations.coord_system",
+            )
+            annotation_color_row, self._annotation_color = self._color_field(
+                placeholder="#000000",
+                tooltip_id="annotations.color",
+            )
+            self._annotation_color.textChanged.connect(self._on_annotation_editor_changed)
+            self._add_form_row(
+                panel_form,
+                "Color",
+                annotation_color_row,
+                tooltip_id="annotations.color",
+            )
+            self._annotation_alpha = self._line("1.0")
+            self._annotation_alpha.textChanged.connect(self._on_annotation_editor_changed)
+            self._add_form_row(
+                panel_form,
+                "Alpha",
+                self._annotation_alpha,
+                tooltip_id="annotations.alpha",
+            )
+            self._annotation_zorder = self._line("5")
+            self._annotation_zorder.textChanged.connect(self._on_annotation_editor_changed)
+            self._add_form_row(
+                panel_form,
+                "Z-order",
+                self._annotation_zorder,
+                tooltip_id="annotations.zorder",
+            )
+
+            self._annotation_text = self._line()
+            self._annotation_text.textChanged.connect(self._on_annotation_editor_changed)
+            self._add_form_row(
+                panel_form,
+                "Text",
+                self._annotation_text,
+                tooltip_id="annotations.text",
+            )
+            self._annotation_x = self._line("0.5")
+            self._annotation_x.textChanged.connect(self._on_annotation_editor_changed)
+            self._add_form_row(panel_form, "X", self._annotation_x, tooltip_id="annotations.x")
+            self._annotation_y = self._line("0.5")
+            self._annotation_y.textChanged.connect(self._on_annotation_editor_changed)
+            self._add_form_row(panel_form, "Y", self._annotation_y, tooltip_id="annotations.y")
+            self._annotation_font_size = self._line("12")
+            self._annotation_font_size.textChanged.connect(self._on_annotation_editor_changed)
+            self._add_form_row(
+                panel_form,
+                "Font size",
+                self._annotation_font_size,
+                tooltip_id="annotations.font_size",
+            )
+            self._annotation_rotation = self._line("0")
+            self._annotation_rotation.textChanged.connect(self._on_annotation_editor_changed)
+            self._add_form_row(
+                panel_form,
+                "Rotation",
+                self._annotation_rotation,
+                tooltip_id="annotations.rotation",
+            )
+            self._annotation_horizontal_align = self._combo(_ANNOTATION_HORIZONTAL_ALIGN)
+            self._annotation_horizontal_align.currentTextChanged.connect(
+                self._on_annotation_editor_changed
+            )
+            self._add_form_row(
+                panel_form,
+                "Horizontal align",
+                self._annotation_horizontal_align,
+                tooltip_id="annotations.horizontal_align",
+            )
+            self._annotation_vertical_align = self._combo(_ANNOTATION_VERTICAL_ALIGN)
+            self._annotation_vertical_align.currentTextChanged.connect(
+                self._on_annotation_editor_changed
+            )
+            self._add_form_row(
+                panel_form,
+                "Vertical align",
+                self._annotation_vertical_align,
+                tooltip_id="annotations.vertical_align",
+            )
+
+            self._annotation_x1 = self._line("0")
+            self._annotation_x1.textChanged.connect(self._on_annotation_editor_changed)
+            self._add_form_row(panel_form, "X1", self._annotation_x1, tooltip_id="annotations.x1")
+            self._annotation_y1 = self._line("0")
+            self._annotation_y1.textChanged.connect(self._on_annotation_editor_changed)
+            self._add_form_row(panel_form, "Y1", self._annotation_y1, tooltip_id="annotations.y1")
+            self._annotation_x2 = self._line("1")
+            self._annotation_x2.textChanged.connect(self._on_annotation_editor_changed)
+            self._add_form_row(panel_form, "X2", self._annotation_x2, tooltip_id="annotations.x2")
+            self._annotation_y2 = self._line("1")
+            self._annotation_y2.textChanged.connect(self._on_annotation_editor_changed)
+            self._add_form_row(panel_form, "Y2", self._annotation_y2, tooltip_id="annotations.y2")
+            self._annotation_line_width = self._line("1.5")
+            self._annotation_line_width.textChanged.connect(self._on_annotation_editor_changed)
+            self._add_form_row(
+                panel_form,
+                "Line width",
+                self._annotation_line_width,
+                tooltip_id="annotations.line_width",
+            )
+            self._annotation_line_style = self._combo(_ANNOTATION_LINE_STYLES)
+            self._annotation_line_style.currentTextChanged.connect(
+                self._on_annotation_editor_changed
+            )
+            self._add_form_row(
+                panel_form,
+                "Line style",
+                self._annotation_line_style,
+                tooltip_id="annotations.line_style",
+            )
+            self._annotation_arrow_style = self._combo(_ANNOTATION_ARROW_STYLES)
+            self._annotation_arrow_style.currentTextChanged.connect(
+                self._on_annotation_editor_changed
+            )
+            self._add_form_row(
+                panel_form,
+                "Arrow style",
+                self._annotation_arrow_style,
+                tooltip_id="annotations.arrow_style",
+            )
+            self._annotation_mutation_scale = self._line("12")
+            self._annotation_mutation_scale.textChanged.connect(self._on_annotation_editor_changed)
+            self._add_form_row(
+                panel_form,
+                "Mutation scale",
+                self._annotation_mutation_scale,
+                tooltip_id="annotations.mutation_scale",
+            )
+            panel_layout.addLayout(panel_form)
+
+            self._annotation_text_rows = [
+                (panel_form, self._annotation_text),
+                (panel_form, self._annotation_x),
+                (panel_form, self._annotation_y),
+                (panel_form, self._annotation_font_size),
+                (panel_form, self._annotation_rotation),
+                (panel_form, self._annotation_horizontal_align),
+                (panel_form, self._annotation_vertical_align),
+            ]
+            self._annotation_line_rows = [
+                (panel_form, self._annotation_x1),
+                (panel_form, self._annotation_y1),
+                (panel_form, self._annotation_x2),
+                (panel_form, self._annotation_y2),
+                (panel_form, self._annotation_line_width),
+                (panel_form, self._annotation_line_style),
+            ]
+            self._annotation_arrow_rows = [
+                (panel_form, self._annotation_arrow_style),
+                (panel_form, self._annotation_mutation_scale),
+            ]
+
+            summary_group = QGroupBox("Preview Summary")
+            summary_layout = QVBoxLayout(summary_group)
+            self._annotation_preview_summary = QLabel(
+                "Preview status will update after the next rendered preview."
+            )
+            self._annotation_preview_summary.setWordWrap(True)
+            self._register_tooltip(self._annotation_preview_summary, "annotations.summary")
+            self._apply_widget_tooltip(self._annotation_preview_summary)
+            summary_layout.addWidget(self._annotation_preview_summary)
+            panel_layout.addWidget(summary_group)
+
+            content_splitter = QSplitter(Qt.Orientation.Horizontal)
+            content_splitter.addWidget(list_group)
+            content_splitter.addWidget(panel)
+            content_splitter.setStretchFactor(0, 0)
+            content_splitter.setStretchFactor(1, 1)
+            content_splitter.setChildrenCollapsible(False)
+            content_splitter.setSizes([260, 640])
+            layout.addWidget(content_splitter, stretch=1)
+            layout.addStretch(1)
+
+        def _annotation_display_text(self, index: int) -> str:
+            if index < 0 or index >= len(self._annotations_data):
+                return f"{index + 1}: Annotation"
+            return _annotation_display_text_from_entry(self._annotations_data[index], index=index)
+
+        def _refresh_annotation_editor_rows(self) -> None:
+            annotation_type = (
+                self._annotation_type.currentText().strip().lower()
+                if hasattr(self, "_annotation_type")
+                else "text"
+            )
+            self._set_rows_visible(self._annotation_text_rows, annotation_type == "text")
+            self._set_rows_visible(self._annotation_line_rows, annotation_type in {"line", "arrow"})
+            self._set_rows_visible(self._annotation_arrow_rows, annotation_type == "arrow")
+
+        def _refresh_annotation_list(self) -> None:
+            if not hasattr(self, "annotation_list"):
+                return
+            self._annotation_syncing = True
+            try:
+                self.annotation_list.clear()
+                for index in range(len(self._annotations_data)):
+                    entry = self._annotations_data[index]
+                    item = QListWidgetItem(self._annotation_display_text(index))
+                    tooltip_text = "\n".join(
+                        [
+                            _annotation_primary_title(entry, index=index + 1),
+                            f"Type: {_annotation_type_label(str(entry.get('type') or 'text'))}",
+                            f"Coordinates: {str(entry.get('coord_system') or 'axes')}",
+                        ]
+                    )
+                    item.setToolTip(tooltip_text)
+                    self.annotation_list.addItem(item)
+                if self._annotations_data:
+                    target = min(
+                        max(self._annotation_active_index, 0), len(self._annotations_data) - 1
+                    )
+                    self._annotation_active_index = target
+                    self.annotation_list.setCurrentRow(target)
+                else:
+                    self._annotation_active_index = 0
+                    self.annotation_list.setCurrentRow(-1)
+            finally:
+                self._annotation_syncing = False
+
+        def _clear_annotation_editor(self) -> None:
+            if not hasattr(self, "_annotation_name"):
+                return
+            self._annotation_syncing = True
+            try:
+                self._set_combo_value(self._annotation_enabled_mode, "on")
+                self._set_combo_value(self._annotation_type, "text")
+                self._annotation_name.setText("")
+                self._set_combo_value(self._annotation_coord_system, "axes")
+                self._annotation_color.setText("#000000")
+                self._annotation_alpha.setText("1.0")
+                self._annotation_zorder.setText("5")
+                self._annotation_text.setText("")
+                self._annotation_x.setText("0.5")
+                self._annotation_y.setText("0.5")
+                self._annotation_font_size.setText("12")
+                self._annotation_rotation.setText("0")
+                self._set_combo_value(self._annotation_horizontal_align, "center")
+                self._set_combo_value(self._annotation_vertical_align, "center")
+                self._annotation_x1.setText("0")
+                self._annotation_y1.setText("0")
+                self._annotation_x2.setText("1")
+                self._annotation_y2.setText("1")
+                self._annotation_line_width.setText("1.5")
+                self._set_combo_value(self._annotation_line_style, "-")
+                self._set_combo_value(self._annotation_arrow_style, "->")
+                self._annotation_mutation_scale.setText("12")
+            finally:
+                self._annotation_syncing = False
+            self._refresh_annotation_editor_rows()
+
+        def _load_annotation_into_editor(self, index: int) -> None:
+            if index < 0 or index >= len(self._annotations_data):
+                self._clear_annotation_editor()
+                if getattr(self, "_annotation_preview_summary", None) is not None:
+                    self._annotation_preview_summary.setText("No annotation selected.")
+                return
+            entry = dict(self._annotations_data[index])
+            self._annotation_syncing = True
+            try:
+                self._set_combo_value(
+                    self._annotation_enabled_mode,
+                    "on" if bool(entry.get("enabled", True)) else "off",
+                )
+                self._set_combo_value(self._annotation_type, str(entry.get("type") or "text"))
+                self._annotation_name.setPlaceholderText(
+                    _default_annotation_name(
+                        str(entry.get("type") or "text"),
+                        index=index + 1,
+                    )
+                )
+                self._annotation_name.setText(str(entry.get("name") or ""))
+                self._set_combo_value(
+                    self._annotation_coord_system,
+                    str(entry.get("coord_system") or "axes"),
+                )
+                self._annotation_color.setText(str(entry.get("color") or "#000000"))
+                self._annotation_alpha.setText(str(entry.get("alpha") or "1.0"))
+                self._annotation_zorder.setText(str(entry.get("zorder") or "5"))
+                self._annotation_text.setText(str(entry.get("text") or ""))
+                self._annotation_x.setText(str(entry.get("x") or "0.5"))
+                self._annotation_y.setText(str(entry.get("y") or "0.5"))
+                self._annotation_font_size.setText(str(entry.get("font_size") or "12"))
+                self._annotation_rotation.setText(str(entry.get("rotation") or "0"))
+                self._set_combo_value(
+                    self._annotation_horizontal_align,
+                    str(entry.get("horizontal_align") or "center"),
+                )
+                self._set_combo_value(
+                    self._annotation_vertical_align,
+                    str(entry.get("vertical_align") or "center"),
+                )
+                self._annotation_x1.setText(str(entry.get("x1") or "0"))
+                self._annotation_y1.setText(str(entry.get("y1") or "0"))
+                self._annotation_x2.setText(str(entry.get("x2") or "1"))
+                self._annotation_y2.setText(str(entry.get("y2") or "1"))
+                self._annotation_line_width.setText(str(entry.get("line_width") or "1.5"))
+                self._set_combo_value(
+                    self._annotation_line_style,
+                    str(entry.get("line_style") or "-"),
+                )
+                self._set_combo_value(
+                    self._annotation_arrow_style,
+                    str(entry.get("arrow_style") or "->"),
+                )
+                self._annotation_mutation_scale.setText(str(entry.get("mutation_scale") or "12"))
+            finally:
+                self._annotation_syncing = False
+            self._refresh_annotation_editor_rows()
+            self._update_annotation_preview_summary(index)
+
+        def _persist_annotation_editor(self, index: int) -> None:
+            if index < 0 or index >= len(self._annotations_data):
+                return
+            current = dict(self._annotations_data[index])
+            current["enabled"] = (
+                self._annotation_enabled_mode.currentText().strip().lower() != "off"
+            )
+            current["type"] = self._annotation_type.currentText().strip().lower() or "text"
+            current["name"] = self._annotation_name.text().strip()
+            current["coord_system"] = (
+                self._annotation_coord_system.currentText().strip().lower() or "axes"
+            )
+            current["color"] = self._annotation_color.text().strip() or "#000000"
+            current["alpha"] = self._annotation_alpha.text().strip() or "1.0"
+            current["zorder"] = self._annotation_zorder.text().strip() or "5"
+            current["text"] = self._annotation_text.text().strip()
+            current["x"] = self._annotation_x.text().strip() or "0.5"
+            current["y"] = self._annotation_y.text().strip() or "0.5"
+            current["font_size"] = self._annotation_font_size.text().strip() or "12"
+            current["rotation"] = self._annotation_rotation.text().strip() or "0"
+            current["horizontal_align"] = (
+                self._annotation_horizontal_align.currentText().strip().lower() or "center"
+            )
+            current["vertical_align"] = (
+                self._annotation_vertical_align.currentText().strip().lower() or "center"
+            )
+            current["x1"] = self._annotation_x1.text().strip() or "0"
+            current["y1"] = self._annotation_y1.text().strip() or "0"
+            current["x2"] = self._annotation_x2.text().strip() or "1"
+            current["y2"] = self._annotation_y2.text().strip() or "1"
+            current["line_width"] = self._annotation_line_width.text().strip() or "1.5"
+            current["line_style"] = self._annotation_line_style.currentText().strip() or "-"
+            current["arrow_style"] = self._annotation_arrow_style.currentText().strip() or "->"
+            current["mutation_scale"] = self._annotation_mutation_scale.text().strip() or "12"
+            self._annotations_data[index] = current
+
+            self._annotation_syncing = True
+            try:
+                self._refresh_annotation_list()
+            finally:
+                self._annotation_syncing = False
+            self._update_annotation_preview_summary(index)
+
+        def _persist_active_annotation_editor(self) -> None:
+            self._persist_annotation_editor(self._annotation_active_index)
+
+        def _handle_annotation_list_selection_change(self, index: int) -> None:
+            if self._annotation_syncing:
+                return
+            self._persist_active_annotation_editor()
+            self._annotation_active_index = max(index, 0)
+            self._load_annotation_into_editor(index)
+            self._refresh_widget_states()
+
+        def _on_annotation_type_changed(self, *_unused: object) -> None:
+            if self._annotation_syncing:
+                return
+            self._refresh_annotation_editor_rows()
+            self._on_annotation_editor_changed()
+
+        def _on_annotation_editor_changed(self, *_unused: object) -> None:
+            if self._annotation_syncing:
+                return
+            self._persist_active_annotation_editor()
+            self._schedule_preview_update()
+
+        def _add_annotation(self, annotation_type: str) -> None:
+            self._persist_active_annotation_editor()
+            entry = _annotation_defaults_for_gui(
+                annotation_type,
+                index=sum(
+                    1
+                    for value in self._annotations_data
+                    if str(value.get("type") or "").strip().lower() == annotation_type
+                )
+                + 1,
+            )
+            self._annotations_data.append(entry)
+            self._annotation_active_index = len(self._annotations_data) - 1
+            self._refresh_annotation_list()
+            self._load_annotation_into_editor(self._annotation_active_index)
+            self._refresh_widget_states()
+            self._schedule_preview_update()
+
+        def _duplicate_annotation(self) -> None:
+            if not self._annotations_data:
+                return
+            self._persist_active_annotation_editor()
+            source = dict(self._annotations_data[self._annotation_active_index])
+            source["id"] = f"annotation:{uuid4().hex}"
+            source["name"] = (
+                f"{str(source.get('name') or _annotation_type_label(str(source.get('type') or 'text'))).strip()} Copy"
+            )
+            insert_at = self._annotation_active_index + 1
+            self._annotations_data.insert(insert_at, source)
+            self._annotation_active_index = insert_at
+            self._refresh_annotation_list()
+            self._load_annotation_into_editor(insert_at)
+            self._refresh_widget_states()
+            self._schedule_preview_update()
+
+        def _delete_annotation(self) -> None:
+            if not self._annotations_data:
+                return
+            self._annotations_data.pop(self._annotation_active_index)
+            if self._annotations_data:
+                self._annotation_active_index = min(
+                    self._annotation_active_index,
+                    len(self._annotations_data) - 1,
+                )
+                self._refresh_annotation_list()
+                self._load_annotation_into_editor(self._annotation_active_index)
+            else:
+                self._annotation_active_index = 0
+                self._refresh_annotation_list()
+                self._clear_annotation_editor()
+                if getattr(self, "_annotation_preview_summary", None) is not None:
+                    self._annotation_preview_summary.setText("No annotations configured.")
+            self._refresh_widget_states()
+            self._schedule_preview_update()
+
+        def _move_annotation(self, delta: int) -> None:
+            if not self._annotations_data or delta == 0:
+                return
+            current = self._annotation_active_index
+            target = min(max(current + delta, 0), len(self._annotations_data) - 1)
+            if target == current:
+                return
+            self._persist_active_annotation_editor()
+            moving = self._annotations_data.pop(current)
+            self._annotations_data.insert(target, moving)
+            self._annotation_active_index = target
+            self._refresh_annotation_list()
+            self._load_annotation_into_editor(target)
+            self._refresh_widget_states()
+            self._schedule_preview_update()
+
+        def _initialize_annotation_data(self, settings: dict[str, Any]) -> None:
+            raw_annotations = settings.get("annotations")
+            self._annotations_data = []
+            if isinstance(raw_annotations, list):
+                for index, value in enumerate(raw_annotations, start=1):
+                    self._annotations_data.append(_coerce_annotation_for_gui(value, index=index))
+            self._annotation_active_index = 0
+            self._refresh_annotation_list()
+            if self._annotations_data:
+                self._load_annotation_into_editor(0)
+            else:
+                self._clear_annotation_editor()
+                if getattr(self, "_annotation_preview_summary", None) is not None:
+                    self._annotation_preview_summary.setText("No annotations configured.")
+
+        def _annotation_summary_for_active(self) -> dict[str, Any] | None:
+            if self._annotation_active_index < 0 or self._annotation_active_index >= len(
+                self._annotations_data
+            ):
+                return None
+            annotation_id = str(
+                self._annotations_data[self._annotation_active_index].get("id")
+                or f"annotation:{self._annotation_active_index}"
+            )
+            raw = self._last_preview_state.get("annotations_summary")
+            if not isinstance(raw, list):
+                return None
+            for item in raw:
+                if isinstance(item, dict) and str(item.get("id") or "") == annotation_id:
+                    return dict(item)
+            return None
+
+        def _update_annotation_preview_summary(self, index: int) -> None:
+            if getattr(self, "_annotation_preview_summary", None) is None:
+                return
+            if index < 0 or index >= len(self._annotations_data):
+                self._annotation_preview_summary.setText("No annotation selected.")
+                return
+            entry = self._annotations_data[index]
+            summary = self._annotation_summary_for_active()
+            title = _annotation_primary_title(entry, index=index + 1)
+            lines = [
+                f"Title: {title}",
+                f"Type: {_annotation_type_label(str(entry.get('type') or 'text'))}",
+                f"Coordinates: {str(entry.get('coord_system') or 'axes')}",
+            ]
+            if isinstance(summary, dict):
+                status = str(summary.get("status") or "ok").strip().lower()
+                if status == "ok":
+                    lines.append("Preview: Rendered in the current preview.")
+                elif status == "disabled":
+                    lines.append("Preview: Disabled and hidden from the current preview.")
+                else:
+                    lines.append(f"Preview: {status}")
+            else:
+                lines.append("Preview: Waiting for the next rendered preview of this annotation.")
+            self._annotation_preview_summary.setText("\n".join(lines))
 
         def _build_analysis_data_sections(self, layout: QVBoxLayout) -> None:
             analysis = self._analysis_name
@@ -3728,6 +5154,12 @@ def launch_plot_settings_panel(
                         self.analysis_axis,
                         tooltip_id="data.profile.axis",
                     )
+                selection_note = QLabel(
+                    "Chooses which stored profile is loaded from the current source."
+                )
+                selection_note.setObjectName("sectionNote")
+                selection_note.setWordWrap(True)
+                selection_form.addRow(selection_note)
                 layout.addWidget(selection)
 
             if analysis == "rdf":
@@ -3761,6 +5193,12 @@ def launch_plot_settings_panel(
                     self.rdf_species_b,
                     tooltip_id="data.rdf.species_b",
                 )
+                selection_note = QLabel(
+                    "Chooses which stored RDF profile is loaded from the current source."
+                )
+                selection_note.setObjectName("sectionNote")
+                selection_note.setWordWrap(True)
+                selection_form.addRow(selection_note)
                 layout.addWidget(selection)
 
             if analysis == "coordination":
@@ -3805,7 +5243,7 @@ def launch_plot_settings_panel(
                     tooltip_id="data.coordination.axis",
                 )
                 note = QLabel(
-                    "Filters which stored coordination profile(s) are loaded from the HDF5. "
+                    "Chooses which stored coordination profile(s) are loaded from the current source."
                 )
                 note.setWordWrap(True)
                 note.setObjectName("sectionNote")
@@ -3933,7 +5371,9 @@ def launch_plot_settings_panel(
             if analysis == "orientation":
                 view = QGroupBox("Orientation View")
                 view_form = QFormLayout(view)
-                self.orientation_component = self._combo(("average", "density-weighted", "heatmap"))
+                self.orientation_component = self._combo(
+                    ("average", "density", "density-weighted", "heatmap")
+                )
                 self.orientation_component.currentTextChanged.connect(
                     self._handle_series_identity_change
                 )
@@ -4000,6 +5440,24 @@ def launch_plot_settings_panel(
                     "alpha": self._series_alpha_data[index]
                     if index < len(self._series_alpha_data)
                     else "",
+                    "error_enabled": self._series_error_enabled_data[index]
+                    if index < len(self._series_error_enabled_data)
+                    else False,
+                    "error_stat": self._series_error_stats_data[index]
+                    if index < len(self._series_error_stats_data)
+                    else "block_sem",
+                    "error_style": self._series_error_styles_data[index]
+                    if index < len(self._series_error_styles_data)
+                    else "band",
+                    "error_color": self._series_error_colors_data[index]
+                    if index < len(self._series_error_colors_data)
+                    else "",
+                    "error_label_override": self._series_error_label_overrides_data[index]
+                    if index < len(self._series_error_label_overrides_data)
+                    else "",
+                    "error_show_in_legend": self._series_error_show_in_legend_data[index]
+                    if index < len(self._series_error_show_in_legend_data)
+                    else False,
                     "fit_enabled": self._series_fit_enabled_data[index]
                     if index < len(self._series_fit_enabled_data)
                     else False,
@@ -4024,6 +5482,15 @@ def launch_plot_settings_panel(
                     "fit_x_max": self._series_fit_x_maxs_data[index]
                     if index < len(self._series_fit_x_maxs_data)
                     else "",
+                    "cumulative_enabled": self._series_cumulative_enabled_data[index]
+                    if index < len(self._series_cumulative_enabled_data)
+                    else False,
+                    "cumulative_label_override": self._series_cumulative_label_overrides_data[index]
+                    if index < len(self._series_cumulative_label_overrides_data)
+                    else "",
+                    "cumulative_show_in_legend": self._series_cumulative_show_in_legend_data[index]
+                    if index < len(self._series_cumulative_show_in_legend_data)
+                    else True,
                     "line_width": self._series_line_widths_data[index]
                     if index < len(self._series_line_widths_data)
                     else "",
@@ -4051,6 +5518,12 @@ def launch_plot_settings_panel(
             new_enabled: list[bool] = []
             new_show_in_legend: list[bool] = []
             new_alpha: list[str] = []
+            new_error_enabled: list[bool] = []
+            new_error_stats: list[str] = []
+            new_error_styles: list[str] = []
+            new_error_colors: list[str] = []
+            new_error_label_overrides: list[str] = []
+            new_error_show_in_legend: list[bool] = []
             new_fit_enabled: list[bool] = []
             new_fit_label_overrides: list[str] = []
             new_fit_show_in_legend: list[bool] = []
@@ -4059,6 +5532,9 @@ def launch_plot_settings_panel(
             new_fit_range_modes: list[str] = []
             new_fit_x_mins: list[str] = []
             new_fit_x_maxs: list[str] = []
+            new_cumulative_enabled: list[bool] = []
+            new_cumulative_label_overrides: list[str] = []
+            new_cumulative_show_in_legend: list[bool] = []
             new_widths: list[str] = []
             new_markers: list[str] = []
             new_line_kwargs: list[str] = []
@@ -4088,6 +5564,18 @@ def launch_plot_settings_panel(
                 new_enabled.append(bool(previous.get("enabled", True)))
                 new_show_in_legend.append(bool(previous.get("show_in_legend", True)))
                 new_alpha.append(str(previous.get("alpha") or "").strip())
+                new_error_enabled.append(bool(previous.get("error_enabled", False)))
+                new_error_stats.append(
+                    str(previous.get("error_stat") or "block_sem").strip() or "block_sem"
+                )
+                new_error_styles.append(
+                    str(previous.get("error_style") or "band").strip() or "band"
+                )
+                new_error_colors.append(str(previous.get("error_color") or "").strip())
+                new_error_label_overrides.append(
+                    str(previous.get("error_label_override") or "").strip()
+                )
+                new_error_show_in_legend.append(bool(previous.get("error_show_in_legend", False)))
                 new_fit_enabled.append(bool(previous.get("fit_enabled", False)))
                 new_fit_label_overrides.append(
                     str(previous.get("fit_label_override") or "").strip()
@@ -4100,6 +5588,13 @@ def launch_plot_settings_panel(
                 )
                 new_fit_x_mins.append(str(previous.get("fit_x_min") or "").strip())
                 new_fit_x_maxs.append(str(previous.get("fit_x_max") or "").strip())
+                new_cumulative_enabled.append(bool(previous.get("cumulative_enabled", False)))
+                new_cumulative_label_overrides.append(
+                    str(previous.get("cumulative_label_override") or "").strip()
+                )
+                new_cumulative_show_in_legend.append(
+                    bool(previous.get("cumulative_show_in_legend", True))
+                )
                 new_widths.append(str(previous.get("line_width") or "").strip())
                 new_markers.append(str(previous.get("marker") or "").strip())
                 new_line_kwargs.append(str(previous.get("line_kwargs") or "").strip())
@@ -4114,6 +5609,12 @@ def launch_plot_settings_panel(
             self._series_enabled_data = new_enabled
             self._series_show_in_legend_data = new_show_in_legend
             self._series_alpha_data = new_alpha
+            self._series_error_enabled_data = new_error_enabled
+            self._series_error_stats_data = new_error_stats
+            self._series_error_styles_data = new_error_styles
+            self._series_error_colors_data = new_error_colors
+            self._series_error_label_overrides_data = new_error_label_overrides
+            self._series_error_show_in_legend_data = new_error_show_in_legend
             self._series_fit_enabled_data = new_fit_enabled
             self._series_fit_label_overrides_data = new_fit_label_overrides
             self._series_fit_show_in_legend_data = new_fit_show_in_legend
@@ -4122,6 +5623,9 @@ def launch_plot_settings_panel(
             self._series_fit_range_modes_data = new_fit_range_modes
             self._series_fit_x_mins_data = new_fit_x_mins
             self._series_fit_x_maxs_data = new_fit_x_maxs
+            self._series_cumulative_enabled_data = new_cumulative_enabled
+            self._series_cumulative_label_overrides_data = new_cumulative_label_overrides
+            self._series_cumulative_show_in_legend_data = new_cumulative_show_in_legend
             self._series_line_widths_data = new_widths
             self._series_markers_data = new_markers
             self._series_line_kwargs_data = new_line_kwargs
@@ -4192,6 +5696,15 @@ def launch_plot_settings_panel(
             self._series_enabled_data = _reorder(self._series_enabled_data)
             self._series_show_in_legend_data = _reorder(self._series_show_in_legend_data)
             self._series_alpha_data = _reorder(self._series_alpha_data)
+            self._series_error_enabled_data = _reorder(self._series_error_enabled_data)
+            self._series_error_stats_data = _reorder(self._series_error_stats_data)
+            self._series_error_styles_data = _reorder(self._series_error_styles_data)
+            self._series_error_label_overrides_data = _reorder(
+                self._series_error_label_overrides_data
+            )
+            self._series_error_show_in_legend_data = _reorder(
+                self._series_error_show_in_legend_data
+            )
             self._series_fit_enabled_data = _reorder(self._series_fit_enabled_data)
             self._series_fit_label_overrides_data = _reorder(self._series_fit_label_overrides_data)
             self._series_fit_show_in_legend_data = _reorder(self._series_fit_show_in_legend_data)
@@ -4200,6 +5713,13 @@ def launch_plot_settings_panel(
             self._series_fit_range_modes_data = _reorder(self._series_fit_range_modes_data)
             self._series_fit_x_mins_data = _reorder(self._series_fit_x_mins_data)
             self._series_fit_x_maxs_data = _reorder(self._series_fit_x_maxs_data)
+            self._series_cumulative_enabled_data = _reorder(self._series_cumulative_enabled_data)
+            self._series_cumulative_label_overrides_data = _reorder(
+                self._series_cumulative_label_overrides_data
+            )
+            self._series_cumulative_show_in_legend_data = _reorder(
+                self._series_cumulative_show_in_legend_data
+            )
             self._series_line_widths_data = _reorder(self._series_line_widths_data)
             self._series_markers_data = _reorder(self._series_markers_data)
             self._series_line_kwargs_data = _reorder(self._series_line_kwargs_data)
@@ -4213,7 +5733,6 @@ def launch_plot_settings_panel(
 
         def _enabled_partitioned_series_id_order(self) -> list[str]:
             current_ids = self._current_series_id_order()
-            natural_ids = _resolve_series_id_order(current_ids, self._series_natural_order_data)
             enabled_by_id = {
                 str(descriptor.get("series_id") or f"series:{index}"): bool(
                     self._series_enabled_data[index]
@@ -4221,32 +5740,49 @@ def launch_plot_settings_panel(
                 for index, descriptor in enumerate(self._series_descriptors_data)
                 if index < len(self._series_enabled_data)
             }
-            enabled_ids = [series_id for series_id in natural_ids if enabled_by_id.get(series_id)]
-            disabled_ids = [
-                series_id for series_id in natural_ids if not enabled_by_id.get(series_id, True)
-            ]
-            return enabled_ids + disabled_ids
+            return _partition_series_ids_by_enabled_state(current_ids, enabled_by_id)
 
         def _restore_active_series_from_id(self, selected_id: str) -> None:
             if not selected_id:
                 return
             try:
-                if selected_id.startswith("fit::"):
+                if selected_id.startswith("cumulative::"):
+                    selected_base_id = selected_id.removeprefix("cumulative::")
+                    self._series_active_index = self._current_series_id_order().index(
+                        selected_base_id
+                    )
+                    self._set_active_series_child_kind(
+                        "cumulative"
+                        if (
+                            self._series_active_index
+                            < len(self._series_cumulative_enabled_data)
+                            and bool(
+                                self._series_cumulative_enabled_data[self._series_active_index]
+                            )
+                            and not self._is_orientation_heatmap_mode()
+                        )
+                        else "base"
+                    )
+                elif selected_id.startswith("fit::"):
                     selected_base_id = selected_id.removeprefix("fit::")
                     self._series_active_index = self._current_series_id_order().index(
                         selected_base_id
                     )
-                    self._series_active_is_fit_child = (
-                        self._series_active_index < len(self._series_fit_enabled_data)
-                        and bool(self._series_fit_enabled_data[self._series_active_index])
-                        and self._fit_supported_for_current_view()
+                    self._set_active_series_child_kind(
+                        "fit"
+                        if (
+                            self._series_active_index < len(self._series_fit_enabled_data)
+                            and bool(self._series_fit_enabled_data[self._series_active_index])
+                            and self._fit_supported_for_current_view()
+                        )
+                        else "base"
                     )
                 else:
                     self._series_active_index = self._current_series_id_order().index(selected_id)
-                    self._series_active_is_fit_child = False
+                    self._set_active_series_child_kind("base")
             except ValueError:
                 self._series_active_index = 0
-                self._series_active_is_fit_child = False
+                self._set_active_series_child_kind("base")
 
         def _effective_series_label(self, index: int) -> str:
             override = ""
@@ -4291,8 +5827,299 @@ def launch_plot_settings_panel(
                 return component != "time-distance"
             return False
 
+        def _error_supported_for_current_view(self) -> bool:
+            return _error_supported_for_view(
+                str(self._analysis_name or ""),
+                orientation_heatmap=self._is_orientation_heatmap_mode(),
+                position_component=(
+                    self.position_component.currentText().strip().lower()
+                    if hasattr(self, "position_component")
+                    else "distance"
+                ),
+                coordination_component=(
+                    self.coordination_component.currentText().strip().lower()
+                    if hasattr(self, "coordination_component")
+                    else "distance"
+                ),
+            )
+
+        def _current_plot_family(self) -> str:
+            return _plot_family_for_view(
+                str(self._analysis_name or ""),
+                orientation_heatmap=self._is_orientation_heatmap_mode(),
+                position_component=(
+                    self.position_component.currentText().strip().lower()
+                    if hasattr(self, "position_component")
+                    else "distance"
+                ),
+                coordination_component=(
+                    self.coordination_component.currentText().strip().lower()
+                    if hasattr(self, "coordination_component")
+                    else "distance"
+                ),
+            )
+
+        def _current_layer_kind(self) -> str:
+            if self._layers_tabs is not None and self._layers_tabs.currentIndex() == 1:
+                return "annotation"
+            if self._series_active_is_cumulative_child:
+                return "cumulative"
+            if self._series_active_is_fit_child:
+                return "fit"
+            if self._series_is_group(self._series_active_index):
+                return "group"
+            return "source"
+
+        def _current_layer_capabilities(self) -> _LayerInspectorCapabilities:
+            plot_family = self._current_plot_family()
+            layer_kind = self._current_layer_kind()
+            is_line_family = plot_family == "line"
+            if layer_kind == "annotation":
+                return _LayerInspectorCapabilities(
+                    plot_family=plot_family,
+                    layer_kind=layer_kind,
+                    show_visibility_label=False,
+                    show_style=False,
+                    show_markers=False,
+                    show_derived_lines=False,
+                    show_uncertainty=False,
+                    show_normalization=False,
+                    show_group_members=False,
+                    show_metadata=False,
+                    show_fit_editor=False,
+                    show_cumulative_editor=False,
+                )
+            if layer_kind == "group":
+                return _LayerInspectorCapabilities(
+                    plot_family=plot_family,
+                    layer_kind=layer_kind,
+                    show_visibility_label=True,
+                    show_style=is_line_family,
+                    show_markers=is_line_family,
+                    show_derived_lines=is_line_family,
+                    show_uncertainty=False,
+                    show_normalization=False,
+                    show_group_members=True,
+                    show_metadata=True,
+                    show_fit_editor=is_line_family,
+                    show_cumulative_editor=is_line_family,
+                )
+            if layer_kind == "fit":
+                return _LayerInspectorCapabilities(
+                    plot_family=plot_family,
+                    layer_kind=layer_kind,
+                    show_visibility_label=False,
+                    show_style=False,
+                    show_markers=False,
+                    show_derived_lines=True,
+                    show_uncertainty=False,
+                    show_normalization=False,
+                    show_group_members=False,
+                    show_metadata=False,
+                    show_fit_editor=is_line_family,
+                    show_cumulative_editor=False,
+                )
+            if layer_kind == "cumulative":
+                return _LayerInspectorCapabilities(
+                    plot_family=plot_family,
+                    layer_kind=layer_kind,
+                    show_visibility_label=False,
+                    show_style=False,
+                    show_markers=False,
+                    show_derived_lines=True,
+                    show_uncertainty=False,
+                    show_normalization=False,
+                    show_group_members=False,
+                    show_metadata=False,
+                    show_fit_editor=False,
+                    show_cumulative_editor=is_line_family,
+                )
+            return _LayerInspectorCapabilities(
+                plot_family=plot_family,
+                layer_kind=layer_kind,
+                show_visibility_label=is_line_family,
+                show_style=is_line_family,
+                show_markers=is_line_family,
+                show_derived_lines=is_line_family,
+                show_uncertainty=self._error_supported_for_current_view(),
+                show_normalization=is_line_family,
+                show_group_members=False,
+                show_metadata=True,
+                show_fit_editor=is_line_family and self._fit_supported_for_current_view(),
+                show_cumulative_editor=is_line_family,
+            )
+
+        def _current_figure_capabilities(self) -> _FigureInspectorCapabilities:
+            plot_family = self._current_plot_family()
+            show_heatmap = plot_family == "heatmap"
+            return _FigureInspectorCapabilities(
+                plot_family=plot_family,
+                show_legend=plot_family == "line",
+                show_lines=plot_family == "line",
+                show_heatmap=show_heatmap,
+                show_colorbar=show_heatmap,
+            )
+
         def _fit_child_series_id(self, index: int) -> str:
             return f"fit::{self._series_descriptor(index).get('series_id') or f'series:{index}'}"
+
+        def _cumulative_child_series_id(self, index: int) -> str:
+            return (
+                f"cumulative::{self._series_descriptor(index).get('series_id') or f'series:{index}'}"
+            )
+
+        def _available_error_stats_for_series(self, index: int) -> list[str]:
+            if self._series_is_group(index):
+                return []
+            descriptor = self._series_descriptor(index)
+            series_id = str(descriptor.get("series_id") or f"series:{index}")
+            raw = self._last_preview_state.get("series_available_error_stats")
+            resolved: list[str] = []
+            values = raw.get(series_id) if isinstance(raw, dict) else None
+            if isinstance(values, list):
+                for value in values:
+                    token = str(value).strip().lower()
+                    if token in _ERROR_STATS and token not in resolved:
+                        resolved.append(token)
+            if resolved:
+                return resolved
+            summary = self._preview_error_summary_for_series(index)
+            if isinstance(summary, dict):
+                token = str(summary.get("stat") or "").strip().lower()
+                if token in _ERROR_STATS:
+                    resolved.append(token)
+                if resolved or str(summary.get("status") or "").strip().lower() in {
+                    "unavailable",
+                    "empty",
+                }:
+                    return resolved
+            return _inferred_available_error_stats(
+                analysis_name=self._analysis_name,
+                error_supported=self._error_supported_for_current_view(),
+                x_bin_width_active=bool(
+                    getattr(self, "x_bin_width", None) and self.x_bin_width.text().strip()
+                ),
+            )
+
+        def _current_error_statistics_mode_for_series(self, index: int) -> str | None:
+            if self._series_is_group(index):
+                return None
+            _ = index
+            return _current_error_statistics_mode(
+                analysis_name=self._analysis_name,
+                error_supported=self._error_supported_for_current_view(),
+                x_bin_width_active=bool(
+                    getattr(self, "x_bin_width", None) and self.x_bin_width.text().strip()
+                ),
+            )
+
+        def _current_error_provenance_for_series(self, index: int) -> str:
+            return _describe_error_provenance(
+                analysis_name=self._analysis_name,
+                requested_stat=self._resolved_error_stat_for_series(index),
+                statistics_mode=self._current_error_statistics_mode_for_series(index) or "direct",
+            )
+
+        def _preview_error_summary_for_series(self, index: int) -> dict[str, Any] | None:
+            descriptor = self._series_descriptor(index)
+            series_id = str(descriptor.get("series_id") or f"series:{index}")
+            raw = self._last_preview_state.get("series_error_summaries")
+            summary = raw.get(series_id) if isinstance(raw, dict) else None
+            return summary if isinstance(summary, dict) else None
+
+        def _error_availability_for_series(self, index: int) -> Any:
+            if self._series_is_group(index):
+                return resolve_series_error_availability(
+                    supported_for_view=False,
+                    available_stats=[],
+                    error_reason="Grouped series do not render error overlays.",
+                )
+            summary = self._preview_error_summary_for_series(index)
+            reason = summary.get("reason") if isinstance(summary, dict) else None
+            if reason is None and not self._error_supported_for_current_view():
+                reason = "Error overlays are only available for 1-D line-based views."
+            return resolve_series_error_availability(
+                supported_for_view=self._error_supported_for_current_view(),
+                available_stats=self._available_error_stats_for_series(index),
+                error_status=summary.get("status") if isinstance(summary, dict) else None,
+                error_reason=reason,
+            )
+
+        def _default_error_stat_for_series(self, index: int) -> str:
+            availability = self._error_availability_for_series(index)
+            return str(availability.default_stat or "sample_sem")
+
+        def _resolved_error_stat_for_series(self, index: int) -> str:
+            configured = (
+                self._series_error_stats_data[index].strip().lower()
+                if 0 <= index < len(self._series_error_stats_data)
+                else None
+            )
+            available = self._error_availability_for_series(index).available_stats
+            if not available:
+                return (
+                    configured
+                    if configured in _ERROR_STATS
+                    else self._default_error_stat_for_series(index)
+                )
+            return _resolve_error_stat_for_available(
+                configured,
+                available,
+            )
+
+        def _series_error_config(self, index: int) -> dict[str, Any]:
+            config = _error_defaults_for_gui()
+            if 0 <= index < len(self._series_error_enabled_data):
+                config["enabled"] = bool(self._series_error_enabled_data[index])
+            config["stat"] = self._resolved_error_stat_for_series(index)
+            if 0 <= index < len(self._series_error_styles_data):
+                token = self._series_error_styles_data[index].strip().lower()
+                if token in _ERROR_STYLES:
+                    config["style"] = token
+            if 0 <= index < len(self._series_error_colors_data):
+                config["color"] = self._series_error_colors_data[index].strip() or None
+            if 0 <= index < len(self._series_error_label_overrides_data):
+                config["label_override"] = (
+                    self._series_error_label_overrides_data[index].strip() or None
+                )
+            if 0 <= index < len(self._series_error_show_in_legend_data):
+                config["show_in_legend"] = bool(self._series_error_show_in_legend_data[index])
+            return config
+
+        def _error_effective_label(self, index: int) -> str:
+            override = ""
+            if 0 <= index < len(self._series_error_label_overrides_data):
+                override = self._series_error_label_overrides_data[index].strip()
+            return override or _default_error_series_label(
+                self._effective_series_label(index),
+                self._resolved_error_stat_for_series(index),
+            )
+
+        def _cumulative_effective_label(self, index: int) -> str:
+            override = ""
+            if 0 <= index < len(self._series_cumulative_label_overrides_data):
+                override = self._series_cumulative_label_overrides_data[index].strip()
+            return override or f"{self._effective_series_label(index)} cumulative average"
+
+        def _active_series_child_kind(self) -> str:
+            if self._series_active_is_cumulative_child:
+                return "cumulative"
+            if self._series_active_is_fit_child:
+                return "fit"
+            return "base"
+
+        def _set_active_series_child_kind(self, kind: str) -> None:
+            normalized = str(kind).strip().lower()
+            self._series_active_is_error_child = False
+            self._series_active_is_cumulative_child = normalized == "cumulative"
+            self._series_active_is_fit_child = normalized == "fit"
+
+        def _active_series_row_id(self) -> str:
+            if self._series_active_is_cumulative_child:
+                return self._cumulative_child_series_id(self._series_active_index)
+            if self._series_active_is_fit_child:
+                return self._fit_child_series_id(self._series_active_index)
+            return str(self._series_descriptor(self._series_active_index).get("series_id") or "")
 
         def _series_fit_config(self, index: int) -> dict[str, Any]:
             config = _fit_defaults_for_gui()
@@ -4338,10 +6165,181 @@ def launch_plot_settings_panel(
                 override = self._series_fit_label_overrides_data[index].strip()
             return override or f"{self._effective_series_label(index)} fit"
 
+        def _series_is_group(self, index: int) -> bool:
+            descriptor = self._series_descriptor(index)
+            return str(descriptor.get("source_kind") or "source").strip().lower() == "group"
+
+        def _group_member_candidate_indices(self) -> list[int]:
+            candidates: list[int] = []
+            for index, descriptor in enumerate(self._series_descriptors_data):
+                if str(descriptor.get("source_kind") or "source").strip().lower() != "group":
+                    candidates.append(index)
+            return candidates
+
+        def _next_group_label(self) -> str:
+            existing = {
+                self._effective_series_label(index).strip().lower()
+                for index in range(len(self._series_labels_data))
+                if self._effective_series_label(index).strip()
+            }
+            for number in range(1, 1000):
+                candidate = f"Group {number}"
+                if candidate.strip().lower() not in existing:
+                    return candidate
+            return f"Group {len(self._series_labels_data) + 1}"
+
+        def _clone_series_at_index(self, index: int) -> None:
+            if index < 0 or index >= len(self._series_descriptors_data):
+                return
+            descriptor = dict(self._series_descriptor(index))
+            source_kind = str(descriptor.get("source_kind") or "source").strip().lower()
+            base_label = self._effective_series_label(index)
+            descriptor["series_id"] = f"{source_kind}:{uuid4().hex}"
+            descriptor["default_label"] = f"{base_label} Copy"
+            insert_at = index + 1
+            def _insert(values: list[Any], copied: Any) -> None:
+                values.insert(insert_at, deepcopy(copied))
+
+            for values, copied in (
+                (self._series_descriptors_data, descriptor),
+                (self._series_labels_data, f"{base_label} Copy"),
+                (self._series_label_overrides_data, f"{base_label} Copy"),
+                (self._series_colors_data, self._series_colors_data[index]),
+                (self._series_enabled_data, self._series_enabled_data[index]),
+                (self._series_show_in_legend_data, self._series_show_in_legend_data[index]),
+                (self._series_alpha_data, self._series_alpha_data[index]),
+                (self._series_error_enabled_data, self._series_error_enabled_data[index]),
+                (self._series_error_stats_data, self._series_error_stats_data[index]),
+                (self._series_error_styles_data, self._series_error_styles_data[index]),
+                (self._series_error_colors_data, self._series_error_colors_data[index]),
+                (
+                    self._series_error_label_overrides_data,
+                    self._series_error_label_overrides_data[index],
+                ),
+                (
+                    self._series_error_show_in_legend_data,
+                    self._series_error_show_in_legend_data[index],
+                ),
+                (self._series_fit_enabled_data, self._series_fit_enabled_data[index]),
+                (
+                    self._series_fit_label_overrides_data,
+                    self._series_fit_label_overrides_data[index],
+                ),
+                (
+                    self._series_fit_show_in_legend_data,
+                    self._series_fit_show_in_legend_data[index],
+                ),
+                (self._series_fit_types_data, self._series_fit_types_data[index]),
+                (self._series_fit_degrees_data, self._series_fit_degrees_data[index]),
+                (self._series_fit_range_modes_data, self._series_fit_range_modes_data[index]),
+                (self._series_fit_x_mins_data, self._series_fit_x_mins_data[index]),
+                (self._series_fit_x_maxs_data, self._series_fit_x_maxs_data[index]),
+                (self._series_cumulative_enabled_data, self._series_cumulative_enabled_data[index]),
+                (
+                    self._series_cumulative_label_overrides_data,
+                    self._series_cumulative_label_overrides_data[index],
+                ),
+                (
+                    self._series_cumulative_show_in_legend_data,
+                    self._series_cumulative_show_in_legend_data[index],
+                ),
+                (self._series_line_widths_data, self._series_line_widths_data[index]),
+                (self._series_markers_data, self._series_markers_data[index]),
+                (self._series_line_kwargs_data, self._series_line_kwargs_data[index]),
+                (
+                    self._series_normalization_modes_data,
+                    self._series_normalization_modes_data[index],
+                ),
+                (
+                    self._series_normalization_values_data,
+                    self._series_normalization_values_data[index],
+                ),
+                (
+                    self._series_normalization_x_refs_data,
+                    self._series_normalization_x_refs_data[index],
+                ),
+            ):
+                _insert(values, copied)
+            self._series_active_index = insert_at
+            self._set_active_series_child_kind("base")
+            self._sync_series_selection_widgets(self._series_active_index)
+            self._load_series_into_editor(self._series_active_index)
+            self._schedule_preview_update()
+
+        def _duplicate_selected_series(self) -> None:
+            self._persist_active_series_editor()
+            self._clone_series_at_index(self._series_active_index)
+
+        def _add_group_series(self) -> None:
+            self._persist_active_series_editor()
+            base_members = [
+                str(self._series_descriptor(index).get("series_id") or f"series:{index}")
+                for index in self._group_member_candidate_indices()
+            ]
+            active_series_id = str(
+                self._series_descriptor(self._series_active_index).get("series_id")
+                or f"series:{self._series_active_index}"
+            )
+            if active_series_id in base_members:
+                member_series_ids = [active_series_id]
+            else:
+                member_series_ids = base_members[:1]
+            descriptor = {
+                "series_id": f"group:{uuid4().hex}",
+                "default_label": self._next_group_label(),
+                "source_kind": "group",
+                "member_series_ids": member_series_ids,
+                "group_reducer": "mean",
+                "source_name": "Grouped series",
+                "source_directory": "",
+                "source_path": "",
+            }
+            self._series_descriptors_data.append(descriptor)
+            self._series_labels_data.append(str(descriptor["default_label"]))
+            self._series_label_overrides_data.append("")
+            self._series_colors_data.append("")
+            self._series_enabled_data.append(True)
+            self._series_show_in_legend_data.append(True)
+            self._series_alpha_data.append("")
+            self._series_error_enabled_data.append(False)
+            self._series_error_stats_data.append("sample_sem")
+            self._series_error_styles_data.append("band")
+            self._series_error_colors_data.append("")
+            self._series_error_label_overrides_data.append("")
+            self._series_error_show_in_legend_data.append(False)
+            self._series_fit_enabled_data.append(False)
+            self._series_fit_label_overrides_data.append("")
+            self._series_fit_show_in_legend_data.append(True)
+            self._series_fit_types_data.append("linear")
+            self._series_fit_degrees_data.append("2")
+            self._series_fit_range_modes_data.append("visible")
+            self._series_fit_x_mins_data.append("")
+            self._series_fit_x_maxs_data.append("")
+            self._series_cumulative_enabled_data.append(False)
+            self._series_cumulative_label_overrides_data.append("")
+            self._series_cumulative_show_in_legend_data.append(True)
+            self._series_line_widths_data.append("")
+            self._series_markers_data.append("")
+            self._series_line_kwargs_data.append("")
+            self._series_normalization_modes_data.append("none")
+            self._series_normalization_values_data.append("")
+            self._series_normalization_x_refs_data.append("")
+            self._series_active_index = len(self._series_descriptors_data) - 1
+            self._set_active_series_child_kind("base")
+            self._sync_series_selection_widgets(self._series_active_index)
+            self._load_series_into_editor(self._series_active_index)
+            self._schedule_preview_update()
+
         def _rebuild_series_display_rows(self) -> None:
             rows: list[dict[str, Any]] = []
             for index in range(len(self._series_labels_data)):
                 rows.append({"kind": "base", "base_index": index})
+                if (
+                    index < len(self._series_cumulative_enabled_data)
+                    and self._series_cumulative_enabled_data[index]
+                    and not self._is_orientation_heatmap_mode()
+                ):
+                    rows.append({"kind": "cumulative", "base_index": index})
                 if (
                     index < len(self._series_fit_enabled_data)
                     and self._series_fit_enabled_data[index]
@@ -4355,11 +6353,12 @@ def launch_plot_settings_panel(
                 return dict(self._series_display_rows[row])
             return {"kind": "base", "base_index": max(0, self._series_active_index)}
 
-        def _display_row_for_selection(self, base_index: int, *, is_fit_child: bool) -> int:
+        def _display_row_for_selection(self, base_index: int, *, kind: str = "base") -> int:
             for row, descriptor in enumerate(self._series_display_rows):
-                if int(descriptor.get("base_index", -1)) == base_index and str(
-                    descriptor.get("kind") or "base"
-                ) == ("fit" if is_fit_child else "base"):
+                if (
+                    int(descriptor.get("base_index", -1)) == base_index
+                    and str(descriptor.get("kind") or "base") == kind
+                ):
                     return row
             for row, descriptor in enumerate(self._series_display_rows):
                 if int(descriptor.get("base_index", -1)) == base_index:
@@ -4370,15 +6369,27 @@ def launch_plot_settings_panel(
             descriptor = self._display_row(row)
             base_index = int(descriptor.get("base_index", 0))
             kind = str(descriptor.get("kind") or "base")
+            base_label = self._effective_series_label(base_index)
+            if self._series_is_group(base_index):
+                base_label = f"{base_label} [Group]"
+            if kind == "cumulative":
+                enabled = base_index < len(self._series_cumulative_enabled_data) and bool(
+                    self._series_cumulative_enabled_data[base_index]
+                )
+                suffix = "" if enabled else " (off)"
+                return (
+                    f"{base_index + 1}.1: Cumulative - "
+                    f"{self._cumulative_effective_label(base_index)}{suffix}"
+                )
             if kind == "fit":
                 enabled = base_index < len(self._series_fit_enabled_data) and bool(
                     self._series_fit_enabled_data[base_index]
                 )
                 suffix = "" if enabled else " (off)"
-                return f"{base_index + 1}.1: Fit - {self._fit_effective_label(base_index)}{suffix}"
+                return f"{base_index + 1}.2: Fit - {self._fit_effective_label(base_index)}{suffix}"
             return _format_series_display_text(
                 base_index,
-                self._effective_series_label(base_index),
+                base_label,
                 enabled=self._series_enabled_data[base_index],
             )
 
@@ -4395,7 +6406,14 @@ def launch_plot_settings_panel(
                 fit_type = str(self._series_fit_config(base_index).get("fit_type") or "fit")
                 tooltip_lines.append(f"Derived series: {fit_type} fit")
                 tooltip_lines.append(f"Series id: {self._fit_child_series_id(base_index)}")
+            elif kind == "cumulative":
+                tooltip_lines.append("Derived series: cumulative average")
+                tooltip_lines.append(f"Series id: {self._cumulative_child_series_id(base_index)}")
             else:
+                if self._series_is_group(base_index):
+                    tooltip_lines.append(
+                        f"Grouped members: {', '.join(self._series_descriptor(base_index).get('member_series_ids', [])) or 'none'}"
+                    )
                 tooltip_lines.append(
                     f"Series id: {descriptor.get('series_id') or f'series:{base_index}'}"
                 )
@@ -4408,20 +6426,24 @@ def launch_plot_settings_panel(
             index = int(row_descriptor.get("base_index", -1))
             if index < 0 or index >= len(self._series_enabled_data):
                 return
-            selected_id = (
-                self._fit_child_series_id(self._series_active_index)
-                if self._series_active_is_fit_child
-                else str(self._series_descriptor(self._series_active_index).get("series_id") or "")
-            )
-            is_fit_child = str(row_descriptor.get("kind") or "base") == "fit"
-            if is_fit_child:
+            selected_id = self._active_series_row_id()
+            row_kind = str(row_descriptor.get("kind") or "base")
+            if row_kind == "fit":
                 self._series_fit_enabled_data[index] = checked
                 if (
                     index == self._series_active_index
                     and self._series_active_is_fit_child
                     and not checked
                 ):
-                    self._series_active_is_fit_child = False
+                    self._set_active_series_child_kind("base")
+            elif row_kind == "cumulative":
+                self._series_cumulative_enabled_data[index] = checked
+                if (
+                    index == self._series_active_index
+                    and self._series_active_is_cumulative_child
+                    and not checked
+                ):
+                    self._set_active_series_child_kind("base")
             else:
                 if checked and self._is_orientation_heatmap_mode():
                     for i in range(len(self._series_enabled_data)):
@@ -4436,7 +6458,9 @@ def launch_plot_settings_panel(
             finally:
                 self._series_syncing = False
             if index == self._series_active_index:
-                if self._series_active_is_fit_child:
+                if self._series_active_is_cumulative_child:
+                    self._load_cumulative_series_into_editor(index)
+                elif self._series_active_is_fit_child:
                     self._load_fit_series_into_editor(index)
                 else:
                     self._load_series_into_editor(index)
@@ -4454,36 +6478,18 @@ def launch_plot_settings_panel(
             target_index = min(max(current_index + delta, 0), len(current_ids) - 1)
             if target_index == current_index:
                 return
-            selected_id = (
-                self._fit_child_series_id(self._series_active_index)
-                if self._series_active_is_fit_child
-                else str(self._series_descriptor(self._series_active_index).get("series_id") or "")
-            )
+            selected_id = self._active_series_row_id()
             self._persist_active_series_editor()
             moving_id = current_ids.pop(current_index)
             current_ids.insert(target_index, moving_id)
             self._apply_series_id_order(current_ids)
-            try:
-                if selected_id.startswith("fit::"):
-                    selected_base_id = selected_id.removeprefix("fit::")
-                    self._series_active_index = self._current_series_id_order().index(
-                        selected_base_id
-                    )
-                    self._series_active_is_fit_child = (
-                        self._series_active_index < len(self._series_fit_enabled_data)
-                        and bool(self._series_fit_enabled_data[self._series_active_index])
-                        and self._fit_supported_for_current_view()
-                    )
-                elif selected_id:
-                    self._series_active_index = self._current_series_id_order().index(selected_id)
-                    self._series_active_is_fit_child = False
-            except ValueError:
-                self._series_active_index = 0
-                self._series_active_is_fit_child = False
+            self._restore_active_series_from_id(selected_id)
             self._series_syncing = True
             try:
                 self._sync_series_selection_widgets(self._series_active_index)
-                if self._series_active_is_fit_child:
+                if self._series_active_is_cumulative_child:
+                    self._load_cumulative_series_into_editor(self._series_active_index)
+                elif self._series_active_is_fit_child:
                     self._load_fit_series_into_editor(self._series_active_index)
                 else:
                     self._load_series_into_editor(self._series_active_index)
@@ -4559,6 +6565,51 @@ def launch_plot_settings_panel(
             for index in range(self.series_list.count()):
                 self._apply_series_list_item_visuals(self.series_list.item(index), index)
 
+        def _current_series_list_view_anchor(self) -> dict[str, int | str] | None:
+            if not hasattr(self, "series_list") or self.series_list is None:
+                return None
+            scrollbar = self.series_list.verticalScrollBar()
+            viewport = self.series_list.viewport()
+            viewport_height = viewport.height() if viewport is not None else 0
+            rows: list[tuple[str, int, int]] = []
+            for row in range(self.series_list.count()):
+                item = self.series_list.item(row)
+                if item is None:
+                    continue
+                row_id = str(item.data(Qt.ItemDataRole.UserRole) or "").strip()
+                if not row_id:
+                    continue
+                rect = self.series_list.visualItemRect(item)
+                rows.append((row_id, int(rect.top()), int(rect.bottom())))
+            return _capture_series_list_view_anchor(
+                rows,
+                viewport_height=viewport_height,
+                scroll_value=scrollbar.value(),
+            )
+
+        def _restore_series_list_view_anchor(self, anchor: dict[str, int | str] | None) -> None:
+            if anchor is None or not hasattr(self, "series_list") or self.series_list is None:
+                return
+            scrollbar = self.series_list.verticalScrollBar()
+            row_tops: dict[str, int] = {}
+            for row in range(self.series_list.count()):
+                item = self.series_list.item(row)
+                if item is None:
+                    continue
+                row_id = str(item.data(Qt.ItemDataRole.UserRole) or "").strip()
+                if not row_id:
+                    continue
+                rect = self.series_list.visualItemRect(item)
+                row_tops[row_id] = int(rect.top())
+            restored_value = _restore_series_list_anchor_scroll_value(
+                anchor,
+                row_tops=row_tops,
+                current_scroll_value=scrollbar.value(),
+                maximum=scrollbar.maximum(),
+            )
+            if restored_value is not None:
+                scrollbar.setValue(restored_value)
+
         def _refresh_active_series_list_widgets(self) -> None:
             if not hasattr(self, "series_list") or self.series_list is None:
                 return
@@ -4574,10 +6625,23 @@ def launch_plot_settings_panel(
             ):
                 fit_row = self._display_row_for_selection(
                     self._series_active_index,
-                    is_fit_child=True,
+                    kind="fit",
                 )
                 if fit_row >= 0 and fit_row != current_row:
                     self._apply_series_list_item_visuals(self.series_list.item(fit_row), fit_row)
+            if (
+                self._series_active_index < len(self._series_cumulative_enabled_data)
+                and self._series_cumulative_enabled_data[self._series_active_index]
+                and not self._is_orientation_heatmap_mode()
+            ):
+                cumulative_row = self._display_row_for_selection(
+                    self._series_active_index,
+                    kind="cumulative",
+                )
+                if cumulative_row >= 0 and cumulative_row != current_row:
+                    self._apply_series_list_item_visuals(
+                        self.series_list.item(cumulative_row), cumulative_row
+                    )
 
         def _apply_series_list_item_visuals(self, item: Any, index: int) -> None:
             if item is None or index < 0:
@@ -4587,21 +6651,21 @@ def launch_plot_settings_panel(
             if base_index < 0 or base_index >= len(self._series_enabled_data):
                 return
             kind = str(row_descriptor.get("kind") or "base")
-            enabled = (
-                self._series_enabled_data[base_index]
-                if kind == "base"
-                else bool(self._series_fit_enabled_data[base_index])
-            )
+            if kind == "fit":
+                enabled = bool(self._series_fit_enabled_data[base_index])
+            elif kind == "cumulative":
+                enabled = bool(self._series_cumulative_enabled_data[base_index])
+            else:
+                enabled = self._series_enabled_data[base_index]
             item.setText(self._display_row_text(index).replace("Â·", "-"))
             item.setData(
                 Qt.ItemDataRole.UserRole,
-                (
-                    self._fit_child_series_id(base_index)
-                    if kind == "fit"
-                    else str(
-                        self._series_descriptor(base_index).get("series_id")
-                        or f"series:{base_index}"
-                    )
+                self._fit_child_series_id(base_index)
+                if kind == "fit"
+                else self._cumulative_child_series_id(base_index)
+                if kind == "cumulative"
+                else str(
+                    self._series_descriptor(base_index).get("series_id") or f"series:{base_index}"
                 ),
             )
             item.setData(Qt.ItemDataRole.UserRole + 1, kind)
@@ -4616,13 +6680,14 @@ def launch_plot_settings_panel(
                     enabled=enabled,
                     selected=self.series_list.currentRow() == index,
                     color_token="" if heatmap_active else self._effective_series_color(base_index),
-                    is_fit_child=kind == "fit",
+                    kind=kind,
                     can_move_up=base_index > 0,
                     can_move_down=base_index < len(self._series_labels_data) - 1,
                     tooltip_text=item.toolTip(),
                 )
 
         def _sync_series_selection_widgets(self, selected_index: int) -> None:
+            view_anchor = self._current_series_list_view_anchor()
             self._rebuild_series_display_rows()
             self.series_list.clear()
             for index in range(len(self._series_display_rows)):
@@ -4671,9 +6736,10 @@ def launch_plot_settings_panel(
             if self.series_list.count() > 0:
                 row = self._display_row_for_selection(
                     selected_index,
-                    is_fit_child=self._series_active_is_fit_child,
+                    kind=self._active_series_child_kind(),
                 )
                 self.series_list.setCurrentRow(row)
+                self._restore_series_list_view_anchor(view_anchor)
                 self._refresh_series_list_widgets()
 
         def _handle_series_identity_change(self, *_unused: object) -> None:
@@ -4731,6 +6797,15 @@ def launch_plot_settings_panel(
                 tooltip_id="data.section.reducer",
             )
             self._x_bin_reducer_row = (binning_form, self.x_bin_reducer)
+            self.min_bin_points = self._line("Leave blank to disable masking")
+            self.min_bin_points.textChanged.connect(self._refresh_widget_states)
+            self._add_form_row(
+                binning_form,
+                "Min points per bin",
+                self.min_bin_points,
+                tooltip_id="data.section.min_points",
+            )
+            self._min_bin_points_row = (binning_form, self.min_bin_points)
 
             if self._analysis_name == "orientation":
                 self.y_bin_width = self._line("Leave blank to use the data width")
@@ -4758,7 +6833,7 @@ def launch_plot_settings_panel(
             self._build_analysis_data_sections(layout)
             self._build_binning_section(layout)
             hint = QLabel(
-                "Data controls decide what gets plotted. Series styling and normalization live in the Series workspace."
+                "Data controls decide what gets plotted. Layer styling, annotations, uncertainty, and derived lines live in the Layers workspace."
             )
             hint.setWordWrap(True)
             layout.addWidget(hint)
@@ -4956,6 +7031,12 @@ def launch_plot_settings_panel(
             self._series_enabled_data = []
             self._series_show_in_legend_data = []
             self._series_alpha_data = []
+            self._series_error_enabled_data = []
+            self._series_error_stats_data = []
+            self._series_error_styles_data = []
+            self._series_error_colors_data = []
+            self._series_error_label_overrides_data = []
+            self._series_error_show_in_legend_data = []
             self._series_fit_enabled_data = []
             self._series_fit_label_overrides_data = []
             self._series_fit_show_in_legend_data = []
@@ -4964,6 +7045,9 @@ def launch_plot_settings_panel(
             self._series_fit_range_modes_data = []
             self._series_fit_x_mins_data = []
             self._series_fit_x_maxs_data = []
+            self._series_cumulative_enabled_data = []
+            self._series_cumulative_label_overrides_data = []
+            self._series_cumulative_show_in_legend_data = []
             self._series_line_widths_data = []
             self._series_markers_data = []
             self._series_line_kwargs_data = []
@@ -5044,6 +7128,24 @@ def launch_plot_settings_panel(
                         alpha = str(raw_alpha_value).strip()
                 self._series_alpha_data.append(alpha)
 
+                error_config = _error_defaults_for_gui()
+                if isinstance(series_override, dict):
+                    error_config = _coerce_series_error_config(series_override.get("error"))
+                self._series_error_enabled_data.append(bool(error_config.get("enabled", False)))
+                self._series_error_stats_data.append(
+                    str(error_config.get("stat") or "block_sem").strip() or "block_sem"
+                )
+                self._series_error_styles_data.append(
+                    str(error_config.get("style") or "band").strip() or "band"
+                )
+                self._series_error_colors_data.append(str(error_config.get("color") or "").strip())
+                self._series_error_label_overrides_data.append(
+                    str(error_config.get("label_override") or "").strip()
+                )
+                self._series_error_show_in_legend_data.append(
+                    bool(error_config.get("show_in_legend", False))
+                )
+
                 fit_config = _fit_defaults_for_gui()
                 if isinstance(series_override, dict):
                     fit_config = _coerce_series_fit_config(
@@ -5088,6 +7190,21 @@ def launch_plot_settings_panel(
                     ""
                     if fit_config.get("fit_x_max") is None
                     else str(fit_config.get("fit_x_max")).strip()
+                )
+
+                cumulative_config = _cumulative_defaults_for_gui()
+                if isinstance(series_override, dict):
+                    cumulative_config = _coerce_series_cumulative_config(
+                        series_override.get("cumulative")
+                    )
+                self._series_cumulative_enabled_data.append(
+                    bool(cumulative_config.get("enabled", False))
+                )
+                self._series_cumulative_label_overrides_data.append(
+                    str(cumulative_config.get("label_override") or "").strip()
+                )
+                self._series_cumulative_show_in_legend_data.append(
+                    bool(cumulative_config.get("show_in_legend", True))
                 )
 
                 width = ""
@@ -5170,7 +7287,7 @@ def launch_plot_settings_panel(
                 selected = self._series_active_index if self._series_active_index < count else 0
                 self._sync_series_selection_widgets(selected)
                 self._series_active_index = selected
-                self._series_active_is_fit_child = False
+                self._set_active_series_child_kind("base")
                 self._load_series_into_editor(selected)
             finally:
                 self._series_syncing = False
@@ -5190,6 +7307,44 @@ def launch_plot_settings_panel(
                 self.series_alpha.setText(self._series_alpha_data[index])
                 self.series_line_width.setText(self._series_line_widths_data[index])
                 self._set_combo_value(self.series_marker, self._series_markers_data[index])
+                if hasattr(self, "_series_error_mode"):
+                    self._set_combo_value(
+                        self._series_error_mode,
+                        "on" if self._series_error_enabled_data[index] else "off",
+                    )
+                if hasattr(self, "_series_error_stat"):
+                    self._refresh_error_stat_choices(index)
+                if hasattr(self, "_series_error_style"):
+                    self._set_combo_value(
+                        self._series_error_style, self._series_error_styles_data[index]
+                    )
+                if hasattr(self, "_series_error_color"):
+                    self._series_error_color.setText(self._series_error_colors_data[index])
+                if hasattr(self, "_series_error_show_in_legend"):
+                    self._set_combo_value(
+                        self._series_error_show_in_legend,
+                        "on" if self._series_error_show_in_legend_data[index] else "off",
+                    )
+                if hasattr(self, "_series_error_label"):
+                    self._series_error_label.setPlaceholderText(self._error_effective_label(index))
+                    self._series_error_label.setText(self._series_error_label_overrides_data[index])
+                if hasattr(self, "_series_cumulative_mode"):
+                    self._set_combo_value(
+                        self._series_cumulative_mode,
+                        "on" if self._series_cumulative_enabled_data[index] else "off",
+                    )
+                if hasattr(self, "_series_cumulative_show_in_legend"):
+                    self._set_combo_value(
+                        self._series_cumulative_show_in_legend,
+                        "on" if self._series_cumulative_show_in_legend_data[index] else "off",
+                    )
+                if hasattr(self, "_series_cumulative_label"):
+                    self._series_cumulative_label.setPlaceholderText(
+                        self._cumulative_effective_label(index)
+                    )
+                    self._series_cumulative_label.setText(
+                        self._series_cumulative_label_overrides_data[index]
+                    )
                 if self._series_fit_mode is not None:
                     self._set_combo_value(
                         self._series_fit_mode,
@@ -5216,22 +7371,65 @@ def launch_plot_settings_panel(
                 if hasattr(self, "_series_fit_label"):
                     self._series_fit_label.setPlaceholderText(self._fit_effective_label(index))
                     self._series_fit_label.setText(self._series_fit_label_overrides_data[index])
+                if hasattr(self, "_series_group_reducer"):
+                    descriptor = self._series_descriptor(index)
+                    reducer = (
+                        str(descriptor.get("group_reducer") or "mean").strip().lower() or "mean"
+                    )
+                    self._set_combo_value(self._series_group_reducer, reducer)
+                if hasattr(self, "_series_group_members"):
+                    self._series_group_members.blockSignals(True)
+                    try:
+                        self._series_group_members.clear()
+                        descriptor = self._series_descriptor(index)
+                        selected_ids = {
+                            str(value).strip()
+                            for value in descriptor.get("member_series_ids", [])
+                            if str(value).strip()
+                        }
+                        for candidate_index in self._group_member_candidate_indices():
+                            candidate_descriptor = self._series_descriptor(candidate_index)
+                            candidate_id = str(
+                                candidate_descriptor.get("series_id") or f"series:{candidate_index}"
+                            )
+                            item = QListWidgetItem(self._effective_series_label(candidate_index))
+                            item.setData(Qt.ItemDataRole.UserRole, candidate_id)
+                            item.setSelected(candidate_id in selected_ids)
+                            self._series_group_members.addItem(item)
+                    finally:
+                        self._series_group_members.blockSignals(False)
                 self.series_line_kwargs_json.setPlainText(self._series_line_kwargs_data[index])
                 self._load_normalization_into_editor(index)
+                is_group = self._series_is_group(index)
                 for widget in (
                     self.series_color,
                     self.series_alpha,
                     self.series_line_width,
                     self.series_marker,
                     self.series_line_kwargs_json,
+                ):
+                    widget.setEnabled(True)
+                for widget in (
                     self.norm_mode,
                     self.norm_value,
                     self.norm_x_ref,
                 ):
-                    widget.setEnabled(True)
+                    widget.setEnabled(not is_group)
                 if self._series_fit_mode is not None:
                     self._series_fit_mode.setEnabled(self._fit_supported_for_current_view())
+                if hasattr(self, "_series_error_mode"):
+                    self._series_error_mode.setEnabled(self._error_supported_for_current_view())
                 fit_supported = self._fit_supported_for_current_view()
+                error_supported = self._error_supported_for_current_view()
+                for widget in (
+                    getattr(self, "_series_error_stat", None),
+                    getattr(self, "_series_error_style", None),
+                    getattr(self, "_series_error_color", None),
+                    getattr(self, "_series_error_show_in_legend", None),
+                    getattr(self, "_series_error_label", None),
+                ):
+                    if widget is not None:
+                        widget.setEnabled(error_supported)
                 for widget in (
                     getattr(self, "_series_fit_type", None),
                     getattr(self, "_series_fit_degree", None),
@@ -5246,10 +7444,37 @@ def launch_plot_settings_panel(
             finally:
                 self._series_syncing = False
             self._update_series_metadata_panel(self._series_active_index)
+            self._update_series_group_summary(self._series_active_index)
+            self._update_series_error_summary(self._series_active_index)
+            self._update_series_cumulative_summary(self._series_active_index)
             self._update_series_fit_summary(self._series_active_index)
+            if getattr(self, "_series_error_style_note", None) is not None:
+                self._series_error_style_note.hide()
+            if getattr(self, "_series_cumulative_style_note", None) is not None:
+                self._series_cumulative_style_note.hide()
             if self._series_fit_style_note is not None:
                 self._series_fit_style_note.hide()
             self._refresh_widget_states()
+
+        def _refresh_error_stat_choices(self, index: int) -> None:
+            if not hasattr(self, "_series_error_stat"):
+                return
+            availability = self._error_availability_for_series(index)
+            available = list(availability.available_stats)
+            if not available:
+                available = [self._default_error_stat_for_series(index)]
+            current = self._resolved_error_stat_for_series(index)
+            if current not in available:
+                current = available[0]
+            if 0 <= index < len(self._series_error_stats_data):
+                self._series_error_stats_data[index] = current
+            self._series_error_stat.blockSignals(True)
+            try:
+                self._series_error_stat.clear()
+                self._series_error_stat.addItems(tuple(available))
+                self._set_combo_value(self._series_error_stat, current)
+            finally:
+                self._series_error_stat.blockSignals(False)
 
         def _load_fit_series_into_editor(self, index: int) -> None:
             if index < 0 or index >= len(self._series_labels_data):
@@ -5266,6 +7491,27 @@ def launch_plot_settings_panel(
                 self.series_alpha.setText(self._series_alpha_data[index])
                 self.series_line_width.setText(self._series_line_widths_data[index])
                 self._set_combo_value(self.series_marker, "")
+                if hasattr(self, "_series_error_mode"):
+                    self._set_combo_value(
+                        self._series_error_mode,
+                        "on" if self._series_error_enabled_data[index] else "off",
+                    )
+                if hasattr(self, "_series_error_stat"):
+                    self._refresh_error_stat_choices(index)
+                if hasattr(self, "_series_error_style"):
+                    self._set_combo_value(
+                        self._series_error_style, self._series_error_styles_data[index]
+                    )
+                if hasattr(self, "_series_error_color"):
+                    self._series_error_color.setText(self._series_error_colors_data[index])
+                if hasattr(self, "_series_error_show_in_legend"):
+                    self._set_combo_value(
+                        self._series_error_show_in_legend,
+                        "on" if self._series_error_show_in_legend_data[index] else "off",
+                    )
+                if hasattr(self, "_series_error_label"):
+                    self._series_error_label.setPlaceholderText(self._error_effective_label(index))
+                    self._series_error_label.setText(self._series_error_label_overrides_data[index])
                 if self._series_fit_mode is not None:
                     self._set_combo_value(self._series_fit_mode, "on")
                 if hasattr(self, "_series_fit_type"):
@@ -5322,9 +7568,126 @@ def launch_plot_settings_panel(
             finally:
                 self._series_syncing = False
             self._update_series_metadata_panel(index)
+            self._update_series_group_summary(index)
+            self._update_series_error_summary(index)
+            self._update_series_cumulative_summary(index)
             self._update_series_fit_summary(index)
+            if getattr(self, "_series_error_style_note", None) is not None:
+                self._series_error_style_note.hide()
+            if getattr(self, "_series_cumulative_style_note", None) is not None:
+                self._series_cumulative_style_note.hide()
             if self._series_fit_style_note is not None:
                 self._series_fit_style_note.show()
+            self._refresh_widget_states()
+
+        def _load_cumulative_series_into_editor(self, index: int) -> None:
+            if index < 0 or index >= len(self._series_labels_data):
+                return
+            self._series_syncing = True
+            try:
+                self._set_combo_value(
+                    self.series_show_in_legend,
+                    "on" if self._series_cumulative_show_in_legend_data[index] else "off",
+                )
+                self.series_label.setPlaceholderText(self._cumulative_effective_label(index))
+                self.series_label.setText(self._series_cumulative_label_overrides_data[index])
+                self.series_color.setText(self._effective_series_color(index))
+                self.series_alpha.setText(self._series_alpha_data[index])
+                self.series_line_width.setText(self._series_line_widths_data[index])
+                self._set_combo_value(self.series_marker, "")
+                if hasattr(self, "_series_error_mode"):
+                    self._set_combo_value(
+                        self._series_error_mode,
+                        "on" if self._series_error_enabled_data[index] else "off",
+                    )
+                if hasattr(self, "_series_error_stat"):
+                    self._refresh_error_stat_choices(index)
+                if hasattr(self, "_series_error_style"):
+                    self._set_combo_value(
+                        self._series_error_style, self._series_error_styles_data[index]
+                    )
+                if hasattr(self, "_series_error_color"):
+                    self._series_error_color.setText(self._series_error_colors_data[index])
+                if hasattr(self, "_series_error_show_in_legend"):
+                    self._set_combo_value(
+                        self._series_error_show_in_legend,
+                        "on" if self._series_error_show_in_legend_data[index] else "off",
+                    )
+                if hasattr(self, "_series_error_label"):
+                    self._series_error_label.setPlaceholderText(self._error_effective_label(index))
+                    self._series_error_label.setText(self._series_error_label_overrides_data[index])
+                if hasattr(self, "_series_cumulative_mode"):
+                    self._set_combo_value(self._series_cumulative_mode, "on")
+                if hasattr(self, "_series_cumulative_show_in_legend"):
+                    self._set_combo_value(
+                        self._series_cumulative_show_in_legend,
+                        "on" if self._series_cumulative_show_in_legend_data[index] else "off",
+                    )
+                if hasattr(self, "_series_cumulative_label"):
+                    self._series_cumulative_label.setPlaceholderText(
+                        self._cumulative_effective_label(index)
+                    )
+                    self._series_cumulative_label.setText(
+                        self._series_cumulative_label_overrides_data[index]
+                    )
+                if self._series_fit_mode is not None:
+                    self._set_combo_value(
+                        self._series_fit_mode,
+                        "on" if self._series_fit_enabled_data[index] else "off",
+                    )
+                if hasattr(self, "_series_fit_type"):
+                    self._set_combo_value(self._series_fit_type, self._series_fit_types_data[index])
+                if hasattr(self, "_series_fit_degree"):
+                    self._series_fit_degree.setText(self._series_fit_degrees_data[index])
+                if hasattr(self, "_series_fit_range_mode"):
+                    self._set_combo_value(
+                        self._series_fit_range_mode,
+                        self._series_fit_range_modes_data[index],
+                    )
+                if hasattr(self, "_series_fit_x_min"):
+                    self._series_fit_x_min.setText(self._series_fit_x_mins_data[index])
+                if hasattr(self, "_series_fit_x_max"):
+                    self._series_fit_x_max.setText(self._series_fit_x_maxs_data[index])
+                if hasattr(self, "_series_fit_show_in_legend"):
+                    self._set_combo_value(
+                        self._series_fit_show_in_legend,
+                        "on" if self._series_fit_show_in_legend_data[index] else "off",
+                    )
+                if hasattr(self, "_series_fit_label"):
+                    self._series_fit_label.setPlaceholderText(self._fit_effective_label(index))
+                    self._series_fit_label.setText(self._series_fit_label_overrides_data[index])
+                self.series_line_kwargs_json.setPlainText(json.dumps({"linestyle": ":"}, indent=2))
+                self._load_normalization_into_editor(index)
+                for widget in (
+                    self.series_color,
+                    self.series_alpha,
+                    self.series_line_width,
+                    self.series_marker,
+                    self.series_line_kwargs_json,
+                    self.norm_mode,
+                    self.norm_value,
+                    self.norm_x_ref,
+                ):
+                    widget.setEnabled(False)
+                if hasattr(self, "_series_cumulative_mode"):
+                    self._series_cumulative_mode.setEnabled(False)
+                if hasattr(self, "_series_cumulative_show_in_legend"):
+                    self._series_cumulative_show_in_legend.setEnabled(True)
+                if hasattr(self, "_series_cumulative_label"):
+                    self._series_cumulative_label.setEnabled(True)
+            finally:
+                self._series_syncing = False
+            self._update_series_metadata_panel(index)
+            self._update_series_group_summary(index)
+            self._update_series_error_summary(index)
+            self._update_series_cumulative_summary(index)
+            self._update_series_fit_summary(index)
+            if getattr(self, "_series_error_style_note", None) is not None:
+                self._series_error_style_note.hide()
+            if getattr(self, "_series_cumulative_style_note", None) is not None:
+                self._series_cumulative_style_note.show()
+            if self._series_fit_style_note is not None:
+                self._series_fit_style_note.hide()
             self._refresh_widget_states()
 
         def _persist_series_editor(self, index: int) -> None:
@@ -5337,6 +7700,41 @@ def launch_plot_settings_panel(
                 self.series_show_in_legend.currentText().strip().lower() != "off"
             )
             self._series_alpha_data[index] = self.series_alpha.text().strip()
+            if hasattr(self, "_series_error_mode"):
+                self._series_error_enabled_data[index] = (
+                    self._series_error_mode.currentText().strip().lower() != "off"
+                )
+            if hasattr(self, "_series_error_stat"):
+                token = self._series_error_stat.currentText().strip().lower()
+                self._series_error_stats_data[index] = (
+                    token if token in _ERROR_STATS else self._default_error_stat_for_series(index)
+                )
+            if hasattr(self, "_series_error_style"):
+                token = self._series_error_style.currentText().strip().lower()
+                self._series_error_styles_data[index] = token if token in _ERROR_STYLES else "band"
+            if hasattr(self, "_series_error_color"):
+                self._series_error_colors_data[index] = self._series_error_color.text().strip()
+            if hasattr(self, "_series_error_show_in_legend"):
+                self._series_error_show_in_legend_data[index] = (
+                    self._series_error_show_in_legend.currentText().strip().lower() != "off"
+                )
+            if hasattr(self, "_series_error_label"):
+                self._series_error_label_overrides_data[index] = (
+                    self._series_error_label.text().strip()
+                )
+            if hasattr(self, "_series_cumulative_mode"):
+                self._series_cumulative_enabled_data[index] = (
+                    self._series_cumulative_mode.currentText().strip().lower() != "off"
+                )
+            if hasattr(self, "_series_cumulative_show_in_legend"):
+                self._series_cumulative_show_in_legend_data[index] = (
+                    self._series_cumulative_show_in_legend.currentText().strip().lower()
+                    != "off"
+                )
+            if hasattr(self, "_series_cumulative_label"):
+                self._series_cumulative_label_overrides_data[index] = (
+                    self._series_cumulative_label.text().strip()
+                )
             if self._series_fit_mode is not None:
                 self._series_fit_enabled_data[index] = (
                     self._series_fit_mode.currentText().strip().lower() != "off"
@@ -5366,6 +7764,19 @@ def launch_plot_settings_panel(
             self._series_line_kwargs_data[index] = (
                 self.series_line_kwargs_json.toPlainText().strip()
             )
+            if self._series_is_group(index):
+                descriptor = dict(self._series_descriptors_data[index])
+                if hasattr(self, "_series_group_reducer"):
+                    descriptor["group_reducer"] = (
+                        self._series_group_reducer.currentText().strip().lower() or "mean"
+                    )
+                if hasattr(self, "_series_group_members"):
+                    descriptor["member_series_ids"] = [
+                        str(item.data(Qt.ItemDataRole.UserRole) or "").strip()
+                        for item in self._series_group_members.selectedItems()
+                        if str(item.data(Qt.ItemDataRole.UserRole) or "").strip()
+                    ]
+                self._series_descriptors_data[index] = descriptor
             self._persist_normalization_editor(index)
             self._series_syncing = True
             try:
@@ -5373,6 +7784,9 @@ def launch_plot_settings_panel(
             finally:
                 self._series_syncing = False
             self._update_series_metadata_panel(index)
+            self._update_series_group_summary(index)
+            self._update_series_error_summary(index)
+            self._update_series_cumulative_summary(index)
             self._update_series_fit_summary(index)
 
         def _persist_fit_series_editor(self, index: int) -> None:
@@ -5393,7 +7807,7 @@ def launch_plot_settings_panel(
             selection_is_fit_child = (
                 self._series_fit_enabled_data[index] and self._fit_supported_for_current_view()
             )
-            self._series_active_is_fit_child = selection_is_fit_child
+            self._set_active_series_child_kind("fit" if selection_is_fit_child else "base")
             self._series_syncing = True
             try:
                 self._sync_series_selection_widgets(self._series_active_index)
@@ -5403,10 +7817,53 @@ def launch_plot_settings_panel(
                     self._load_series_into_editor(index)
             finally:
                 self._series_syncing = False
+            self._update_series_error_summary(index)
+            self._update_series_cumulative_summary(index)
+            self._update_series_fit_summary(index)
+
+        def _persist_cumulative_series_editor(self, index: int) -> None:
+            if index < 0 or index >= len(self._series_labels_data):
+                return
+            if hasattr(self, "_series_cumulative_show_in_legend"):
+                self._series_cumulative_show_in_legend_data[index] = (
+                    self._series_cumulative_show_in_legend.currentText().strip().lower()
+                    != "off"
+                )
+            else:
+                self._series_cumulative_show_in_legend_data[index] = (
+                    self.series_show_in_legend.currentText().strip().lower() != "off"
+                )
+            if hasattr(self, "_series_cumulative_label"):
+                self._series_cumulative_label_overrides_data[index] = (
+                    self._series_cumulative_label.text().strip()
+                )
+            else:
+                self._series_cumulative_label_overrides_data[index] = (
+                    self.series_label.text().strip()
+                )
+            selection_is_cumulative_child = bool(self._series_cumulative_enabled_data[index]) and (
+                not self._is_orientation_heatmap_mode()
+            )
+            self._set_active_series_child_kind(
+                "cumulative" if selection_is_cumulative_child else "base"
+            )
+            self._series_syncing = True
+            try:
+                self._sync_series_selection_widgets(self._series_active_index)
+                if selection_is_cumulative_child:
+                    self._load_cumulative_series_into_editor(index)
+                else:
+                    self._load_series_into_editor(index)
+            finally:
+                self._series_syncing = False
+            self._update_series_error_summary(index)
+            self._update_series_cumulative_summary(index)
             self._update_series_fit_summary(index)
 
         def _persist_active_series_editor(self) -> None:
-            if self._series_active_is_fit_child:
+            if self._series_active_is_cumulative_child:
+                self._persist_cumulative_series_editor(self._series_active_index)
+            elif self._series_active_is_fit_child:
                 self._persist_fit_series_editor(self._series_active_index)
             else:
                 self._persist_series_editor(self._series_active_index)
@@ -5416,26 +7873,44 @@ def launch_plot_settings_panel(
                 return
             selected_descriptor = self._display_row(index)
             target_base_index = int(selected_descriptor.get("base_index", 0))
-            target_is_fit_child = str(selected_descriptor.get("kind") or "base") == "fit"
+            target_kind = str(selected_descriptor.get("kind") or "base")
             self._persist_active_series_editor()
             self._series_active_index = target_base_index
-            self._series_active_is_fit_child = (
-                target_is_fit_child
-                and target_base_index < len(self._series_fit_enabled_data)
-                and bool(self._series_fit_enabled_data[target_base_index])
-                and self._fit_supported_for_current_view()
-            )
+            if target_kind == "fit":
+                self._set_active_series_child_kind(
+                    "fit"
+                    if (
+                        target_base_index < len(self._series_fit_enabled_data)
+                        and bool(self._series_fit_enabled_data[target_base_index])
+                        and self._fit_supported_for_current_view()
+                    )
+                    else "base"
+                )
+            elif target_kind == "cumulative":
+                self._set_active_series_child_kind(
+                    "cumulative"
+                    if (
+                        target_base_index < len(self._series_cumulative_enabled_data)
+                        and bool(self._series_cumulative_enabled_data[target_base_index])
+                        and not self._is_orientation_heatmap_mode()
+                    )
+                    else "base"
+                )
+            else:
+                self._set_active_series_child_kind("base")
             self._series_syncing = True
             try:
                 self.series_list.setCurrentRow(
                     self._display_row_for_selection(
                         self._series_active_index,
-                        is_fit_child=self._series_active_is_fit_child,
+                        kind=self._active_series_child_kind(),
                     )
                 )
             finally:
                 self._series_syncing = False
-            if self._series_active_is_fit_child:
+            if self._series_active_is_cumulative_child:
+                self._load_cumulative_series_into_editor(self._series_active_index)
+            elif self._series_active_is_fit_child:
                 self._load_fit_series_into_editor(self._series_active_index)
             else:
                 self._load_series_into_editor(self._series_active_index)
@@ -5462,26 +7937,7 @@ def launch_plot_settings_panel(
                     desired_order.append(item_id)
             self._persist_active_series_editor()
             self._apply_series_id_order(desired_order)
-            if selected_id:
-                try:
-                    if selected_id.startswith("fit::"):
-                        selected_base_id = selected_id.removeprefix("fit::")
-                        self._series_active_index = self._current_series_id_order().index(
-                            selected_base_id
-                        )
-                        self._series_active_is_fit_child = (
-                            self._series_active_index < len(self._series_fit_enabled_data)
-                            and bool(self._series_fit_enabled_data[self._series_active_index])
-                            and self._fit_supported_for_current_view()
-                        )
-                    else:
-                        self._series_active_index = self._current_series_id_order().index(
-                            selected_id
-                        )
-                        self._series_active_is_fit_child = False
-                except ValueError:
-                    self._series_active_index = 0
-                    self._series_active_is_fit_child = False
+            self._restore_active_series_from_id(selected_id)
             self._series_syncing = True
             try:
                 self._sync_series_selection_widgets(self._series_active_index)
@@ -5525,6 +7981,8 @@ def launch_plot_settings_panel(
                 self._series_label_overrides_data[index] = self.series_label.text().strip()
                 if hasattr(self, "_series_fit_label") and self._series_fit_label is not None:
                     self._series_fit_label.setPlaceholderText(self._fit_effective_label(index))
+                if hasattr(self, "_series_error_label") and self._series_error_label is not None:
+                    self._series_error_label.setPlaceholderText(self._error_effective_label(index))
             self._refresh_active_series_list_widgets()
             self._schedule_preview_update()
 
@@ -5765,6 +8223,278 @@ def launch_plot_settings_panel(
             if self._series_fit_style_note is not None:
                 self._series_fit_style_note.show()
 
+        def _update_series_cumulative_summary(self, index: int) -> None:
+            summary_label = getattr(self, "_series_cumulative_summary", None)
+            if summary_label is None:
+                return
+            if index < 0 or index >= len(self._series_labels_data):
+                summary_label.setText("No cumulative-average line available for this selection.")
+                summary_label.show()
+                if getattr(self, "_series_cumulative_style_note", None) is not None:
+                    self._series_cumulative_style_note.hide()
+                return
+
+            if self._is_orientation_heatmap_mode():
+                summary_label.setText(
+                    "Cumulative-average lines are only available for 1-D line-based views."
+                )
+                summary_label.show()
+                if getattr(self, "_series_cumulative_style_note", None) is not None:
+                    self._series_cumulative_style_note.hide()
+                return
+
+            enabled = index < len(self._series_cumulative_enabled_data) and bool(
+                self._series_cumulative_enabled_data[index]
+            )
+            descriptor = self._series_descriptor(index)
+            series_id = str(descriptor.get("series_id") or f"series:{index}")
+            raw = self._last_preview_state.get("series_cumulative_summaries")
+            summary = raw.get(series_id) if isinstance(raw, dict) else None
+            if not enabled:
+                summary_label.setText("No cumulative-average line configured for this series.")
+                summary_label.show()
+                if getattr(self, "_series_cumulative_style_note", None) is not None:
+                    self._series_cumulative_style_note.hide()
+                return
+            if not isinstance(summary, dict):
+                summary_label.setText(
+                    "Cumulative-average line is enabled. Render details will update with the preview."
+                )
+                summary_label.show()
+                if getattr(self, "_series_cumulative_style_note", None) is not None:
+                    self._series_cumulative_style_note.show()
+                return
+            status = str(summary.get("status") or "").strip().lower()
+            if status == "ok":
+                summary_label.setText(
+                    "\n".join(
+                        [
+                            f"Label: {summary.get('label') or self._cumulative_effective_label(index)}",
+                            f"Visible points: {summary.get('point_count') if summary.get('point_count') is not None else 'n/a'}",
+                            "Running mean of the currently displayed y-values ordered by x.",
+                        ]
+                    )
+                )
+                summary_label.show()
+                if getattr(self, "_series_cumulative_style_note", None) is not None:
+                    self._series_cumulative_style_note.show()
+                return
+            if status == "empty":
+                summary_label.setText(
+                    "Cumulative-average line is enabled, but no finite plotted points remain."
+                )
+                summary_label.show()
+                if getattr(self, "_series_cumulative_style_note", None) is not None:
+                    self._series_cumulative_style_note.show()
+                return
+            summary_label.setText("Cumulative-average line is disabled for this series.")
+            summary_label.show()
+            if getattr(self, "_series_cumulative_style_note", None) is not None:
+                self._series_cumulative_style_note.hide()
+
+        def _update_series_group_summary(self, index: int) -> None:
+            summary_label = getattr(self, "_series_group_summary", None)
+            if summary_label is None:
+                return
+            if index < 0 or index >= len(self._series_descriptors_data):
+                summary_label.setText("No grouped-series settings available.")
+                return
+            descriptor = self._series_descriptor(index)
+            if not self._series_is_group(index):
+                summary_label.setText("This series is not grouped.")
+                return
+            member_ids = [
+                str(value).strip()
+                for value in descriptor.get("member_series_ids", [])
+                if str(value).strip()
+            ]
+            group_map = self._last_preview_state.get("series_group_summaries")
+            series_id = str(descriptor.get("series_id") or f"series:{index}")
+            summary = group_map.get(series_id) if isinstance(group_map, dict) else None
+            reducer = str(descriptor.get("group_reducer") or "mean")
+            lines = [
+                f"Reducer: {reducer}",
+                f"Members: {len(member_ids)}",
+            ]
+            if isinstance(summary, dict):
+                reason = str(summary.get("reason") or "").strip()
+                status = str(summary.get("status") or "").strip().lower()
+                if status == "ok":
+                    lines.append("Grouped line rendered from the current member series.")
+                elif reason:
+                    lines.append(reason)
+            elif not member_ids:
+                lines.append("Select at least one member series.")
+            summary_label.setText("\n".join(lines))
+
+        def _update_series_error_summary(self, index: int) -> None:
+            if (
+                getattr(self, "_series_error_summary", None) is None
+                or getattr(self, "_series_error_warning", None) is None
+            ):
+                return
+            explanation_label = getattr(self, "_series_error_explanation", None)
+            if index < 0 or index >= len(self._series_labels_data):
+                self._series_error_summary.setText("No error overlay available for this selection.")
+                self._series_error_summary.show()
+                if explanation_label is not None:
+                    explanation_label.setText("")
+                    explanation_label.hide()
+                self._series_error_warning.hide()
+                self._series_error_warning.setText("")
+                if getattr(self, "_series_error_style_note", None) is not None:
+                    self._series_error_style_note.hide()
+                return
+
+            if not self._error_supported_for_current_view():
+                self._series_error_summary.setText(
+                    "Error overlays are only available for 1-D line-based views."
+                )
+                self._series_error_summary.show()
+                if explanation_label is not None:
+                    explanation_label.setText("")
+                    explanation_label.hide()
+                self._series_error_warning.hide()
+                self._series_error_warning.setText("")
+                if getattr(self, "_series_error_style_note", None) is not None:
+                    self._series_error_style_note.hide()
+                return
+
+            descriptor = self._series_descriptor(index)
+            summary = self._preview_error_summary_for_series(index)
+            availability = self._error_availability_for_series(index)
+            available = list(availability.available_stats)
+            masked_map = self._last_preview_state.get("series_masked_bin_counts")
+            series_id = str(descriptor.get("series_id") or f"series:{index}")
+            masked_count = masked_map.get(series_id) if isinstance(masked_map, dict) else None
+            if not isinstance(summary, dict):
+                available_text = ", ".join(available) if available else "none yet"
+                configured_stat = self._series_error_stats_data[index]
+                resolved_stat = self._resolved_error_stat_for_series(index)
+                statistics_mode = self._current_error_statistics_mode_for_series(index)
+                statistics_mode_text = {
+                    "direct": "Stored direct statistics",
+                    "raw_grouped": "Raw grouped statistics",
+                    "saved_rebinned_sample": "Rebinned sample statistics from stored data",
+                }.get(statistics_mode or "", "Not yet rendered")
+                lines = [
+                    "Rendered uncertainty details are not available for the current preview state yet.",
+                    f"Configured statistic: {configured_stat or 'sample_sem'}",
+                    f"Effective statistic: {resolved_stat}",
+                    f"Statistics mode: {statistics_mode_text}",
+                    f"Available stats: {available_text}",
+                ]
+                if availability.reason:
+                    lines.append(f"Availability: {availability.reason}")
+                self._series_error_summary.setText("\n".join(lines))
+                self._series_error_summary.show()
+                if explanation_label is not None:
+                    provenance = self._current_error_provenance_for_series(index)
+                    if provenance:
+                        explanation_label.setText(f"What it shows: {provenance}")
+                        explanation_label.show()
+                    else:
+                        explanation_label.setText("")
+                        explanation_label.hide()
+                self._series_error_warning.hide()
+                self._series_error_warning.setText("")
+                if getattr(self, "_series_error_style_note", None) is not None:
+                    self._series_error_style_note.show()
+                return
+
+            status = str(summary.get("status") or "").strip().lower()
+            if status == "ok":
+                statistics_mode = str(summary.get("statistics_mode") or "").strip().lower()
+                statistics_mode_text = {
+                    "direct": "Stored direct statistics",
+                    "raw_grouped": "Raw grouped statistics",
+                    "saved_rebinned_sample": "Rebinned sample statistics from stored data",
+                }.get(statistics_mode, "Statistics mode unavailable")
+                lines = [
+                    f"Statistic: {summary.get('stat') or self._resolved_error_stat_for_series(index)}",
+                    f"Style: {summary.get('style') or self._series_error_styles_data[index]}",
+                    f"Color: {summary.get('color') or self._series_error_colors_data[index] or 'Follow series color'}",
+                    f"Statistics mode: {statistics_mode_text}",
+                    f"Visible bins: {summary.get('point_count') if summary.get('point_count') is not None else 'n/a'}",
+                ]
+                reason = str(summary.get("reason") or "").strip()
+                if reason:
+                    lines.append(reason)
+                if masked_count is not None:
+                    lines.append(f"Masked bins: {masked_count}")
+                if available:
+                    lines.append(f"Available stats: {', '.join(available)}")
+                self._series_error_summary.setText("\n".join(lines))
+                self._series_error_summary.show()
+                provenance = str(summary.get("provenance") or "").strip()
+                if explanation_label is not None:
+                    if provenance:
+                        explanation_label.setText(f"What it shows: {provenance}")
+                        explanation_label.show()
+                    else:
+                        explanation_label.setText("")
+                        explanation_label.hide()
+                self._series_error_warning.hide()
+                self._series_error_warning.setText("")
+                if getattr(self, "_series_error_style_note", None) is not None:
+                    self._series_error_style_note.show()
+                return
+
+            if status == "off":
+                available_text = ", ".join(available) if available else "none"
+                self._series_error_summary.setText(
+                    "\n".join(
+                        [
+                            "No error overlay is currently rendered for this series.",
+                            f"Available stats: {available_text}",
+                        ]
+                    )
+                )
+                self._series_error_summary.show()
+                provenance = str(summary.get("provenance") or "").strip()
+                if explanation_label is not None:
+                    if provenance:
+                        explanation_label.setText(f"What it would show: {provenance}")
+                        explanation_label.show()
+                    else:
+                        explanation_label.setText("")
+                        explanation_label.hide()
+                self._series_error_warning.hide()
+                self._series_error_warning.setText("")
+                if getattr(self, "_series_error_style_note", None) is not None:
+                    self._series_error_style_note.hide()
+                return
+
+            if status == "disabled":
+                reason = str(
+                    summary.get("reason") or "Error overlay is not active for this series."
+                )
+                self._series_error_summary.setText(reason)
+                self._series_error_summary.show()
+                provenance = str(summary.get("provenance") or "").strip()
+                if explanation_label is not None:
+                    if provenance:
+                        explanation_label.setText(f"What it would show: {provenance}")
+                        explanation_label.show()
+                    else:
+                        explanation_label.setText("")
+                        explanation_label.hide()
+                self._series_error_warning.hide()
+                self._series_error_warning.setText("")
+                if getattr(self, "_series_error_style_note", None) is not None:
+                    self._series_error_style_note.show()
+                return
+
+            reason = str(summary.get("reason") or "Error overlay is unavailable for this series.")
+            self._series_error_summary.hide()
+            if explanation_label is not None:
+                explanation_label.setText("")
+                explanation_label.hide()
+            self._series_error_warning.setText(reason)
+            self._series_error_warning.show()
+            if getattr(self, "_series_error_style_note", None) is not None:
+                self._series_error_style_note.show()
+
         def _update_series_fit_summary(self, index: int) -> None:
             if self._series_fit_summary is None or self._series_fit_warning is None:
                 return
@@ -5876,6 +8606,7 @@ def launch_plot_settings_panel(
                 self.fig_height,
                 self.dpi,
                 self.font_family,
+                self.base_font_size,
                 self.title_font,
                 self.label_font,
                 self.tick_font,
@@ -5890,6 +8621,7 @@ def launch_plot_settings_panel(
                 self.tick_length,
                 self.tick_width,
                 self.x_bin_width,
+                self.min_bin_points,
             )
             for widget in line_widgets:
                 widget.textChanged.connect(self._schedule_preview_update)
@@ -6259,14 +8991,7 @@ def launch_plot_settings_panel(
                     key="legend_kwargs",
                     nested_key="fontsize",
                 )
-            self.legend_font.setText(
-                ""
-                if legend_font_size is None
-                else _display_positive_int(
-                    legend_font_size,
-                    fallback=defaults.legend_font_size,
-                )
-            )
+            self.legend_font.setText(_display_optional_positive_int(legend_font_size))
 
             self._set_combo_value(
                 self.grid_mode,
@@ -6324,6 +9049,7 @@ def launch_plot_settings_panel(
             )
             self.dpi.setText(str(settings.get("dpi") or defaults.dpi))
             self.font_family.setText(str(settings.get("font_family") or ""))
+            self.base_font_size.setText(_display_optional_positive_int(settings.get("font_size")))
             self.figure_facecolor.setText(
                 _extract_dict_text(settings, key="figure_kwargs", nested_key="facecolor")
             )
@@ -6336,24 +9062,9 @@ def launch_plot_settings_panel(
                     auto_mode="off",
                 ),
             )
-            self.title_font.setText(
-                _display_positive_int(
-                    settings.get("title_font_size"),
-                    fallback=defaults.title_font_size,
-                )
-            )
-            self.label_font.setText(
-                _display_positive_int(
-                    settings.get("label_font_size"),
-                    fallback=defaults.label_font_size,
-                )
-            )
-            self.tick_font.setText(
-                _display_positive_int(
-                    settings.get("tick_font_size"),
-                    fallback=defaults.tick_font_size,
-                )
-            )
+            self.title_font.setText(_display_optional_positive_int(settings.get("title_font_size")))
+            self.label_font.setText(_display_optional_positive_int(settings.get("label_font_size")))
+            self.tick_font.setText(_display_optional_positive_int(settings.get("tick_font_size")))
             self.line_width.setText(str(settings.get("line_width") or defaults.line_width))
             self._set_combo_value(
                 self.line_style,
@@ -6364,6 +9075,10 @@ def launch_plot_settings_panel(
             )
             self.marker_size.setText(
                 _extract_dict_text(settings, key="line_kwargs", nested_key="markersize")
+            )
+            self._set_combo_value(
+                self.axes_border_mode,
+                _toggle_to_mode(settings.get("border"), auto_mode="on"),
             )
             self._set_combo_value(self.grid_linestyle, str(settings.get("grid_linestyle") or ""))
             self.grid_linewidth.setText(
@@ -6393,6 +9108,7 @@ def launch_plot_settings_panel(
             self.tick_length.setText(
                 _extract_dict_text(settings, key="tick_params_kwargs", nested_key="length")
             )
+            self._refresh_font_size_placeholders()
             self.tick_width.setText(
                 _extract_dict_text(settings, key="tick_params_kwargs", nested_key="width")
             )
@@ -6510,7 +9226,7 @@ def launch_plot_settings_panel(
             if hasattr(self, "heatmap_cmap"):
                 self._set_combo_value(
                     self.heatmap_cmap,
-                    str(settings.get("heatmap_cmap") or "viridis"),
+                    str(settings.get("heatmap_cmap") or "turbo"),
                 )
             if hasattr(self, "heatmap_normalization_mode"):
                 raw_mode = settings.get("heatmap_normalization_mode")
@@ -6565,12 +9281,14 @@ def launch_plot_settings_panel(
                 self.heatmap_colorbar_aspect.setText(str(raw) if raw is not None else "20")
             self.x_bin_width.setText(str(settings.get("x_bin_width") or ""))
             self._set_combo_value(self.x_bin_reducer, str(settings.get("x_bin_reducer") or "mean"))
+            self.min_bin_points.setText(str(settings.get("min_bin_points") or ""))
             if hasattr(self, "y_bin_width"):
                 self.y_bin_width.setText(str(settings.get("y_bin_width") or ""))
             if hasattr(self, "y_bin_reducer"):
                 self._set_combo_value(
                     self.y_bin_reducer, str(settings.get("y_bin_reducer") or "mean")
                 )
+            self._initialize_annotation_data(settings)
             self._initialize_series_data(settings)
             self._initialize_normalization_data(settings)
             self._update_potential_summary_panel(settings)
@@ -6604,6 +9322,17 @@ def launch_plot_settings_panel(
             )
 
         def _refresh_widget_states(self, *_unused: object) -> None:
+            if all(
+                hasattr(self, name)
+                for name in (
+                    "title_font",
+                    "label_font",
+                    "tick_font",
+                    "legend_font",
+                    "base_font_size",
+                )
+            ):
+                self._refresh_font_size_placeholders()
             title_enabled = self._synced_field_mode("title") != "off"
             legend_enabled = self.legend_mode.currentText().strip().lower() != "off"
             grid_enabled = self.grid_mode.currentText().strip().lower() != "off"
@@ -6633,7 +9362,11 @@ def launch_plot_settings_panel(
             )
             coordination_time_distance = coordination_component == "time-distance"
             coordination_distance = coordination_component == "distance"
-            fit_supported = self._fit_supported_for_current_view()
+            layer_caps = self._current_layer_capabilities()
+            figure_caps = self._current_figure_capabilities()
+            fit_supported = bool(layer_caps.show_fit_editor)
+            cumulative_supported = bool(layer_caps.show_cumulative_editor)
+            selected_group = layer_caps.layer_kind == "group"
 
             self._set_rows_enabled(
                 self._title_rows,
@@ -6663,85 +9396,57 @@ def launch_plot_settings_panel(
                     disabled_reason="ticks are currently off.",
                 )
 
+            if self._series_visibility_group is not None:
+                self._series_visibility_group.setVisible(layer_caps.show_visibility_label)
+            if self._series_style_group is not None:
+                self._series_style_group.setVisible(layer_caps.show_style)
+            if self._series_uncertainty_group is not None:
+                self._series_uncertainty_group.setVisible(layer_caps.show_uncertainty)
+            if self._series_derived_group is not None:
+                self._series_derived_group.setVisible(layer_caps.show_derived_lines)
+            if self._series_fit_group is not None:
+                self._series_fit_group.setVisible(layer_caps.show_fit_editor)
+            if self._series_cumulative_group is not None:
+                self._series_cumulative_group.setVisible(layer_caps.show_cumulative_editor)
+            if self._series_group_group is not None:
+                self._series_group_group.setVisible(layer_caps.show_group_members)
+            if self._normalization_group is not None:
+                self._normalization_group.setVisible(layer_caps.show_normalization)
+            if self._series_metadata_group is not None:
+                self._series_metadata_group.setVisible(layer_caps.show_metadata)
+            if self._figure_legend_section is not None:
+                self._figure_legend_section.setVisible(figure_caps.show_legend)
+            if self._figure_lines_group is not None:
+                self._figure_lines_group.setVisible(figure_caps.show_lines)
+            if self._figure_heatmap_group is not None:
+                self._figure_heatmap_group.setVisible(figure_caps.show_heatmap)
+            if self._figure_colorbar_group is not None:
+                self._figure_colorbar_group.setVisible(figure_caps.show_colorbar)
+
             if self._position_map_color_row is not None:
-                self._set_form_row_enabled(
+                self._set_form_row_visible(
                     self._position_map_color_row[0],
                     self._position_map_color_row[1],
                     position_xy_projection,
-                    disabled_reason="Color by is only used for the xy-z projection.",
                 )
             if self._position_time_axis_row is not None:
-                self._set_form_row_enabled(
+                self._set_form_row_visible(
                     self._position_time_axis_row[0],
                     self._position_time_axis_row[1],
                     not position_xy_projection,
-                    disabled_reason="Time axis is unavailable for the xy-z projection.",
                 )
             if self._coordination_time_axis_row is not None:
-                self._set_form_row_enabled(
+                self._set_form_row_visible(
                     self._coordination_time_axis_row[0],
                     self._coordination_time_axis_row[1],
                     not coordination_distance,
-                    disabled_reason="Time axis is unavailable for the distance view.",
                 )
             if self._data_transform_group is not None and self._analysis_name == "position":
-                self._data_transform_group.setEnabled(not position_xy_projection)
-                self._data_transform_group.setToolTip(
-                    ""
-                    if not position_xy_projection
-                    else "Time sectioning is unavailable for the xy-z projection."
-                )
-            if self._normalization_group is not None and self._analysis_name == "position":
-                self._normalization_group.setEnabled(not position_xy_projection)
-                self._normalization_group.setToolTip(
-                    ""
-                    if not position_xy_projection
-                    else "Normalization is unavailable for the xy-z projection."
-                )
+                self._data_transform_group.setVisible(not position_xy_projection)
             if self._data_transform_group is not None and self._analysis_name == "coordination":
-                self._data_transform_group.setEnabled(not coordination_time_distance)
-                self._data_transform_group.setToolTip(
-                    ""
-                    if not coordination_time_distance
-                    else "Sectioning is unavailable for the time-distance view."
-                )
-            if self._normalization_group is not None and self._analysis_name == "coordination":
-                self._normalization_group.setEnabled(not coordination_time_distance)
-                self._normalization_group.setToolTip(
-                    ""
-                    if not coordination_time_distance
-                    else "Normalization is unavailable for the time-distance view."
-                )
+                self._data_transform_group.setVisible(not coordination_time_distance)
             # ── orientation heatmap mode ──────────────────────────────
             is_heatmap = self._is_orientation_heatmap_mode()
-            if self._figure_tabs is not None:
-                if is_heatmap and not self._heatmap_tab_is_shown:
-                    idx = self._figure_tabs.indexOf(self._tab_lines)
-                    if idx >= 0:
-                        self._figure_tabs.removeTab(idx)
-                    canvas_idx = self._figure_tabs.indexOf(self._tab_canvas)
-                    insert_pos = canvas_idx if canvas_idx >= 0 else self._figure_tabs.count()
-                    self._figure_tabs.insertTab(insert_pos, self._tab_heatmap, "Heatmap")
-                    self._heatmap_tab_is_shown = True
-                    self._pre_heatmap_grid_mode = self.grid_mode.currentText()
-                    self._set_combo_value(self.grid_mode, "Off")
-                elif not is_heatmap and self._heatmap_tab_is_shown:
-                    idx = self._figure_tabs.indexOf(self._tab_heatmap)
-                    if idx >= 0:
-                        self._figure_tabs.removeTab(idx)
-                    canvas_idx = self._figure_tabs.indexOf(self._tab_canvas)
-                    insert_pos = canvas_idx if canvas_idx >= 0 else self._figure_tabs.count()
-                    self._figure_tabs.insertTab(insert_pos, self._tab_lines, "Lines && Markers")
-                    self._heatmap_tab_is_shown = False
-                    restored = getattr(self, "_pre_heatmap_grid_mode", "On")
-                    self._set_combo_value(self.grid_mode, restored)
-                legend_tab_idx = self._figure_tabs.indexOf(self._tab_legend)
-                if legend_tab_idx >= 0:
-                    self._figure_tabs.setTabEnabled(legend_tab_idx, not is_heatmap)
-                    self._figure_tabs.setTabToolTip(
-                        legend_tab_idx,
-                        "" if not is_heatmap else "Legend is unavailable for heatmap views.",
-                    )
             if self._data_transform_group is not None and self._analysis_name == "orientation":
                 self._data_transform_group.setEnabled(True)
                 self._data_transform_group.setToolTip("")
@@ -6820,16 +9525,72 @@ def launch_plot_settings_panel(
                     disabled_reason="reference x is only used for value_at_x normalization.",
                 )
             if self._normalization_copy_button is not None:
-                normalization_copy_enabled = not self._series_active_is_fit_child
+                normalization_copy_enabled = (
+                    not self._series_active_is_fit_child
+                    and not self._series_active_is_cumulative_child
+                    and not selected_group
+                )
                 self._normalization_copy_button.setEnabled(normalization_copy_enabled)
                 self._apply_widget_tooltip(
                     self._normalization_copy_button,
                     disabled_reason=(
                         None
                         if normalization_copy_enabled
-                        else "normalization is edited on the base series only."
+                        else "normalization is edited on non-group base series only."
                     ),
                 )
+            if self._normalization_group is not None and selected_group:
+                self._normalization_group.setEnabled(False)
+                self._normalization_group.setToolTip(
+                    "Grouped series aggregate already-transformed member series and do not apply an extra normalization step."
+                )
+            annotation_selected = bool(self._annotations_data)
+            series_selected = bool(self._series_descriptors_data)
+            if getattr(self, "_series_duplicate_button", None) is not None:
+                self._series_duplicate_button.setEnabled(series_selected)
+            if getattr(self, "_series_add_group_button", None) is not None:
+                self._series_add_group_button.setEnabled(bool(self._group_member_candidate_indices()))
+            for button in (
+                getattr(self, "_annotation_duplicate_button", None),
+                getattr(self, "_annotation_delete_button", None),
+            ):
+                if button is not None:
+                    button.setEnabled(annotation_selected)
+            if getattr(self, "_annotation_move_up_button", None) is not None:
+                self._annotation_move_up_button.setEnabled(
+                    annotation_selected and self._annotation_active_index > 0
+                )
+            if getattr(self, "_annotation_move_down_button", None) is not None:
+                self._annotation_move_down_button.setEnabled(
+                    annotation_selected
+                    and self._annotation_active_index < len(self._annotations_data) - 1
+                )
+            for widget in (
+                getattr(self, "_annotation_enabled_mode", None),
+                getattr(self, "_annotation_type", None),
+                getattr(self, "_annotation_name", None),
+                getattr(self, "_annotation_coord_system", None),
+                getattr(self, "_annotation_color", None),
+                getattr(self, "_annotation_alpha", None),
+                getattr(self, "_annotation_zorder", None),
+                getattr(self, "_annotation_text", None),
+                getattr(self, "_annotation_x", None),
+                getattr(self, "_annotation_y", None),
+                getattr(self, "_annotation_font_size", None),
+                getattr(self, "_annotation_rotation", None),
+                getattr(self, "_annotation_horizontal_align", None),
+                getattr(self, "_annotation_vertical_align", None),
+                getattr(self, "_annotation_x1", None),
+                getattr(self, "_annotation_y1", None),
+                getattr(self, "_annotation_x2", None),
+                getattr(self, "_annotation_y2", None),
+                getattr(self, "_annotation_line_width", None),
+                getattr(self, "_annotation_line_style", None),
+                getattr(self, "_annotation_arrow_style", None),
+                getattr(self, "_annotation_mutation_scale", None),
+            ):
+                if widget is not None:
+                    widget.setEnabled(annotation_selected)
             title_mode = self._synced_field_mode("title")
             x_label_mode = self._synced_field_mode("x_label")
             y_label_mode = self._synced_field_mode("y_label")
@@ -6848,12 +9609,121 @@ def launch_plot_settings_panel(
                 self.y_label,
                 disabled_reason=None if y_label_mode != "off" else "its sync mode is Off.",
             )
+            error_supported = self._error_supported_for_current_view()
+            error_availability = self._error_availability_for_series(self._series_active_index)
+            if hasattr(self, "_series_error_mode"):
+                self._series_error_mode.setEnabled(
+                    error_supported
+                    and not self._series_active_is_fit_child
+                    and not self._series_active_is_cumulative_child
+                    and not selected_group
+                )
+                self._apply_widget_tooltip(
+                    self._series_error_mode,
+                    disabled_reason=(
+                        "error settings are edited on the base series only."
+                        if self._series_active_is_fit_child or self._series_active_is_cumulative_child
+                        else "grouped series do not render error overlays."
+                        if selected_group
+                        else None
+                        if error_supported
+                        else "error overlays are only available for 1-D line-based views."
+                    ),
+                )
+            if hasattr(self, "_series_error_stat"):
+                self._series_error_stat.setEnabled(
+                    error_supported
+                    and not self._series_active_is_fit_child
+                    and not self._series_active_is_cumulative_child
+                    and not selected_group
+                    and error_availability.selector_enabled
+                )
+                self._apply_widget_tooltip(
+                    self._series_error_stat,
+                    disabled_reason=(
+                        "error settings are edited on the base series only."
+                        if self._series_active_is_fit_child or self._series_active_is_cumulative_child
+                        else "grouped series do not render error overlays."
+                        if selected_group
+                        else error_availability.reason
+                        if error_supported and not error_availability.selector_enabled
+                        else None
+                        if error_supported
+                        else "error overlays are only available for 1-D line-based views."
+                    ),
+                )
+            if hasattr(self, "_series_error_style"):
+                self._series_error_style.setEnabled(
+                    error_supported
+                    and not self._series_active_is_fit_child
+                    and not self._series_active_is_cumulative_child
+                    and not selected_group
+                )
+                self._apply_widget_tooltip(
+                    self._series_error_style,
+                    disabled_reason=(
+                        "error settings are edited on the base series only."
+                        if self._series_active_is_fit_child or self._series_active_is_cumulative_child
+                        else "grouped series do not render error overlays."
+                        if selected_group
+                        else None
+                        if error_supported
+                        else "error overlays are only available for 1-D line-based views."
+                    ),
+                )
+            for widget in (
+                getattr(self, "_series_error_color", None),
+                getattr(self, "_series_error_show_in_legend", None),
+                getattr(self, "_series_error_label", None),
+            ):
+                if widget is not None:
+                    widget.setEnabled(
+                        error_supported
+                        and not self._series_active_is_fit_child
+                        and not self._series_active_is_cumulative_child
+                        and not selected_group
+                    )
+                    self._apply_widget_tooltip(
+                        widget,
+                        disabled_reason=(
+                            "error settings are edited on the base series only."
+                            if self._series_active_is_fit_child
+                            or self._series_active_is_cumulative_child
+                            else "grouped series do not render error overlays."
+                            if selected_group
+                            else None
+                            if error_supported
+                            else "error overlays are only available for 1-D line-based views."
+                        ),
+                    )
+            if self._min_bin_points_row is not None:
+                self._set_form_row_visible(
+                    self._min_bin_points_row[0],
+                    self._min_bin_points_row[1],
+                    error_supported,
+                )
+                self._set_form_row_enabled(
+                    self._min_bin_points_row[0],
+                    self._min_bin_points_row[1],
+                    error_supported,
+                    disabled_reason=(
+                        None
+                        if error_supported
+                        else "minimum bin counts are only available for 1-D line-based views."
+                    ),
+                )
             if self._series_fit_mode is not None:
-                self._series_fit_mode.setEnabled(fit_supported)
+                self._series_fit_mode.setEnabled(
+                    fit_supported and not self._series_active_is_cumulative_child
+                )
                 self._apply_widget_tooltip(
                     self._series_fit_mode,
                     disabled_reason=(
-                        None if fit_supported else "fitting is only available for line-based views."
+                        "fit settings are edited on the base series only."
+                        if self._series_active_is_cumulative_child
+                        else None
+                        if fit_supported
+                        else "fitting is only available for line-based views."
                     ),
                 )
             fit_active = (
@@ -6873,13 +9743,16 @@ def launch_plot_settings_panel(
             polynomial_selected = fit_type == "polynomial"
             if hasattr(self, "_series_fit_type"):
                 self._series_fit_type.setEnabled(
-                    fit_supported and not self._series_active_is_fit_child
+                    fit_supported
+                    and not self._series_active_is_fit_child
+                    and not self._series_active_is_cumulative_child
                 )
                 self._apply_widget_tooltip(
                     self._series_fit_type,
                     disabled_reason=(
                         "fit settings are edited on the base series only."
                         if self._series_active_is_fit_child
+                        or self._series_active_is_cumulative_child
                         else None
                         if fit_supported
                         else "fitting is only available for line-based views."
@@ -6926,6 +9799,7 @@ def launch_plot_settings_panel(
                     widget.setEnabled(
                         fit_supported
                         and not self._series_active_is_fit_child
+                        and not self._series_active_is_cumulative_child
                         and fit_active
                         and fit_manual_range
                     )
@@ -6934,6 +9808,7 @@ def launch_plot_settings_panel(
                         disabled_reason=(
                             "fit settings are edited on the base series only."
                             if self._series_active_is_fit_child
+                            or self._series_active_is_cumulative_child
                             else "turn fitting on first."
                             if not fit_active
                             else "manual fit range is not selected."
@@ -6942,9 +9817,48 @@ def launch_plot_settings_panel(
                         ),
                     )
             if hasattr(self, "_series_fit_show_in_legend"):
-                self._series_fit_show_in_legend.setEnabled(fit_supported and fit_active)
+                self._series_fit_show_in_legend.setEnabled(
+                    fit_supported and fit_active and not self._series_active_is_cumulative_child
+                )
             if hasattr(self, "_series_fit_label"):
-                self._series_fit_label.setEnabled(fit_supported and fit_active)
+                self._series_fit_label.setEnabled(
+                    fit_supported and fit_active and not self._series_active_is_cumulative_child
+                )
+            if hasattr(self, "_series_cumulative_mode"):
+                self._series_cumulative_mode.setEnabled(
+                    cumulative_supported and not self._series_active_is_fit_child
+                )
+                self._apply_widget_tooltip(
+                    self._series_cumulative_mode,
+                    disabled_reason=(
+                        "cumulative settings are edited on the base series only."
+                        if self._series_active_is_fit_child
+                        else None
+                        if cumulative_supported
+                        else "cumulative-average lines are only available for 1-D line-based views."
+                    ),
+                )
+            cumulative_active = (
+                cumulative_supported
+                and hasattr(self, "_series_cumulative_mode")
+                and self._series_cumulative_mode.currentText().strip().lower() != "off"
+            )
+            for widget in (
+                getattr(self, "_series_cumulative_show_in_legend", None),
+                getattr(self, "_series_cumulative_label", None),
+            ):
+                if widget is not None:
+                    widget.setEnabled(cumulative_supported and cumulative_active)
+            if hasattr(self, "_series_group_group") and self._series_group_group is not None:
+                self._series_group_group.setEnabled(not self._series_active_is_fit_child)
+            if hasattr(self, "_series_group_reducer"):
+                self._series_group_reducer.setEnabled(
+                    selected_group and not self._series_active_is_fit_child
+                )
+            if hasattr(self, "_series_group_members"):
+                self._series_group_members.setEnabled(
+                    selected_group and not self._series_active_is_fit_child
+                )
             self._preview_button.setEnabled(
                 _preview_button_enabled(
                     auto_update_enabled=self._auto_preview_checkbox.isChecked(),
@@ -6952,12 +9866,14 @@ def launch_plot_settings_panel(
                 )
             )
             self._update_normalization_warning()
+            self._update_series_error_summary(self._series_active_index)
             self._update_series_fit_summary(self._series_active_index)
             self._sync_standard_controls_to_advanced_json()
             self._refresh_shell_state()
 
         def _collect_settings(self) -> dict[str, Any]:
             self._persist_active_series_editor()
+            self._persist_active_annotation_editor()
 
             def _synced_text(key: str, widget: QLineEdit) -> str | None:
                 mode = self._synced_field_mode(key)
@@ -7117,6 +10033,71 @@ def launch_plot_settings_panel(
                 normalization_values_value = normalization_values
                 normalization_x_refs_value = normalization_x_refs
 
+            raw_annotations: list[dict[str, Any]] = []
+            for annotation_entry in self._annotations_data:
+                annotation_type = (
+                    str(annotation_entry.get("type") or "text").strip().lower() or "text"
+                )
+                payload: dict[str, Any] = {
+                    "id": str(annotation_entry.get("id") or f"annotation:{uuid4().hex}").strip(),
+                    "type": annotation_type,
+                    "enabled": bool(annotation_entry.get("enabled", True)),
+                    "name": str(annotation_entry.get("name") or "").strip(),
+                    "coord_system": str(annotation_entry.get("coord_system") or "axes")
+                    .strip()
+                    .lower(),
+                    "color": str(annotation_entry.get("color") or "#000000").strip() or "#000000",
+                    "alpha": str(annotation_entry.get("alpha") or "1.0").strip() or "1.0",
+                    "zorder": str(annotation_entry.get("zorder") or "5").strip() or "5",
+                }
+                if annotation_type == "text":
+                    payload.update(
+                        {
+                            "text": str(annotation_entry.get("text") or "").strip(),
+                            "x": str(annotation_entry.get("x") or "0.5").strip() or "0.5",
+                            "y": str(annotation_entry.get("y") or "0.5").strip() or "0.5",
+                            "font_size": str(annotation_entry.get("font_size") or "12").strip()
+                            or "12",
+                            "rotation": str(annotation_entry.get("rotation") or "0").strip() or "0",
+                            "horizontal_align": str(
+                                annotation_entry.get("horizontal_align") or "center"
+                            )
+                            .strip()
+                            .lower()
+                            or "center",
+                            "vertical_align": str(
+                                annotation_entry.get("vertical_align") or "center"
+                            )
+                            .strip()
+                            .lower()
+                            or "center",
+                        }
+                    )
+                else:
+                    payload.update(
+                        {
+                            "x1": str(annotation_entry.get("x1") or "0").strip() or "0",
+                            "y1": str(annotation_entry.get("y1") or "0").strip() or "0",
+                            "x2": str(annotation_entry.get("x2") or "1").strip() or "1",
+                            "y2": str(annotation_entry.get("y2") or "1").strip() or "1",
+                            "line_width": str(annotation_entry.get("line_width") or "1.5").strip()
+                            or "1.5",
+                            "line_style": str(annotation_entry.get("line_style") or "-").strip()
+                            or "-",
+                        }
+                    )
+                    if annotation_type == "arrow":
+                        payload["arrow_style"] = (
+                            str(annotation_entry.get("arrow_style") or "->").strip() or "->"
+                        )
+                        payload["mutation_scale"] = (
+                            str(annotation_entry.get("mutation_scale") or "12").strip() or "12"
+                        )
+                raw_annotations.append(payload)
+            annotations_value = (
+                _coerce_plot_annotations(raw_annotations) if raw_annotations else None
+            )
+
             series_overrides: dict[str, dict[str, Any]] = {}
             for index, descriptor in enumerate(self._series_descriptors_data):
                 series_id = str(descriptor.get("series_id") or f"series:{index}")
@@ -7197,6 +10178,40 @@ def launch_plot_settings_panel(
                     entry["fit_show_in_legend"] = False
                 if fit_config_payload["fit_label_override"]:
                     entry["fit_label_override"] = fit_config_payload["fit_label_override"]
+                cumulative_enabled_value = bool(self._series_cumulative_enabled_data[index])
+                cumulative_label_override_value = (
+                    self._series_cumulative_label_overrides_data[index].strip() or None
+                )
+                cumulative_show_in_legend_value = bool(
+                    self._series_cumulative_show_in_legend_data[index]
+                )
+                cumulative_payload = {
+                    "enabled": cumulative_enabled_value,
+                    "label_override": cumulative_label_override_value,
+                    "show_in_legend": cumulative_show_in_legend_value,
+                }
+                if cumulative_payload != _cumulative_defaults_for_gui():
+                    entry["cumulative"] = cumulative_payload
+                error_enabled_value = bool(self._series_error_enabled_data[index])
+                error_stat = self._resolved_error_stat_for_series(index)
+                error_style = self._series_error_styles_data[index].strip().lower()
+                if error_style not in _ERROR_STYLES:
+                    error_style = "band"
+                error_color_value = self._series_error_colors_data[index].strip() or None
+                error_label_override_value = (
+                    self._series_error_label_overrides_data[index].strip() or None
+                )
+                error_show_in_legend_value = bool(self._series_error_show_in_legend_data[index])
+                error_config_payload = {
+                    "enabled": error_enabled_value,
+                    "stat": error_stat,
+                    "style": error_style,
+                    "color": error_color_value,
+                    "label_override": error_label_override_value,
+                    "show_in_legend": error_show_in_legend_value,
+                }
+                if error_config_payload != _error_defaults_for_gui():
+                    entry["error"] = error_config_payload
                 alpha_token = self._series_alpha_data[index].strip()
                 if alpha_token:
                     try:
@@ -7383,6 +10398,12 @@ def launch_plot_settings_panel(
             x_bin_width = _optional_float(self.x_bin_width.text(), field_name="x-bin-width")
             if x_bin_width is not None and x_bin_width <= 0:
                 raise ValueError("x-bin-width must be positive.")
+            min_bin_points = _optional_int(
+                self.min_bin_points.text(),
+                field_name="min-points-per-bin",
+            )
+            if min_bin_points is not None and min_bin_points < 1:
+                raise ValueError("min-points-per-bin must be >= 1.")
 
             y_bin_width: float | None = None
             if hasattr(self, "y_bin_width"):
@@ -7425,6 +10446,7 @@ def launch_plot_settings_panel(
                 ),
                 "title_visible": title_visible_value,
                 "legend": _mode_to_toggle(self.legend_mode.currentText()),
+                "border": _mode_to_toggle(self.axes_border_mode.currentText()),
                 "grid": _mode_to_toggle(self.grid_mode.currentText()),
                 "ticks": self.ticks_visibility.currentText().strip().lower() != "none",
                 "markers": _mode_to_toggle(self.markers_mode.currentText()),
@@ -7433,6 +10455,9 @@ def launch_plot_settings_panel(
                 "figsize": figsize,
                 "dpi": _optional_positive_int_or_none(self.dpi.text(), field_name="dpi"),
                 "font_family": _explicit_text(self.font_family.text()) or None,
+                "font_size": _optional_positive_int_or_none(
+                    self.base_font_size.text(), field_name="font-size"
+                ),
                 "title_font_size": _optional_positive_int_or_none(
                     self.title_font.text(), field_name="title-font-size"
                 ),
@@ -7464,10 +10489,12 @@ def launch_plot_settings_panel(
                 "series_normalization_modes": normalization_modes_value,
                 "series_normalization_values": normalization_values_value,
                 "series_normalization_x_refs": normalization_x_refs_value,
+                "annotations": annotations_value,
                 "x_bin_width": x_bin_width,
                 "x_bin_reducer": (self.x_bin_reducer.currentText().strip() or "mean")
                 if x_bin_width is not None
                 else None,
+                "min_bin_points": min_bin_points,
                 "y_bin_width": y_bin_width,
                 "y_bin_reducer": (self.y_bin_reducer.currentText().strip() or "mean")
                 if hasattr(self, "y_bin_reducer") and y_bin_width is not None
@@ -7689,7 +10716,40 @@ def launch_plot_settings_panel(
                 if suffix in {".h5", ".hdf5"}:
                     if on_import_hdf5 is None:
                         raise ValueError("HDF5 import is unavailable for this plot session.")
-                    payload = on_import_hdf5(path_str, self._current_profile_name)
+                    selected_profile_name: str | None = None
+                    if on_list_import_hdf5_profiles is not None:
+                        listing = on_list_import_hdf5_profiles(path_str)
+                        available_names = listing.get("available_names")
+                        active_name = str(listing.get("active_name") or "").strip() or None
+                        if isinstance(available_names, list):
+                            normalized_names = [
+                                str(name).strip() for name in available_names if str(name).strip()
+                            ]
+                            if len(normalized_names) > 1:
+                                if active_name in normalized_names:
+                                    default_name = active_name
+                                elif "Default" in normalized_names:
+                                    default_name = "Default"
+                                else:
+                                    default_name = normalized_names[0]
+                                selected_profile_name, accepted = QInputDialog.getItem(
+                                    self,
+                                    "Choose imported profile",
+                                    "Saved profile",
+                                    normalized_names,
+                                    normalized_names.index(default_name),
+                                    False,
+                                )
+                                if not accepted:
+                                    self._status_label.setText("Import canceled.")
+                                    self._refresh_shell_state()
+                                    return
+                                selected_profile_name = (
+                                    str(selected_profile_name).strip() or default_name
+                                )
+                            elif len(normalized_names) == 1:
+                                selected_profile_name = normalized_names[0]
+                    payload = on_import_hdf5(path_str, selected_profile_name)
                     source_label = source_path.name
                 else:
                     payload = json.loads(source_path.read_text(encoding="utf-8"))
@@ -7844,7 +10904,7 @@ def launch_plot_settings_panel(
         app = QApplication([])
 
     window = _PlotSettingsWindow()
-    window.show()
+    window.showMaximized()
 
     # Ensure window is on a visible screen (guards against stale geometry).
     if QApplication.screenAt(window.geometry().center()) is None:

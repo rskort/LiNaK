@@ -12,6 +12,7 @@ dist/
 
 # Test / coverage artifacts
 .pytest_cache/
+.pytest_runs/
 .coverage
 htmlcov/
 LiNaK_outputs/

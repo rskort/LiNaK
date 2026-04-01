@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from concurrent.futures import ProcessPoolExecutor
-from collections.abc import Mapping
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from collections.abc import Mapping, Sequence
+from contextlib import nullcontext
 from dataclasses import dataclass
-from itertools import repeat
+from itertools import combinations_with_replacement, repeat
 import logging
 import os
 from pathlib import Path
@@ -16,12 +17,14 @@ from ase import Atoms
 from ase.data import atomic_numbers
 from ase.geometry import get_distances
 from ase.neighborlist import neighbor_list
+from scipy.spatial import cKDTree
 
 from ..storage.hdf5_utils import (
     is_hdf5_path,
     read_linak_hdf5_profiles_by_index,
     read_linak_hdf5_profiles,
     write_linak_hdf5,
+    write_linak_hdf5_profile_collection,
 )
 from .binning import (
     reconstruct_uniform_bin_edges_from_centers,
@@ -29,6 +32,16 @@ from .binning import (
     uniform_bin_width_from_edges,
 )
 from .schema import build_profile_metadata, default_plot_labels
+from .statistics import (
+    SeriesStatistics,
+    block_mean_matrix,
+    build_series_statistics,
+    build_series_statistics_from_moments,
+    build_statistics_metadata,
+    statistics_payload_from_series_map,
+    statistics_series_map_from_datasets,
+    resolve_block_slices,
+)
 from ..plot.plotting import (
     DEFAULT_PLOT_STYLE,
     PlotStyle,
@@ -48,6 +61,12 @@ _DEFAULT_RDF_THREAD_CAP = 4
 _RDF_MIN_PARALLEL_FRAMES_PER_WORKER = 4
 _RDF_MIN_CHUNK_SIZE = 16
 _RDF_MAX_CHUNK_SIZE = 128
+_RDF_DENSE_PAIR_THRESHOLD = 250_000
+_RDF_FAST_MAX_DISTANCE_VALUES_PER_CHUNK = 2_000_000
+_RDF_FAST_TARGET_CHUNKS_PER_WORKER = 4
+_RDF_BACKEND_DENSE = "chunked_dense_matrix"
+_RDF_BACKEND_SPARSE = "chunked_sparse_cutoff"
+_RDF_BACKEND_GENERIC = "framewise_generic_fallback"
 
 
 @dataclass(frozen=True)
@@ -60,6 +79,7 @@ class RDFProfile:
     bin_centers: np.ndarray
     g_r: np.ndarray
     n_frames: int
+    series_statistics: dict[str, SeriesStatistics] | None = None
 
 
 @dataclass(frozen=True)
@@ -87,6 +107,211 @@ class _RDFWorkerConfig:
     max_sphere_volume: float
     selection_cache: _RDFSelectionCache | None = None
     strategy_override: str | None = None
+    collect_statistics: bool = False
+    block_index_by_frame: np.ndarray | None = None
+
+
+@dataclass(frozen=True)
+class _RDFOrthorhombicChunk:
+    """Compact orthorhombic chunk payload used by fast RDF backends."""
+
+    positions_a: np.ndarray
+    positions_b: np.ndarray
+    cell_lengths: np.ndarray
+    volumes: np.ndarray
+    frame_count: int
+    frame_start: int
+
+
+@dataclass(frozen=True)
+class _RDFOrthorhombicConfig:
+    """Shared config for orthorhombic RDF chunk kernels."""
+
+    r_max: float
+    bin_edges: np.ndarray
+    shell_volumes: np.ndarray
+    same_selection: bool
+    count_a: int
+    count_b: int
+    indices_a: np.ndarray
+    indices_b: np.ndarray
+    self_pair_rows: np.ndarray
+    self_pair_cols: np.ndarray
+    collect_statistics: bool = False
+    block_index_by_frame: np.ndarray | None = None
+
+
+@dataclass(frozen=True)
+class _RDFBackendResolution:
+    """Resolved RDF execution backend for one compute_rdf call."""
+
+    backend: str
+    worker_count: int
+    use_parallel: bool
+    chunk_size: int
+    selection_cache: _RDFSelectionCache | None = None
+    cell_lengths: np.ndarray | None = None
+    volumes: np.ndarray | None = None
+    generic_strategy_override: str | None = None
+    pair_count: int = 0
+
+
+@dataclass
+class _RDFStatisticsMoments:
+    """Compact per-bin RDF statistics moments accumulated during the main compute pass."""
+
+    point_count: np.ndarray
+    sample_n: np.ndarray
+    sample_sum: np.ndarray
+    sample_sumsq: np.ndarray
+    block_sum: np.ndarray | None = None
+    block_n: np.ndarray | None = None
+
+
+@dataclass(frozen=True)
+class _RDFPairJob:
+    """Prepared one-pair RDF job reused by pairwise RDF collection compute."""
+
+    species_a: str
+    species_b: str
+    backend: str
+    selection_cache: _RDFSelectionCache
+    orthorhombic_config: _RDFOrthorhombicConfig
+
+
+@dataclass(frozen=True)
+class _RDFOrthorhombicMultiChunk:
+    """Shared species-position chunk reused across multiple RDF pairs."""
+
+    positions_by_species: Mapping[str, np.ndarray]
+    cell_lengths: np.ndarray
+    volumes: np.ndarray
+    frame_count: int
+    frame_start: int
+
+
+def _resolve_rdf_block_index_by_frame(frame_count: int) -> np.ndarray | None:
+    """Return one frame->block index map or ``None`` when block stats are unavailable."""
+    block_resolution = resolve_block_slices(int(frame_count))
+    if block_resolution is None:
+        return None
+    block_slices, _block_lengths = block_resolution
+    block_index_by_frame = np.full(int(frame_count), -1, dtype=int)
+    for block_index, block_slice in enumerate(block_slices):
+        block_index_by_frame[block_slice] = int(block_index)
+    return block_index_by_frame
+
+
+def _empty_rdf_statistics_moments(
+    *,
+    n_bins: int,
+    n_blocks: int | None,
+) -> _RDFStatisticsMoments:
+    """Allocate empty per-bin RDF statistics moments."""
+    block_shape = None if n_blocks is None else (int(n_blocks), int(n_bins))
+    return _RDFStatisticsMoments(
+        point_count=np.zeros(int(n_bins), dtype=int),
+        sample_n=np.zeros(int(n_bins), dtype=int),
+        sample_sum=np.zeros(int(n_bins), dtype=float),
+        sample_sumsq=np.zeros(int(n_bins), dtype=float),
+        block_sum=None if block_shape is None else np.zeros(block_shape, dtype=float),
+        block_n=None if block_shape is None else np.zeros(block_shape, dtype=int),
+    )
+
+
+def _rdf_g_values_from_counts_expected(
+    counts: np.ndarray,
+    expected: np.ndarray,
+) -> np.ndarray:
+    """Return exact per-frame RDF values with NaN where expected counts are unavailable."""
+    counts_array = np.asarray(counts, dtype=float)
+    expected_array = np.asarray(expected, dtype=float)
+    g_values = np.full(counts_array.shape, np.nan, dtype=float)
+    finite = expected_array > 0.0
+    g_values[finite] = counts_array[finite] / expected_array[finite]
+    return g_values
+
+
+def _update_rdf_statistics_moments(
+    moments: _RDFStatisticsMoments | None,
+    *,
+    counts: np.ndarray,
+    expected: np.ndarray,
+    frame_index: int,
+    block_index_by_frame: np.ndarray | None,
+) -> None:
+    """Accumulate one frame's exact RDF values into per-bin sample/block moments."""
+    if moments is None:
+        return
+    counts_array = np.asarray(counts, dtype=float)
+    expected_array = np.asarray(expected, dtype=float)
+    moments.point_count += np.rint(counts_array).astype(int)
+    finite = expected_array > 0.0
+    if not np.any(finite):
+        return
+    g_values = np.full(counts_array.shape, np.nan, dtype=float)
+    g_values[finite] = counts_array[finite] / expected_array[finite]
+    moments.sample_n[finite] += 1
+    moments.sample_sum[finite] += g_values[finite]
+    moments.sample_sumsq[finite] += g_values[finite] ** 2
+    if (
+        block_index_by_frame is None
+        or moments.block_sum is None
+        or moments.block_n is None
+        or frame_index < 0
+        or frame_index >= block_index_by_frame.size
+    ):
+        return
+    block_index = int(block_index_by_frame[frame_index])
+    if block_index < 0:
+        return
+    moments.block_sum[block_index, finite] += g_values[finite]
+    moments.block_n[block_index, finite] += 1
+
+
+def _merge_rdf_statistics_moments(
+    destination: _RDFStatisticsMoments | None,
+    source: _RDFStatisticsMoments | None,
+) -> _RDFStatisticsMoments | None:
+    """Merge one chunk-local RDF statistics payload into the running total."""
+    if destination is None:
+        return source
+    if source is None:
+        return destination
+    destination.point_count += source.point_count
+    destination.sample_n += source.sample_n
+    destination.sample_sum += source.sample_sum
+    destination.sample_sumsq += source.sample_sumsq
+    if destination.block_sum is not None and source.block_sum is not None:
+        destination.block_sum += source.block_sum
+    if destination.block_n is not None and source.block_n is not None:
+        destination.block_n += source.block_n
+    return destination
+
+
+def _block_mean_matrix_from_rdf_moments(
+    moments: _RDFStatisticsMoments,
+) -> np.ndarray | None:
+    """Return block-mean values reconstructed from accumulated block sums/counts."""
+    if moments.block_sum is None or moments.block_n is None:
+        return None
+    block_values = np.full(moments.block_sum.shape, np.nan, dtype=float)
+    valid = moments.block_n > 0
+    block_values[valid] = moments.block_sum[valid] / moments.block_n[valid].astype(float)
+    return block_values
+
+
+def _finalize_rdf_statistics_moments(
+    moments: _RDFStatisticsMoments,
+) -> SeriesStatistics:
+    """Build persisted RDF series statistics from accumulated moments."""
+    return build_series_statistics_from_moments(
+        point_count=moments.point_count,
+        sample_n=moments.sample_n,
+        sample_sum=moments.sample_sum,
+        sample_sumsq=moments.sample_sumsq,
+        block_values=_block_mean_matrix_from_rdf_moments(moments),
+    )
 
 
 def _normalize_species(species: str | None) -> str:
@@ -99,6 +324,94 @@ def _normalize_species(species: str | None) -> str:
         return "ALL"
 
     return species[0].upper() + species[1:].lower()
+
+
+def _available_element_species(frames: list[Atoms]) -> list[str]:
+    """Return sorted unique element symbols across a trajectory."""
+    species_set: set[str] = set()
+    for frame in frames:
+        species_set.update(frame.get_chemical_symbols())
+    return sorted(species_set)
+
+
+def _canonical_rdf_pair(species_a: str, species_b: str) -> tuple[str, str]:
+    """Return the unique unordered storage key for a physical RDF pair."""
+    label_a = _normalize_species(species_a)
+    label_b = _normalize_species(species_b)
+    return (label_a, label_b) if label_a <= label_b else (label_b, label_a)
+
+
+def _ordered_unique_unordered_rdf_pairs(
+    pairs: Sequence[tuple[str, str]],
+) -> list[tuple[str, str]]:
+    """Return unique physical RDF pairs preserving first-seen canonical order."""
+    ordered: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for species_a, species_b in pairs:
+        pair = _canonical_rdf_pair(species_a, species_b)
+        if pair in seen:
+            continue
+        seen.add(pair)
+        ordered.append(pair)
+    return ordered
+
+
+def _canonicalize_rdf_pair(species_a: str, species_b: str) -> tuple[str, str]:
+    """Return deterministic unordered RDF pair order for physical pair identity."""
+    left = _normalize_species(species_a)
+    right = _normalize_species(species_b)
+    return (left, right) if left <= right else (right, left)
+
+
+def _pair_request_is_cross_species(
+    wanted_species_a: str | None,
+    wanted_species_b: str | None,
+) -> bool:
+    return (
+        wanted_species_a is not None
+        and wanted_species_b is not None
+        and wanted_species_a != wanted_species_b
+    )
+
+
+def _rdf_pair_matches_request(
+    *,
+    stored_species_a: str,
+    stored_species_b: str,
+    wanted_species_a: str | None,
+    wanted_species_b: str | None,
+) -> bool:
+    """Return whether a stored RDF pair satisfies a requested pair filter."""
+    stored_a = _normalize_species(stored_species_a)
+    stored_b = _normalize_species(stored_species_b)
+    if wanted_species_a is not None and wanted_species_b is not None:
+        if stored_a == wanted_species_a and stored_b == wanted_species_b:
+            return True
+        return _pair_request_is_cross_species(wanted_species_a, wanted_species_b) and (
+            stored_a == wanted_species_b and stored_b == wanted_species_a
+        )
+    if wanted_species_a is not None and stored_a != wanted_species_a:
+        return False
+    if wanted_species_b is not None and stored_b != wanted_species_b:
+        return False
+    return True
+
+
+def _rdf_pair_matches_exact_request(
+    *,
+    stored_species_a: str,
+    stored_species_b: str,
+    wanted_species_a: str | None,
+    wanted_species_b: str | None,
+) -> bool:
+    """Return whether a stored RDF pair matches the requested exact order."""
+    stored_a = _normalize_species(stored_species_a)
+    stored_b = _normalize_species(stored_species_b)
+    if wanted_species_a is not None and stored_a != wanted_species_a:
+        return False
+    if wanted_species_b is not None and stored_b != wanted_species_b:
+        return False
+    return True
 
 
 def _select_mask(numbers: np.ndarray, species: str) -> np.ndarray:
@@ -146,6 +459,116 @@ def _frame_perpendicular_heights(frame: Atoms) -> tuple[float, float, float]:
         raise ValueError("RDF requires valid periodic cell vectors in all frames.")
     heights = volume / face_areas
     return float(heights[0]), float(heights[1]), float(heights[2])
+
+
+def _frame_has_axis_aligned_orthorhombic_cell(frame: Atoms) -> bool:
+    """Return whether a frame uses a positive diagonal orthorhombic cell."""
+    pbc = np.asarray(frame.get_pbc(), dtype=bool)
+    if pbc.shape != (3,) or not bool(np.all(pbc)):
+        return False
+    cell = np.asarray(frame.cell.array, dtype=float)
+    if cell.shape != (3, 3):
+        return False
+    diagonal = np.diag(np.diag(cell))
+    if not np.allclose(cell, diagonal, rtol=0.0, atol=1.0e-12):
+        return False
+    return bool(np.all(np.diag(diagonal) > 0.0))
+
+
+def _resolve_rdf_orthorhombic_geometry(
+    frames: list[Atoms],
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Return per-frame orthorhombic cell lengths/volumes when available."""
+    if not frames:
+        return None
+
+    cell_lengths = np.empty((len(frames), 3), dtype=float)
+    volumes = np.empty(len(frames), dtype=float)
+    for frame_index, frame in enumerate(frames):
+        if not _frame_has_axis_aligned_orthorhombic_cell(frame):
+            return None
+        diagonal = np.asarray(np.diag(frame.cell.array), dtype=float)
+        cell_lengths[frame_index, :] = diagonal
+        volumes[frame_index] = float(np.prod(diagonal))
+    return cell_lengths, volumes
+
+
+def _histogram_rdf_distances(
+    sampled_distances: np.ndarray,
+    *,
+    bin_edges: np.ndarray,
+) -> np.ndarray:
+    """Histogram RDF distances with NumPy-compatible edge semantics."""
+    distances = np.asarray(sampled_distances, dtype=float).reshape(-1)
+    n_bins = max(0, int(bin_edges.size) - 1)
+    if n_bins == 0 or distances.size == 0:
+        return np.zeros(n_bins, dtype=float)
+
+    finite = np.isfinite(distances) & (distances >= 0.0) & (distances <= float(bin_edges[-1]))
+    distances = distances[finite]
+    if distances.size == 0:
+        return np.zeros(n_bins, dtype=float)
+
+    bin_indices = np.searchsorted(bin_edges, distances, side="right") - 1
+    last_index = n_bins - 1
+    right_edge_mask = np.isclose(
+        distances,
+        float(bin_edges[-1]),
+        rtol=0.0,
+        atol=np.finfo(float).eps * max(1.0, abs(float(bin_edges[-1]))),
+    )
+    bin_indices[right_edge_mask] = last_index
+    valid_bins = (bin_indices >= 0) & (bin_indices <= last_index)
+    return np.bincount(bin_indices[valid_bins], minlength=n_bins).astype(float, copy=False)
+
+
+def _resolve_rdf_self_pair_coordinates(
+    indices_a: np.ndarray,
+    indices_b: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return row/column coordinates for literal self-pairs shared by two selections."""
+    if indices_a.size == 0 or indices_b.size == 0:
+        return np.empty(0, dtype=int), np.empty(0, dtype=int)
+    _shared, rows, cols = np.intersect1d(
+        np.asarray(indices_a, dtype=int),
+        np.asarray(indices_b, dtype=int),
+        assume_unique=True,
+        return_indices=True,
+    )
+    return np.asarray(rows, dtype=int), np.asarray(cols, dtype=int)
+
+
+def _resolve_rdf_orthorhombic_selection_cache(
+    frames: list[Atoms],
+    *,
+    label_a: str,
+    label_b: str,
+    selection_cache: _RDFSelectionCache | None,
+) -> _RDFSelectionCache | None:
+    """Resolve stable selection metadata required by orthorhombic fast backends."""
+    if selection_cache is not None:
+        return selection_cache
+    if not frames or not (label_a == "ALL" and label_b == "ALL"):
+        return None
+
+    atom_count = len(frames[0])
+    for frame_index, frame in enumerate(frames[1:], start=1):
+        if len(frame) != atom_count:
+            LOGGER.warning(
+                "RDF atom count changed at frame %d; falling back to framewise RDF backend.",
+                frame_index,
+            )
+            return None
+    mask = np.ones(atom_count, dtype=bool)
+    indices = np.arange(atom_count, dtype=int)
+    return _RDFSelectionCache(
+        mask_a=mask,
+        mask_b=mask,
+        indices_a=indices,
+        indices_b=indices,
+        count_a=int(atom_count),
+        count_b=int(atom_count),
+    )
 
 
 def _sample_distances_neighbor_list(
@@ -258,6 +681,13 @@ def _build_uniform_rdf_bins(
     return bin_edges, effective_bin_width
 
 
+def _resolve_auto_r_max_for_bin_width(*, auto_r_max: float, target_bin_width: float) -> float:
+    """Round an auto-derived safe ``r_max`` down to a compatible uniform-bin endpoint."""
+    n_bins = max(1, int(np.floor(float(auto_r_max) / float(target_bin_width))))
+    resolved = float(n_bins) * float(target_bin_width)
+    return resolved
+
+
 def _shell_volumes_from_edges(bin_edges: np.ndarray) -> np.ndarray:
     """Return exact spherical shell volumes for uniform RDF bins."""
     edges = np.asarray(bin_edges, dtype=float)
@@ -276,9 +706,18 @@ def _normalize_strategy_override(strategy_override: str | None) -> str | None:
     if strategy_override is None:
         return None
     token = str(strategy_override).strip().lower()
-    if token not in {"neighbor_list", "selected_matrix", "full_matrix"}:
+    if token not in {
+        "neighbor_list",
+        "selected_matrix",
+        "full_matrix",
+        _RDF_BACKEND_DENSE,
+        _RDF_BACKEND_SPARSE,
+        _RDF_BACKEND_GENERIC,
+    }:
         raise ValueError(
-            "RDF strategy override must be one of: neighbor_list, selected_matrix, full_matrix."
+            "RDF strategy override must be one of: "
+            "neighbor_list, selected_matrix, full_matrix, "
+            "chunked_dense_matrix, chunked_sparse_cutoff, framewise_generic_fallback."
         )
     return token
 
@@ -289,10 +728,112 @@ def _resolve_rdf_chunk_size(n_frames: int, worker_count: int) -> int:
     return min(_RDF_MAX_CHUNK_SIZE, chunk_size)
 
 
+def _resolve_rdf_fast_chunk_size(
+    *,
+    frame_count: int,
+    pair_count: int,
+    worker_count: int,
+) -> int:
+    """Resolve chunk size for orthorhombic fast RDF kernels."""
+    if frame_count <= 0:
+        return 1
+    if pair_count <= 0:
+        return frame_count
+
+    target_chunks = max(worker_count * _RDF_FAST_TARGET_CHUNKS_PER_WORKER, 1)
+    parallel_chunk = max(1, (frame_count + target_chunks - 1) // target_chunks)
+    memory_chunk = max(1, _RDF_FAST_MAX_DISTANCE_VALUES_PER_CHUNK // max(1, pair_count))
+    return max(1, min(frame_count, parallel_chunk, memory_chunk))
+
+
 def _should_parallelize_rdf(n_frames: int, worker_count: int) -> bool:
     if worker_count <= 1:
         return False
     return n_frames >= max(_RDF_MIN_CHUNK_SIZE, worker_count * _RDF_MIN_PARALLEL_FRAMES_PER_WORKER)
+
+
+def _resolve_rdf_backend(
+    frames: list[Atoms],
+    *,
+    label_a: str,
+    label_b: str,
+    r_max: float,
+    worker_count: int,
+    selection_cache: _RDFSelectionCache | None,
+    strategy_override: str | None,
+) -> _RDFBackendResolution:
+    """Resolve the fastest exact RDF backend that preserves current semantics."""
+    generic_strategy_override = None
+    if strategy_override in {"neighbor_list", "selected_matrix", "full_matrix"}:
+        generic_strategy_override = strategy_override
+        strategy_override = _RDF_BACKEND_GENERIC
+
+    orthorhombic_geometry = _resolve_rdf_orthorhombic_geometry(frames)
+    orthorhombic_selection = _resolve_rdf_orthorhombic_selection_cache(
+        frames,
+        label_a=label_a,
+        label_b=label_b,
+        selection_cache=selection_cache,
+    )
+    orthorhombic_ready = orthorhombic_geometry is not None and orthorhombic_selection is not None
+
+    if strategy_override in {_RDF_BACKEND_DENSE, _RDF_BACKEND_SPARSE} and not orthorhombic_ready:
+        raise ValueError(
+            f"RDF backend override '{strategy_override}' requires axis-aligned orthorhombic "
+            "cells and stable atom selections across frames."
+        )
+
+    if strategy_override == _RDF_BACKEND_GENERIC or not orthorhombic_ready:
+        chunk_size = (
+            _resolve_rdf_chunk_size(len(frames), worker_count)
+            if _should_parallelize_rdf(len(frames), worker_count)
+            else len(frames)
+        )
+        return _RDFBackendResolution(
+            backend=_RDF_BACKEND_GENERIC,
+            worker_count=worker_count,
+            use_parallel=_should_parallelize_rdf(len(frames), worker_count),
+            chunk_size=chunk_size,
+            selection_cache=selection_cache,
+            generic_strategy_override=generic_strategy_override,
+        )
+
+    if orthorhombic_geometry is None or orthorhombic_selection is None:
+        raise ValueError("Orthorhombic RDF backend resolution requires geometry and selections.")
+    cell_lengths, volumes = orthorhombic_geometry
+    pair_count = int(orthorhombic_selection.count_a * orthorhombic_selection.count_b)
+    mean_volume = float(np.mean(volumes))
+    max_sphere_volume = (4.0 / 3.0) * np.pi * (float(r_max) ** 3)
+    neighbor_density = min(1.0, max_sphere_volume / max(mean_volume, 1.0e-12))
+
+    if strategy_override == _RDF_BACKEND_DENSE:
+        backend = _RDF_BACKEND_DENSE
+    elif strategy_override == _RDF_BACKEND_SPARSE:
+        backend = _RDF_BACKEND_SPARSE
+    elif (
+        pair_count <= _RDF_DENSE_PAIR_THRESHOLD
+        or neighbor_density > _NEIGHBORLIST_DENSITY_THRESHOLD
+    ):
+        backend = _RDF_BACKEND_DENSE
+    else:
+        backend = _RDF_BACKEND_SPARSE
+
+    use_parallel = _should_parallelize_rdf(len(frames), worker_count)
+    chunk_size = _resolve_rdf_fast_chunk_size(
+        frame_count=len(frames),
+        pair_count=max(1, pair_count),
+        worker_count=worker_count,
+    )
+    return _RDFBackendResolution(
+        backend=backend,
+        worker_count=worker_count,
+        use_parallel=use_parallel,
+        chunk_size=chunk_size,
+        selection_cache=orthorhombic_selection,
+        cell_lengths=cell_lengths,
+        volumes=volumes,
+        pair_count=pair_count,
+    )
 
 
 def _iter_rdf_frame_chunks(
@@ -303,6 +844,626 @@ def _iter_rdf_frame_chunks(
         list(enumerate(frames[start : start + chunk_size], start))
         for start in range(0, len(frames), chunk_size)
     ]
+
+
+def _iter_rdf_orthorhombic_chunks(
+    frames: list[Atoms],
+    *,
+    selection_cache: _RDFSelectionCache,
+    cell_lengths: np.ndarray,
+    volumes: np.ndarray,
+    chunk_size: int,
+) -> list[_RDFOrthorhombicChunk]:
+    """Build compact orthorhombic chunk payloads from selected positions only."""
+    chunks: list[_RDFOrthorhombicChunk] = []
+    indices_a = np.asarray(selection_cache.indices_a, dtype=int)
+    indices_b = np.asarray(selection_cache.indices_b, dtype=int)
+    for start in range(0, len(frames), chunk_size):
+        stop = min(len(frames), start + chunk_size)
+        positions_a = np.stack(
+            [np.asarray(frame.positions[indices_a], dtype=float) for frame in frames[start:stop]],
+            axis=0,
+        )
+        positions_b = np.stack(
+            [np.asarray(frame.positions[indices_b], dtype=float) for frame in frames[start:stop]],
+            axis=0,
+        )
+        chunks.append(
+            _RDFOrthorhombicChunk(
+                positions_a=positions_a,
+                positions_b=positions_b,
+                cell_lengths=np.asarray(cell_lengths[start:stop], dtype=float),
+                volumes=np.asarray(volumes[start:stop], dtype=float),
+                frame_count=stop - start,
+                frame_start=start,
+            )
+        )
+    return chunks
+
+
+def _iter_rdf_orthorhombic_multi_chunks(
+    frames: list[Atoms],
+    *,
+    selection_caches_by_species: Mapping[str, _RDFSelectionCache],
+    cell_lengths: np.ndarray,
+    volumes: np.ndarray,
+    chunk_size: int,
+) -> list[_RDFOrthorhombicMultiChunk]:
+    """Build compact orthorhombic chunk payloads shared across RDF species pairs."""
+    chunks: list[_RDFOrthorhombicMultiChunk] = []
+    for start in range(0, len(frames), chunk_size):
+        stop = min(len(frames), start + chunk_size)
+        positions_by_species = {
+            species: np.stack(
+                [
+                    np.asarray(frame.positions[cache.indices_a], dtype=float)
+                    for frame in frames[start:stop]
+                ],
+                axis=0,
+            )
+            for species, cache in selection_caches_by_species.items()
+        }
+        chunks.append(
+            _RDFOrthorhombicMultiChunk(
+                positions_by_species=positions_by_species,
+                cell_lengths=np.asarray(cell_lengths[start:stop], dtype=float),
+                volumes=np.asarray(volumes[start:stop], dtype=float),
+                frame_count=stop - start,
+                frame_start=start,
+            )
+        )
+    return chunks
+
+
+def _resolve_rdf_expected_counts_from_volumes(
+    volumes: np.ndarray,
+    *,
+    config: _RDFOrthorhombicConfig,
+) -> np.ndarray:
+    """Return accumulated expected RDF counts for one chunk of frames."""
+    neighbor_count = config.count_b - 1 if config.same_selection else config.count_b
+    if config.count_a <= 0 or neighbor_count <= 0:
+        return np.zeros_like(config.shell_volumes, dtype=float)
+    scale = float(config.count_a * neighbor_count) * float(
+        np.sum(1.0 / np.asarray(volumes, dtype=float))
+    )
+    return np.asarray(config.shell_volumes, dtype=float) * scale
+
+
+def _resolve_rdf_expected_counts_from_volume(
+    volume: float,
+    *,
+    config: _RDFOrthorhombicConfig,
+) -> np.ndarray:
+    """Return expected RDF counts for one orthorhombic frame volume."""
+    neighbor_count = config.count_b - 1 if config.same_selection else config.count_b
+    if config.count_a <= 0 or neighbor_count <= 0:
+        return np.zeros_like(config.shell_volumes, dtype=float)
+    scale = float(config.count_a * neighbor_count) / float(volume)
+    return np.asarray(config.shell_volumes, dtype=float) * scale
+
+
+def _wrap_orthorhombic_positions(positions: np.ndarray, cell_lengths: np.ndarray) -> np.ndarray:
+    """Wrap positions into an orthorhombic unit cell for periodic KD-tree queries."""
+    wrapped = np.mod(np.asarray(positions, dtype=float), np.asarray(cell_lengths, dtype=float))
+    return np.asarray(wrapped, dtype=float)
+
+
+def _compute_orthorhombic_pair_distances(
+    positions_a: np.ndarray,
+    positions_b: np.ndarray,
+    *,
+    cell_lengths: np.ndarray,
+) -> np.ndarray:
+    """Compute exact orthorhombic MIC distances for selected pairs."""
+    deltas = np.asarray(positions_a, dtype=float) - np.asarray(positions_b, dtype=float)
+    lengths = np.asarray(cell_lengths, dtype=float)
+    deltas -= lengths * np.round(deltas / lengths)
+    return np.linalg.norm(deltas, axis=1)
+
+
+def _collect_sparse_query_pairs(
+    neighbor_lists: list[list[int]],
+    *,
+    indices_a: np.ndarray,
+    indices_b: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Flatten KD-tree neighbor-list output into ordered local pair indices."""
+    pair_i: list[np.ndarray] = []
+    pair_j: list[np.ndarray] = []
+    for local_i, neighbors in enumerate(neighbor_lists):
+        if not neighbors:
+            continue
+        neighbor_indices = np.asarray(neighbors, dtype=int)
+        keep = np.asarray(indices_b[neighbor_indices] != indices_a[local_i], dtype=bool)
+        if not np.any(keep):
+            continue
+        filtered = neighbor_indices[keep]
+        pair_i.append(np.full(filtered.size, local_i, dtype=int))
+        pair_j.append(filtered)
+
+    if not pair_i:
+        return np.empty(0, dtype=int), np.empty(0, dtype=int)
+    return np.concatenate(pair_i), np.concatenate(pair_j)
+
+
+def _compute_rdf_dense_orthorhombic_chunk_contributions(
+    chunk: _RDFOrthorhombicChunk,
+    config: _RDFOrthorhombicConfig,
+) -> tuple[np.ndarray, np.ndarray, int, _RDFStatisticsMoments | None]:
+    """Compute one dense orthorhombic RDF chunk exactly."""
+    deltas = chunk.positions_a[:, :, np.newaxis, :] - chunk.positions_b[:, np.newaxis, :, :]
+    deltas -= chunk.cell_lengths[:, np.newaxis, np.newaxis, :] * np.round(
+        deltas / chunk.cell_lengths[:, np.newaxis, np.newaxis, :]
+    )
+    distances = np.linalg.norm(deltas, axis=3)
+    if config.self_pair_rows.size:
+        distances[:, config.self_pair_rows, config.self_pair_cols] = np.inf
+    counts = np.zeros(config.bin_edges.size - 1, dtype=float)
+    moments = (
+        _empty_rdf_statistics_moments(
+            n_bins=config.bin_edges.size - 1,
+            n_blocks=(
+                None
+                if config.block_index_by_frame is None
+                else int(np.max(config.block_index_by_frame)) + 1
+            ),
+        )
+        if config.collect_statistics
+        else None
+    )
+    for frame_local in range(chunk.frame_count):
+        frame_counts = _histogram_rdf_distances(distances[frame_local], bin_edges=config.bin_edges)
+        counts += frame_counts
+        if moments is not None:
+            frame_expected = _resolve_rdf_expected_counts_from_volume(
+                float(chunk.volumes[frame_local]),
+                config=config,
+            )
+            _update_rdf_statistics_moments(
+                moments,
+                counts=frame_counts,
+                expected=frame_expected,
+                frame_index=chunk.frame_start + frame_local,
+                block_index_by_frame=config.block_index_by_frame,
+            )
+    expected = _resolve_rdf_expected_counts_from_volumes(chunk.volumes, config=config)
+    return counts, expected, chunk.frame_count, moments
+
+
+def _compute_rdf_sparse_orthorhombic_chunk_contributions(
+    chunk: _RDFOrthorhombicChunk,
+    config: _RDFOrthorhombicConfig,
+) -> tuple[np.ndarray, np.ndarray, int, _RDFStatisticsMoments | None]:
+    """Compute one sparse orthorhombic RDF chunk exactly via periodic KD-tree queries."""
+    counts_accum = np.zeros(config.bin_edges.size - 1, dtype=float)
+    expected_accum = _resolve_rdf_expected_counts_from_volumes(chunk.volumes, config=config)
+    moments = (
+        _empty_rdf_statistics_moments(
+            n_bins=config.bin_edges.size - 1,
+            n_blocks=(
+                None
+                if config.block_index_by_frame is None
+                else int(np.max(config.block_index_by_frame)) + 1
+            ),
+        )
+        if config.collect_statistics
+        else None
+    )
+
+    for frame_local in range(chunk.frame_count):
+        lengths = np.asarray(chunk.cell_lengths[frame_local], dtype=float)
+        positions_a = _wrap_orthorhombic_positions(chunk.positions_a[frame_local], lengths)
+        positions_b = _wrap_orthorhombic_positions(chunk.positions_b[frame_local], lengths)
+        tree_a = cKDTree(positions_a, boxsize=lengths)
+        if config.same_selection:
+            neighbor_lists = tree_a.query_ball_tree(tree_a, r=float(config.r_max))
+        else:
+            tree_b = cKDTree(positions_b, boxsize=lengths)
+            neighbor_lists = tree_a.query_ball_tree(tree_b, r=float(config.r_max))
+        pair_i, pair_j = _collect_sparse_query_pairs(
+            neighbor_lists,
+            indices_a=config.indices_a,
+            indices_b=config.indices_b,
+        )
+        if pair_i.size == 0:
+            if moments is not None:
+                _update_rdf_statistics_moments(
+                    moments,
+                    counts=np.zeros(config.bin_edges.size - 1, dtype=float),
+                    expected=_resolve_rdf_expected_counts_from_volume(
+                        float(chunk.volumes[frame_local]),
+                        config=config,
+                    ),
+                    frame_index=chunk.frame_start + frame_local,
+                    block_index_by_frame=config.block_index_by_frame,
+                )
+            continue
+        pair_distances = _compute_orthorhombic_pair_distances(
+            positions_a[pair_i],
+            positions_b[pair_j],
+            cell_lengths=lengths,
+        )
+        frame_counts = _histogram_rdf_distances(pair_distances, bin_edges=config.bin_edges)
+        counts_accum += frame_counts
+        if moments is not None:
+            _update_rdf_statistics_moments(
+                moments,
+                counts=frame_counts,
+                expected=_resolve_rdf_expected_counts_from_volume(
+                    float(chunk.volumes[frame_local]),
+                    config=config,
+                ),
+                frame_index=chunk.frame_start + frame_local,
+                block_index_by_frame=config.block_index_by_frame,
+            )
+    return counts_accum, expected_accum, chunk.frame_count, moments
+
+
+def _resolve_rdf_pairwise_jobs(
+    *,
+    pairs: list[tuple[str, str]],
+    bin_edges: np.ndarray,
+    shell_volumes: np.ndarray,
+    mean_volume: float,
+    r_max: float,
+    selection_caches_by_species: Mapping[str, _RDFSelectionCache],
+    collect_statistics: bool = False,
+    block_index_by_frame: np.ndarray | None = None,
+) -> list[_RDFPairJob]:
+    """Resolve prepared orthorhombic RDF jobs for one pairwise collection compute."""
+    jobs: list[_RDFPairJob] = []
+    max_sphere_volume = (4.0 / 3.0) * np.pi * (float(r_max) ** 3)
+    neighbor_density = min(1.0, max_sphere_volume / max(float(mean_volume), 1.0e-12))
+    for species_a, species_b in pairs:
+        cache_a = selection_caches_by_species[species_a]
+        cache_b = selection_caches_by_species[species_b]
+        same_selection = species_a == species_b
+        selection_cache = _build_rdf_pair_selection_cache(
+            cache_a,
+            cache_b,
+            same_selection=same_selection,
+        )
+        pair_count = int(selection_cache.count_a * selection_cache.count_b)
+        backend = (
+            _RDF_BACKEND_DENSE
+            if pair_count <= _RDF_DENSE_PAIR_THRESHOLD
+            or neighbor_density > _NEIGHBORLIST_DENSITY_THRESHOLD
+            else _RDF_BACKEND_SPARSE
+        )
+        self_pair_rows, self_pair_cols = _resolve_rdf_self_pair_coordinates(
+            selection_cache.indices_a,
+            selection_cache.indices_b,
+        )
+        jobs.append(
+            _RDFPairJob(
+                species_a=species_a,
+                species_b=species_b,
+                backend=backend,
+                selection_cache=selection_cache,
+                orthorhombic_config=_RDFOrthorhombicConfig(
+                    r_max=float(r_max),
+                    bin_edges=np.asarray(bin_edges, dtype=float),
+                    shell_volumes=np.asarray(shell_volumes, dtype=float),
+                    same_selection=same_selection,
+                    count_a=int(selection_cache.count_a),
+                    count_b=int(selection_cache.count_b),
+                    indices_a=np.asarray(selection_cache.indices_a, dtype=int),
+                    indices_b=np.asarray(selection_cache.indices_b, dtype=int),
+                    self_pair_rows=self_pair_rows,
+                    self_pair_cols=self_pair_cols,
+                    collect_statistics=collect_statistics,
+                    block_index_by_frame=block_index_by_frame,
+                ),
+            )
+        )
+    return jobs
+
+
+def _resolve_rdf_pair_selection_caches(
+    *,
+    pairs: Sequence[tuple[str, str]],
+    selection_caches_by_species: Mapping[str, _RDFSelectionCache] | None,
+) -> dict[tuple[str, str], _RDFSelectionCache | None]:
+    """Resolve pair-selection caches from shared per-species caches when available."""
+    if selection_caches_by_species is None:
+        return {pair: None for pair in pairs}
+
+    resolved: dict[tuple[str, str], _RDFSelectionCache | None] = {}
+    for species_a, species_b in pairs:
+        cache_a = selection_caches_by_species[species_a]
+        cache_b = selection_caches_by_species[species_b]
+        resolved[(species_a, species_b)] = _build_rdf_pair_selection_cache(
+            cache_a,
+            cache_b,
+            same_selection=(species_a == species_b),
+        )
+    return resolved
+
+
+def _accumulate_rdf_pair_collection(
+    frames: list[Atoms],
+    *,
+    pairs: Sequence[tuple[str, str]],
+    r_max: float | None,
+    bin_width: float,
+    threads: int | None = None,
+    progress_desc: str | None = None,
+    collect_statistics: bool = False,
+) -> tuple[
+    list[tuple[str, str]],
+    np.ndarray,
+    np.ndarray,
+    dict[tuple[str, str], np.ndarray],
+    dict[tuple[str, str], np.ndarray],
+    dict[tuple[str, str], _RDFSelectionCache | None],
+    dict[tuple[str, str], _RDFStatisticsMoments | None],
+]:
+    """Accumulate exact RDF observed/expected counts for one or more physical pairs."""
+    if not frames:
+        raise ValueError("At least one trajectory frame is required.")
+
+    unique_pairs = _ordered_unique_unordered_rdf_pairs(pairs)
+    if not unique_pairs:
+        raise ValueError("At least one RDF pair is required.")
+
+    ensure_positive("bin_width", bin_width)
+    requested_bin_width = float(bin_width)
+    auto_r_max_raw = None
+    if r_max is None:
+        auto_r_max_raw = _auto_r_max_from_frames(frames)
+        r_max = _resolve_auto_r_max_for_bin_width(
+            auto_r_max=float(auto_r_max_raw),
+            target_bin_width=requested_bin_width,
+        )
+    ensure_positive("r_max", r_max)
+    resolved_r_max = float(r_max)
+    bin_edges, _effective_bin_width = _build_uniform_rdf_bins(
+        r_max=resolved_r_max,
+        target_bin_width=requested_bin_width,
+    )
+    if auto_r_max_raw is not None and not np.isclose(
+        resolved_r_max,
+        float(auto_r_max_raw),
+        rtol=1.0e-9,
+        atol=1.0e-12,
+    ):
+        LOGGER.info(
+            "Rounded auto RDF r_max down from %.6g to %.6g Angstrom to match bin_width=%.6g.",
+            float(auto_r_max_raw),
+            resolved_r_max,
+            requested_bin_width,
+        )
+
+    shell_volumes = _shell_volumes_from_edges(bin_edges)
+    worker_count = _resolve_rdf_worker_count(threads, len(frames))
+    species_labels = sorted({label for pair in unique_pairs for label in pair})
+    orthorhombic_geometry = _resolve_rdf_orthorhombic_geometry(frames)
+    selection_caches_by_species = _resolve_rdf_selection_caches_by_species(
+        frames,
+        species_labels=species_labels,
+    )
+    selection_cache_by_pair = _resolve_rdf_pair_selection_caches(
+        pairs=unique_pairs,
+        selection_caches_by_species=selection_caches_by_species,
+    )
+
+    counts_by_pair = {pair: np.zeros(bin_edges.size - 1, dtype=float) for pair in unique_pairs}
+    expected_by_pair = {pair: np.zeros(bin_edges.size - 1, dtype=float) for pair in unique_pairs}
+    block_index_by_frame = (
+        _resolve_rdf_block_index_by_frame(len(frames)) if collect_statistics else None
+    )
+    moments_by_pair = {
+        pair: (
+            _empty_rdf_statistics_moments(
+                n_bins=bin_edges.size - 1,
+                n_blocks=(
+                    None if block_index_by_frame is None else int(np.max(block_index_by_frame)) + 1
+                ),
+            )
+            if collect_statistics
+            else None
+        )
+        for pair in unique_pairs
+    }
+
+    if orthorhombic_geometry is not None and selection_caches_by_species is not None:
+        cell_lengths, volumes = orthorhombic_geometry
+        mean_volume = float(np.mean(volumes))
+        jobs = _resolve_rdf_pairwise_jobs(
+            pairs=list(unique_pairs),
+            bin_edges=bin_edges,
+            shell_volumes=shell_volumes,
+            mean_volume=mean_volume,
+            r_max=resolved_r_max,
+            selection_caches_by_species=selection_caches_by_species,
+            collect_statistics=collect_statistics,
+            block_index_by_frame=block_index_by_frame,
+        )
+        use_parallel = _should_parallelize_rdf(len(frames), worker_count)
+        max_pair_count = max(
+            int(job.selection_cache.count_a * job.selection_cache.count_b) for job in jobs
+        )
+        chunk_size = _resolve_rdf_fast_chunk_size(
+            frame_count=len(frames),
+            pair_count=max(1, max_pair_count),
+            worker_count=worker_count,
+        )
+        chunks = _iter_rdf_orthorhombic_multi_chunks(
+            frames,
+            selection_caches_by_species=selection_caches_by_species,
+            cell_lengths=cell_lengths,
+            volumes=volumes,
+            chunk_size=chunk_size,
+        )
+
+        progress_cm: ProgressBar | None
+        if progress_desc is None:
+            progress_cm = None
+        else:
+            progress_cm = ProgressBar(desc=progress_desc, total=len(frames), unit="frame")
+
+        progress_context = nullcontext(progress_cm) if progress_cm is None else progress_cm
+        with progress_context as progress:
+            if use_parallel:
+                with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                    for chunk_results in executor.map(
+                        _compute_rdf_pairwise_orthorhombic_chunk_contributions,
+                        chunks,
+                        repeat(tuple(jobs)),
+                    ):
+                        processed_frames = 0
+                        for (
+                            species_a,
+                            species_b,
+                            counts,
+                            expected,
+                            processed,
+                            chunk_moments,
+                        ) in chunk_results:
+                            counts_by_pair[(species_a, species_b)] += counts
+                            expected_by_pair[(species_a, species_b)] += expected
+                            moments_by_pair[(species_a, species_b)] = _merge_rdf_statistics_moments(
+                                moments_by_pair[(species_a, species_b)],
+                                chunk_moments,
+                            )
+                            processed_frames = max(processed_frames, processed)
+                        if progress is not None:
+                            progress.update(processed_frames)
+            else:
+                for chunk in chunks:
+                    chunk_results = _compute_rdf_pairwise_orthorhombic_chunk_contributions(
+                        chunk,
+                        tuple(jobs),
+                    )
+                    processed_frames = 0
+                    for (
+                        species_a,
+                        species_b,
+                        counts,
+                        expected,
+                        processed,
+                        chunk_moments,
+                    ) in chunk_results:
+                        counts_by_pair[(species_a, species_b)] += counts
+                        expected_by_pair[(species_a, species_b)] += expected
+                        moments_by_pair[(species_a, species_b)] = _merge_rdf_statistics_moments(
+                            moments_by_pair[(species_a, species_b)],
+                            chunk_moments,
+                        )
+                        processed_frames = max(processed_frames, processed)
+                    if progress is not None:
+                        progress.update(processed_frames)
+
+        return (
+            unique_pairs,
+            np.asarray(bin_edges, dtype=float),
+            np.asarray(shell_volumes, dtype=float),
+            counts_by_pair,
+            expected_by_pair,
+            selection_cache_by_pair,
+            moments_by_pair,
+        )
+
+    total_work = len(frames) * len(unique_pairs)
+    progress_cm = (
+        None
+        if progress_desc is None
+        else ProgressBar(desc=progress_desc, total=total_work, unit="frame")
+    )
+    progress_context = nullcontext(progress_cm) if progress_cm is None else progress_cm
+    with progress_context as progress:
+        for species_a, species_b in unique_pairs:
+            same_selection = species_a == species_b
+            selection_cache = selection_cache_by_pair[(species_a, species_b)]
+            backend_resolution = _resolve_rdf_backend(
+                frames,
+                label_a=species_a,
+                label_b=species_b,
+                r_max=resolved_r_max,
+                worker_count=worker_count,
+                selection_cache=selection_cache,
+                strategy_override=None,
+            )
+            generic_config = _RDFWorkerConfig(
+                label_a=species_a,
+                label_b=species_b,
+                same_selection=same_selection,
+                r_max=resolved_r_max,
+                bin_edges=np.asarray(bin_edges, dtype=float),
+                shell_volumes=np.asarray(shell_volumes, dtype=float),
+                max_sphere_volume=(4.0 / 3.0) * np.pi * (resolved_r_max**3),
+                selection_cache=selection_cache,
+                strategy_override=backend_resolution.generic_strategy_override,
+                collect_statistics=collect_statistics,
+                block_index_by_frame=block_index_by_frame,
+            )
+
+            progress_proxy: Any
+            if progress is None:
+
+                class _NullProgressBar:
+                    def update(self, _n: int = 1) -> None:
+                        return None
+
+                progress_proxy = _NullProgressBar()
+            else:
+                progress_proxy = progress
+
+            counts_accum, expected_accum, moments = _compute_rdf_generic_backend(
+                frames,
+                config=generic_config,
+                worker_count=backend_resolution.worker_count,
+                use_parallel=backend_resolution.use_parallel,
+                chunk_size=backend_resolution.chunk_size,
+                progress=progress_proxy,
+            )
+            counts_by_pair[(species_a, species_b)] = counts_accum
+            expected_by_pair[(species_a, species_b)] = expected_accum
+            moments_by_pair[(species_a, species_b)] = moments
+
+    return (
+        unique_pairs,
+        np.asarray(bin_edges, dtype=float),
+        np.asarray(shell_volumes, dtype=float),
+        counts_by_pair,
+        expected_by_pair,
+        selection_cache_by_pair,
+        moments_by_pair,
+    )
+
+
+def _compute_rdf_pairwise_orthorhombic_chunk_contributions(
+    chunk: _RDFOrthorhombicMultiChunk,
+    jobs: tuple[_RDFPairJob, ...],
+) -> list[tuple[str, str, np.ndarray, np.ndarray, int, _RDFStatisticsMoments | None]]:
+    """Compute exact orthorhombic RDF contributions for all requested pairs in one chunk."""
+    results: list[tuple[str, str, np.ndarray, np.ndarray, int, _RDFStatisticsMoments | None]] = []
+    for job in jobs:
+        pair_chunk = _RDFOrthorhombicChunk(
+            positions_a=np.asarray(chunk.positions_by_species[job.species_a], dtype=float),
+            positions_b=np.asarray(chunk.positions_by_species[job.species_b], dtype=float),
+            cell_lengths=np.asarray(chunk.cell_lengths, dtype=float),
+            volumes=np.asarray(chunk.volumes, dtype=float),
+            frame_count=chunk.frame_count,
+            frame_start=chunk.frame_start,
+        )
+        if job.backend == _RDF_BACKEND_DENSE:
+            counts, expected, processed, moments = (
+                _compute_rdf_dense_orthorhombic_chunk_contributions(
+                    pair_chunk,
+                    job.orthorhombic_config,
+                )
+            )
+        else:
+            counts, expected, processed, moments = (
+                _compute_rdf_sparse_orthorhombic_chunk_contributions(
+                    pair_chunk,
+                    job.orthorhombic_config,
+                )
+            )
+        results.append((job.species_a, job.species_b, counts, expected, processed, moments))
+    return results
 
 
 def _resolve_rdf_selection_cache(
@@ -350,6 +1511,66 @@ def _resolve_rdf_selection_cache(
     )
 
 
+def _resolve_rdf_selection_caches_by_species(
+    frames: list[Atoms],
+    *,
+    species_labels: list[str],
+) -> dict[str, _RDFSelectionCache] | None:
+    """Resolve stable per-species selection caches reused across many RDF pairs."""
+    if not frames:
+        return {}
+
+    reference_numbers = np.asarray(frames[0].numbers, dtype=int)
+    for frame_index, frame in enumerate(frames[1:], start=1):
+        current_numbers = np.asarray(frame.numbers, dtype=int)
+        if current_numbers.shape != reference_numbers.shape or not np.array_equal(
+            current_numbers,
+            reference_numbers,
+        ):
+            LOGGER.warning(
+                "RDF atom identities/order changed at frame %d; "
+                "falling back to per-pair framewise species selection.",
+                frame_index,
+            )
+            return None
+
+    caches: dict[str, _RDFSelectionCache] = {}
+    for label in species_labels:
+        mask = _select_mask(reference_numbers, label)
+        indices = np.flatnonzero(mask)
+        count = int(indices.size)
+        if count == 0:
+            raise ValueError(f"RDF selection produced no atoms in frame 0 (species={label}).")
+        caches[label] = _RDFSelectionCache(
+            mask_a=mask,
+            mask_b=mask,
+            indices_a=indices,
+            indices_b=indices,
+            count_a=count,
+            count_b=count,
+        )
+    return caches
+
+
+def _build_rdf_pair_selection_cache(
+    cache_a: _RDFSelectionCache,
+    cache_b: _RDFSelectionCache,
+    *,
+    same_selection: bool,
+) -> _RDFSelectionCache:
+    """Combine single-species stable caches into one pair-selection cache."""
+    if same_selection:
+        return cache_a
+    return _RDFSelectionCache(
+        mask_a=np.asarray(cache_a.mask_a, dtype=bool),
+        mask_b=np.asarray(cache_b.mask_a, dtype=bool),
+        indices_a=np.asarray(cache_a.indices_a, dtype=int),
+        indices_b=np.asarray(cache_b.indices_a, dtype=int),
+        count_a=int(cache_a.count_a),
+        count_b=int(cache_b.count_a),
+    )
+
+
 def _compute_rdf_frame_contribution(
     frame_index: int,
     frame: Atoms,
@@ -393,7 +1614,7 @@ def _compute_rdf_frame_contribution(
                 & (sampled_distances >= 0.0)
                 & (sampled_distances <= r_max)
             ]
-        counts = np.histogram(sampled_distances, bins=bin_edges)[0].astype(float)
+        counts = _histogram_rdf_distances(sampled_distances, bin_edges=bin_edges)
         # Both observed and expected counts use ordered pairs: i->j and j->i are distinct.
         rho_b = (n_atoms - 1) / volume
         expected = (n_atoms * rho_b) * shell_volumes
@@ -455,7 +1676,7 @@ def _compute_rdf_frame_contribution(
                 r_max=r_max,
             )
 
-    counts = np.histogram(sampled_distances, bins=bin_edges)[0].astype(float)
+    counts = _histogram_rdf_distances(sampled_distances, bin_edges=bin_edges)
     # Expected counts must match the same ordered-pair convention used above.
     if same_selection:
         rho_b = (count_b - 1) / volume
@@ -468,10 +1689,22 @@ def _compute_rdf_frame_contribution(
 def _compute_rdf_chunk_contributions(
     chunk: list[tuple[int, Atoms]],
     config: _RDFWorkerConfig,
-) -> tuple[np.ndarray, np.ndarray, int]:
+) -> tuple[np.ndarray, np.ndarray, int, _RDFStatisticsMoments | None]:
     """Compute accumulated RDF contributions for one chunk of frames."""
     counts_accum = np.zeros(config.bin_edges.size - 1, dtype=float)
     expected_accum = np.zeros_like(counts_accum)
+    moments = (
+        _empty_rdf_statistics_moments(
+            n_bins=config.bin_edges.size - 1,
+            n_blocks=(
+                None
+                if config.block_index_by_frame is None
+                else int(np.max(config.block_index_by_frame)) + 1
+            ),
+        )
+        if config.collect_statistics
+        else None
+    )
     for frame_index, frame in chunk:
         counts, expected = _compute_rdf_frame_contribution(
             frame_index,
@@ -488,7 +1721,185 @@ def _compute_rdf_chunk_contributions(
         )
         counts_accum += counts
         expected_accum += expected
-    return counts_accum, expected_accum, len(chunk)
+        _update_rdf_statistics_moments(
+            moments,
+            counts=counts,
+            expected=expected,
+            frame_index=frame_index,
+            block_index_by_frame=config.block_index_by_frame,
+        )
+    return counts_accum, expected_accum, len(chunk), moments
+
+
+def _compute_rdf_generic_backend(
+    frames: list[Atoms],
+    *,
+    config: _RDFWorkerConfig,
+    worker_count: int,
+    use_parallel: bool,
+    chunk_size: int,
+    progress: Any,
+) -> tuple[np.ndarray, np.ndarray, _RDFStatisticsMoments | None]:
+    """Accumulate RDF contributions with the legacy exact framewise backend."""
+    counts_accum = np.zeros(config.bin_edges.size - 1, dtype=float)
+    expected_accum = np.zeros_like(counts_accum)
+    moments = (
+        _empty_rdf_statistics_moments(
+            n_bins=config.bin_edges.size - 1,
+            n_blocks=(
+                None
+                if config.block_index_by_frame is None
+                else int(np.max(config.block_index_by_frame)) + 1
+            ),
+        )
+        if config.collect_statistics
+        else None
+    )
+    if not use_parallel:
+        for frame_index, frame in enumerate(frames):
+            counts, expected = _compute_rdf_frame_contribution(
+                frame_index,
+                frame,
+                label_a=config.label_a,
+                label_b=config.label_b,
+                same_selection=config.same_selection,
+                r_max=config.r_max,
+                bin_edges=config.bin_edges,
+                shell_volumes=config.shell_volumes,
+                max_sphere_volume=config.max_sphere_volume,
+                selection_cache=config.selection_cache,
+                strategy_override=config.strategy_override,
+            )
+            counts_accum += counts
+            expected_accum += expected
+            _update_rdf_statistics_moments(
+                moments,
+                counts=counts,
+                expected=expected,
+                frame_index=frame_index,
+                block_index_by_frame=config.block_index_by_frame,
+            )
+            progress.update()
+        return counts_accum, expected_accum, moments
+
+    chunks = _iter_rdf_frame_chunks(frames, chunk_size)
+    with ProcessPoolExecutor(max_workers=worker_count) as executor:
+        for counts, expected, processed_frames, chunk_moments in executor.map(
+            _compute_rdf_chunk_contributions,
+            chunks,
+            repeat(config),
+        ):
+            counts_accum += counts
+            expected_accum += expected
+            moments = _merge_rdf_statistics_moments(moments, chunk_moments)
+            progress.update(processed_frames)
+    return counts_accum, expected_accum, moments
+
+
+def _compute_rdf_orthorhombic_backend(
+    frames: list[Atoms],
+    *,
+    config: _RDFOrthorhombicConfig,
+    backend: str,
+    selection_cache: _RDFSelectionCache,
+    cell_lengths: np.ndarray,
+    volumes: np.ndarray,
+    worker_count: int,
+    use_parallel: bool,
+    chunk_size: int,
+    progress: Any,
+) -> tuple[np.ndarray, np.ndarray, _RDFStatisticsMoments | None]:
+    """Accumulate RDF contributions with an exact orthorhombic fast backend."""
+    counts_accum = np.zeros(config.bin_edges.size - 1, dtype=float)
+    expected_accum = np.zeros_like(counts_accum)
+    moments = (
+        _empty_rdf_statistics_moments(
+            n_bins=config.bin_edges.size - 1,
+            n_blocks=(
+                None
+                if config.block_index_by_frame is None
+                else int(np.max(config.block_index_by_frame)) + 1
+            ),
+        )
+        if config.collect_statistics
+        else None
+    )
+    chunks = _iter_rdf_orthorhombic_chunks(
+        frames,
+        selection_cache=selection_cache,
+        cell_lengths=cell_lengths,
+        volumes=volumes,
+        chunk_size=chunk_size,
+    )
+    worker = (
+        _compute_rdf_dense_orthorhombic_chunk_contributions
+        if backend == _RDF_BACKEND_DENSE
+        else _compute_rdf_sparse_orthorhombic_chunk_contributions
+    )
+
+    if not use_parallel:
+        for chunk in chunks:
+            counts, expected, processed_frames, chunk_moments = worker(chunk, config)
+            counts_accum += counts
+            expected_accum += expected
+            moments = _merge_rdf_statistics_moments(moments, chunk_moments)
+            progress.update(processed_frames)
+        return counts_accum, expected_accum, moments
+
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        for counts, expected, processed_frames, chunk_moments in executor.map(
+            worker, chunks, repeat(config)
+        ):
+            counts_accum += counts
+            expected_accum += expected
+            moments = _merge_rdf_statistics_moments(moments, chunk_moments)
+            progress.update(processed_frames)
+    return counts_accum, expected_accum, moments
+
+
+def _compute_rdf_statistics_profile(
+    frames: list[Atoms],
+    *,
+    label_a: str,
+    label_b: str,
+    r_max: float,
+    bin_edges: np.ndarray,
+    shell_volumes: np.ndarray,
+    selection_cache: _RDFSelectionCache | None = None,
+    strategy_override: str | None = None,
+) -> SeriesStatistics:
+    """Compute persisted RDF uncertainty statistics from exact per-frame RDF values."""
+    max_sphere_volume = (4.0 / 3.0) * np.pi * (float(r_max) ** 3)
+    same_selection = label_a == label_b
+    sample_rows: list[np.ndarray] = []
+    point_count = np.zeros(bin_edges.size - 1, dtype=int)
+    for frame_index, frame in enumerate(frames):
+        counts, expected = _compute_rdf_frame_contribution(
+            frame_index,
+            frame,
+            label_a=label_a,
+            label_b=label_b,
+            same_selection=same_selection,
+            r_max=float(r_max),
+            bin_edges=np.asarray(bin_edges, dtype=float),
+            shell_volumes=np.asarray(shell_volumes, dtype=float),
+            max_sphere_volume=max_sphere_volume,
+            selection_cache=selection_cache,
+            strategy_override=strategy_override,
+        )
+        point_count += np.rint(counts).astype(int)
+        g_values = np.full(counts.shape, np.nan, dtype=float)
+        finite = expected > 0.0
+        g_values[finite] = counts[finite] / expected[finite]
+        sample_rows.append(g_values)
+    sample_matrix = np.vstack(sample_rows)
+    block_resolution = resolve_block_slices(len(frames))
+    block_slices = None if block_resolution is None else block_resolution[0]
+    return build_series_statistics(
+        point_count=point_count,
+        sample_values=sample_matrix,
+        block_values=block_mean_matrix(sample_matrix, block_slices=block_slices),
+    )
 
 
 def compute_rdf(
@@ -509,26 +1920,31 @@ def compute_rdf(
     label_b = _normalize_species(species_b if species_b is not None else species_a)
     strategy_override = _normalize_strategy_override(_strategy_override)
 
+    requested_bin_width = float(bin_width)
+    auto_r_max_raw = None
     if r_max is None:
-        r_max = _auto_r_max_from_frames(frames)
+        auto_r_max_raw = _auto_r_max_from_frames(frames)
+        r_max = _resolve_auto_r_max_for_bin_width(
+            auto_r_max=float(auto_r_max_raw),
+            target_bin_width=requested_bin_width,
+        )
 
     ensure_positive("r_max", r_max)
 
-    requested_bin_width = float(bin_width)
-    bin_edges, effective_bin_width = _build_uniform_rdf_bins(
+    bin_edges, _effective_bin_width = _build_uniform_rdf_bins(
         r_max=float(r_max),
         target_bin_width=requested_bin_width,
     )
-    if not np.isclose(effective_bin_width, requested_bin_width, rtol=1.0e-9, atol=1.0e-12):
+    if auto_r_max_raw is not None and not np.isclose(
+        float(r_max), float(auto_r_max_raw), rtol=1.0e-9, atol=1.0e-12
+    ):
         LOGGER.info(
-            "Adjusted RDF bin width from %.6g to %.6g Angstrom so uniform bins end at r_max=%.6g.",
+            "Rounded auto RDF r_max down from %.6g to %.6g Angstrom to match bin_width=%.6g.",
+            float(auto_r_max_raw),
+            float(r_max),
             requested_bin_width,
-            effective_bin_width,
-            r_max,
         )
 
-    counts_accum = np.zeros(bin_edges.size - 1, dtype=float)
-    expected_accum = np.zeros_like(counts_accum)
     same_selection = label_a == label_b
     shell_volumes = _shell_volumes_from_edges(bin_edges)
 
@@ -542,8 +1958,18 @@ def compute_rdf(
 
     max_sphere_volume = (4.0 / 3.0) * np.pi * (r_max**3)
     worker_count = _resolve_rdf_worker_count(threads, len(frames))
+    block_index_by_frame = _resolve_rdf_block_index_by_frame(len(frames))
     selection_cache = _resolve_rdf_selection_cache(frames, label_a=label_a, label_b=label_b)
-    config = _RDFWorkerConfig(
+    backend_resolution = _resolve_rdf_backend(
+        frames,
+        label_a=label_a,
+        label_b=label_b,
+        r_max=float(r_max),
+        worker_count=worker_count,
+        selection_cache=selection_cache,
+        strategy_override=strategy_override,
+    )
+    generic_config = _RDFWorkerConfig(
         label_a=label_a,
         label_b=label_b,
         same_selection=same_selection,
@@ -551,55 +1977,118 @@ def compute_rdf(
         bin_edges=bin_edges,
         shell_volumes=shell_volumes,
         max_sphere_volume=max_sphere_volume,
-        selection_cache=selection_cache,
-        strategy_override=strategy_override,
+        selection_cache=backend_resolution.selection_cache,
+        strategy_override=backend_resolution.generic_strategy_override,
+        collect_statistics=True,
+        block_index_by_frame=block_index_by_frame,
     )
-
-    use_parallel = _should_parallelize_rdf(len(frames), worker_count)
-    chunk_size = _resolve_rdf_chunk_size(len(frames), worker_count) if use_parallel else len(frames)
-    if use_parallel:
-        LOGGER.info(
-            "Using %d worker process(es) for RDF frame processing (chunk_size=%d).",
-            worker_count,
-            chunk_size,
+    orth_backend_inputs: (
+        tuple[_RDFOrthorhombicConfig, _RDFSelectionCache, np.ndarray, np.ndarray] | None
+    ) = None
+    if backend_resolution.backend == _RDF_BACKEND_GENERIC:
+        if backend_resolution.use_parallel:
+            LOGGER.info(
+                "Using RDF backend: generic framewise fallback "
+                "(workers=%d, chunk_size=%d frame(s)).",
+                backend_resolution.worker_count,
+                backend_resolution.chunk_size,
+            )
+        else:
+            LOGGER.info("Using RDF backend: generic framewise fallback.")
+    else:
+        backend_label = (
+            "dense orthorhombic chunked"
+            if backend_resolution.backend == _RDF_BACKEND_DENSE
+            else "sparse orthorhombic cutoff"
         )
+        LOGGER.info(
+            "Using RDF backend: %s (workers=%d, chunk_size=%d frame(s), pair_count=%d).",
+            backend_label,
+            backend_resolution.worker_count,
+            backend_resolution.chunk_size,
+            backend_resolution.pair_count,
+        )
+
+        orth_selection = backend_resolution.selection_cache
+        orth_cell_lengths = backend_resolution.cell_lengths
+        orth_volumes = backend_resolution.volumes
+        if orth_selection is None:
+            raise ValueError("Orthorhombic RDF backend requires resolved stable selections.")
+        if orth_cell_lengths is None or orth_volumes is None:
+            raise ValueError("Orthorhombic RDF backend requires per-frame cell geometry.")
+        self_pair_rows, self_pair_cols = _resolve_rdf_self_pair_coordinates(
+            orth_selection.indices_a,
+            orth_selection.indices_b,
+        )
+        orthorhombic_config = _RDFOrthorhombicConfig(
+            r_max=float(r_max),
+            bin_edges=np.asarray(bin_edges, dtype=float),
+            shell_volumes=np.asarray(shell_volumes, dtype=float),
+            same_selection=same_selection,
+            count_a=int(orth_selection.count_a),
+            count_b=int(orth_selection.count_b),
+            indices_a=np.asarray(orth_selection.indices_a, dtype=int),
+            indices_b=np.asarray(orth_selection.indices_b, dtype=int),
+            self_pair_rows=self_pair_rows,
+            self_pair_cols=self_pair_cols,
+            collect_statistics=True,
+            block_index_by_frame=block_index_by_frame,
+        )
+        orth_backend_inputs = (
+            orthorhombic_config,
+            orth_selection,
+            orth_cell_lengths,
+            orth_volumes,
+        )
+
     with ProgressBar(
         desc=f"Computing RDF {label_a}-{label_b}", total=len(frames), unit="frame"
     ) as progress:
-        if not use_parallel:
-            for i, frame in enumerate(frames):
-                counts, expected = _compute_rdf_frame_contribution(
-                    i,
-                    frame,
-                    label_a=config.label_a,
-                    label_b=config.label_b,
-                    same_selection=config.same_selection,
-                    r_max=config.r_max,
-                    bin_edges=config.bin_edges,
-                    shell_volumes=config.shell_volumes,
-                    max_sphere_volume=config.max_sphere_volume,
-                    selection_cache=config.selection_cache,
-                    strategy_override=config.strategy_override,
-                )
-                counts_accum += counts
-                expected_accum += expected
-                progress.update()
+        if backend_resolution.backend == _RDF_BACKEND_GENERIC:
+            counts_accum, expected_accum, moments = _compute_rdf_generic_backend(
+                frames,
+                config=generic_config,
+                worker_count=backend_resolution.worker_count,
+                use_parallel=backend_resolution.use_parallel,
+                chunk_size=backend_resolution.chunk_size,
+                progress=progress,
+            )
         else:
-            chunks = _iter_rdf_frame_chunks(frames, chunk_size)
-            with ProcessPoolExecutor(max_workers=worker_count) as executor:
-                for counts, expected, processed_frames in executor.map(
-                    _compute_rdf_chunk_contributions,
-                    chunks,
-                    repeat(config),
-                ):
-                    counts_accum += counts
-                    expected_accum += expected
-                    progress.update(processed_frames)
+            if orth_backend_inputs is None:
+                raise ValueError("Orthorhombic RDF backend inputs were not initialized.")
+            orthorhombic_config, orth_selection, orth_cell_lengths, orth_volumes = (
+                orth_backend_inputs
+            )
+            counts_accum, expected_accum, moments = _compute_rdf_orthorhombic_backend(
+                frames,
+                config=orthorhombic_config,
+                backend=backend_resolution.backend,
+                selection_cache=orth_selection,
+                cell_lengths=orth_cell_lengths,
+                volumes=orth_volumes,
+                worker_count=backend_resolution.worker_count,
+                use_parallel=backend_resolution.use_parallel,
+                chunk_size=backend_resolution.chunk_size,
+                progress=progress,
+            )
 
     g_r = np.full_like(counts_accum, np.nan, dtype=float)
     non_zero = expected_accum > 0.0
     g_r[non_zero] = counts_accum[non_zero] / expected_accum[non_zero]
     bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+    if moments is None:
+        raise ValueError("RDF statistics moments were not collected during compute.")
+    with ProgressBar(
+        desc=f"Finalizing RDF statistics {label_a}-{label_b}",
+        total=1,
+        unit="profile",
+    ) as progress:
+        statistics = _finalize_rdf_statistics_moments(moments)
+        progress.update()
+    LOGGER.info(
+        "Computed RDF profile with saved %s statistics.",
+        "sample+block" if statistics.block_sem is not None else "sample",
+    )
 
     return RDFProfile(
         species_a=label_a,
@@ -608,16 +2097,96 @@ def compute_rdf(
         bin_centers=bin_centers,
         g_r=g_r,
         n_frames=len(frames),
+        series_statistics={"g_r": statistics},
     )
 
 
-def save_rdf_profile(
-    profile: RDFProfile,
-    output: str | Path,
+def compute_rdf_profiles(
+    frames: list[Atoms],
     *,
-    additional_metadata: Mapping[str, Any] | None = None,
-) -> Path:
-    """Save RDF profile to LiNaK HDF5 and return written path."""
+    r_max: float | None = None,
+    bin_width: float = 0.05,
+    threads: int | None = None,
+) -> list[RDFProfile]:
+    """Compute RDFs for all unique unordered element-species pairs in a trajectory."""
+    if not frames:
+        raise ValueError("At least one trajectory frame is required.")
+
+    species_labels = _available_element_species(frames)
+    if not species_labels:
+        raise ValueError("No elements found in trajectory.")
+    pairs = list(combinations_with_replacement(species_labels, 2))
+    requested_bin_width = float(bin_width)
+    LOGGER.info(
+        "Computing pairwise RDF collection (%d profile(s), species=%s, r_max=%s, bin_width=%.6g).",
+        len(pairs),
+        ", ".join(species_labels),
+        "auto" if r_max is None else f"{float(r_max):.6g}",
+        requested_bin_width,
+    )
+    (
+        unique_pairs,
+        bin_edges,
+        shell_volumes,
+        counts_by_pair,
+        expected_by_pair,
+        selection_cache_by_pair,
+        moments_by_pair,
+    ) = _accumulate_rdf_pair_collection(
+        frames,
+        pairs=pairs,
+        r_max=r_max,
+        bin_width=requested_bin_width,
+        threads=threads,
+        progress_desc="Computing RDF pair collection",
+        collect_statistics=True,
+    )
+
+    bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+    resolved_profiles: list[RDFProfile] = []
+    with ProgressBar(
+        desc="Finalizing RDF statistics",
+        total=len(unique_pairs),
+        unit="profile",
+    ) as progress:
+        for species_a, species_b in unique_pairs:
+            counts_accum = counts_by_pair[(species_a, species_b)]
+            expected_accum = expected_by_pair[(species_a, species_b)]
+            g_r = np.full_like(counts_accum, np.nan, dtype=float)
+            non_zero = expected_accum > 0.0
+            g_r[non_zero] = counts_accum[non_zero] / expected_accum[non_zero]
+            moments = moments_by_pair[(species_a, species_b)]
+            if moments is None:
+                raise ValueError(
+                    f"RDF statistics moments were not collected for pair {species_a}-{species_b}."
+                )
+            resolved_profiles.append(
+                RDFProfile(
+                    species_a=species_a,
+                    species_b=species_b,
+                    bin_edges=np.asarray(bin_edges, dtype=float),
+                    bin_centers=np.asarray(bin_centers, dtype=float),
+                    g_r=g_r,
+                    n_frames=len(frames),
+                    series_statistics={"g_r": _finalize_rdf_statistics_moments(moments)},
+                )
+            )
+            progress.update()
+    any_block_statistics = any(
+        profile.series_statistics is not None
+        and profile.series_statistics["g_r"].block_sem is not None
+        for profile in resolved_profiles
+    )
+    LOGGER.info(
+        "Computed %d RDF profiles with saved %s statistics.",
+        len(resolved_profiles),
+        "sample+block" if any_block_statistics else "sample",
+    )
+    return resolved_profiles
+
+
+def _rdf_profile_hdf5_payload(profile: RDFProfile) -> dict[str, Any]:
+    """Return LiNaK HDF5 payload pieces for one RDF profile."""
     bin_edges = np.asarray(profile.bin_edges, dtype=float)
     bin_centers = np.asarray(profile.bin_centers, dtype=float)
     if bin_edges.size != bin_centers.size + 1:
@@ -632,29 +2201,77 @@ def save_rdf_profile(
         bin_edges,
         source_label=f"RDF profile '{profile.species_a}-{profile.species_b}'",
     )
-
-    metadata = build_profile_metadata(
-        analysis="rdf",
-        metadata={
-            "species_a": profile.species_a,
-            "species_b": profile.species_b,
-            "n_frames": profile.n_frames,
-            "bin_width_A": bin_width,
+    metadata_payload = {
+        "species_a": profile.species_a,
+        "species_b": profile.species_b,
+        "n_frames": profile.n_frames,
+        "bin_width_A": bin_width,
+    }
+    if profile.series_statistics:
+        block_resolution = resolve_block_slices(int(profile.n_frames))
+        block_lengths = None if block_resolution is None else block_resolution[1]
+        metadata_payload["statistics"] = build_statistics_metadata(
+            statistics_by_series=profile.series_statistics,
+            block_lengths=block_lengths,
+        )
+    return {
+        "datasets": {
+            "bin_centers_A": np.asarray(profile.bin_centers, dtype=float),
+            "g_r": np.asarray(profile.g_r, dtype=float),
+            **statistics_payload_from_series_map(profile.series_statistics),
         },
-    )
+        "metadata": build_profile_metadata(
+            analysis="rdf",
+            metadata=metadata_payload,
+        ),
+    }
+
+
+def save_rdf_profile(
+    profile: RDFProfile,
+    output: str | Path,
+    *,
+    additional_metadata: Mapping[str, Any] | None = None,
+) -> Path:
+    """Save RDF profile to LiNaK HDF5 and return written path."""
+    payload = _rdf_profile_hdf5_payload(profile)
+    metadata = dict(payload["metadata"])
     if additional_metadata:
         metadata.update(dict(additional_metadata))
 
     output_path = write_linak_hdf5(
         output,
         analysis="rdf",
-        datasets={
-            "bin_centers_A": profile.bin_centers,
-            "g_r": profile.g_r,
-        },
+        datasets=payload["datasets"],
         metadata=metadata,
     )
     LOGGER.info("Saved RDF data to '%s'.", output_path)
+    return output_path
+
+
+def save_rdf_profiles(
+    profiles: list[RDFProfile],
+    output: str | Path,
+    *,
+    additional_metadata: Mapping[str, Any] | None = None,
+) -> Path:
+    """Save one or more RDF profiles to LiNaK HDF5 and return the written path."""
+    if not profiles:
+        raise ValueError("At least one RDF profile is required.")
+    if len(profiles) == 1:
+        return save_rdf_profile(
+            profiles[0],
+            output,
+            additional_metadata=additional_metadata,
+        )
+
+    output_path = write_linak_hdf5_profile_collection(
+        output,
+        analysis="rdf",
+        profiles=[_rdf_profile_hdf5_payload(profile) for profile in profiles],
+        metadata=dict(additional_metadata or {}),
+    )
+    LOGGER.info("Saved %d RDF profiles to '%s'.", len(profiles), output_path)
     return output_path
 
 
@@ -705,7 +2322,8 @@ def _load_rdf_profiles_from_payloads(
     species_a: str | None = None,
     species_b: str | None = None,
 ) -> list[RDFProfile]:
-    profiles: list[RDFProfile] = []
+    exact_profiles: list[RDFProfile] = []
+    reversed_profiles: list[RDFProfile] = []
     wanted_species_a = (
         None if species_a is None or not species_a.strip() else _normalize_species(species_a)
     )
@@ -722,14 +2340,11 @@ def _load_rdf_profiles_from_payloads(
 
         resolved_species_a = str(metadata.get("species_a", "")).strip() or "UNKNOWN"
         resolved_species_b = str(metadata.get("species_b", "")).strip() or resolved_species_a
-        if (
-            wanted_species_a is not None
-            and _normalize_species(resolved_species_a) != wanted_species_a
-        ):
-            continue
-        if (
-            wanted_species_b is not None
-            and _normalize_species(resolved_species_b) != wanted_species_b
+        if not _rdf_pair_matches_request(
+            stored_species_a=resolved_species_a,
+            stored_species_b=resolved_species_b,
+            wanted_species_a=wanted_species_a,
+            wanted_species_b=wanted_species_b,
         ):
             continue
 
@@ -754,17 +2369,48 @@ def _load_rdf_profiles_from_payloads(
         g_r = np.asarray(datasets["g_r"], dtype=float)
         n_frames = int(metadata.get("n_frames", 0))
 
-        profiles.append(
-            RDFProfile(
-                species_a=resolved_species_a,
-                species_b=resolved_species_b,
-                bin_edges=bin_edges,
-                bin_centers=bin_centers,
-                g_r=g_r,
-                n_frames=n_frames,
-            )
+        profile = RDFProfile(
+            species_a=resolved_species_a,
+            species_b=resolved_species_b,
+            bin_edges=bin_edges,
+            bin_centers=bin_centers,
+            g_r=g_r,
+            n_frames=n_frames,
+            series_statistics=statistics_series_map_from_datasets(
+                datasets,
+                dataset_names=("g_r",),
+            ),
         )
-    return profiles
+        if _rdf_pair_matches_exact_request(
+            stored_species_a=resolved_species_a,
+            stored_species_b=resolved_species_b,
+            wanted_species_a=wanted_species_a,
+            wanted_species_b=wanted_species_b,
+        ):
+            exact_profiles.append(profile)
+        elif _pair_request_is_cross_species(wanted_species_a, wanted_species_b):
+            reversed_profiles.append(
+                RDFProfile(
+                    species_a=str(wanted_species_a),
+                    species_b=str(wanted_species_b),
+                    bin_edges=bin_edges,
+                    bin_centers=bin_centers,
+                    g_r=g_r,
+                    n_frames=n_frames,
+                    series_statistics=statistics_series_map_from_datasets(
+                        datasets,
+                        dataset_names=("g_r",),
+                    ),
+                )
+            )
+        else:
+            exact_profiles.append(profile)
+
+    if exact_profiles:
+        return exact_profiles
+    if reversed_profiles:
+        return reversed_profiles
+    return []
 
 
 def load_rdf_profiles_by_index(
@@ -822,6 +2468,7 @@ def plot_rdf_profile(
     legend_loc: str = "best",
     line_label: str | None = None,
     line_colors: list[str] | None = None,
+    error_config: dict[str, Any] | None = None,
     series_enabled: list[bool] | None = None,
     series_show_in_legend: list[bool] | None = None,
     series_line_widths: list[float | None] | None = None,
@@ -830,11 +2477,14 @@ def plot_rdf_profile(
     series_fit_enabled: list[bool] | None = None,
     series_fit_labels: list[str | None] | None = None,
     series_fit_show_in_legend: list[bool] | None = None,
-    series_normalization_modes: list[str] | None = None,
+    cumulative_config: dict[str, Any] | None = None,
+    series_normalization_modes: list[str | None] | None = None,
     series_normalization_values: list[float | None] | None = None,
     series_normalization_x_refs: list[float | None] | None = None,
     x_bin_width: float | None = None,
     x_bin_reducer: str | None = None,
+    min_bin_points: int | None = None,
+    annotations: list[dict[str, Any]] | None = None,
     capture_state: dict[str, Any] | None = None,
     suppress_output_log: bool = False,
     matplotlib_rc: dict[str, Any] | None = None,
@@ -888,11 +2538,19 @@ def plot_rdf_profile(
         fit_show_in_legend=(
             True if not series_fit_show_in_legend else bool(series_fit_show_in_legend[0])
         ),
+        cumulative_config=cumulative_config,
+        series_statistics=None
+        if profile.series_statistics is None
+        else profile.series_statistics.get("g_r"),
+        error_config=error_config,
         normalization_mode=single_series.normalization_mode,
         normalization_value=single_series.normalization_value,
         normalization_x_ref=single_series.normalization_x_ref,
         x_bin_width=x_bin_width,
         x_bin_reducer=x_bin_reducer,
+        min_bin_points=min_bin_points,
+        analysis_name="rdf",
+        annotations=annotations,
         style=style,
         x_scale=x_scale,
         y_scale=y_scale,
@@ -953,6 +2611,7 @@ def plot_rdf_profiles(
     series_ids: list[str] | None = None,
     series_labels: list[str] | None = None,
     line_colors: list[str] | None = None,
+    series_error_configs: list[dict[str, Any] | None] | None = None,
     series_enabled: list[bool] | None = None,
     series_show_in_legend: list[bool] | None = None,
     series_line_widths: list[float | None] | None = None,
@@ -961,11 +2620,16 @@ def plot_rdf_profiles(
     series_fit_enabled: list[bool] | None = None,
     series_fit_labels: list[str | None] | None = None,
     series_fit_show_in_legend: list[bool] | None = None,
-    series_normalization_modes: list[str] | None = None,
+    series_cumulative_configs: list[dict[str, Any] | None] | None = None,
+    render_series_descriptors: list[dict[str, Any]] | None = None,
+    series_overrides_by_id: dict[str, dict[str, Any]] | None = None,
+    series_normalization_modes: list[str | None] | None = None,
     series_normalization_values: list[float | None] | None = None,
     series_normalization_x_refs: list[float | None] | None = None,
     x_bin_width: float | None = None,
     x_bin_reducer: str | None = None,
+    min_bin_points: int | None = None,
+    annotations: list[dict[str, Any]] | None = None,
     capture_state: dict[str, Any] | None = None,
     suppress_output_log: bool = False,
     matplotlib_rc: dict[str, Any] | None = None,
@@ -1021,15 +2685,21 @@ def plot_rdf_profiles(
             legend_loc=legend_loc,
             line_label=labels[0] if labels else None,
             line_colors=line_colors,
+            error_config=None if not series_error_configs else series_error_configs[0],
             series_enabled=series_enabled,
             series_line_widths=series_line_widths,
             series_markers=series_markers,
             series_fit_configs=series_fit_configs,
+            cumulative_config=None
+            if not series_cumulative_configs
+            else series_cumulative_configs[0],
             series_normalization_modes=series_normalization_modes,
             series_normalization_values=series_normalization_values,
             series_normalization_x_refs=series_normalization_x_refs,
             x_bin_width=x_bin_width,
             x_bin_reducer=x_bin_reducer,
+            min_bin_points=min_bin_points,
+            annotations=annotations,
             capture_state=capture_state,
             suppress_output_log=suppress_output_log,
             matplotlib_rc=matplotlib_rc,
@@ -1065,11 +2735,22 @@ def plot_rdf_profiles(
         series_fit_enabled=series_fit_enabled,
         series_fit_labels=series_fit_labels,
         series_fit_show_in_legend=series_fit_show_in_legend,
+        series_cumulative_configs=series_cumulative_configs,
+        series_error_configs=series_error_configs,
+        series_statistics_data=[
+            None if profile.series_statistics is None else profile.series_statistics.get("g_r")
+            for profile in profiles
+        ],
         series_normalization_modes=series_normalization_modes,
         series_normalization_values=series_normalization_values,
         series_normalization_x_refs=series_normalization_x_refs,
+        render_series_descriptors=render_series_descriptors,
+        series_overrides_by_id=series_overrides_by_id,
         x_bin_width=x_bin_width,
         x_bin_reducer=x_bin_reducer,
+        min_bin_points=min_bin_points,
+        analysis_name="rdf",
+        annotations=annotations,
         x_scale=x_scale,
         y_scale=y_scale,
         x_lim=x_lim,

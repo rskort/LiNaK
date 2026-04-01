@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import h5py
@@ -10,10 +11,14 @@ import linak.analysis.coordination as coordination_module
 from linak.analysis.coordination import (
     CoordinationCutoffResolution,
     CoordinationProfile,
+    compute_coordination_profiles,
     compute_coordination_profile,
+    load_coordination_profiles,
     load_coordination_profile,
     plot_coordination_profile,
+    resolve_coordination_cutoffs,
     resolve_coordination_cutoff,
+    save_coordination_profiles,
     save_coordination_profile,
 )
 from linak.analysis.rdf import RDFProfile, save_rdf_profile
@@ -520,24 +525,15 @@ def test_resolve_coordination_cutoff_from_rdf_file_saves_diagnostic_plot(tmp_pat
     assert resolution.cutoff_A == pytest.approx(resolution.rdf_minimum_A)
 
 
-def test_resolve_coordination_cutoff_defaults_to_sampled_rdf(monkeypatch):
+def test_resolve_coordination_cutoff_defaults_to_full_rdf(monkeypatch):
     bin_edges = np.array([0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0], dtype=float)
     counts = np.array([0.2, 1.8, 1.2, 0.35, 0.55, 0.9], dtype=float)
     monkeypatch.setattr(
         coordination_module,
-        "_build_reference_rdf_config",
-        lambda *args, **kwargs: (
-            bin_edges,
-            SimpleNamespace(bin_edges=bin_edges),
-        ),
-    )
-    monkeypatch.setattr(
-        coordination_module,
-        "_accumulate_reference_rdf_contributions",
-        lambda *args, **kwargs: (
-            counts.copy(),
-            np.ones_like(counts),
-        ),
+        "_compute_reference_rdf_pairs",
+        lambda *args, **kwargs: {
+            ("H", "O"): (0.5 * (bin_edges[:-1] + bin_edges[1:]), counts.copy())
+        },
     )
 
     resolution = resolve_coordination_cutoff(
@@ -549,9 +545,43 @@ def test_resolve_coordination_cutoff_defaults_to_sampled_rdf(monkeypatch):
         cutoff_from_rdf=False,
     )
 
-    assert resolution.mode == "sampled_rdf"
-    assert resolution.rdf_sampled_frame_index is not None
+    assert resolution.mode == "full_rdf"
+    assert resolution.rdf_sampled_frame_index is None
     assert resolution.cutoff_A == pytest.approx(resolution.rdf_minimum_A)
+
+
+def test_resolve_coordination_cutoffs_reuses_physical_rdf_pair_for_ordered_pairs(tmp_path):
+    rdf_path = tmp_path / "reference_rdf.h5"
+    save_rdf_profile(
+        RDFProfile(
+            species_a="H",
+            species_b="O",
+            bin_edges=np.array([0.0, 0.5, 1.0, 1.5, 2.0], dtype=float),
+            bin_centers=np.array([0.25, 0.75, 1.25, 1.75], dtype=float),
+            g_r=np.array([0.2, 1.8, 0.45, 0.8], dtype=float),
+            n_frames=4,
+        ),
+        rdf_path,
+    )
+
+    resolutions = resolve_coordination_cutoffs(
+        frames=[],
+        ordered_pairs=[("O", "H"), ("H", "O")],
+        cutoff_A=None,
+        cutoff_rdf_path=rdf_path,
+        cutoff_from_rdf=True,
+        diagnostic_plot_outputs={
+            ("O", "H"): tmp_path / "o_h_cutoff.png",
+            ("H", "O"): tmp_path / "h_o_cutoff.png",
+        },
+    )
+
+    assert list(resolutions) == [("O", "H"), ("H", "O")]
+    assert resolutions[("O", "H")].mode == "rdf_file"
+    assert resolutions[("H", "O")].mode == "rdf_file"
+    assert resolutions[("O", "H")].cutoff_A == pytest.approx(resolutions[("H", "O")].cutoff_A)
+    assert Path(str(resolutions[("O", "H")].diagnostic_plot_path)).exists()
+    assert Path(str(resolutions[("H", "O")].diagnostic_plot_path)).exists()
 
 
 def test_resolve_coordination_cutoff_accepts_zero_smoothing_width():
@@ -642,64 +672,19 @@ def test_compute_reference_rdf_uses_nan_for_zero_expected_bins(monkeypatch):
     assert g_r[1] == pytest.approx(2.0)
 
 
-def test_resolve_coordination_cutoff_converges_in_random_batches(monkeypatch):
-    batch_sizes: list[int] = []
-    observed_cumulative_counts: list[np.ndarray] = []
-    bin_edges = np.array([0.0, 0.5, 1.0, 1.5], dtype=float)
-    batch_size = coordination_module._DEFAULT_RDF_CONVERGENCE_BATCH_SIZE
-    min_frames = coordination_module._DEFAULT_RDF_CONVERGENCE_MIN_FRAMES
-    expected_steps = int(np.ceil(min_frames / batch_size))
-    monkeypatch.setattr(
-        coordination_module,
-        "_build_reference_rdf_config",
-        lambda *args, **kwargs: (
-            bin_edges,
-            SimpleNamespace(bin_edges=bin_edges),
-        ),
-    )
-    monkeypatch.setattr(
-        coordination_module, "_resolve_rdf_worker_count", lambda *_args, **_kwargs: 1
-    )
-
-    def _fake_accumulate(selected_frames, **_kwargs):
-        batch_sizes.append(len(selected_frames))
-        counts = np.full(bin_edges.size - 1, float(len(selected_frames)), dtype=float)
-        expected = np.full(
-            bin_edges.size - 1,
-            float(batch_size) if len(batch_sizes) == 1 else 0.0,
-            dtype=float,
-        )
-        return counts, expected
+def test_resolve_coordination_cutoff_from_full_rdf_uses_shared_pair_collection(monkeypatch):
+    bin_centers = np.array([0.25, 0.75, 1.25], dtype=float)
+    g_r = np.array([0.2, 1.8, 0.45], dtype=float)
 
     monkeypatch.setattr(
         coordination_module,
-        "_accumulate_reference_rdf_contributions",
-        _fake_accumulate,
-    )
-    monkeypatch.setattr(
-        coordination_module,
-        "_resolve_cutoff_from_rdf_curve",
-        lambda **_kwargs: (
-            observed_cumulative_counts.append(np.asarray(_kwargs["g_r"], dtype=float).copy())
-            or (
-                np.zeros(bin_edges.size - 1, dtype=float),
-                0.75,
-                1.55
-                if len(observed_cumulative_counts) == 1
-                else (
-                    1.50020
-                    if len(observed_cumulative_counts) == expected_steps - 2
-                    else (
-                        1.50025
-                        if len(observed_cumulative_counts) == expected_steps - 1
-                        else 1.50023
-                    )
-                ),
-            )
-        ),
+        "_compute_reference_rdf_pairs",
+        lambda *args, **kwargs: {
+            ("H", "O"): (bin_centers, g_r)
+        },
     )
 
-    frames = _coordination_test_frames() * 1200
+    frames = _coordination_test_frames() * 3
     resolution = resolve_coordination_cutoff(
         frames=frames,
         species_a="O",
@@ -709,16 +694,68 @@ def test_resolve_coordination_cutoff_converges_in_random_batches(monkeypatch):
         cutoff_from_rdf=False,
     )
 
-    assert batch_sizes == [batch_size] * expected_steps
-    np.testing.assert_allclose(observed_cumulative_counts[0], np.full(3, 1.0))
-    np.testing.assert_allclose(observed_cumulative_counts[1], np.full(3, 2.0))
-    np.testing.assert_allclose(
-        observed_cumulative_counts[-1],
-        np.full(3, float(expected_steps)),
+    assert resolution.rdf_sampled_frame_index is None
+    assert resolution.mode == "full_rdf"
+    np.testing.assert_allclose(resolution.rdf_bin_centers_A, bin_centers)
+    np.testing.assert_allclose(resolution.rdf_g_r, g_r)
+    assert resolution.rdf_g_r_smoothed is not None
+
+
+def test_compute_coordination_profiles_returns_ordered_pair_collection():
+    frames = _coordination_test_frames()
+    cutoff_resolutions = {
+        ("H", "H"): CoordinationCutoffResolution(1.0, 0.4, "direct"),
+        ("H", "O"): CoordinationCutoffResolution(1.0, 0.4, "direct"),
+        ("O", "H"): CoordinationCutoffResolution(1.0, 0.4, "direct"),
+        ("O", "O"): CoordinationCutoffResolution(1.0, 0.4, "direct"),
+    }
+
+    profiles = compute_coordination_profiles(
+        frames,
+        ordered_pairs=[("H", "H"), ("H", "O"), ("O", "H"), ("O", "O")],
+        axis="z",
+        timestep_fs=2.0,
+        surface_mode="rough",
+        surface_elements=["Pt"],
+        cutoff_resolutions=cutoff_resolutions,
     )
-    assert resolution.rdf_sampled_frame_index is not None
-    assert resolution.rdf_sampled_frame_index.size == batch_size * expected_steps
-    assert resolution.mode == "sampled_rdf"
+
+    assert [(profile.species_a, profile.species_b) for profile in profiles] == [
+        ("H", "H"),
+        ("H", "O"),
+        ("O", "H"),
+        ("O", "O"),
+    ]
+
+
+def test_save_and_load_coordination_profiles_collection(tmp_path):
+    frames = _coordination_test_frames()
+    cutoff_resolutions = {
+        ("H", "H"): CoordinationCutoffResolution(1.0, 0.4, "direct"),
+        ("H", "O"): CoordinationCutoffResolution(1.0, 0.4, "direct"),
+        ("O", "H"): CoordinationCutoffResolution(1.0, 0.4, "direct"),
+        ("O", "O"): CoordinationCutoffResolution(1.0, 0.4, "direct"),
+    }
+    profiles = compute_coordination_profiles(
+        frames,
+        ordered_pairs=[("H", "H"), ("H", "O"), ("O", "H"), ("O", "O")],
+        axis="z",
+        timestep_fs=2.0,
+        surface_mode="rough",
+        surface_elements=["Pt"],
+        cutoff_resolutions=cutoff_resolutions,
+    )
+    output = tmp_path / "coordination_collection.h5"
+
+    save_coordination_profiles(profiles, output)
+    loaded = load_coordination_profiles(output)
+
+    assert [(profile.species_a, profile.species_b) for profile in loaded] == [
+        ("H", "H"),
+        ("H", "O"),
+        ("O", "H"),
+        ("O", "O"),
+    ]
 
 
 def test_resolve_coordination_cutoff_prefers_direct_cutoff_over_other_sources(tmp_path):

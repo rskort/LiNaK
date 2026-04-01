@@ -2,11 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from concurrent.futures import ProcessPoolExecutor
-from contextlib import nullcontext
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from itertools import repeat
 import logging
 from pathlib import Path
 from typing import Any
@@ -18,6 +15,7 @@ import numpy as np
 from ..plot.plotting import (
     DEFAULT_PLOT_STYLE,
     PlotStyle,
+    _render_plot_annotations,
     _sanitize_line_collection_kwargs,
     configure_matplotlib_backend,
     format_axis_label_units,
@@ -32,6 +30,7 @@ from ..storage.hdf5_utils import (
     read_linak_hdf5_profiles_by_index,
     read_linak_hdf5_profiles,
     write_linak_hdf5,
+    write_linak_hdf5_profile_collection,
 )
 from ..utils import ensure_positive
 from .position import (
@@ -45,18 +44,13 @@ from .density import (
     _surface_metadata_view,
     SurfaceEstimate,
     SurfaceEstimatorOptions,
+    available_element_species,
 )
 from .rdf import (
-    _RDFWorkerConfig,
+    _accumulate_rdf_pair_collection,
     _auto_r_max_from_frames,
-    _build_uniform_rdf_bins,
-    _compute_rdf_chunk_contributions,
-    _compute_rdf_frame_contribution,
+    _canonical_rdf_pair,
     _normalize_species as _normalize_rdf_species,
-    _resolve_rdf_chunk_size,
-    _resolve_rdf_selection_cache,
-    _resolve_rdf_worker_count,
-    _should_parallelize_rdf,
 )
 from .schema import build_profile_metadata
 
@@ -65,15 +59,13 @@ _DEFAULT_DISTANCE_BIN_WIDTH_A = 0.25
 _DEFAULT_CUTOFF_SMOOTHING_WIDTH_A = 0.50
 _DEFAULT_RDF_BIN_WIDTH_A = 0.05
 _DEFAULT_RDF_SMOOTHING_SIGMA_A = 0.10
-_DEFAULT_RDF_CONVERGENCE_BATCH_SIZE = 250
-_DEFAULT_RDF_CONVERGENCE_MIN_FRAMES = 1_000
-_DEFAULT_RDF_CONVERGENCE_MAX_FRAMES = 5_000
-_DEFAULT_RDF_CONVERGENCE_WINDOW = 3
-_DEFAULT_RDF_CONVERGENCE_TOLERANCE_A = 2.5e-3
 _MIN_FIT_POINTS = 3
 _FIT_HALF_WINDOW_POINTS = 3
-_COORD_VECTORIZE_PAIR_THRESHOLD = 50_000
+_COORD_DENSE_PAIR_THRESHOLD = 200_000
 _COORD_MAX_DISTANCE_VALUES_PER_CHUNK = 2_000_000
+_COORD_BACKEND_DENSE = "dense_chunked_orthorhombic"
+_COORD_BACKEND_NEIGHBOR = "framewise_periodic_neighbor_list"
+_COORD_BACKEND_GENERIC = "framewise_generic"
 
 
 @dataclass(frozen=True)
@@ -128,8 +120,46 @@ class CoordinationProfile:
     cutoff_diagnostic_plot_path: str | None = None
 
 
+@dataclass(frozen=True)
+class _CoordinationSelectionCache:
+    """Stable per-run center/neighbor selection metadata reused across frames."""
+
+    center_indices: np.ndarray
+    neighbor_indices: np.ndarray
+    center_lookup: np.ndarray
+    center_mask: np.ndarray
+    neighbor_mask: np.ndarray
+    same_selection: bool
+    center_count: int
+    neighbor_count: int
+    pair_count: int
+
+
 def _normalize_species(species: str | None) -> str:
     return _normalize_rdf_species(species)
+
+
+def _ordered_coordination_pairs_from_frames(frames: list[Atoms]) -> list[tuple[str, str]]:
+    """Return the ordered center->neighbor species pairs for bare collection mode."""
+    species_labels = available_element_species(frames)
+    if not species_labels:
+        raise ValueError("No elements found in trajectory.")
+    return [(species_a, species_b) for species_a in species_labels for species_b in species_labels]
+
+
+def _unique_physical_coordination_pairs(
+    ordered_pairs: list[tuple[str, str]],
+) -> list[tuple[str, str]]:
+    """Return unique unordered RDF reference pairs needed by coordination pairs."""
+    unique_pairs: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for species_a, species_b in ordered_pairs:
+        pair = _canonical_rdf_pair(species_a, species_b)
+        if pair in seen:
+            continue
+        seen.add(pair)
+        unique_pairs.append(pair)
+    return unique_pairs
 
 
 def _normalize_axis(axis: str | None) -> str:
@@ -166,6 +196,60 @@ def _select_indices(frame: Atoms, species: str) -> np.ndarray:
         return np.arange(len(frame), dtype=int)
     symbols = np.asarray(frame.get_chemical_symbols(), dtype=object)
     return np.where(symbols == species)[0].astype(int, copy=False)
+
+
+def _build_coordination_selection_cache(
+    *,
+    frame: Atoms,
+    center_species: str,
+    neighbor_species: str,
+    center_indices: np.ndarray | None = None,
+) -> _CoordinationSelectionCache:
+    """Build stable selection metadata reused across one coordination run."""
+    resolved_center_indices = (
+        _select_indices(frame, center_species)
+        if center_indices is None
+        else np.asarray(center_indices, dtype=int)
+    )
+    resolved_neighbor_indices = _select_indices(frame, neighbor_species)
+    same_selection = center_species == neighbor_species
+    if same_selection and not np.array_equal(resolved_center_indices, resolved_neighbor_indices):
+        raise ValueError(
+            "Same-species coordination requires identical center and neighbor index ordering."
+        )
+
+    center_count = int(resolved_center_indices.size)
+    neighbor_count = int(resolved_neighbor_indices.size)
+    if center_count == 0:
+        raise ValueError(
+            f"No center atoms found for species '{center_species}' in the reference frame."
+        )
+    if neighbor_count == 0:
+        raise ValueError(
+            f"No neighbor atoms found for species '{neighbor_species}' in the reference frame."
+        )
+
+    center_lookup = np.full(len(frame), -1, dtype=int)
+    center_lookup[resolved_center_indices] = np.arange(center_count, dtype=int)
+    center_mask = np.zeros(len(frame), dtype=bool)
+    center_mask[resolved_center_indices] = True
+    neighbor_mask = np.zeros(len(frame), dtype=bool)
+    neighbor_mask[resolved_neighbor_indices] = True
+
+    return _CoordinationSelectionCache(
+        center_indices=resolved_center_indices,
+        neighbor_indices=resolved_neighbor_indices,
+        center_lookup=center_lookup,
+        center_mask=center_mask,
+        neighbor_mask=neighbor_mask,
+        same_selection=same_selection,
+        center_count=center_count,
+        neighbor_count=neighbor_count,
+        pair_count=max(
+            0,
+            center_count * neighbor_count - (center_count if same_selection else 0),
+        ),
+    )
 
 
 def _optional_finite_float(value: Any) -> float | None:
@@ -312,143 +396,51 @@ def _fit_local_quadratic_minimum(
     return float(np.clip(vertex, lower, upper))
 
 
-def _resolve_converged_sampled_rdf(
+def _compute_reference_rdf_pairs(
     frames: list[Atoms],
     *,
-    species_a: str,
-    species_b: str,
-    batch_size: int = _DEFAULT_RDF_CONVERGENCE_BATCH_SIZE,
-    tolerance_A: float = _DEFAULT_RDF_CONVERGENCE_TOLERANCE_A,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, float]:
+    pairs: Sequence[tuple[str, str]],
+    r_max: float | None,
+    bin_width: float,
+) -> dict[tuple[str, str], tuple[np.ndarray, np.ndarray]]:
+    """Compute full-trajectory reference RDF curves for one or more physical pairs."""
     if not frames:
         raise ValueError("At least one trajectory frame is required.")
-    ensure_positive("batch_size", batch_size)
-    ensure_positive("tolerance_A", tolerance_A)
 
-    frame_order = np.asarray(np.random.default_rng(0).permutation(len(frames)), dtype=int)
-    max_sampled_frames = min(len(frame_order), int(_DEFAULT_RDF_CONVERGENCE_MAX_FRAMES))
-    min_frames_before_check = min(max_sampled_frames, int(_DEFAULT_RDF_CONVERGENCE_MIN_FRAMES))
-    convergence_window = max(2, int(_DEFAULT_RDF_CONVERGENCE_WINDOW))
-    selected_index_batches: list[np.ndarray] = []
-    sampled_frame_count = 0
-    previous_cutoff_A: float | None = None
-    recent_cutoffs_A: list[float] = []
-    selected_frame_batch = [
-        (frame_index, frames[frame_index]) for frame_index in frame_order.tolist()
-    ]
+    unique_pairs = _unique_physical_coordination_pairs(
+        [(str(species_a), str(species_b)) for species_a, species_b in pairs]
+    )
+    if not unique_pairs:
+        raise ValueError("At least one coordination pair is required.")
+
     (
+        accumulated_pairs,
         bin_edges,
-        config,
-    ) = _build_reference_rdf_config(
-        selected_frame_batch,
-        species_a=species_a,
-        species_b=species_b,
-        r_max=None,
-        bin_width=float(_DEFAULT_RDF_BIN_WIDTH_A),
+        _shell_volumes,
+        counts_by_pair,
+        expected_by_pair,
+        _selection_cache_by_pair,
+        _statistics_by_pair,
+    ) = _accumulate_rdf_pair_collection(
+        frames,
+        pairs=unique_pairs,
+        r_max=r_max,
+        bin_width=float(bin_width),
+        progress_desc="Coordination cutoff RDF",
     )
-    counts_accum = np.zeros(bin_edges.size - 1, dtype=float)
-    expected_accum = np.zeros_like(counts_accum)
-    final_bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
-    final_g_r = np.full_like(counts_accum, np.nan, dtype=float)
-    final_smoothed = np.empty(0, dtype=float)
-    final_peak_A: float | None = None
-    final_minimum_A: float | None = None
-    max_batch_frames = min(int(batch_size), max_sampled_frames)
-    worker_count = _resolve_rdf_worker_count(None, max_batch_frames)
-    use_parallel = _should_parallelize_rdf(max_batch_frames, worker_count)
+    if accumulated_pairs != unique_pairs:
+        raise ValueError("Full coordination RDF accumulation changed pair ordering.")
 
-    executor_context = (
-        ProcessPoolExecutor(max_workers=worker_count) if use_parallel else nullcontext(None)
-    )
-    with executor_context as executor:
-        for step_index, start in enumerate(range(0, max_sampled_frames, int(batch_size)), start=1):
-            stop = min(start + int(batch_size), max_sampled_frames)
-            next_batch = frame_order[start:stop]
-            batch_frames = selected_frame_batch[start:stop]
-            if next_batch.size == 0:
-                break
-            batch_counts, batch_expected = _accumulate_reference_rdf_contributions(
-                batch_frames,
-                config=config,
-                progress=None,
-                executor=executor,
-                worker_count=worker_count,
-            )
-            counts_accum += batch_counts
-            expected_accum += batch_expected
-            selected_index_batches.append(next_batch.astype(int))
-            sampled_frame_count += int(next_batch.size)
-            non_zero = expected_accum > 0.0
-            final_g_r = np.full_like(counts_accum, np.nan, dtype=float)
-            final_g_r[non_zero] = counts_accum[non_zero] / expected_accum[non_zero]
-            try:
-                final_smoothed, final_peak_A, final_minimum_A = _resolve_cutoff_from_rdf_curve(
-                    bin_centers_A=final_bin_centers,
-                    g_r=final_g_r,
-                    smoothing_sigma_A=float(_DEFAULT_RDF_SMOOTHING_SIGMA_A),
-                )
-            except ValueError as exc:
-                LOGGER.info(
-                    "Coordination cutoff RDF step %d: sampled=%d frame(s), cutoff unresolved (%s).",
-                    step_index,
-                    sampled_frame_count,
-                    exc,
-                )
-                continue
-            delta_A = (
-                None
-                if previous_cutoff_A is None
-                else abs(float(final_minimum_A) - float(previous_cutoff_A))
-            )
-            previous_cutoff_A = float(final_minimum_A)
-            recent_cutoffs_A.append(float(final_minimum_A))
-            if len(recent_cutoffs_A) > convergence_window:
-                recent_cutoffs_A = recent_cutoffs_A[-convergence_window:]
-            recent_span_A = (
-                None
-                if len(recent_cutoffs_A) < convergence_window
-                else max(recent_cutoffs_A) - min(recent_cutoffs_A)
-            )
-            LOGGER.info(
-                "Coordination cutoff RDF step %d: sampled=%d frame(s), cutoff=%.6g A%s%s",
-                step_index,
-                sampled_frame_count,
-                final_minimum_A,
-                "" if delta_A is None else f", delta={delta_A:.6g} A",
-                "" if recent_span_A is None else f", recent_span={recent_span_A:.6g} A",
-            )
-            if (
-                sampled_frame_count >= min_frames_before_check
-                and recent_span_A is not None
-                and recent_span_A <= float(tolerance_A)
-            ):
-                return (
-                    np.sort(np.concatenate(selected_index_batches)).astype(int, copy=False),
-                    np.asarray(final_bin_centers, dtype=float),
-                    np.asarray(final_g_r, dtype=float),
-                    np.asarray(final_smoothed, dtype=float),
-                    float(final_peak_A),
-                    float(final_minimum_A),
-                )
-
-    if final_peak_A is None or final_minimum_A is None:
-        raise ValueError(
-            "Unable to resolve a coordination cutoff from the sampled RDF; no valid first peak/minimum pair was found."
-        )
-
-    LOGGER.info(
-        "Coordination cutoff RDF did not converge within %.6g A after sampling %d frame(s); using the final sampled cutoff.",
-        float(tolerance_A),
-        sampled_frame_count,
-    )
-    return (
-        np.sort(np.concatenate(selected_index_batches)).astype(int, copy=False),
-        np.asarray(final_bin_centers, dtype=float),
-        np.asarray(final_g_r, dtype=float),
-        np.asarray(final_smoothed, dtype=float),
-        float(final_peak_A),
-        float(final_minimum_A),
-    )
+    bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+    resolved: dict[tuple[str, str], tuple[np.ndarray, np.ndarray]] = {}
+    for pair in unique_pairs:
+        counts = np.asarray(counts_by_pair[pair], dtype=float)
+        expected = np.asarray(expected_by_pair[pair], dtype=float)
+        g_r = np.full_like(counts, np.nan, dtype=float)
+        finite_mask = expected > 0.0
+        g_r[finite_mask] = counts[finite_mask] / expected[finite_mask]
+        resolved[pair] = (np.asarray(bin_centers, dtype=float), g_r)
+    return resolved
 
 
 def _resolve_reference_rdf_r_max(
@@ -471,108 +463,76 @@ def _build_reference_rdf_config(
     species_b: str,
     r_max: float | None,
     bin_width: float,
-) -> tuple[np.ndarray, _RDFWorkerConfig]:
+) -> tuple[np.ndarray, dict[str, Any]]:
     if not selected_frames:
         raise ValueError("No frames were selected for RDF cutoff resolution.")
     ensure_positive("bin_width", bin_width)
 
     frame_objects = [frame for _frame_index, frame in selected_frames]
     resolved_r_max = _resolve_reference_rdf_r_max(frame_objects, r_max=r_max)
-    bin_edges, _effective_bin_width = _build_uniform_rdf_bins(
-        r_max=resolved_r_max,
-        target_bin_width=float(bin_width),
-    )
-    shell_volumes = (4.0 / 3.0) * np.pi * (bin_edges[1:] ** 3 - bin_edges[:-1] ** 3)
-    max_sphere_volume = (4.0 / 3.0) * np.pi * (resolved_r_max**3)
-    same_selection = species_a == species_b
-    selection_cache = _resolve_rdf_selection_cache(
-        frame_objects,
-        label_a=species_a,
-        label_b=species_b,
-    )
+    n_bins = max(1, int(np.floor(float(resolved_r_max) / float(bin_width))))
+    effective_r_max = float(n_bins) * float(bin_width)
+    bin_edges = np.linspace(0.0, effective_r_max, n_bins + 1, dtype=float)
     return (
         bin_edges,
-        _RDFWorkerConfig(
-            label_a=species_a,
-            label_b=species_b,
-            same_selection=same_selection,
-            r_max=resolved_r_max,
-            bin_edges=bin_edges,
-            shell_volumes=shell_volumes,
-            max_sphere_volume=max_sphere_volume,
-            selection_cache=selection_cache,
-        ),
+        {
+            "species_a": _normalize_species(species_a),
+            "species_b": _normalize_species(species_b),
+            "r_max": float(effective_r_max),
+            "bin_width": float(bin_width),
+        },
     )
 
 
 def _accumulate_reference_rdf_contributions(
     selected_frames: list[tuple[int, Atoms]],
     *,
-    config: _RDFWorkerConfig,
+    config: Mapping[str, Any] | Any,
     progress: ProgressBar | None = None,
-    executor: ProcessPoolExecutor | None = None,
     worker_count: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    counts_accum = np.zeros(config.bin_edges.size - 1, dtype=float)
-    expected_accum = np.zeros_like(counts_accum)
+    del worker_count
+    if isinstance(config, Mapping):
+        resolved_species_a = str(config["species_a"])
+        resolved_species_b = str(config["species_b"])
+        resolved_r_max = float(config["r_max"])
+        resolved_bin_width = float(config["bin_width"])
+    else:
+        resolved_species_a = str(config.species_a)
+        resolved_species_b = str(config.species_b)
+        resolved_r_max = float(config.r_max)
+        resolved_bin_width = float(config.bin_width)
+
     if not selected_frames:
-        return counts_accum, expected_accum
+        n_bins = max(1, int(np.floor(float(resolved_r_max) / float(resolved_bin_width))))
+        counts_accum = np.zeros(n_bins, dtype=float)
+        return counts_accum, np.zeros_like(counts_accum)
 
-    resolved_worker_count = (
-        _resolve_rdf_worker_count(None, len(selected_frames))
-        if worker_count is None
-        else worker_count
+    frame_objects = [frame for _frame_index, frame in selected_frames]
+    (
+        unique_pairs,
+        bin_edges,
+        _shell_volumes,
+        counts_by_pair,
+        expected_by_pair,
+        _selection_cache,
+        _statistics_by_pair,
+    ) = _accumulate_rdf_pair_collection(
+        frame_objects,
+        pairs=[(resolved_species_a, resolved_species_b)],
+        r_max=resolved_r_max,
+        bin_width=resolved_bin_width,
+        progress_desc=None,
     )
-    resolved_worker_count = min(resolved_worker_count, max(1, len(selected_frames)))
-    use_parallel = _should_parallelize_rdf(len(selected_frames), resolved_worker_count)
-    if not use_parallel:
-        for frame_index, frame in selected_frames:
-            counts, expected = _compute_rdf_frame_contribution(
-                frame_index,
-                frame,
-                label_a=config.label_a,
-                label_b=config.label_b,
-                same_selection=config.same_selection,
-                r_max=config.r_max,
-                bin_edges=config.bin_edges,
-                shell_volumes=config.shell_volumes,
-                max_sphere_volume=config.max_sphere_volume,
-                selection_cache=config.selection_cache,
-            )
-            counts_accum += counts
-            expected_accum += expected
-            if progress is not None:
-                progress.update()
-        return counts_accum, expected_accum
-
-    chunk_size = _resolve_rdf_chunk_size(len(selected_frames), resolved_worker_count)
-    chunks = [
-        selected_frames[start : start + chunk_size]
-        for start in range(0, len(selected_frames), chunk_size)
-    ]
-    if executor is None:
-        with ProcessPoolExecutor(max_workers=resolved_worker_count) as local_executor:
-            for counts, expected, processed_frames in local_executor.map(
-                _compute_rdf_chunk_contributions,
-                chunks,
-                repeat(config),
-            ):
-                counts_accum += counts
-                expected_accum += expected
-                if progress is not None:
-                    progress.update(processed_frames)
-        return counts_accum, expected_accum
-
-    for counts, expected, processed_frames in executor.map(
-        _compute_rdf_chunk_contributions,
-        chunks,
-        repeat(config),
-    ):
-        counts_accum += counts
-        expected_accum += expected
-        if progress is not None:
-            progress.update(processed_frames)
-    return counts_accum, expected_accum
+    pair = _canonical_rdf_pair(resolved_species_a, resolved_species_b)
+    if progress is not None:
+        progress.update(len(selected_frames))
+    if unique_pairs != [pair]:
+        raise ValueError("Reference RDF accumulation returned unexpected pair selection.")
+    return (
+        np.asarray(counts_by_pair[pair], dtype=float),
+        np.asarray(expected_by_pair[pair], dtype=float),
+    )
 
 
 def _compute_reference_rdf(
@@ -727,96 +687,172 @@ def resolve_coordination_cutoff(
     cutoff_smoothing_width_A: float = _DEFAULT_CUTOFF_SMOOTHING_WIDTH_A,
     diagnostic_plot_output: str | Path | None = None,
 ) -> CoordinationCutoffResolution:
+    label_a = _normalize_species(species_a)
+    label_b = _normalize_species(species_b if species_b is not None else species_a)
+    resolutions = resolve_coordination_cutoffs(
+        frames=frames,
+        ordered_pairs=[(label_a, label_b)],
+        cutoff_A=cutoff_A,
+        cutoff_rdf_path=cutoff_rdf_path,
+        cutoff_from_rdf=cutoff_from_rdf,
+        cutoff_smoothing_width_A=cutoff_smoothing_width_A,
+        diagnostic_plot_outputs=(
+            None if diagnostic_plot_output is None else {(label_a, label_b): diagnostic_plot_output}
+        ),
+    )
+    return resolutions[(label_a, label_b)]
+
+
+def resolve_coordination_cutoffs(
+    *,
+    frames: list[Atoms],
+    ordered_pairs: Sequence[tuple[str, str]],
+    cutoff_A: float | None,
+    cutoff_rdf_path: str | Path | None,
+    cutoff_from_rdf: bool,
+    cutoff_smoothing_width_A: float = _DEFAULT_CUTOFF_SMOOTHING_WIDTH_A,
+    diagnostic_plot_outputs: Mapping[tuple[str, str], str | Path] | None = None,
+) -> dict[tuple[str, str], CoordinationCutoffResolution]:
     cutoff_smoothing_width_A = _ensure_nonnegative(
         "cutoff_smoothing_width_A", cutoff_smoothing_width_A
     )
-
-    label_a = _normalize_species(species_a)
-    label_b = _normalize_species(species_b if species_b is not None else species_a)
+    normalized_pairs = [
+        (_normalize_species(species_a), _normalize_species(species_b))
+        for species_a, species_b in ordered_pairs
+    ]
+    if not normalized_pairs:
+        raise ValueError("At least one coordination pair is required.")
+    unique_physical_pairs = _unique_physical_coordination_pairs(normalized_pairs)
+    diagnostic_outputs = {
+        (_normalize_species(species_a), _normalize_species(species_b)): output
+        for (species_a, species_b), output in (diagnostic_plot_outputs or {}).items()
+    }
 
     if cutoff_A is not None:
         ensure_positive("cutoff_A", cutoff_A)
-        return CoordinationCutoffResolution(
-            cutoff_A=float(cutoff_A),
-            smoothing_width_A=float(cutoff_smoothing_width_A),
-            mode="direct",
-        )
+        return {
+            pair: CoordinationCutoffResolution(
+                cutoff_A=float(cutoff_A),
+                smoothing_width_A=float(cutoff_smoothing_width_A),
+                mode="direct",
+            )
+            for pair in normalized_pairs
+        }
 
     if cutoff_rdf_path is not None:
         from .rdf import load_rdf_profile
 
         source_path = Path(cutoff_rdf_path).expanduser().resolve()
-        rdf_profile = load_rdf_profile(source_path, species_a=label_a, species_b=label_b)
+        resolved_by_physical_pair: dict[tuple[str, str], CoordinationCutoffResolution] = {}
+        for physical_pair in unique_physical_pairs:
+            rdf_profile = load_rdf_profile(
+                source_path,
+                species_a=physical_pair[0],
+                species_b=physical_pair[1],
+            )
+            smoothed, peak_A, minimum_A = _resolve_cutoff_from_rdf_curve(
+                bin_centers_A=np.asarray(rdf_profile.bin_centers, dtype=float),
+                g_r=np.asarray(rdf_profile.g_r, dtype=float),
+                smoothing_sigma_A=float(_DEFAULT_RDF_SMOOTHING_SIGMA_A),
+            )
+            resolved_by_physical_pair[physical_pair] = CoordinationCutoffResolution(
+                cutoff_A=float(minimum_A),
+                smoothing_width_A=float(cutoff_smoothing_width_A),
+                mode="rdf_file",
+                rdf_bin_centers_A=np.asarray(rdf_profile.bin_centers, dtype=float),
+                rdf_g_r=np.asarray(rdf_profile.g_r, dtype=float),
+                rdf_g_r_smoothed=smoothed,
+                rdf_peak_A=peak_A,
+                rdf_minimum_A=float(minimum_A),
+                rdf_source_path=str(source_path),
+            )
+
+        resolved_by_ordered_pair: dict[tuple[str, str], CoordinationCutoffResolution] = {}
+        for pair in normalized_pairs:
+            physical_pair = _canonical_rdf_pair(*pair)
+            base = resolved_by_physical_pair[physical_pair]
+            if base.rdf_peak_A is None or base.rdf_minimum_A is None:
+                raise ValueError(
+                    f"RDF file cutoff resolution for pair {pair[0]}-{pair[1]} is incomplete."
+                )
+            diagnostic_path = None
+            diagnostic_output = diagnostic_outputs.get(pair)
+            if diagnostic_output is not None:
+                diagnostic_path = _save_cutoff_diagnostic_plot(
+                    output=diagnostic_output,
+                    bin_centers_A=np.asarray(base.rdf_bin_centers_A, dtype=float),
+                    g_r=np.asarray(base.rdf_g_r, dtype=float),
+                    g_r_smoothed=np.asarray(base.rdf_g_r_smoothed, dtype=float),
+                    peak_A=float(base.rdf_peak_A),
+                    minimum_A=float(base.rdf_minimum_A),
+                    species_a=pair[0],
+                    species_b=pair[1],
+                )
+            resolved_by_ordered_pair[pair] = CoordinationCutoffResolution(
+                cutoff_A=float(base.cutoff_A),
+                smoothing_width_A=float(base.smoothing_width_A),
+                mode=base.mode,
+                rdf_bin_centers_A=np.asarray(base.rdf_bin_centers_A, dtype=float),
+                rdf_g_r=np.asarray(base.rdf_g_r, dtype=float),
+                rdf_g_r_smoothed=np.asarray(base.rdf_g_r_smoothed, dtype=float),
+                rdf_peak_A=base.rdf_peak_A,
+                rdf_minimum_A=base.rdf_minimum_A,
+                rdf_source_path=base.rdf_source_path,
+                diagnostic_plot_path=None if diagnostic_path is None else str(diagnostic_path),
+            )
+        return resolved_by_ordered_pair
+
+    LOGGER.info(
+        "Resolving coordination cutoff from full-trajectory RDF for %d physical pair(s).",
+        len(unique_physical_pairs),
+    )
+    resolved_curves = _compute_reference_rdf_pairs(
+        frames,
+        pairs=unique_physical_pairs,
+        r_max=None,
+        bin_width=float(_DEFAULT_RDF_BIN_WIDTH_A),
+    )
+    resolved_by_ordered_pair = {}
+    for pair in normalized_pairs:
+        physical_pair = _canonical_rdf_pair(*pair)
+        bin_centers_A, g_r = resolved_curves[physical_pair]
         smoothed, peak_A, minimum_A = _resolve_cutoff_from_rdf_curve(
-            bin_centers_A=np.asarray(rdf_profile.bin_centers, dtype=float),
-            g_r=np.asarray(rdf_profile.g_r, dtype=float),
+            bin_centers_A=np.asarray(bin_centers_A, dtype=float),
+            g_r=np.asarray(g_r, dtype=float),
             smoothing_sigma_A=float(_DEFAULT_RDF_SMOOTHING_SIGMA_A),
         )
         diagnostic_path = None
-        if diagnostic_plot_output is not None:
+        diagnostic_output = diagnostic_outputs.get(pair)
+        if diagnostic_output is not None:
             diagnostic_path = _save_cutoff_diagnostic_plot(
-                output=diagnostic_plot_output,
-                bin_centers_A=np.asarray(rdf_profile.bin_centers, dtype=float),
-                g_r=np.asarray(rdf_profile.g_r, dtype=float),
+                output=diagnostic_output,
+                bin_centers_A=bin_centers_A,
+                g_r=g_r,
                 g_r_smoothed=smoothed,
                 peak_A=peak_A,
                 minimum_A=minimum_A,
-                species_a=label_a,
-                species_b=label_b,
+                species_a=pair[0],
+                species_b=pair[1],
             )
-        return CoordinationCutoffResolution(
+        resolved_by_ordered_pair[pair] = CoordinationCutoffResolution(
             cutoff_A=float(minimum_A),
             smoothing_width_A=float(cutoff_smoothing_width_A),
-            mode="rdf_file",
-            rdf_bin_centers_A=np.asarray(rdf_profile.bin_centers, dtype=float),
-            rdf_g_r=np.asarray(rdf_profile.g_r, dtype=float),
-            rdf_g_r_smoothed=smoothed,
+            mode="full_rdf",
+            rdf_bin_centers_A=np.asarray(bin_centers_A, dtype=float),
+            rdf_g_r=np.asarray(g_r, dtype=float),
+            rdf_g_r_smoothed=np.asarray(smoothed, dtype=float),
             rdf_peak_A=peak_A,
             rdf_minimum_A=float(minimum_A),
-            rdf_source_path=str(source_path),
             diagnostic_plot_path=None if diagnostic_path is None else str(diagnostic_path),
         )
-
-    # Default to an internally sampled RDF whenever no higher-priority cutoff source is provided.
-    LOGGER.info(
-        "Resolving coordination cutoff from sampled RDF using random %d-frame batches (check after %d frame(s), %d-step span <= %.6g A, cap=%d frame(s)).",
-        int(_DEFAULT_RDF_CONVERGENCE_BATCH_SIZE),
-        int(_DEFAULT_RDF_CONVERGENCE_MIN_FRAMES),
-        int(_DEFAULT_RDF_CONVERGENCE_WINDOW),
-        float(_DEFAULT_RDF_CONVERGENCE_TOLERANCE_A),
-        int(_DEFAULT_RDF_CONVERGENCE_MAX_FRAMES),
-    )
-    sampled_indices, bin_centers_A, g_r, smoothed, peak_A, minimum_A = (
-        _resolve_converged_sampled_rdf(
-            frames,
-            species_a=label_a,
-            species_b=label_b,
+        LOGGER.info(
+            "Resolved coordination cutoff for %s-%s from full RDF: cutoff=%.6g A (peak=%.6g A).",
+            pair[0],
+            pair[1],
+            float(minimum_A),
+            float(peak_A),
         )
-    )
-    diagnostic_path = None
-    if diagnostic_plot_output is not None:
-        diagnostic_path = _save_cutoff_diagnostic_plot(
-            output=diagnostic_plot_output,
-            bin_centers_A=bin_centers_A,
-            g_r=g_r,
-            g_r_smoothed=smoothed,
-            peak_A=peak_A,
-            minimum_A=minimum_A,
-            species_a=label_a,
-            species_b=label_b,
-        )
-    return CoordinationCutoffResolution(
-        cutoff_A=float(minimum_A),
-        smoothing_width_A=float(cutoff_smoothing_width_A),
-        mode="sampled_rdf",
-        rdf_bin_centers_A=np.asarray(bin_centers_A, dtype=float),
-        rdf_g_r=np.asarray(g_r, dtype=float),
-        rdf_g_r_smoothed=np.asarray(smoothed, dtype=float),
-        rdf_peak_A=peak_A,
-        rdf_minimum_A=float(minimum_A),
-        rdf_sampled_frame_index=np.asarray(sampled_indices, dtype=int),
-        diagnostic_plot_path=None if diagnostic_path is None else str(diagnostic_path),
-    )
+    return resolved_by_ordered_pair
 
 
 def _continuous_coordination_weights(
@@ -881,40 +917,64 @@ def _deduplicate_ordered_pairs(
 def _compute_coordination_frame_values(
     frame: Atoms,
     *,
-    center_indices: np.ndarray,
-    neighbor_indices: np.ndarray,
-    same_selection: bool,
+    selection_cache: _CoordinationSelectionCache | None = None,
+    center_indices: np.ndarray | None = None,
+    neighbor_indices: np.ndarray | None = None,
+    same_selection: bool | None = None,
     cutoff_A: float,
     smoothing_width_A: float,
 ) -> np.ndarray:
-    n_centers = int(center_indices.size)
+    if selection_cache is None:
+        if center_indices is None or neighbor_indices is None or same_selection is None:
+            raise TypeError(
+                "Provide either selection_cache or center_indices/neighbor_indices/same_selection."
+            )
+        resolved_center_indices = np.asarray(center_indices, dtype=int)
+        resolved_neighbor_indices = np.asarray(neighbor_indices, dtype=int)
+        if same_selection and not np.array_equal(resolved_center_indices, resolved_neighbor_indices):
+            raise ValueError(
+                "Same-species coordination requires identical center and neighbor index ordering."
+            )
+        center_lookup = np.full(len(frame), -1, dtype=int)
+        center_lookup[resolved_center_indices] = np.arange(resolved_center_indices.size, dtype=int)
+        center_mask = np.zeros(len(frame), dtype=bool)
+        center_mask[resolved_center_indices] = True
+        neighbor_mask = np.zeros(len(frame), dtype=bool)
+        neighbor_mask[resolved_neighbor_indices] = True
+        selection_cache = _CoordinationSelectionCache(
+            center_indices=resolved_center_indices,
+            neighbor_indices=resolved_neighbor_indices,
+            center_lookup=center_lookup,
+            center_mask=center_mask,
+            neighbor_mask=neighbor_mask,
+            same_selection=bool(same_selection),
+            center_count=int(resolved_center_indices.size),
+            neighbor_count=int(resolved_neighbor_indices.size),
+            pair_count=max(
+                0,
+                int(resolved_center_indices.size) * int(resolved_neighbor_indices.size)
+                - (int(resolved_center_indices.size) if same_selection else 0),
+            ),
+        )
+
+    n_centers = int(selection_cache.center_count)
     if n_centers == 0:
         raise ValueError("Coordination calculation requires at least one center atom.")
-    if same_selection and not np.array_equal(center_indices, neighbor_indices):
-        raise ValueError(
-            "Same-species coordination requires identical center and neighbor index ordering."
-        )
     support_cutoff = float(cutoff_A) + 0.5 * float(smoothing_width_A)
     if support_cutoff <= 0.0:
         raise ValueError("Coordination support cutoff must be positive.")
 
     use_neighbor_list = _frame_has_usable_cell(frame)
-    center_lookup = np.full(len(frame), -1, dtype=int)
-    center_lookup[np.asarray(center_indices, dtype=int)] = np.arange(n_centers, dtype=int)
     weights_accum = np.zeros(n_centers, dtype=float)
 
     if use_neighbor_list:
-        center_mask = np.zeros(len(frame), dtype=bool)
-        neighbor_mask = np.zeros(len(frame), dtype=bool)
-        center_mask[np.asarray(center_indices, dtype=int)] = True
-        neighbor_mask[np.asarray(neighbor_indices, dtype=int)] = True
         i_pairs, j_pairs, pair_distances = neighbor_list(
             "ijd",
             frame,
             float(np.nextafter(support_cutoff, np.inf)),
         )
-        mask = center_mask[i_pairs] & neighbor_mask[j_pairs]
-        if same_selection:
+        mask = selection_cache.center_mask[i_pairs] & selection_cache.neighbor_mask[j_pairs]
+        if selection_cache.same_selection:
             mask &= i_pairs != j_pairs
         if np.any(mask):
             i_selected = np.asarray(i_pairs[mask], dtype=int)
@@ -931,10 +991,12 @@ def _compute_coordination_frame_values(
                 cutoff_A=float(cutoff_A),
                 smoothing_width_A=float(smoothing_width_A),
             )
-            np.add.at(weights_accum, center_lookup[i_selected], weights)
+            np.add.at(weights_accum, selection_cache.center_lookup[i_selected], weights)
         return weights_accum
 
-    if same_selection:
+    center_indices = selection_cache.center_indices
+    neighbor_indices = selection_cache.neighbor_indices
+    if selection_cache.same_selection:
         pair_distances = np.asarray(frame.get_all_distances(mic=False), dtype=float)[
             np.ix_(center_indices, neighbor_indices)
         ]
@@ -972,7 +1034,7 @@ def _can_vectorize_coordination_kernel(
     *,
     pair_count: int,
 ) -> bool:
-    if pair_count <= 0 or pair_count > _COORD_VECTORIZE_PAIR_THRESHOLD:
+    if pair_count <= 0 or pair_count > _COORD_DENSE_PAIR_THRESHOLD:
         return False
     if not frames:
         return False
@@ -1014,26 +1076,60 @@ def _validate_coordination_matrix(
 def _compute_coordination_values_chunked(
     frames: list[Atoms],
     *,
-    center_indices: np.ndarray,
-    neighbor_indices: np.ndarray,
-    same_selection: bool,
+    selection_cache: _CoordinationSelectionCache | None = None,
+    center_indices: np.ndarray | None = None,
+    neighbor_indices: np.ndarray | None = None,
+    same_selection: bool | None = None,
     cutoff_A: float,
     smoothing_width_A: float,
 ) -> np.ndarray:
+    if selection_cache is None:
+        if center_indices is None or neighbor_indices is None or same_selection is None:
+            raise TypeError(
+                "Provide either selection_cache or center_indices/neighbor_indices/same_selection."
+            )
+        if not frames:
+            raise ValueError("At least one trajectory frame is required.")
+        resolved_center_indices = np.asarray(center_indices, dtype=int)
+        resolved_neighbor_indices = np.asarray(neighbor_indices, dtype=int)
+        if same_selection and not np.array_equal(resolved_center_indices, resolved_neighbor_indices):
+            raise ValueError(
+                "Same-species coordination requires identical center and neighbor index ordering."
+            )
+        center_lookup = np.full(len(frames[0]), -1, dtype=int)
+        center_lookup[resolved_center_indices] = np.arange(resolved_center_indices.size, dtype=int)
+        center_mask = np.zeros(len(frames[0]), dtype=bool)
+        center_mask[resolved_center_indices] = True
+        neighbor_mask = np.zeros(len(frames[0]), dtype=bool)
+        neighbor_mask[resolved_neighbor_indices] = True
+        selection_cache = _CoordinationSelectionCache(
+            center_indices=resolved_center_indices,
+            neighbor_indices=resolved_neighbor_indices,
+            center_lookup=center_lookup,
+            center_mask=center_mask,
+            neighbor_mask=neighbor_mask,
+            same_selection=bool(same_selection),
+            center_count=int(resolved_center_indices.size),
+            neighbor_count=int(resolved_neighbor_indices.size),
+            pair_count=max(
+                0,
+                int(resolved_center_indices.size) * int(resolved_neighbor_indices.size)
+                - (int(resolved_center_indices.size) if same_selection else 0),
+            ),
+        )
+
     frame_count = len(frames)
-    center_count = int(center_indices.size)
-    neighbor_count = int(neighbor_indices.size)
-    pair_count = max(0, center_count * neighbor_count - (center_count if same_selection else 0))
+    center_indices = selection_cache.center_indices
+    neighbor_indices = selection_cache.neighbor_indices
+    center_count = int(selection_cache.center_count)
+    neighbor_count = int(selection_cache.neighbor_count)
+    pair_count = int(selection_cache.pair_count)
     chunk_size = _resolve_coordination_chunk_size(frame_count=frame_count, pair_count=pair_count)
     use_mic = bool(frames) and all(_frame_has_usable_cell(frame) for frame in frames)
-    if same_selection and not np.array_equal(center_indices, neighbor_indices):
-        raise ValueError(
-            "Same-species coordination requires identical center and neighbor index ordering."
-        )
 
     coordination = np.zeros((frame_count, center_count), dtype=np.float32)
     with ProgressBar(
-        desc=f"Coordination values ({center_count}x{neighbor_count})",
+        desc=f"Computing coordination ({center_count}x{neighbor_count})",
         total=frame_count,
         unit="frame",
     ) as progress:
@@ -1066,7 +1162,7 @@ def _compute_coordination_values_chunked(
                     deltas / cell_lengths[:, np.newaxis, np.newaxis, :]
                 )
             distances = np.linalg.norm(deltas, axis=3)
-            if same_selection:
+            if selection_cache.same_selection:
                 diagonal = np.arange(center_count, dtype=int)
                 distances[:, diagonal, diagonal] = np.inf
             weights = _continuous_coordination_weights(
@@ -1080,6 +1176,138 @@ def _compute_coordination_values_chunked(
             )
             progress.update(stop - start)
     return coordination
+
+
+def _compute_coordination_profile_from_position_profile(
+    frames: list[Atoms],
+    *,
+    position_profile: Any,
+    species_b: str,
+    cutoff_resolution: CoordinationCutoffResolution,
+) -> CoordinationProfile:
+    """Compute one coordination profile reusing a precomputed center position profile."""
+    label_a = _normalize_species(str(position_profile.species))
+    label_b = _normalize_species(species_b)
+
+    selection_cache = _build_coordination_selection_cache(
+        frame=frames[0],
+        center_species=label_a,
+        neighbor_species=label_b,
+        center_indices=np.asarray(position_profile.atom_indices, dtype=int),
+    )
+    center_indices = selection_cache.center_indices
+    center_count = int(selection_cache.center_count)
+    neighbor_count = int(selection_cache.neighbor_count)
+    pair_count = int(selection_cache.pair_count)
+    if _can_vectorize_coordination_kernel(frames, pair_count=pair_count):
+        backend = _COORD_BACKEND_DENSE
+        coordination = _compute_coordination_values_chunked(
+            frames,
+            selection_cache=selection_cache,
+            cutoff_A=float(cutoff_resolution.cutoff_A),
+            smoothing_width_A=float(cutoff_resolution.smoothing_width_A),
+        )
+    else:
+        backend = (
+            _COORD_BACKEND_NEIGHBOR
+            if bool(frames) and all(_frame_has_usable_cell(frame) for frame in frames)
+            else _COORD_BACKEND_GENERIC
+        )
+        coordination = np.zeros(
+            (len(frames), center_count),
+            dtype=np.float32,
+        )
+        with ProgressBar(
+            desc=f"Computing coordination ({center_count}x{neighbor_count})",
+            total=len(frames),
+            unit="frame",
+        ) as progress:
+            for frame_index, frame in enumerate(frames):
+                coordination[frame_index, :] = _compute_coordination_frame_values(
+                    frame,
+                    selection_cache=selection_cache,
+                    cutoff_A=float(cutoff_resolution.cutoff_A),
+                    smoothing_width_A=float(cutoff_resolution.smoothing_width_A),
+                )
+                progress.update()
+
+    LOGGER.info(
+        "Computed coordination for %s-%s over %d frame(s) using %s (pair_count=%d, cutoff=%.6g A).",
+        label_a,
+        label_b,
+        len(frames),
+        backend,
+        pair_count,
+        float(cutoff_resolution.cutoff_A),
+    )
+
+    coordination = _validate_coordination_matrix(
+        coordination,
+        frame_count=len(frames),
+        center_count=center_count,
+    )
+    distance_to_surface = np.asarray(position_profile.distance_to_surface, dtype=float)
+    if distance_to_surface.shape != coordination.shape:
+        raise ValueError(
+            "Coordination/position alignment failed: distance-to-surface shape "
+            f"{distance_to_surface.shape} does not match coordination shape {coordination.shape}."
+        )
+    if not np.array_equal(center_indices, np.asarray(position_profile.atom_indices, dtype=int)):
+        raise ValueError(
+            "Coordination center ordering no longer matches the tracked position profile."
+        )
+
+    return CoordinationProfile(
+        species_a=label_a,
+        species_b=label_b,
+        axis=str(position_profile.axis),
+        atom_indices=center_indices,
+        frame_index=np.asarray(position_profile.frame_index, dtype=int),
+        step=np.asarray(position_profile.step, dtype=float),
+        time_fs=np.asarray(position_profile.time_fs, dtype=float),
+        time_ps=np.asarray(position_profile.time_ps, dtype=float),
+        distance_to_surface=np.asarray(distance_to_surface, dtype=np.float32),
+        coordination_number=np.asarray(coordination, dtype=np.float32),
+        n_frames=int(position_profile.n_frames),
+        n_atoms=int(position_profile.n_atoms),
+        coordinate_mode=str(position_profile.coordinate_mode),
+        surface_position=position_profile.surface_position,
+        surface_position_std=position_profile.surface_position_std,
+        surface_position_per_frame=(
+            None
+            if position_profile.surface_position_per_frame is None
+            else np.asarray(position_profile.surface_position_per_frame, dtype=float)
+        ),
+        surface_estimate=position_profile.surface_estimate,
+        cell_lengths_angstrom=position_profile.cell_lengths_angstrom,
+        cutoff_A=float(cutoff_resolution.cutoff_A),
+        cutoff_smoothing_width_A=float(cutoff_resolution.smoothing_width_A),
+        cutoff_mode=str(cutoff_resolution.mode),
+        cutoff_rdf_bin_centers_A=(
+            None
+            if cutoff_resolution.rdf_bin_centers_A is None
+            else np.asarray(cutoff_resolution.rdf_bin_centers_A, dtype=float)
+        ),
+        cutoff_rdf_g_r=(
+            None
+            if cutoff_resolution.rdf_g_r is None
+            else np.asarray(cutoff_resolution.rdf_g_r, dtype=float)
+        ),
+        cutoff_rdf_g_r_smoothed=(
+            None
+            if cutoff_resolution.rdf_g_r_smoothed is None
+            else np.asarray(cutoff_resolution.rdf_g_r_smoothed, dtype=float)
+        ),
+        cutoff_rdf_peak_A=cutoff_resolution.rdf_peak_A,
+        cutoff_rdf_minimum_A=cutoff_resolution.rdf_minimum_A,
+        cutoff_rdf_sampled_frame_index=(
+            None
+            if cutoff_resolution.rdf_sampled_frame_index is None
+            else np.asarray(cutoff_resolution.rdf_sampled_frame_index, dtype=int)
+        ),
+        cutoff_rdf_source_path=cutoff_resolution.rdf_source_path,
+        cutoff_diagnostic_plot_path=cutoff_resolution.diagnostic_plot_path,
+    )
 
 
 def compute_coordination_profile(
@@ -1118,132 +1346,81 @@ def compute_coordination_profile(
         include_fixed_surface_atoms=include_fixed_surface_atoms,
         surface_options=surface_options,
     )
-
-    neighbor_indices = _select_indices(frames[0], label_b)
-    if neighbor_indices.size == 0:
-        raise ValueError(f"No atoms found for species '{label_b}' in frame 0.")
-
-    same_selection = label_a == label_b
-    center_indices = np.asarray(position_profile.atom_indices, dtype=int)
-    center_count = int(center_indices.size)
-    neighbor_count = int(neighbor_indices.size)
-    pair_count = max(0, center_count * neighbor_count - (center_count if same_selection else 0))
-    LOGGER.info(
-        "Computing coordination values for %d frame(s), %d center atom(s), %d neighbor atom(s).",
-        len(frames),
-        center_count,
-        neighbor_count,
-    )
-    if _can_vectorize_coordination_kernel(frames, pair_count=pair_count):
-        chunk_size = _resolve_coordination_chunk_size(
-            frame_count=len(frames),
-            pair_count=max(1, pair_count),
-        )
-        LOGGER.info(
-            "Using chunked vectorized coordination kernel (pair_count=%d, chunk_size=%d frame(s)).",
-            pair_count,
-            chunk_size,
-        )
-        coordination = _compute_coordination_values_chunked(
-            frames,
-            center_indices=center_indices,
-            neighbor_indices=np.asarray(neighbor_indices, dtype=int),
-            same_selection=same_selection,
-            cutoff_A=float(cutoff_resolution.cutoff_A),
-            smoothing_width_A=float(cutoff_resolution.smoothing_width_A),
-        )
-    else:
-        LOGGER.info(
-            "Using framewise coordination kernel (pair_count=%d per frame).",
-            pair_count,
-        )
-        coordination = np.zeros(
-            (len(frames), center_count),
-            dtype=np.float32,
-        )
-        with ProgressBar(
-            desc=f"Coordination values ({center_count}x{neighbor_count})",
-            total=len(frames),
-            unit="frame",
-        ) as progress:
-            for frame_index, frame in enumerate(frames):
-                coordination[frame_index, :] = _compute_coordination_frame_values(
-                    frame,
-                    center_indices=center_indices,
-                    neighbor_indices=np.asarray(neighbor_indices, dtype=int),
-                    same_selection=same_selection,
-                    cutoff_A=float(cutoff_resolution.cutoff_A),
-                    smoothing_width_A=float(cutoff_resolution.smoothing_width_A),
-                )
-                progress.update()
-
-    coordination = _validate_coordination_matrix(
-        coordination,
-        frame_count=len(frames),
-        center_count=center_count,
-    )
-    distance_to_surface = np.asarray(position_profile.distance_to_surface, dtype=float)
-    if distance_to_surface.shape != coordination.shape:
-        raise ValueError(
-            "Coordination/position alignment failed: distance-to-surface shape "
-            f"{distance_to_surface.shape} does not match coordination shape {coordination.shape}."
-        )
-    if not np.array_equal(center_indices, np.asarray(position_profile.atom_indices, dtype=int)):
-        raise ValueError(
-            "Coordination center ordering no longer matches the tracked position profile."
-        )
-
-    return CoordinationProfile(
-        species_a=label_a,
+    return _compute_coordination_profile_from_position_profile(
+        frames,
+        position_profile=position_profile,
         species_b=label_b,
-        axis=axis_label,
-        atom_indices=center_indices,
-        frame_index=np.asarray(position_profile.frame_index, dtype=int),
-        step=np.asarray(position_profile.step, dtype=float),
-        time_fs=np.asarray(position_profile.time_fs, dtype=float),
-        time_ps=np.asarray(position_profile.time_ps, dtype=float),
-        distance_to_surface=np.asarray(distance_to_surface, dtype=np.float32),
-        coordination_number=np.asarray(coordination, dtype=np.float32),
-        n_frames=int(position_profile.n_frames),
-        n_atoms=int(position_profile.n_atoms),
-        coordinate_mode=position_profile.coordinate_mode,
-        surface_position=position_profile.surface_position,
-        surface_position_std=position_profile.surface_position_std,
-        surface_position_per_frame=(
-            None
-            if position_profile.surface_position_per_frame is None
-            else np.asarray(position_profile.surface_position_per_frame, dtype=float)
-        ),
-        surface_estimate=position_profile.surface_estimate,
-        cell_lengths_angstrom=position_profile.cell_lengths_angstrom,
-        cutoff_A=float(cutoff_resolution.cutoff_A),
-        cutoff_smoothing_width_A=float(cutoff_resolution.smoothing_width_A),
-        cutoff_mode=str(cutoff_resolution.mode),
-        cutoff_rdf_bin_centers_A=(
-            None
-            if cutoff_resolution.rdf_bin_centers_A is None
-            else np.asarray(cutoff_resolution.rdf_bin_centers_A, dtype=float)
-        ),
-        cutoff_rdf_g_r=(
-            None
-            if cutoff_resolution.rdf_g_r is None
-            else np.asarray(cutoff_resolution.rdf_g_r, dtype=float)
-        ),
-        cutoff_rdf_g_r_smoothed=(
-            None
-            if cutoff_resolution.rdf_g_r_smoothed is None
-            else np.asarray(cutoff_resolution.rdf_g_r_smoothed, dtype=float)
-        ),
-        cutoff_rdf_peak_A=cutoff_resolution.rdf_peak_A,
-        cutoff_rdf_minimum_A=cutoff_resolution.rdf_minimum_A,
-        cutoff_rdf_sampled_frame_index=(
-            None
-            if cutoff_resolution.rdf_sampled_frame_index is None
-            else np.asarray(cutoff_resolution.rdf_sampled_frame_index, dtype=int)
-        ),
-        cutoff_rdf_source_path=cutoff_resolution.rdf_source_path,
-        cutoff_diagnostic_plot_path=cutoff_resolution.diagnostic_plot_path,
+        cutoff_resolution=cutoff_resolution,
     )
+
+
+def compute_coordination_profiles(
+    frames: list[Atoms],
+    *,
+    ordered_pairs: Sequence[tuple[str, str]] | None = None,
+    axis: str = "z",
+    timestep_fs: float = 1.0,
+    surface_mode: str = "auto",
+    surface_elements: list[str] | tuple[str, ...] | None = None,
+    include_fixed_surface_atoms: bool = False,
+    surface_options: SurfaceEstimatorOptions | None = None,
+    cutoff_resolutions: Mapping[tuple[str, str], CoordinationCutoffResolution],
+) -> list[CoordinationProfile]:
+    """Compute ordered coordination profiles while reusing center trajectories."""
+    if not frames:
+        raise ValueError("At least one trajectory frame is required.")
+
+    axis_label = _normalize_axis(axis)
+    ensure_positive("timestep_fs", timestep_fs)
+    resolved_pairs = (
+        [
+            (_normalize_species(species_a), _normalize_species(species_b))
+            for species_a, species_b in ordered_pairs
+        ]
+        if ordered_pairs is not None
+        else _ordered_coordination_pairs_from_frames(frames)
+    )
+    if not resolved_pairs:
+        raise ValueError("At least one coordination pair is required.")
+
+    center_species_in_order: list[str] = []
+    for species_a, _species_b in resolved_pairs:
+        if species_a not in center_species_in_order:
+            center_species_in_order.append(species_a)
+
+    position_profiles_by_species: dict[str, Any] = {}
+    for species_a in center_species_in_order:
+        LOGGER.info(
+            "Resolving coordination center trajectories for %d frame(s) using species_a=%s.",
+            len(frames),
+            species_a,
+        )
+        position_profiles_by_species[species_a] = compute_position_profile(
+            frames,
+            species=species_a,
+            axis=axis_label,
+            timestep_fs=float(timestep_fs),
+            surface_mode=surface_mode,
+            surface_elements=surface_elements,
+            include_fixed_surface_atoms=include_fixed_surface_atoms,
+            surface_options=surface_options,
+        )
+
+    profiles: list[CoordinationProfile] = []
+    for pair in resolved_pairs:
+        if pair not in cutoff_resolutions:
+            raise ValueError(
+                f"Missing coordination cutoff resolution for pair {pair[0]}-{pair[1]}."
+            )
+        profiles.append(
+            _compute_coordination_profile_from_position_profile(
+                frames,
+                position_profile=position_profiles_by_species[pair[0]],
+                species_b=pair[1],
+                cutoff_resolution=cutoff_resolutions[pair],
+            )
+        )
+    return profiles
 
 
 def save_coordination_profile(
@@ -1298,12 +1475,99 @@ def save_coordination_profile(
             "cutoff_rdf_bin_centers_A": profile.cutoff_rdf_bin_centers_A,
             "cutoff_rdf_g_r": profile.cutoff_rdf_g_r,
             "cutoff_rdf_g_r_smoothed": profile.cutoff_rdf_g_r_smoothed,
-            "cutoff_rdf_sampled_frame_index": profile.cutoff_rdf_sampled_frame_index,
             **_surface_estimate_datasets(profile.surface_estimate),
-        },
+        }
+        | (
+            {}
+            if profile.cutoff_rdf_sampled_frame_index is None
+            else {
+                "cutoff_rdf_sampled_frame_index": profile.cutoff_rdf_sampled_frame_index,
+            }
+        ),
         metadata=metadata,
     )
     LOGGER.info("Saved coordination data to '%s'.", output_path)
+    return output_path
+
+
+def _coordination_profile_hdf5_payload(profile: CoordinationProfile) -> dict[str, Any]:
+    """Return LiNaK HDF5 payload pieces for one coordination profile."""
+    return {
+        "datasets": {
+            "frame_index": profile.frame_index,
+            "step": profile.step,
+            "time_fs": profile.time_fs,
+            "time_ps": profile.time_ps,
+            "atom_indices": profile.atom_indices,
+            "distance_to_surface_A": profile.distance_to_surface,
+            "coordination_number": profile.coordination_number,
+            "surface_position_per_frame_A": profile.surface_position_per_frame,
+            "cutoff_rdf_bin_centers_A": profile.cutoff_rdf_bin_centers_A,
+            "cutoff_rdf_g_r": profile.cutoff_rdf_g_r,
+            "cutoff_rdf_g_r_smoothed": profile.cutoff_rdf_g_r_smoothed,
+            **_surface_estimate_datasets(profile.surface_estimate),
+        }
+        | (
+            {}
+            if profile.cutoff_rdf_sampled_frame_index is None
+            else {
+                "cutoff_rdf_sampled_frame_index": profile.cutoff_rdf_sampled_frame_index,
+            }
+        ),
+        "metadata": build_profile_metadata(
+            analysis="coordination",
+            metadata={
+                "species_a": profile.species_a,
+                "species_b": profile.species_b,
+                "axis": profile.axis,
+                "n_frames": int(profile.n_frames),
+                "n_atoms": int(profile.n_atoms),
+                "coordinate_mode": profile.coordinate_mode,
+                "cell_lengths_angstrom": (
+                    None
+                    if profile.cell_lengths_angstrom is None
+                    else [float(value) for value in profile.cell_lengths_angstrom]
+                ),
+                "cutoff_A": profile.cutoff_A,
+                "cutoff_smoothing_width_A": profile.cutoff_smoothing_width_A,
+                "cutoff_mode": profile.cutoff_mode,
+                "cutoff_rdf_peak_A": profile.cutoff_rdf_peak_A,
+                "cutoff_rdf_minimum_A": profile.cutoff_rdf_minimum_A,
+                "cutoff_rdf_source_path": profile.cutoff_rdf_source_path,
+                "cutoff_diagnostic_plot_path": profile.cutoff_diagnostic_plot_path,
+                **_surface_metadata_payload(
+                    surface_position=profile.surface_position,
+                    surface_position_std=profile.surface_position_std,
+                    estimate=profile.surface_estimate,
+                ),
+            },
+        ),
+    }
+
+
+def save_coordination_profiles(
+    profiles: list[CoordinationProfile],
+    output: str | Path,
+    *,
+    additional_metadata: Mapping[str, Any] | None = None,
+) -> Path:
+    """Save one or more coordination profiles to LiNaK HDF5 and return the written path."""
+    if not profiles:
+        raise ValueError("At least one coordination profile is required.")
+    if len(profiles) == 1:
+        return save_coordination_profile(
+            profiles[0],
+            output,
+            additional_metadata=additional_metadata,
+        )
+
+    output_path = write_linak_hdf5_profile_collection(
+        output,
+        analysis="coordination",
+        profiles=[_coordination_profile_hdf5_payload(profile) for profile in profiles],
+        metadata=dict(additional_metadata or {}),
+    )
+    LOGGER.info("Saved %d coordination profiles to '%s'.", len(profiles), output_path)
     return output_path
 
 
@@ -1635,11 +1899,12 @@ def _plot_coordination_time_distance_projection(
     series_enabled: list[bool] | None,
     series_line_widths: list[float | None] | None,
     series_markers: list[str | None] | None,
-    series_normalization_modes: list[str] | None,
+    series_normalization_modes: list[str | None] | None,
     series_normalization_values: list[float | None] | None,
     series_normalization_x_refs: list[float | None] | None,
     x_bin_width: float | None,
     x_bin_reducer: str | None,
+    annotations: list[dict[str, Any]] | None,
     capture_state: dict[str, Any] | None,
     suppress_output_log: bool,
     matplotlib_rc: dict[str, Any] | None,
@@ -1767,7 +2032,7 @@ def _plot_coordination_time_distance_projection(
             segment_color_all = np.concatenate(segment_color_blocks, axis=0)
             collection = LineCollection(
                 segments_all,
-                cmap="viridis",
+                cmap="turbo",
                 norm=norm,
                 **line_collection_kwargs,
             )
@@ -1779,7 +2044,7 @@ def _plot_coordination_time_distance_projection(
                 np.asarray(point_x_values, dtype=float),
                 np.asarray(point_y_values, dtype=float),
                 c=np.asarray(point_color_values, dtype=float),
-                cmap="viridis",
+                cmap="turbo",
                 norm=norm,
                 s=marker_size,
                 edgecolors="none",
@@ -1868,6 +2133,7 @@ def _plot_coordination_time_distance_projection(
             ax.set_ylim(bottom=bottom, top=top)
         if axes_kwargs is not None:
             ax.set(**dict(axes_kwargs))
+        annotation_summaries = _render_plot_annotations(ax, annotations)
 
         if tight_layout_kwargs is not None:
             fig.tight_layout(**dict(tight_layout_kwargs))
@@ -1898,6 +2164,7 @@ def _plot_coordination_time_distance_projection(
                     "markers": bool(point_x_values),
                     "component": "time-distance",
                     "time_axis": str(time_axis).strip().lower(),
+                    "annotations_summary": annotation_summaries,
                 }
             )
 
@@ -1954,6 +2221,7 @@ def plot_coordination_profile(
     legend_loc: str = "best",
     line_label: str | None = None,
     line_colors: list[str] | None = None,
+    error_config: dict[str, Any] | None = None,
     series_enabled: list[bool] | None = None,
     series_show_in_legend: list[bool] | None = None,
     series_line_widths: list[float | None] | None = None,
@@ -1962,11 +2230,17 @@ def plot_coordination_profile(
     series_fit_enabled: list[bool] | None = None,
     series_fit_labels: list[str | None] | None = None,
     series_fit_show_in_legend: list[bool] | None = None,
-    series_normalization_modes: list[str] | None = None,
+    series_cumulative_configs: list[dict[str, Any] | None] | None = None,
+    render_series_descriptors: list[dict[str, Any]] | None = None,
+    series_overrides_by_id: dict[str, dict[str, Any]] | None = None,
+    cumulative_config: dict[str, Any] | None = None,
+    series_normalization_modes: list[str | None] | None = None,
     series_normalization_values: list[float | None] | None = None,
     series_normalization_x_refs: list[float | None] | None = None,
     x_bin_width: float | None = None,
     x_bin_reducer: str | None = None,
+    min_bin_points: int | None = None,
+    annotations: list[dict[str, Any]] | None = None,
     capture_state: dict[str, Any] | None = None,
     suppress_output_log: bool = False,
     matplotlib_rc: dict[str, Any] | None = None,
@@ -2013,6 +2287,7 @@ def plot_coordination_profile(
             series_normalization_x_refs=series_normalization_x_refs,
             x_bin_width=x_bin_width,
             x_bin_reducer=x_bin_reducer,
+            annotations=annotations,
             capture_state=capture_state,
             suppress_output_log=suppress_output_log,
             matplotlib_rc=matplotlib_rc,
@@ -2054,11 +2329,21 @@ def plot_coordination_profile(
             series_fit_enabled=series_fit_enabled,
             series_fit_labels=series_fit_labels,
             series_fit_show_in_legend=series_fit_show_in_legend,
+            series_cumulative_configs=series_cumulative_configs,
+            series_error_configs=[error_config] * profile.n_atoms
+            if error_config is not None
+            else None,
+            series_raw_statistics=[True] * profile.n_atoms,
             series_normalization_modes=series_normalization_modes,
             series_normalization_values=series_normalization_values,
             series_normalization_x_refs=series_normalization_x_refs,
+            render_series_descriptors=render_series_descriptors,
+            series_overrides_by_id=series_overrides_by_id,
             x_bin_width=x_bin_width,
             x_bin_reducer=x_bin_reducer,
+            min_bin_points=min_bin_points,
+            analysis_name="coordination",
+            annotations=annotations,
             x_scale=x_scale,
             y_scale=y_scale,
             x_lim=x_lim,
@@ -2090,11 +2375,8 @@ def plot_coordination_profile(
 
     bin_width = _DEFAULT_DISTANCE_BIN_WIDTH_A if x_bin_width is None else float(x_bin_width)
     reducer = "mean" if x_bin_reducer is None else str(x_bin_reducer).strip().lower()
-    x_values, y_values = _coordination_distance_series(
-        profile,
-        bin_width_A=bin_width,
-        reducer=reducer,
-    )
+    x_values = np.asarray(profile.distance_to_surface, dtype=float).reshape(-1)
+    y_values = np.asarray(profile.coordination_number, dtype=float).reshape(-1)
     line_label_resolved = line_label or f"{profile.species_a}-{profile.species_b}"
     effective_legend = False if legend is None else legend
     return plot_line_series(
@@ -2122,11 +2404,17 @@ def plot_coordination_profile(
         fit_show_in_legend=(
             True if not series_fit_show_in_legend else bool(series_fit_show_in_legend[0])
         ),
+        cumulative_config=cumulative_config,
+        raw_point_statistics=True,
+        error_config=error_config,
         normalization_mode=series_normalization_modes[0] if series_normalization_modes else None,
         normalization_value=series_normalization_values[0] if series_normalization_values else None,
         normalization_x_ref=series_normalization_x_refs[0] if series_normalization_x_refs else None,
-        x_bin_width=None,
-        x_bin_reducer=None,
+        x_bin_width=bin_width,
+        x_bin_reducer=reducer,
+        min_bin_points=min_bin_points,
+        analysis_name="coordination",
+        annotations=annotations,
         style=style,
         x_scale=x_scale,
         y_scale=y_scale,
@@ -2189,6 +2477,7 @@ def plot_coordination_profiles(
     series_ids: list[str] | None = None,
     series_labels: list[str] | None = None,
     line_colors: list[str] | None = None,
+    series_error_configs: list[dict[str, Any] | None] | None = None,
     series_enabled: list[bool] | None = None,
     series_show_in_legend: list[bool] | None = None,
     series_line_widths: list[float | None] | None = None,
@@ -2197,11 +2486,16 @@ def plot_coordination_profiles(
     series_fit_enabled: list[bool] | None = None,
     series_fit_labels: list[str | None] | None = None,
     series_fit_show_in_legend: list[bool] | None = None,
-    series_normalization_modes: list[str] | None = None,
+    series_cumulative_configs: list[dict[str, Any] | None] | None = None,
+    render_series_descriptors: list[dict[str, Any]] | None = None,
+    series_overrides_by_id: dict[str, dict[str, Any]] | None = None,
+    series_normalization_modes: list[str | None] | None = None,
     series_normalization_values: list[float | None] | None = None,
     series_normalization_x_refs: list[float | None] | None = None,
     x_bin_width: float | None = None,
     x_bin_reducer: str | None = None,
+    min_bin_points: int | None = None,
+    annotations: list[dict[str, Any]] | None = None,
     capture_state: dict[str, Any] | None = None,
     suppress_output_log: bool = False,
     matplotlib_rc: dict[str, Any] | None = None,
@@ -2252,6 +2546,7 @@ def plot_coordination_profiles(
             series_normalization_x_refs=series_normalization_x_refs,
             x_bin_width=x_bin_width,
             x_bin_reducer=x_bin_reducer,
+            annotations=annotations,
             capture_state=capture_state,
             suppress_output_log=suppress_output_log,
             matplotlib_rc=matplotlib_rc,
@@ -2311,11 +2606,20 @@ def plot_coordination_profiles(
             series_fit_enabled=series_fit_enabled,
             series_fit_labels=series_fit_labels,
             series_fit_show_in_legend=series_fit_show_in_legend,
+            series_cumulative_configs=series_cumulative_configs,
+            render_series_descriptors=render_series_descriptors,
+            series_overrides_by_id=series_overrides_by_id,
+            cumulative_config=None
+            if not series_cumulative_configs
+            else series_cumulative_configs[0],
+            error_config=None if not series_error_configs else series_error_configs[0],
             series_normalization_modes=series_normalization_modes,
             series_normalization_values=series_normalization_values,
             series_normalization_x_refs=series_normalization_x_refs,
             x_bin_width=x_bin_width,
             x_bin_reducer=x_bin_reducer,
+            min_bin_points=min_bin_points,
+            annotations=annotations,
             capture_state=capture_state,
             suppress_output_log=suppress_output_log,
             matplotlib_rc=matplotlib_rc,
@@ -2365,11 +2669,19 @@ def plot_coordination_profiles(
             series_fit_enabled=series_fit_enabled,
             series_fit_labels=series_fit_labels,
             series_fit_show_in_legend=series_fit_show_in_legend,
+            series_cumulative_configs=series_cumulative_configs,
+            series_error_configs=series_error_configs,
+            series_raw_statistics=[True] * len(labels),
             series_normalization_modes=series_normalization_modes,
             series_normalization_values=series_normalization_values,
             series_normalization_x_refs=series_normalization_x_refs,
+            render_series_descriptors=render_series_descriptors,
+            series_overrides_by_id=series_overrides_by_id,
             x_bin_width=x_bin_width,
             x_bin_reducer=x_bin_reducer,
+            min_bin_points=min_bin_points,
+            analysis_name="coordination",
+            annotations=annotations,
             x_scale=x_scale,
             y_scale=y_scale,
             x_lim=x_lim,
@@ -2407,13 +2719,8 @@ def plot_coordination_profiles(
     default_labels = []
     default_x_label = _coordination_distance_label(profiles[0])
     for profile in profiles:
-        x_values, y_values = _coordination_distance_series(
-            profile,
-            bin_width_A=bin_width,
-            reducer=reducer,
-        )
-        x_series.append(x_values)
-        y_series.append(y_values)
+        x_series.append(np.asarray(profile.distance_to_surface, dtype=float).reshape(-1))
+        y_series.append(np.asarray(profile.coordination_number, dtype=float).reshape(-1))
         default_labels.append(f"{profile.species_a}-{profile.species_b}")
         default_x_label = _coordination_distance_label(profile)
     labels = resolve_series_labels(default_labels, series_labels, series_kind="coordination")
@@ -2440,11 +2747,19 @@ def plot_coordination_profiles(
         series_fit_enabled=series_fit_enabled,
         series_fit_labels=series_fit_labels,
         series_fit_show_in_legend=series_fit_show_in_legend,
+        series_cumulative_configs=series_cumulative_configs,
+        series_error_configs=series_error_configs,
+        series_raw_statistics=[True] * len(labels),
         series_normalization_modes=series_normalization_modes,
         series_normalization_values=series_normalization_values,
         series_normalization_x_refs=series_normalization_x_refs,
-        x_bin_width=None,
-        x_bin_reducer=None,
+        render_series_descriptors=render_series_descriptors,
+        series_overrides_by_id=series_overrides_by_id,
+        x_bin_width=bin_width,
+        x_bin_reducer=reducer,
+        min_bin_points=min_bin_points,
+        analysis_name="coordination",
+        annotations=annotations,
         x_scale=x_scale,
         y_scale=y_scale,
         x_lim=x_lim,

@@ -19,6 +19,13 @@ from ..storage.hdf5_utils import (
     write_linak_hdf5,
 )
 from .schema import build_profile_metadata, default_plot_labels
+from .statistics import (
+    SeriesStatistics,
+    build_series_statistics,
+    build_statistics_metadata,
+    statistics_payload_from_series_map,
+    statistics_series_map_from_datasets,
+)
 from ..plot.plotting import (
     DEFAULT_PLOT_STYLE,
     PlotStyle,
@@ -43,6 +50,7 @@ class MSDProfile:
     time_ps: np.ndarray
     msd: np.ndarray
     n_frames: int
+    series_statistics: dict[str, SeriesStatistics] | None = None
 
 
 def _normalize_species(species: str | None) -> str:
@@ -101,6 +109,7 @@ def compute_msd(
 
     reference_positions = np.asarray(reference.positions[reference_indices], dtype=float)
     msd = np.zeros(len(frames), dtype=float)
+    squared_samples_by_lag = np.zeros((len(frames), reference_indices.size), dtype=float)
     use_pbc_mic = all(_frame_has_usable_cell(frame) for frame in frames)
 
     if use_pbc_mic:
@@ -130,7 +139,9 @@ def compute_msd(
                 unwrapped_positions += np.asarray(mic_steps, dtype=float)
 
                 displacements = unwrapped_positions - reference_positions
-                msd[i] = float(np.mean(np.sum(displacements**2, axis=1)))
+                squared_displacements = np.sum(displacements**2, axis=1)
+                squared_samples_by_lag[i, :] = np.asarray(squared_displacements, dtype=float)
+                msd[i] = float(np.mean(squared_displacements))
                 prev_positions = current_positions
                 progress.update()
     else:
@@ -152,11 +163,18 @@ def compute_msd(
                 displacements = (
                     np.asarray(frame.positions[frame_indices], dtype=float) - reference_positions
                 )
-                msd[i] = float(np.mean(np.sum(displacements**2, axis=1)))
+                squared_displacements = np.sum(displacements**2, axis=1)
+                squared_samples_by_lag[i, :] = np.asarray(squared_displacements, dtype=float)
+                msd[i] = float(np.mean(squared_displacements))
                 progress.update()
 
     time_fs = np.arange(len(frames), dtype=float) * timestep_fs
     time_ps = time_fs / 1000.0
+    statistics = build_series_statistics(
+        point_count=np.full(len(frames), reference_indices.size, dtype=int),
+        sample_values=squared_samples_by_lag.T,
+        block_values=None,
+    )
 
     return MSDProfile(
         species=species_label,
@@ -164,6 +182,7 @@ def compute_msd(
         time_ps=time_ps,
         msd=msd,
         n_frames=len(frames),
+        series_statistics={"msd_A2": statistics},
     )
 
 
@@ -174,12 +193,18 @@ def save_msd_profile(
     additional_metadata: Mapping[str, Any] | None = None,
 ) -> Path:
     """Save MSD profile to LiNaK HDF5 and return written path."""
+    metadata_payload = {
+        "species": profile.species,
+        "n_frames": profile.n_frames,
+    }
+    if profile.series_statistics:
+        metadata_payload["statistics"] = build_statistics_metadata(
+            statistics_by_series=profile.series_statistics,
+            block_lengths=None,
+        )
     metadata = build_profile_metadata(
         analysis="msd",
-        metadata={
-            "species": profile.species,
-            "n_frames": profile.n_frames,
-        },
+        metadata=metadata_payload,
     )
     if additional_metadata:
         metadata.update(dict(additional_metadata))
@@ -191,6 +216,7 @@ def save_msd_profile(
             "time_fs": profile.time_fs,
             "time_ps": profile.time_ps,
             "msd_A2": profile.msd,
+            **statistics_payload_from_series_map(profile.series_statistics),
         },
         metadata=metadata,
     )
@@ -237,6 +263,10 @@ def _load_msd_profiles_from_payloads(
         time_ps = np.asarray(datasets["time_ps"], dtype=float)
         msd = np.asarray(datasets["msd_A2"], dtype=float)
         n_frames = int(metadata.get("n_frames", time_fs.size))
+        series_statistics = statistics_series_map_from_datasets(
+            datasets,
+            dataset_names=("msd_A2",),
+        )
 
         profiles.append(
             MSDProfile(
@@ -245,6 +275,7 @@ def _load_msd_profiles_from_payloads(
                 time_ps=time_ps,
                 msd=msd,
                 n_frames=n_frames,
+                series_statistics=series_statistics,
             )
         )
     return profiles
@@ -312,6 +343,7 @@ def plot_msd_profile(
     legend_loc: str = "best",
     line_label: str | None = None,
     line_colors: list[str] | None = None,
+    error_config: dict[str, Any] | None = None,
     series_enabled: list[bool] | None = None,
     series_show_in_legend: list[bool] | None = None,
     series_line_widths: list[float | None] | None = None,
@@ -320,11 +352,14 @@ def plot_msd_profile(
     series_fit_enabled: list[bool] | None = None,
     series_fit_labels: list[str | None] | None = None,
     series_fit_show_in_legend: list[bool] | None = None,
-    series_normalization_modes: list[str] | None = None,
+    cumulative_config: dict[str, Any] | None = None,
+    series_normalization_modes: list[str | None] | None = None,
     series_normalization_values: list[float | None] | None = None,
     series_normalization_x_refs: list[float | None] | None = None,
     x_bin_width: float | None = None,
     x_bin_reducer: str | None = None,
+    min_bin_points: int | None = None,
+    annotations: list[dict[str, Any]] | None = None,
     capture_state: dict[str, Any] | None = None,
     suppress_output_log: bool = False,
     matplotlib_rc: dict[str, Any] | None = None,
@@ -378,11 +413,19 @@ def plot_msd_profile(
         fit_show_in_legend=(
             True if not series_fit_show_in_legend else bool(series_fit_show_in_legend[0])
         ),
+        cumulative_config=cumulative_config,
+        series_statistics=None
+        if profile.series_statistics is None
+        else profile.series_statistics.get("msd_A2"),
+        error_config=error_config,
         normalization_mode=single_series.normalization_mode,
         normalization_value=single_series.normalization_value,
         normalization_x_ref=single_series.normalization_x_ref,
         x_bin_width=x_bin_width,
         x_bin_reducer=x_bin_reducer,
+        min_bin_points=min_bin_points,
+        analysis_name="msd",
+        annotations=annotations,
         style=style,
         x_scale=x_scale,
         y_scale=y_scale,
@@ -443,6 +486,7 @@ def plot_msd_profiles(
     series_ids: list[str] | None = None,
     series_labels: list[str] | None = None,
     line_colors: list[str] | None = None,
+    series_error_configs: list[dict[str, Any] | None] | None = None,
     series_enabled: list[bool] | None = None,
     series_show_in_legend: list[bool] | None = None,
     series_line_widths: list[float | None] | None = None,
@@ -451,11 +495,16 @@ def plot_msd_profiles(
     series_fit_enabled: list[bool] | None = None,
     series_fit_labels: list[str | None] | None = None,
     series_fit_show_in_legend: list[bool] | None = None,
-    series_normalization_modes: list[str] | None = None,
+    series_cumulative_configs: list[dict[str, Any] | None] | None = None,
+    render_series_descriptors: list[dict[str, Any]] | None = None,
+    series_overrides_by_id: dict[str, dict[str, Any]] | None = None,
+    series_normalization_modes: list[str | None] | None = None,
     series_normalization_values: list[float | None] | None = None,
     series_normalization_x_refs: list[float | None] | None = None,
     x_bin_width: float | None = None,
     x_bin_reducer: str | None = None,
+    min_bin_points: int | None = None,
+    annotations: list[dict[str, Any]] | None = None,
     capture_state: dict[str, Any] | None = None,
     suppress_output_log: bool = False,
     matplotlib_rc: dict[str, Any] | None = None,
@@ -511,15 +560,21 @@ def plot_msd_profiles(
             legend_loc=legend_loc,
             line_label=labels[0] if labels else None,
             line_colors=line_colors,
+            error_config=None if not series_error_configs else series_error_configs[0],
             series_enabled=series_enabled,
             series_line_widths=series_line_widths,
             series_markers=series_markers,
             series_fit_configs=series_fit_configs,
+            cumulative_config=None
+            if not series_cumulative_configs
+            else series_cumulative_configs[0],
             series_normalization_modes=series_normalization_modes,
             series_normalization_values=series_normalization_values,
             series_normalization_x_refs=series_normalization_x_refs,
             x_bin_width=x_bin_width,
             x_bin_reducer=x_bin_reducer,
+            min_bin_points=min_bin_points,
+            annotations=annotations,
             capture_state=capture_state,
             suppress_output_log=suppress_output_log,
             matplotlib_rc=matplotlib_rc,
@@ -555,11 +610,22 @@ def plot_msd_profiles(
         series_fit_enabled=series_fit_enabled,
         series_fit_labels=series_fit_labels,
         series_fit_show_in_legend=series_fit_show_in_legend,
+        series_cumulative_configs=series_cumulative_configs,
+        series_error_configs=series_error_configs,
+        series_statistics_data=[
+            None if profile.series_statistics is None else profile.series_statistics.get("msd_A2")
+            for profile in profiles
+        ],
         series_normalization_modes=series_normalization_modes,
         series_normalization_values=series_normalization_values,
         series_normalization_x_refs=series_normalization_x_refs,
+        render_series_descriptors=render_series_descriptors,
+        series_overrides_by_id=series_overrides_by_id,
         x_bin_width=x_bin_width,
         x_bin_reducer=x_bin_reducer,
+        min_bin_points=min_bin_points,
+        analysis_name="msd",
+        annotations=annotations,
         x_scale=x_scale,
         y_scale=y_scale,
         x_lim=x_lim,

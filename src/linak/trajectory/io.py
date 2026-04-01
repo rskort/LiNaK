@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from dataclasses import dataclass
+from datetime import datetime, timezone
 import logging
 import os
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
+import h5py
 import numpy as np
 from ase import Atoms
 from ase.calculators.singlepoint import SinglePointCalculator
+from ase.constraints import FixAtoms
 from ase.io import iread, write
 from ase.io.formats import UnknownFileTypeError
 from ase.io import lammpsrun as ase_lammpsrun
@@ -25,6 +30,472 @@ from ..progress import ProgressBar
 LOGGER = logging.getLogger(__name__)
 
 _ASE_LAMMPS_DATA_TO_ASE_ATOMS = getattr(ase_lammpsrun, "lammps_data_to_ase_atoms", None)
+
+_XYZ_LIKE_SUFFIXES = {".xyz", ".extxyz"}
+LINAK_TRAJECTORY_HDF5_FORMAT = "linak-trajectory-hdf5"
+LINAK_TRAJECTORY_HDF5_VERSION = 1
+_TRAJECTORY_INFO_INT_KEYS = ("timestep",)
+_TRAJECTORY_INFO_FLOAT_KEYS = (
+    "frame_timestep_fs",
+    "md_timestep_fs",
+    "trajectory_stride_md",
+    "time_fs",
+)
+
+
+@dataclass(frozen=True)
+class TrajectoryStoredMetadata:
+    """Optional simulation-context metadata stored alongside trajectory arrays."""
+
+    input_path: Path | None = None
+    input_format: str | None = None
+    cell_angstrom: tuple[float, float, float] | None = None
+    cell_source: str | None = None
+    frame_timestep_fs: float | None = None
+    md_timestep_fs: float | None = None
+    trajectory_stride_md: int | None = None
+    timestep_source: str | None = None
+    fixed_atom_indices: tuple[int, ...] = ()
+    fixed_atoms_source: str | None = None
+
+
+def default_trajectory_hdf5_output_path(source: str | Path) -> Path:
+    """Return the default output path for a converted LiNaK trajectory HDF5."""
+    source_path = Path(source).expanduser().resolve()
+    stem = source_path.stem or source_path.name or "trajectory"
+    return source_path.with_name(f"{stem}.traj.h5")
+
+
+def is_linak_trajectory_hdf5(path: str | Path) -> bool:
+    """Return ``True`` when ``path`` is a LiNaK trajectory HDF5 container."""
+    source_path = Path(path).expanduser().resolve()
+    if source_path.suffix.lower() not in {".h5", ".hdf5"}:
+        return False
+    try:
+        with h5py.File(source_path, "r") as handle:
+            return (
+                str(handle.attrs.get("linak_format", "")).strip() == LINAK_TRAJECTORY_HDF5_FORMAT
+                and str(handle.attrs.get("kind", "")).strip() == "trajectory"
+            )
+    except OSError:
+        return False
+
+
+def _normalize_stored_metadata(
+    metadata: TrajectoryStoredMetadata | None,
+) -> TrajectoryStoredMetadata | None:
+    if metadata is None:
+        return None
+
+    input_path = (
+        metadata.input_path.expanduser().resolve() if metadata.input_path is not None else None
+    )
+    input_format = (
+        str(metadata.input_format).strip().lower() or None if metadata.input_format else None
+    )
+    cell_angstrom = (
+        cast(
+            tuple[float, float, float],
+            tuple(float(value) for value in metadata.cell_angstrom),
+        )
+        if metadata.cell_angstrom is not None
+        else None
+    )
+    cell_source = str(metadata.cell_source).strip() or None if metadata.cell_source else None
+    frame_timestep_fs = (
+        float(metadata.frame_timestep_fs) if metadata.frame_timestep_fs is not None else None
+    )
+    md_timestep_fs = float(metadata.md_timestep_fs) if metadata.md_timestep_fs is not None else None
+    trajectory_stride_md = (
+        int(metadata.trajectory_stride_md) if metadata.trajectory_stride_md is not None else None
+    )
+    timestep_source = (
+        str(metadata.timestep_source).strip() or None if metadata.timestep_source else None
+    )
+    fixed_atom_indices = tuple(
+        sorted({int(index) for index in metadata.fixed_atom_indices if int(index) >= 0})
+    )
+    fixed_atoms_source = (
+        str(metadata.fixed_atoms_source).strip() or None if metadata.fixed_atoms_source else None
+    )
+    return TrajectoryStoredMetadata(
+        input_path=input_path,
+        input_format=input_format,
+        cell_angstrom=cell_angstrom,
+        cell_source=cell_source,
+        frame_timestep_fs=frame_timestep_fs,
+        md_timestep_fs=md_timestep_fs,
+        trajectory_stride_md=trajectory_stride_md,
+        timestep_source=timestep_source,
+        fixed_atom_indices=fixed_atom_indices,
+        fixed_atoms_source=fixed_atoms_source,
+    )
+
+
+def _fixed_atom_indices_from_constraints(frames: list[Atoms]) -> tuple[int, ...]:
+    if not frames:
+        return ()
+    reference_indices: tuple[int, ...] | None = None
+    for frame in frames:
+        indices: set[int] = set()
+        for constraint in getattr(frame, "constraints", ()) or ():
+            get_indices = getattr(constraint, "get_indices", None)
+            if get_indices is None:
+                continue
+            try:
+                indices.update(int(index) for index in np.asarray(get_indices(), dtype=int).ravel())
+            except Exception:  # pragma: no cover - defensive against third-party constraints.
+                continue
+        current = tuple(sorted(index for index in indices if index >= 0))
+        if reference_indices is None:
+            reference_indices = current
+            continue
+        if current != reference_indices:
+            return ()
+    return reference_indices or ()
+
+
+def _resolve_write_metadata(
+    frames: list[Atoms],
+    metadata: TrajectoryStoredMetadata | None,
+) -> TrajectoryStoredMetadata | None:
+    resolved = _normalize_stored_metadata(metadata)
+    if resolved is None:
+        fixed_atom_indices = _fixed_atom_indices_from_constraints(frames)
+        if not fixed_atom_indices:
+            return None
+        return TrajectoryStoredMetadata(
+            fixed_atom_indices=fixed_atom_indices,
+            fixed_atoms_source="trajectory constraints",
+        )
+
+    fixed_atom_indices = resolved.fixed_atom_indices or _fixed_atom_indices_from_constraints(frames)
+    fixed_atoms_source = resolved.fixed_atoms_source
+    if fixed_atom_indices and fixed_atoms_source is None:
+        fixed_atoms_source = "trajectory constraints"
+    return TrajectoryStoredMetadata(
+        input_path=resolved.input_path,
+        input_format=resolved.input_format,
+        cell_angstrom=resolved.cell_angstrom,
+        cell_source=resolved.cell_source,
+        frame_timestep_fs=resolved.frame_timestep_fs,
+        md_timestep_fs=resolved.md_timestep_fs,
+        trajectory_stride_md=resolved.trajectory_stride_md,
+        timestep_source=resolved.timestep_source,
+        fixed_atom_indices=fixed_atom_indices,
+        fixed_atoms_source=fixed_atoms_source,
+    )
+
+
+def read_trajectory_hdf5_metadata(path: str | Path) -> TrajectoryStoredMetadata | None:
+    """Read stored simulation-context metadata from a LiNaK trajectory HDF5."""
+    trajectory_path = Path(path).expanduser().resolve()
+    if not is_linak_trajectory_hdf5(trajectory_path):
+        return None
+
+    with h5py.File(trajectory_path, "r") as handle:
+        metadata_group = handle.get("metadata")
+        if not isinstance(metadata_group, h5py.Group):
+            return None
+
+        input_path_raw = metadata_group.attrs.get("input_path")
+        input_path = (
+            Path(str(input_path_raw)).expanduser().resolve()
+            if input_path_raw not in (None, "")
+            else None
+        )
+        input_format_raw = metadata_group.attrs.get("input_format")
+        input_format = (
+            str(input_format_raw).strip().lower() if input_format_raw not in (None, "") else None
+        )
+        cell_source_raw = metadata_group.attrs.get("cell_source")
+        cell_source = str(cell_source_raw).strip() if cell_source_raw not in (None, "") else None
+        timestep_source_raw = metadata_group.attrs.get("timestep_source")
+        timestep_source = (
+            str(timestep_source_raw).strip() if timestep_source_raw not in (None, "") else None
+        )
+        fixed_atoms_source_raw = metadata_group.attrs.get("fixed_atoms_source")
+        fixed_atoms_source = (
+            str(fixed_atoms_source_raw).strip()
+            if fixed_atoms_source_raw not in (None, "")
+            else None
+        )
+
+        cell_dataset = metadata_group.get("cell_angstrom")
+        cell_angstrom = (
+            cast(
+                tuple[float, float, float],
+                tuple(
+                    float(value) for value in np.asarray(cell_dataset, dtype=np.float64).tolist()
+                ),
+            )
+            if isinstance(cell_dataset, h5py.Dataset)
+            else None
+        )
+        fixed_atom_indices_dataset = metadata_group.get("fixed_atom_indices")
+        fixed_atom_indices = (
+            tuple(
+                int(value)
+                for value in np.asarray(fixed_atom_indices_dataset, dtype=np.int64).tolist()
+            )
+            if isinstance(fixed_atom_indices_dataset, h5py.Dataset)
+            else ()
+        )
+        frame_timestep_fs_raw = metadata_group.attrs.get("frame_timestep_fs")
+        md_timestep_fs_raw = metadata_group.attrs.get("md_timestep_fs")
+        trajectory_stride_md_raw = metadata_group.attrs.get("trajectory_stride_md")
+
+        return _normalize_stored_metadata(
+            TrajectoryStoredMetadata(
+                input_path=input_path,
+                input_format=input_format,
+                cell_angstrom=cell_angstrom,
+                cell_source=cell_source,
+                frame_timestep_fs=(
+                    float(frame_timestep_fs_raw) if frame_timestep_fs_raw is not None else None
+                ),
+                md_timestep_fs=float(md_timestep_fs_raw)
+                if md_timestep_fs_raw is not None
+                else None,
+                trajectory_stride_md=(
+                    int(trajectory_stride_md_raw) if trajectory_stride_md_raw is not None else None
+                ),
+                timestep_source=timestep_source,
+                fixed_atom_indices=fixed_atom_indices,
+                fixed_atoms_source=fixed_atoms_source,
+            )
+        )
+
+
+def _collect_frame_info_values(
+    frames: list[Atoms],
+    *,
+    key: str,
+    dtype: type[np.floating[Any]] | type[np.integer[Any]] | str,
+) -> np.ndarray | None:
+    values: list[float | int] = []
+    for frame in frames:
+        raw_value = frame.info.get(key)
+        if raw_value is None or isinstance(raw_value, bool):
+            return None
+        if not isinstance(raw_value, (int, float, np.integer, np.floating)):
+            return None
+        values.append(float(raw_value) if dtype == np.float64 else int(raw_value))
+    if not values:
+        return None
+    return np.asarray(values, dtype=dtype)
+
+
+def _validate_fixed_topology_frames(frames: list[Atoms]) -> np.ndarray:
+    reference = frames[0].get_atomic_numbers()
+    if len(reference) == 0:
+        raise ValueError("Converted trajectory HDF5 requires at least one atom per frame.")
+
+    for index, frame in enumerate(frames[1:], start=1):
+        current = frame.get_atomic_numbers()
+        if len(current) != len(reference):
+            raise ValueError(
+                "LiNaK trajectory HDF5 conversion currently supports fixed topology only: "
+                f"frame 0 has {len(reference)} atoms but frame {index} has {len(current)}."
+            )
+        if not np.array_equal(current, reference):
+            raise ValueError(
+                "LiNaK trajectory HDF5 conversion currently supports fixed topology only: "
+                f"atomic numbers/order differ in frame {index}."
+            )
+    return reference
+
+
+def _write_trajectory_hdf5(
+    frames: list[Atoms],
+    output_path: Path,
+    *,
+    source_path: str | Path | None = None,
+    source_format: str | None = None,
+    metadata: TrajectoryStoredMetadata | None = None,
+) -> Path:
+    atomic_numbers = _validate_fixed_topology_frames(frames)
+    frame_count = len(frames)
+    atom_count = len(atomic_numbers)
+    chunk_frames = max(1, min(frame_count, 64))
+
+    positions = np.empty((frame_count, atom_count, 3), dtype=np.float64)
+    cells = np.empty((frame_count, 3, 3), dtype=np.float64)
+    pbc = np.empty((frame_count, 3), dtype=bool)
+    for index, frame in enumerate(frames):
+        positions[index] = np.asarray(frame.get_positions(), dtype=np.float64)
+        cells[index] = np.asarray(frame.cell.array, dtype=np.float64)
+        pbc[index] = np.asarray(frame.get_pbc(), dtype=bool)
+
+    info_arrays: dict[str, np.ndarray] = {}
+    for key in _TRAJECTORY_INFO_INT_KEYS:
+        values = _collect_frame_info_values(frames, key=key, dtype=np.int64)
+        if values is not None:
+            info_arrays[key] = values
+    for key in _TRAJECTORY_INFO_FLOAT_KEYS:
+        values = _collect_frame_info_values(frames, key=key, dtype=np.float64)
+        if values is not None:
+            info_arrays[key] = values
+    stored_metadata = _resolve_write_metadata(frames, metadata)
+
+    with ProgressBar(desc="Writing trajectory", total=frame_count, unit="frame") as progress:
+        with h5py.File(output_path, "w") as handle:
+            handle.attrs["linak_format"] = LINAK_TRAJECTORY_HDF5_FORMAT
+            handle.attrs["linak_trajectory_version"] = LINAK_TRAJECTORY_HDF5_VERSION
+            handle.attrs["kind"] = "trajectory"
+            handle.attrs["frame_count"] = frame_count
+            handle.attrs["atom_count"] = atom_count
+            handle.attrs["created_utc"] = datetime.now(timezone.utc).isoformat()
+            if source_path is not None:
+                handle.attrs["source_path"] = str(Path(source_path).expanduser().resolve())
+            if source_format:
+                handle.attrs["source_format"] = str(source_format)
+
+            handle.create_dataset(
+                "positions",
+                data=positions,
+                chunks=(chunk_frames, atom_count, 3),
+                compression="lzf",
+                shuffle=True,
+            )
+            handle.create_dataset(
+                "cell",
+                data=cells,
+                chunks=(chunk_frames, 3, 3),
+                compression="lzf",
+                shuffle=True,
+            )
+            handle.create_dataset(
+                "pbc",
+                data=pbc,
+                chunks=(chunk_frames, 3),
+                compression="lzf",
+            )
+            handle.create_dataset("atomic_numbers", data=atomic_numbers.astype(np.int64))
+            if info_arrays:
+                info_group = handle.create_group("frame_info")
+                for key, values in info_arrays.items():
+                    info_group.create_dataset(
+                        key,
+                        data=values,
+                        chunks=(chunk_frames,),
+                        compression="lzf",
+                        shuffle=values.dtype.kind in {"i", "u", "f"},
+                    )
+            if stored_metadata is not None:
+                metadata_group = handle.create_group("metadata")
+                if stored_metadata.input_path is not None:
+                    metadata_group.attrs["input_path"] = str(stored_metadata.input_path)
+                if stored_metadata.input_format:
+                    metadata_group.attrs["input_format"] = stored_metadata.input_format
+                if stored_metadata.cell_source:
+                    metadata_group.attrs["cell_source"] = stored_metadata.cell_source
+                if stored_metadata.timestep_source:
+                    metadata_group.attrs["timestep_source"] = stored_metadata.timestep_source
+                if stored_metadata.fixed_atoms_source:
+                    metadata_group.attrs["fixed_atoms_source"] = stored_metadata.fixed_atoms_source
+                if stored_metadata.frame_timestep_fs is not None:
+                    metadata_group.attrs["frame_timestep_fs"] = stored_metadata.frame_timestep_fs
+                if stored_metadata.md_timestep_fs is not None:
+                    metadata_group.attrs["md_timestep_fs"] = stored_metadata.md_timestep_fs
+                if stored_metadata.trajectory_stride_md is not None:
+                    metadata_group.attrs["trajectory_stride_md"] = (
+                        stored_metadata.trajectory_stride_md
+                    )
+                if stored_metadata.cell_angstrom is not None:
+                    metadata_group.create_dataset(
+                        "cell_angstrom",
+                        data=np.asarray(stored_metadata.cell_angstrom, dtype=np.float64),
+                    )
+                if stored_metadata.fixed_atom_indices:
+                    metadata_group.create_dataset(
+                        "fixed_atom_indices",
+                        data=np.asarray(stored_metadata.fixed_atom_indices, dtype=np.int64),
+                    )
+            progress.update(frame_count)
+
+    return output_path
+
+
+def _build_atoms_from_hdf5_chunk(
+    *,
+    atomic_numbers: np.ndarray,
+    positions_chunk: np.ndarray,
+    cell_chunk: np.ndarray,
+    pbc_chunk: np.ndarray,
+    frame_info_chunks: dict[str, np.ndarray],
+    fixed_atom_indices: tuple[int, ...],
+) -> list[Atoms]:
+    chunk: list[Atoms] = []
+    for offset in range(len(positions_chunk)):
+        frame = Atoms(
+            numbers=atomic_numbers,
+            positions=positions_chunk[offset],
+            cell=cell_chunk[offset],
+            pbc=tuple(bool(value) for value in pbc_chunk[offset]),
+        )
+        for key, values in frame_info_chunks.items():
+            scalar = values[offset]
+            if np.issubdtype(values.dtype, np.integer):
+                frame.info[key] = int(scalar)
+            elif np.issubdtype(values.dtype, np.floating):
+                frame.info[key] = float(scalar)
+            else:  # pragma: no cover - guarded by writer dtype choices.
+                frame.info[key] = scalar.item()
+        if fixed_atom_indices:
+            frame.set_constraint(FixAtoms(indices=list(fixed_atom_indices)))
+        chunk.append(frame)
+    return chunk
+
+
+def _read_trajectory_hdf5_chunks(path: Path, *, chunk_size: int) -> Iterator[list[Atoms]]:
+    with h5py.File(path, "r") as handle:
+        if (
+            str(handle.attrs.get("linak_format", "")).strip() != LINAK_TRAJECTORY_HDF5_FORMAT
+            or str(handle.attrs.get("kind", "")).strip() != "trajectory"
+        ):
+            raise ValueError(f"Unsupported trajectory HDF5 format in '{path}'.")
+
+        positions = handle["positions"]
+        cells = handle["cell"]
+        pbc = handle["pbc"]
+        atomic_numbers = np.asarray(handle["atomic_numbers"], dtype=np.int64)
+        frame_count = int(handle.attrs.get("frame_count", positions.shape[0]))
+        info_group = handle.get("frame_info")
+        info_names = list(info_group.keys()) if isinstance(info_group, h5py.Group) else []
+        stored_metadata = read_trajectory_hdf5_metadata(path)
+        fixed_atom_indices = (
+            stored_metadata.fixed_atom_indices if stored_metadata is not None else ()
+        )
+
+        with ProgressBar(desc="Reading trajectory", total=frame_count, unit="frame") as progress:
+            for start in range(0, frame_count, chunk_size):
+                stop = min(start + chunk_size, frame_count)
+                positions_chunk = np.asarray(positions[start:stop], dtype=np.float64)
+                cell_chunk = np.asarray(cells[start:stop], dtype=np.float64)
+                pbc_chunk = np.asarray(pbc[start:stop], dtype=bool)
+                frame_info_chunks = (
+                    {key: np.asarray(info_group[key][start:stop]) for key in info_names}
+                    if isinstance(info_group, h5py.Group)
+                    else {}
+                )
+                chunk = _build_atoms_from_hdf5_chunk(
+                    atomic_numbers=atomic_numbers,
+                    positions_chunk=positions_chunk,
+                    cell_chunk=cell_chunk,
+                    pbc_chunk=pbc_chunk,
+                    frame_info_chunks=frame_info_chunks,
+                    fixed_atom_indices=fixed_atom_indices,
+                )
+                progress.update(len(chunk))
+                yield chunk
+
+
+def _read_trajectory_hdf5(path: Path) -> list[Atoms]:
+    frames: list[Atoms] = []
+    for chunk in _read_trajectory_hdf5_chunks(path, chunk_size=256):
+        frames.extend(chunk)
+    return frames
 
 
 def _lammps_data_to_ase_atoms(
@@ -185,18 +656,63 @@ def _parse_box_bound(
     return cell, celldisp, pbc
 
 
-def _read_frames(path: Path, *, format: str | None = None) -> list[Atoms]:
+def _read_frames(
+    path: Path,
+    *,
+    format: str | None = None,
+    total_frames: int | None = None,
+) -> list[Atoms]:
     frames: list[Atoms] = []
-    with ProgressBar(desc="Reading trajectory", unit="frame") as progress:
+    with ProgressBar(desc="Reading trajectory", total=total_frames, unit="frame") as progress:
         for frame in iread(str(path), index=":", format=format):
             frames.append(frame)
             progress.update()
     return frames
 
 
+def _count_lammps_dump_frames(path: Path) -> int:
+    """Count frames in a LAMMPS text dump by scanning timestep markers."""
+    frame_count = 0
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if line.startswith("ITEM: TIMESTEP"):
+                frame_count += 1
+    return frame_count
+
+
+def _count_xyz_like_frames(path: Path) -> int:
+    """Count frames in XYZ-like text trajectories without parsing Atoms objects."""
+    frame_count = 0
+    with path.open("r", encoding="utf-8") as handle:
+        while True:
+            natoms_line = handle.readline()
+            if not natoms_line:
+                break
+            stripped = natoms_line.strip()
+            if not stripped:
+                continue
+            try:
+                atom_count = int(stripped)
+            except ValueError:
+                raise ValueError(
+                    f"Could not resolve XYZ-style frame count from '{path}': "
+                    f"expected atom count line, got {stripped!r}."
+                ) from None
+            comment_line = handle.readline()
+            if comment_line == "":
+                raise ValueError(f"Incomplete XYZ trajectory '{path}': missing comment line.")
+            for _ in range(atom_count):
+                atom_line = handle.readline()
+                if atom_line == "":
+                    raise ValueError(f"Incomplete XYZ trajectory '{path}': truncated atom block.")
+            frame_count += 1
+    return frame_count
+
+
 def _read_lammps_dump_frames(path: Path) -> list[Atoms]:
     """Read a LAMMPS text dump frame-by-frame to keep progress responsive."""
     frames: list[Atoms] = []
+    total_frames = _count_lammps_dump_frames(path)
     n_atoms = 0
     cell = None
     celldisp = None
@@ -207,6 +723,7 @@ def _read_lammps_dump_frames(path: Path) -> list[Atoms]:
         path.open("r", encoding="utf-8") as handle,
         ProgressBar(
             desc="Reading trajectory",
+            total=total_frames,
             unit="frame",
         ) as progress,
     ):
@@ -260,6 +777,48 @@ def _read_lammps_dump_frames(path: Path) -> list[Atoms]:
                 progress.update()
 
     return frames
+
+
+def read_trajectory_chunks(path: str | Path, *, chunk_size: int) -> Iterator[list[Atoms]]:
+    """Yield trajectory frames in fixed-size chunks.
+
+    This allows analyses to stream large trajectories without materializing all frames.
+    """
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be a positive integer.")
+
+    trajectory_path = Path(path).expanduser().resolve()
+    if not trajectory_path.exists():
+        raise FileNotFoundError(f"Trajectory file not found: {trajectory_path}")
+
+    if is_linak_trajectory_hdf5(trajectory_path):
+        yield from _read_trajectory_hdf5_chunks(trajectory_path, chunk_size=chunk_size)
+        return
+
+    suffix = trajectory_path.suffix.lower()
+    if suffix == ".lmp":
+        frames = _read_lammps_input_trajectory(trajectory_path)
+        for start in range(0, len(frames), chunk_size):
+            yield frames[start : start + chunk_size]
+        return
+
+    if suffix == ".dump":
+        frames = _read_lammps_dump_frames(trajectory_path)
+        for start in range(0, len(frames), chunk_size):
+            yield frames[start : start + chunk_size]
+        return
+
+    total_frames = _count_xyz_like_frames(trajectory_path) if suffix in _XYZ_LIKE_SUFFIXES else None
+    with ProgressBar(desc="Reading trajectory", total=total_frames, unit="frame") as progress:
+        chunk: list[Atoms] = []
+        for frame in iread(str(trajectory_path), index=":"):
+            chunk.append(frame)
+            progress.update()
+            if len(chunk) >= chunk_size:
+                yield chunk
+                chunk = []
+        if chunk:
+            yield chunk
 
 
 def _frame_has_usable_cell(frame: Atoms) -> bool:
@@ -334,8 +893,9 @@ def read_trajectory(path: str | Path) -> list[Atoms]:
     ----------
     path
         Path to a trajectory file.
-        Supported values include ASE-supported trajectory files (e.g. `.xyz`, `.dump`)
-        and LAMMPS input files (`.lmp`) that reference a dump file.
+        Supported values include ASE-supported trajectory files (e.g. `.xyz`, `.dump`),
+        LiNaK trajectory HDF5 files (`.traj.h5`), and LAMMPS input files (`.lmp`) that
+        reference a dump file.
 
     Returns
     -------
@@ -358,13 +918,16 @@ def read_trajectory(path: str | Path) -> list[Atoms]:
     if not trajectory_path.exists():
         raise FileNotFoundError(f"Trajectory file not found: {trajectory_path}")
 
-    suffix = trajectory_path.suffix.lower()
-    if suffix == ".lmp":
-        frames = _read_lammps_input_trajectory(trajectory_path)
-    elif suffix == ".dump":
-        frames = _read_lammps_dump_frames(trajectory_path)
+    if is_linak_trajectory_hdf5(trajectory_path):
+        frames = _read_trajectory_hdf5(trajectory_path)
     else:
-        frames = _read_frames(trajectory_path)
+        suffix = trajectory_path.suffix.lower()
+        if suffix == ".lmp":
+            frames = _read_lammps_input_trajectory(trajectory_path)
+        elif suffix == ".dump":
+            frames = _read_lammps_dump_frames(trajectory_path)
+        else:
+            frames = _read_frames(trajectory_path)
 
     if not frames:
         raise ValueError(f"No frames were read from: {trajectory_path}")
@@ -376,20 +939,38 @@ def read_trajectory(path: str | Path) -> list[Atoms]:
     return frames
 
 
-def write_trajectory(frames: list[Atoms], path: str | Path) -> Path:
+def write_trajectory(
+    frames: list[Atoms],
+    path: str | Path,
+    *,
+    source_path: str | Path | None = None,
+    source_format: str | None = None,
+    metadata: TrajectoryStoredMetadata | None = None,
+) -> Path:
     """Write trajectory frames to disk and return the written path."""
     if not frames:
         raise ValueError("At least one trajectory frame is required for writing.")
 
     output_path = Path(path).expanduser().resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    if output_path.suffix.lower() in {".h5", ".hdf5"}:
+        written = _write_trajectory_hdf5(
+            frames,
+            output_path,
+            source_path=source_path,
+            source_format=source_format,
+            metadata=metadata,
+        )
+        LOGGER.info("Wrote %d frame(s) to '%s'.", len(frames), output_path)
+        return written
+
     with ProgressBar(desc="Writing trajectory", total=1, unit="step") as progress:
         try:
             write(str(output_path), frames)
         except UnknownFileTypeError as exc:
             raise ValueError(
                 f"Unsupported output trajectory format for '{output_path}'. "
-                "Use a writable extension such as .xyz."
+                "Use a writable extension such as .xyz or .traj.h5."
             ) from exc
         progress.update()
     LOGGER.info("Wrote %d frame(s) to '%s'.", len(frames), output_path)

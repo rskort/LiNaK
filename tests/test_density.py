@@ -722,6 +722,11 @@ def test_save_and_load_density_profile(tmp_path):
     np.testing.assert_allclose(loaded.number_density, profile.number_density)
     assert loaded.units == profile.units
     assert loaded.coordinate_mode == profile.coordinate_mode
+    assert loaded.series_statistics is not None
+    density_stats = loaded.series_statistics["density"]
+    number_stats = loaded.series_statistics["number_density"]
+    np.testing.assert_array_equal(density_stats.point_count, np.array([1, 1]))
+    np.testing.assert_array_equal(number_stats.point_count, np.array([1, 1]))
     if profile.surface_position is None:
         assert loaded.surface_position is None
     else:
@@ -1753,3 +1758,76 @@ def test_plot_line_series_can_suppress_save_log(tmp_path, caplog):
 
     assert output.exists()
     assert "Saved plot to" not in caplog.text
+
+
+def test_compute_density_profile_logs_single_run_summary_at_info_and_details_at_debug(caplog):
+    frame = Atoms(
+        "OO",
+        positions=[[0.0, 0.0, 0.10], [0.0, 0.0, 1.10]],
+        cell=[10.0, 10.0, 10.0],
+        pbc=True,
+    )
+
+    with caplog.at_level(logging.INFO, logger="linak.analysis.density"):
+        compute_density_profile(
+            frames=[frame],
+            species="O",
+            axis="z",
+            bin_width=1.0,
+        )
+
+    info_messages = [
+        record.getMessage() for record in caplog.records if record.levelno == logging.INFO
+    ]
+    assert any("Density compute summary:" in message for message in info_messages)
+    assert not any("Selected " in message for message in info_messages)
+    assert not any("Density mode:" in message for message in info_messages)
+    assert not any("Density normalization path" in message for message in info_messages)
+
+    caplog.clear()
+    with caplog.at_level(logging.DEBUG, logger="linak.analysis.density"):
+        compute_density_profile(
+            frames=[frame],
+            species="O",
+            axis="z",
+            bin_width=1.0,
+        )
+
+    debug_messages = [record.getMessage() for record in caplog.records]
+    assert any("Selected " in message for message in debug_messages)
+    assert any("Density mode:" in message for message in debug_messages)
+    assert any("Density normalization path" in message for message in debug_messages)
+
+
+def test_compute_density_profiles_logs_one_compact_info_summary(caplog):
+    frame = Atoms(
+        "OH2",
+        positions=[
+            [0.0, 0.0, 0.50],
+            [0.8, 0.0, 0.55],
+            [-0.2, 0.75, 0.45],
+        ],
+        cell=[10.0, 10.0, 10.0],
+        pbc=True,
+    )
+
+    with caplog.at_level(logging.INFO, logger="linak.analysis.density"):
+        profiles = compute_density_profiles(
+            frames=[frame],
+            species="all",
+            axis="z",
+            bin_width=1.0,
+        )
+
+    assert [profile.species for profile in profiles] == ["H", "O", "H2O"]
+    info_messages = [
+        record.getMessage() for record in caplog.records if record.levelno == logging.INFO
+    ]
+    summary_messages = [
+        message for message in info_messages if "Density compute summary:" in message
+    ]
+    assert len(summary_messages) == 1
+    assert "3 profile(s): H, O, H2O;" in summary_messages[0]
+    assert not any("Selected " in message for message in info_messages)
+    assert not any("Density mode:" in message for message in info_messages)
+    assert not any("Density normalization path" in message for message in info_messages)

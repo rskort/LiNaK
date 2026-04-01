@@ -1,5 +1,3 @@
-import pytest
-
 from linak.plot.plot_settings import (
     copy_plot_profile,
     delete_named_plot_profile,
@@ -124,7 +122,7 @@ def test_copy_plot_profile_without_name_copies_entire_named_store(tmp_path):
     }
 
 
-def test_combined_hdf5_plot_settings_collapse_named_profiles_to_one_document(tmp_path):
+def test_combined_hdf5_plot_settings_support_named_profiles(tmp_path):
     source = tmp_path / "combined_density.h5"
     _write_combined_density_hdf5(source)
 
@@ -132,20 +130,32 @@ def test_combined_hdf5_plot_settings_collapse_named_profiles_to_one_document(tmp
     write_plot_profile(
         source,
         "plot:density",
-        {"title": "Should overwrite default"},
+        {"title": "Publication title"},
         profile_name="Publication",
     )
 
-    assert read_plot_profile_names(source, "plot:density") == ["Default"]
-    assert read_active_plot_profile_name(source, "plot:density") == "Default"
-    assert read_plot_profile(source, "plot:density") == {"title": "Should overwrite default"}
-    assert read_plot_profile(source, "plot:density", profile_name="Publication") is None
+    assert read_plot_profile_names(source, "plot:density") == ["Default", "Publication"]
+    assert read_active_plot_profile_name(source, "plot:density") == "Publication"
+    assert read_plot_profile(source, "plot:density") == {"title": "Publication title"}
+    assert read_plot_profile(source, "plot:density", profile_name="Default") == {
+        "title": "Default title"
+    }
+    assert read_plot_profile(source, "plot:density", profile_name="Publication") == {
+        "title": "Publication title"
+    }
 
 
-def test_combined_hdf5_plot_settings_reject_set_active_for_non_default_name(tmp_path):
+def test_combined_hdf5_plot_settings_allow_set_active_named_profile(tmp_path):
     source = tmp_path / "combined_density.h5"
     _write_combined_density_hdf5(source)
     write_plot_profile(source, "plot:density", {"title": "Saved"})
+    write_plot_profile(
+        source,
+        "plot:density",
+        {"title": "Publication title"},
+        profile_name="Publication",
+    )
 
-    with pytest.raises(ValueError, match="fixed profile 'Default'"):
-        set_active_plot_profile(source, "plot:density", "Publication")
+    set_active_plot_profile(source, "plot:density", "Publication")
+
+    assert read_active_plot_profile_name(source, "plot:density") == "Publication"

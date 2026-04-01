@@ -27,7 +27,7 @@ class AnalysisSchema:
 _ANALYSIS_SCHEMAS: dict[str, AnalysisSchema] = {
     "density": AnalysisSchema(
         analysis="density",
-        version=3,
+        version=4,
         default_units_map={
             "bin_width_A": "Angstrom",
             "bin_centers_A": "Angstrom",
@@ -42,7 +42,7 @@ _ANALYSIS_SCHEMAS: dict[str, AnalysisSchema] = {
     ),
     "msd": AnalysisSchema(
         analysis="msd",
-        version=1,
+        version=2,
         default_units_map={
             "time_fs": "fs",
             "time_ps": "ps",
@@ -52,7 +52,7 @@ _ANALYSIS_SCHEMAS: dict[str, AnalysisSchema] = {
     ),
     "rdf": AnalysisSchema(
         analysis="rdf",
-        version=1,
+        version=2,
         default_units_map={
             "bin_width_A": "Angstrom",
             "bin_centers_A": "Angstrom",
@@ -105,7 +105,7 @@ _ANALYSIS_SCHEMAS: dict[str, AnalysisSchema] = {
     ),
     "orientation": AnalysisSchema(
         analysis="orientation",
-        version=4,
+        version=5,
         default_units_map={
             "bin_centers_A": "Angstrom",
             "bin_edges_A": "Angstrom",
@@ -186,6 +186,19 @@ def resolve_units_map(
     if isinstance(raw_units, Mapping):
         for key, value in raw_units.items():
             resolved[str(key)] = str(value)
+    for key in list(resolved):
+        if key.endswith(("_std", "_sem")):
+            continue
+        if key.endswith(("_point_count", "_sample_n", "_block_n")):
+            continue
+        base_unit = resolved.get(key)
+        if base_unit is None:
+            continue
+        resolved.setdefault(f"{key}_std", base_unit)
+        resolved.setdefault(f"{key}_sem", base_unit)
+        resolved.setdefault(f"{key}_point_count", "counts")
+        resolved.setdefault(f"{key}_sample_n", "counts")
+        resolved.setdefault(f"{key}_block_n", "counts")
     return resolved
 
 

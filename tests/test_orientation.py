@@ -366,6 +366,13 @@ def test_save_load_round_trip(tmp_path):
         loaded.cos_azimuthal_mean, profile.cos_azimuthal_mean, equal_nan=True
     )
     np.testing.assert_array_equal(loaded.count_total, profile.count_total)
+    assert loaded.series_statistics is not None
+    assert "cos_polar_mean" in loaded.series_statistics
+    assert "density" in loaded.series_statistics
+    np.testing.assert_array_equal(
+        loaded.series_statistics["density"].point_count,
+        loaded.count_total,
+    )
     np.testing.assert_array_equal(loaded.count_polar_valid, profile.count_polar_valid)
     np.testing.assert_array_equal(loaded.count_azimuthal_valid, profile.count_azimuthal_valid)
     np.testing.assert_allclose(loaded.cos_polar_density, profile.cos_polar_density, equal_nan=True)

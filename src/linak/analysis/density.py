@@ -30,6 +30,15 @@ from .schema import (
     canonicalize_density_units,
     resolve_units_map,
 )
+from .statistics import (
+    SeriesStatistics,
+    block_mean_matrix,
+    build_series_statistics,
+    build_statistics_metadata,
+    statistics_payload_from_series_map,
+    statistics_series_map_from_datasets,
+    resolve_block_slices,
+)
 from ..plot.plotting import (
     DEFAULT_PLOT_STYLE,
     PlotStyle,
@@ -90,6 +99,7 @@ class DensityProfile:
     surface_position: float | None = None
     surface_position_std: float | None = None
     surface_estimate: SurfaceEstimate | None = None
+    series_statistics: dict[str, SeriesStatistics] | None = None
 
 
 @dataclass(frozen=True)
@@ -2551,7 +2561,7 @@ def _compute_density_profile_from_selected(
     n_selected_total = sum(values.size for values in selected_per_frame)
     if n_selected_total == 0:
         raise ValueError(f"No entities found for selection '{species_label}' in trajectory.")
-    LOGGER.info(
+    LOGGER.debug(
         "Selected %d total %s across %d frame(s).",
         n_selected_total,
         count_label,
@@ -2593,7 +2603,7 @@ def _compute_density_profile_from_selected(
     mass_histogram_sum = np.zeros(bin_edges.size - 1, dtype=float)
     entity_histogram_sum = np.zeros(bin_edges.size - 1, dtype=float)
     use_volumetric_density = all(_frame_has_usable_cell(frame, axis_index) for frame in frames)
-    LOGGER.info("Density mode: %s.", "volumetric" if use_volumetric_density else "linear")
+    LOGGER.debug("Density mode: %s.", "volumetric" if use_volumetric_density else "linear")
 
     slice_volumes: np.ndarray | None = None
     variable_slice_volume = False
@@ -2615,7 +2625,7 @@ def _compute_density_profile_from_selected(
         use_volumetric_density=use_volumetric_density,
         variable_slice_volume=variable_slice_volume,
     )
-    LOGGER.info(
+    LOGGER.debug(
         "Density normalization path for '%s': %s.",
         species_label,
         normalization_mode,
@@ -2634,6 +2644,8 @@ def _compute_density_profile_from_selected(
     framewise_entity_density_sum = (
         np.zeros_like(entity_histogram_sum) if framewise_normalization else None
     )
+    per_frame_density_values: list[np.ndarray] = []
+    per_frame_number_density_values: list[np.ndarray] = []
     with ProgressBar(
         desc=f"Binning {species_label} density", total=n_frames, unit="frame"
     ) as progress:
@@ -2660,6 +2672,17 @@ def _compute_density_profile_from_selected(
             )
             mass_histogram_sum += per_frame_mass_histogram
             entity_histogram_sum += per_frame_entity_histogram
+            if use_volumetric_density and slice_volumes is not None:
+                frame_volume = float(slice_volumes[frame_index])
+                frame_density = (per_frame_mass_histogram / frame_volume) / ANGSTROM3_TO_CM3
+                frame_number_density = (
+                    per_frame_entity_histogram / frame_volume
+                ) / ANGSTROM3_TO_NM3
+            else:
+                frame_density = per_frame_mass_histogram / bin_width
+                frame_number_density = per_frame_entity_histogram / bin_width
+            per_frame_density_values.append(np.asarray(frame_density, dtype=float))
+            per_frame_number_density_values.append(np.asarray(frame_number_density, dtype=float))
             if (
                 framewise_mass_density_sum is not None
                 and framewise_entity_density_sum is not None
@@ -2698,6 +2721,20 @@ def _compute_density_profile_from_selected(
         species_label,
         volumetric=use_volumetric_density,
     )
+    sample_density_matrix = np.vstack(per_frame_density_values)
+    sample_number_density_matrix = np.vstack(per_frame_number_density_values)
+    block_resolution = resolve_block_slices(n_frames)
+    block_slices = None if block_resolution is None else block_resolution[0]
+    density_statistics = build_series_statistics(
+        point_count=np.rint(entity_histogram_sum).astype(int),
+        sample_values=sample_density_matrix,
+        block_values=block_mean_matrix(sample_density_matrix, block_slices=block_slices),
+    )
+    number_density_statistics = build_series_statistics(
+        point_count=np.rint(entity_histogram_sum).astype(int),
+        sample_values=sample_number_density_matrix,
+        block_values=block_mean_matrix(sample_number_density_matrix, block_slices=block_slices),
+    )
 
     return DensityProfile(
         axis=axis.lower(),
@@ -2715,7 +2752,46 @@ def _compute_density_profile_from_selected(
         surface_position=surface_position,
         surface_position_std=surface_position_std,
         surface_estimate=surface_estimate,
+        series_statistics={
+            "density": density_statistics,
+            "number_density": number_density_statistics,
+        },
     )
+
+
+def _summarize_density_run(
+    *,
+    frames: list[Atoms],
+    axis_index: int,
+    coordinate_mode: str,
+    labels: list[str],
+) -> tuple[str, str]:
+    use_volumetric_density = all(_frame_has_usable_cell(frame, axis_index) for frame in frames)
+    density_mode = "volumetric" if use_volumetric_density else "linear"
+    normalization_mode = _density_normalization_mode(
+        use_volumetric_density=use_volumetric_density,
+        variable_slice_volume=bool(
+            use_volumetric_density and _density_uses_variable_slice_volume(frames, axis_index)
+        ),
+    )
+    summary = ", ".join(labels)
+    return (
+        density_mode,
+        f"{len(labels)} profile(s): {summary}; {coordinate_mode} coordinates; {density_mode} density; {normalization_mode} normalization",
+    )
+
+
+def _density_uses_variable_slice_volume(frames: list[Atoms], axis_index: int) -> bool:
+    if not frames or not all(_frame_has_usable_cell(frame, axis_index) for frame in frames):
+        return False
+    slice_volumes = np.empty(len(frames), dtype=float)
+    for i, frame in enumerate(frames):
+        cell = np.asarray(frame.cell.array, dtype=float)
+        axis_length = np.linalg.norm(cell[axis_index])
+        volume = abs(float(np.linalg.det(cell)))
+        cross_section = volume / axis_length
+        slice_volumes[i] = cross_section
+    return not np.allclose(slice_volumes, slice_volumes[0], rtol=0.0, atol=1e-12)
 
 
 def compute_density_profile(
@@ -2820,6 +2896,13 @@ def compute_density_profile(
         selected_per_frame,
         None if trusted_surface_estimate is None else trusted_surface_estimate.per_frame,
     )
+    _density_mode, run_summary = _summarize_density_run(
+        frames=frames,
+        axis_index=axis_index,
+        coordinate_mode=coordinate_mode,
+        labels=[species_label],
+    )
+    LOGGER.info("Density compute summary: %s.", run_summary)
     histogram_bounds = None
     if normalized_binning == "cell":
         surface_per_frame = (
@@ -2966,6 +3049,13 @@ def compute_density_profiles(
         None if trusted_surface_estimate is None else trusted_surface_estimate.per_frame
     )
     coordinate_mode_global = "distance" if trusted_surface_estimate is not None else "axis"
+    _density_mode, run_summary = _summarize_density_run(
+        frames=frames,
+        axis_index=axis_index,
+        coordinate_mode=coordinate_mode_global,
+        labels=[*element_species, "H2O"],
+    )
+    LOGGER.info("Density compute summary: %s.", run_summary)
     histogram_bounds = None
     if normalized_binning == "cell":
         histogram_bounds = _cell_histogram_bounds(
@@ -3073,29 +3163,38 @@ def _density_profile_hdf5_payload(profile: DensityProfile) -> dict[str, Any]:
     if canonical_number_units is not None:
         units_map["number_density"] = canonical_number_units
 
+    metadata_payload = {
+        "axis": profile.axis,
+        "species": profile.species,
+        "units": canonical_density_units,
+        "n_frames": profile.n_frames,
+        "number_density_units": canonical_number_units,
+        "coordinate_mode": profile.coordinate_mode,
+        "bin_width_A": bin_width,
+        "counts_per_frame_available": False,
+        **_surface_metadata_payload(
+            surface_position=profile.surface_position,
+            surface_position_std=profile.surface_position_std,
+            estimate=profile.surface_estimate,
+        ),
+    }
+    if profile.series_statistics:
+        block_resolution = resolve_block_slices(int(profile.n_frames))
+        block_lengths = None if block_resolution is None else block_resolution[1]
+        metadata_payload["statistics"] = build_statistics_metadata(
+            statistics_by_series=profile.series_statistics,
+            block_lengths=block_lengths,
+        )
     metadata = build_profile_metadata(
         analysis="density",
-        metadata={
-            "axis": profile.axis,
-            "species": profile.species,
-            "units": canonical_density_units,
-            "n_frames": profile.n_frames,
-            "number_density_units": canonical_number_units,
-            "coordinate_mode": profile.coordinate_mode,
-            "bin_width_A": bin_width,
-            "counts_per_frame_available": False,
-            **_surface_metadata_payload(
-                surface_position=profile.surface_position,
-                surface_position_std=profile.surface_position_std,
-                estimate=profile.surface_estimate,
-            ),
-        },
+        metadata=metadata_payload,
         units_map=units_map,
     )
     datasets = {
         "bin_centers_A": profile.bin_centers,
         "density": canonical_density,
         "number_density": canonical_number_density,
+        **statistics_payload_from_series_map(profile.series_statistics),
         **_surface_estimate_datasets(profile.surface_estimate),
     }
     return {
@@ -3214,6 +3313,10 @@ def _load_density_profiles_from_payloads(
         coordinate_mode = str(metadata.get("coordinate_mode", "axis")).strip().lower()
         if coordinate_mode not in {"axis", "distance"}:
             coordinate_mode = "axis"
+        series_statistics = statistics_series_map_from_datasets(
+            datasets,
+            dataset_names=("density", "number_density"),
+        )
 
         surface_metadata = _surface_metadata_view(metadata)
         surface_position_raw = surface_metadata.get("position", metadata.get("surface_position"))
@@ -3293,6 +3396,7 @@ def _load_density_profiles_from_payloads(
                 surface_position=surface_position,
                 surface_position_std=surface_position_std,
                 surface_estimate=surface_estimate,
+                series_statistics=series_statistics,
             )
         )
     return profiles
@@ -3547,7 +3651,7 @@ def _prepared_density_auto_limit_series(
     series_enabled: list[bool] | None = None,
     x_bin_width: float | None = None,
     x_bin_reducer: str | None = None,
-    series_normalization_modes: list[str] | None = None,
+    series_normalization_modes: list[str | None] | None = None,
     series_normalization_values: list[float | None] | None = None,
     series_normalization_x_refs: list[float | None] | None = None,
 ) -> tuple[list[np.ndarray], list[np.ndarray]]:
@@ -3606,8 +3710,10 @@ def plot_density_profile(
     legend: bool | None = None,
     legend_title: str | None = None,
     legend_loc: str = "best",
+    annotations: list[dict[str, Any]] | None = None,
     line_label: str | None = None,
     line_colors: list[str] | None = None,
+    error_config: dict[str, Any] | None = None,
     series_enabled: list[bool] | None = None,
     series_show_in_legend: list[bool] | None = None,
     series_line_widths: list[float | None] | None = None,
@@ -3616,11 +3722,13 @@ def plot_density_profile(
     series_fit_enabled: list[bool] | None = None,
     series_fit_labels: list[str | None] | None = None,
     series_fit_show_in_legend: list[bool] | None = None,
-    series_normalization_modes: list[str] | None = None,
+    cumulative_config: dict[str, Any] | None = None,
+    series_normalization_modes: list[str | None] | None = None,
     series_normalization_values: list[float | None] | None = None,
     series_normalization_x_refs: list[float | None] | None = None,
     x_bin_width: float | None = None,
     x_bin_reducer: str | None = None,
+    min_bin_points: int | None = None,
     capture_state: dict[str, Any] | None = None,
     suppress_output_log: bool = False,
     matplotlib_rc: dict[str, Any] | None = None,
@@ -3668,6 +3776,7 @@ def plot_density_profile(
     )
     resolved_x_lim = _merge_plot_limits(x_lim, auto_x_lim)
     resolved_y_lim = _merge_plot_limits(y_lim, auto_y_lim)
+    stats_key = "number_density" if quantity.strip().lower() == "number" else "density"
 
     return plot_line_series(
         x_values,
@@ -3694,11 +3803,17 @@ def plot_density_profile(
         fit_show_in_legend=(
             True if not series_fit_show_in_legend else bool(series_fit_show_in_legend[0])
         ),
+        cumulative_config=cumulative_config,
+        series_statistics=None
+        if profile.series_statistics is None
+        else profile.series_statistics.get(stats_key),
+        error_config=error_config,
         normalization_mode=single_series.normalization_mode,
         normalization_value=single_series.normalization_value,
         normalization_x_ref=single_series.normalization_x_ref,
         x_bin_width=x_bin_width,
         x_bin_reducer=x_bin_reducer,
+        min_bin_points=min_bin_points,
         style=style,
         x_scale=x_scale,
         y_scale=y_scale,
@@ -3716,6 +3831,8 @@ def plot_density_profile(
         legend=legend,
         legend_title=legend_title,
         legend_loc=legend_loc,
+        analysis_name="density",
+        annotations=annotations,
         capture_state=capture_state,
         matplotlib_rc=matplotlib_rc,
         figure_kwargs=figure_kwargs,
@@ -3758,9 +3875,11 @@ def plot_density_profiles(
     legend: bool | None = None,
     legend_title: str | None = None,
     legend_loc: str = "best",
+    annotations: list[dict[str, Any]] | None = None,
     series_ids: list[str] | None = None,
     series_labels: list[str] | None = None,
     line_colors: list[str] | None = None,
+    series_error_configs: list[dict[str, Any] | None] | None = None,
     series_enabled: list[bool] | None = None,
     series_show_in_legend: list[bool] | None = None,
     series_line_widths: list[float | None] | None = None,
@@ -3769,11 +3888,15 @@ def plot_density_profiles(
     series_fit_enabled: list[bool] | None = None,
     series_fit_labels: list[str | None] | None = None,
     series_fit_show_in_legend: list[bool] | None = None,
-    series_normalization_modes: list[str] | None = None,
+    series_cumulative_configs: list[dict[str, Any] | None] | None = None,
+    render_series_descriptors: list[dict[str, Any]] | None = None,
+    series_overrides_by_id: dict[str, dict[str, Any]] | None = None,
+    series_normalization_modes: list[str | None] | None = None,
     series_normalization_values: list[float | None] | None = None,
     series_normalization_x_refs: list[float | None] | None = None,
     x_bin_width: float | None = None,
     x_bin_reducer: str | None = None,
+    min_bin_points: int | None = None,
     capture_state: dict[str, Any] | None = None,
     suppress_output_log: bool = False,
     matplotlib_rc: dict[str, Any] | None = None,
@@ -3826,12 +3949,17 @@ def plot_density_profiles(
             legend=legend,
             legend_title=legend_title,
             legend_loc=legend_loc,
+            annotations=annotations,
             line_label=labels[0] if labels else None,
             line_colors=line_colors,
+            error_config=(None if not series_error_configs else series_error_configs[0]),
             series_enabled=series_enabled,
             series_line_widths=series_line_widths,
             series_markers=series_markers,
             series_fit_configs=series_fit_configs,
+            cumulative_config=None
+            if not series_cumulative_configs
+            else series_cumulative_configs[0],
             series_normalization_modes=series_normalization_modes,
             series_normalization_values=series_normalization_values,
             series_normalization_x_refs=series_normalization_x_refs,
@@ -3887,6 +4015,7 @@ def plot_density_profiles(
     )
     resolved_x_lim = _merge_plot_limits(x_lim, auto_x_lim)
     resolved_y_lim = _merge_plot_limits(y_lim, auto_y_lim)
+    stats_key = "number_density" if quantity.strip().lower() == "number" else "density"
 
     return plot_multi_line_series(
         x_series,
@@ -3910,11 +4039,20 @@ def plot_density_profiles(
         series_fit_enabled=series_fit_enabled,
         series_fit_labels=series_fit_labels,
         series_fit_show_in_legend=series_fit_show_in_legend,
+        series_cumulative_configs=series_cumulative_configs,
+        series_error_configs=series_error_configs,
+        series_statistics_data=[
+            None if profile.series_statistics is None else profile.series_statistics.get(stats_key)
+            for profile in profiles
+        ],
         series_normalization_modes=series_normalization_modes,
         series_normalization_values=series_normalization_values,
         series_normalization_x_refs=series_normalization_x_refs,
+        render_series_descriptors=render_series_descriptors,
+        series_overrides_by_id=series_overrides_by_id,
         x_bin_width=x_bin_width,
         x_bin_reducer=x_bin_reducer,
+        min_bin_points=min_bin_points,
         x_scale=x_scale,
         y_scale=y_scale,
         x_lim=resolved_x_lim,
@@ -3931,6 +4069,8 @@ def plot_density_profiles(
         legend=legend,
         legend_title=legend_title,
         legend_loc=legend_loc,
+        analysis_name="density",
+        annotations=annotations,
         capture_state=capture_state,
         matplotlib_rc=matplotlib_rc,
         figure_kwargs=figure_kwargs,

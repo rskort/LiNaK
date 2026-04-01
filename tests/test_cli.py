@@ -13,7 +13,9 @@ from linak.cli import (
     _build_density_gui_context,
     _build_gui_series_descriptors,
     _build_rdf_profile_filter_options,
+    _default_rdf_collection_hdf5_output_path,
     _combine_analysis_hdf5_sources,
+    _load_rdf_plot_profiles,
     _without_preview_series_state,
     _rewrite_implicit_csv_interactive,
     _rewrite_implicit_plot_csv,
@@ -51,7 +53,8 @@ from linak.plot.plot_settings import (
     read_plot_profile_names,
     write_plot_profile,
 )
-from linak.analysis.rdf import RDFProfile, compute_rdf, save_rdf_profile
+from linak.analysis.rdf import RDFProfile, compute_rdf, load_rdf_profile, save_rdf_profile
+from linak.trajectory.io import read_trajectory_hdf5_metadata, write_trajectory
 
 
 def _write_xyz(path: Path) -> None:
@@ -291,6 +294,34 @@ def test_root_help_mentions_plot_and_compute(capsys):
     assert "hdf5" in out
 
 
+def test_filter_plotter_kwargs_drops_unsupported_entries():
+    def _plotter(*, title: str | None = None) -> None:
+        del title
+
+    filtered = cli_mod._filter_plotter_kwargs(
+        _plotter,
+        {
+            "title": "Example",
+            "annotations": [{"kind": "text", "text": "x", "x": 0.1, "y": 0.2}],
+        },
+    )
+
+    assert filtered == {"title": "Example"}
+
+
+def test_filter_plotter_kwargs_keeps_kwargs_for_var_keyword_plotter():
+    def _plotter(**kwargs: object) -> None:
+        del kwargs
+
+    payload = {
+        "title": "Example",
+        "annotations": [{"kind": "text", "text": "x", "x": 0.1, "y": 0.2}],
+    }
+    filtered = cli_mod._filter_plotter_kwargs(_plotter, payload)
+
+    assert filtered == payload
+
+
 def test_root_command_without_args_shows_overview(capsys):
     rc = main(["--log-level", "ERROR"])
     assert rc == 0
@@ -334,8 +365,312 @@ def test_apply_command_without_subcommand_shows_overview(capsys):
     assert rc == 0
     out = capsys.readouterr().out
     assert "LiNaK Apply Usage" in out
+    assert "linak apply convert" in out
     assert "linak apply pbc" in out
     assert "linak apply compress" in out
+
+
+def test_apply_convert_help_lists_hdf5_output(tmp_path, capsys):
+    parser = build_parser()
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["apply", "convert", "--help"])
+
+    out = capsys.readouterr().out
+    assert ".traj.h5" in out
+    assert "--format" in out
+
+
+def test_apply_convert_dry_run_reports_default_output(tmp_path, capsys):
+    trajectory = tmp_path / "traj.xyz"
+    _write_xyz(trajectory)
+
+    rc = main(
+        [
+            "--log-level",
+            "ERROR",
+            "apply",
+            "convert",
+            str(trajectory),
+            "--dry-run",
+        ]
+    )
+
+    assert rc == 0
+    assert "traj.traj.h5" in capsys.readouterr().err
+
+
+def test_apply_convert_writes_traj_hdf5(tmp_path):
+    trajectory = tmp_path / "traj.xyz"
+    _write_xyz(trajectory)
+
+    rc = main(
+        [
+            "--log-level",
+            "ERROR",
+            "apply",
+            "convert",
+            str(trajectory),
+        ]
+    )
+
+    assert rc == 0
+    assert (tmp_path / "traj.traj.h5").exists()
+
+
+def test_apply_convert_embeds_input_metadata_into_traj_hdf5(tmp_path):
+    trajectory = tmp_path / "traj.xyz"
+    input_path = tmp_path / "input.inp"
+    _write_xyz(trajectory)
+    input_path.write_text(
+        "&SUBSYS\n"
+        "  &CELL\n"
+        "    ABC 17.887 15.491 59.671\n"
+        "  &END CELL\n"
+        "&END SUBSYS\n"
+        "&MOTION\n"
+        "  &CONSTRAINT\n"
+        "    &FIXED_ATOMS\n"
+        "      LIST 1\n"
+        "    &END FIXED_ATOMS\n"
+        "  &END CONSTRAINT\n"
+        "  &MD\n"
+        "    TIMESTEP [fs] 0.5\n"
+        "  &END MD\n"
+        "  &PRINT\n"
+        "    &TRAJECTORY\n"
+        "      &EACH\n"
+        "        MD 5\n"
+        "      &END EACH\n"
+        "    &END TRAJECTORY\n"
+        "  &END PRINT\n"
+        "&END MOTION\n",
+        encoding="utf-8",
+    )
+
+    rc = main(
+        [
+            "--log-level",
+            "ERROR",
+            "apply",
+            "convert",
+            str(trajectory),
+            "--input",
+            str(input_path),
+        ]
+    )
+
+    assert rc == 0
+    metadata = read_trajectory_hdf5_metadata(tmp_path / "traj.traj.h5")
+    assert metadata is not None
+    assert metadata.input_path == input_path.resolve()
+    assert metadata.cell_angstrom == pytest.approx((17.887, 15.491, 59.671))
+    assert metadata.frame_timestep_fs == pytest.approx(2.5)
+    assert metadata.md_timestep_fs == pytest.approx(0.5)
+    assert metadata.trajectory_stride_md == 5
+    assert metadata.fixed_atom_indices == (0,)
+
+
+def test_compute_msd_uses_converted_trajectory_hdf5_timestep_metadata_without_input(tmp_path):
+    source_dir = tmp_path / "source"
+    converted_dir = tmp_path / "converted"
+    source_dir.mkdir()
+    converted_dir.mkdir()
+    trajectory = source_dir / "traj.xyz"
+    input_path = source_dir / "input.inp"
+    _write_xyz(trajectory)
+    _write_cp2k_input(input_path, timestep_fs=0.5, stride_md=5)
+    converted_path = converted_dir / "traj.traj.h5"
+
+    rc_convert = main(
+        [
+            "--log-level",
+            "ERROR",
+            "apply",
+            "convert",
+            str(trajectory),
+            "--output",
+            str(converted_path),
+            "--input",
+            str(input_path),
+        ]
+    )
+    assert rc_convert == 0
+
+    output = converted_dir / "traj_msd_o.h5"
+    rc = main(
+        [
+            "--log-level",
+            "ERROR",
+            "compute",
+            "msd",
+            str(converted_path),
+            "--species",
+            "O",
+            "--output",
+            str(output),
+        ]
+    )
+
+    assert rc == 0
+    profile = load_msd_profile(output)
+    assert profile.time_fs[1] == pytest.approx(2.5)
+
+
+def test_compute_rdf_uses_converted_trajectory_hdf5_cell_metadata_without_input(tmp_path):
+    source_dir = tmp_path / "source"
+    converted_dir = tmp_path / "converted"
+    source_dir.mkdir()
+    converted_dir.mkdir()
+    trajectory = source_dir / "traj.xyz"
+    input_path = source_dir / "input.inp"
+    _write_xyz(trajectory)
+    _write_cp2k_input(input_path)
+    converted_path = converted_dir / "traj.traj.h5"
+
+    rc_convert = main(
+        [
+            "--log-level",
+            "ERROR",
+            "apply",
+            "convert",
+            str(trajectory),
+            "--output",
+            str(converted_path),
+            "--input",
+            str(input_path),
+        ]
+    )
+    assert rc_convert == 0
+
+    output = converted_dir / "rdf.h5"
+    rc = main(
+        [
+            "--log-level",
+            "ERROR",
+            "compute",
+            "rdf",
+            str(converted_path),
+            "--species-a",
+            "O",
+            "--species-b",
+            "O",
+            "--output",
+            str(output),
+        ]
+    )
+
+    assert rc == 0
+    profile = load_rdf_profile(output)
+    assert profile.species_a == "O"
+    assert profile.species_b == "O"
+
+
+def test_compute_density_accepts_converted_trajectory_hdf5(tmp_path):
+    trajectory_h5 = tmp_path / "traj.traj.h5"
+    frames = [
+        Atoms(
+            "OO",
+            positions=[[0.0, 0.0, 0.02], [0.0, 0.0, 0.08]],
+            cell=[10.0, 10.0, 10.0],
+            pbc=True,
+        ),
+        Atoms(
+            "OO",
+            positions=[[0.0, 0.0, 0.12], [0.0, 0.0, 0.18]],
+            cell=[10.0, 10.0, 10.0],
+            pbc=True,
+        ),
+    ]
+    write_trajectory(frames, trajectory_h5)
+    output = tmp_path / "density.h5"
+
+    rc = main(
+        [
+            "--log-level",
+            "ERROR",
+            "compute",
+            "density",
+            str(trajectory_h5),
+            "--species",
+            "O",
+            "--axis",
+            "z",
+            "--output",
+            str(output),
+        ]
+    )
+
+    assert rc == 0
+    assert output.exists()
+    profile = load_density_profile(output)
+    assert profile.species == "O"
+
+
+def test_compute_density_logs_convert_hint_for_raw_text_trajectory(tmp_path, caplog):
+    trajectory = tmp_path / "traj.xyz"
+    _write_xyz(trajectory)
+    output = tmp_path / "density_raw.h5"
+
+    with caplog.at_level("INFO"):
+        rc = main(
+            [
+                "--log-level",
+                "INFO",
+                "compute",
+                "density",
+                str(trajectory),
+                "--species",
+                "O",
+                "--axis",
+                "z",
+                "--output",
+                str(output),
+            ]
+        )
+
+    assert rc == 0
+    assert "linak apply convert" in caplog.text
+
+
+def test_compute_density_skips_convert_hint_for_converted_trajectory(tmp_path, caplog):
+    trajectory_h5 = tmp_path / "traj.traj.h5"
+    frames = [
+        Atoms(
+            "OO",
+            positions=[[0.0, 0.0, 0.02], [0.0, 0.0, 0.08]],
+            cell=[10.0, 10.0, 10.0],
+            pbc=True,
+        ),
+        Atoms(
+            "OO",
+            positions=[[0.0, 0.0, 0.12], [0.0, 0.0, 0.18]],
+            cell=[10.0, 10.0, 10.0],
+            pbc=True,
+        ),
+    ]
+    write_trajectory(frames, trajectory_h5)
+    output = tmp_path / "density_converted.h5"
+
+    with caplog.at_level("INFO"):
+        rc = main(
+            [
+                "--log-level",
+                "INFO",
+                "compute",
+                "density",
+                str(trajectory_h5),
+                "--species",
+                "O",
+                "--axis",
+                "z",
+                "--output",
+                str(output),
+            ]
+        )
+
+    assert rc == 0
+    assert "linak apply convert" not in caplog.text
 
 
 def test_csv_get_prints_numeric_metrics(tmp_path, capsys):
@@ -1450,7 +1785,7 @@ def test_compute_rdf_dry_run_resolves_input_cell_without_reading_trajectory(
     assert rc == 0
     err = capsys.readouterr().err
     assert "cell resolution: resolved 17.887 15.491 59.671 Angstrom" in err
-    assert "r_max resolution: 7.7455" in err
+    assert "r_max resolution: 7.7 (auto rounded down from 7.7455 to match bin_width=0.05)" in err
 
 
 def test_compute_potential_dry_run_validates_missing_hartree_file(tmp_path):
@@ -1729,16 +2064,41 @@ def test_build_rdf_profile_filter_options_uses_common_pairs_across_sources():
             (
                 "b.h5",
                 [
-                    {"metadata": {"species_a": "O", "species_b": "H"}},
+                    {"metadata": {"species_a": "H", "species_b": "O"}},
                     {"metadata": {"species_a": "O", "species_b": "O"}},
                 ],
             ),
         ]
     )
 
-    assert options["species_a"] == ["O"]
-    assert options["species_b_by_species_a"][""] == ["H"]
+    assert options["species_a"] == ["O", "H"]
+    assert options["species_b_by_species_a"][""] == ["H", "O"]
     assert options["species_b_by_species_a"]["O"] == ["H"]
+    assert options["species_b_by_species_a"]["H"] == ["O"]
+
+
+def test_load_rdf_plot_profiles_supports_reversed_cross_pair_selection(tmp_path):
+    profile = RDFProfile(
+        species_a="O",
+        species_b="H",
+        bin_edges=np.array([0.0, 1.0, 2.0], dtype=float),
+        bin_centers=np.array([0.5, 1.5], dtype=float),
+        g_r=np.array([0.1, 0.2], dtype=float),
+        n_frames=2,
+    )
+    source = tmp_path / "rdf.h5"
+    save_rdf_profile(profile, source)
+
+    profiles, fallback_labels, _series_ids, _origins = _load_rdf_plot_profiles(
+        sources=[str(source)],
+        species_a="H",
+        species_b="O",
+    )
+
+    assert len(profiles) == 1
+    assert profiles[0].species_a == "H"
+    assert profiles[0].species_b == "O"
+    assert fallback_labels == [["H-O"]]
 
 
 def test_build_coordination_profile_filter_options_tracks_axes_by_pair():
@@ -2061,6 +2421,15 @@ def test_plot_density_gui_mode_uses_gui_launcher(tmp_path, monkeypatch):
     assert rc == 0
     assert captured["profile_key"] == "plot:density"
     assert captured["analysis_name"] == "density"
+
+
+def test_plot_parser_no_border_flag_reaches_shared_plot_style():
+    args = build_parser().parse_args(["plot", "dummy.h5", "--no-border"])
+
+    style = cli_mod._build_plot_style(args)
+
+    assert args.border is False
+    assert style.axes_border is False
 
 
 def test_plot_density_gui_initial_settings_include_analysis_controls(tmp_path, monkeypatch):
@@ -2484,6 +2853,10 @@ def test_plot_density_gui_provides_hdf5_import_callback(tmp_path, monkeypatch):
     imported_payload: dict[str, object] = {}
 
     def _fake_gui_launcher(**kwargs):
+        list_callback = kwargs.get("on_list_import_hdf5_profiles")
+        assert callable(list_callback)
+        listing = list_callback(str(source_h5))
+        assert listing["available_names"] == ["Default"]
         callback = kwargs.get("on_import_hdf5")
         assert callable(callback)
         imported_payload.update(callback(str(source_h5), "Default"))
@@ -2542,7 +2915,7 @@ def test_plot_density_gui_uses_requested_named_settings_profile(tmp_path, monkey
     assert initial["x_mode"] == "axis"
 
 
-def test_plot_density_gui_combined_hdf5_disables_named_profile_management(tmp_path, monkeypatch):
+def test_plot_density_gui_combined_hdf5_enables_named_profile_management(tmp_path, monkeypatch):
     frame = Atoms(
         "OO",
         positions=[[0.0, 0.0, 0.10], [0.0, 0.0, 1.10]],
@@ -2579,12 +2952,110 @@ def test_plot_density_gui_combined_hdf5_disables_named_profile_management(tmp_pa
     )
 
     assert rc == 0
-    assert captured["allow_named_profiles"] is False
+    assert captured["allow_named_profiles"] is True
     assert captured["available_profile_names"] == ["Default"]
     assert captured["initial_profile_name"] == "Default"
-    assert captured["on_load_profile"] is None
-    assert captured["on_delete_profile"] is None
-    assert captured["on_set_active_profile"] is None
+    assert callable(captured["on_load_profile"])
+    assert callable(captured["on_delete_profile"])
+    assert callable(captured["on_set_active_profile"])
+
+
+def test_plot_density_gui_combined_hdf5_named_profiles_round_trip(tmp_path, monkeypatch):
+    frame = Atoms(
+        "OO",
+        positions=[[0.0, 0.0, 0.10], [0.0, 0.0, 1.10]],
+        cell=[10.0, 10.0, 10.0],
+        pbc=True,
+    )
+    profile = compute_density_profile([frame], species="O", axis="z", bin_width=1.0)
+    source_h5_a = tmp_path / "source_a_density.h5"
+    source_h5_b = tmp_path / "source_b_density.h5"
+    combined_h5 = tmp_path / "combined_density.h5"
+    save_density_profile(profile, source_h5_a)
+    save_density_profile(profile, source_h5_b)
+    _combine_analysis_hdf5_sources(
+        sources=[str(source_h5_a), str(source_h5_b)],
+        analysis="density",
+        output=combined_h5,
+    )
+
+    captured: dict[str, object] = {}
+
+    def _fake_gui_launcher(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr("linak.cli._open_plot_settings_gui", _fake_gui_launcher)
+
+    rc = main(
+        [
+            "--log-level",
+            "ERROR",
+            "plot",
+            str(combined_h5),
+            "--gui",
+        ]
+    )
+
+    assert rc == 0
+    on_save = captured["on_save"]
+    on_load_profile = captured["on_load_profile"]
+    on_set_active_profile = captured["on_set_active_profile"]
+    assert callable(on_save)
+    assert callable(on_load_profile)
+    assert callable(on_set_active_profile)
+
+    on_save("Publication", {"title": "Combined paper"})
+    on_set_active_profile("Publication")
+
+    assert read_plot_profile_names(combined_h5, "plot:density") == ["Publication"]
+    saved = read_plot_profile(combined_h5, "plot:density", profile_name="Publication")
+    assert isinstance(saved, dict)
+    assert saved["title"] == "Combined paper"
+    assert read_active_plot_profile_name(combined_h5, "plot:density") == "Publication"
+    assert on_load_profile("Publication")["title"] == "Combined paper"
+
+
+def test_plot_density_gui_hdf5_import_callback_respects_explicit_selected_profile(
+    tmp_path, monkeypatch
+):
+    source_h5 = tmp_path / "source_density.h5"
+    _write_density_hdf5(source_h5)
+    write_plot_profile(source_h5, "plot:density", {"title": "Default title"})
+    write_plot_profile(
+        source_h5,
+        "plot:density",
+        {"title": "Paper title"},
+        profile_name="Paper",
+    )
+
+    captured_listing: dict[str, object] = {}
+    imported_payload: dict[str, object] = {}
+
+    def _fake_gui_launcher(**kwargs):
+        list_callback = kwargs.get("on_list_import_hdf5_profiles")
+        import_callback = kwargs.get("on_import_hdf5")
+        assert callable(list_callback)
+        assert callable(import_callback)
+        listing = list_callback(str(source_h5))
+        captured_listing.update(listing)
+        imported_payload.update(import_callback(str(source_h5), "Paper"))
+
+    monkeypatch.setattr("linak.cli._open_plot_settings_gui", _fake_gui_launcher)
+
+    rc = main(
+        [
+            "--log-level",
+            "ERROR",
+            "plot",
+            str(source_h5),
+            "--gui",
+        ]
+    )
+
+    assert rc == 0
+    assert captured_listing["available_names"] == ["Default", "Paper"]
+    assert captured_listing["active_name"] == "Paper"
+    assert imported_payload["title"] == "Paper title"
 
 
 def test_plot_density_gui_combined_hdf5_does_not_pass_reordered_series_lists_to_gui(
@@ -3577,6 +4048,86 @@ def test_compute_rdf_threads_option_is_forwarded(tmp_path, monkeypatch):
     assert captured["threads"] == 2
 
 
+def test_compute_rdf_without_explicit_species_writes_pairwise_collection(tmp_path, monkeypatch):
+    trajectory_dir = tmp_path / "traj_dir"
+    work_dir = tmp_path / "work_dir"
+    trajectory_dir.mkdir()
+    work_dir.mkdir()
+    monkeypatch.chdir(work_dir)
+
+    trajectory = trajectory_dir / "traj.xyz"
+    frame = Atoms(
+        "OH",
+        positions=[[0.0, 0.0, 0.0], [0.9, 0.0, 0.0]],
+        cell=[10.0, 10.0, 10.0],
+        pbc=True,
+    )
+    write(trajectory, [frame], format="extxyz")
+    (trajectory_dir / "input.inp").write_text("ABC [angstrom] 10.0 10.0 10.0\n", encoding="utf-8")
+
+    rc = main(
+        [
+            "--log-level",
+            "ERROR",
+            "compute",
+            "rdf",
+            str(trajectory),
+        ]
+    )
+
+    assert rc == 0
+    assert _default_rdf_collection_hdf5_output_path(trajectory).exists()
+
+
+def test_compute_rdf_explicit_all_keeps_single_profile_path(tmp_path, monkeypatch):
+    captured: dict[str, object] = {}
+    frame = Atoms(
+        "OH",
+        positions=[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+        cell=[10.0, 10.0, 10.0],
+        pbc=True,
+    )
+    profile = RDFProfile(
+        species_a="ALL",
+        species_b="ALL",
+        bin_edges=np.array([0.0, 1.0, 2.0]),
+        bin_centers=np.array([0.5, 1.5]),
+        g_r=np.array([0.0, 1.0]),
+        n_frames=1,
+    )
+
+    def _fake_read_trajectory(_path):
+        return [frame]
+
+    def _fake_compute_rdf(**kwargs):
+        captured["species_a"] = kwargs["species_a"]
+        captured["species_b"] = kwargs["species_b"]
+        return profile
+
+    monkeypatch.setattr("linak.trajectory.io.read_trajectory", _fake_read_trajectory)
+    monkeypatch.setattr("linak.analysis.rdf.compute_rdf", _fake_compute_rdf)
+    monkeypatch.setattr("linak.analysis.rdf.save_rdf_profile", lambda *_args, **_kwargs: None)
+
+    rc = main(
+        [
+            "--log-level",
+            "ERROR",
+            "compute",
+            "rdf",
+            str(tmp_path / "traj.xyz"),
+            "--species-a",
+            "all",
+            "--species-b",
+            "all",
+            "--output",
+            str(tmp_path / "rdf_all.h5"),
+        ]
+    )
+
+    assert rc == 0
+    assert captured == {"species_a": "all", "species_b": "all"}
+
+
 def test_compute_coordination_with_cutoff_rdf_writes_hdf5_and_diagnostic_png(tmp_path, monkeypatch):
     from linak.analysis.rdf import RDFProfile
 
@@ -3698,7 +4249,7 @@ def test_compute_coordination_defaults_to_cutoff_from_rdf_when_unspecified(tmp_p
         return CoordinationCutoffResolution(
             cutoff_A=1.0,
             smoothing_width_A=0.4,
-            mode="sampled_rdf",
+            mode="full_rdf",
         )
 
     monkeypatch.setattr(
@@ -3742,15 +4293,89 @@ def test_compute_coordination_defaults_to_cutoff_from_rdf_when_unspecified(tmp_p
     assert (_linak_output_dir(tmp_path) / "traj_coordination_o_h_cutoff_rdf.png").exists()
 
 
+def test_compute_coordination_without_explicit_species_writes_collection_hdf5(
+    tmp_path, monkeypatch
+):
+    trajectory = tmp_path / "traj.xyz"
+    trajectory.write_text("", encoding="utf-8")
+
+    frames = [
+        Atoms(
+            "PtPtOH",
+            positions=[
+                [0.0, 0.0, 0.20],
+                [1.0, 0.0, 0.20],
+                [0.0, 0.0, 1.00],
+                [0.70, 0.0, 1.00],
+            ],
+            cell=[10.0, 10.0, 10.0],
+            pbc=True,
+        ),
+        Atoms(
+            "PtPtOH",
+            positions=[
+                [0.0, 0.0, 0.30],
+                [1.0, 0.0, 0.30],
+                [0.0, 0.0, 1.20],
+                [1.10, 0.0, 1.20],
+            ],
+            cell=[10.0, 10.0, 10.0],
+            pbc=True,
+        ),
+    ]
+
+    monkeypatch.setattr("linak.trajectory.io.read_trajectory", lambda _path: frames)
+
+    rc = main(
+        [
+            "--log-level",
+            "ERROR",
+            "compute",
+            "coordination",
+            str(trajectory),
+            "--axis",
+            "z",
+            "--surface-mode",
+            "rough",
+            "--surface-elements",
+            "Pt",
+            "--timestep-fs",
+            "2.0",
+            "--cell",
+            "10",
+            "10",
+            "10",
+            "--cutoff",
+            "1.0",
+        ]
+    )
+
+    assert rc == 2
+
+
 def test_build_parser_omits_coordination_rdf_tuning_flags():
     parser = build_parser()
 
-    args = parser.parse_args(["compute", "coordination", "traj.xyz"])
+    args = parser.parse_args(
+        ["compute", "coordination", "traj.xyz", "--species-a", "O", "--species-b", "H"]
+    )
 
     assert not hasattr(args, "rdf_sample_fraction")
     assert not hasattr(args, "rdf_bin_width")
     assert not hasattr(args, "rdf_r_max")
     assert not hasattr(args, "rdf_smoothing_sigma")
+
+
+def test_compute_coordination_requires_explicit_species_pair(tmp_path, capsys):
+    trajectory = tmp_path / "traj.xyz"
+    _write_xyz(trajectory)
+
+    rc = main(["--log-level", "ERROR", "compute", "coordination", str(trajectory)])
+
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "--species-a" in err
+    assert "--species-b" in err
 
 
 def test_compute_density_writes_default_csv(tmp_path, monkeypatch):

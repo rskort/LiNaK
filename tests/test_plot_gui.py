@@ -4,9 +4,18 @@ from pathlib import Path
 from linak.plot.plot_gui import (
     _AUTO_PREVIEW_DEBOUNCE_MS,
     _TOOLTIPS,
+    _annotation_display_text_from_entry,
+    _annotation_fallback_title,
+    _current_error_statistics_mode,
+    _capture_series_list_view_anchor,
+    _coerce_series_error_config,
     _coerce_series_order,
     _coerce_series_descriptors,
     _coerce_series_overrides,
+    _default_error_series_label,
+    _error_supported_for_view,
+    _font_size_placeholder_text,
+    _inferred_available_error_stats,
     _derive_synced_field_locks,
     _derive_warning_messages,
     _preview_button_enabled,
@@ -14,9 +23,12 @@ from linak.plot.plot_gui import (
     _extract_dict_mode,
     _format_series_display_text,
     _lock_to_sync_mode,
+    _partition_series_ids_by_enabled_state,
+    _resolve_error_stat_for_available,
     _resolve_asset_path,
     _resolve_series_id_order,
     _resolve_series_line_colors,
+    _restore_series_list_anchor_scroll_value,
     _sync_mode_to_lock,
     _toggle_to_mode,
     _without_new_profile_series_overrides,
@@ -60,10 +72,185 @@ def test_all_plot_gui_tooltip_ids_have_registered_messages():
     assert sorted(used_tooltip_ids - set(_TOOLTIPS)) == []
 
 
+def test_plot_settings_panel_opens_maximized_by_default():
+    source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+
+    assert "window.showMaximized()" in source
+
+
+def test_plot_settings_panel_uses_item_chooser_for_multi_profile_hdf5_import():
+    source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+
+    assert "QInputDialog.getItem(" in source
+
+
+def test_plot_settings_panel_edits_error_bars_on_base_series_and_keeps_min_bin_points():
+    source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+
+    assert '"error::' not in source
+    assert '"Color"' in source
+    assert "self._series_error_color" in source
+    assert '"min_bin_points"' in source
+
+
+def test_plot_settings_panel_includes_layers_page_with_annotations_and_payload():
+    source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+
+    assert '_register_workspace_page("Layers"' in source
+    assert "_build_layers_page" in source
+    assert 'tabs.addTab(self._tab_annotations, "Annotations")' in source
+    assert "def _build_annotations_tab(self) -> None:" in source
+    assert '"annotations": annotations_value' in source
+    assert '"Add Text"' in source
+    assert '"Add Line"' in source
+    assert '"Add Arrow"' in source
+
+
+def test_annotation_fallback_title_prefers_text_preview_and_compact_geometry_labels():
+    assert (
+        _annotation_fallback_title({"type": "text", "text": "Peak marker"}, index=1)
+        == "Peak marker"
+    )
+    assert (
+        _annotation_fallback_title(
+            {"type": "line", "x1": "0", "y1": "1", "x2": "2", "y2": "3"},
+            index=2,
+        )
+        == "Line (0, 1 -> 2, 3)"
+    )
+    assert (
+        _annotation_fallback_title(
+            {"type": "arrow", "x1": "0.1", "y1": "0.2", "x2": "0.8", "y2": "0.9"},
+            index=3,
+        )
+        == "Arrow (0.1, 0.2 -> 0.8, 0.9)"
+    )
+
+
+def test_annotation_display_text_prefers_name_and_keeps_type_visible():
+    assert (
+        _annotation_display_text_from_entry(
+            {"type": "text", "name": "Peak marker", "enabled": True},
+            index=0,
+        )
+        == "1: Peak marker [Text]"
+    )
+    assert (
+        _annotation_display_text_from_entry(
+            {"type": "line", "x1": "0", "y1": "1", "x2": "2", "y2": "3", "enabled": False},
+            index=1,
+        )
+        == "2: Line (0, 1 -> 2, 3) [Line] (off)"
+    )
+
+
+def test_current_error_statistics_mode_tracks_raw_and_rebinned_saved_series():
+    assert (
+        _current_error_statistics_mode(
+            analysis_name="position",
+            error_supported=True,
+            x_bin_width_active=False,
+        )
+        == "raw_grouped"
+    )
+    assert (
+        _current_error_statistics_mode(
+            analysis_name="rdf",
+            error_supported=True,
+            x_bin_width_active=True,
+        )
+        == "saved_rebinned_sample"
+    )
+    assert (
+        _current_error_statistics_mode(
+            analysis_name="rdf",
+            error_supported=True,
+            x_bin_width_active=False,
+        )
+        == "direct"
+    )
+
+
+def test_inferred_available_error_stats_follow_current_series_mode():
+    assert _inferred_available_error_stats(
+        analysis_name="position",
+        error_supported=True,
+        x_bin_width_active=False,
+    ) == ["sample_std", "sample_sem"]
+    assert _inferred_available_error_stats(
+        analysis_name="rdf",
+        error_supported=True,
+        x_bin_width_active=True,
+    ) == ["sample_std", "sample_sem"]
+    assert _inferred_available_error_stats(
+        analysis_name="rdf",
+        error_supported=True,
+        x_bin_width_active=False,
+    ) == ["sample_std", "sample_sem", "block_std", "block_sem"]
+
+
+def test_plot_settings_panel_shows_error_provenance_explanation_text():
+    source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+
+    assert 'self._series_error_explanation = QLabel("")' in source
+    assert "What it shows:" in source
+    assert "What it would show:" in source
+
+
+def test_plot_settings_panel_includes_cumulative_controls_and_group_actions():
+    source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+
+    assert '"Duplicate"' in source
+    assert '"Add Group"' in source
+    assert 'QGroupBox("Cumulative Average")' in source
+    assert 'self._series_cumulative_mode' in source
+    assert 'self._series_group_reducer' in source
+    assert 'self._series_group_members' in source
+    assert '"group_reducer"' in source
+    assert '"member_series_ids"' in source
+
+
+def test_plot_settings_panel_uses_task_first_workspace_pages():
+    source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+
+    assert '_register_workspace_page("Data"' in source
+    assert '_register_workspace_page("Layers"' in source
+    assert '_register_workspace_page("Figure"' in source
+    assert '_register_workspace_page("Export"' in source
+    assert '_register_workspace_page("Profiles"' in source
+    assert '_register_workspace_page("Advanced"' in source
+    assert '_register_workspace_page("Overview"' not in source
+    assert '_register_workspace_page("Series"' not in source
+
+
+def test_plot_settings_panel_uses_compact_figure_tabs():
+    source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+
+    assert 'tabs.addTab(text_legend_tab, "Text && Legend")' in source
+    assert 'tabs.addTab(axes_limits_tab, "Axes && Limits")' in source
+    assert 'tabs.addTab(ticks_grid_tab, "Ticks && Grid")' in source
+    assert 'tabs.addTab(style_tab, "Style")' in source
+
+
+def test_plot_settings_panel_uses_cumulative_child_ids_in_series_list():
+    source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+
+    assert "cumulative::" in source
+    assert '"kind": "cumulative"' in source
+
+
+def test_orientation_gui_offers_density_line_view():
+    source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+
+    assert '("average", "density", "density-weighted", "heatmap")' in source
+
+
 def test_without_series_specific_settings_keeps_non_series_limits():
     settings = {
         "x_lim": [0.0, 10.0],
         "y_lim": [0.0, 1.0],
+        "border": False,
+        "font_size": 15,
         "font_family": "DejaVu Sans",
         "series_enabled": [True, False],
     }
@@ -72,8 +259,38 @@ def test_without_series_specific_settings_keeps_non_series_limits():
 
     assert filtered["x_lim"] == [0.0, 10.0]
     assert filtered["y_lim"] == [0.0, 1.0]
+    assert filtered["border"] is False
+    assert filtered["font_size"] == 15
     assert filtered["font_family"] == "DejaVu Sans"
     assert "series_enabled" not in filtered
+
+
+def test_font_size_placeholder_text_includes_effective_size_in_brackets():
+    assert _font_size_placeholder_text(14) == "Auto (14)"
+
+
+def test_resolve_error_stat_for_available_prefers_available_semantics():
+    assert (
+        _resolve_error_stat_for_available("block_sem", ["sample_sem", "sample_std"]) == "sample_sem"
+    )
+    assert (
+        _resolve_error_stat_for_available("sample_std", ["sample_sem", "sample_std"])
+        == "sample_std"
+    )
+    assert _resolve_error_stat_for_available(None, ["block_std"]) == "block_std"
+
+
+def test_default_error_series_label_uses_effective_stat_name():
+    assert _default_error_series_label("H2O density", "sample_sem") == "H2O density sample_sem"
+
+
+def test_error_supported_for_view_tracks_one_dimensional_modes_only():
+    assert _error_supported_for_view("rdf") is True
+    assert _error_supported_for_view("orientation", orientation_heatmap=True) is False
+    assert _error_supported_for_view("position", position_component="xy-z") is False
+    assert (
+        _error_supported_for_view("coordination", coordination_component="time-distance") is False
+    )
 
 
 def test_without_new_profile_series_overrides_resets_series_customizations_only():
@@ -130,6 +347,10 @@ def test_coerce_series_descriptors_preserves_identity_and_metadata():
         {
             "series_id": "series:0:3",
             "default_label": "O",
+            "source_kind": "source",
+            "source_series_id": None,
+            "member_series_ids": [],
+            "group_reducer": "mean",
             "source_name": "density.h5",
             "source_directory": "runs/run_04",
             "source_path": "/tmp/runs/run_04/density.h5",
@@ -153,6 +374,26 @@ def test_coerce_series_overrides_keeps_sparse_label_override_mapping():
     assert overrides["series:0:3"]["enabled"] is False
 
 
+def test_coerce_series_error_config_keeps_color_override():
+    config = _coerce_series_error_config(
+        {
+            "enabled": True,
+            "stat": "sample_std",
+            "style": "whiskers",
+            "color": "#cc5500",
+            "label_override": "error",
+            "show_in_legend": True,
+        }
+    )
+
+    assert config["enabled"] is True
+    assert config["stat"] == "sample_std"
+    assert config["style"] == "whiskers"
+    assert config["color"] == "#cc5500"
+    assert config["label_override"] == "error"
+    assert config["show_in_legend"] is True
+
+
 def test_coerce_series_order_deduplicates_and_strips_values():
     assert _coerce_series_order([" a ", "", "b", "a", "b", "c"]) == ["a", "b", "c"]
 
@@ -162,6 +403,72 @@ def test_resolve_series_id_order_appends_new_series_after_requested_order():
         ["series-a", "series-b", "series-c"],
         ["series-c", "series-a", "missing"],
     ) == ["series-c", "series-a", "series-b"]
+
+
+def test_partition_series_ids_by_enabled_state_preserves_current_relative_order():
+    resolved = _partition_series_ids_by_enabled_state(
+        ["series-c", "series-a", "series-b", "series-d"],
+        {
+            "series-c": True,
+            "series-a": False,
+            "series-b": True,
+            "series-d": False,
+        },
+    )
+
+    assert resolved == ["series-c", "series-b", "series-a", "series-d"]
+
+
+def test_capture_series_list_view_anchor_uses_top_visible_row_and_offset():
+    anchor = _capture_series_list_view_anchor(
+        [
+            ("series-a", -12, 8),
+            ("series-b", 8, 28),
+            ("series-c", 28, 48),
+        ],
+        viewport_height=40,
+        scroll_value=32,
+    )
+
+    assert anchor == {
+        "row_id": "series-a",
+        "offset": -12,
+        "scroll_value": 32,
+    }
+
+
+def test_restore_series_list_anchor_scroll_value_preserves_anchor_offset_after_reorder():
+    restored = _restore_series_list_anchor_scroll_value(
+        {
+            "row_id": "series-a",
+            "offset": -12,
+            "scroll_value": 32,
+        },
+        row_tops={
+            "series-b": 0,
+            "series-c": 20,
+            "series-a": 40,
+        },
+        current_scroll_value=0,
+        maximum=200,
+    )
+
+    assert restored == 52
+
+
+def test_restore_series_list_anchor_scroll_value_falls_back_to_previous_scroll_when_missing():
+    restored = _restore_series_list_anchor_scroll_value(
+        {
+            "row_id": "series-missing",
+            "offset": -12,
+            "scroll_value": 32,
+        },
+        row_tops={"series-a": 0},
+        current_scroll_value=0,
+        maximum=200,
+    )
+
+    assert restored == 32
 
 
 def test_derive_synced_field_locks_prefers_explicit_metadata():

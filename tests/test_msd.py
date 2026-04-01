@@ -41,6 +41,11 @@ def test_save_and_load_msd_profile(tmp_path):
     np.testing.assert_allclose(loaded.time_ps, profile.time_ps)
     np.testing.assert_allclose(loaded.msd, profile.msd)
     assert loaded.species == "O"
+    assert loaded.series_statistics is not None
+    stats = loaded.series_statistics["msd_A2"]
+    np.testing.assert_array_equal(stats.point_count, np.array([2]))
+    np.testing.assert_array_equal(stats.sample_n, np.array([2]))
+    assert stats.block_n is None
 
 
 def test_load_msd_profile_rejects_csv_input(tmp_path):

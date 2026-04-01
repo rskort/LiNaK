@@ -7,6 +7,9 @@ from linak.pbc import (
     extract_cell_from_lammps_input,
     extract_cell_from_simulation_input,
     extract_cell_from_cp2k_input,
+    extract_fixed_atom_indices_from_cp2k_input,
+    extract_fixed_atom_indices_from_lammps_input,
+    extract_fixed_atom_indices_from_simulation_input,
     extract_frame_timestep_fs_from_lammps_input,
     extract_frame_timestep_fs_from_simulation_input,
     extract_frame_timestep_fs_from_cp2k_input,
@@ -117,6 +120,24 @@ def test_extract_frame_timestep_fs_from_cp2k_input_multiplies_timestep_and_strid
     assert frame_timestep_fs == pytest.approx(2.5)
 
 
+def test_extract_fixed_atom_indices_from_cp2k_input_parses_list_ranges(tmp_path):
+    cp2k_input = tmp_path / "input.inp"
+    cp2k_input.write_text(
+        "&MOTION\n"
+        "  &CONSTRAINT\n"
+        "    &FIXED_ATOMS\n"
+        "      LIST 2..4 8 10..9\n"
+        "    &END FIXED_ATOMS\n"
+        "  &END CONSTRAINT\n"
+        "&END MOTION\n",
+        encoding="utf-8",
+    )
+
+    fixed = extract_fixed_atom_indices_from_cp2k_input(cp2k_input)
+
+    assert fixed == (1, 2, 3, 7, 8, 9)
+
+
 def test_find_unique_cp2k_input_requires_exactly_one_file(tmp_path):
     with pytest.raises(FileNotFoundError, match="No CP2K .inp file"):
         find_unique_cp2k_input(tmp_path)
@@ -176,6 +197,18 @@ def test_extract_frame_timestep_fs_from_lammps_input_uses_units_and_dump_stride(
     assert frame_timestep_fs == pytest.approx(5.0)
 
 
+def test_extract_fixed_atom_indices_from_lammps_input_parses_group_and_setforce(tmp_path):
+    lammps_input = tmp_path / "input.lmp"
+    lammps_input.write_text(
+        "group fixed_group id 4 5 6:7\nfix freeze fixed_group setforce 0.0 0.0 0.0\n",
+        encoding="utf-8",
+    )
+
+    fixed = extract_fixed_atom_indices_from_lammps_input(lammps_input)
+
+    assert fixed == (3, 4, 5, 6)
+
+
 def test_extract_cell_and_timestep_from_simulation_input_dispatch_lammps(tmp_path):
     lammps_input = tmp_path / "input.lmp"
     data_file = tmp_path / "system.data"
@@ -205,6 +238,24 @@ def test_extract_cell_and_timestep_from_simulation_input_dispatch_lammps(tmp_pat
     assert md_timestep_fs == pytest.approx(1.0)
     assert stride_md == 20
     assert frame_timestep_fs == pytest.approx(20.0)
+
+
+def test_extract_fixed_atom_indices_from_simulation_input_dispatches_cp2k(tmp_path):
+    cp2k_input = tmp_path / "input.inp"
+    cp2k_input.write_text(
+        "&MOTION\n"
+        "  &CONSTRAINT\n"
+        "    &FIXED_ATOMS\n"
+        "      LIST 1 3..4\n"
+        "    &END FIXED_ATOMS\n"
+        "  &END CONSTRAINT\n"
+        "&END MOTION\n",
+        encoding="utf-8",
+    )
+
+    fixed = extract_fixed_atom_indices_from_simulation_input(cp2k_input)
+
+    assert fixed == (0, 2, 3)
 
 
 def test_resolve_cell_dimensions_prefers_explicit_cell(tmp_path):

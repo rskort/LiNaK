@@ -34,6 +34,15 @@ from ..storage.hdf5_utils import (
     write_linak_hdf5,
 )
 from .schema import build_profile_metadata
+from .statistics import (
+    SeriesStatistics,
+    block_mean_matrix,
+    build_series_statistics,
+    build_statistics_metadata,
+    statistics_payload_from_series_map,
+    statistics_series_map_from_datasets,
+    resolve_block_slices,
+)
 from .density import (
     _cell_histogram_bounds,
     _frame_has_usable_cell,
@@ -121,6 +130,7 @@ class OrientationProfile:
     surface_position_std: float | None = None
     surface_estimate: SurfaceEstimate | None = None
     cell_lengths_angstrom: tuple[float, float, float] | None = None
+    series_statistics: dict[str, SeriesStatistics] | None = None
 
 
 @dataclass(frozen=True)
@@ -823,9 +833,19 @@ def compute_orientation_profile(
         else None
     )
     cell_lengths = _representative_cell_lengths(frames)
+    sample_cos_polar_mean = np.full((len(frames), n_dist_bins), np.nan, dtype=float)
+    sample_cos_azimuthal_mean = np.full((len(frames), n_dist_bins), np.nan, dtype=float)
+    sample_density = np.full((len(frames), n_dist_bins), np.nan, dtype=float)
+    sample_cos_polar_density = np.full((len(frames), n_dist_bins), np.nan, dtype=float)
+    sample_cos_azimuthal_density = np.full((len(frames), n_dist_bins), np.nan, dtype=float)
 
     for frame_idx, data in enumerate(frame_data):
         total_mask = _distance_bin_membership_mask(data.distances, dist_bin_edges)
+        frame_total_hist = np.zeros(n_dist_bins, dtype=int)
+        frame_polar_count = np.zeros(n_dist_bins, dtype=int)
+        frame_azimuthal_count = np.zeros(n_dist_bins, dtype=int)
+        frame_polar_sum = np.zeros(n_dist_bins, dtype=float)
+        frame_azimuthal_sum = np.zeros(n_dist_bins, dtype=float)
         if np.any(total_mask):
             dist_idx_total = _distance_bin_indices(data.distances[total_mask], dist_bin_edges)
             frame_total_hist = np.bincount(dist_idx_total, minlength=n_dist_bins).astype(int)
@@ -837,12 +857,14 @@ def compute_orientation_profile(
         if np.any(polar_mask):
             dist_idx_polar = _distance_bin_indices(data.distances[polar_mask], dist_bin_edges)
             polar_values = np.asarray(data.cos_polar[polar_mask], dtype=float)
-            count_polar_valid += np.bincount(dist_idx_polar, minlength=n_dist_bins).astype(int)
-            cos_polar_sum += np.bincount(
+            frame_polar_count = np.bincount(dist_idx_polar, minlength=n_dist_bins).astype(int)
+            count_polar_valid += frame_polar_count
+            frame_polar_sum = np.bincount(
                 dist_idx_polar,
                 weights=polar_values,
                 minlength=n_dist_bins,
             )
+            cos_polar_sum += frame_polar_sum
             angle_idx_polar = _angle_bin_indices(polar_values, angle_bin_edges)
             np.add.at(heatmap_polar, (dist_idx_polar, angle_idx_polar), 1.0)
 
@@ -853,17 +875,32 @@ def compute_orientation_profile(
                 dist_bin_edges,
             )
             azimuthal_values = np.asarray(data.cos_azimuthal[azimuthal_mask], dtype=float)
-            count_azimuthal_valid += np.bincount(
+            frame_azimuthal_count = np.bincount(
                 dist_idx_azimuthal,
                 minlength=n_dist_bins,
             ).astype(int)
-            cos_azimuthal_sum += np.bincount(
+            count_azimuthal_valid += frame_azimuthal_count
+            frame_azimuthal_sum = np.bincount(
                 dist_idx_azimuthal,
                 weights=azimuthal_values,
                 minlength=n_dist_bins,
             )
+            cos_azimuthal_sum += frame_azimuthal_sum
             angle_idx_azimuthal = _angle_bin_indices(azimuthal_values, angle_bin_edges)
             np.add.at(heatmap_azimuthal, (dist_idx_azimuthal, angle_idx_azimuthal), 1.0)
+
+        frame_density = (
+            np.asarray(frame_total_hist, dtype=float) / float(slab_volumes[frame_idx])
+            if slab_volumes is not None
+            else np.asarray(frame_total_hist, dtype=float) / float(bin_width)
+        )
+        frame_cos_polar_mean = _mean_with_nan(frame_polar_sum, frame_polar_count)
+        frame_cos_azimuthal_mean = _mean_with_nan(frame_azimuthal_sum, frame_azimuthal_count)
+        sample_density[frame_idx] = frame_density
+        sample_cos_polar_mean[frame_idx] = frame_cos_polar_mean
+        sample_cos_azimuthal_mean[frame_idx] = frame_cos_azimuthal_mean
+        sample_cos_polar_density[frame_idx] = frame_cos_polar_mean * frame_density
+        sample_cos_azimuthal_density[frame_idx] = frame_cos_azimuthal_mean * frame_density
 
     n_frames = len(frames)
     cos_polar_mean = _mean_with_nan(cos_polar_sum, count_polar_valid)
@@ -875,6 +912,35 @@ def compute_orientation_profile(
         slab_volumes=slab_volumes,
         framewise_density_sum=framewise_density_sum,
     )
+    block_resolution = resolve_block_slices(n_frames)
+    block_slices = None if block_resolution is None else block_resolution[0]
+    series_statistics = {
+        "cos_polar_mean": build_series_statistics(
+            point_count=count_polar_valid,
+            sample_values=sample_cos_polar_mean,
+            block_values=block_mean_matrix(sample_cos_polar_mean, block_slices=block_slices),
+        ),
+        "cos_azimuthal_mean": build_series_statistics(
+            point_count=count_azimuthal_valid,
+            sample_values=sample_cos_azimuthal_mean,
+            block_values=block_mean_matrix(sample_cos_azimuthal_mean, block_slices=block_slices),
+        ),
+        "density": build_series_statistics(
+            point_count=count_total,
+            sample_values=sample_density,
+            block_values=block_mean_matrix(sample_density, block_slices=block_slices),
+        ),
+        "cos_polar_density": build_series_statistics(
+            point_count=count_polar_valid,
+            sample_values=sample_cos_polar_density,
+            block_values=block_mean_matrix(sample_cos_polar_density, block_slices=block_slices),
+        ),
+        "cos_azimuthal_density": build_series_statistics(
+            point_count=count_azimuthal_valid,
+            sample_values=sample_cos_azimuthal_density,
+            block_values=block_mean_matrix(sample_cos_azimuthal_density, block_slices=block_slices),
+        ),
+    }
 
     return OrientationProfile(
         axis=axis,
@@ -900,6 +966,7 @@ def compute_orientation_profile(
         surface_position_std=surface_position_std,
         surface_estimate=surface_estimate,
         cell_lengths_angstrom=cell_lengths,
+        series_statistics=series_statistics,
     )
 
 
@@ -909,26 +976,34 @@ _ANALYSIS_NAME = "orientation"
 def _orientation_profile_hdf5_payload(
     profile: OrientationProfile,
 ) -> dict[str, Any]:
+    metadata_payload = {
+        "species": "H2O",
+        "axis": profile.axis,
+        "reference_axis": profile.reference_axis,
+        "n_frames": int(profile.n_frames),
+        "n_molecules_per_frame": int(profile.n_molecules_per_frame),
+        "coordinate_mode": profile.coordinate_mode,
+        "cell_lengths_angstrom": (
+            None
+            if profile.cell_lengths_angstrom is None
+            else [float(v) for v in profile.cell_lengths_angstrom]
+        ),
+        **_surface_metadata_payload(
+            surface_position=profile.surface_position,
+            surface_position_std=profile.surface_position_std,
+            estimate=profile.surface_estimate,
+        ),
+    }
+    if profile.series_statistics:
+        block_resolution = resolve_block_slices(int(profile.n_frames))
+        block_lengths = None if block_resolution is None else block_resolution[1]
+        metadata_payload["statistics"] = build_statistics_metadata(
+            statistics_by_series=profile.series_statistics,
+            block_lengths=block_lengths,
+        )
     metadata = build_profile_metadata(
         analysis=_ANALYSIS_NAME,
-        metadata={
-            "species": "H2O",
-            "axis": profile.axis,
-            "reference_axis": profile.reference_axis,
-            "n_frames": int(profile.n_frames),
-            "n_molecules_per_frame": int(profile.n_molecules_per_frame),
-            "coordinate_mode": profile.coordinate_mode,
-            "cell_lengths_angstrom": (
-                None
-                if profile.cell_lengths_angstrom is None
-                else [float(v) for v in profile.cell_lengths_angstrom]
-            ),
-            **_surface_metadata_payload(
-                surface_position=profile.surface_position,
-                surface_position_std=profile.surface_position_std,
-                estimate=profile.surface_estimate,
-            ),
-        },
+        metadata=metadata_payload,
     )
     datasets: dict[str, np.ndarray | None] = {
         "bin_edges_A": profile.bin_edges,
@@ -946,6 +1021,7 @@ def _orientation_profile_hdf5_payload(
         "heatmap_angle_bin_edges": profile.heatmap_angle_bin_edges,
         "heatmap_angle_bin_centers": profile.heatmap_angle_bin_centers,
         **_surface_estimate_datasets(profile.surface_estimate),
+        **statistics_payload_from_series_map(profile.series_statistics),
     }
     return {"datasets": datasets, "metadata": metadata}
 
@@ -1008,6 +1084,16 @@ def _build_orientation_profile_from_hdf5(
         datasets.get("count_azimuthal_valid", np.sum(heatmap_azimuthal, axis=1)),
         dtype=int,
     )
+    series_statistics = statistics_series_map_from_datasets(
+        datasets,
+        dataset_names=(
+            "cos_polar_mean",
+            "cos_azimuthal_mean",
+            "density",
+            "cos_polar_density",
+            "cos_azimuthal_density",
+        ),
+    )
 
     return OrientationProfile(
         axis=str(metadata.get("axis", "z")),
@@ -1035,6 +1121,7 @@ def _build_orientation_profile_from_hdf5(
         ),
         surface_estimate=surface_estimate,
         cell_lengths_angstrom=cell_lengths,
+        series_statistics=series_statistics,
     )
 
 
@@ -1071,7 +1158,7 @@ def load_orientation_profiles_by_index(
 # ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ plotting helpers ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚ÂÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬
 
 _ANGLE_CHOICES = ("polar", "azimuthal")
-_COMPONENT_CHOICES = ("average", "density-weighted", "heatmap")
+_COMPONENT_CHOICES = ("average", "density", "density-weighted", "heatmap")
 
 
 def _normalize_angle_token(angle: str | None) -> str:
@@ -1098,6 +1185,8 @@ def _y_label_for_component(component: str, angle: str) -> str:
     angle_label = "θ" if angle == "polar" else "φ"
     if component == "average":
         return f"⟨cos({angle_label})⟩"
+    if component == "density":
+        return "H2O number density"
     if component == "density-weighted":
         return f"H2O density-weighted ⟨cos({angle_label})⟩"
     return f"cos({angle_label})"
@@ -1111,6 +1200,8 @@ def _select_1d_data(
     x = profile.bin_centers
     if component == "average":
         y = profile.cos_polar_mean if angle == "polar" else profile.cos_azimuthal_mean
+    elif component == "density":
+        y = profile.density
     elif component == "density-weighted":
         y = profile.cos_polar_density if angle == "polar" else profile.cos_azimuthal_density
     else:
@@ -1160,6 +1251,7 @@ def plot_orientation_profile(
     legend_loc: str = "best",
     line_label: str | None = None,
     line_colors: list[str] | None = None,
+    error_config: dict[str, Any] | None = None,
     series_enabled: list[bool] | None = None,
     series_show_in_legend: list[bool] | None = None,
     series_line_widths: list[float | None] | None = None,
@@ -1168,11 +1260,13 @@ def plot_orientation_profile(
     series_fit_enabled: list[bool] | None = None,
     series_fit_labels: list[str | None] | None = None,
     series_fit_show_in_legend: list[bool] | None = None,
-    series_normalization_modes: list[str] | None = None,
+    cumulative_config: dict[str, Any] | None = None,
+    series_normalization_modes: list[str | None] | None = None,
     series_normalization_values: list[float | None] | None = None,
     series_normalization_x_refs: list[float | None] | None = None,
     x_bin_width: float | None = None,
     x_bin_reducer: str | None = None,
+    min_bin_points: int | None = None,
     heatmap_vmin: float | None = None,
     heatmap_vmax: float | None = None,
     heatmap_cmap: str | None = None,
@@ -1189,6 +1283,7 @@ def plot_orientation_profile(
     heatmap_colorbar_pad: float | None = None,
     heatmap_colorbar_shrink: float | None = None,
     heatmap_colorbar_aspect: float | None = None,
+    annotations: list[dict[str, Any]] | None = None,
     capture_state: dict[str, Any] | None = None,
     suppress_output_log: bool = False,
     matplotlib_rc: dict[str, Any] | None = None,
@@ -1243,6 +1338,7 @@ def plot_orientation_profile(
             heatmap_colorbar_pad=heatmap_colorbar_pad,
             heatmap_colorbar_shrink=heatmap_colorbar_shrink,
             heatmap_colorbar_aspect=heatmap_colorbar_aspect,
+            annotations=annotations,
             x_ticks=x_ticks,
             y_ticks=y_ticks,
             x_label_pad=x_label_pad,
@@ -1259,6 +1355,13 @@ def plot_orientation_profile(
     x, y = _select_1d_data(profile, norm_component, norm_angle)
     default_title = f"H2O orientation ({norm_angle})"
     default_y = _y_label_for_component(norm_component, norm_angle)
+    stats_key = {
+        "average": "cos_polar_mean" if norm_angle == "polar" else "cos_azimuthal_mean",
+        "density": "density",
+        "density-weighted": (
+            "cos_polar_density" if norm_angle == "polar" else "cos_azimuthal_density"
+        ),
+    }[norm_component]
     return plot_line_series(
         x,
         y,
@@ -1284,11 +1387,19 @@ def plot_orientation_profile(
         fit_show_in_legend=(
             True if not series_fit_show_in_legend else bool(series_fit_show_in_legend[0])
         ),
+        cumulative_config=cumulative_config,
+        series_statistics=None
+        if profile.series_statistics is None
+        else profile.series_statistics.get(stats_key),
+        error_config=error_config,
         normalization_mode=series_normalization_modes[0] if series_normalization_modes else None,
         normalization_value=series_normalization_values[0] if series_normalization_values else None,
         normalization_x_ref=series_normalization_x_refs[0] if series_normalization_x_refs else None,
         x_bin_width=x_bin_width,
         x_bin_reducer=x_bin_reducer,
+        min_bin_points=min_bin_points,
+        analysis_name="orientation",
+        annotations=annotations,
         style=style,
         x_scale=x_scale,
         y_scale=y_scale,
@@ -1351,6 +1462,7 @@ def plot_orientation_profiles(
     series_ids: list[str] | None = None,
     series_labels: list[str] | None = None,
     line_colors: list[str] | None = None,
+    series_error_configs: list[dict[str, Any] | None] | None = None,
     series_enabled: list[bool] | None = None,
     series_show_in_legend: list[bool] | None = None,
     series_line_widths: list[float | None] | None = None,
@@ -1359,11 +1471,15 @@ def plot_orientation_profiles(
     series_fit_enabled: list[bool] | None = None,
     series_fit_labels: list[str | None] | None = None,
     series_fit_show_in_legend: list[bool] | None = None,
-    series_normalization_modes: list[str] | None = None,
+    series_cumulative_configs: list[dict[str, Any] | None] | None = None,
+    render_series_descriptors: list[dict[str, Any]] | None = None,
+    series_overrides_by_id: dict[str, dict[str, Any]] | None = None,
+    series_normalization_modes: list[str | None] | None = None,
     series_normalization_values: list[float | None] | None = None,
     series_normalization_x_refs: list[float | None] | None = None,
     x_bin_width: float | None = None,
     x_bin_reducer: str | None = None,
+    min_bin_points: int | None = None,
     heatmap_vmin: float | None = None,
     heatmap_vmax: float | None = None,
     heatmap_cmap: str | None = None,
@@ -1380,6 +1496,7 @@ def plot_orientation_profiles(
     heatmap_colorbar_pad: float | None = None,
     heatmap_colorbar_shrink: float | None = None,
     heatmap_colorbar_aspect: float | None = None,
+    annotations: list[dict[str, Any]] | None = None,
     capture_state: dict[str, Any] | None = None,
     suppress_output_log: bool = False,
     matplotlib_rc: dict[str, Any] | None = None,
@@ -1438,6 +1555,7 @@ def plot_orientation_profiles(
             heatmap_colorbar_pad=heatmap_colorbar_pad,
             heatmap_colorbar_shrink=heatmap_colorbar_shrink,
             heatmap_colorbar_aspect=heatmap_colorbar_aspect,
+            annotations=annotations,
             x_ticks=x_ticks,
             y_ticks=y_ticks,
             x_label_pad=x_label_pad,
@@ -1455,6 +1573,13 @@ def plot_orientation_profiles(
     x_arrays: list[np.ndarray] = []
     y_arrays: list[np.ndarray] = []
     labels: list[str] = []
+    stats_key = {
+        "average": "cos_polar_mean" if norm_angle == "polar" else "cos_azimuthal_mean",
+        "density": "density",
+        "density-weighted": (
+            "cos_polar_density" if norm_angle == "polar" else "cos_azimuthal_density"
+        ),
+    }[norm_component]
     for i, profile in enumerate(profiles):
         x, y = _select_1d_data(profile, norm_component, norm_angle)
         x_arrays.append(x)
@@ -1489,11 +1614,22 @@ def plot_orientation_profiles(
         series_fit_enabled=series_fit_enabled,
         series_fit_labels=series_fit_labels,
         series_fit_show_in_legend=series_fit_show_in_legend,
+        series_cumulative_configs=series_cumulative_configs,
+        series_error_configs=series_error_configs,
+        series_statistics_data=[
+            None if profile.series_statistics is None else profile.series_statistics.get(stats_key)
+            for profile in profiles
+        ],
         series_normalization_modes=series_normalization_modes,
         series_normalization_values=series_normalization_values,
         series_normalization_x_refs=series_normalization_x_refs,
+        render_series_descriptors=render_series_descriptors,
+        series_overrides_by_id=series_overrides_by_id,
         x_bin_width=x_bin_width,
         x_bin_reducer=x_bin_reducer,
+        min_bin_points=min_bin_points,
+        analysis_name="orientation",
+        annotations=annotations,
         x_scale=x_scale,
         y_scale=y_scale,
         x_lim=x_lim,
@@ -1718,6 +1854,7 @@ def _plot_orientation_heatmap(
     heatmap_colorbar_pad: float | None,
     heatmap_colorbar_shrink: float | None,
     heatmap_colorbar_aspect: float | None,
+    annotations: list[dict[str, Any]] | None,
     x_ticks: list[float] | tuple[float, ...] | None,
     y_ticks: list[float] | tuple[float, ...] | None,
     x_label_pad: float | None,
@@ -1864,6 +2001,7 @@ def _plot_orientation_heatmap(
         heatmap_colorbar_pad=heatmap_colorbar_pad,
         heatmap_colorbar_shrink=heatmap_colorbar_shrink,
         heatmap_colorbar_aspect=heatmap_colorbar_aspect,
+        annotations=annotations,
         capture_state_extra={
             "heatmap_normalization_mode": normalization_mode,
             "heatmap_log_scale": bool(heatmap_log_scale),

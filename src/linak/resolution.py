@@ -14,6 +14,7 @@ from .pbc import (
     extract_frame_timestep_fs_from_simulation_input,
     find_unique_simulation_input,
 )
+from .trajectory.io import read_trajectory_hdf5_metadata
 from .utils import ensure_positive
 
 LOGGER = logging.getLogger(__name__)
@@ -71,6 +72,29 @@ def _auto_detect_frame_timestep_fs(trajectory_path: str | Path) -> tuple[float, 
         input_path
     )
     return frame_timestep_fs, md_timestep_fs, stride_md, input_path
+
+
+def _trajectory_hdf5_cell_metadata(
+    trajectory_path: str | Path,
+) -> tuple[tuple[float, float, float] | None, Path | None]:
+    metadata = read_trajectory_hdf5_metadata(trajectory_path)
+    if metadata is None or metadata.cell_angstrom is None:
+        return None, None
+    return metadata.cell_angstrom, metadata.input_path
+
+
+def _trajectory_hdf5_timestep_metadata(
+    trajectory_path: str | Path,
+) -> tuple[float | None, float | None, int | None, Path | None]:
+    metadata = read_trajectory_hdf5_metadata(trajectory_path)
+    if metadata is None or metadata.frame_timestep_fs is None:
+        return None, None, None, None
+    return (
+        metadata.frame_timestep_fs,
+        metadata.md_timestep_fs,
+        metadata.trajectory_stride_md,
+        metadata.input_path,
+    )
 
 
 def _normalize_info_key(key: object) -> str:
@@ -256,6 +280,7 @@ def resolve_analysis_cell(
     explicit_input_resolved = (
         Path(input_path).expanduser().resolve() if input_path is not None else None
     )
+    trajectory_hdf5_cell, trajectory_hdf5_input = _trajectory_hdf5_cell_metadata(trajectory)
 
     auto_cell: tuple[float, float, float] | None = None
     auto_input: Path | None = None
@@ -267,6 +292,8 @@ def resolve_analysis_cell(
     candidates: list[tuple[str, tuple[float, float, float]]] = []
     if explicit_cell is not None:
         candidates.append(("explicit --cell", explicit_cell))
+    if trajectory_hdf5_cell is not None:
+        candidates.append(("trajectory HDF5 metadata", trajectory_hdf5_cell))
     if explicit_input_cell is not None and explicit_input_resolved is not None:
         candidates.append((f"explicit --input ({explicit_input_resolved})", explicit_input_cell))
     if auto_cell is not None and auto_input is not None:
@@ -275,6 +302,12 @@ def resolve_analysis_cell(
 
     if explicit_cell is not None:
         return CellResolution(cell_angstrom=explicit_cell, source="explicit --cell")
+    if trajectory_hdf5_cell is not None:
+        return CellResolution(
+            cell_angstrom=trajectory_hdf5_cell,
+            source="trajectory HDF5 metadata",
+            input_path=trajectory_hdf5_input,
+        )
     if explicit_input_cell is not None and explicit_input_resolved is not None:
         return CellResolution(
             cell_angstrom=explicit_input_cell,
@@ -310,6 +343,12 @@ def resolve_analysis_timestep_fs(
     metadata_timestep, metadata_md_timestep, metadata_stride = _extract_metadata_timestep_details(
         frames
     )
+    (
+        trajectory_hdf5_timestep,
+        trajectory_hdf5_md_timestep,
+        trajectory_hdf5_stride,
+        trajectory_hdf5_input,
+    ) = _trajectory_hdf5_timestep_metadata(trajectory)
 
     explicit_input_timestep: float | None = None
     explicit_input_md_timestep: float | None = None
@@ -337,6 +376,8 @@ def resolve_analysis_timestep_fs(
     candidates: list[tuple[str, float]] = []
     if explicit_timestep is not None:
         candidates.append(("explicit --timestep-fs", explicit_timestep))
+    if trajectory_hdf5_timestep is not None:
+        candidates.append(("trajectory HDF5 metadata", trajectory_hdf5_timestep))
     if metadata_timestep is not None:
         candidates.append(("trajectory metadata", metadata_timestep))
     if explicit_input_timestep is not None and explicit_input_resolved is not None:
@@ -350,6 +391,15 @@ def resolve_analysis_timestep_fs(
     if explicit_timestep is not None:
         return TimestepResolution(
             frame_timestep_fs=explicit_timestep, source="explicit --timestep-fs"
+        )
+
+    if trajectory_hdf5_timestep is not None:
+        return TimestepResolution(
+            frame_timestep_fs=trajectory_hdf5_timestep,
+            source="trajectory HDF5 metadata",
+            input_path=trajectory_hdf5_input,
+            md_timestep_fs=trajectory_hdf5_md_timestep,
+            trajectory_stride_md=trajectory_hdf5_stride,
         )
 
     if metadata_timestep is not None:

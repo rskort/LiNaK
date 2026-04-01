@@ -5,6 +5,7 @@ from linak.resolution import (
     resolve_analysis_cell,
     resolve_analysis_timestep_fs,
 )
+from linak.trajectory.io import TrajectoryStoredMetadata, write_trajectory
 
 
 def test_resolve_analysis_cell_uses_auto_inp(tmp_path):
@@ -89,6 +90,28 @@ def test_resolve_analysis_cell_raises_when_no_source_is_available(tmp_path):
         resolve_analysis_cell(trajectory)
 
 
+def test_resolve_analysis_cell_prefers_trajectory_hdf5_metadata_over_input(tmp_path):
+    trajectory = tmp_path / "traj.traj.h5"
+    frames = [Atoms("H", positions=[[0.0, 0.0, 0.0]])]
+    write_trajectory(
+        frames,
+        trajectory,
+        metadata=TrajectoryStoredMetadata(
+            input_path=tmp_path / "input.inp",
+            input_format="inp",
+            cell_angstrom=(8.0, 9.0, 10.0),
+            cell_source="simulation input",
+        ),
+    )
+    explicit_input = tmp_path / "other.inp"
+    explicit_input.write_text("ABC [angstrom] 4.0 4.0 4.0\n", encoding="utf-8")
+
+    resolved = resolve_analysis_cell(trajectory, input_path=explicit_input)
+
+    assert resolved.cell_angstrom == pytest.approx((8.0, 9.0, 10.0))
+    assert resolved.source == "trajectory HDF5 metadata"
+
+
 def test_resolve_analysis_timestep_uses_auto_inp(tmp_path):
     trajectory = tmp_path / "traj.xyz"
     trajectory.write_text("", encoding="utf-8")
@@ -169,6 +192,33 @@ def test_resolve_analysis_timestep_prefers_metadata_over_input(tmp_path):
 
     assert resolved.frame_timestep_fs == pytest.approx(1.25)
     assert resolved.source == "trajectory metadata"
+
+
+def test_resolve_analysis_timestep_prefers_trajectory_hdf5_metadata_over_input(tmp_path):
+    trajectory = tmp_path / "traj.traj.h5"
+    frames = [Atoms("H", positions=[[0.0, 0.0, 0.0]])]
+    write_trajectory(
+        frames,
+        trajectory,
+        metadata=TrajectoryStoredMetadata(
+            input_path=tmp_path / "input.inp",
+            input_format="inp",
+            frame_timestep_fs=2.5,
+            md_timestep_fs=0.5,
+            trajectory_stride_md=5,
+            timestep_source="simulation input",
+        ),
+    )
+    explicit_input = tmp_path / "other.inp"
+    explicit_input.write_text(
+        "TIMESTEP [fs] 1.0\n&TRAJECTORY\n  &EACH\n    MD 10\n  &END EACH\n&END TRAJECTORY\n",
+        encoding="utf-8",
+    )
+
+    resolved = resolve_analysis_timestep_fs(trajectory, input_path=explicit_input)
+
+    assert resolved.frame_timestep_fs == pytest.approx(2.5)
+    assert resolved.source == "trajectory HDF5 metadata"
 
 
 def test_resolve_analysis_timestep_raises_when_no_source_is_available(tmp_path):

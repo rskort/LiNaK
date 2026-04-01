@@ -13,6 +13,7 @@ import numpy as np
 from .trajectory.lammps import (
     extract_cell_from_lammps_input,
     extract_frame_timestep_fs_from_lammps_input,
+    extract_fixed_atom_indices_from_lammps_input,
 )
 from .progress import ProgressBar
 from .utils import ensure_positive
@@ -42,6 +43,7 @@ _TIMESTEP_PATTERN = re.compile(
 _SECTION_START_PATTERN = re.compile(r"^\s*&([A-Za-z_][A-Za-z0-9_]*)\b", re.IGNORECASE)
 _SECTION_END_PATTERN = re.compile(r"^\s*&END(?:\s+([A-Za-z_][A-Za-z0-9_]*))?\b", re.IGNORECASE)
 _MD_EACH_PATTERN = re.compile(r"^\s*MD\s+([+-]?\d+)\s*$", re.IGNORECASE)
+_FIXED_ATOM_RANGE_PATTERN = re.compile(r"^([+-]?\d+)\.\.([+-]?\d+)$")
 
 
 def _normalize_input_path(path: str | Path) -> Path:
@@ -316,6 +318,93 @@ def extract_frame_timestep_fs_from_simulation_input(path: str | Path) -> tuple[f
         return extract_frame_timestep_fs_from_lammps_input(input_path)
     if suffix == ".inp":
         return extract_frame_timestep_fs_from_cp2k_input(input_path)
+    supported = ", ".join(SUPPORTED_SIM_INPUT_SUFFIXES)
+    raise ValueError(
+        f"Unsupported simulation input format '{input_path.suffix}' for '{input_path}'. "
+        f"Supported formats: {supported}."
+    )
+
+
+def _expand_cp2k_fixed_atom_list(raw: str, *, input_path: Path, line_number: int) -> list[int]:
+    tokens = [token.strip() for token in raw.replace(",", " ").split() if token.strip()]
+    indices: list[int] = []
+    for token in tokens:
+        range_match = _FIXED_ATOM_RANGE_PATTERN.match(token)
+        if range_match:
+            start = int(range_match.group(1))
+            stop = int(range_match.group(2))
+            step = 1 if stop >= start else -1
+            indices.extend(range(start, stop + step, step))
+            continue
+        try:
+            indices.append(int(token))
+        except ValueError as exc:
+            raise ValueError(
+                f"Unsupported FIXED_ATOMS LIST token '{token}' in '{input_path}' line {line_number}."
+            ) from exc
+    return indices
+
+
+def extract_fixed_atom_indices_from_cp2k_input(path: str | Path) -> tuple[int, ...] | None:
+    """Extract zero-based fixed atom indices from CP2K ``&FIXED_ATOMS / LIST`` entries."""
+    input_path = Path(path).expanduser().resolve()
+    if not input_path.exists():
+        raise FileNotFoundError(f"CP2K input file not found: {input_path}")
+    if not input_path.is_file():
+        raise ValueError(f"CP2K input path is not a file: {input_path}")
+
+    sections: list[str] = []
+    fixed_atom_indices: set[int] = set()
+    with input_path.open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            no_comment = line.split("!", 1)[0].strip()
+            if not no_comment:
+                continue
+
+            section_end = _SECTION_END_PATTERN.match(no_comment)
+            if section_end:
+                name = section_end.group(1)
+                if name:
+                    expected = name.upper()
+                    for idx in range(len(sections) - 1, -1, -1):
+                        if sections[idx] == expected:
+                            sections = sections[:idx]
+                            break
+                elif sections:
+                    sections.pop()
+                continue
+
+            section_start = _SECTION_START_PATTERN.match(no_comment)
+            if section_start:
+                sections.append(section_start.group(1).upper())
+                continue
+
+            if "CONSTRAINT" not in sections or "FIXED_ATOMS" not in sections:
+                continue
+            if not no_comment.upper().startswith("LIST"):
+                continue
+
+            list_payload = no_comment[4:].strip()
+            indices = _expand_cp2k_fixed_atom_list(
+                list_payload,
+                input_path=input_path,
+                line_number=line_number,
+            )
+            fixed_atom_indices.update(index - 1 for index in indices if index > 0)
+
+    if not fixed_atom_indices:
+        return None
+    return tuple(sorted(fixed_atom_indices))
+
+
+def extract_fixed_atom_indices_from_simulation_input(path: str | Path) -> tuple[int, ...] | None:
+    """Extract zero-based fixed atom indices from a CP2K or LAMMPS input file."""
+    input_path = _normalize_input_path(path)
+    suffix = input_path.suffix.lower()
+    if suffix == ".lmp":
+        return extract_fixed_atom_indices_from_lammps_input(input_path)
+    if suffix == ".inp":
+        return extract_fixed_atom_indices_from_cp2k_input(input_path)
     supported = ", ".join(SUPPORTED_SIM_INPUT_SUFFIXES)
     raise ValueError(
         f"Unsupported simulation input format '{input_path.suffix}' for '{input_path}'. "

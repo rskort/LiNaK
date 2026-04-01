@@ -9,7 +9,7 @@ LiNaK is a lightweight Python toolkit for molecular dynamics trajectory analysis
 LiNaK provides four top-level commands:
 - `linak compute`: generate LiNaK HDF5 analysis files
 - `linak plot`: plot LiNaK density, MSD, RDF, position, coordination, and potential HDF5 files by auto-detecting the analysis from the HDF5 metadata
-- `linak apply`: apply PBC or compress CP2K output files
+- `linak apply`: convert trajectories, apply PBC, or compress CP2K output files
 - `linak hdf5` (`linak hd`, `linak h5`): inspect, combine, transform, and plot generic tabular HDF5 data
 
 Supported inputs include:
@@ -83,6 +83,14 @@ msd = compute_msd(frames, species="O", timestep_fs=0.5)
 
 print(density.species, density.units, density.n_frames)
 print(msd.species, msd.msd[-1], "A^2")
+```
+
+Recommended CLI workflow for repeated analysis:
+
+```bash
+linak apply convert traj.xyz
+linak compute rdf traj.traj.h5
+linak plot LiNaK_outputs/traj.traj_rdf.h5
 ```
 
 ## CLI Overview
@@ -164,15 +172,24 @@ instead of requiring free-text entry.
 ### `linak apply`
 
 Available apply commands:
+- `convert`: convert a trajectory into LiNaK trajectory HDF5 (`*.traj.h5`)
 - `pbc`: wrap atom positions into an orthorhombic periodic cell
 - `compress`: extract structured files from one CP2K `.out` file
 
 Examples:
 
 ```bash
+linak apply convert traj.xyz
+linak apply convert traj.xyz --input input.inp
 linak apply pbc pos.xyz --cell 17.887 15.491 59.671
 linak apply compress /path/to/output.out
 ```
+
+Converted `*.traj.h5` files store exact frame counts plus any simulation metadata
+LiNaK can resolve at conversion time, including cell lengths, timestep/stride,
+and fixed-atom constraints when the input declares them. Later `compute`
+commands prefer explicit CLI overrides first, then the stored trajectory-HDF5
+metadata, then explicit/auto-detected simulation inputs.
 
 ### `linak hdf5`
 
@@ -218,6 +235,7 @@ Detailed method notes:
 
 Cell handling for density:
 - first use `--cell A B C` if provided
+- then use metadata embedded in a converted `*.traj.h5` when available
 - then use `--input` / `--cp2k-input` / `--lammps-input` if provided
 - otherwise auto-detect a single `.inp` or `.lmp` next to the trajectory
 - if no periodic cell can be resolved, LiNaK falls back to a linear density profile
@@ -239,10 +257,11 @@ Use `--surface-elements` when LiNaK should only use specific atoms for surface d
 
 For MSD, LiNaK resolves the frame timestep in this order:
 1. `--timestep-fs` if provided
-2. trajectory metadata when available
-3. simulation input from `--input` / `--cp2k-input` / `--lammps-input` if provided
-4. auto-detected `.inp` or `.lmp` next to the trajectory
-5. fallback to `0.5 fs`
+2. metadata embedded in a converted `*.traj.h5` when available
+3. trajectory metadata when available
+4. simulation input from `--input` / `--cp2k-input` / `--lammps-input` if provided
+5. auto-detected `.inp` or `.lmp` next to the trajectory
+6. fallback to `0.5 fs`
 
 When a usable periodic cell is available, MSD uses periodic minimum-image
 accumulation. Otherwise it falls back to direct displacement.
@@ -251,7 +270,9 @@ accumulation. Otherwise it falls back to direct displacement.
 
 `linak compute rdf` supports `--species-a`, `--species-b`, `--r-max`,
 `--bin-width`, and `--threads`. RDF requires a usable cell volume, taken from
-trajectory metadata when present or resolved from simulation input.
+explicit `--cell` first, then converted trajectory-HDF5 metadata, then
+simulation-input resolution, then any usable cell already embedded in the
+loaded trajectory frames.
 
 ### Coordination
 
