@@ -74,12 +74,16 @@ def test_execute_series_fit_logarithmic_requires_positive_x():
     assert summary["display_point_count"] == 5
 
 
-def test_resolve_series_fit_configs_upgrades_legacy_linear_fit_flags():
+def test_resolve_series_fit_configs_uses_explicit_fit_config():
     configs = resolve_series_fit_configs(
         series_count=1,
-        series_fit_enabled=[True],
-        series_fit_labels=["demo fit"],
-        series_fit_show_in_legend=[False],
+        series_fit_configs=[
+            {
+                "fit_enabled": True,
+                "fit_label_override": "demo fit",
+                "fit_show_in_legend": False,
+            }
+        ],
     )
 
     assert configs == [

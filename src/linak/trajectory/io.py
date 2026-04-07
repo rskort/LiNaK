@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 import logging
 import os
 from pathlib import Path
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import h5py
 import numpy as np
@@ -28,6 +28,9 @@ from .lammps import (
 from ..progress import ProgressBar
 
 LOGGER = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from ..analysis.density import SurfaceEstimate
 
 _ASE_LAMMPS_DATA_TO_ASE_ATOMS = getattr(ase_lammpsrun, "lammps_data_to_ase_atoms", None)
 
@@ -57,6 +60,19 @@ class TrajectoryStoredMetadata:
     timestep_source: str | None = None
     fixed_atom_indices: tuple[int, ...] = ()
     fixed_atoms_source: str | None = None
+    pbc_applied: bool = False
+    pbc_cell_angstrom: tuple[float, float, float] | None = None
+    pbc_source: str | None = None
+    coordinate_basis: str | None = None
+    surface_cache_status: str | None = None
+    surface_cache_axis: str | None = None
+    surface_cache_mode: str | None = None
+    surface_cache_elements: tuple[str, ...] | None = None
+    surface_cache_include_fixed_surface_atoms: bool = False
+    surface_cache_rough_surface_envelope_A: float | None = None
+    surface_cache_source: str | None = None
+    surface_cache_unavailable_reason: str | None = None
+    surface_cache_estimate: SurfaceEstimate | None = None
 
 
 def default_trajectory_hdf5_output_path(source: str | Path) -> Path:
@@ -118,6 +134,53 @@ def _normalize_stored_metadata(
     fixed_atoms_source = (
         str(metadata.fixed_atoms_source).strip() or None if metadata.fixed_atoms_source else None
     )
+    pbc_cell_angstrom = (
+        cast(
+            tuple[float, float, float],
+            tuple(float(value) for value in metadata.pbc_cell_angstrom),
+        )
+        if metadata.pbc_cell_angstrom is not None
+        else None
+    )
+    pbc_source = str(metadata.pbc_source).strip() or None if metadata.pbc_source else None
+    coordinate_basis = (
+        str(metadata.coordinate_basis).strip() or None if metadata.coordinate_basis else None
+    )
+    surface_cache_status = (
+        str(metadata.surface_cache_status).strip().lower() or None
+        if metadata.surface_cache_status
+        else None
+    )
+    surface_cache_axis = (
+        str(metadata.surface_cache_axis).strip().lower() or None
+        if metadata.surface_cache_axis
+        else None
+    )
+    surface_cache_mode = (
+        str(metadata.surface_cache_mode).strip().lower() or None
+        if metadata.surface_cache_mode
+        else None
+    )
+    surface_cache_elements = (
+        tuple(str(value).strip() for value in metadata.surface_cache_elements if str(value).strip())
+        if metadata.surface_cache_elements is not None
+        else None
+    )
+    surface_cache_source = (
+        str(metadata.surface_cache_source).strip() or None
+        if metadata.surface_cache_source
+        else None
+    )
+    surface_cache_unavailable_reason = (
+        str(metadata.surface_cache_unavailable_reason).strip() or None
+        if metadata.surface_cache_unavailable_reason
+        else None
+    )
+    surface_cache_rough_surface_envelope_A = (
+        float(metadata.surface_cache_rough_surface_envelope_A)
+        if metadata.surface_cache_rough_surface_envelope_A is not None
+        else None
+    )
     return TrajectoryStoredMetadata(
         input_path=input_path,
         input_format=input_format,
@@ -129,6 +192,21 @@ def _normalize_stored_metadata(
         timestep_source=timestep_source,
         fixed_atom_indices=fixed_atom_indices,
         fixed_atoms_source=fixed_atoms_source,
+        pbc_applied=bool(metadata.pbc_applied),
+        pbc_cell_angstrom=pbc_cell_angstrom,
+        pbc_source=pbc_source,
+        coordinate_basis=coordinate_basis,
+        surface_cache_status=surface_cache_status,
+        surface_cache_axis=surface_cache_axis,
+        surface_cache_mode=surface_cache_mode,
+        surface_cache_elements=surface_cache_elements,
+        surface_cache_include_fixed_surface_atoms=bool(
+            metadata.surface_cache_include_fixed_surface_atoms
+        ),
+        surface_cache_rough_surface_envelope_A=surface_cache_rough_surface_envelope_A,
+        surface_cache_source=surface_cache_source,
+        surface_cache_unavailable_reason=surface_cache_unavailable_reason,
+        surface_cache_estimate=metadata.surface_cache_estimate,
     )
 
 
@@ -184,7 +262,34 @@ def _resolve_write_metadata(
         timestep_source=resolved.timestep_source,
         fixed_atom_indices=fixed_atom_indices,
         fixed_atoms_source=fixed_atoms_source,
+        pbc_applied=resolved.pbc_applied,
+        pbc_cell_angstrom=resolved.pbc_cell_angstrom,
+        pbc_source=resolved.pbc_source,
+        coordinate_basis=resolved.coordinate_basis,
+        surface_cache_status=resolved.surface_cache_status,
+        surface_cache_axis=resolved.surface_cache_axis,
+        surface_cache_mode=resolved.surface_cache_mode,
+        surface_cache_elements=resolved.surface_cache_elements,
+        surface_cache_include_fixed_surface_atoms=resolved.surface_cache_include_fixed_surface_atoms,
+        surface_cache_rough_surface_envelope_A=resolved.surface_cache_rough_surface_envelope_A,
+        surface_cache_source=resolved.surface_cache_source,
+        surface_cache_unavailable_reason=resolved.surface_cache_unavailable_reason,
+        surface_cache_estimate=resolved.surface_cache_estimate,
     )
+
+
+def _optional_attr_str(value: Any) -> str | None:
+    if value in (None, ""):
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _decode_hdf5_string_array(values: np.ndarray) -> np.ndarray:
+    array = np.asarray(values)
+    if array.dtype.kind == "S":
+        return np.char.decode(array, "utf-8", errors="replace")
+    return array.astype(str)
 
 
 def read_trajectory_hdf5_metadata(path: str | Path) -> TrajectoryStoredMetadata | None:
@@ -244,6 +349,53 @@ def read_trajectory_hdf5_metadata(path: str | Path) -> TrajectoryStoredMetadata 
         frame_timestep_fs_raw = metadata_group.attrs.get("frame_timestep_fs")
         md_timestep_fs_raw = metadata_group.attrs.get("md_timestep_fs")
         trajectory_stride_md_raw = metadata_group.attrs.get("trajectory_stride_md")
+        pbc_applied_raw = metadata_group.attrs.get("pbc_applied")
+        pbc_cell_dataset = metadata_group.get("pbc_cell_angstrom")
+        pbc_cell_angstrom = (
+            cast(
+                tuple[float, float, float],
+                tuple(
+                    float(value)
+                    for value in np.asarray(pbc_cell_dataset, dtype=np.float64).tolist()
+                ),
+            )
+            if isinstance(pbc_cell_dataset, h5py.Dataset)
+            else None
+        )
+        pbc_source_raw = metadata_group.attrs.get("pbc_source")
+        coordinate_basis_raw = metadata_group.attrs.get("coordinate_basis")
+
+        surface_group = metadata_group.get("surface_cache")
+        surface_cache_status: str | None = None
+        surface_cache_axis: str | None = None
+        surface_cache_mode: str | None = None
+        surface_cache_elements: tuple[str, ...] | None = None
+        surface_cache_include_fixed_surface_atoms = False
+        surface_cache_rough_surface_envelope_A: float | None = None
+        surface_cache_source: str | None = None
+        surface_cache_unavailable_reason: str | None = None
+        if isinstance(surface_group, h5py.Group):
+            surface_cache_status = _optional_attr_str(surface_group.attrs.get("status"))
+            surface_cache_axis = _optional_attr_str(surface_group.attrs.get("axis"))
+            surface_cache_mode = _optional_attr_str(surface_group.attrs.get("surface_mode"))
+            surface_elements_dataset = surface_group.get("surface_elements")
+            if isinstance(surface_elements_dataset, h5py.Dataset):
+                surface_cache_elements = tuple(
+                    str(value)
+                    for value in _decode_hdf5_string_array(np.asarray(surface_elements_dataset))
+                    if str(value)
+                )
+            surface_cache_include_fixed_surface_atoms = bool(
+                surface_group.attrs.get("include_fixed_surface_atoms", False)
+            )
+            rough_envelope_raw = surface_group.attrs.get("rough_surface_envelope_A")
+            surface_cache_rough_surface_envelope_A = (
+                float(rough_envelope_raw) if rough_envelope_raw is not None else None
+            )
+            surface_cache_source = _optional_attr_str(surface_group.attrs.get("source"))
+            surface_cache_unavailable_reason = _optional_attr_str(
+                surface_group.attrs.get("unavailable_reason")
+            )
 
         return _normalize_stored_metadata(
             TrajectoryStoredMetadata(
@@ -263,8 +415,181 @@ def read_trajectory_hdf5_metadata(path: str | Path) -> TrajectoryStoredMetadata 
                 timestep_source=timestep_source,
                 fixed_atom_indices=fixed_atom_indices,
                 fixed_atoms_source=fixed_atoms_source,
+                pbc_applied=bool(pbc_applied_raw),
+                pbc_cell_angstrom=pbc_cell_angstrom,
+                pbc_source=_optional_attr_str(pbc_source_raw),
+                coordinate_basis=_optional_attr_str(coordinate_basis_raw),
+                surface_cache_status=surface_cache_status,
+                surface_cache_axis=surface_cache_axis,
+                surface_cache_mode=surface_cache_mode,
+                surface_cache_elements=surface_cache_elements,
+                surface_cache_include_fixed_surface_atoms=surface_cache_include_fixed_surface_atoms,
+                surface_cache_rough_surface_envelope_A=surface_cache_rough_surface_envelope_A,
+                surface_cache_source=surface_cache_source,
+                surface_cache_unavailable_reason=surface_cache_unavailable_reason,
             )
         )
+
+
+def _normalize_surface_cache_elements(
+    surface_elements: list[str] | tuple[str, ...] | None,
+) -> tuple[str, ...] | None:
+    if surface_elements is None:
+        return None
+    from ..analysis.density import _normalize_surface_elements_argument
+
+    normalized = _normalize_surface_elements_argument(surface_elements)
+    return None if normalized is None else tuple(normalized)
+
+
+def _surface_cache_settings_match(
+    group: h5py.Group,
+    *,
+    axis: str,
+    surface_mode: str,
+    surface_elements: list[str] | tuple[str, ...] | None,
+    include_fixed_surface_atoms: bool,
+    rough_surface_envelope_A: float | None,
+) -> bool:
+    cached_axis = _optional_attr_str(group.attrs.get("axis"))
+    cached_mode = _optional_attr_str(group.attrs.get("surface_mode"))
+    if cached_axis is None or cached_axis.lower() != axis.lower():
+        return False
+    if cached_mode is None or cached_mode.lower() != surface_mode.lower():
+        return False
+    if bool(group.attrs.get("include_fixed_surface_atoms", False)) != bool(
+        include_fixed_surface_atoms
+    ):
+        return False
+    cached_rough_raw = group.attrs.get("rough_surface_envelope_A")
+    cached_rough = float(cached_rough_raw) if cached_rough_raw is not None else None
+    if cached_rough != rough_surface_envelope_A:
+        return False
+    cached_elements_dataset = group.get("surface_elements")
+    cached_elements = (
+        tuple(
+            str(value)
+            for value in _decode_hdf5_string_array(np.asarray(cached_elements_dataset))
+            if str(value)
+        )
+        if isinstance(cached_elements_dataset, h5py.Dataset)
+        else None
+    )
+    return cached_elements == _normalize_surface_cache_elements(surface_elements)
+
+
+def _surface_cache_metadata_from_group(group: h5py.Group) -> dict[str, Any]:
+    metadata: dict[str, Any] = {}
+    attr_to_metadata = {
+        "surface_position": "surface_position",
+        "surface_position_std": "surface_position_std",
+        "surface_estimate_mode": "surface_mode",
+        "surface_side": "surface_side",
+        "surface_method_label": "surface_method_label",
+        "surface_valid_fraction": "surface_valid_fraction",
+        "surface_median_confidence": "surface_median_confidence",
+        "surface_composite_score": "surface_composite_score",
+        "surface_low_confidence_threshold": "surface_low_confidence_threshold",
+    }
+    for attr_name, metadata_name in attr_to_metadata.items():
+        if attr_name in group.attrs:
+            metadata[metadata_name] = group.attrs[attr_name]
+    selected_elements = group.get("surface_selected_elements")
+    if isinstance(selected_elements, h5py.Dataset):
+        metadata["surface_selected_elements"] = tuple(
+            str(value)
+            for value in _decode_hdf5_string_array(np.asarray(selected_elements))
+            if str(value)
+        )
+    candidate_indices = group.get("surface_candidate_indices")
+    if isinstance(candidate_indices, h5py.Dataset):
+        metadata["surface_candidate_indices"] = np.asarray(candidate_indices, dtype=np.int64)
+    return metadata
+
+
+def _read_surface_cache_datasets(group: h5py.Group) -> dict[str, np.ndarray]:
+    required = (
+        "surface_position_per_frame_A",
+        "surface_valid_mask",
+        "surface_confidence",
+        "surface_provenance",
+    )
+    missing = [name for name in required if not isinstance(group.get(name), h5py.Dataset)]
+    if missing:
+        raise ValueError(
+            f"Trajectory HDF5 surface cache is malformed: missing dataset(s) {', '.join(missing)}."
+        )
+    datasets: dict[str, np.ndarray] = {}
+    for name, item in group.items():
+        if isinstance(item, h5py.Dataset) and name.startswith("surface_"):
+            datasets[name] = np.asarray(item)
+    return datasets
+
+
+def read_trajectory_hdf5_surface_cache(
+    path: str | Path,
+    *,
+    axis: str,
+    surface_mode: str,
+    surface_elements: list[str] | tuple[str, ...] | None,
+    include_fixed_surface_atoms: bool,
+    rough_surface_envelope_A: float | None,
+    frame_count: int,
+) -> SurfaceEstimate | None:
+    """Return a matching conversion-time surface cache from a trajectory HDF5."""
+    trajectory_path = Path(path).expanduser().resolve()
+    if not is_linak_trajectory_hdf5(trajectory_path):
+        return None
+
+    with h5py.File(trajectory_path, "r") as handle:
+        metadata_group = handle.get("metadata")
+        if not isinstance(metadata_group, h5py.Group):
+            return None
+        surface_group = metadata_group.get("surface_cache")
+        if not isinstance(surface_group, h5py.Group):
+            return None
+        status = _optional_attr_str(surface_group.attrs.get("status"))
+        if status != "available":
+            return None
+        if not _surface_cache_settings_match(
+            surface_group,
+            axis=axis,
+            surface_mode=surface_mode,
+            surface_elements=surface_elements,
+            include_fixed_surface_atoms=include_fixed_surface_atoms,
+            rough_surface_envelope_A=rough_surface_envelope_A,
+        ):
+            LOGGER.debug(
+                "Trajectory HDF5 surface cache in '%s' does not match requested settings.",
+                trajectory_path,
+            )
+            return None
+        datasets = _read_surface_cache_datasets(surface_group)
+        metadata = _surface_cache_metadata_from_group(surface_group)
+
+    from ..analysis.density import _surface_estimate_from_payload
+
+    estimate = _surface_estimate_from_payload(datasets=datasets, metadata=metadata)
+    if estimate is None:
+        raise ValueError("Trajectory HDF5 surface cache is malformed: no surface estimate data.")
+    if estimate.frame_values.shape != (int(frame_count),):
+        raise ValueError(
+            "Trajectory HDF5 surface cache is malformed: "
+            f"surface_position_per_frame_A has shape {estimate.frame_values.shape}, "
+            f"expected ({int(frame_count)},)."
+        )
+    for label, values in (
+        ("surface_valid_mask", estimate.valid_mask),
+        ("surface_confidence", estimate.confidence),
+        ("surface_provenance", estimate.provenance),
+    ):
+        if np.asarray(values).shape != estimate.frame_values.shape:
+            raise ValueError(
+                "Trajectory HDF5 surface cache is malformed: "
+                f"{label} shape {np.asarray(values).shape} does not match "
+                f"surface_position_per_frame_A shape {estimate.frame_values.shape}."
+            )
+    return estimate
 
 
 def _collect_frame_info_values(
@@ -304,6 +629,85 @@ def _validate_fixed_topology_frames(frames: list[Atoms]) -> np.ndarray:
                 f"atomic numbers/order differ in frame {index}."
             )
     return reference
+
+
+def _write_string_dataset(group: h5py.Group, name: str, values: tuple[str, ...]) -> None:
+    maxlen = max(1, *(len(value.encode("utf-8")) for value in values))
+    group.create_dataset(name, data=np.asarray(list(values), dtype=f"S{maxlen}"))
+
+
+def _write_trajectory_surface_cache(
+    metadata_group: h5py.Group,
+    metadata: TrajectoryStoredMetadata,
+) -> None:
+    if metadata.surface_cache_status is None:
+        return
+
+    surface_group = metadata_group.create_group("surface_cache")
+    surface_group.attrs["status"] = metadata.surface_cache_status
+    if metadata.surface_cache_axis:
+        surface_group.attrs["axis"] = metadata.surface_cache_axis
+    if metadata.surface_cache_mode:
+        surface_group.attrs["surface_mode"] = metadata.surface_cache_mode
+    surface_group.attrs["include_fixed_surface_atoms"] = bool(
+        metadata.surface_cache_include_fixed_surface_atoms
+    )
+    if metadata.surface_cache_rough_surface_envelope_A is not None:
+        surface_group.attrs["rough_surface_envelope_A"] = (
+            metadata.surface_cache_rough_surface_envelope_A
+        )
+    if metadata.surface_cache_source:
+        surface_group.attrs["source"] = metadata.surface_cache_source
+    if metadata.surface_cache_unavailable_reason:
+        surface_group.attrs["unavailable_reason"] = metadata.surface_cache_unavailable_reason
+    if metadata.surface_cache_elements is not None:
+        _write_string_dataset(surface_group, "surface_elements", metadata.surface_cache_elements)
+
+    estimate = metadata.surface_cache_estimate
+    if metadata.surface_cache_status != "available" or estimate is None:
+        return
+
+    from ..analysis.density import _surface_estimate_datasets, _surface_metadata_payload
+
+    nested_metadata = _surface_metadata_payload(
+        surface_position=estimate.position,
+        surface_position_std=estimate.std,
+        estimate=estimate,
+    ).get("surface", {})
+    if "position" in nested_metadata:
+        surface_group.attrs["surface_position"] = float(nested_metadata["position"])
+    if "position_std" in nested_metadata:
+        surface_group.attrs["surface_position_std"] = float(nested_metadata["position_std"])
+    if "mode" in nested_metadata:
+        surface_group.attrs["surface_estimate_mode"] = str(nested_metadata["mode"])
+    if "side" in nested_metadata:
+        surface_group.attrs["surface_side"] = str(nested_metadata["side"])
+    if "method_label" in nested_metadata:
+        surface_group.attrs["surface_method_label"] = str(nested_metadata["method_label"])
+    for key in (
+        "valid_fraction",
+        "median_confidence",
+        "composite_score",
+        "low_confidence_threshold",
+    ):
+        if key in nested_metadata and nested_metadata[key] is not None:
+            surface_group.attrs[f"surface_{key}"] = float(nested_metadata[key])
+    selected_elements = tuple(str(value) for value in nested_metadata.get("selected_elements", ()))
+    if selected_elements:
+        _write_string_dataset(surface_group, "surface_selected_elements", selected_elements)
+    candidate_indices = nested_metadata.get("candidate_indices")
+    if candidate_indices is not None:
+        surface_group.create_dataset(
+            "surface_candidate_indices",
+            data=np.asarray(candidate_indices, dtype=np.int64),
+        )
+
+    for name, values in _surface_estimate_datasets(estimate).items():
+        if values is None:
+            continue
+        array = np.asarray(values)
+        compression = "lzf" if array.ndim > 0 and array.size > 0 else None
+        surface_group.create_dataset(name, data=array, compression=compression)
 
 
 def _write_trajectory_hdf5(
@@ -394,6 +798,12 @@ def _write_trajectory_hdf5(
                     metadata_group.attrs["timestep_source"] = stored_metadata.timestep_source
                 if stored_metadata.fixed_atoms_source:
                     metadata_group.attrs["fixed_atoms_source"] = stored_metadata.fixed_atoms_source
+                if stored_metadata.pbc_applied:
+                    metadata_group.attrs["pbc_applied"] = True
+                if stored_metadata.pbc_source:
+                    metadata_group.attrs["pbc_source"] = stored_metadata.pbc_source
+                if stored_metadata.coordinate_basis:
+                    metadata_group.attrs["coordinate_basis"] = stored_metadata.coordinate_basis
                 if stored_metadata.frame_timestep_fs is not None:
                     metadata_group.attrs["frame_timestep_fs"] = stored_metadata.frame_timestep_fs
                 if stored_metadata.md_timestep_fs is not None:
@@ -407,11 +817,17 @@ def _write_trajectory_hdf5(
                         "cell_angstrom",
                         data=np.asarray(stored_metadata.cell_angstrom, dtype=np.float64),
                     )
+                if stored_metadata.pbc_cell_angstrom is not None:
+                    metadata_group.create_dataset(
+                        "pbc_cell_angstrom",
+                        data=np.asarray(stored_metadata.pbc_cell_angstrom, dtype=np.float64),
+                    )
                 if stored_metadata.fixed_atom_indices:
                     metadata_group.create_dataset(
                         "fixed_atom_indices",
                         data=np.asarray(stored_metadata.fixed_atom_indices, dtype=np.int64),
                     )
+                _write_trajectory_surface_cache(metadata_group, stored_metadata)
             progress.update(frame_count)
 
     return output_path

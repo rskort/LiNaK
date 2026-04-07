@@ -488,7 +488,7 @@ def test_coordination_analysis_reports_progress_for_cutoff_and_values(monkeypatc
 
     assert profile.coordination_number.shape == (2, 1)
     entered = [event[1] for event in events if event[0] == "enter"]
-    assert any("Coordination values" in desc for desc in entered)
+    assert any("Computing coordination" in desc for desc in entered)
     updates = [event for event in events if event[0] == "update"]
     assert updates
 
@@ -673,15 +673,13 @@ def test_compute_reference_rdf_uses_nan_for_zero_expected_bins(monkeypatch):
 
 
 def test_resolve_coordination_cutoff_from_full_rdf_uses_shared_pair_collection(monkeypatch):
-    bin_centers = np.array([0.25, 0.75, 1.25], dtype=float)
-    g_r = np.array([0.2, 1.8, 0.45], dtype=float)
+    bin_centers = np.array([0.25, 0.75, 1.25, 1.75], dtype=float)
+    g_r = np.array([0.2, 1.8, 0.45, 0.8], dtype=float)
 
     monkeypatch.setattr(
         coordination_module,
         "_compute_reference_rdf_pairs",
-        lambda *args, **kwargs: {
-            ("H", "O"): (bin_centers, g_r)
-        },
+        lambda *args, **kwargs: {("H", "O"): (bin_centers, g_r)},
     )
 
     frames = _coordination_test_frames() * 3

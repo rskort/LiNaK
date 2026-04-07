@@ -55,6 +55,13 @@ def _normalize_input_path(path: str | Path) -> Path:
     return input_path
 
 
+def _strip_cp2k_comment(line: str) -> str:
+    stripped = line
+    for marker in ("!", "#"):
+        stripped = stripped.split(marker, 1)[0]
+    return stripped.strip()
+
+
 def find_unique_simulation_input(search_dir: str | Path) -> Path:
     """Find exactly one supported simulation input file in a directory."""
     directory = Path(search_dir).expanduser().resolve()
@@ -136,7 +143,7 @@ def extract_cell_from_cp2k_input(path: str | Path) -> tuple[float, float, float]
     angle_line_number: int | None = None
     with input_path.open("r", encoding="utf-8") as handle:
         for line_number, line in enumerate(handle, start=1):
-            no_comment = line.split("!", 1)[0].strip()
+            no_comment = _strip_cp2k_comment(line)
             if not no_comment:
                 continue
             abc_match = _ABC_PATTERN.match(no_comment)
@@ -180,7 +187,7 @@ def extract_cell_from_cp2k_input(path: str | Path) -> tuple[float, float, float]
         display = os.path.relpath(input_path)
     except ValueError:
         display = str(input_path)
-    LOGGER.info(
+    LOGGER.debug(
         "Parsed CP2K cell from '%s': %.6g \u00d7 %.6g \u00d7 %.6g \u00c5 (90\u00b0 90\u00b0 90\u00b0).",
         display,
         cell[0],
@@ -200,7 +207,7 @@ def extract_timestep_fs_from_cp2k_input(path: str | Path) -> float:
 
     with input_path.open("r", encoding="utf-8") as handle:
         for line_number, line in enumerate(handle, start=1):
-            no_comment = line.split("!", 1)[0].strip()
+            no_comment = _strip_cp2k_comment(line)
             if not no_comment:
                 continue
             match = _TIMESTEP_PATTERN.match(no_comment)
@@ -216,7 +223,7 @@ def extract_timestep_fs_from_cp2k_input(path: str | Path) -> float:
 
             timestep_fs = float(match.group(2))
             ensure_positive("timestep_fs", timestep_fs)
-            LOGGER.info(
+            LOGGER.debug(
                 "Parsed CP2K TIMESTEP from '%s' line %d: %.6g fs.",
                 input_path,
                 line_number,
@@ -244,7 +251,7 @@ def extract_trajectory_stride_md_from_cp2k_input(path: str | Path) -> int:
     sections: list[str] = []
     with input_path.open("r", encoding="utf-8") as handle:
         for line_number, line in enumerate(handle, start=1):
-            no_comment = line.split("!", 1)[0].strip()
+            no_comment = _strip_cp2k_comment(line)
             if not no_comment:
                 continue
 
@@ -278,7 +285,7 @@ def extract_trajectory_stride_md_from_cp2k_input(path: str | Path) -> int:
                 raise ValueError(
                     f"Invalid TRAJECTORY/EACH MD value '{stride_md}' in '{input_path}' line {line_number}."
                 )
-            LOGGER.info(
+            LOGGER.debug(
                 "Parsed CP2K TRAJECTORY stride from '%s' line %d: every %d MD step(s).",
                 input_path,
                 line_number,
@@ -286,7 +293,7 @@ def extract_trajectory_stride_md_from_cp2k_input(path: str | Path) -> int:
             )
             return stride_md
 
-    LOGGER.info(
+    LOGGER.debug(
         "No explicit TRAJECTORY/EACH MD stride found in '%s'; using default MD 1.",
         input_path,
     )
@@ -300,7 +307,7 @@ def extract_frame_timestep_fs_from_cp2k_input(path: str | Path) -> tuple[float, 
     stride_md = extract_trajectory_stride_md_from_cp2k_input(input_path)
     frame_timestep_fs = md_timestep_fs * float(stride_md)
     ensure_positive("frame_timestep_fs", frame_timestep_fs)
-    LOGGER.info(
+    LOGGER.debug(
         "Resolved frame timestep from '%s': %.6g fs (TIMESTEP %.6g fs x MD %d).",
         input_path,
         frame_timestep_fs,
@@ -357,7 +364,7 @@ def extract_fixed_atom_indices_from_cp2k_input(path: str | Path) -> tuple[int, .
     fixed_atom_indices: set[int] = set()
     with input_path.open("r", encoding="utf-8") as handle:
         for line_number, line in enumerate(handle, start=1):
-            no_comment = line.split("!", 1)[0].strip()
+            no_comment = _strip_cp2k_comment(line)
             if not no_comment:
                 continue
 

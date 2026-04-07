@@ -27,7 +27,7 @@ class AnalysisSchema:
 _ANALYSIS_SCHEMAS: dict[str, AnalysisSchema] = {
     "density": AnalysisSchema(
         analysis="density",
-        version=4,
+        version=1,
         default_units_map={
             "bin_width_A": "Angstrom",
             "bin_centers_A": "Angstrom",
@@ -42,7 +42,7 @@ _ANALYSIS_SCHEMAS: dict[str, AnalysisSchema] = {
     ),
     "msd": AnalysisSchema(
         analysis="msd",
-        version=2,
+        version=1,
         default_units_map={
             "time_fs": "fs",
             "time_ps": "ps",
@@ -52,7 +52,7 @@ _ANALYSIS_SCHEMAS: dict[str, AnalysisSchema] = {
     ),
     "rdf": AnalysisSchema(
         analysis="rdf",
-        version=2,
+        version=1,
         default_units_map={
             "bin_width_A": "Angstrom",
             "bin_centers_A": "Angstrom",
@@ -62,7 +62,7 @@ _ANALYSIS_SCHEMAS: dict[str, AnalysisSchema] = {
     ),
     "position": AnalysisSchema(
         analysis="position",
-        version=3,
+        version=1,
         default_units_map={
             "frame_index": "index",
             "step": "step",
@@ -82,7 +82,7 @@ _ANALYSIS_SCHEMAS: dict[str, AnalysisSchema] = {
     ),
     "coordination": AnalysisSchema(
         analysis="coordination",
-        version=3,
+        version=1,
         default_units_map={
             "frame_index": "index",
             "step": "step",
@@ -105,7 +105,7 @@ _ANALYSIS_SCHEMAS: dict[str, AnalysisSchema] = {
     ),
     "orientation": AnalysisSchema(
         analysis="orientation",
-        version=5,
+        version=1,
         default_units_map={
             "bin_centers_A": "Angstrom",
             "bin_edges_A": "Angstrom",
@@ -232,7 +232,7 @@ def canonicalize_density_units(
     number_density: np.ndarray | None,
     number_density_units: str | None,
 ) -> tuple[np.ndarray, str, np.ndarray | None, str | None]:
-    """Convert known legacy volumetric density units to canonical LiNaK units."""
+    """Convert supported volumetric density units to canonical LiNaK units."""
     canonical_density = np.asarray(density, dtype=float)
     canonical_density_units = str(density_units)
     factor = _MASS_UNIT_TO_G_PER_CM3.get(canonical_density_units)

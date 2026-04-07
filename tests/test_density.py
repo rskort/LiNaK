@@ -6,6 +6,7 @@ from ase import Atoms
 from ase.constraints import FixAtoms
 import h5py
 
+from linak import __version__ as LINAK_VERSION
 import linak.analysis.density as density_module
 import linak.analysis.water as water_module
 from linak.analysis.density import (
@@ -802,8 +803,8 @@ def test_save_density_profile_writes_nested_surface_metadata(tmp_path):
     assert loaded.surface_estimate.mode == profile.surface_estimate.mode
 
 
-def test_load_density_profile_accepts_legacy_flat_surface_metadata(tmp_path):
-    out = tmp_path / "legacy_density_surface.h5"
+def test_load_density_profile_rejects_incompatible_flat_surface_metadata(tmp_path):
+    out = tmp_path / "old_density_surface.h5"
     with h5py.File(out, "w") as handle:
         handle.attrs["linak_format"] = "linak-hdf5"
         handle.attrs["analysis"] = "density"
@@ -832,11 +833,8 @@ def test_load_density_profile_accepts_legacy_flat_surface_metadata(tmp_path):
         handle.create_dataset("surface_valid_mask", data=np.array([True, True], dtype=bool))
         handle.create_dataset("surface_confidence", data=np.array([0.8, 0.8], dtype=float))
 
-    loaded = load_density_profile(out, axis="z", species="O")
-    assert loaded.surface_position == pytest.approx(1.25)
-    assert loaded.surface_position_std == pytest.approx(0.05)
-    assert loaded.surface_estimate is not None
-    assert loaded.surface_estimate.mode == "rough"
+    with pytest.raises(ValueError, match="corrupted or originates from the wrong LiNaK version"):
+        load_density_profile(out, axis="z", species="O")
 
 
 def test_save_and_load_density_profile_preserves_molecular_number_density_units(tmp_path):
@@ -894,13 +892,18 @@ def test_save_density_profiles_writes_hdf5_collection(tmp_path):
     assert [profile.species for profile in loaded] == ["H", "O", "H2O"]
 
 
-def test_load_density_profile_supports_legacy_bin_edges_dataset(tmp_path):
-    out = tmp_path / "legacy_density.h5"
+def test_load_density_profile_rejects_missing_v1_bin_width_metadata(tmp_path):
+    out = tmp_path / "old_density.h5"
     with h5py.File(out, "w") as handle:
         handle.attrs["linak_format"] = "linak-hdf5"
+        handle.attrs["linak_format_version"] = 1
+        handle.attrs["linak_version"] = LINAK_VERSION
         handle.attrs["analysis"] = "density"
         handle.attrs["metadata_json"] = json.dumps(
             {
+                "analysis": "density",
+                "analysis_schema_version": 1,
+                "profile_uid": "density-without-bin-width",
                 "axis": "z",
                 "species": "O",
                 "units": "g/Angstrom^3",
@@ -913,9 +916,8 @@ def test_load_density_profile_supports_legacy_bin_edges_dataset(tmp_path):
         handle.create_dataset("counts_per_frame", data=np.array([1.0, 2.0], dtype=float))
         handle.create_dataset("density", data=np.array([0.1, 0.2], dtype=float))
 
-    loaded = load_density_profile(out, axis="z", species="O")
-    np.testing.assert_allclose(loaded.bin_edges, np.array([0.0, 1.0, 2.0]))
-    assert loaded.units == "g/cm^3"
+    with pytest.raises(ValueError, match="missing required v1 metadata bin_width_A"):
+        load_density_profile(out, axis="z", species="O")
 
 
 def test_density_profile_uses_framewise_surface_distance_for_binning():
@@ -1140,7 +1142,7 @@ def test_estimate_surface_reference_exposes_provenance_and_confidence():
 
 
 def test_load_density_profile_rejects_csv_input(tmp_path):
-    csv = tmp_path / "legacy_density.csv"
+    csv = tmp_path / "old_density.csv"
     csv.write_text(
         "bin_left_A,bin_right_A,bin_center_A,counts_per_frame,density_atoms_per_Angstrom\n"
         "0.0,1.0,0.5,2.0,2.0\n",

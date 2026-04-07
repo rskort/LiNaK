@@ -14,6 +14,7 @@ from linak.cli import (
     _build_gui_series_descriptors,
     _build_rdf_profile_filter_options,
     _default_rdf_collection_hdf5_output_path,
+    _default_rdf_selected_hdf5_output_path,
     _combine_analysis_hdf5_sources,
     _load_rdf_plot_profiles,
     _without_preview_series_state,
@@ -54,13 +55,41 @@ from linak.plot.plot_settings import (
     write_plot_profile,
 )
 from linak.analysis.rdf import RDFProfile, compute_rdf, load_rdf_profile, save_rdf_profile
-from linak.trajectory.io import read_trajectory_hdf5_metadata, write_trajectory
+from linak.trajectory.io import (
+    TrajectoryStoredMetadata,
+    read_trajectory,
+    read_trajectory_hdf5_metadata,
+    read_trajectory_hdf5_surface_cache,
+    write_trajectory,
+)
 
 
 def _write_xyz(path: Path) -> None:
     frame0 = Atoms("OO", positions=[[0.0, 0.0, 0.02], [0.0, 0.0, 0.08]])
     frame1 = Atoms("OO", positions=[[0.0, 0.0, 0.12], [0.0, 0.0, 0.18]])
     write(path, [frame0, frame1], format="extxyz")
+
+
+def _write_surface_xyz(path: Path) -> None:
+    symbols = "Au8"
+    base_positions = np.array(
+        [
+            [0.0, 0.0, 0.1],
+            [1.0, 0.0, 0.1],
+            [0.0, 1.0, 0.1],
+            [1.0, 1.0, 0.1],
+            [0.0, 0.0, 2.1],
+            [1.0, 0.0, 2.1],
+            [0.0, 1.0, 2.1],
+            [1.0, 1.0, 2.1],
+        ],
+        dtype=float,
+    )
+    frames = [
+        Atoms(symbols, positions=base_positions.copy()),
+        Atoms(symbols, positions=base_positions + np.array([0.0, 0.0, 0.05])),
+    ]
+    write(path, frames, format="extxyz")
 
 
 def _write_lammps_dump(path: Path, *, positions: list[tuple[float, float, float]]) -> None:
@@ -388,7 +417,7 @@ def test_apply_convert_dry_run_reports_default_output(tmp_path, capsys):
     rc = main(
         [
             "--log-level",
-            "ERROR",
+            "INFO",
             "apply",
             "convert",
             str(trajectory),
@@ -469,6 +498,167 @@ def test_apply_convert_embeds_input_metadata_into_traj_hdf5(tmp_path):
     assert metadata.md_timestep_fs == pytest.approx(0.5)
     assert metadata.trajectory_stride_md == 5
     assert metadata.fixed_atom_indices == (0,)
+
+
+def test_apply_convert_wraps_pbc_and_caches_default_surface(tmp_path):
+    trajectory = tmp_path / "surface.xyz"
+    input_path = tmp_path / "input.inp"
+    _write_surface_xyz(trajectory)
+    input_path.write_text(
+        "&SUBSYS\n  &CELL\n    ABC 2.0 2.0 4.0\n  &END CELL\n&END SUBSYS\n",
+        encoding="utf-8",
+    )
+
+    rc = main(
+        [
+            "--log-level",
+            "ERROR",
+            "apply",
+            "convert",
+            str(trajectory),
+            "--input",
+            str(input_path),
+        ]
+    )
+
+    assert rc == 0
+    converted = tmp_path / "surface.traj.h5"
+    metadata = read_trajectory_hdf5_metadata(converted)
+    assert metadata is not None
+    assert metadata.pbc_applied is True
+    assert metadata.pbc_cell_angstrom == pytest.approx((2.0, 2.0, 4.0))
+    assert metadata.coordinate_basis == "pbc-wrapped"
+    assert metadata.surface_cache_status == "available"
+    assert metadata.surface_cache_axis == "z"
+    assert metadata.surface_cache_mode == "auto"
+
+    cached = read_trajectory_hdf5_surface_cache(
+        converted,
+        axis="z",
+        surface_mode="auto",
+        surface_elements=None,
+        include_fixed_surface_atoms=False,
+        rough_surface_envelope_A=None,
+        frame_count=2,
+    )
+    assert cached is not None
+    assert cached.frame_values.shape == (2,)
+    assert np.all(np.isfinite(cached.frame_values))
+
+    loaded = read_trajectory(converted)
+    assert np.all(np.asarray(loaded[0].positions) >= 0.0)
+    assert np.all(np.asarray(loaded[0].positions) < np.array([2.0, 2.0, 4.0]))
+
+
+def test_compute_position_reuses_conversion_cached_pbc_and_surface(tmp_path, monkeypatch):
+    import linak.analysis.density as density_module
+    import linak.pbc as pbc_module
+
+    trajectory = tmp_path / "surface.xyz"
+    input_path = tmp_path / "input.inp"
+    _write_surface_xyz(trajectory)
+    input_path.write_text(
+        "&SUBSYS\n"
+        "  &CELL\n"
+        "    ABC 2.0 2.0 4.0\n"
+        "  &END CELL\n"
+        "&END SUBSYS\n"
+        "&MOTION\n"
+        "  &MD\n"
+        "    TIMESTEP [fs] 1.0\n"
+        "  &END MD\n"
+        "  &PRINT\n"
+        "    &TRAJECTORY\n"
+        "      &EACH\n"
+        "        MD 1\n"
+        "      &END EACH\n"
+        "    &END TRAJECTORY\n"
+        "  &END PRINT\n"
+        "&END MOTION\n",
+        encoding="utf-8",
+    )
+    converted = tmp_path / "surface.traj.h5"
+    rc_convert = main(
+        [
+            "--log-level",
+            "ERROR",
+            "apply",
+            "convert",
+            str(trajectory),
+            "--input",
+            str(input_path),
+            "--output",
+            str(converted),
+        ]
+    )
+    assert rc_convert == 0
+
+    def _fail_pbc(*_args, **_kwargs):
+        raise AssertionError("PBC should not be reapplied for converted trajectory HDF5")
+
+    def _fail_surface(*_args, **_kwargs):
+        raise AssertionError("Surface should not be re-estimated for matching cache")
+
+    monkeypatch.setattr(pbc_module, "apply_pbc_to_frames", _fail_pbc)
+    monkeypatch.setattr(density_module, "_select_surface_estimate", _fail_surface)
+
+    output = tmp_path / "position.h5"
+    rc = main(
+        [
+            "--log-level",
+            "ERROR",
+            "compute",
+            "position",
+            str(converted),
+            "--species",
+            "Au",
+            "--axis",
+            "z",
+            "--output",
+            str(output),
+        ]
+    )
+
+    assert rc == 0
+    profile = load_position_profile(output)
+    assert profile.coordinate_mode == "distance"
+    assert profile.surface_position_per_frame is not None
+
+
+def test_conversion_surface_cache_mismatch_is_not_used(tmp_path):
+    trajectory = tmp_path / "surface.xyz"
+    input_path = tmp_path / "input.inp"
+    _write_surface_xyz(trajectory)
+    input_path.write_text(
+        "&SUBSYS\n  &CELL\n    ABC 2.0 2.0 4.0\n  &END CELL\n&END SUBSYS\n",
+        encoding="utf-8",
+    )
+    converted = tmp_path / "surface.traj.h5"
+    rc = main(
+        [
+            "--log-level",
+            "ERROR",
+            "apply",
+            "convert",
+            str(trajectory),
+            "--input",
+            str(input_path),
+            "--output",
+            str(converted),
+        ]
+    )
+    assert rc == 0
+
+    cached = read_trajectory_hdf5_surface_cache(
+        converted,
+        axis="x",
+        surface_mode="auto",
+        surface_elements=None,
+        include_fixed_surface_atoms=False,
+        rough_surface_envelope_A=None,
+        frame_count=2,
+    )
+    assert cached is None
 
 
 def test_compute_msd_uses_converted_trajectory_hdf5_timestep_metadata_without_input(tmp_path):
@@ -607,30 +797,29 @@ def test_compute_density_accepts_converted_trajectory_hdf5(tmp_path):
     assert profile.species == "O"
 
 
-def test_compute_density_logs_convert_hint_for_raw_text_trajectory(tmp_path, caplog):
+def test_compute_density_logs_convert_hint_for_raw_text_trajectory(tmp_path, capsys):
     trajectory = tmp_path / "traj.xyz"
     _write_xyz(trajectory)
     output = tmp_path / "density_raw.h5"
 
-    with caplog.at_level("INFO"):
-        rc = main(
-            [
-                "--log-level",
-                "INFO",
-                "compute",
-                "density",
-                str(trajectory),
-                "--species",
-                "O",
-                "--axis",
-                "z",
-                "--output",
-                str(output),
-            ]
-        )
+    rc = main(
+        [
+            "--log-level",
+            "INFO",
+            "compute",
+            "density",
+            str(trajectory),
+            "--species",
+            "O",
+            "--axis",
+            "z",
+            "--output",
+            str(output),
+        ]
+    )
 
     assert rc == 0
-    assert "linak apply convert" in caplog.text
+    assert "linak apply convert" in capsys.readouterr().err
 
 
 def test_compute_density_skips_convert_hint_for_converted_trajectory(tmp_path, caplog):
@@ -1543,15 +1732,15 @@ def test_plot_help_lists_analysis_and_style_options(capsys):
     assert "--title-font-size" in out
 
 
-@pytest.mark.parametrize("subcommand", ["density", "position"])
-def test_plot_legacy_subcommands_are_rejected(tmp_path, capsys, subcommand):
+@pytest.mark.parametrize("token", ["density", "position"])
+def test_plot_analysis_name_tokens_are_not_subcommands(tmp_path, capsys, token):
     source = tmp_path / "density.h5"
     _write_density_hdf5(source)
 
-    rc = main(["--log-level", "ERROR", "plot", subcommand, str(source), "--no-show"])
+    rc = main(["--log-level", "ERROR", "plot", token, str(source), "--no-show"])
 
     assert rc == 1
-    assert "subcommands were removed" in capsys.readouterr().err
+    assert "Use -f/--files" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize(
@@ -1786,6 +1975,143 @@ def test_compute_rdf_dry_run_resolves_input_cell_without_reading_trajectory(
     err = capsys.readouterr().err
     assert "cell resolution: resolved 17.887 15.491 59.671 Angstrom" in err
     assert "r_max resolution: 7.7 (auto rounded down from 7.7455 to match bin_width=0.05)" in err
+
+
+def test_compute_rdf_dry_run_uses_trajectory_hdf5_cell_without_adjacent_input_lookup(
+    tmp_path, monkeypatch, capsys
+):
+    monkeypatch.chdir(tmp_path)
+    trajectory = tmp_path / "traj.traj.h5"
+    write_trajectory(
+        [Atoms("OO", positions=[[0.0, 0.0, 0.1], [0.0, 0.0, 0.2]])],
+        trajectory,
+        metadata=TrajectoryStoredMetadata(
+            input_path=tmp_path / "input.inp",
+            input_format="inp",
+            cell_angstrom=(10.0, 11.0, 12.0),
+            cell_source="simulation input",
+            frame_timestep_fs=2.5,
+            md_timestep_fs=0.5,
+            trajectory_stride_md=5,
+            timestep_source="simulation input",
+        ),
+    )
+
+    def _raise_if_called(*_args, **_kwargs):
+        raise AssertionError("_auto_detect_cell should not be called for trajectory HDF5 dry-run")
+
+    monkeypatch.setattr("linak.resolution._auto_detect_cell", _raise_if_called)
+
+    rc = main(
+        [
+            "--log-level",
+            "INFO",
+            "compute",
+            "rdf",
+            str(trajectory),
+            "--species-a",
+            "O",
+            "--species-b",
+            "O",
+            "--dry-run",
+        ]
+    )
+
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "trajectory HDF5 metadata" in err
+    assert "auto-detected" not in err
+
+
+def test_compute_msd_dry_run_uses_trajectory_hdf5_timestep_without_adjacent_input_lookup(
+    tmp_path, monkeypatch, capsys
+):
+    monkeypatch.chdir(tmp_path)
+    trajectory = tmp_path / "traj.traj.h5"
+    frames = [
+        Atoms("O", positions=[[0.0, 0.0, 0.1]]),
+        Atoms("O", positions=[[0.0, 0.0, 0.2]]),
+    ]
+    write_trajectory(
+        frames,
+        trajectory,
+        metadata=TrajectoryStoredMetadata(
+            input_path=tmp_path / "input.inp",
+            input_format="inp",
+            cell_angstrom=(10.0, 11.0, 12.0),
+            cell_source="simulation input",
+            frame_timestep_fs=2.5,
+            md_timestep_fs=0.5,
+            trajectory_stride_md=5,
+            timestep_source="simulation input",
+        ),
+    )
+
+    def _raise_if_called(*_args, **_kwargs):
+        raise AssertionError(
+            "_auto_detect_frame_timestep_fs should not be called for trajectory HDF5 dry-run"
+        )
+
+    monkeypatch.setattr("linak.resolution._auto_detect_frame_timestep_fs", _raise_if_called)
+
+    rc = main(
+        [
+            "--log-level",
+            "INFO",
+            "compute",
+            "msd",
+            str(trajectory),
+            "--species",
+            "O",
+            "--dry-run",
+        ]
+    )
+
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "trajectory HDF5 metadata" in err
+    assert "auto-detected" not in err
+
+
+def test_compute_density_uses_trajectory_hdf5_cell_without_adjacent_input_lookup(
+    tmp_path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    trajectory = tmp_path / "traj.traj.h5"
+    write_trajectory(
+        [Atoms("O", positions=[[0.0, 0.0, 0.1]])],
+        trajectory,
+        metadata=TrajectoryStoredMetadata(
+            input_path=tmp_path / "input.inp",
+            input_format="inp",
+            cell_angstrom=(10.0, 11.0, 12.0),
+            cell_source="simulation input",
+        ),
+    )
+
+    def _raise_if_called(*_args, **_kwargs):
+        raise AssertionError("_auto_detect_cell should not be called for trajectory HDF5 compute")
+
+    monkeypatch.setattr("linak.resolution._auto_detect_cell", _raise_if_called)
+
+    rc = main(
+        [
+            "--log-level",
+            "ERROR",
+            "compute",
+            "density",
+            str(trajectory),
+            "--species",
+            "O",
+        ]
+    )
+
+    assert rc == 0
+    _datasets, metadata = read_linak_hdf5(
+        _linak_output_dir(tmp_path) / "traj.traj_density_o_z.h5",
+        expected_analysis="density",
+    )
+    assert metadata["cell_source"] == "trajectory HDF5 metadata"
 
 
 def test_compute_potential_dry_run_validates_missing_hartree_file(tmp_path):
@@ -3817,6 +4143,40 @@ def test_plot_position_rejects_trajectory_input(tmp_path, capsys):
     assert "only accepts HDF5 input" in capsys.readouterr().err
 
 
+def test_plot_rdf_handler_rejects_section_width_larger_than_available_range(tmp_path):
+    frame = Atoms(
+        "OH",
+        positions=[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+        cell=[10.0, 10.0, 10.0],
+        pbc=True,
+    )
+    source_h5 = tmp_path / "source_rdf.h5"
+    save_rdf_profile(
+        compute_rdf([frame], species_a="O", species_b="H", r_max=2.0, bin_width=1.0),
+        source_h5,
+    )
+
+    argv = [
+        "plot",
+        str(source_h5),
+        "--species-a",
+        "O",
+        "--species-b",
+        "H",
+        "--no-show",
+        "--output",
+        str(tmp_path / "rdf.png"),
+    ]
+    args = build_parser().parse_args(argv)
+    args._runtime_argv = tuple(argv)
+    args.x_bin_width = 5.0
+    args.x_bin_reducer = None
+    args.min_bin_points = None
+
+    with pytest.raises(ValueError, match="Section width 5 is larger than the available x-range"):
+        args.handler(args)
+
+
 def test_plot_position_gui_uses_atom_level_series_in_initial_settings(tmp_path, monkeypatch):
     source_h5 = tmp_path / "source_position.h5"
     _write_position_hdf5(source_h5)
@@ -4048,6 +4408,126 @@ def test_compute_rdf_threads_option_is_forwarded(tmp_path, monkeypatch):
     assert captured["threads"] == 2
 
 
+def test_compute_rdf_atom_selectors_are_forwarded(tmp_path, monkeypatch):
+    captured: dict[str, object] = {}
+    frame = Atoms(
+        "OHHHHHH",
+        positions=[
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [3.0, 0.0, 0.0],
+            [4.0, 0.0, 0.0],
+            [5.0, 0.0, 0.0],
+            [6.0, 0.0, 0.0],
+        ],
+        cell=[20.0, 20.0, 20.0],
+        pbc=True,
+    )
+    profile = RDFProfile(
+        species_a="atoms[0,2..3,5..6]",
+        species_b="atoms[1]",
+        bin_edges=np.array([0.0, 1.0, 2.0]),
+        bin_centers=np.array([0.5, 1.5]),
+        g_r=np.array([0.0, 1.0]),
+        n_frames=1,
+        atom_indices_a=np.array([0, 2, 3, 5, 6], dtype=int),
+        atom_indices_b=np.array([1], dtype=int),
+        selection_kind_a="atoms",
+        selection_kind_b="atoms",
+    )
+
+    def _fake_read_trajectory(_path):
+        return [frame]
+
+    def _fake_compute_rdf(**kwargs):
+        captured.update(kwargs)
+        return profile
+
+    monkeypatch.setattr("linak.trajectory.io.read_trajectory", _fake_read_trajectory)
+    monkeypatch.setattr("linak.analysis.rdf.compute_rdf", _fake_compute_rdf)
+    monkeypatch.setattr("linak.analysis.rdf.save_rdf_profile", lambda *_args, **_kwargs: None)
+
+    rc = main(
+        [
+            "--log-level",
+            "ERROR",
+            "compute",
+            "rdf",
+            str(tmp_path / "traj.xyz"),
+            "--atoms-a",
+            "0",
+            "2..3",
+            "{5,6}",
+            "--atoms-b",
+            "1",
+            "--output",
+            str(tmp_path / "rdf_selected.h5"),
+        ]
+    )
+
+    assert rc == 0
+    assert captured["species_a"] is None
+    assert captured["species_b"] is None
+    assert captured["atom_indices_a"] == (0, 2, 3, 5, 6)
+    assert captured["atom_indices_b"] == (1,)
+
+
+def test_compute_rdf_mixed_species_and_atom_selectors_are_forwarded(tmp_path, monkeypatch):
+    captured: dict[str, object] = {}
+    frame = Atoms(
+        "OHH",
+        positions=[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
+        cell=[20.0, 20.0, 20.0],
+        pbc=True,
+    )
+    profile = RDFProfile(
+        species_a="O",
+        species_b="atoms[1..2]",
+        bin_edges=np.array([0.0, 1.0, 2.0]),
+        bin_centers=np.array([0.5, 1.5]),
+        g_r=np.array([0.0, 1.0]),
+        n_frames=1,
+        atom_indices_b=np.array([1, 2], dtype=int),
+        selection_kind_a="species",
+        selection_kind_b="atoms",
+    )
+
+    def _fake_read_trajectory(_path):
+        return [frame]
+
+    def _fake_compute_rdf(**kwargs):
+        captured.update(kwargs)
+        return profile
+
+    monkeypatch.setattr("linak.trajectory.io.read_trajectory", _fake_read_trajectory)
+    monkeypatch.setattr("linak.analysis.rdf.compute_rdf", _fake_compute_rdf)
+    monkeypatch.setattr("linak.analysis.rdf.save_rdf_profile", lambda *_args, **_kwargs: None)
+
+    rc = main(
+        [
+            "--log-level",
+            "ERROR",
+            "compute",
+            "rdf",
+            str(tmp_path / "traj.xyz"),
+            "--species-a",
+            "O",
+            "--atoms-b",
+            "1",
+            "2",
+            "--output",
+            str(tmp_path / "rdf_selected.h5"),
+        ]
+    )
+
+    assert rc == 0
+    assert captured["species_a"] == "O"
+    assert captured["species_b"] is None
+    assert captured["atom_indices_a"] is None
+    assert captured["atom_indices_b"] == (1, 2)
+
+
 def test_compute_rdf_without_explicit_species_writes_pairwise_collection(tmp_path, monkeypatch):
     trajectory_dir = tmp_path / "traj_dir"
     work_dir = tmp_path / "work_dir"
@@ -4077,6 +4557,58 @@ def test_compute_rdf_without_explicit_species_writes_pairwise_collection(tmp_pat
 
     assert rc == 0
     assert _default_rdf_collection_hdf5_output_path(trajectory).exists()
+
+
+def test_compute_rdf_explicit_atom_selection_uses_selected_default_output(tmp_path, monkeypatch):
+    captured_output: dict[str, Path] = {}
+    frame = Atoms(
+        "OH",
+        positions=[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+        cell=[10.0, 10.0, 10.0],
+        pbc=True,
+    )
+    trajectory = tmp_path / "traj.xyz"
+    trajectory.write_text("", encoding="utf-8")
+    profile = RDFProfile(
+        species_a="atoms[0]",
+        species_b="atoms[1]",
+        bin_edges=np.array([0.0, 1.0, 2.0]),
+        bin_centers=np.array([0.5, 1.5]),
+        g_r=np.array([0.0, 1.0]),
+        n_frames=1,
+        atom_indices_a=np.array([0], dtype=int),
+        atom_indices_b=np.array([1], dtype=int),
+        selection_kind_a="atoms",
+        selection_kind_b="atoms",
+    )
+
+    def _fake_read_trajectory(_path):
+        return [frame]
+
+    def _fake_save_rdf_profile(_profile, output, **_kwargs):
+        captured_output["path"] = Path(output)
+        return Path(output)
+
+    monkeypatch.setattr("linak.trajectory.io.read_trajectory", _fake_read_trajectory)
+    monkeypatch.setattr("linak.analysis.rdf.compute_rdf", lambda **_kwargs: profile)
+    monkeypatch.setattr("linak.analysis.rdf.save_rdf_profile", _fake_save_rdf_profile)
+
+    rc = main(
+        [
+            "--log-level",
+            "ERROR",
+            "compute",
+            "rdf",
+            str(trajectory),
+            "--atoms-a",
+            "0",
+            "--atoms-b",
+            "1",
+        ]
+    )
+
+    assert rc == 0
+    assert captured_output["path"] == _default_rdf_selected_hdf5_output_path(trajectory)
 
 
 def test_compute_rdf_explicit_all_keeps_single_profile_path(tmp_path, monkeypatch):
@@ -4126,6 +4658,101 @@ def test_compute_rdf_explicit_all_keeps_single_profile_path(tmp_path, monkeypatc
 
     assert rc == 0
     assert captured == {"species_a": "all", "species_b": "all"}
+
+
+def test_compute_rdf_rejects_selector_b_without_explicit_selector_a(tmp_path, capsys):
+    rc = main(
+        [
+            "--log-level",
+            "ERROR",
+            "compute",
+            "rdf",
+            str(tmp_path / "traj.xyz"),
+            "--atoms-b",
+            "1",
+        ]
+    )
+
+    assert rc == 1
+    assert "selector A" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "argv, message",
+    [
+        (
+            ["compute", "rdf", "traj.xyz", "--atoms-a", "-1", "--dry-run"],
+            "Atom indices must be >= 0",
+        ),
+        (
+            ["compute", "rdf", "traj.xyz", "--atoms-a", "2..1", "--dry-run"],
+            "range end must be >=",
+        ),
+        (
+            ["compute", "rdf", "traj.xyz", "--atoms-a", "foo", "--dry-run"],
+            "Malformed atom index",
+        ),
+    ],
+)
+def test_compute_rdf_rejects_invalid_atom_selector_tokens(argv, message, capsys):
+    rc = main(["--log-level", "ERROR", *argv])
+
+    assert rc == 1
+    assert message in capsys.readouterr().err
+
+
+def test_compute_rdf_rejects_out_of_range_atom_indices(tmp_path, capsys):
+    trajectory = tmp_path / "traj.xyz"
+    write(
+        trajectory,
+        [
+            Atoms(
+                "OH",
+                positions=[[0.0, 0.0, 0.0], [0.9, 0.0, 0.0]],
+                cell=[10.0, 10.0, 10.0],
+                pbc=True,
+            )
+        ],
+        format="extxyz",
+    )
+
+    rc = main(
+        [
+            "--log-level",
+            "ERROR",
+            "compute",
+            "rdf",
+            str(trajectory),
+            "--atoms-a",
+            "5",
+        ]
+    )
+
+    assert rc == 1
+    assert "out-of-range indices" in capsys.readouterr().err
+
+
+def test_compute_rdf_dry_run_reports_atom_selectors(capsys):
+    rc = main(
+        [
+            "--log-level",
+            "INFO",
+            "compute",
+            "rdf",
+            "traj.xyz",
+            "--atoms-a",
+            "0",
+            "2..3",
+            "--atoms-b",
+            "5",
+            "--dry-run",
+        ]
+    )
+
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "selector_a=atoms[0,2..3]" in err
+    assert "selector_b=atoms[5]" in err
 
 
 def test_compute_coordination_with_cutoff_rdf_writes_hdf5_and_diagnostic_png(tmp_path, monkeypatch):

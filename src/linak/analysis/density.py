@@ -7,7 +7,6 @@ from dataclasses import asdict, dataclass
 import logging
 from pathlib import Path
 from typing import Any, Literal, cast
-import warnings
 
 import numpy as np
 from ase import Atoms
@@ -106,7 +105,7 @@ class DensityProfile:
 class SurfaceEstimatorOptions:
     mode: str = "auto"
     side: Literal["top", "bottom"] = "top"
-    reduction_mode: Literal["median", "trimmed_mean", "legacy_mean"] = "median"
+    reduction_mode: Literal["median", "trimmed_mean"] = "median"
     trim_fraction: float = 0.10
     gap_min_A: float = 0.25
     gap_factor: float = 3.0
@@ -126,7 +125,6 @@ class SurfaceEstimatorOptions:
     fill_neighbor_tolerance_A: float = 0.75
     jump_reject_tolerance_A: float = 1.50
     low_confidence_threshold: float = 0.55
-    legacy_mean_reduction: bool = False
     debug_diagnostics: bool = False
     surface_elements: tuple[str, ...] | None = None
     surface_atom_indices: tuple[int, ...] | None = None
@@ -425,21 +423,8 @@ def _validate_surface_options(
     mode = _normalize_surface_mode_token(options.mode)
     side = _normalize_surface_side_token(options.side)
     reduction_mode = str(options.reduction_mode).strip().lower()
-    if options.legacy_mean_reduction:
-        reduction_mode = "legacy_mean"
-        warnings.warn(
-            "Using legacy mean-based surface reduction; results may be less robust.",
-            UserWarning,
-            stacklevel=3,
-        )
-    if reduction_mode not in {"median", "trimmed_mean", "legacy_mean"}:
-        raise ValueError("surface reduction_mode must be one of: median, trimmed_mean, legacy_mean")
-    if reduction_mode == "legacy_mean":
-        warnings.warn(
-            "Legacy mean-based surface estimation is enabled explicitly.",
-            UserWarning,
-            stacklevel=3,
-        )
+    if reduction_mode not in {"median", "trimmed_mean"}:
+        raise ValueError("surface reduction_mode must be one of: median, trimmed_mean")
 
     trim_fraction = float(options.trim_fraction)
     if not 0.0 <= trim_fraction < 0.5:
@@ -508,7 +493,7 @@ def _validate_surface_options(
     return SurfaceEstimatorOptions(
         mode=mode,
         side=cast(Literal["top", "bottom"], side),
-        reduction_mode=cast(Literal["median", "trimmed_mean", "legacy_mean"], reduction_mode),
+        reduction_mode=cast(Literal["median", "trimmed_mean"], reduction_mode),
         trim_fraction=trim_fraction,
         gap_min_A=float(options.gap_min_A),
         gap_factor=float(options.gap_factor),
@@ -528,7 +513,6 @@ def _validate_surface_options(
         fill_neighbor_tolerance_A=float(options.fill_neighbor_tolerance_A),
         jump_reject_tolerance_A=float(options.jump_reject_tolerance_A),
         low_confidence_threshold=float(options.low_confidence_threshold),
-        legacy_mean_reduction=bool(options.legacy_mean_reduction),
         debug_diagnostics=bool(options.debug_diagnostics),
         surface_elements=None if normalized_elements is None else tuple(normalized_elements),
         surface_atom_indices=atom_indices,
@@ -604,8 +588,6 @@ def _robust_reduce(values: np.ndarray, options: SurfaceEstimatorOptions) -> floa
     array = np.asarray(values, dtype=float)
     if array.size == 0:
         return float("nan")
-    if options.reduction_mode == "legacy_mean":
-        return float(np.mean(array))
     if options.reduction_mode == "trimmed_mean":
         trim = int(np.floor(float(options.trim_fraction) * array.size))
         if trim > 0 and (array.size - 2 * trim) >= 1:
@@ -2265,7 +2247,7 @@ def _surface_estimate_from_payload(
     provenance = (
         _decode_string_array(np.asarray(datasets["surface_provenance"]))
         if "surface_provenance" in datasets
-        else np.where(valid_mask, "legacy_loaded", "missing").astype(object)
+        else np.where(valid_mask, "loaded", "missing").astype(object)
     )
     candidate_count = (
         np.asarray(datasets["surface_candidate_count"], dtype=int)
@@ -2804,6 +2786,7 @@ def compute_density_profile(
     include_fixed_surface_atoms: bool = False,
     binning: str = "observed",
     surface_options: SurfaceEstimatorOptions | None = None,
+    precomputed_surface_estimate: SurfaceEstimate | None = None,
 ) -> DensityProfile:
     """Compute a 1D species mass-density profile along a Cartesian axis.
 
@@ -2838,14 +2821,22 @@ def compute_density_profile(
     if normalized_binning not in {"observed", "cell"}:
         raise ValueError("binning must be one of: observed, cell")
     axis_index = axis_to_index(axis)
-    surface_estimate, _surface_method = _select_surface_estimate(
-        frames,
-        axis,
-        mode=surface_mode,
-        surface_elements=surface_elements,
-        include_fixed_surface_atoms=include_fixed_surface_atoms,
-        surface_options=surface_options,
-    )
+    surface_estimate: SurfaceEstimate | None
+    if precomputed_surface_estimate is not None:
+        if precomputed_surface_estimate.frame_values.shape != (len(frames),):
+            raise ValueError(
+                "precomputed_surface_estimate frame count does not match the trajectory."
+            )
+        surface_estimate = precomputed_surface_estimate
+    else:
+        surface_estimate, _surface_method = _select_surface_estimate(
+            frames,
+            axis,
+            mode=surface_mode,
+            surface_elements=surface_elements,
+            include_fixed_surface_atoms=include_fixed_surface_atoms,
+            surface_options=surface_options,
+        )
     surface_position = None if surface_estimate is None else surface_estimate.position
     surface_position_std = None if surface_estimate is None else surface_estimate.std
     if surface_position is None:
@@ -2958,6 +2949,7 @@ def compute_density_profiles(
     include_fixed_surface_atoms: bool = False,
     binning: str = "observed",
     surface_options: SurfaceEstimatorOptions | None = None,
+    precomputed_surface_estimate: SurfaceEstimate | None = None,
 ) -> list[DensityProfile]:
     """Compute one or more density profiles based on the species selection policy."""
     ensure_positive("bin_width", bin_width)
@@ -2977,20 +2969,29 @@ def compute_density_profiles(
                 include_fixed_surface_atoms=include_fixed_surface_atoms,
                 binning=normalized_binning,
                 surface_options=surface_options,
+                precomputed_surface_estimate=precomputed_surface_estimate,
             )
         ]
 
     if not frames:
         raise ValueError("At least one trajectory frame is required.")
 
-    surface_estimate, _surface_method = _select_surface_estimate(
-        frames,
-        axis,
-        mode=surface_mode,
-        surface_elements=surface_elements,
-        include_fixed_surface_atoms=include_fixed_surface_atoms,
-        surface_options=surface_options,
-    )
+    surface_estimate: SurfaceEstimate | None
+    if precomputed_surface_estimate is not None:
+        if precomputed_surface_estimate.frame_values.shape != (len(frames),):
+            raise ValueError(
+                "precomputed_surface_estimate frame count does not match the trajectory."
+            )
+        surface_estimate = precomputed_surface_estimate
+    else:
+        surface_estimate, _surface_method = _select_surface_estimate(
+            frames,
+            axis,
+            mode=surface_mode,
+            surface_elements=surface_elements,
+            include_fixed_surface_atoms=include_fixed_surface_atoms,
+            surface_options=surface_options,
+        )
     surface_position = None if surface_estimate is None else surface_estimate.position
     surface_position_std = None if surface_estimate is None else surface_estimate.std
     if surface_position is None:
@@ -3356,23 +3357,18 @@ def _load_density_profiles_from_payloads(
             entities_per_frame = np.asarray(datasets["entities_per_frame"], dtype=float)
 
         bin_centers = np.asarray(datasets["bin_centers_A"], dtype=float)
-        if "bin_edges_A" in datasets:
-            bin_edges = np.asarray(datasets["bin_edges_A"], dtype=float)
-        else:
-            bin_width = resolve_uniform_bin_width_for_load(
-                metadata=metadata,
-                bin_centers=bin_centers,
-                source_path=source_path,
-                analysis_name="Density",
-            )
-            bin_edges = reconstruct_uniform_bin_edges_from_centers(
-                bin_centers,
-                bin_width=bin_width,
-            )
+        bin_width = resolve_uniform_bin_width_for_load(
+            metadata=metadata,
+            bin_centers=bin_centers,
+            source_path=source_path,
+            analysis_name="Density",
+        )
+        bin_edges = reconstruct_uniform_bin_edges_from_centers(
+            bin_centers,
+            bin_width=bin_width,
+        )
         if bin_edges.size != bin_centers.size + 1:
-            raise ValueError(
-                f"Density HDF5 '{source_path}' has incompatible bin_edges_A/bin_centers_A sizes."
-            )
+            raise ValueError(f"Density HDF5 '{source_path}' has incompatible bin geometry.")
 
         if "counts_per_frame" in datasets:
             counts_per_frame = np.asarray(datasets["counts_per_frame"], dtype=float)
@@ -3719,9 +3715,6 @@ def plot_density_profile(
     series_line_widths: list[float | None] | None = None,
     series_markers: list[str | None] | None = None,
     series_fit_configs: list[dict[str, Any] | None] | None = None,
-    series_fit_enabled: list[bool] | None = None,
-    series_fit_labels: list[str | None] | None = None,
-    series_fit_show_in_legend: list[bool] | None = None,
     cumulative_config: dict[str, Any] | None = None,
     series_normalization_modes: list[str | None] | None = None,
     series_normalization_values: list[float | None] | None = None,
@@ -3796,13 +3789,6 @@ def plot_density_profile(
         line_visible=single_series.line_visible,
         show_in_legend=True if not series_show_in_legend else bool(series_show_in_legend[0]),
         fit_config=None if not series_fit_configs else series_fit_configs[0],
-        fit_enabled=True if series_fit_enabled and bool(series_fit_enabled[0]) else False,
-        fit_label=(
-            None if not series_fit_labels or not series_fit_labels[0] else str(series_fit_labels[0])
-        ),
-        fit_show_in_legend=(
-            True if not series_fit_show_in_legend else bool(series_fit_show_in_legend[0])
-        ),
         cumulative_config=cumulative_config,
         series_statistics=None
         if profile.series_statistics is None
@@ -3885,9 +3871,6 @@ def plot_density_profiles(
     series_line_widths: list[float | None] | None = None,
     series_markers: list[str | None] | None = None,
     series_fit_configs: list[dict[str, Any] | None] | None = None,
-    series_fit_enabled: list[bool] | None = None,
-    series_fit_labels: list[str | None] | None = None,
-    series_fit_show_in_legend: list[bool] | None = None,
     series_cumulative_configs: list[dict[str, Any] | None] | None = None,
     render_series_descriptors: list[dict[str, Any]] | None = None,
     series_overrides_by_id: dict[str, dict[str, Any]] | None = None,
@@ -4036,9 +4019,6 @@ def plot_density_profiles(
         series_line_widths=series_line_widths,
         series_markers=series_markers,
         series_fit_configs=series_fit_configs,
-        series_fit_enabled=series_fit_enabled,
-        series_fit_labels=series_fit_labels,
-        series_fit_show_in_legend=series_fit_show_in_legend,
         series_cumulative_configs=series_cumulative_configs,
         series_error_configs=series_error_configs,
         series_statistics_data=[

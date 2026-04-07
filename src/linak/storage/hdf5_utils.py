@@ -4,10 +4,10 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
-import hashlib
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
+from uuid import uuid4
 
 import numpy as np
 
@@ -22,18 +22,14 @@ except ModuleNotFoundError as exc:  # pragma: no cover
 
 LINAK_HDF5_FORMAT = "linak-hdf5"
 LINAK_HDF5_VERSION = 1
+LINAK_ANALYSIS_SCHEMA_VERSION = 1
 HDF5_SUFFIXES = (".h5", ".hdf5")
 _COLLECTION_GROUP = "profiles"
-_PROFILE_UID_EXCLUDED_METADATA_KEYS = {
-    "combined",
-    "profile_count",
-    "profile_index",
-    "origin_hdf5_path",
-    "source_files",
-    "source_index",
-    "source_path",
-    "source_profile_index",
-}
+INCOMPATIBLE_LINAK_HDF5_MESSAGE = (
+    "The HDF5 file is either corrupted or originates from the wrong LiNaK version. "
+    "Check which LiNaK version generated the file and recompute with the current LiNaK version "
+    "if necessary."
+)
 
 
 def require_h5py() -> None:
@@ -76,52 +72,127 @@ def _json_ready(value: Any) -> Any:
     return value
 
 
-def _decode_metadata_json(raw: Any) -> dict[str, Any]:
+def _raise_incompatible_linak_hdf5(path: str | Path, detail: str | None = None) -> NoReturn:
+    path_label = str(Path(path).expanduser().resolve())
+    message = f"{INCOMPATIBLE_LINAK_HDF5_MESSAGE} File: {path_label}"
+    if detail:
+        message = f"{message} Detail: {detail}"
+    raise ValueError(message)
+
+
+def _decode_metadata_json(raw: Any, *, path: str | Path, location: str) -> dict[str, Any]:
     if raw is None:
-        return {}
+        _raise_incompatible_linak_hdf5(path, f"Missing {location} metadata_json.")
     if isinstance(raw, bytes):
-        raw = raw.decode("utf-8", errors="replace")
+        raw = raw.decode("utf-8", errors="strict")
     try:
         parsed = json.loads(str(raw))
-    except json.JSONDecodeError:
-        return {}
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        _raise_incompatible_linak_hdf5(path, f"Invalid {location} metadata_json.")
     if isinstance(parsed, dict):
         return {str(key): value for key, value in parsed.items()}
-    return {"value": parsed}
+    _raise_incompatible_linak_hdf5(path, f"{location} metadata_json must decode to an object.")
 
 
 def _now_utc_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
-def _stable_profile_uid(
+def _decode_required_string_attr(
     *,
-    analysis: str,
-    metadata: Mapping[str, Any],
-    datasets: Mapping[str, np.ndarray],
+    attrs: Mapping[str, Any],
+    name: str,
+    path: str | Path,
 ) -> str:
-    explicit = str(metadata.get("profile_uid") or "").strip()
-    if explicit:
-        return explicit
+    if name not in attrs:
+        _raise_incompatible_linak_hdf5(path, f"Missing root attribute '{name}'.")
+    value = attrs[name]
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="strict")
+    decoded = str(value).strip()
+    if not decoded:
+        _raise_incompatible_linak_hdf5(path, f"Empty root attribute '{name}'.")
+    return decoded
 
-    fingerprint = hashlib.sha256()
-    fingerprint.update(str(analysis).strip().lower().encode("utf-8", errors="replace"))
 
-    filtered_metadata = {
-        str(key): _json_ready(value)
-        for key, value in metadata.items()
-        if str(key) not in _PROFILE_UID_EXCLUDED_METADATA_KEYS and str(key) != "profile_uid"
-    }
-    fingerprint.update(json.dumps(filtered_metadata, sort_keys=True).encode("utf-8"))
+def _read_required_linak_header(
+    handle: Any,
+    *,
+    path: str | Path,
+    expected_analysis: str | None,
+) -> str:
+    file_format = _decode_required_string_attr(attrs=handle.attrs, name="linak_format", path=path)
+    if file_format != LINAK_HDF5_FORMAT:
+        _raise_incompatible_linak_hdf5(path, "Unsupported or missing LiNaK HDF5 format marker.")
 
-    for name in sorted(datasets):
-        array = np.asarray(datasets[name])
-        fingerprint.update(str(name).encode("utf-8", errors="replace"))
-        fingerprint.update(str(array.dtype).encode("ascii", errors="replace"))
-        fingerprint.update(repr(tuple(array.shape)).encode("ascii", errors="replace"))
-        contiguous = np.ascontiguousarray(array)
-        fingerprint.update(contiguous.view(np.uint8))
-    return f"legacy-{fingerprint.hexdigest()}"
+    raw_format_version = _decode_required_string_attr(
+        attrs=handle.attrs,
+        name="linak_format_version",
+        path=path,
+    )
+    try:
+        format_version = int(raw_format_version)
+    except ValueError:
+        _raise_incompatible_linak_hdf5(path, "Invalid LiNaK HDF5 format version.")
+    if format_version != LINAK_HDF5_VERSION:
+        _raise_incompatible_linak_hdf5(
+            path,
+            f"Unsupported LiNaK HDF5 format version {format_version}; expected {LINAK_HDF5_VERSION}.",
+        )
+
+    file_linak_version = _decode_required_string_attr(
+        attrs=handle.attrs,
+        name="linak_version",
+        path=path,
+    )
+    if file_linak_version != __version__:
+        _raise_incompatible_linak_hdf5(
+            path,
+            f"File was written by LiNaK {file_linak_version}; current LiNaK is {__version__}.",
+        )
+
+    analysis = _decode_required_string_attr(attrs=handle.attrs, name="analysis", path=path)
+    if expected_analysis is not None and analysis != expected_analysis:
+        raise ValueError(
+            f"HDF5 analysis mismatch for '{Path(path).expanduser().resolve()}': "
+            f"expected '{expected_analysis}', got '{analysis}'."
+        )
+    return analysis
+
+
+def _validate_profile_metadata(
+    metadata: dict[str, Any],
+    *,
+    path: str | Path,
+    analysis: str,
+    location: str,
+) -> None:
+    required_keys = ("analysis", "analysis_schema_version", "profile_uid")
+    missing = [key for key in required_keys if str(metadata.get(key) or "").strip() == ""]
+    if missing:
+        _raise_incompatible_linak_hdf5(
+            path,
+            f"{location} metadata is missing required key(s): {', '.join(missing)}.",
+        )
+    metadata_analysis = str(metadata["analysis"]).strip()
+    if metadata_analysis != analysis:
+        _raise_incompatible_linak_hdf5(
+            path,
+            f"{location} metadata analysis '{metadata_analysis}' does not match root '{analysis}'.",
+        )
+    try:
+        schema_version = int(metadata["analysis_schema_version"])
+    except (TypeError, ValueError):
+        _raise_incompatible_linak_hdf5(
+            path,
+            f"{location} metadata has invalid analysis_schema_version.",
+        )
+    if schema_version != LINAK_ANALYSIS_SCHEMA_VERSION:
+        _raise_incompatible_linak_hdf5(
+            path,
+            f"{location} uses analysis schema version {schema_version}; expected "
+            f"{LINAK_ANALYSIS_SCHEMA_VERSION}.",
+        )
 
 
 def write_linak_hdf5(
@@ -136,7 +207,11 @@ def write_linak_hdf5(
     output_path = resolve_hdf5_output_path(output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    metadata_json = json.dumps(_json_ready(dict(metadata or {})), sort_keys=True)
+    metadata_map = dict(metadata or {})
+    metadata_map.setdefault("analysis", str(analysis))
+    metadata_map.setdefault("analysis_schema_version", LINAK_ANALYSIS_SCHEMA_VERSION)
+    metadata_map.setdefault("profile_uid", uuid4().hex)
+    metadata_json = json.dumps(_json_ready(metadata_map), sort_keys=True)
     with h5py.File(output_path, "w") as handle:
         handle.attrs["linak_format"] = LINAK_HDF5_FORMAT
         handle.attrs["linak_format_version"] = LINAK_HDF5_VERSION
@@ -173,17 +248,16 @@ def read_linak_hdf5_profiles(
         raise FileNotFoundError(f"HDF5 file not found: {hdf5_path}")
 
     with h5py.File(hdf5_path, "r") as handle:
-        file_format = str(handle.attrs.get("linak_format", ""))
-        if file_format != LINAK_HDF5_FORMAT:
-            raise ValueError(f"File is not a LiNaK HDF5 analysis file: {hdf5_path}")
-
-        analysis = str(handle.attrs.get("analysis", ""))
-        if expected_analysis is not None and analysis != expected_analysis:
-            raise ValueError(
-                f"HDF5 analysis mismatch for '{hdf5_path}': expected '{expected_analysis}', got '{analysis}'."
-            )
-
-        root_metadata = _decode_metadata_json(handle.attrs.get("metadata_json", "{}"))
+        analysis = _read_required_linak_header(
+            handle,
+            path=hdf5_path,
+            expected_analysis=expected_analysis,
+        )
+        root_metadata = _decode_metadata_json(
+            handle.attrs.get("metadata_json"),
+            path=hdf5_path,
+            location="root",
+        )
         root_metadata.setdefault("analysis", analysis)
 
         collection = handle.get(_COLLECTION_GROUP)
@@ -206,7 +280,11 @@ def read_linak_hdf5_profiles(
                     }
                     profile_metadata = dict(root_metadata)
                     profile_metadata.update(
-                        _decode_metadata_json(group.attrs.get("metadata_json", "{}"))
+                        _decode_metadata_json(
+                            group.attrs.get("metadata_json"),
+                            path=hdf5_path,
+                            location=f"profile {index}",
+                        )
                     )
                     profile_metadata.setdefault("analysis", analysis)
                     if (
@@ -215,10 +293,11 @@ def read_linak_hdf5_profiles(
                     ):
                         profile_metadata["source_profile_index"] = profile_metadata["profile_index"]
                     profile_metadata["profile_index"] = index
-                    profile_metadata["profile_uid"] = _stable_profile_uid(
+                    _validate_profile_metadata(
+                        profile_metadata,
+                        path=hdf5_path,
                         analysis=analysis,
-                        metadata=profile_metadata,
-                        datasets=datasets,
+                        location=f"profile {index}",
                     )
                     profiles.append((datasets, profile_metadata))
                 return profiles
@@ -228,10 +307,11 @@ def read_linak_hdf5_profiles(
             for name, dataset in handle.items()
             if hasattr(dataset, "shape")
         }
-        root_metadata["profile_uid"] = _stable_profile_uid(
+        _validate_profile_metadata(
+            root_metadata,
+            path=hdf5_path,
             analysis=analysis,
-            metadata=root_metadata,
-            datasets=datasets,
+            location="root profile",
         )
         return [(datasets, root_metadata)]
 
@@ -248,17 +328,16 @@ def read_linak_hdf5_profile_headers(
         raise FileNotFoundError(f"HDF5 file not found: {hdf5_path}")
 
     with h5py.File(hdf5_path, "r") as handle:
-        file_format = str(handle.attrs.get("linak_format", ""))
-        if file_format != LINAK_HDF5_FORMAT:
-            raise ValueError(f"File is not a LiNaK HDF5 analysis file: {hdf5_path}")
-
-        analysis = str(handle.attrs.get("analysis", ""))
-        if expected_analysis is not None and analysis != expected_analysis:
-            raise ValueError(
-                f"HDF5 analysis mismatch for '{hdf5_path}': expected '{expected_analysis}', got '{analysis}'."
-            )
-
-        root_metadata = _decode_metadata_json(handle.attrs.get("metadata_json", "{}"))
+        analysis = _read_required_linak_header(
+            handle,
+            path=hdf5_path,
+            expected_analysis=expected_analysis,
+        )
+        root_metadata = _decode_metadata_json(
+            handle.attrs.get("metadata_json"),
+            path=hdf5_path,
+            location="root",
+        )
         root_metadata.setdefault("analysis", analysis)
 
         collection = handle.get(_COLLECTION_GROUP)
@@ -276,7 +355,11 @@ def read_linak_hdf5_profile_headers(
                 for index, (_name, group) in enumerate(sorted(member_items, key=_member_sort_key)):
                     profile_metadata = dict(root_metadata)
                     profile_metadata.update(
-                        _decode_metadata_json(group.attrs.get("metadata_json", "{}"))
+                        _decode_metadata_json(
+                            group.attrs.get("metadata_json"),
+                            path=hdf5_path,
+                            location=f"profile {index}",
+                        )
                     )
                     profile_metadata.setdefault("analysis", analysis)
                     if (
@@ -285,10 +368,22 @@ def read_linak_hdf5_profile_headers(
                     ):
                         profile_metadata["source_profile_index"] = profile_metadata["profile_index"]
                     profile_metadata["profile_index"] = index
+                    _validate_profile_metadata(
+                        profile_metadata,
+                        path=hdf5_path,
+                        analysis=analysis,
+                        location=f"profile {index}",
+                    )
                     headers.append(profile_metadata)
                 return headers
 
         root_metadata.setdefault("profile_index", 0)
+        _validate_profile_metadata(
+            root_metadata,
+            path=hdf5_path,
+            analysis=analysis,
+            location="root profile",
+        )
         return [root_metadata]
 
 
@@ -315,17 +410,16 @@ def read_linak_hdf5_profiles_by_index(
     )
 
     with h5py.File(hdf5_path, "r") as handle:
-        file_format = str(handle.attrs.get("linak_format", ""))
-        if file_format != LINAK_HDF5_FORMAT:
-            raise ValueError(f"File is not a LiNaK HDF5 analysis file: {hdf5_path}")
-
-        analysis = str(handle.attrs.get("analysis", ""))
-        if expected_analysis is not None and analysis != expected_analysis:
-            raise ValueError(
-                f"HDF5 analysis mismatch for '{hdf5_path}': expected '{expected_analysis}', got '{analysis}'."
-            )
-
-        root_metadata = _decode_metadata_json(handle.attrs.get("metadata_json", "{}"))
+        analysis = _read_required_linak_header(
+            handle,
+            path=hdf5_path,
+            expected_analysis=expected_analysis,
+        )
+        root_metadata = _decode_metadata_json(
+            handle.attrs.get("metadata_json"),
+            path=hdf5_path,
+            location="root",
+        )
         root_metadata.setdefault("analysis", analysis)
 
         collection = handle.get(_COLLECTION_GROUP)
@@ -361,7 +455,11 @@ def read_linak_hdf5_profiles_by_index(
                     }
                     profile_metadata = dict(root_metadata)
                     profile_metadata.update(
-                        _decode_metadata_json(group.attrs.get("metadata_json", "{}"))
+                        _decode_metadata_json(
+                            group.attrs.get("metadata_json"),
+                            path=hdf5_path,
+                            location=f"profile {requested_index}",
+                        )
                     )
                     profile_metadata.setdefault("analysis", analysis)
                     if (
@@ -370,10 +468,11 @@ def read_linak_hdf5_profiles_by_index(
                     ):
                         profile_metadata["source_profile_index"] = profile_metadata["profile_index"]
                     profile_metadata["profile_index"] = requested_index
-                    profile_metadata["profile_uid"] = _stable_profile_uid(
+                    _validate_profile_metadata(
+                        profile_metadata,
+                        path=hdf5_path,
                         analysis=analysis,
-                        metadata=profile_metadata,
-                        datasets=datasets,
+                        location=f"profile {requested_index}",
                     )
                     selected_profiles.append((datasets, profile_metadata))
                 return selected_profiles
@@ -392,10 +491,11 @@ def read_linak_hdf5_profiles_by_index(
             }
             metadata = dict(root_metadata)
             metadata.setdefault("profile_index", 0)
-            metadata["profile_uid"] = _stable_profile_uid(
+            _validate_profile_metadata(
+                metadata,
+                path=hdf5_path,
                 analysis=analysis,
-                metadata=metadata,
-                datasets=datasets,
+                location="root profile",
             )
             root_profiles.append((datasets, metadata))
         return root_profiles
@@ -453,6 +553,12 @@ def write_linak_hdf5_profile_collection(
                 profile_metadata_map = dict(profile_metadata)
             else:
                 raise ValueError("Each profile payload metadata must be a mapping when provided.")
+            profile_metadata_map.setdefault("analysis", str(analysis))
+            profile_metadata_map.setdefault(
+                "analysis_schema_version",
+                LINAK_ANALYSIS_SCHEMA_VERSION,
+            )
+            profile_metadata_map.setdefault("profile_uid", uuid4().hex)
             profile_group = profiles_group.require_group(f"{index:04d}")
             profile_group.attrs["metadata_json"] = json.dumps(
                 _json_ready(profile_metadata_map),

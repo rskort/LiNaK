@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import h5py
+import pytest
 from ase import Atoms
 from ase.constraints import FixAtoms
 from ase.io import write
@@ -10,6 +12,7 @@ from linak.trajectory.io import (
     default_trajectory_hdf5_output_path,
     is_linak_trajectory_hdf5,
     read_trajectory_hdf5_metadata,
+    read_trajectory_hdf5_surface_cache,
     read_trajectory,
     read_trajectory_chunks,
     write_trajectory,
@@ -305,6 +308,10 @@ def test_write_and_read_linak_trajectory_hdf5_roundtrip_stored_metadata_and_cons
             timestep_source="simulation input",
             fixed_atom_indices=(1,),
             fixed_atoms_source="simulation input",
+            pbc_applied=True,
+            pbc_cell_angstrom=(5.0, 6.0, 7.0),
+            pbc_source="simulation input",
+            coordinate_basis="pbc-wrapped",
         ),
     )
 
@@ -317,8 +324,44 @@ def test_write_and_read_linak_trajectory_hdf5_roundtrip_stored_metadata_and_cons
     assert metadata.frame_timestep_fs == 2.5
     assert metadata.trajectory_stride_md == 5
     assert metadata.fixed_atom_indices == (1,)
+    assert metadata.pbc_applied is True
+    assert metadata.pbc_cell_angstrom == (5.0, 6.0, 7.0)
+    assert metadata.coordinate_basis == "pbc-wrapped"
     assert loaded[0].constraints
     assert tuple(int(index) for index in loaded[0].constraints[0].get_indices()) == (1,)
+
+
+def test_read_trajectory_hdf5_surface_cache_rejects_malformed_available_cache(tmp_path):
+    path = tmp_path / "traj.traj.h5"
+    frames = [
+        Atoms("O", positions=[[0.0, 0.0, 0.0]]),
+        Atoms("O", positions=[[0.0, 0.0, 1.0]]),
+    ]
+    write_trajectory(
+        frames,
+        path,
+        metadata=TrajectoryStoredMetadata(
+            surface_cache_status="unavailable",
+            surface_cache_axis="z",
+            surface_cache_mode="auto",
+        ),
+    )
+    with h5py.File(path, "a") as handle:
+        surface_cache = handle["metadata/surface_cache"]
+        surface_cache.attrs["status"] = "available"
+        surface_cache.attrs["axis"] = "z"
+        surface_cache.attrs["surface_mode"] = "auto"
+
+    with pytest.raises(ValueError, match="surface cache is malformed"):
+        read_trajectory_hdf5_surface_cache(
+            path,
+            axis="z",
+            surface_mode="auto",
+            surface_elements=None,
+            include_fixed_surface_atoms=False,
+            rough_surface_envelope_A=None,
+            frame_count=2,
+        )
 
 
 def test_read_trajectory_hdf5_chunks_use_exact_total(tmp_path, monkeypatch):

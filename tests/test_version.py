@@ -4,6 +4,7 @@ from pathlib import Path
 import re
 
 import linak
+from linak.analysis.schema import get_analysis_schema
 
 
 def _pyproject_version() -> str:
@@ -17,3 +18,8 @@ def _pyproject_version() -> str:
 
 def test_package_version_matches_pyproject() -> None:
     assert linak.__version__ == _pyproject_version()
+
+
+def test_registered_analysis_schemas_are_development_v1() -> None:
+    for analysis in ("density", "msd", "rdf", "position", "coordination", "orientation"):
+        assert get_analysis_schema(analysis).version == 1

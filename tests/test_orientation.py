@@ -396,11 +396,11 @@ def test_load_orientation_profiles_list(tmp_path):
     assert isinstance(profiles[0], OrientationProfile)
 
 
-def test_load_orientation_profile_without_count_datasets(tmp_path):
+def test_load_orientation_profile_rejects_missing_count_datasets(tmp_path):
     profile = compute_orientation_profile(
         frames=_multi_frame_trajectory(2), axis="z", bin_width=1.0
     )
-    out = tmp_path / "orientation_legacy_counts.h5"
+    out = tmp_path / "orientation_missing_counts.h5"
     save_orientation_profile(profile, out)
 
     with h5py.File(out, "a") as handle:
@@ -412,16 +412,8 @@ def test_load_orientation_profile_without_count_datasets(tmp_path):
             target = next(path for path in dataset_paths if path.endswith(suffix))
             del handle[target]
 
-    loaded = load_orientation_profile(out)
-    np.testing.assert_array_equal(
-        loaded.count_total, np.sum(loaded.heatmap_polar, axis=1).astype(int)
-    )
-    np.testing.assert_array_equal(
-        loaded.count_polar_valid, np.sum(loaded.heatmap_polar, axis=1).astype(int)
-    )
-    np.testing.assert_array_equal(
-        loaded.count_azimuthal_valid, np.sum(loaded.heatmap_azimuthal, axis=1).astype(int)
-    )
+    with pytest.raises(ValueError, match="Missing dataset 'count_total'"):
+        load_orientation_profile(out)
 
 
 def test_save_with_additional_metadata(tmp_path):
@@ -487,7 +479,7 @@ def test_plot_orientation_profile_density_weighted_uses_unicode_auto_label(tmp_p
     assert capture_state["y_label"] == "H2O density-weighted ⟨cos(θ)⟩"
 
 
-def test_plot_orientation_profile_repairs_legacy_mojibake_labels(tmp_path):
+def test_plot_orientation_profile_preserves_explicit_labels(tmp_path):
     from linak.analysis.orientation import plot_orientation_profile
 
     profile = compute_orientation_profile(
@@ -495,27 +487,24 @@ def test_plot_orientation_profile_repairs_legacy_mojibake_labels(tmp_path):
     )
     capture_state: dict[str, object] = {}
 
-    def _mojibake(text: str) -> str:
-        return text.encode("utf-8").decode("cp1252")
-
     result = plot_orientation_profile(
         profile,
-        output=str(tmp_path / "orient_mojibake_repair.png"),
+        output=str(tmp_path / "orient_explicit_labels.png"),
         show=False,
         component="average",
         angle="polar",
-        title=_mojibake("H₂O orientation (polar)"),
-        x_label=_mojibake("Distance to surface along Z (Å)"),
-        y_label=_mojibake("⟨cos(θ)⟩"),
-        line_label=_mojibake("⟨cos(θ)⟩"),
+        title="H2O orientation (polar)",
+        x_label="Distance to surface along Z (A)",
+        y_label="<cos(theta)>",
+        line_label="<cos(theta)>",
         capture_state=capture_state,
     )
 
     assert result is not None
-    assert capture_state["title"] == "H₂O orientation (polar)"
-    assert capture_state["x_label"] == "Distance to surface along Z (Å)"
-    assert capture_state["y_label"] == "⟨cos(θ)⟩"
-    assert capture_state["series_labels"] == ["⟨cos(θ)⟩"]
+    assert capture_state["title"] == "H2O orientation (polar)"
+    assert capture_state["x_label"] == "Distance to surface along Z (A)"
+    assert capture_state["y_label"] == "<cos(theta)>"
+    assert capture_state["series_labels"] == ["<cos(theta)>"]
 
 
 def test_plot_orientation_profile_heatmap(tmp_path):
@@ -563,7 +552,7 @@ def test_plot_orientation_profile_heatmap_normalize_uses_global_probability(tmp_
     np.testing.assert_allclose(np.sum(finite_values), 1.0)
 
 
-def test_plot_orientation_profile_heatmap_legacy_shrunk_mode_maps_to_global_probability(tmp_path):
+def test_plot_orientation_profile_heatmap_rejects_unknown_normalization_mode(tmp_path):
     from linak.analysis.orientation import plot_orientation_profile
 
     profile = compute_orientation_profile(
@@ -571,23 +560,16 @@ def test_plot_orientation_profile_heatmap_legacy_shrunk_mode_maps_to_global_prob
     )
     capture_state: dict[str, object] = {}
     out = tmp_path / "orient_heat_shrunk.png"
-    result = plot_orientation_profile(
-        profile,
-        output=str(out),
-        show=False,
-        component="heatmap",
-        angle="polar",
-        heatmap_normalization_mode="shrunk_row_probability",
-        capture_state=capture_state,
-    )
-    assert result is not None
-    assert out.exists()
-    ax = capture_state["axes"]
-    mesh = ax.collections[0]
-    values = np.asarray(mesh.get_array(), dtype=float)
-    finite_values = values[np.isfinite(values)]
-    assert finite_values.size > 0
-    np.testing.assert_allclose(np.sum(finite_values), 1.0)
+    with pytest.raises(ValueError, match="heatmap_normalization_mode must be one of"):
+        plot_orientation_profile(
+            profile,
+            output=str(out),
+            show=False,
+            component="heatmap",
+            angle="polar",
+            heatmap_normalization_mode="shrunk_row_probability",
+            capture_state=capture_state,
+        )
 
 
 def test_plot_orientation_profile_heatmap_bulk_water_reference_normalizes_bulk_mean_to_one(

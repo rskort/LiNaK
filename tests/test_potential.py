@@ -214,7 +214,11 @@ def test_plot_potential_profiles_capture_defaults_and_fit_summary(tmp_path):
         show=False,
         output=output,
         capture_state=capture_state,
-        series_fit_enabled=[True, False, True],
+        series_fit_configs=[
+            {"fit_enabled": True},
+            {"fit_enabled": False},
+            {"fit_enabled": True},
+        ],
     )
 
     assert result == output.resolve()

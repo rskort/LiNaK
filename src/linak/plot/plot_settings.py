@@ -128,10 +128,7 @@ def _coerce_profile_store(value: Any) -> PlotProfileStore | None:
         return None
 
     if not _is_named_profile_store(settings):
-        return PlotProfileStore(
-            active_profile=DEFAULT_PLOT_PROFILE_NAME,
-            profiles={DEFAULT_PLOT_PROFILE_NAME: settings},
-        )
+        return None
 
     raw_profiles = settings.get(_NAMED_PROFILE_STORE_PROFILES)
     if not isinstance(raw_profiles, dict):
@@ -159,19 +156,7 @@ def _coerce_profile_store(value: Any) -> PlotProfileStore | None:
     return PlotProfileStore(active_profile=active_profile, profiles=profiles)
 
 
-def _serialize_profile_store(
-    store: PlotProfileStore,
-    *,
-    prefer_legacy_single: bool,
-) -> dict[str, Any]:
-    if prefer_legacy_single:
-        legacy = store.profiles.get(DEFAULT_PLOT_PROFILE_NAME)
-        if (
-            legacy is not None
-            and store.active_profile == DEFAULT_PLOT_PROFILE_NAME
-            and len(store.profiles) == 1
-        ):
-            return _json_ready(legacy)
+def _serialize_profile_store(store: PlotProfileStore) -> dict[str, Any]:
     return {
         _NAMED_PROFILE_STORE_SENTINEL: _NAMED_PROFILE_STORE_VERSION,
         _NAMED_PROFILE_STORE_ACTIVE: store.active_profile,
@@ -189,19 +174,6 @@ def _read_profiles_map_with_store(
         if store is not None:
             stores[str(key)] = store
     return raw_profiles, stores
-
-
-def _coerce_single_profile_store(value: Any) -> PlotProfileStore | None:
-    store = _coerce_profile_store(value)
-    if store is None or store.active_profile is None:
-        return None
-    active_settings = store.profiles.get(store.active_profile)
-    if not isinstance(active_settings, dict):
-        return None
-    return PlotProfileStore(
-        active_profile=DEFAULT_PLOT_PROFILE_NAME,
-        profiles={DEFAULT_PLOT_PROFILE_NAME: dict(active_settings)},
-    )
 
 
 def default_plot_profile_name() -> str:
@@ -360,19 +332,6 @@ def write_plot_profile(
         existing_raw = profiles.get(key)
         existing_store = _coerce_profile_store(existing_raw)
 
-        if profile_name is None and existing_raw is None:
-            profiles[key] = settings_dict
-            _write_profiles_map(group, profiles)
-            return
-        if (
-            profile_name is None
-            and existing_raw is not None
-            and not _is_named_profile_store(existing_raw)
-        ):
-            profiles[key] = settings_dict
-            _write_profiles_map(group, profiles)
-            return
-
         target_name = (
             _normalize_profile_name(profile_name)
             if profile_name is not None
@@ -396,14 +355,7 @@ def write_plot_profile(
             )
             new_store = PlotProfileStore(active_profile=active_profile, profiles=updated_profiles)
 
-        profiles[key] = _serialize_profile_store(
-            new_store,
-            prefer_legacy_single=(
-                profile_name is None
-                and existing_raw is not None
-                and not _is_named_profile_store(existing_raw)
-            ),
-        )
+        profiles[key] = _serialize_profile_store(new_store)
         _write_profiles_map(group, profiles)
 
 
@@ -464,10 +416,7 @@ def delete_named_plot_profile(
             active_profile = _first_profile_name(updated_profiles)
         assert active_profile is not None
         new_store = PlotProfileStore(active_profile=active_profile, profiles=updated_profiles)
-        profiles[key] = _serialize_profile_store(
-            new_store,
-            prefer_legacy_single=True,
-        )
+        profiles[key] = _serialize_profile_store(new_store)
         _write_profiles_map(group, profiles)
         return True, active_profile
 
@@ -490,8 +439,7 @@ def set_active_plot_profile(path: str | Path, profile_key: str, profile_name: st
             )
         profiles = _read_profiles_map(group)
         key = str(profile_key)
-        raw = profiles.get(key)
-        store = _coerce_profile_store(raw)
+        store = _coerce_profile_store(profiles.get(key))
         if store is None or target_name not in store.profiles:
             raise ValueError(
                 f"No named plot profile '{target_name}' found for '{key}' in '{source_path}'."
@@ -500,10 +448,7 @@ def set_active_plot_profile(path: str | Path, profile_key: str, profile_name: st
             active_profile=target_name,
             profiles=dict(store.profiles),
         )
-        profiles[key] = _serialize_profile_store(
-            updated_store,
-            prefer_legacy_single=(raw is not None and not _is_named_profile_store(raw)),
-        )
+        profiles[key] = _serialize_profile_store(updated_store)
         _write_profiles_map(group, profiles)
 
 

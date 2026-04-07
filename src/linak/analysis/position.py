@@ -195,15 +195,24 @@ def _resolve_surface_distance_values(
     surface_elements: list[str] | tuple[str, ...] | None,
     include_fixed_surface_atoms: bool,
     surface_options: SurfaceEstimatorOptions | None,
+    precomputed_surface_estimate: SurfaceEstimate | None,
 ) -> tuple[np.ndarray, str, float | None, float | None, np.ndarray | None, SurfaceEstimate | None]:
-    surface_estimate, _surface_method = _select_surface_estimate(
-        frames,
-        axis,
-        mode=surface_mode,
-        surface_elements=surface_elements,
-        include_fixed_surface_atoms=include_fixed_surface_atoms,
-        surface_options=surface_options,
-    )
+    surface_estimate: SurfaceEstimate | None
+    if precomputed_surface_estimate is not None:
+        if precomputed_surface_estimate.frame_values.shape != (axis_values_all.shape[0],):
+            raise ValueError(
+                "precomputed_surface_estimate frame count does not match the trajectory."
+            )
+        surface_estimate = precomputed_surface_estimate
+    else:
+        surface_estimate, _surface_method = _select_surface_estimate(
+            frames,
+            axis,
+            mode=surface_mode,
+            surface_elements=surface_elements,
+            include_fixed_surface_atoms=include_fixed_surface_atoms,
+            surface_options=surface_options,
+        )
     if surface_estimate is None:
         LOGGER.warning(
             "Could not estimate a surface position along %s; storing raw %s coordinates "
@@ -252,6 +261,7 @@ def _compute_position_profiles_for_labels(
     surface_elements: list[str] | tuple[str, ...] | None,
     include_fixed_surface_atoms: bool,
     surface_options: SurfaceEstimatorOptions | None,
+    precomputed_surface_estimate: SurfaceEstimate | None,
 ) -> list[PositionProfile]:
     ensure_positive("timestep_fs", timestep_fs)
     symbols = _validate_stable_atom_layout(frames)
@@ -274,6 +284,7 @@ def _compute_position_profiles_for_labels(
         surface_elements=surface_elements,
         include_fixed_surface_atoms=include_fixed_surface_atoms,
         surface_options=surface_options,
+        precomputed_surface_estimate=precomputed_surface_estimate,
     )
 
     frame_index = np.arange(len(frames), dtype=int)
@@ -334,6 +345,7 @@ def compute_position_profile(
     surface_elements: list[str] | tuple[str, ...] | None = None,
     include_fixed_surface_atoms: bool = False,
     surface_options: SurfaceEstimatorOptions | None = None,
+    precomputed_surface_estimate: SurfaceEstimate | None = None,
 ) -> PositionProfile:
     """Compute one atom-resolved position profile."""
     species_label = _normalize_species(species)
@@ -346,6 +358,7 @@ def compute_position_profile(
         surface_elements=surface_elements,
         include_fixed_surface_atoms=include_fixed_surface_atoms,
         surface_options=surface_options,
+        precomputed_surface_estimate=precomputed_surface_estimate,
     )
     return profiles[0]
 
@@ -360,6 +373,7 @@ def compute_position_profiles(
     surface_elements: list[str] | tuple[str, ...] | None = None,
     include_fixed_surface_atoms: bool = False,
     surface_options: SurfaceEstimatorOptions | None = None,
+    precomputed_surface_estimate: SurfaceEstimate | None = None,
 ) -> list[PositionProfile]:
     """Compute one or more atom-resolved position profiles."""
     species_label = _normalize_species(species)
@@ -374,6 +388,7 @@ def compute_position_profiles(
                 surface_elements=surface_elements,
                 include_fixed_surface_atoms=include_fixed_surface_atoms,
                 surface_options=surface_options,
+                precomputed_surface_estimate=precomputed_surface_estimate,
             )
         ]
 
@@ -389,6 +404,7 @@ def compute_position_profiles(
         surface_elements=surface_elements,
         include_fixed_surface_atoms=include_fixed_surface_atoms,
         surface_options=surface_options,
+        precomputed_surface_estimate=precomputed_surface_estimate,
     )
 
 
@@ -1200,9 +1216,6 @@ def plot_position_profile(
     series_line_widths: list[float | None] | None = None,
     series_markers: list[str | None] | None = None,
     series_fit_configs: list[dict[str, Any] | None] | None = None,
-    series_fit_enabled: list[bool] | None = None,
-    series_fit_labels: list[str | None] | None = None,
-    series_fit_show_in_legend: list[bool] | None = None,
     series_cumulative_configs: list[dict[str, Any] | None] | None = None,
     render_series_descriptors: list[dict[str, Any]] | None = None,
     series_overrides_by_id: dict[str, dict[str, Any]] | None = None,
@@ -1318,15 +1331,6 @@ def plot_position_profile(
             line_visible=single_series.line_visible,
             show_in_legend=True if not series_show_in_legend else bool(series_show_in_legend[0]),
             fit_config=None if not series_fit_configs else series_fit_configs[0],
-            fit_enabled=True if series_fit_enabled and bool(series_fit_enabled[0]) else False,
-            fit_label=(
-                None
-                if not series_fit_labels or not series_fit_labels[0]
-                else str(series_fit_labels[0])
-            ),
-            fit_show_in_legend=(
-                True if not series_fit_show_in_legend else bool(series_fit_show_in_legend[0])
-            ),
             cumulative_config=cumulative_config,
             raw_point_statistics=True,
             error_config=error_config,
@@ -1469,9 +1473,6 @@ def plot_position_profiles(
     series_line_widths: list[float | None] | None = None,
     series_markers: list[str | None] | None = None,
     series_fit_configs: list[dict[str, Any] | None] | None = None,
-    series_fit_enabled: list[bool] | None = None,
-    series_fit_labels: list[str | None] | None = None,
-    series_fit_show_in_legend: list[bool] | None = None,
     series_cumulative_configs: list[dict[str, Any] | None] | None = None,
     render_series_descriptors: list[dict[str, Any]] | None = None,
     series_overrides_by_id: dict[str, dict[str, Any]] | None = None,
@@ -1583,9 +1584,6 @@ def plot_position_profiles(
             series_line_widths=series_line_widths,
             series_markers=series_markers,
             series_fit_configs=series_fit_configs,
-            series_fit_enabled=series_fit_enabled,
-            series_fit_labels=series_fit_labels,
-            series_fit_show_in_legend=series_fit_show_in_legend,
             series_cumulative_configs=series_cumulative_configs,
             render_series_descriptors=render_series_descriptors,
             series_overrides_by_id=series_overrides_by_id,
@@ -1655,9 +1653,6 @@ def plot_position_profiles(
         series_line_widths=series_line_widths,
         series_markers=series_markers,
         series_fit_configs=series_fit_configs,
-        series_fit_enabled=series_fit_enabled,
-        series_fit_labels=series_fit_labels,
-        series_fit_show_in_legend=series_fit_show_in_legend,
         series_cumulative_configs=series_cumulative_configs,
         series_error_configs=series_error_configs,
         series_raw_statistics=[True] * len(labels),

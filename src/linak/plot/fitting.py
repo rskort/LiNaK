@@ -199,17 +199,9 @@ def default_fit_config() -> FitConfigDict:
 
 def coerce_fit_config(
     raw: Any,
-    *,
-    legacy_enabled: Any = False,
-    legacy_label: Any = None,
-    legacy_show_in_legend: Any = True,
 ) -> FitConfigDict:
-    """Normalize a raw fit configuration with compatibility for legacy fields."""
+    """Normalize a raw fit configuration."""
     config = default_fit_config()
-    config["fit_enabled"] = bool(legacy_enabled)
-    if legacy_label not in {None, ""}:
-        config["fit_label_override"] = str(legacy_label).strip() or None
-    config["fit_show_in_legend"] = bool(legacy_show_in_legend)
 
     if isinstance(raw, dict):
         if "fit_enabled" in raw:
@@ -246,11 +238,8 @@ def resolve_series_fit_configs(
     *,
     series_count: int,
     series_fit_configs: list[dict[str, Any] | None] | None = None,
-    series_fit_enabled: list[bool] | None = None,
-    series_fit_labels: list[str | None] | None = None,
-    series_fit_show_in_legend: list[bool] | None = None,
 ) -> list[FitConfigDict]:
-    """Resolve per-series fit configurations, preserving legacy compatibility."""
+    """Resolve per-series fit configurations."""
     configs: list[FitConfigDict] = []
     for index in range(series_count):
         raw = (
@@ -258,29 +247,7 @@ def resolve_series_fit_configs(
             if series_fit_configs is None or index >= len(series_fit_configs)
             else series_fit_configs[index]
         )
-        legacy_enabled = (
-            False
-            if series_fit_enabled is None or index >= len(series_fit_enabled)
-            else bool(series_fit_enabled[index])
-        )
-        legacy_label = (
-            None
-            if series_fit_labels is None or index >= len(series_fit_labels)
-            else series_fit_labels[index]
-        )
-        legacy_show = (
-            True
-            if series_fit_show_in_legend is None or index >= len(series_fit_show_in_legend)
-            else bool(series_fit_show_in_legend[index])
-        )
-        configs.append(
-            coerce_fit_config(
-                raw,
-                legacy_enabled=legacy_enabled,
-                legacy_label=legacy_label,
-                legacy_show_in_legend=legacy_show,
-            )
-        )
+        configs.append(coerce_fit_config(raw))
     return configs
 
 

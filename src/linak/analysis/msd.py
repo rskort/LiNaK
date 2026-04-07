@@ -349,9 +349,6 @@ def plot_msd_profile(
     series_line_widths: list[float | None] | None = None,
     series_markers: list[str | None] | None = None,
     series_fit_configs: list[dict[str, Any] | None] | None = None,
-    series_fit_enabled: list[bool] | None = None,
-    series_fit_labels: list[str | None] | None = None,
-    series_fit_show_in_legend: list[bool] | None = None,
     cumulative_config: dict[str, Any] | None = None,
     series_normalization_modes: list[str | None] | None = None,
     series_normalization_values: list[float | None] | None = None,
@@ -406,13 +403,6 @@ def plot_msd_profile(
         line_visible=single_series.line_visible,
         show_in_legend=True if not series_show_in_legend else bool(series_show_in_legend[0]),
         fit_config=None if not series_fit_configs else series_fit_configs[0],
-        fit_enabled=True if series_fit_enabled and bool(series_fit_enabled[0]) else False,
-        fit_label=(
-            None if not series_fit_labels or not series_fit_labels[0] else str(series_fit_labels[0])
-        ),
-        fit_show_in_legend=(
-            True if not series_fit_show_in_legend else bool(series_fit_show_in_legend[0])
-        ),
         cumulative_config=cumulative_config,
         series_statistics=None
         if profile.series_statistics is None
@@ -492,9 +482,6 @@ def plot_msd_profiles(
     series_line_widths: list[float | None] | None = None,
     series_markers: list[str | None] | None = None,
     series_fit_configs: list[dict[str, Any] | None] | None = None,
-    series_fit_enabled: list[bool] | None = None,
-    series_fit_labels: list[str | None] | None = None,
-    series_fit_show_in_legend: list[bool] | None = None,
     series_cumulative_configs: list[dict[str, Any] | None] | None = None,
     render_series_descriptors: list[dict[str, Any]] | None = None,
     series_overrides_by_id: dict[str, dict[str, Any]] | None = None,
@@ -607,9 +594,6 @@ def plot_msd_profiles(
         series_line_widths=series_line_widths,
         series_markers=series_markers,
         series_fit_configs=series_fit_configs,
-        series_fit_enabled=series_fit_enabled,
-        series_fit_labels=series_fit_labels,
-        series_fit_show_in_legend=series_fit_show_in_legend,
         series_cumulative_configs=series_cumulative_configs,
         series_error_configs=series_error_configs,
         series_statistics_data=[

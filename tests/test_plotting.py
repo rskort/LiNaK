@@ -169,6 +169,33 @@ def test_with_style_overrides_updates_axes_border():
     assert plotting_module.DEFAULT_PLOT_STYLE.axes_border is True
 
 
+def test_plot_line_series_applies_dict_border_selectively(tmp_path):
+    capture_state: dict[str, object] = {}
+
+    result = plotting_module.plot_line_series(
+        np.array([0.0, 1.0, 2.0], dtype=float),
+        np.array([1.0, 2.0, 3.0], dtype=float),
+        title="Line",
+        x_label="x",
+        y_label="y",
+        output=tmp_path / "line_partial.png",
+        show=False,
+        style=plotting_module.with_style_overrides(
+            axes_border={"left": True, "right": False, "top": False, "bottom": True}
+        ),
+        capture_state=capture_state,
+    )
+
+    assert result is not None
+    ax = capture_state["axes"]
+    assert ax.spines["left"].get_visible() is True
+    assert ax.spines["right"].get_visible() is False
+    assert ax.spines["top"].get_visible() is False
+    assert ax.spines["bottom"].get_visible() is True
+    # Mixed state → capture emits a dict, not a bool
+    assert isinstance(capture_state["axes_border"], dict)
+
+
 def test_default_plot_font_sizes_follow_base_font_size():
     assert plotting_module.default_plot_font_sizes(12) == {
         "title_font_size": 14,
@@ -407,6 +434,50 @@ def test_plot_line_series_rebinned_saved_profile_falls_back_from_block_to_sample
     assert "Block uncertainty is unavailable after x rebinning" in error_summary["reason"]
 
 
+def test_plot_line_series_rejects_section_width_smaller_than_data_bin_width(tmp_path):
+    with pytest.raises(ValueError, match="smaller than the data bin width 1"):
+        plotting_module.plot_line_series(
+            np.array([0.0, 1.0, 2.0, 3.0], dtype=float),
+            np.array([1.0, 2.0, 3.0, 4.0], dtype=float),
+            title="Too small",
+            x_label="x",
+            y_label="y",
+            output=tmp_path / "too_small.png",
+            show=False,
+            x_bin_width=0.5,
+        )
+
+
+def test_plot_line_series_rejects_section_width_larger_than_full_range(tmp_path):
+    with pytest.raises(ValueError, match="larger than the available x-range 3"):
+        plotting_module.plot_line_series(
+            np.array([0.0, 1.0, 2.0, 3.0], dtype=float),
+            np.array([1.0, 2.0, 3.0, 4.0], dtype=float),
+            title="Too large",
+            x_label="x",
+            y_label="y",
+            output=tmp_path / "too_large.png",
+            show=False,
+            x_bin_width=5.0,
+        )
+
+
+def test_plot_line_series_accepts_section_width_equal_to_data_bin_width(tmp_path):
+    result = plotting_module.plot_line_series(
+        np.array([0.0, 1.0, 2.0, 3.0], dtype=float),
+        np.array([1.0, 2.0, 3.0, 4.0], dtype=float),
+        title="Equal width",
+        x_label="x",
+        y_label="y",
+        output=tmp_path / "equal_width.png",
+        show=False,
+        x_bin_width=1.0,
+    )
+
+    assert result is not None
+    assert (tmp_path / "equal_width.png").exists()
+
+
 def test_plot_line_series_renders_annotations_and_reports_summary(tmp_path):
     capture_state: dict[str, object] = {}
 
@@ -561,7 +632,28 @@ def test_plot_rdf_profile_forwards_annotations_and_reports_rdf_provenance(tmp_pa
     assert any(text.get_text() == "RDF peak" for text in capture_state["axes"].texts)
     summary = capture_state["series_error_summaries"]["series"]
     assert summary["provenance_family"] == "block"
-    assert "per-frame g(r)" in summary["provenance"]
+    assert "g(r)" in summary["provenance"]
+
+
+def test_plot_rdf_profile_writes_output_without_strict_zip_runtime_dependency(tmp_path):
+    profile = RDFProfile(
+        species_a="O",
+        species_b="H",
+        bin_edges=np.array([0.0, 0.1, 0.2, 0.3, 0.4], dtype=float),
+        bin_centers=np.array([0.05, 0.15, 0.25, 0.35], dtype=float),
+        g_r=np.array([0.0, 0.5, 1.2, 0.8], dtype=float),
+        n_frames=4,
+    )
+    output = tmp_path / "rdf_profile.png"
+
+    result = plot_rdf_profile(
+        profile,
+        output=output,
+        show=False,
+    )
+
+    assert result == output
+    assert output.exists()
 
 
 def test_plot_orientation_heatmap_profile_forwards_annotations(tmp_path):
@@ -674,6 +766,66 @@ def test_plot_multi_line_series_renders_grouped_mean_series(tmp_path):
     ax = capture_state["axes"]
     assert len(ax.lines) == 1
     np.testing.assert_allclose(ax.lines[0].get_ydata(), np.array([1.5, 3.5, 6.5], dtype=float))
+
+
+def test_plot_multi_line_series_rebinned_grouped_path_succeeds_without_strict_zip(tmp_path):
+    capture_state: dict[str, object] = {}
+
+    result = plotting_module.plot_multi_line_series(
+        [
+            np.array([0.00, 0.09, 0.21, 0.31], dtype=float),
+            np.array([0.02, 0.11, 0.19, 0.29], dtype=float),
+        ],
+        [
+            np.array([1.0, 2.0, 3.0, 4.0], dtype=float),
+            np.array([1.5, 2.5, 3.5, 4.5], dtype=float),
+        ],
+        ["a", "b"],
+        series_ids=["series:a", "series:b"],
+        title="Grouped rebinned",
+        x_label="x",
+        y_label="y",
+        output=tmp_path / "grouped_rebinned.png",
+        show=False,
+        x_bin_width=0.1,
+        x_bin_reducer="mean",
+        render_series_descriptors=[
+            {
+                "series_id": "group:1",
+                "default_label": "Grouped mean",
+                "source_kind": "group",
+                "member_series_ids": ["series:a", "series:b"],
+                "group_reducer": "mean",
+            }
+        ],
+        capture_state=capture_state,
+    )
+
+    assert result is not None
+    assert (tmp_path / "grouped_rebinned.png").exists()
+    summary = capture_state["series_group_summaries"]["group:1"]
+    assert summary["status"] == "ok"
+
+
+def test_aggregate_grouped_prepared_series_rejects_mismatched_member_lengths():
+    prepared = plotting_module.PreparedLineSeries(
+        x=np.array([0.0, 1.0, 2.0], dtype=float),
+        y=np.array([1.0, 2.0], dtype=float),
+        statistics=None,
+        available_error_stats=[],
+        error_config=plotting_module.SeriesErrorConfig(),
+        masked_bin_count=0,
+        error_status="unavailable",
+        statistics_mode="direct",
+    )
+
+    with pytest.raises(ValueError, match="grouped-series x/y point counts do not match"):
+        plotting_module._aggregate_grouped_prepared_series(
+            [prepared],
+            reducer="mean",
+            x_bin_width=0.1,
+            x_bin_reducer="mean",
+        )
 
 
 def test_plot_multi_line_series_marks_group_unavailable_for_mismatched_x_without_rebin(tmp_path):

@@ -70,7 +70,9 @@ def test_resolve_analysis_cell_prefers_explicit_input_over_auto(tmp_path):
     assert resolved.source.startswith("explicit --input")
 
 
-def test_resolve_analysis_cell_warns_when_sources_disagree(tmp_path, caplog):
+def test_resolve_analysis_cell_does_not_probe_auto_sources_when_explicit_cell_is_enough(
+    tmp_path, caplog
+):
     trajectory = tmp_path / "traj.xyz"
     trajectory.write_text("", encoding="utf-8")
     (tmp_path / "input.inp").write_text("ABC [angstrom] 2.0 2.0 2.0\n", encoding="utf-8")
@@ -79,7 +81,7 @@ def test_resolve_analysis_cell_warns_when_sources_disagree(tmp_path, caplog):
         resolved = resolve_analysis_cell(trajectory, cell=(1.0, 1.0, 1.0))
 
     assert resolved.cell_angstrom == pytest.approx((1.0, 1.0, 1.0))
-    assert "Cell sources disagree" in caplog.text
+    assert "Cell sources disagree" not in caplog.text
 
 
 def test_resolve_analysis_cell_raises_when_no_source_is_available(tmp_path):
@@ -107,6 +109,35 @@ def test_resolve_analysis_cell_prefers_trajectory_hdf5_metadata_over_input(tmp_p
     explicit_input.write_text("ABC [angstrom] 4.0 4.0 4.0\n", encoding="utf-8")
 
     resolved = resolve_analysis_cell(trajectory, input_path=explicit_input)
+
+    assert resolved.cell_angstrom == pytest.approx((8.0, 9.0, 10.0))
+    assert resolved.source == "trajectory HDF5 metadata"
+
+
+def test_resolve_analysis_cell_uses_trajectory_hdf5_metadata_without_auto_detection(
+    tmp_path, monkeypatch
+):
+    trajectory = tmp_path / "traj.traj.h5"
+    frames = [Atoms("H", positions=[[0.0, 0.0, 0.0]])]
+    write_trajectory(
+        frames,
+        trajectory,
+        metadata=TrajectoryStoredMetadata(
+            input_path=tmp_path / "input.inp",
+            input_format="inp",
+            cell_angstrom=(8.0, 9.0, 10.0),
+            cell_source="simulation input",
+        ),
+    )
+
+    def _raise_if_called(*_args, **_kwargs):
+        raise AssertionError(
+            "_auto_detect_cell should not be called when HDF5 cell metadata exists"
+        )
+
+    monkeypatch.setattr("linak.resolution._auto_detect_cell", _raise_if_called)
+
+    resolved = resolve_analysis_cell(trajectory)
 
     assert resolved.cell_angstrom == pytest.approx((8.0, 9.0, 10.0))
     assert resolved.source == "trajectory HDF5 metadata"
@@ -160,7 +191,9 @@ def test_resolve_analysis_timestep_prefers_explicit_over_auto(tmp_path):
     assert resolved.source == "explicit --timestep-fs"
 
 
-def test_resolve_analysis_timestep_warns_when_sources_disagree(tmp_path, caplog):
+def test_resolve_analysis_timestep_does_not_probe_auto_sources_when_explicit_timestep_is_enough(
+    tmp_path, caplog
+):
     trajectory = tmp_path / "traj.xyz"
     trajectory.write_text("", encoding="utf-8")
     (tmp_path / "input.inp").write_text(
@@ -172,7 +205,7 @@ def test_resolve_analysis_timestep_warns_when_sources_disagree(tmp_path, caplog)
         resolved = resolve_analysis_timestep_fs(trajectory, timestep_fs=1.0)
 
     assert resolved.frame_timestep_fs == pytest.approx(1.0)
-    assert "Timestep sources disagree" in caplog.text
+    assert "Timestep sources disagree" not in caplog.text
 
 
 def test_resolve_analysis_timestep_prefers_metadata_over_input(tmp_path):
@@ -216,6 +249,37 @@ def test_resolve_analysis_timestep_prefers_trajectory_hdf5_metadata_over_input(t
     )
 
     resolved = resolve_analysis_timestep_fs(trajectory, input_path=explicit_input)
+
+    assert resolved.frame_timestep_fs == pytest.approx(2.5)
+    assert resolved.source == "trajectory HDF5 metadata"
+
+
+def test_resolve_analysis_timestep_uses_trajectory_hdf5_metadata_without_auto_detection(
+    tmp_path, monkeypatch
+):
+    trajectory = tmp_path / "traj.traj.h5"
+    frames = [Atoms("H", positions=[[0.0, 0.0, 0.0]])]
+    write_trajectory(
+        frames,
+        trajectory,
+        metadata=TrajectoryStoredMetadata(
+            input_path=tmp_path / "input.inp",
+            input_format="inp",
+            frame_timestep_fs=2.5,
+            md_timestep_fs=0.5,
+            trajectory_stride_md=5,
+            timestep_source="simulation input",
+        ),
+    )
+
+    def _raise_if_called(*_args, **_kwargs):
+        raise AssertionError(
+            "_auto_detect_frame_timestep_fs should not be called when HDF5 timestep metadata exists"
+        )
+
+    monkeypatch.setattr("linak.resolution._auto_detect_frame_timestep_fs", _raise_if_called)
+
+    resolved = resolve_analysis_timestep_fs(trajectory)
 
     assert resolved.frame_timestep_fs == pytest.approx(2.5)
     assert resolved.source == "trajectory HDF5 metadata"

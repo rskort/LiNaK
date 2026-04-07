@@ -50,6 +50,7 @@ def test_lazy_load_duplicate_indices_no_overlap(tmp_path):
                     "species": species,
                     "profile_index": idx,  # Source-local index
                     "source_profile_index": idx,
+                    "bin_width_A": 1.0,
                 },
             }
         )
@@ -68,6 +69,7 @@ def test_lazy_load_duplicate_indices_no_overlap(tmp_path):
                     "species": species,
                     "profile_index": idx,  # Source-local index (duplicated!)
                     "source_profile_index": idx,
+                    "bin_width_A": 1.0,
                 },
             }
         )
@@ -149,6 +151,7 @@ def test_lazy_load_maintains_species_correctness(tmp_path):
                     "species": species,
                     "profile_index": idx,
                     "source_profile_index": idx,
+                    "bin_width_A": 1.0,
                 },
             }
         )
@@ -167,6 +170,7 @@ def test_lazy_load_maintains_species_correctness(tmp_path):
                     "species": species,
                     "profile_index": idx,
                     "source_profile_index": idx,
+                    "bin_width_A": 1.0,
                 },
             }
         )

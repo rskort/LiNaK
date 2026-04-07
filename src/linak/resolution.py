@@ -171,7 +171,7 @@ def _extract_metadata_timestep_details(
         md_timestep_fs = _coerce_float(info_first.get("md_timestep_fs"))
         stride_raw = info_first.get("trajectory_stride_md")
         stride_md = int(stride_raw) if isinstance(stride_raw, (int, np.integer)) else None
-        LOGGER.info(
+        LOGGER.debug(
             "Inferred frame timestep from trajectory metadata key '%s': %.6g fs.",
             key,
             inferred,
@@ -218,7 +218,7 @@ def _extract_metadata_timestep_details(
         md_timestep_fs = _coerce_float(info_first.get("md_timestep_fs"))
         stride_raw = info_first.get("trajectory_stride_md")
         stride_md = int(stride_raw) if isinstance(stride_raw, (int, np.integer)) else None
-        LOGGER.info(
+        LOGGER.debug(
             "Inferred frame timestep from trajectory metadata key '%s': %.6g fs.",
             display_key or key,
             inferred,
@@ -282,38 +282,45 @@ def resolve_analysis_cell(
     )
     trajectory_hdf5_cell, trajectory_hdf5_input = _trajectory_hdf5_cell_metadata(trajectory)
 
-    auto_cell: tuple[float, float, float] | None = None
-    auto_input: Path | None = None
-    try:
-        auto_cell, auto_input = _auto_detect_cell(trajectory)
-    except Exception as exc:
-        LOGGER.debug("Automatic cell detection failed for '%s': %s", trajectory, exc)
-
-    candidates: list[tuple[str, tuple[float, float, float]]] = []
     if explicit_cell is not None:
-        candidates.append(("explicit --cell", explicit_cell))
-    if trajectory_hdf5_cell is not None:
-        candidates.append(("trajectory HDF5 metadata", trajectory_hdf5_cell))
-    if explicit_input_cell is not None and explicit_input_resolved is not None:
-        candidates.append((f"explicit --input ({explicit_input_resolved})", explicit_input_cell))
-    if auto_cell is not None and auto_input is not None:
-        candidates.append((f"auto-detected ({auto_input})", auto_cell))
-    _warn_on_mismatched_cells(trajectory, candidates)
-
-    if explicit_cell is not None:
+        candidates: list[tuple[str, tuple[float, float, float]]] = [
+            ("explicit --cell", explicit_cell)
+        ]
+        if trajectory_hdf5_cell is not None:
+            candidates.append(("trajectory HDF5 metadata", trajectory_hdf5_cell))
+        if explicit_input_cell is not None and explicit_input_resolved is not None:
+            candidates.append(
+                (f"explicit --input ({explicit_input_resolved})", explicit_input_cell)
+            )
+        _warn_on_mismatched_cells(trajectory, candidates)
         return CellResolution(cell_angstrom=explicit_cell, source="explicit --cell")
+
     if trajectory_hdf5_cell is not None:
+        candidates = [("trajectory HDF5 metadata", trajectory_hdf5_cell)]
+        if explicit_input_cell is not None and explicit_input_resolved is not None:
+            candidates.append(
+                (f"explicit --input ({explicit_input_resolved})", explicit_input_cell)
+            )
+        _warn_on_mismatched_cells(trajectory, candidates)
         return CellResolution(
             cell_angstrom=trajectory_hdf5_cell,
             source="trajectory HDF5 metadata",
             input_path=trajectory_hdf5_input,
         )
+
     if explicit_input_cell is not None and explicit_input_resolved is not None:
         return CellResolution(
             cell_angstrom=explicit_input_cell,
             source=f"explicit --input ({explicit_input_resolved})",
             input_path=explicit_input_resolved,
         )
+
+    auto_cell: tuple[float, float, float] | None = None
+    auto_input: Path | None = None
+    try:
+        auto_cell, auto_input = _auto_detect_cell(trajectory)
+    except Exception as exc:
+        LOGGER.debug("Automatic cell detection failed for '%s': %s", trajectory, exc)
     if auto_cell is not None and auto_input is not None:
         return CellResolution(
             cell_angstrom=auto_cell,
@@ -362,38 +369,30 @@ def resolve_analysis_timestep_fs(
             explicit_input_stride,
         ) = extract_frame_timestep_fs_from_simulation_input(explicit_input_resolved)
 
-    auto_timestep: float | None = None
-    auto_md_timestep: float | None = None
-    auto_stride: int | None = None
-    auto_input: Path | None = None
-    try:
-        auto_timestep, auto_md_timestep, auto_stride, auto_input = _auto_detect_frame_timestep_fs(
-            trajectory
-        )
-    except Exception as exc:
-        LOGGER.debug("Automatic timestep detection failed for '%s': %s", trajectory, exc)
-
-    candidates: list[tuple[str, float]] = []
     if explicit_timestep is not None:
-        candidates.append(("explicit --timestep-fs", explicit_timestep))
-    if trajectory_hdf5_timestep is not None:
-        candidates.append(("trajectory HDF5 metadata", trajectory_hdf5_timestep))
-    if metadata_timestep is not None:
-        candidates.append(("trajectory metadata", metadata_timestep))
-    if explicit_input_timestep is not None and explicit_input_resolved is not None:
-        candidates.append(
-            (f"explicit --input ({explicit_input_resolved})", explicit_input_timestep)
-        )
-    if auto_timestep is not None and auto_input is not None:
-        candidates.append((f"auto-detected ({auto_input})", auto_timestep))
-    _warn_on_mismatched_timestep_sources(trajectory, candidates)
-
-    if explicit_timestep is not None:
+        candidates: list[tuple[str, float]] = [("explicit --timestep-fs", explicit_timestep)]
+        if trajectory_hdf5_timestep is not None:
+            candidates.append(("trajectory HDF5 metadata", trajectory_hdf5_timestep))
+        if metadata_timestep is not None:
+            candidates.append(("trajectory metadata", metadata_timestep))
+        if explicit_input_timestep is not None and explicit_input_resolved is not None:
+            candidates.append(
+                (f"explicit --input ({explicit_input_resolved})", explicit_input_timestep)
+            )
+        _warn_on_mismatched_timestep_sources(trajectory, candidates)
         return TimestepResolution(
             frame_timestep_fs=explicit_timestep, source="explicit --timestep-fs"
         )
 
     if trajectory_hdf5_timestep is not None:
+        candidates = [("trajectory HDF5 metadata", trajectory_hdf5_timestep)]
+        if metadata_timestep is not None:
+            candidates.append(("trajectory metadata", metadata_timestep))
+        if explicit_input_timestep is not None and explicit_input_resolved is not None:
+            candidates.append(
+                (f"explicit --input ({explicit_input_resolved})", explicit_input_timestep)
+            )
+        _warn_on_mismatched_timestep_sources(trajectory, candidates)
         return TimestepResolution(
             frame_timestep_fs=trajectory_hdf5_timestep,
             source="trajectory HDF5 metadata",
@@ -403,6 +402,12 @@ def resolve_analysis_timestep_fs(
         )
 
     if metadata_timestep is not None:
+        candidates = [("trajectory metadata", metadata_timestep)]
+        if explicit_input_timestep is not None and explicit_input_resolved is not None:
+            candidates.append(
+                (f"explicit --input ({explicit_input_resolved})", explicit_input_timestep)
+            )
+        _warn_on_mismatched_timestep_sources(trajectory, candidates)
         return TimestepResolution(
             frame_timestep_fs=metadata_timestep,
             source="trajectory metadata",
@@ -424,6 +429,16 @@ def resolve_analysis_timestep_fs(
             trajectory_stride_md=explicit_input_stride,
         )
 
+    auto_timestep: float | None = None
+    auto_md_timestep: float | None = None
+    auto_stride: int | None = None
+    auto_input: Path | None = None
+    try:
+        auto_timestep, auto_md_timestep, auto_stride, auto_input = _auto_detect_frame_timestep_fs(
+            trajectory
+        )
+    except Exception as exc:
+        LOGGER.debug("Automatic timestep detection failed for '%s': %s", trajectory, exc)
     if (
         auto_timestep is not None
         and auto_input is not None

@@ -30,7 +30,7 @@ The shared estimator exposes advanced Python options through
 
 - `mode = "auto" | "layered" | "rough"`
 - `side = "top" | "bottom"`
-- `reduction_mode = "median" | "trimmed_mean" | "legacy_mean"`
+- `reduction_mode = "median" | "trimmed_mean"`
 - `low_confidence_threshold`
 - layer-gap and layer-size thresholds
 - rough-reference selection fraction, quantile, and optional
@@ -43,9 +43,6 @@ The default reduction is robust:
 - rough low-mobility estimates use the median of the selected reference
   coordinates
 - tracked fills use the same robust reducer
-
-Legacy mean-based reductions still exist, but only through explicit advanced
-Python options.
 
 LiNaK stores effective surface-estimation settings in nested HDF5 metadata under
 `surface.effective_options` for reproducibility.
@@ -184,8 +181,7 @@ of the selected layer coordinates:
 when `reduction_mode="median"`.
 
 If `reduction_mode="trimmed_mean"`, LiNaK trims the configured fraction from
-both tails before averaging. `legacy_mean` restores the older mean-based
-behavior.
+both tails before averaging.
 
 ### Layered Confidence
 
@@ -452,9 +448,12 @@ such as:
 - `surface.low_confidence_threshold`
 - `surface.effective_options`
 
-Older files may still contain flat summary keys such as `surface_position` or
-`surface_mode`. LiNaK loaders accept both the older flat form and the newer
-nested surface metadata.
+Current development analysis outputs use strict v1 structured surface metadata.
+If required surface datasets or metadata are missing from a current analysis
+file, recompute the analysis with the current LiNaK version. Converted
+trajectory HDF5 files may also carry a default conversion-time surface cache;
+surface-aware analyses reuse that cache only when their requested surface
+settings match it.
 
 ## Important Limitations
 

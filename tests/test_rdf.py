@@ -8,12 +8,14 @@ import pytest
 from ase import Atoms
 
 import linak.analysis.rdf as rdf_mod
+from linak import __version__ as LINAK_VERSION
 from linak.analysis.rdf import (
     RDFProfile,
     compute_rdf,
     compute_rdf_profiles,
     load_rdf_profile,
     load_rdf_profiles,
+    plot_rdf_profile,
     save_rdf_profile,
     save_rdf_profiles,
 )
@@ -482,6 +484,220 @@ def test_save_and_load_rdf_profile(tmp_path):
     np.testing.assert_array_equal(stats.sample_n, np.array([1, 1]))
 
 
+def test_compute_rdf_supports_explicit_atom_indices():
+    frame = Atoms(
+        "OHH",
+        positions=[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
+        cell=[20.0, 20.0, 20.0],
+        pbc=True,
+    )
+
+    explicit = compute_rdf(
+        [frame],
+        atom_indices_a=[0],
+        atom_indices_b=[1, 2],
+        r_max=3.0,
+        bin_width=1.0,
+        threads=1,
+    )
+    species = compute_rdf(
+        [frame],
+        species_a="O",
+        species_b="H",
+        r_max=3.0,
+        bin_width=1.0,
+        threads=1,
+    )
+
+    np.testing.assert_allclose(explicit.bin_edges, species.bin_edges)
+    np.testing.assert_allclose(explicit.g_r, species.g_r, equal_nan=True)
+    assert explicit.species_a == "atoms[0]"
+    assert explicit.species_b == "atoms[1..2]"
+    np.testing.assert_array_equal(explicit.atom_indices_a, np.array([0]))
+    np.testing.assert_array_equal(explicit.atom_indices_b, np.array([1, 2]))
+    assert explicit.selection_kind_a == "atoms"
+    assert explicit.selection_kind_b == "atoms"
+
+
+def test_compute_rdf_supports_mixed_species_and_atom_selectors():
+    frame = Atoms(
+        "OHH",
+        positions=[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
+        cell=[20.0, 20.0, 20.0],
+        pbc=True,
+    )
+
+    mixed = compute_rdf(
+        [frame],
+        species_a="O",
+        atom_indices_b=[1, 2],
+        r_max=3.0,
+        bin_width=1.0,
+        threads=1,
+    )
+    species = compute_rdf(
+        [frame],
+        species_a="O",
+        species_b="H",
+        r_max=3.0,
+        bin_width=1.0,
+        threads=1,
+    )
+
+    np.testing.assert_allclose(mixed.g_r, species.g_r, equal_nan=True)
+    assert mixed.species_a == "O"
+    assert mixed.species_b == "atoms[1..2]"
+    assert mixed.selection_kind_a == "species"
+    assert mixed.selection_kind_b == "atoms"
+
+
+def test_compute_rdf_same_explicit_atom_selection_matches_same_species_behavior():
+    frame = Atoms(
+        "OO",
+        positions=[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+        cell=[10.0, 10.0, 10.0],
+        pbc=True,
+    )
+
+    explicit = compute_rdf(
+        [frame],
+        atom_indices_a=[0, 1],
+        atom_indices_b=[0, 1],
+        r_max=2.0,
+        bin_width=1.0,
+        threads=1,
+    )
+    species = compute_rdf(
+        [frame],
+        species_a="O",
+        species_b="O",
+        r_max=2.0,
+        bin_width=1.0,
+        threads=1,
+    )
+
+    np.testing.assert_allclose(explicit.g_r, species.g_r, equal_nan=True)
+
+
+def test_compute_rdf_expected_counts_handle_overlapping_explicit_selections():
+    frame = Atoms(
+        "OHH",
+        positions=[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
+        cell=[20.0, 20.0, 20.0],
+        pbc=True,
+    )
+    cache = rdf_mod._resolve_rdf_selection_cache(
+        [frame],
+        label_a="atoms[0..1]",
+        label_b="atoms[1..2]",
+        atom_indices_a=np.array([0, 1], dtype=int),
+        atom_indices_b=np.array([1, 2], dtype=int),
+    )
+    assert cache is not None
+
+    shell_volumes = rdf_mod._shell_volumes_from_edges(np.array([0.0, 1.0, 2.0, 3.0], dtype=float))
+    counts, expected = rdf_mod._compute_rdf_frame_contribution(
+        0,
+        frame,
+        label_a="atoms[0..1]",
+        label_b="atoms[1..2]",
+        same_selection=False,
+        r_max=3.0,
+        bin_edges=np.array([0.0, 1.0, 2.0, 3.0], dtype=float),
+        shell_volumes=shell_volumes,
+        max_sphere_volume=(4.0 / 3.0) * np.pi * (3.0**3),
+        selection_cache=cache,
+    )
+
+    np.testing.assert_array_equal(counts, np.array([0.0, 2.0, 1.0]))
+    np.testing.assert_allclose(expected, (3.0 / frame.get_volume()) * shell_volumes)
+
+
+def test_compute_rdf_explicit_atom_indices_require_stable_layout():
+    frame_a = Atoms(
+        "OH",
+        positions=[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+        cell=[10.0, 10.0, 10.0],
+        pbc=True,
+    )
+    frame_b = Atoms(
+        "HO",
+        positions=[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+        cell=[10.0, 10.0, 10.0],
+        pbc=True,
+    )
+
+    with pytest.raises(ValueError, match="stable atom identities/order"):
+        compute_rdf(
+            [frame_a, frame_b],
+            atom_indices_a=[0],
+            atom_indices_b=[1],
+            r_max=2.0,
+            bin_width=1.0,
+            threads=1,
+        )
+
+
+def test_save_and_load_rdf_profile_preserves_atom_selection_metadata(tmp_path):
+    frame = Atoms(
+        "OHH",
+        positions=[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
+        cell=[20.0, 20.0, 20.0],
+        pbc=True,
+    )
+    profile = compute_rdf(
+        [frame],
+        atom_indices_a=[0],
+        atom_indices_b=[1, 2],
+        r_max=3.0,
+        bin_width=1.0,
+        threads=1,
+    )
+    out = tmp_path / "rdf_selected.h5"
+
+    save_rdf_profile(profile, out)
+    with h5py.File(out, "r") as handle:
+        metadata = json.loads(str(handle.attrs["metadata_json"]))
+        assert metadata["selection_kind_a"] == "atoms"
+        assert metadata["selection_kind_b"] == "atoms"
+        np.testing.assert_array_equal(handle["atom_indices_a"][...], np.array([0]))
+        np.testing.assert_array_equal(handle["atom_indices_b"][...], np.array([1, 2]))
+
+    loaded = load_rdf_profile(out)
+
+    assert loaded.selection_kind_a == "atoms"
+    assert loaded.selection_kind_b == "atoms"
+    np.testing.assert_array_equal(loaded.atom_indices_a, np.array([0]))
+    np.testing.assert_array_equal(loaded.atom_indices_b, np.array([1, 2]))
+    assert loaded.species_a == "atoms[0]"
+    assert loaded.species_b == "atoms[1..2]"
+
+
+def test_atom_selected_rdf_hdf5_still_plots(tmp_path):
+    frame = Atoms(
+        "OHH",
+        positions=[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
+        cell=[20.0, 20.0, 20.0],
+        pbc=True,
+    )
+    profile = compute_rdf(
+        [frame],
+        atom_indices_a=[0],
+        atom_indices_b=[1, 2],
+        r_max=3.0,
+        bin_width=1.0,
+        threads=1,
+    )
+    source = tmp_path / "rdf_selected.h5"
+    output = tmp_path / "rdf_selected.png"
+    save_rdf_profile(profile, source)
+
+    loaded = load_rdf_profile(source)
+    plot_rdf_profile(loaded, output=output, show=False)
+
+    assert output.exists()
+
+
 def test_compute_rdf_profiles_returns_unique_unordered_species_pairs():
     frames = [
         Atoms(
@@ -595,7 +811,7 @@ def test_compute_rdf_profiles_do_not_use_postpass_statistics_helper(monkeypatch)
     assert all(profile.series_statistics is not None for profile in profiles)
 
 
-def test_compute_rdf_inline_statistics_match_legacy_helper():
+def test_compute_rdf_inline_statistics_match_reference_helper():
     frames = [
         Atoms(
             "OHH",
@@ -690,13 +906,18 @@ def test_save_rdf_profiles_writes_profile_collection(tmp_path):
     assert len(payloads) == 2
 
 
-def test_load_rdf_profile_supports_legacy_bin_edges_dataset(tmp_path):
-    out = tmp_path / "legacy_rdf.h5"
+def test_load_rdf_profile_rejects_missing_v1_bin_width_metadata(tmp_path):
+    out = tmp_path / "old_rdf.h5"
     with h5py.File(out, "w") as handle:
         handle.attrs["linak_format"] = "linak-hdf5"
+        handle.attrs["linak_format_version"] = 1
+        handle.attrs["linak_version"] = LINAK_VERSION
         handle.attrs["analysis"] = "rdf"
         handle.attrs["metadata_json"] = json.dumps(
             {
+                "analysis": "rdf",
+                "analysis_schema_version": 1,
+                "profile_uid": "rdf-without-bin-width",
                 "species_a": "O",
                 "species_b": "H",
                 "n_frames": 1,
@@ -706,12 +927,12 @@ def test_load_rdf_profile_supports_legacy_bin_edges_dataset(tmp_path):
         handle.create_dataset("bin_centers_A", data=np.array([0.5, 1.5], dtype=float))
         handle.create_dataset("g_r", data=np.array([0.0, 1.0], dtype=float))
 
-    loaded = load_rdf_profile(out, species_a="O", species_b="H")
-    np.testing.assert_allclose(loaded.bin_edges, np.array([0.0, 1.0, 2.0]))
+    with pytest.raises(ValueError, match="missing required v1 metadata bin_width_A"):
+        load_rdf_profile(out, species_a="O", species_b="H")
 
 
 def test_load_rdf_profile_rejects_csv_input(tmp_path):
-    csv = tmp_path / "legacy_rdf.csv"
+    csv = tmp_path / "old_rdf.csv"
     csv.write_text(
         "bin_left_A,bin_right_A,r_A,g_r\n0.0,1.0,0.5,1.0\n",
         encoding="utf-8",
@@ -761,14 +982,24 @@ def test_load_rdf_profiles_filters_by_stored_species_metadata(tmp_path):
         analysis="rdf",
         profiles=[
             {
-                "metadata": {"species_a": "O", "species_b": "H", "n_frames": 1},
+                "metadata": {
+                    "species_a": "O",
+                    "species_b": "H",
+                    "n_frames": 1,
+                    "bin_width_A": 1.0,
+                },
                 "datasets": {
                     "bin_centers_A": np.array([0.5, 1.5], dtype=float),
                     "g_r": np.array([0.1, 0.2], dtype=float),
                 },
             },
             {
-                "metadata": {"species_a": "H", "species_b": "H", "n_frames": 1},
+                "metadata": {
+                    "species_a": "H",
+                    "species_b": "H",
+                    "n_frames": 1,
+                    "bin_width_A": 1.0,
+                },
                 "datasets": {
                     "bin_centers_A": np.array([0.5, 1.5], dtype=float),
                     "g_r": np.array([0.3, 0.4], dtype=float),
@@ -791,7 +1022,12 @@ def test_load_rdf_profiles_supports_symmetric_cross_pair_lookup(tmp_path):
         analysis="rdf",
         profiles=[
             {
-                "metadata": {"species_a": "O", "species_b": "H", "n_frames": 1},
+                "metadata": {
+                    "species_a": "O",
+                    "species_b": "H",
+                    "n_frames": 1,
+                    "bin_width_A": 1.0,
+                },
                 "datasets": {
                     "bin_centers_A": np.array([0.5, 1.5], dtype=float),
                     "g_r": np.array([0.1, 0.2], dtype=float),
@@ -878,7 +1114,7 @@ def test_compute_rdf_logs_dense_orthorhombic_backend(caplog):
         for index in range(4)
     ]
 
-    with caplog.at_level("INFO", logger="linak.analysis.rdf"):
+    with caplog.at_level("DEBUG", logger="linak.analysis.rdf"):
         compute_rdf(frames, species_a="O", species_b="H", r_max=2.0, bin_width=1.0, threads=1)
 
     assert "Using RDF backend: dense orthorhombic chunked" in caplog.text
@@ -901,7 +1137,7 @@ def test_compute_rdf_logs_sparse_orthorhombic_backend(monkeypatch, caplog):
     ]
     monkeypatch.setattr(rdf_mod, "_RDF_DENSE_PAIR_THRESHOLD", 1)
 
-    with caplog.at_level("INFO", logger="linak.analysis.rdf"):
+    with caplog.at_level("DEBUG", logger="linak.analysis.rdf"):
         compute_rdf(frames, species_a="O", species_b="H", r_max=1.5, bin_width=0.25, threads=1)
 
     assert "Using RDF backend: sparse orthorhombic cutoff" in caplog.text
@@ -917,7 +1153,7 @@ def test_compute_rdf_logs_generic_fallback_for_skewed_cells(caplog):
         )
     ]
 
-    with caplog.at_level("INFO", logger="linak.analysis.rdf"):
+    with caplog.at_level("DEBUG", logger="linak.analysis.rdf"):
         compute_rdf(frames, species_a="O", species_b="H", r_max=2.0, bin_width=1.0, threads=1)
 
     assert "Using RDF backend: generic framewise fallback." in caplog.text

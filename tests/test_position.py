@@ -122,7 +122,7 @@ def test_save_and_load_position_profile(tmp_path):
 
 
 def test_load_position_profile_rejects_csv_input(tmp_path):
-    csv = tmp_path / "legacy_position.csv"
+    csv = tmp_path / "old_position.csv"
     csv.write_text("time_ps,distance\n0.0,1.0\n", encoding="utf-8")
 
     with pytest.raises(ValueError, match="Use .h5/.hdf5"):

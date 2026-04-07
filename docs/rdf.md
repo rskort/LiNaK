@@ -189,9 +189,10 @@ and metadata such as:
 - effective `bin_width_A`
 - `units_map`
 
-`bin_edges_A` may appear in older or explicitly written files, but the current
-minimal RDF payload stores `bin_centers_A` plus `bin_width_A`, and LiNaK
-reconstructs uniform bin edges on load when needed.
+Current v1 RDF files store `bin_centers_A` plus metadata `bin_width_A`; LiNaK
+reconstructs uniform bin edges from those fields on load. Files that only carry
+older bin-edge-style metadata are rejected and should be recomputed with the
+current package.
 
 ## Important Assumptions And Limitations
 

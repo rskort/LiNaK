@@ -94,7 +94,7 @@ class PlotStyle:
     legend_font_size: int = 10
     line_width: float = 2.0
     line_color: str = "#1f77b4"
-    axes_border: bool = True
+    axes_border: bool | dict[str, bool] = True
     grid: bool = True
     grid_linestyle: str = "--"
     grid_linewidth: float = 0.8
@@ -118,8 +118,8 @@ DEFAULT_PLOT_STYLE = PlotStyle()
 _MOJIBAKE_MARKERS = ("Ã", "â", "Î", "Ï", "Â")
 
 
-def repair_legacy_plot_text(value: str) -> str:
-    """Repair common UTF-8 mojibake in legacy saved plot labels/titles.
+def normalize_plot_text(value: str) -> str:
+    """Return plot text exactly as stored.
 
     Some older plot settings were persisted after UTF-8 text had been decoded with
     a Windows single-byte code page. That produces strings such as ``Hâ‚‚O``,
@@ -127,31 +127,17 @@ def repair_legacy_plot_text(value: str) -> str:
     clean defaults. This helper repairs those strings conservatively.
     """
     text = str(value)
-    if not any(marker in text for marker in _MOJIBAKE_MARKERS):
-        return text
-
-    best = text
-    best_score = sum(best.count(marker) for marker in _MOJIBAKE_MARKERS)
-    for encoding in ("cp1252", "latin-1"):
-        try:
-            candidate = text.encode(encoding).decode("utf-8")
-        except (UnicodeEncodeError, UnicodeDecodeError):
-            continue
-        candidate_score = sum(candidate.count(marker) for marker in _MOJIBAKE_MARKERS)
-        if candidate_score < best_score:
-            best = candidate
-            best_score = candidate_score
-    return best
+    return text
 
 
 def format_axis_label_units(label: str) -> str:
     """Return the axis label exactly as provided by the caller."""
-    return repair_legacy_plot_text(str(label))
+    return normalize_plot_text(str(label))
 
 
 def resolve_explicit_plot_text(value: str | None, default: str) -> str:
     """Preserve explicit blank strings while still filling missing values from defaults."""
-    return repair_legacy_plot_text(default if value is None else str(value))
+    return normalize_plot_text(default if value is None else str(value))
 
 
 def _series_statistics(x_values: np.ndarray, y_values: np.ndarray) -> dict[str, float | int | None]:
@@ -410,7 +396,7 @@ def _coerce_plot_annotation(value: Any, *, index: int) -> dict[str, Any]:
         "id": str(value.get("id") or f"annotation:{index}").strip() or f"annotation:{index}",
         "type": annotation_type,
         "enabled": bool(value.get("enabled", True)),
-        "name": repair_legacy_plot_text(
+        "name": normalize_plot_text(
             str(value.get("name") or f"{annotation_type.title()} {index + 1}").strip()
             or f"{annotation_type.title()} {index + 1}"
         ),
@@ -421,7 +407,7 @@ def _coerce_plot_annotation(value: Any, *, index: int) -> dict[str, Any]:
     }
 
     if annotation_type == "text":
-        text_value = repair_legacy_plot_text(str(value.get("text") or ""))
+        text_value = normalize_plot_text(str(value.get("text") or ""))
         if normalized["enabled"] and not text_value.strip():
             raise ValueError(f"Annotation {index + 1} text cannot be blank when enabled.")
         h_align = str(value.get("horizontal_align") or "center").strip().lower()
@@ -545,7 +531,7 @@ def _render_plot_annotations(
             ax.text(
                 float(annotation["x"]),
                 float(annotation["y"]),
-                repair_legacy_plot_text(str(annotation["text"])),
+                normalize_plot_text(str(annotation["text"])),
                 transform=transform,
                 color=str(annotation["color"]),
                 alpha=float(annotation["alpha"]),
@@ -605,7 +591,7 @@ def with_style_overrides(
     legend_font_size: int | None = None,
     line_width: float | None = None,
     line_color: str | None = None,
-    axes_border: bool | None = None,
+    axes_border: bool | dict[str, bool] | None = None,
     grid: bool | None = None,
     grid_linestyle: str | None = None,
     grid_linewidth: float | None = None,
@@ -1135,7 +1121,7 @@ def configure_matplotlib_backend(
                 if _is_interactive_backend(active):
                     _BACKEND_CONFIGURED = True
                     _CONFIGURED_BACKEND = active
-                    LOGGER.info("Configured Matplotlib backend '%s'.", active)
+                    LOGGER.debug("Configured Matplotlib backend '%s'.", active)
                     return active
             except Exception as exc:  # pragma: no cover - environment dependent
                 last_error = exc
@@ -1155,7 +1141,7 @@ def configure_matplotlib_backend(
     active = matplotlib.get_backend()
     _BACKEND_CONFIGURED = True
     _CONFIGURED_BACKEND = active
-    LOGGER.info("Configured Matplotlib backend '%s'.", active)
+    LOGGER.debug("Configured Matplotlib backend '%s'.", active)
     return active
 
 
@@ -1306,7 +1292,7 @@ def _capture_plot_state(
             "markers": any(
                 marker not in {"", "None", "none", " ", "NoneType"} for marker in line_markers
             ),
-            "series_labels": [repair_legacy_plot_text(str(label)) for label in line_labels],
+            "series_labels": [normalize_plot_text(str(label)) for label in line_labels],
             "figsize": [float(style.figure_size[0]), float(style.figure_size[1])],
             "dpi": int(style.dpi),
             "font_family": style.font_family,
@@ -1318,7 +1304,10 @@ def _capture_plot_state(
             "line_width": float(style.line_width),
             "line_kwargs": line_kwargs,
             "axes_kwargs": axes_kwargs,
-            "axes_border": bool(all(spine.get_visible() for spine in ax.spines.values())),
+            "axes_border": (
+                lambda _states={name: spine.get_visible() for name, spine in ax.spines.items()}:
+                True if all(_states.values()) else False if not any(_states.values()) else dict(_states)
+            )(),
             "x_margin": float(ax.get_xmargin()),
             "y_margin": float(ax.get_ymargin()),
             "x_label_pad": float(ax.xaxis.labelpad),
@@ -1335,9 +1324,13 @@ def _capture_plot_state(
     )
 
 
-def _apply_axes_border(ax: Any, *, visible: bool) -> None:
-    for spine in ax.spines.values():
-        spine.set_visible(bool(visible))
+def _apply_axes_border(ax: Any, *, visible: bool | dict[str, bool]) -> None:
+    if isinstance(visible, dict):
+        for name, spine in ax.spines.items():
+            spine.set_visible(bool(visible.get(name, True)))
+    else:
+        for spine in ax.spines.values():
+            spine.set_visible(bool(visible))
 
 
 def _capture_heatmap_state(
@@ -1405,6 +1398,7 @@ def _rebin_xy_series(
         return x, y
     if bin_width <= 0:
         raise ValueError("x_bin_width must be positive.")
+    _validate_section_width_request(x, bin_width=bin_width)
 
     mask = np.isfinite(x) & np.isfinite(y)
     if not np.any(mask):
@@ -1430,6 +1424,52 @@ def _rebin_xy_series(
         y_out[out_index] = _reduce_values(y_group, reducer=reducer)
 
     return x_out, y_out
+
+
+def _resolve_meaningful_source_bin_width(x: np.ndarray) -> float | None:
+    finite_x = np.asarray(x[np.isfinite(x)], dtype=float)
+    if finite_x.size < 2:
+        return None
+    unique_sorted = np.unique(np.sort(finite_x, kind="mergesort"))
+    if unique_sorted.size < 2:
+        return None
+    diffs = np.diff(unique_sorted)
+    if np.any(~np.isfinite(diffs)) or np.any(diffs <= 0.0):
+        return None
+    first = float(diffs[0])
+    if np.allclose(diffs, first, rtol=1.0e-6, atol=1.0e-12):
+        return first
+    return None
+
+
+def _validate_section_width_request(x: np.ndarray, *, bin_width: float) -> None:
+    if bin_width <= 0.0:
+        raise ValueError("x_bin_width must be positive.")
+
+    finite_x = np.asarray(x[np.isfinite(x)], dtype=float)
+    if finite_x.size == 0:
+        return
+
+    x_min = float(np.min(finite_x))
+    x_max = float(np.max(finite_x))
+    x_range = float(x_max - x_min)
+    if x_range <= 1.0e-12:
+        raise ValueError(
+            f"Section width {float(bin_width):.6g} cannot be applied because the available x-range "
+            f"is degenerate ({x_range:.6g})."
+        )
+    if float(bin_width) > x_range:
+        raise ValueError(
+            f"Section width {float(bin_width):.6g} is larger than the available x-range "
+            f"{x_range:.6g}. Use a width <= {x_range:.6g}."
+        )
+
+    source_bin_width = _resolve_meaningful_source_bin_width(finite_x)
+    if source_bin_width is not None and float(bin_width) + 1.0e-12 < source_bin_width:
+        raise ValueError(
+            f"Section width {float(bin_width):.6g} is smaller than the data bin width "
+            f"{source_bin_width:.6g}. Use a width >= {source_bin_width:.6g}."
+        )
 
 
 def _normalize_mode(value: str | None) -> str:
@@ -1833,11 +1873,21 @@ def _aggregate_grouped_prepared_series(
     if not prepared_members:
         return None, None, "Grouped series has no member series."
 
+    for prepared in prepared_members:
+        x_values = np.asarray(prepared.x, dtype=float)
+        y_values = np.asarray(prepared.y, dtype=float)
+        if x_values.shape != y_values.shape:
+            raise ValueError(
+                "Internal plotting error: grouped-series x/y point counts do not match."
+            )
+
     first_x = np.asarray(prepared_members[0].x, dtype=float)
     same_grid = True
     for prepared in prepared_members[1:]:
         candidate_x = np.asarray(prepared.x, dtype=float)
-        if candidate_x.shape != first_x.shape or not np.allclose(candidate_x, first_x, equal_nan=True):
+        if candidate_x.shape != first_x.shape or not np.allclose(
+            candidate_x, first_x, equal_nan=True
+        ):
             same_grid = False
             break
 
@@ -1867,11 +1917,23 @@ def _aggregate_grouped_prepared_series(
     per_series_bins: list[dict[int, float]] = []
     per_series_x_bins: list[dict[int, float]] = []
     seen_bins: set[int] = set()
-    for x_values, y_values in zip(global_x, global_y, strict=False):
+    if len(global_x) != len(global_y):
+        raise ValueError(
+            "Internal plotting error: grouped-series x/y collection counts do not match."
+        )
+    for x_values, y_values in zip(global_x, global_y):
+        if len(x_values) != len(y_values):
+            raise ValueError(
+                "Internal plotting error: grouped-series x/y point counts do not match."
+            )
         bin_index = np.floor((x_values - start) / float(x_bin_width)).astype(np.int64)
         bin_values: dict[int, list[float]] = {}
         bin_positions: dict[int, list[float]] = {}
-        for current_x, current_y, current_bin in zip(x_values, y_values, bin_index, strict=False):
+        if len(bin_index) != len(x_values):
+            raise ValueError(
+                "Internal plotting error: grouped-series bin index count does not match x values."
+            )
+        for current_x, current_y, current_bin in zip(x_values, y_values, bin_index):
             key = int(current_bin)
             bin_values.setdefault(key, []).append(float(current_y))
             bin_positions.setdefault(key, []).append(float(current_x))
@@ -1907,9 +1969,7 @@ def _aggregate_grouped_prepared_series(
             if current_bin in positions and np.isfinite(positions[current_bin])
         ]
         x_out.append(float(np.mean(np.asarray(x_candidates, dtype=float))))
-        y_out.append(
-            _reduce_group_stack(np.asarray(y_candidates, dtype=float), reducer=reducer)
-        )
+        y_out.append(_reduce_group_stack(np.asarray(y_candidates, dtype=float), reducer=reducer))
     return np.asarray(x_out, dtype=float), np.asarray(y_out, dtype=float), None
 
 
@@ -1977,6 +2037,16 @@ def plot_line_series(
     suppress_output_log: bool = False,
 ) -> Path | None:
     """Plot a single line using the shared LiNaK style."""
+    resolved_fit_config = None if fit_config is None else dict(fit_config)
+    if fit_enabled or fit_label not in {None, ""} or fit_show_in_legend is False:
+        resolved_fit_config = dict(resolved_fit_config or {})
+        if fit_enabled:
+            resolved_fit_config["fit_enabled"] = True
+        if fit_label not in {None, ""}:
+            resolved_fit_config["fit_label_override"] = str(fit_label)
+        if fit_show_in_legend is False:
+            resolved_fit_config["fit_show_in_legend"] = False
+
     return plot_multi_line_series(
         [np.asarray(x, dtype=float)],
         [np.asarray(y, dtype=float)],
@@ -1995,10 +2065,7 @@ def plot_line_series(
         series_show_in_legend=[bool(show_in_legend)],
         series_line_widths=[line_width_override],
         series_markers=[line_marker],
-        series_fit_configs=[fit_config],
-        series_fit_enabled=[fit_enabled],
-        series_fit_labels=[fit_label],
-        series_fit_show_in_legend=[fit_show_in_legend],
+        series_fit_configs=[resolved_fit_config],
         series_cumulative_configs=[cumulative_config],
         series_statistics_data=[series_statistics],
         series_raw_statistics=[raw_point_statistics],
@@ -2180,7 +2247,7 @@ def plot_heatmap_series(
         if title_visible is False:
             ax.set_title("", fontsize=style.title_font_size)
         else:
-            ax.set_title(repair_legacy_plot_text(title), fontsize=style.title_font_size)
+            ax.set_title(normalize_plot_text(title), fontsize=style.title_font_size)
         ax.tick_params(axis="both", labelsize=style.tick_font_size)
         resolved_tick_params_kwargs, tick_axis_hint, minor_ticks_mode = _extract_tick_controls(
             tick_params_kwargs
@@ -2309,9 +2376,6 @@ def plot_multi_line_series(
     series_line_widths: list[float | None] | None = None,
     series_markers: list[str | None] | None = None,
     series_fit_configs: list[dict[str, Any] | None] | None = None,
-    series_fit_enabled: list[bool] | None = None,
-    series_fit_labels: list[str | None] | None = None,
-    series_fit_show_in_legend: list[bool] | None = None,
     series_cumulative_configs: list[dict[str, Any] | None] | None = None,
     series_statistics_data: list[SeriesStatistics | None] | None = None,
     series_raw_statistics: list[bool] | None = None,
@@ -2375,13 +2439,11 @@ def plot_multi_line_series(
         )
     if series_show_in_legend is not None and len(series_show_in_legend) != source_count:
         raise ValueError(
-            "series_show_in_legend count must match the number of plotted series "
-            f"({source_count})."
+            f"series_show_in_legend count must match the number of plotted series ({source_count})."
         )
     if series_line_widths is not None and len(series_line_widths) != source_count:
         raise ValueError(
-            "series_line_widths count must match the number of plotted series "
-            f"({source_count})."
+            f"series_line_widths count must match the number of plotted series ({source_count})."
         )
     if series_markers is not None and len(series_markers) != source_count:
         raise ValueError(
@@ -2389,17 +2451,13 @@ def plot_multi_line_series(
         )
     if series_line_kwargs is not None and len(series_line_kwargs) != source_count:
         raise ValueError(
-            "series_line_kwargs count must match the number of plotted series "
-            f"({source_count})."
+            f"series_line_kwargs count must match the number of plotted series ({source_count})."
         )
 
     resolved_line_colors = resolve_series_colors(line_colors, series_count=source_count)
     resolved_fit_configs_source = resolve_series_fit_configs(
         series_count=source_count,
         series_fit_configs=series_fit_configs,
-        series_fit_enabled=series_fit_enabled,
-        series_fit_labels=series_fit_labels,
-        series_fit_show_in_legend=series_fit_show_in_legend,
     )
     resolved_cumulative_configs_source = _coerce_cumulative_config_list(
         source_count,
@@ -2421,13 +2479,9 @@ def plot_multi_line_series(
             ),
             "line_visible": True if series_enabled is None else bool(series_enabled[index]),
             "show_in_legend": (
-                True
-                if series_show_in_legend is None
-                else bool(series_show_in_legend[index])
+                True if series_show_in_legend is None else bool(series_show_in_legend[index])
             ),
-            "line_color": (
-                None if resolved_line_colors is None else resolved_line_colors[index]
-            ),
+            "line_color": (None if resolved_line_colors is None else resolved_line_colors[index]),
             "line_width": None if series_line_widths is None else series_line_widths[index],
             "marker": None if series_markers is None else series_markers[index],
             "line_kwargs": None if series_line_kwargs is None else series_line_kwargs[index],
@@ -2435,19 +2489,13 @@ def plot_multi_line_series(
             "cumulative_config": resolved_cumulative_configs_source[index],
             "error_config": resolved_error_configs_source[index],
             "normalization_mode": (
-                None
-                if series_normalization_modes is None
-                else series_normalization_modes[index]
+                None if series_normalization_modes is None else series_normalization_modes[index]
             ),
             "normalization_value": (
-                None
-                if series_normalization_values is None
-                else series_normalization_values[index]
+                None if series_normalization_values is None else series_normalization_values[index]
             ),
             "normalization_x_ref": (
-                None
-                if series_normalization_x_refs is None
-                else series_normalization_x_refs[index]
+                None if series_normalization_x_refs is None else series_normalization_x_refs[index]
             ),
         }
 
@@ -2507,27 +2555,6 @@ def plot_multi_line_series(
             series_count=1,
             series_fit_configs=[
                 fit_override if isinstance(fit_override, dict) else source_entry["fit_config"]
-            ],
-            series_fit_enabled=[
-                bool(
-                    current_override.get(
-                        "fit_enabled",
-                        source_entry["fit_config"].get("fit_enabled", False),
-                    )
-                )
-            ],
-            series_fit_labels=[
-                None
-                if current_override.get("fit_label_override") in {None, ""}
-                else str(current_override.get("fit_label_override"))
-            ],
-            series_fit_show_in_legend=[
-                bool(
-                    current_override.get(
-                        "fit_show_in_legend",
-                        source_entry["fit_config"].get("fit_show_in_legend", True),
-                    )
-                )
             ],
         )[0]
         cumulative_value = (
@@ -2627,15 +2654,6 @@ def plot_multi_line_series(
             fit_config = resolve_series_fit_configs(
                 series_count=1,
                 series_fit_configs=[fit_override if isinstance(fit_override, dict) else None],
-                series_fit_enabled=[bool(current_override.get("fit_enabled", False))],
-                series_fit_labels=[
-                    None
-                    if current_override.get("fit_label_override") in {None, ""}
-                    else str(current_override.get("fit_label_override"))
-                ],
-                series_fit_show_in_legend=[
-                    bool(current_override.get("fit_show_in_legend", True))
-                ],
             )[0]
             render_items.append(
                 {
@@ -2651,8 +2669,7 @@ def plot_multi_line_series(
                         if str(value).strip()
                     ],
                     "group_reducer": _resolve_reducer_name(
-                        str(descriptor.get("group_reducer") or "mean").strip().lower()
-                        or "mean"
+                        str(descriptor.get("group_reducer") or "mean").strip().lower() or "mean"
                     ),
                     "line_visible": bool(current_override.get("enabled", True)),
                     "show_in_legend": bool(current_override.get("show_in_legend", True)),
@@ -2729,7 +2746,11 @@ def plot_multi_line_series(
         series_normalization_values=[item["normalization_value"] for item in source_render_items],
         series_normalization_x_refs=[item["normalization_x_ref"] for item in source_render_items],
     )
-    for item, prepared in zip(source_render_items, prepared_series, strict=False):
+    if len(source_render_items) != len(prepared_series):
+        raise ValueError(
+            "Internal plotting error: prepared series count does not match render items."
+        )
+    for item, prepared in zip(source_render_items, prepared_series):
         item["prepared"] = prepared
     if len(source_render_items) > 1 and 0 < normalized_count < len(source_render_items):
         LOGGER.warning(
@@ -2846,9 +2867,13 @@ def plot_multi_line_series(
             if color_token:
                 kwargs["color"] = color_token
             if line_kwargs is not None:
-                kwargs.update(dict(line_kwargs))
+                resolved_line_kwargs = dict(line_kwargs)
+                resolved_line_kwargs.pop("label", None)
+                kwargs.update(resolved_line_kwargs)
             if item.get("line_kwargs") is not None:
-                kwargs.update(dict(item["line_kwargs"]))
+                resolved_item_line_kwargs = dict(item["line_kwargs"])
+                resolved_item_line_kwargs.pop("label", None)
+                kwargs.update(resolved_item_line_kwargs)
             artist = None
             if line_visible:
                 (artist,) = ax.plot(x_values, y_values, **kwargs)
@@ -2962,9 +2987,7 @@ def plot_multi_line_series(
                 error_summaries[fit_key] = {
                     "enabled": False if is_group else bool(prepared_item.error_config.enabled),
                     "status": (
-                        "disabled"
-                        if is_group or not line_visible
-                        else prepared_item.error_status
+                        "disabled" if is_group or not line_visible else prepared_item.error_status
                     ),
                     "statistics_mode": prepared_item.statistics_mode,
                     "provenance_family": _error_provenance_family(
@@ -3035,9 +3058,7 @@ def plot_multi_line_series(
             cumulative_config = item.get("cumulative_config")
             if isinstance(cumulative_config, SeriesCumulativeConfig) and cumulative_config.enabled:
                 cumulative_x, cumulative_y = _build_cumulative_series(x_values, y_values)
-                cumulative_label = (
-                    cumulative_config.label_override or f"{label} cumulative average"
-                )
+                cumulative_label = cumulative_config.label_override or f"{label} cumulative average"
                 cumulative_summaries[fit_key] = {
                     "enabled": True,
                     "status": "ok" if cumulative_x.size else "empty",
@@ -3057,9 +3078,7 @@ def plot_multi_line_series(
                         ),
                         "marker": "",
                         "label": (
-                            cumulative_label
-                            if cumulative_config.show_in_legend
-                            else "_nolegend_"
+                            cumulative_label if cumulative_config.show_in_legend else "_nolegend_"
                         ),
                     }
                     line_alpha = None if artist is None else artist.get_alpha()
@@ -3095,7 +3114,7 @@ def plot_multi_line_series(
         if title_visible is False:
             ax.set_title("", fontsize=style.title_font_size)
         else:
-            ax.set_title(repair_legacy_plot_text(title), fontsize=style.title_font_size)
+            ax.set_title(normalize_plot_text(title), fontsize=style.title_font_size)
         ax.tick_params(axis="both", labelsize=style.tick_font_size)
         resolved_tick_params_kwargs, tick_axis_hint, minor_ticks_mode = _extract_tick_controls(
             tick_params_kwargs

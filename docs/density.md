@@ -243,16 +243,21 @@ and shared surface metadata under `surface`, such as:
 - `surface.low_confidence_threshold`
 - `surface.effective_options`
 
-### Notes On Legacy / Reconstructed Fields
+### Current v1 Stored Fields
 
-LiNaK can still reconstruct or load some additional arrays in compatibility
-paths, such as:
+Current density HDF5 files store the v1 bin geometry as:
 
-- `bin_edges_A`
+- `bin_centers_A`
+- metadata `bin_width_A`
+
+LiNaK reconstructs uniform bin edges from those current v1 fields when loading.
+Files that only provide older bin-edge-style metadata are rejected and should be
+recomputed with the current package.
+
+Density files may also include optional current-schema arrays such as:
+
 - `counts_per_frame`
 - `entities_per_frame`
-
-But these are not part of the normal current write payload for density files.
 
 ## Important Assumptions And Limitations
 

@@ -49,7 +49,7 @@ def test_save_and_load_msd_profile(tmp_path):
 
 
 def test_load_msd_profile_rejects_csv_input(tmp_path):
-    csv = tmp_path / "legacy_msd.csv"
+    csv = tmp_path / "old_msd.csv"
     csv.write_text(
         "time_fs,time_ps,msd_A2\n0.0,0.0,0.0\n",
         encoding="utf-8",

@@ -138,6 +138,51 @@ def test_extract_fixed_atom_indices_from_cp2k_input_parses_list_ranges(tmp_path)
     assert fixed == (1, 2, 3, 7, 8, 9)
 
 
+def test_extract_fixed_atom_indices_from_cp2k_input_ignores_hash_comments(tmp_path):
+    cp2k_input = tmp_path / "input.inp"
+    cp2k_input.write_text(
+        "&MOTION\n"
+        "  &CONSTRAINT\n"
+        "    &FIXED_ATOMS\n"
+        "      LIST 646..789   # bottom 4 Au layers\n"
+        "    &END FIXED_ATOMS\n"
+        "  &END CONSTRAINT\n"
+        "&END MOTION\n",
+        encoding="utf-8",
+    )
+
+    fixed = extract_fixed_atom_indices_from_cp2k_input(cp2k_input)
+
+    assert fixed == tuple(range(645, 789))
+
+
+def test_extract_fixed_atom_indices_from_cp2k_input_ignores_bang_comments(tmp_path):
+    cp2k_input = tmp_path / "input.inp"
+    cp2k_input.write_text(
+        "&MOTION\n"
+        "  &CONSTRAINT\n"
+        "    &FIXED_ATOMS\n"
+        "      LIST 2..4 ! pinned slab atoms\n"
+        "    &END FIXED_ATOMS\n"
+        "  &END CONSTRAINT\n"
+        "&END MOTION\n",
+        encoding="utf-8",
+    )
+
+    fixed = extract_fixed_atom_indices_from_cp2k_input(cp2k_input)
+
+    assert fixed == (1, 2, 3)
+
+
+def test_extract_timestep_fs_from_cp2k_input_ignores_hash_comments(tmp_path):
+    cp2k_input = tmp_path / "input.inp"
+    cp2k_input.write_text("TIMESTEP [fs] 0.5 # saved every MD step\n", encoding="utf-8")
+
+    timestep_fs = extract_timestep_fs_from_cp2k_input(cp2k_input)
+
+    assert timestep_fs == pytest.approx(0.5)
+
+
 def test_find_unique_cp2k_input_requires_exactly_one_file(tmp_path):
     with pytest.raises(FileNotFoundError, match="No CP2K .inp file"):
         find_unique_cp2k_input(tmp_path)

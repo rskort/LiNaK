@@ -17,8 +17,7 @@ Supported inputs include:
 - LAMMPS and CP2K input scripts (`.lmp`, and `.inp`, respectively)
 - CP2K Hartree cube files for potential analysis
 
-LiNaK currently supports Python `3.9`, `3.11`, and `3.13`. 
-Other versions may work but are not guaranteed to be tested or supported.
+LiNaK currently supports Python `3.9`, `3.10`, `3.11`, `3.12`, and `3.13`.
 
 ## Installation
 
@@ -150,17 +149,15 @@ the stored `Water bulk`, `Fermi`, and `cSHE` series against `Record ID`, and
 each series can optionally add a linear-fit overlay from the `Series` page.
 
 The current Studio layout is organized as:
-- `Overview`
-- `Data`
-- `Series`
-- `Figure`
 - `Profiles`
-- `Export`
+- `Data`
+- `Layers`
+- `Figure`
 - `Advanced`
 
 Named plot profiles are stored inside the HDF5 file. The `Profiles` page is
 used to select, save, duplicate, rename, delete, import, and export those
-profiles. The `Export` page is only for writing rendered figure files.
+profiles. Figure export lives with the preview controls.
 
 For RDF and coordination HDF5 files, `Data > Profile Selection` filters which
 stored profile(s) are loaded from the HDF5. When multiple stored species
@@ -185,11 +182,23 @@ linak apply pbc pos.xyz --cell 17.887 15.491 59.671
 linak apply compress /path/to/output.out
 ```
 
-Converted `*.traj.h5` files store exact frame counts plus any simulation metadata
-LiNaK can resolve at conversion time, including cell lengths, timestep/stride,
-and fixed-atom constraints when the input declares them. Later `compute`
-commands prefer explicit CLI overrides first, then the stored trajectory-HDF5
-metadata, then explicit/auto-detected simulation inputs.
+Converted `*.traj.h5` files are LiNaK's canonical preprocessed trajectory
+format. They store exact frame counts plus any simulation metadata LiNaK can
+resolve at conversion time, including cell lengths, timestep/stride, and
+fixed-atom constraints when the input declares them. When a valid cell is
+available, conversion also writes PBC-wrapped coordinates and marks that
+preprocessing in the trajectory metadata. Conversion always attempts to cache
+the default frame-wise surface reference (`z`, `auto`, automatic surface
+elements); later surface-aware `compute` commands reuse that cache when their
+surface settings match and recompute only when the user requests different
+settings.
+
+Later `compute` commands prefer explicit CLI overrides first, then stored
+trajectory-HDF5 metadata, then explicit/auto-detected simulation inputs.
+
+LiNaK analysis HDF5 files use a strict development v1 schema. If an HDF5 file
+was written by an incompatible LiNaK version or is missing required v1 metadata,
+LiNaK rejects it and asks you to recompute the analysis with the current package.
 
 ### `linak hdf5`
 

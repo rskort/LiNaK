@@ -6,6 +6,8 @@ from linak.plot.plot_gui import (
     _TOOLTIPS,
     _annotation_display_text_from_entry,
     _annotation_fallback_title,
+    _border_setting_to_mode,
+    _border_spines_from_setting,
     _current_error_statistics_mode,
     _capture_series_list_view_anchor,
     _coerce_series_error_config,
@@ -203,33 +205,106 @@ def test_plot_settings_panel_includes_cumulative_controls_and_group_actions():
     assert '"Duplicate"' in source
     assert '"Add Group"' in source
     assert 'QGroupBox("Cumulative Average")' in source
-    assert 'self._series_cumulative_mode' in source
-    assert 'self._series_group_reducer' in source
-    assert 'self._series_group_members' in source
+    assert "self._series_cumulative_mode" in source
+    assert "self._series_group_reducer" in source
+    assert "self._series_group_members" in source
     assert '"group_reducer"' in source
     assert '"member_series_ids"' in source
+
+
+def test_plot_settings_panel_hides_inactive_optional_layer_details():
+    source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+
+    assert "self._series_error_detail_rows" in source
+    assert "self._set_rows_visible(self._series_error_detail_rows, error_active)" in source
+    assert "self._series_fit_detail_rows" in source
+    assert "self._set_form_row_visible(form, field, visible)" in source
+    assert "self._series_cumulative_detail_rows" in source
+    assert (
+        "self._set_rows_visible(self._series_cumulative_detail_rows, cumulative_active)" in source
+    )
+    assert "self._normalization_actions_widget" in source
+    assert "widget.setVisible(norm_enabled)" in source
+    assert 'norm_x_ref_enabled = norm_mode == "value_at_x"' in source
+
+
+def test_plot_settings_panel_hides_inactive_figure_data_and_annotation_details():
+    source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+
+    assert "self._title_detail_widgets" in source
+    assert "widget.setVisible(title_enabled)" in source
+    assert "widget.setVisible(x_label_enabled)" in source
+    assert "widget.setVisible(y_label_enabled)" in source
+    assert "self._set_rows_visible(self._legend_rows, legend_enabled)" in source
+    assert "self._set_rows_visible(self._grid_rows, grid_enabled)" in source
+    assert "self._set_rows_visible(self._ticks_rows, ticks_enabled)" in source
+    assert "self._set_rows_visible(self._marker_rows, markers_enabled)" in source
+    assert "self._set_rows_visible(self._colorbar_rows, colorbar_enabled)" in source
+    assert "self._set_form_row_visible(\n                    self._x_bin_reducer_row[0]" in source
+    assert "self._set_form_row_visible(\n                    self._y_bin_reducer_row[0]" in source
+    assert "self._annotation_common_detail_rows" in source
+    assert 'annotation_enabled and annotation_type == "text"' in source
+    assert "self._annotation_summary_group.setVisible(annotation_enabled)" in source
 
 
 def test_plot_settings_panel_uses_task_first_workspace_pages():
     source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
 
-    assert '_register_workspace_page("Data"' in source
-    assert '_register_workspace_page("Layers"' in source
-    assert '_register_workspace_page("Figure"' in source
-    assert '_register_workspace_page("Export"' in source
-    assert '_register_workspace_page("Profiles"' in source
-    assert '_register_workspace_page("Advanced"' in source
+    profiles_index = source.index('_register_workspace_page("Profiles"')
+    data_index = source.index('_register_workspace_page("Data"')
+    layers_index = source.index('_register_workspace_page("Layers"')
+    figure_index = source.index('_register_workspace_page("Figure"')
+    advanced_index = source.index('_register_workspace_page("Advanced"')
+
+    assert profiles_index < data_index < layers_index < figure_index < advanced_index
+    assert '_register_workspace_page("Export"' not in source
     assert '_register_workspace_page("Overview"' not in source
     assert '_register_workspace_page("Series"' not in source
 
 
-def test_plot_settings_panel_uses_compact_figure_tabs():
+def test_plot_settings_panel_flattens_figure_controls_into_one_scroll_page():
     source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
 
-    assert 'tabs.addTab(text_legend_tab, "Text && Legend")' in source
-    assert 'tabs.addTab(axes_limits_tab, "Axes && Limits")' in source
-    assert 'tabs.addTab(ticks_grid_tab, "Ticks && Grid")' in source
-    assert 'tabs.addTab(style_tab, "Style")' in source
+    assert 'QGroupBox("Text & Labels")' in source
+    assert 'QGroupBox("Legend")' in source
+    assert 'QGroupBox("Axes & Limits")' in source
+    assert 'QGroupBox("Ticks & Grid")' in source
+    assert 'QGroupBox("Line / Marker Style")' in source
+    assert 'QGroupBox("Heatmap / Colorbar")' in source
+    assert 'QGroupBox("Canvas / Font / Figure Size")' in source
+    assert 'tabs.addTab(text_legend_tab, "Text && Legend")' not in source
+    assert 'tabs.addTab(axes_limits_tab, "Axes && Limits")' not in source
+    assert 'tabs.addTab(ticks_grid_tab, "Ticks && Grid")' not in source
+    assert 'tabs.addTab(style_tab, "Style")' not in source
+
+
+def test_plot_settings_panel_moves_export_into_preview_toolbar():
+    source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+
+    assert 'transparent_label = QLabel("Transparent save")' in source
+    assert 'self._save_figure_button = QPushButton("Export Figure")' in source
+    assert "header_layout.addWidget(self._save_figure_button)" not in source
+
+
+def test_plot_settings_panel_keeps_reset_as_a_profile_action():
+    source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+
+    assert '_page_button("Reset Profile to Defaults", self._handle_reset)' in source
+    assert 'self._reset_button = QPushButton("Reset to Defaults")' not in source
+
+
+def test_plot_settings_panel_removes_preview_badge_strip_and_warning_banner():
+    source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+
+    assert "status_strip = QFrame(right_panel)" not in source
+    assert 'self._warning_summary_label = QLabel("")' not in source
+
+
+def test_plot_settings_panel_gives_annotation_list_a_dedicated_object_name():
+    source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+
+    assert 'self.annotation_list.setObjectName("annotationList")' in source
+    assert "QListWidget#annotationList::item" in source
 
 
 def test_plot_settings_panel_uses_cumulative_child_ids_in_series_list():
@@ -474,11 +549,7 @@ def test_restore_series_list_anchor_scroll_value_falls_back_to_previous_scroll_w
 def test_derive_synced_field_locks_prefers_explicit_metadata():
     locks = _derive_synced_field_locks(
         {
-            "_gui_locked_fields": {
-                "x_label": True,
-                "y_label": False,
-                "ignored": True,
-            },
+            "_gui_sync_modes": {"x_label": "manual", "y_label": "auto"},
             "x_label": None,
             "y_label": "Density",
         }
@@ -525,6 +596,30 @@ def test_extract_limit_rounds_auto_values_for_gui_display():
 def test_toggle_to_mode_materializes_auto_to_effective_default():
     assert _toggle_to_mode(None, auto_mode="on") == "on"
     assert _toggle_to_mode(None, auto_mode="off") == "off"
+
+
+def test_border_setting_to_mode_handles_bool_and_dict():
+    assert _border_setting_to_mode(True) == "on"
+    assert _border_setting_to_mode(None) == "on"
+    assert _border_setting_to_mode(False) == "off"
+    assert _border_setting_to_mode({"left": True, "right": False}) == "custom"
+
+
+def test_border_spines_from_setting_extracts_per_side():
+    result = _border_spines_from_setting({"left": False, "right": True, "top": True, "bottom": False})
+    assert result == {"left": False, "right": True, "top": True, "bottom": False}
+
+    result_false = _border_spines_from_setting(False)
+    assert all(not v for v in result_false.values())
+    assert set(result_false.keys()) == {"left", "right", "top", "bottom"}
+
+    result_true = _border_spines_from_setting(True)
+    assert all(v for v in result_true.values())
+
+    # Missing keys default to True
+    result_partial = _border_spines_from_setting({"left": False})
+    assert result_partial["left"] is False
+    assert result_partial["right"] is True
 
 
 def test_extract_dict_mode_materializes_missing_bool_to_effective_default():

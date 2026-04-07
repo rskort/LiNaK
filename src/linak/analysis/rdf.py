@@ -80,6 +80,10 @@ class RDFProfile:
     g_r: np.ndarray
     n_frames: int
     series_statistics: dict[str, SeriesStatistics] | None = None
+    atom_indices_a: np.ndarray | None = None
+    atom_indices_b: np.ndarray | None = None
+    selection_kind_a: str = "species"
+    selection_kind_b: str = "species"
 
 
 @dataclass(frozen=True)
@@ -92,6 +96,17 @@ class _RDFSelectionCache:
     indices_b: np.ndarray
     count_a: int
     count_b: int
+    overlap_count: int
+
+
+@dataclass(frozen=True)
+class _RDFResolvedSelector:
+    """Normalized one-side RDF selector used by compute and persistence layers."""
+
+    selection_kind: str
+    label: str
+    species_label: str | None
+    atom_indices: np.ndarray | None
 
 
 @dataclass(frozen=True)
@@ -133,6 +148,7 @@ class _RDFOrthorhombicConfig:
     same_selection: bool
     count_a: int
     count_b: int
+    overlap_count: int
     indices_a: np.ndarray
     indices_b: np.ndarray
     self_pair_rows: np.ndarray
@@ -324,6 +340,61 @@ def _normalize_species(species: str | None) -> str:
         return "ALL"
 
     return species[0].upper() + species[1:].lower()
+
+
+def _format_atom_selector_label(atom_indices: Sequence[int] | np.ndarray) -> str:
+    values = [int(value) for value in np.asarray(atom_indices, dtype=int).tolist()]
+    if not values:
+        return "atoms[]"
+
+    chunks: list[str] = []
+    start = values[0]
+    end = values[0]
+    for value in values[1:]:
+        if value == end + 1:
+            end = value
+            continue
+        chunks.append(str(start) if start == end else f"{start}..{end}")
+        start = value
+        end = value
+    chunks.append(str(start) if start == end else f"{start}..{end}")
+    return f"atoms[{','.join(chunks)}]"
+
+
+def _resolve_rdf_selector(
+    *,
+    species: str | None,
+    atom_indices: Sequence[int] | np.ndarray | None,
+) -> _RDFResolvedSelector:
+    if atom_indices is not None:
+        raw_indices = np.asarray(atom_indices, dtype=int).reshape(-1)
+        ordered_indices: list[int] = []
+        seen: set[int] = set()
+        for raw_value in raw_indices.tolist():
+            value = int(raw_value)
+            if value in seen:
+                continue
+            seen.add(value)
+            ordered_indices.append(value)
+        resolved_indices = np.asarray(ordered_indices, dtype=int)
+        if resolved_indices.size == 0:
+            raise ValueError("RDF atom-index selection produced no atoms.")
+        if np.any(resolved_indices < 0):
+            raise ValueError("RDF atom-index selections must use indices >= 0.")
+        return _RDFResolvedSelector(
+            selection_kind="atoms",
+            label=_format_atom_selector_label(resolved_indices),
+            species_label=None,
+            atom_indices=np.asarray(resolved_indices, dtype=int),
+        )
+
+    normalized_species = _normalize_species(species)
+    return _RDFResolvedSelector(
+        selection_kind="species",
+        label=normalized_species,
+        species_label=normalized_species,
+        atom_indices=None,
+    )
 
 
 def _available_element_species(frames: list[Atoms]) -> list[str]:
@@ -568,6 +639,7 @@ def _resolve_rdf_orthorhombic_selection_cache(
         indices_b=indices,
         count_a=int(atom_count),
         count_b=int(atom_count),
+        overlap_count=int(atom_count),
     )
 
 
@@ -921,12 +993,10 @@ def _resolve_rdf_expected_counts_from_volumes(
     config: _RDFOrthorhombicConfig,
 ) -> np.ndarray:
     """Return accumulated expected RDF counts for one chunk of frames."""
-    neighbor_count = config.count_b - 1 if config.same_selection else config.count_b
-    if config.count_a <= 0 or neighbor_count <= 0:
+    valid_ordered_pair_count = (config.count_a * config.count_b) - config.overlap_count
+    if config.count_a <= 0 or config.count_b <= 0 or valid_ordered_pair_count <= 0:
         return np.zeros_like(config.shell_volumes, dtype=float)
-    scale = float(config.count_a * neighbor_count) * float(
-        np.sum(1.0 / np.asarray(volumes, dtype=float))
-    )
+    scale = float(valid_ordered_pair_count) * float(np.sum(1.0 / np.asarray(volumes, dtype=float)))
     return np.asarray(config.shell_volumes, dtype=float) * scale
 
 
@@ -936,10 +1006,10 @@ def _resolve_rdf_expected_counts_from_volume(
     config: _RDFOrthorhombicConfig,
 ) -> np.ndarray:
     """Return expected RDF counts for one orthorhombic frame volume."""
-    neighbor_count = config.count_b - 1 if config.same_selection else config.count_b
-    if config.count_a <= 0 or neighbor_count <= 0:
+    valid_ordered_pair_count = (config.count_a * config.count_b) - config.overlap_count
+    if config.count_a <= 0 or config.count_b <= 0 or valid_ordered_pair_count <= 0:
         return np.zeros_like(config.shell_volumes, dtype=float)
-    scale = float(config.count_a * neighbor_count) / float(volume)
+    scale = float(valid_ordered_pair_count) / float(volume)
     return np.asarray(config.shell_volumes, dtype=float) * scale
 
 
@@ -1148,6 +1218,7 @@ def _resolve_rdf_pairwise_jobs(
                     same_selection=same_selection,
                     count_a=int(selection_cache.count_a),
                     count_b=int(selection_cache.count_b),
+                    overlap_count=int(selection_cache.overlap_count),
                     indices_a=np.asarray(selection_cache.indices_a, dtype=int),
                     indices_b=np.asarray(selection_cache.indices_b, dtype=int),
                     self_pair_rows=self_pair_rows,
@@ -1471,11 +1542,13 @@ def _resolve_rdf_selection_cache(
     *,
     label_a: str,
     label_b: str,
+    atom_indices_a: np.ndarray | None = None,
+    atom_indices_b: np.ndarray | None = None,
 ) -> _RDFSelectionCache | None:
-    """Reuse species selections when atom identities remain fixed across all frames."""
+    """Reuse RDF selections when atom identities remain fixed across all frames."""
     if not frames:
         return None
-    if label_a == "ALL" and label_b == "ALL":
+    if atom_indices_a is None and atom_indices_b is None and label_a == "ALL" and label_b == "ALL":
         return None
 
     reference_numbers = np.asarray(frames[0].numbers, dtype=int)
@@ -1484,6 +1557,11 @@ def _resolve_rdf_selection_cache(
         if current_numbers.shape != reference_numbers.shape or not np.array_equal(
             current_numbers, reference_numbers
         ):
+            if atom_indices_a is not None or atom_indices_b is not None:
+                raise ValueError(
+                    "Explicit RDF atom-index selections require stable atom identities/order "
+                    f"across frames; mismatch detected at frame {frame_index}."
+                )
             LOGGER.warning(
                 "RDF atom identities/order changed at frame %d; "
                 "falling back to per-frame species selection.",
@@ -1491,23 +1569,45 @@ def _resolve_rdf_selection_cache(
             )
             return None
 
-    mask_a = _select_mask(reference_numbers, label_a)
-    mask_b = _select_mask(reference_numbers, label_b)
-    indices_a = np.flatnonzero(mask_a)
-    indices_b = np.flatnonzero(mask_b)
+    if atom_indices_a is not None:
+        indices_a = np.asarray(atom_indices_a, dtype=int).reshape(-1)
+        if np.any(indices_a >= reference_numbers.size):
+            raise ValueError(
+                f"RDF atom-index selection A contains out-of-range indices for {reference_numbers.size} atoms."
+            )
+        mask_a = np.zeros(reference_numbers.size, dtype=bool)
+        mask_a[indices_a] = True
+    else:
+        mask_a = _select_mask(reference_numbers, label_a)
+        indices_a = np.flatnonzero(mask_a)
+
+    if atom_indices_b is not None:
+        indices_b = np.asarray(atom_indices_b, dtype=int).reshape(-1)
+        if np.any(indices_b >= reference_numbers.size):
+            raise ValueError(
+                f"RDF atom-index selection B contains out-of-range indices for {reference_numbers.size} atoms."
+            )
+        mask_b = np.zeros(reference_numbers.size, dtype=bool)
+        mask_b[indices_b] = True
+    else:
+        mask_b = _select_mask(reference_numbers, label_b)
+        indices_b = np.flatnonzero(mask_b)
+
     count_a = int(indices_a.size)
     count_b = int(indices_b.size)
     if count_a == 0 or count_b == 0:
         raise ValueError(
             f"RDF selection produced no atoms in frame 0 (species_a={label_a}, species_b={label_b})."
         )
+    overlap_count = int(np.intersect1d(indices_a, indices_b, assume_unique=True).size)
     return _RDFSelectionCache(
         mask_a=mask_a,
         mask_b=mask_b,
-        indices_a=indices_a,
-        indices_b=indices_b,
+        indices_a=np.asarray(indices_a, dtype=int),
+        indices_b=np.asarray(indices_b, dtype=int),
         count_a=count_a,
         count_b=count_b,
+        overlap_count=overlap_count,
     )
 
 
@@ -1548,6 +1648,7 @@ def _resolve_rdf_selection_caches_by_species(
             indices_b=indices,
             count_a=count,
             count_b=count,
+            overlap_count=count,
         )
     return caches
 
@@ -1568,6 +1669,9 @@ def _build_rdf_pair_selection_cache(
         indices_b=np.asarray(cache_b.indices_a, dtype=int),
         count_a=int(cache_a.count_a),
         count_b=int(cache_b.count_a),
+        overlap_count=int(
+            np.intersect1d(cache_a.indices_a, cache_b.indices_a, assume_unique=True).size
+        ),
     )
 
 
@@ -1615,9 +1719,8 @@ def _compute_rdf_frame_contribution(
                 & (sampled_distances <= r_max)
             ]
         counts = _histogram_rdf_distances(sampled_distances, bin_edges=bin_edges)
-        # Both observed and expected counts use ordered pairs: i->j and j->i are distinct.
-        rho_b = (n_atoms - 1) / volume
-        expected = (n_atoms * rho_b) * shell_volumes
+        valid_ordered_pair_count = n_atoms * n_atoms - n_atoms
+        expected = (float(valid_ordered_pair_count) / volume) * shell_volumes
         return counts, expected
 
     if selection_cache is not None:
@@ -1627,6 +1730,7 @@ def _compute_rdf_frame_contribution(
         indices_b = selection_cache.indices_b
         count_a = selection_cache.count_a
         count_b = selection_cache.count_b
+        overlap_count = selection_cache.overlap_count
     else:
         mask_a = _select_mask(numbers, label_a)
         mask_b = _select_mask(numbers, label_b)
@@ -1634,6 +1738,7 @@ def _compute_rdf_frame_contribution(
         indices_b = np.flatnonzero(mask_b)
         count_a = int(indices_a.size)
         count_b = int(indices_b.size)
+        overlap_count = int(np.intersect1d(indices_a, indices_b, assume_unique=True).size)
     if count_a == 0 or count_b == 0:
         raise ValueError(
             f"RDF selection produced no atoms in frame {frame_index} "
@@ -1677,12 +1782,8 @@ def _compute_rdf_frame_contribution(
             )
 
     counts = _histogram_rdf_distances(sampled_distances, bin_edges=bin_edges)
-    # Expected counts must match the same ordered-pair convention used above.
-    if same_selection:
-        rho_b = (count_b - 1) / volume
-    else:
-        rho_b = count_b / volume
-    expected = (count_a * rho_b) * shell_volumes
+    valid_ordered_pair_count = (count_a * count_b) - overlap_count
+    expected = (float(valid_ordered_pair_count) / volume) * shell_volumes
     return counts, expected
 
 
@@ -1740,7 +1841,7 @@ def _compute_rdf_generic_backend(
     chunk_size: int,
     progress: Any,
 ) -> tuple[np.ndarray, np.ndarray, _RDFStatisticsMoments | None]:
-    """Accumulate RDF contributions with the legacy exact framewise backend."""
+    """Accumulate RDF contributions with the exact framewise backend."""
     counts_accum = np.zeros(config.bin_edges.size - 1, dtype=float)
     expected_accum = np.zeros_like(counts_accum)
     moments = (
@@ -1906,6 +2007,8 @@ def compute_rdf(
     frames: list[Atoms],
     species_a: str | None = "all",
     species_b: str | None = None,
+    atom_indices_a: Sequence[int] | np.ndarray | None = None,
+    atom_indices_b: Sequence[int] | np.ndarray | None = None,
     r_max: float | None = None,
     bin_width: float = 0.05,
     threads: int | None = None,
@@ -1916,8 +2019,13 @@ def compute_rdf(
         raise ValueError("At least one trajectory frame is required.")
 
     ensure_positive("bin_width", bin_width)
-    label_a = _normalize_species(species_a)
-    label_b = _normalize_species(species_b if species_b is not None else species_a)
+    selector_a = _resolve_rdf_selector(species=species_a, atom_indices=atom_indices_a)
+    selector_b = _resolve_rdf_selector(
+        species=species_b if species_b is not None else species_a,
+        atom_indices=atom_indices_b if atom_indices_b is not None else atom_indices_a,
+    )
+    label_a = str(selector_a.label)
+    label_b = str(selector_b.label)
     strategy_override = _normalize_strategy_override(_strategy_override)
 
     requested_bin_width = float(bin_width)
@@ -1959,7 +2067,13 @@ def compute_rdf(
     max_sphere_volume = (4.0 / 3.0) * np.pi * (r_max**3)
     worker_count = _resolve_rdf_worker_count(threads, len(frames))
     block_index_by_frame = _resolve_rdf_block_index_by_frame(len(frames))
-    selection_cache = _resolve_rdf_selection_cache(frames, label_a=label_a, label_b=label_b)
+    selection_cache = _resolve_rdf_selection_cache(
+        frames,
+        label_a=label_a,
+        label_b=label_b,
+        atom_indices_a=selector_a.atom_indices,
+        atom_indices_b=selector_b.atom_indices,
+    )
     backend_resolution = _resolve_rdf_backend(
         frames,
         label_a=label_a,
@@ -1987,21 +2101,21 @@ def compute_rdf(
     ) = None
     if backend_resolution.backend == _RDF_BACKEND_GENERIC:
         if backend_resolution.use_parallel:
-            LOGGER.info(
+            LOGGER.debug(
                 "Using RDF backend: generic framewise fallback "
                 "(workers=%d, chunk_size=%d frame(s)).",
                 backend_resolution.worker_count,
                 backend_resolution.chunk_size,
             )
         else:
-            LOGGER.info("Using RDF backend: generic framewise fallback.")
+            LOGGER.debug("Using RDF backend: generic framewise fallback.")
     else:
         backend_label = (
             "dense orthorhombic chunked"
             if backend_resolution.backend == _RDF_BACKEND_DENSE
             else "sparse orthorhombic cutoff"
         )
-        LOGGER.info(
+        LOGGER.debug(
             "Using RDF backend: %s (workers=%d, chunk_size=%d frame(s), pair_count=%d).",
             backend_label,
             backend_resolution.worker_count,
@@ -2027,6 +2141,7 @@ def compute_rdf(
             same_selection=same_selection,
             count_a=int(orth_selection.count_a),
             count_b=int(orth_selection.count_b),
+            overlap_count=int(orth_selection.overlap_count),
             indices_a=np.asarray(orth_selection.indices_a, dtype=int),
             indices_b=np.asarray(orth_selection.indices_b, dtype=int),
             self_pair_rows=self_pair_rows,
@@ -2098,6 +2213,14 @@ def compute_rdf(
         g_r=g_r,
         n_frames=len(frames),
         series_statistics={"g_r": statistics},
+        atom_indices_a=None
+        if selector_a.atom_indices is None
+        else np.asarray(selector_a.atom_indices, dtype=int),
+        atom_indices_b=None
+        if selector_b.atom_indices is None
+        else np.asarray(selector_b.atom_indices, dtype=int),
+        selection_kind_a=str(selector_a.selection_kind),
+        selection_kind_b=str(selector_b.selection_kind),
     )
 
 
@@ -2204,6 +2327,8 @@ def _rdf_profile_hdf5_payload(profile: RDFProfile) -> dict[str, Any]:
     metadata_payload = {
         "species_a": profile.species_a,
         "species_b": profile.species_b,
+        "selection_kind_a": str(profile.selection_kind_a),
+        "selection_kind_b": str(profile.selection_kind_b),
         "n_frames": profile.n_frames,
         "bin_width_A": bin_width,
     }
@@ -2218,6 +2343,16 @@ def _rdf_profile_hdf5_payload(profile: RDFProfile) -> dict[str, Any]:
         "datasets": {
             "bin_centers_A": np.asarray(profile.bin_centers, dtype=float),
             "g_r": np.asarray(profile.g_r, dtype=float),
+            **(
+                {}
+                if profile.atom_indices_a is None
+                else {"atom_indices_a": np.asarray(profile.atom_indices_a, dtype=int)}
+            ),
+            **(
+                {}
+                if profile.atom_indices_b is None
+                else {"atom_indices_b": np.asarray(profile.atom_indices_b, dtype=int)}
+            ),
             **statistics_payload_from_series_map(profile.series_statistics),
         },
         "metadata": build_profile_metadata(
@@ -2340,6 +2475,8 @@ def _load_rdf_profiles_from_payloads(
 
         resolved_species_a = str(metadata.get("species_a", "")).strip() or "UNKNOWN"
         resolved_species_b = str(metadata.get("species_b", "")).strip() or resolved_species_a
+        selection_kind_a = str(metadata.get("selection_kind_a", "species") or "species")
+        selection_kind_b = str(metadata.get("selection_kind_b", "species") or "species")
         if not _rdf_pair_matches_request(
             stored_species_a=resolved_species_a,
             stored_species_b=resolved_species_b,
@@ -2349,25 +2486,30 @@ def _load_rdf_profiles_from_payloads(
             continue
 
         bin_centers = np.asarray(datasets["bin_centers_A"], dtype=float)
-        if "bin_edges_A" in datasets:
-            bin_edges = np.asarray(datasets["bin_edges_A"], dtype=float)
-        else:
-            bin_width = resolve_uniform_bin_width_for_load(
-                metadata=metadata,
-                bin_centers=bin_centers,
-                source_path=source_path,
-                analysis_name="RDF",
-            )
-            bin_edges = reconstruct_uniform_bin_edges_from_centers(
-                bin_centers,
-                bin_width=bin_width,
-            )
+        bin_width = resolve_uniform_bin_width_for_load(
+            metadata=metadata,
+            bin_centers=bin_centers,
+            source_path=source_path,
+            analysis_name="RDF",
+        )
+        bin_edges = reconstruct_uniform_bin_edges_from_centers(
+            bin_centers,
+            bin_width=bin_width,
+        )
         if bin_edges.size != bin_centers.size + 1:
-            raise ValueError(
-                f"RDF HDF5 '{source_path}' has incompatible bin_edges_A/bin_centers_A sizes."
-            )
+            raise ValueError(f"RDF HDF5 '{source_path}' has incompatible bin geometry.")
         g_r = np.asarray(datasets["g_r"], dtype=float)
         n_frames = int(metadata.get("n_frames", 0))
+        atom_indices_a = (
+            None
+            if "atom_indices_a" not in datasets
+            else np.asarray(datasets["atom_indices_a"], dtype=int)
+        )
+        atom_indices_b = (
+            None
+            if "atom_indices_b" not in datasets
+            else np.asarray(datasets["atom_indices_b"], dtype=int)
+        )
 
         profile = RDFProfile(
             species_a=resolved_species_a,
@@ -2380,6 +2522,10 @@ def _load_rdf_profiles_from_payloads(
                 datasets,
                 dataset_names=("g_r",),
             ),
+            atom_indices_a=atom_indices_a,
+            atom_indices_b=atom_indices_b,
+            selection_kind_a=selection_kind_a,
+            selection_kind_b=selection_kind_b,
         )
         if _rdf_pair_matches_exact_request(
             stored_species_a=resolved_species_a,
@@ -2401,6 +2547,10 @@ def _load_rdf_profiles_from_payloads(
                         datasets,
                         dataset_names=("g_r",),
                     ),
+                    atom_indices_a=atom_indices_a,
+                    atom_indices_b=atom_indices_b,
+                    selection_kind_a=selection_kind_a,
+                    selection_kind_b=selection_kind_b,
                 )
             )
         else:
@@ -2474,9 +2624,6 @@ def plot_rdf_profile(
     series_line_widths: list[float | None] | None = None,
     series_markers: list[str | None] | None = None,
     series_fit_configs: list[dict[str, Any] | None] | None = None,
-    series_fit_enabled: list[bool] | None = None,
-    series_fit_labels: list[str | None] | None = None,
-    series_fit_show_in_legend: list[bool] | None = None,
     cumulative_config: dict[str, Any] | None = None,
     series_normalization_modes: list[str | None] | None = None,
     series_normalization_values: list[float | None] | None = None,
@@ -2531,13 +2678,6 @@ def plot_rdf_profile(
         line_visible=single_series.line_visible,
         show_in_legend=True if not series_show_in_legend else bool(series_show_in_legend[0]),
         fit_config=None if not series_fit_configs else series_fit_configs[0],
-        fit_enabled=True if series_fit_enabled and bool(series_fit_enabled[0]) else False,
-        fit_label=(
-            None if not series_fit_labels or not series_fit_labels[0] else str(series_fit_labels[0])
-        ),
-        fit_show_in_legend=(
-            True if not series_fit_show_in_legend else bool(series_fit_show_in_legend[0])
-        ),
         cumulative_config=cumulative_config,
         series_statistics=None
         if profile.series_statistics is None
@@ -2617,9 +2757,6 @@ def plot_rdf_profiles(
     series_line_widths: list[float | None] | None = None,
     series_markers: list[str | None] | None = None,
     series_fit_configs: list[dict[str, Any] | None] | None = None,
-    series_fit_enabled: list[bool] | None = None,
-    series_fit_labels: list[str | None] | None = None,
-    series_fit_show_in_legend: list[bool] | None = None,
     series_cumulative_configs: list[dict[str, Any] | None] | None = None,
     render_series_descriptors: list[dict[str, Any]] | None = None,
     series_overrides_by_id: dict[str, dict[str, Any]] | None = None,
@@ -2732,9 +2869,6 @@ def plot_rdf_profiles(
         series_line_widths=series_line_widths,
         series_markers=series_markers,
         series_fit_configs=series_fit_configs,
-        series_fit_enabled=series_fit_enabled,
-        series_fit_labels=series_fit_labels,
-        series_fit_show_in_legend=series_fit_show_in_legend,
         series_cumulative_configs=series_cumulative_configs,
         series_error_configs=series_error_configs,
         series_statistics_data=[

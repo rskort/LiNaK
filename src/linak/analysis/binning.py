@@ -31,45 +31,34 @@ def resolve_uniform_bin_width_for_load(
     source_path: Path,
     analysis_name: str,
 ) -> float:
-    """Resolve bin width from metadata or infer it from equally spaced centers."""
+    """Resolve the required v1 bin width metadata for a binned profile."""
     raw = metadata.get("bin_width_A")
-    if raw is not None:
-        try:
-            raw_value: Any = raw
-            width = float(raw_value)
-        except (TypeError, ValueError) as exc:
+    if raw is None:
+        raise ValueError(
+            f"{analysis_name} HDF5 '{source_path}' is missing required v1 metadata "
+            "bin_width_A. The HDF5 file is either corrupted or originates from the wrong "
+            "LiNaK version. Check which LiNaK version generated the file and recompute with "
+            "the current LiNaK version if necessary."
+        )
+    try:
+        raw_value: Any = raw
+        width = float(raw_value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"{analysis_name} HDF5 '{source_path}' has invalid metadata value bin_width_A={raw!r}."
+        ) from exc
+    if not np.isfinite(width) or width <= 0.0:
+        raise ValueError(
+            f"{analysis_name} HDF5 '{source_path}' has non-positive bin_width_A={raw!r}."
+        )
+    if bin_centers.size > 1:
+        center_steps = np.diff(bin_centers)
+        if not np.allclose(center_steps, width, rtol=1.0e-6, atol=1.0e-9):
             raise ValueError(
-                f"{analysis_name} HDF5 '{source_path}' has invalid metadata value "
-                f"bin_width_A={raw!r}."
-            ) from exc
-        if not np.isfinite(width) or width <= 0.0:
-            raise ValueError(
-                f"{analysis_name} HDF5 '{source_path}' has non-positive bin_width_A={raw!r}."
+                f"{analysis_name} HDF5 '{source_path}' has inconsistent "
+                "bin_centers_A and bin_width_A."
             )
-        if bin_centers.size > 1:
-            center_steps = np.diff(bin_centers)
-            if not np.allclose(center_steps, width, rtol=1.0e-6, atol=1.0e-9):
-                raise ValueError(
-                    f"{analysis_name} HDF5 '{source_path}' has inconsistent "
-                    "bin_centers_A and bin_width_A."
-                )
-        return width
-
-    if bin_centers.size <= 1:
-        raise ValueError(
-            f"{analysis_name} HDF5 '{source_path}' is missing bin_edges_A and bin_width_A; "
-            "cannot reconstruct single-bin edges."
-        )
-    center_steps = np.diff(bin_centers)
-    if not np.all(np.isfinite(center_steps)) or np.any(center_steps <= 0.0):
-        raise ValueError(f"{analysis_name} HDF5 '{source_path}' has invalid bin_centers_A spacing.")
-    inferred = float(center_steps[0])
-    if not np.allclose(center_steps, inferred, rtol=1.0e-6, atol=1.0e-9):
-        raise ValueError(
-            f"{analysis_name} HDF5 '{source_path}' is missing bin_edges_A/bin_width_A and has "
-            "non-uniform bin_centers_A spacing."
-        )
-    return inferred
+    return width
 
 
 def reconstruct_uniform_bin_edges_from_centers(
