@@ -18,20 +18,18 @@ from linak.plot.plot_gui import (
     _error_supported_for_view,
     _font_size_placeholder_text,
     _inferred_available_error_stats,
-    _derive_synced_field_locks,
+    _derive_synced_field_modes,
     _derive_warning_messages,
     _preview_button_enabled,
     _extract_limit,
     _extract_dict_mode,
     _format_series_display_text,
-    _lock_to_sync_mode,
     _partition_series_ids_by_enabled_state,
     _resolve_error_stat_for_available,
     _resolve_asset_path,
     _resolve_series_id_order,
     _resolve_series_line_colors,
     _restore_series_list_anchor_scroll_value,
-    _sync_mode_to_lock,
     _toggle_to_mode,
     _without_new_profile_series_overrides,
     _without_series_specific_settings,
@@ -237,7 +235,8 @@ def test_plot_settings_panel_hides_inactive_figure_data_and_annotation_details()
     assert "widget.setVisible(y_label_enabled)" in source
     assert "self._set_rows_visible(self._legend_rows, legend_enabled)" in source
     assert "self._set_rows_visible(self._grid_rows, grid_enabled)" in source
-    assert "self._set_rows_visible(self._ticks_rows, ticks_enabled)" in source
+    assert "self._set_rows_visible(self._x_ticks_rows, x_ticks_enabled)" in source
+    assert "self._set_rows_visible(self._y_ticks_rows, y_ticks_enabled)" in source
     assert "self._set_rows_visible(self._marker_rows, markers_enabled)" in source
     assert "self._set_rows_visible(self._colorbar_rows, colorbar_enabled)" in source
     assert "self._set_form_row_visible(\n                    self._x_bin_reducer_row[0]" in source
@@ -265,25 +264,63 @@ def test_plot_settings_panel_uses_task_first_workspace_pages():
 def test_plot_settings_panel_flattens_figure_controls_into_one_scroll_page():
     source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
 
-    assert 'QGroupBox("Text & Labels")' in source
+    assert 'QGroupBox("Canvas & Typography")' in source
+    assert 'QGroupBox("Lines & Markers")' in source
+    assert 'QGroupBox("Axes, Ticks & Grid")' in source
     assert 'QGroupBox("Legend")' in source
-    assert 'QGroupBox("Axes & Limits")' in source
-    assert 'QGroupBox("Ticks & Grid")' in source
-    assert 'QGroupBox("Line / Marker Style")' in source
-    assert 'QGroupBox("Heatmap / Colorbar")' in source
-    assert 'QGroupBox("Canvas / Font / Figure Size")' in source
+    assert 'QGroupBox("Heatmap & Colorbar")' in source
+    assert 'QGroupBox("Grid")' in source
+    assert 'QGroupBox("Border")' in source
     assert 'tabs.addTab(text_legend_tab, "Text && Legend")' not in source
     assert 'tabs.addTab(axes_limits_tab, "Axes && Limits")' not in source
     assert 'tabs.addTab(ticks_grid_tab, "Ticks && Grid")' not in source
     assert 'tabs.addTab(style_tab, "Style")' not in source
 
 
-def test_plot_settings_panel_moves_export_into_preview_toolbar():
+def test_plot_settings_panel_keeps_export_in_preview_toolbar_without_transparent_save():
     source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
 
-    assert 'transparent_label = QLabel("Transparent save")' in source
-    assert 'self._save_figure_button = QPushButton("Export Figure")' in source
+    assert 'transparent_label = QLabel("Transparent save")' not in source
+    assert "self.transparent_mode" not in source
+    assert 'self.figure_alpha = self._bounded_float_line("0.0 - 1.0"' in source
+    assert 'self.save_figure_button = QPushButton("Export Figure")' in source
     assert "header_layout.addWidget(self._save_figure_button)" not in source
+
+
+def test_plot_settings_panel_supports_detachable_preview_window():
+    source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+
+    assert "class _PreviewPane(QFrame)" in source
+    assert "class _DetachedPreviewWindow(QMainWindow)" in source
+    assert 'self.detach_button = QPushButton("Detach Preview")' in source
+    assert 'self.dock_button = QPushButton("Dock Back")' in source
+    assert 'self.setWindowTitle("LiNaK Figure Preview")' in source
+    assert "self._embedded_preview_pane.setVisible(False)" in source
+    assert "detached_window.close_from_dock()" in source
+    assert "QTimer.singleShot(0, self._on_dock_requested)" in source
+
+
+def test_plot_settings_panel_keeps_status_outside_hidden_preview_panel():
+    source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+
+    assert "root_layout.addWidget(self._status_label)" in source
+    assert "right_layout.addWidget(self._status_label)" not in source
+    assert "QFrame#detachedPreviewPanel" in source
+
+
+def test_plot_settings_panel_exposes_per_axis_ticks_and_color_controls():
+    source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+
+    assert "self.x_ticks_mode = self._combo(_TOGGLE_MODES)" in source
+    assert "self.y_ticks_mode = self._combo(_TOGGLE_MODES)" in source
+    assert "self.x_tick_direction = self._combo(_TICK_DIRECTIONS)" in source
+    assert "self.y_tick_direction = self._combo(_TICK_DIRECTIONS)" in source
+    assert "self.x_label_font = self._positive_int_line()" in source
+    assert "self.y_label_font = self._positive_int_line()" in source
+    assert 'tooltip_id="figure.canvas.font_color"' in source
+    assert 'tooltip_id="figure.lines.marker_color"' in source
+    assert '"_x_tick_params"' in source
+    assert '"_y_tick_params"' in source
 
 
 def test_plot_settings_panel_keeps_reset_as_a_profile_action():
@@ -311,7 +348,8 @@ def test_plot_settings_panel_uses_cumulative_child_ids_in_series_list():
     source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
 
     assert "cumulative::" in source
-    assert '"kind": "cumulative"' in source
+    # Base rows now show inline badges instead of child rows in the series list
+    assert "\u00b7" in source  # middle dot badge separator is present
 
 
 def test_orientation_gui_offers_density_line_view():
@@ -546,21 +584,25 @@ def test_restore_series_list_anchor_scroll_value_falls_back_to_previous_scroll_w
     assert restored == 32
 
 
-def test_derive_synced_field_locks_prefers_explicit_metadata():
-    locks = _derive_synced_field_locks(
+def test_derive_synced_field_modes_prefers_explicit_auto_metadata():
+    modes = _derive_synced_field_modes(
         {
             "_gui_sync_modes": {"x_label": "manual", "y_label": "auto"},
             "x_label": None,
             "y_label": "Density",
+            "x_lim": [0.0, 5.0],
+            "x_ticks": [0.0, 1.0, 2.0],
         }
     )
 
-    assert locks["x_label"] is True
-    assert locks["y_label"] is False
+    assert modes["x_label"] == "manual"
+    assert modes["y_label"] == "auto"
+    assert modes["x_lim"] == "manual"
+    assert modes["x_ticks"] == "manual"
 
 
-def test_derive_synced_field_locks_detects_explicit_limits_ticks_and_label_padding():
-    locks = _derive_synced_field_locks(
+def test_derive_synced_field_modes_detects_explicit_limits_ticks_and_label_padding():
+    modes = _derive_synced_field_modes(
         {
             "title": "",
             "x_label": None,
@@ -573,17 +615,47 @@ def test_derive_synced_field_locks_detects_explicit_limits_ticks_and_label_paddi
         }
     )
 
-    assert locks == {
-        "title": True,
-        "x_label": False,
-        "y_label": True,
-        "x_lim": True,
-        "y_lim": False,
-        "x_ticks": True,
-        "y_ticks": False,
-        "x_label_pad": True,
-        "y_label_pad": False,
+    assert modes == {
+        "title": "manual",
+        "x_label": "auto",
+        "y_label": "manual",
+        "x_lim": "manual",
+        "y_lim": "auto",
+        "x_ticks": "manual",
+        "y_ticks": "auto",
+        "x_label_pad": "manual",
+        "y_label_pad": "auto",
     }
+
+
+def test_derive_synced_field_modes_maps_hidden_title_to_off_and_merges_partial_metadata():
+    modes = _derive_synced_field_modes(
+        {
+            "_gui_sync_modes": {"x_label": "manual"},
+            "title_visible": False,
+            "title": None,
+            "x_label": None,
+            "y_label": "Density",
+        }
+    )
+
+    assert modes["title"] == "off"
+    assert modes["x_label"] == "manual"
+    assert modes["y_label"] == "manual"
+    assert modes["x_lim"] == "auto"
+
+
+def test_auto_manual_sync_uses_one_mode_map_and_no_locked_field_metadata():
+    gui_source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+    cli_source = Path("src/linak/cli.py").read_text(encoding="utf-8")
+
+    assert "_synced_field_locks" not in gui_source
+    assert "_derive_synced_field_locks" not in gui_source
+    assert "_gui_locked_fields" not in cli_source
+    assert "for key in _SYNCED_FIELD_KEYS" in gui_source
+    assert 'if self._synced_field_mode(key) != "manual":' in gui_source
+    assert 'if self._synced_field_mode(key) != "auto"' in gui_source
+    assert 'if title_mode == "off":' in gui_source
 
 
 def test_extract_limit_rounds_auto_values_for_gui_display():
@@ -606,7 +678,9 @@ def test_border_setting_to_mode_handles_bool_and_dict():
 
 
 def test_border_spines_from_setting_extracts_per_side():
-    result = _border_spines_from_setting({"left": False, "right": True, "top": True, "bottom": False})
+    result = _border_spines_from_setting(
+        {"left": False, "right": True, "top": True, "bottom": False}
+    )
     assert result == {"left": False, "right": True, "top": True, "bottom": False}
 
     result_false = _border_spines_from_setting(False)
@@ -628,14 +702,6 @@ def test_extract_dict_mode_materializes_missing_bool_to_effective_default():
         _extract_dict_mode({}, key="savefig_kwargs", nested_key="transparent", auto_mode="off")
         == "off"
     )
-
-
-def test_sync_mode_mapping_round_trips_manual_and_auto():
-    assert _lock_to_sync_mode(True) == "Manual"
-    assert _lock_to_sync_mode(False) == "Auto"
-    assert _sync_mode_to_lock("Manual") is True
-    assert _sync_mode_to_lock("manual") is True
-    assert _sync_mode_to_lock("Auto") is False
 
 
 def test_derive_warning_messages_reports_disabled_sections_and_partial_normalization():

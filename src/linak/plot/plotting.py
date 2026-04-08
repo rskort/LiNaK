@@ -87,6 +87,7 @@ class PlotStyle:
     figure_size: tuple[float, float] = (7.0, 4.0)
     dpi: int = 200
     font_family: str = "DejaVu Sans"
+    font_color: str = "#000000"
     base_font_size: int = _DEFAULT_BASE_FONT_SIZE
     title_font_size: int = 14
     label_font_size: int = 12
@@ -231,6 +232,10 @@ class SeriesCumulativeConfig:
     enabled: bool = False
     label_override: str | None = None
     show_in_legend: bool = True
+    color: str | None = None
+    alpha: float | None = None
+    line_width: float | None = None
+    line_style: str | None = None
 
 
 @dataclass(frozen=True)
@@ -584,6 +589,7 @@ def with_style_overrides(
     figure_size: tuple[float, float] | None = None,
     dpi: int | None = None,
     font_family: str | None = None,
+    font_color: str | None = None,
     font_size: int | None = None,
     title_font_size: int | None = None,
     label_font_size: int | None = None,
@@ -606,6 +612,8 @@ def with_style_overrides(
         updates["dpi"] = dpi
     if font_family is not None:
         updates["font_family"] = font_family
+    if font_color is not None:
+        updates["font_color"] = str(font_color)
     target_base_font_size = base_style.base_font_size if font_size is None else int(font_size)
     if font_size is not None:
         updates["base_font_size"] = target_base_font_size
@@ -748,12 +756,28 @@ class SeriesErrorAvailability:
 def _coerce_cumulative_config(value: Any) -> SeriesCumulativeConfig:
     if not isinstance(value, dict):
         return SeriesCumulativeConfig()
+    _color = value.get("color")
+    _alpha_raw = value.get("alpha")
+    _lw_raw = value.get("line_width")
+    _ls = value.get("line_style")
+    try:
+        _alpha = float(_alpha_raw) if _alpha_raw is not None and str(_alpha_raw).strip() else None
+    except (ValueError, TypeError):
+        _alpha = None
+    try:
+        _lw = float(_lw_raw) if _lw_raw is not None and str(_lw_raw).strip() else None
+    except (ValueError, TypeError):
+        _lw = None
     return SeriesCumulativeConfig(
         enabled=bool(value.get("enabled", False)),
         label_override=(
             None if value.get("label_override") in {None, ""} else str(value.get("label_override"))
         ),
         show_in_legend=bool(value.get("show_in_legend", True)),
+        color=str(_color).strip() or None if _color is not None and str(_color).strip() else None,
+        alpha=_alpha,
+        line_width=_lw,
+        line_style=str(_ls).strip() or None if _ls is not None and str(_ls).strip() else None,
     )
 
 
@@ -1206,6 +1230,10 @@ def _extract_tick_controls(
     resolved = dict(tick_params_kwargs)
     axis_hint_raw = resolved.pop("_ticks_axis", None)
     minor_mode_raw = resolved.pop("_minor_ticks_mode", None)
+    resolved.pop("_x_tick_params", None)
+    resolved.pop("_y_tick_params", None)
+    resolved.pop("_x_minor_ticks_mode", None)
+    resolved.pop("_y_minor_ticks_mode", None)
 
     axis_hint = _normalize_tick_axis(axis_hint_raw) if axis_hint_raw is not None else "both"
     if axis_hint_raw is None and "axis" in resolved:
@@ -1213,6 +1241,59 @@ def _extract_tick_controls(
 
     minor_mode = _normalize_minor_ticks_mode(minor_mode_raw)
     return resolved, axis_hint, minor_mode
+
+
+def _apply_figure_kwargs(fig: Any, figure_kwargs: dict[str, Any] | None) -> None:
+    if figure_kwargs is None:
+        return
+    resolved = dict(figure_kwargs)
+    alpha = resolved.pop("alpha", None)
+    if resolved:
+        fig.set(**resolved)
+    if alpha is not None:
+        fig.patch.set_alpha(float(alpha))
+
+
+def _axis_tick_params(
+    tick_params_kwargs: dict[str, Any] | None,
+    axis: str,
+) -> dict[str, Any]:
+    if not isinstance(tick_params_kwargs, dict):
+        return {}
+    raw = tick_params_kwargs.get(f"_{axis}_tick_params")
+    if not isinstance(raw, dict):
+        return {}
+    allowed = {"direction", "length", "width", "labelsize", "colors", "color"}
+    return {
+        key: value
+        for key, value in raw.items()
+        if key in allowed and value is not None and str(value).strip() != ""
+    }
+
+
+def _minor_tick_mode(tick_params_kwargs: dict[str, Any] | None, axis: str, fallback: str) -> str:
+    if not isinstance(tick_params_kwargs, dict):
+        return fallback
+    raw = tick_params_kwargs.get(f"_{axis}_minor_ticks_mode", fallback)
+    return _normalize_minor_ticks_mode(raw)
+
+
+def _apply_minor_tick_modes(
+    ax: Any,
+    *,
+    tick_params_kwargs: dict[str, Any] | None,
+    fallback_mode: str,
+) -> None:
+    x_mode = _minor_tick_mode(tick_params_kwargs, "x", fallback_mode)
+    y_mode = _minor_tick_mode(tick_params_kwargs, "y", fallback_mode)
+    if x_mode == "on" or y_mode == "on":
+        ax.minorticks_on()
+    elif x_mode == "off" and y_mode == "off":
+        ax.minorticks_off()
+    if x_mode == "off" and y_mode == "on":
+        ax.tick_params(axis="x", which="minor", bottom=False, top=False)
+    if y_mode == "off" and x_mode == "on":
+        ax.tick_params(axis="y", which="minor", left=False, right=False)
 
 
 def _capture_plot_state(
@@ -1264,6 +1345,14 @@ def _capture_plot_state(
             "alpha": None if line_alpha is None else float(line_alpha),
             "markersize": float(first_line.get_markersize()),
         }
+    axes_border_states = {name: spine.get_visible() for name, spine in ax.spines.items()}
+    axes_border_state: bool | dict[str, bool]
+    if all(axes_border_states.values()):
+        axes_border_state = True
+    elif not any(axes_border_states.values()):
+        axes_border_state = False
+    else:
+        axes_border_state = dict(axes_border_states)
 
     capture_state.clear()
     capture_state.update(
@@ -1304,10 +1393,7 @@ def _capture_plot_state(
             "line_width": float(style.line_width),
             "line_kwargs": line_kwargs,
             "axes_kwargs": axes_kwargs,
-            "axes_border": (
-                lambda _states={name: spine.get_visible() for name, spine in ax.spines.items()}:
-                True if all(_states.values()) else False if not any(_states.values()) else dict(_states)
-            )(),
+            "axes_border": axes_border_state,
             "x_margin": float(ax.get_xmargin()),
             "y_margin": float(ax.get_ymargin()),
             "x_label_pad": float(ax.xaxis.labelpad),
@@ -2015,6 +2101,10 @@ def plot_line_series(
     y_ticks: list[float] | tuple[float, ...] | None = None,
     x_tick_rotation: float | None = None,
     y_tick_rotation: float | None = None,
+    x_label_font_size: int | None = None,
+    y_label_font_size: int | None = None,
+    x_tick_font_size: int | None = None,
+    y_tick_font_size: int | None = None,
     x_label_pad: float | None = None,
     y_label_pad: float | None = None,
     title_visible: bool | None = None,
@@ -2086,6 +2176,10 @@ def plot_line_series(
         y_ticks=y_ticks,
         x_tick_rotation=x_tick_rotation,
         y_tick_rotation=y_tick_rotation,
+        x_label_font_size=x_label_font_size,
+        y_label_font_size=y_label_font_size,
+        x_tick_font_size=x_tick_font_size,
+        y_tick_font_size=y_tick_font_size,
         x_label_pad=x_label_pad,
         y_label_pad=y_label_pad,
         title_visible=title_visible,
@@ -2127,6 +2221,10 @@ def plot_heatmap_series(
     y_ticks: list[float] | tuple[float, ...] | None = None,
     x_tick_rotation: float | None = None,
     y_tick_rotation: float | None = None,
+    x_label_font_size: int | None = None,
+    y_label_font_size: int | None = None,
+    x_tick_font_size: int | None = None,
+    y_tick_font_size: int | None = None,
     x_label_pad: float | None = None,
     y_label_pad: float | None = None,
     title_visible: bool | None = None,
@@ -2169,8 +2267,7 @@ def plot_heatmap_series(
         rc_context_args.update(dict(matplotlib_rc))
     with plt.rc_context(rc_context_args):
         fig, ax = plt.subplots(figsize=style.figure_size)
-        if figure_kwargs is not None:
-            fig.set(**dict(figure_kwargs))
+        _apply_figure_kwargs(fig, figure_kwargs)
 
         heatmap_array = np.asarray(z_values, dtype=float)
         mesh_kwargs: dict[str, Any] = {
@@ -2235,9 +2332,18 @@ def plot_heatmap_series(
                 )
             if heatmap_colorbar_tick_size is not None:
                 colorbar.ax.tick_params(labelsize=heatmap_colorbar_tick_size)
+            colorbar.ax.tick_params(colors=style.font_color)
+            label_axis = colorbar.ax.yaxis if cb_is_vertical else colorbar.ax.xaxis
+            label_axis.label.set_color(style.font_color)
 
-        xlabel_kwargs: dict[str, Any] = {"fontsize": style.label_font_size}
-        ylabel_kwargs: dict[str, Any] = {"fontsize": style.label_font_size}
+        xlabel_kwargs: dict[str, Any] = {
+            "fontsize": x_label_font_size or style.label_font_size,
+            "color": style.font_color,
+        }
+        ylabel_kwargs: dict[str, Any] = {
+            "fontsize": y_label_font_size or style.label_font_size,
+            "color": style.font_color,
+        }
         if x_label_pad is not None:
             xlabel_kwargs["labelpad"] = float(x_label_pad)
         if y_label_pad is not None:
@@ -2245,10 +2351,14 @@ def plot_heatmap_series(
         ax.set_xlabel(format_axis_label_units(x_label), **xlabel_kwargs)
         ax.set_ylabel(format_axis_label_units(y_label), **ylabel_kwargs)
         if title_visible is False:
-            ax.set_title("", fontsize=style.title_font_size)
+            ax.set_title("", fontsize=style.title_font_size, color=style.font_color)
         else:
-            ax.set_title(normalize_plot_text(title), fontsize=style.title_font_size)
-        ax.tick_params(axis="both", labelsize=style.tick_font_size)
+            ax.set_title(
+                normalize_plot_text(title),
+                fontsize=style.title_font_size,
+                color=style.font_color,
+            )
+        ax.tick_params(axis="both", labelsize=style.tick_font_size, colors=style.font_color)
         resolved_tick_params_kwargs, tick_axis_hint, minor_ticks_mode = _extract_tick_controls(
             tick_params_kwargs
         )
@@ -2281,16 +2391,27 @@ def plot_heatmap_series(
                         top=False,
                         labelbottom=False,
                     )
-            if x_tick_rotation is not None:
-                ax.tick_params(axis="x", rotation=float(x_tick_rotation))
-            if y_tick_rotation is not None:
-                ax.tick_params(axis="y", rotation=float(y_tick_rotation))
-        if minor_ticks_mode == "on":
-            ax.minorticks_on()
-        elif minor_ticks_mode == "off":
-            ax.minorticks_off()
         if resolved_tick_params_kwargs:
             ax.tick_params(**resolved_tick_params_kwargs)
+        x_axis_tick_params = _axis_tick_params(tick_params_kwargs, "x")
+        y_axis_tick_params = _axis_tick_params(tick_params_kwargs, "y")
+        if x_tick_font_size is not None:
+            x_axis_tick_params["labelsize"] = int(x_tick_font_size)
+        if y_tick_font_size is not None:
+            y_axis_tick_params["labelsize"] = int(y_tick_font_size)
+        if x_tick_rotation is not None:
+            x_axis_tick_params["rotation"] = float(x_tick_rotation)
+        if y_tick_rotation is not None:
+            y_axis_tick_params["rotation"] = float(y_tick_rotation)
+        if x_axis_tick_params:
+            ax.tick_params(axis="x", **x_axis_tick_params)
+        if y_axis_tick_params:
+            ax.tick_params(axis="y", **y_axis_tick_params)
+        _apply_minor_tick_modes(
+            ax,
+            tick_params_kwargs=tick_params_kwargs,
+            fallback_mode=minor_ticks_mode,
+        )
         if x_ticks is not None:
             ax.set_xticks([float(value) for value in x_ticks])
         if y_ticks is not None:
@@ -2399,6 +2520,10 @@ def plot_multi_line_series(
     y_ticks: list[float] | tuple[float, ...] | None = None,
     x_tick_rotation: float | None = None,
     y_tick_rotation: float | None = None,
+    x_label_font_size: int | None = None,
+    y_label_font_size: int | None = None,
+    x_tick_font_size: int | None = None,
+    y_tick_font_size: int | None = None,
     x_label_pad: float | None = None,
     y_label_pad: float | None = None,
     title_visible: bool | None = None,
@@ -2578,7 +2703,8 @@ def plot_multi_line_series(
             "y": np.asarray(source_entry["y"], dtype=float),
             "statistics": source_entry["statistics"],
             "raw_statistics": bool(source_entry["raw_statistics"]),
-            "line_visible": bool(current_override.get("enabled", source_entry["line_visible"])),
+            "line_visible": bool(current_override.get("enabled", source_entry["line_visible"]))
+            and bool(current_override.get("show_raw_line", True)),
             "show_in_legend": bool(
                 current_override.get("show_in_legend", source_entry["show_in_legend"])
             ),
@@ -2816,8 +2942,7 @@ def plot_multi_line_series(
         rc_context_args.update(dict(matplotlib_rc))
     with plt.rc_context(rc_context_args):
         fig, ax = plt.subplots(figsize=style.figure_size)
-        if figure_kwargs is not None:
-            fig.set(**dict(figure_kwargs))
+        _apply_figure_kwargs(fig, figure_kwargs)
         rendered_colors: list[str] = []
         rendered_markers: list[str] = []
         rendered_labels: list[str] = []
@@ -3029,16 +3154,24 @@ def plot_multi_line_series(
                 fit_summary["label"] = fit_render_label
                 fit_summaries[fit_key] = fit_summary
                 if fit_summary.get("status") == "ok":
+                    _fit_base_color = str(
+                        artist.get_color()
+                        if artist is not None
+                        else kwargs.get("color", style.line_color)
+                    )
+                    _fit_base_lw = float(
+                        artist.get_linewidth() if artist is not None else kwargs["lw"]
+                    )
+                    _fit_color_override = str(fit_config.get("fit_color") or "").strip() or None
+                    _fit_alpha_override = fit_config.get("fit_alpha")
+                    _fit_lw_override = fit_config.get("fit_line_width")
+                    _fit_ls_override = str(fit_config.get("fit_line_style") or "").strip() or None
                     fit_kwargs: dict[str, Any] = {
-                        "color": str(
-                            artist.get_color()
-                            if artist is not None
-                            else kwargs.get("color", style.line_color)
-                        ),
-                        "linestyle": "--",
-                        "linewidth": float(
-                            artist.get_linewidth() if artist is not None else kwargs["lw"]
-                        ),
+                        "color": _fit_color_override if _fit_color_override else _fit_base_color,
+                        "linestyle": _fit_ls_override if _fit_ls_override else "--",
+                        "linewidth": float(_fit_lw_override)
+                        if _fit_lw_override is not None
+                        else _fit_base_lw,
                         "marker": "",
                         "label": (
                             fit_render_label
@@ -3046,9 +3179,13 @@ def plot_multi_line_series(
                             else "_nolegend_"
                         ),
                     }
-                    line_alpha = None if artist is None else artist.get_alpha()
-                    if line_alpha is not None:
-                        fit_kwargs["alpha"] = float(line_alpha)
+                    if _fit_alpha_override is not None:
+                        try:
+                            fit_kwargs["alpha"] = float(_fit_alpha_override)
+                        except (ValueError, TypeError):
+                            pass
+                    elif artist is not None and artist.get_alpha() is not None:
+                        fit_kwargs["alpha"] = float(artist.get_alpha())
                     ax.plot(
                         np.asarray(fit_summary.get("x_fit", []), dtype=float),
                         np.asarray(fit_summary.get("y_fit", []), dtype=float),
@@ -3066,24 +3203,32 @@ def plot_multi_line_series(
                     "point_count": int(cumulative_x.size),
                 }
                 if cumulative_x.size:
+                    _base_color = str(
+                        artist.get_color()
+                        if artist is not None
+                        else kwargs.get("color", style.line_color)
+                    )
+                    _base_lw = float(artist.get_linewidth() if artist is not None else kwargs["lw"])
+                    _base_ls = ":"
                     cumulative_kwargs: dict[str, Any] = {
-                        "color": str(
-                            artist.get_color()
-                            if artist is not None
-                            else kwargs.get("color", style.line_color)
-                        ),
-                        "linestyle": ":",
-                        "linewidth": float(
-                            artist.get_linewidth() if artist is not None else kwargs["lw"]
-                        ),
+                        "color": cumulative_config.color
+                        if cumulative_config.color
+                        else _base_color,
+                        "linestyle": cumulative_config.line_style
+                        if cumulative_config.line_style
+                        else _base_ls,
+                        "linewidth": cumulative_config.line_width
+                        if cumulative_config.line_width is not None
+                        else _base_lw,
                         "marker": "",
                         "label": (
                             cumulative_label if cumulative_config.show_in_legend else "_nolegend_"
                         ),
                     }
-                    line_alpha = None if artist is None else artist.get_alpha()
-                    if line_alpha is not None:
-                        cumulative_kwargs["alpha"] = float(line_alpha)
+                    if cumulative_config.alpha is not None:
+                        cumulative_kwargs["alpha"] = float(cumulative_config.alpha)
+                    elif artist is not None and artist.get_alpha() is not None:
+                        cumulative_kwargs["alpha"] = float(artist.get_alpha())
                     ax.plot(cumulative_x, cumulative_y, **cumulative_kwargs)
             else:
                 cumulative_summaries[fit_key] = {
@@ -3102,9 +3247,18 @@ def plot_multi_line_series(
             }
             if legend_kwargs is not None:
                 resolved_legend_kwargs.update(dict(legend_kwargs))
-            ax.legend(**resolved_legend_kwargs)
-        xlabel_kwargs: dict[str, Any] = {"fontsize": style.label_font_size}
-        ylabel_kwargs: dict[str, Any] = {"fontsize": style.label_font_size}
+            legend_obj = ax.legend(**resolved_legend_kwargs)
+            for text in legend_obj.get_texts():
+                text.set_color(style.font_color)
+            legend_obj.get_title().set_color(style.font_color)
+        xlabel_kwargs: dict[str, Any] = {
+            "fontsize": x_label_font_size or style.label_font_size,
+            "color": style.font_color,
+        }
+        ylabel_kwargs: dict[str, Any] = {
+            "fontsize": y_label_font_size or style.label_font_size,
+            "color": style.font_color,
+        }
         if x_label_pad is not None:
             xlabel_kwargs["labelpad"] = float(x_label_pad)
         if y_label_pad is not None:
@@ -3112,10 +3266,14 @@ def plot_multi_line_series(
         ax.set_xlabel(format_axis_label_units(x_label), **xlabel_kwargs)
         ax.set_ylabel(format_axis_label_units(y_label), **ylabel_kwargs)
         if title_visible is False:
-            ax.set_title("", fontsize=style.title_font_size)
+            ax.set_title("", fontsize=style.title_font_size, color=style.font_color)
         else:
-            ax.set_title(normalize_plot_text(title), fontsize=style.title_font_size)
-        ax.tick_params(axis="both", labelsize=style.tick_font_size)
+            ax.set_title(
+                normalize_plot_text(title),
+                fontsize=style.title_font_size,
+                color=style.font_color,
+            )
+        ax.tick_params(axis="both", labelsize=style.tick_font_size, colors=style.font_color)
         resolved_tick_params_kwargs, tick_axis_hint, minor_ticks_mode = _extract_tick_controls(
             tick_params_kwargs
         )
@@ -3166,16 +3324,27 @@ def plot_multi_line_series(
                         top=False,
                         labelbottom=False,
                     )
-            if x_tick_rotation is not None:
-                ax.tick_params(axis="x", rotation=float(x_tick_rotation))
-            if y_tick_rotation is not None:
-                ax.tick_params(axis="y", rotation=float(y_tick_rotation))
-        if minor_ticks_mode == "on":
-            ax.minorticks_on()
-        elif minor_ticks_mode == "off":
-            ax.minorticks_off()
         if resolved_tick_params_kwargs:
             ax.tick_params(**resolved_tick_params_kwargs)
+        x_axis_tick_params = _axis_tick_params(tick_params_kwargs, "x")
+        y_axis_tick_params = _axis_tick_params(tick_params_kwargs, "y")
+        if x_tick_font_size is not None:
+            x_axis_tick_params["labelsize"] = int(x_tick_font_size)
+        if y_tick_font_size is not None:
+            y_axis_tick_params["labelsize"] = int(y_tick_font_size)
+        if x_tick_rotation is not None:
+            x_axis_tick_params["rotation"] = float(x_tick_rotation)
+        if y_tick_rotation is not None:
+            y_axis_tick_params["rotation"] = float(y_tick_rotation)
+        if x_axis_tick_params:
+            ax.tick_params(axis="x", **x_axis_tick_params)
+        if y_axis_tick_params:
+            ax.tick_params(axis="y", **y_axis_tick_params)
+        _apply_minor_tick_modes(
+            ax,
+            tick_params_kwargs=tick_params_kwargs,
+            fallback_mode=minor_ticks_mode,
+        )
         ax.set_xscale(x_scale)
         ax.set_yscale(y_scale)
         if x_ticks is not None:

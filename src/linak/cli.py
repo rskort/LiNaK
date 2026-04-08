@@ -180,6 +180,7 @@ _PERSISTED_PLOT_SETTING_OPTION_FLAGS = {
     "figsize": ("--figsize",),
     "file_labels": ("--file-labels",),
     "font_family": ("--font-family",),
+    "font_color": (),
     "font_size": ("--font-size",),
     "border": ("--border", "--no-border"),
     "grid": ("--grid", "--no-grid"),
@@ -189,6 +190,8 @@ _PERSISTED_PLOT_SETTING_OPTION_FLAGS = {
     "group": ("--group",),
     "kind": ("--kind",),
     "label_font_size": ("--label-font-size",),
+    "x_label_font_size": (),
+    "y_label_font_size": (),
     "legend": ("--legend", "--no-legend"),
     "legend_font_size": ("--legend-font-size",),
     "legend_loc": ("--legend-loc",),
@@ -202,6 +205,8 @@ _PERSISTED_PLOT_SETTING_OPTION_FLAGS = {
     "species_a": ("--species-a",),
     "species_b": ("--species-b",),
     "tick_font_size": ("--tick-font-size",),
+    "x_tick_font_size": (),
+    "y_tick_font_size": (),
     "title": ("--title",),
     "title_visible": ("--title-mode",),
     "title_font_size": ("--title-font-size",),
@@ -275,11 +280,17 @@ _PLOT_SETTINGS_COMMON_KEYS = (
     "figsize",
     "dpi",
     "font_family",
+    "font_color",
     "font_size",
     "title_font_size",
     "label_font_size",
+    "x_label_font_size",
+    "y_label_font_size",
     "tick_font_size",
+    "x_tick_font_size",
+    "y_tick_font_size",
     "legend_font_size",
+    "figure_alpha",
     "line_width",
     "line_color",
     "line_colors",
@@ -3691,6 +3702,7 @@ def _build_plot_style(args: argparse.Namespace) -> PlotStyle:
         figure_size=figure_size,
         dpi=args.dpi,
         font_family=args.font_family,
+        font_color=getattr(args, "font_color", None),
         font_size=getattr(args, "font_size", None),
         title_font_size=args.title_font_size,
         label_font_size=args.label_font_size,
@@ -3984,7 +3996,8 @@ def _apply_effective_series_settings(
     overrides = _coerce_series_override_map(getattr(args, "series_overrides", None))
     ordered_descriptors = list(series_descriptors) if isinstance(series_descriptors, list) else []
     source_ordered_descriptors = [
-        d for d in ordered_descriptors
+        d
+        for d in ordered_descriptors
         if str(d.get("source_kind") or "source").strip().lower() != "group"
     ]
 
@@ -4131,7 +4144,8 @@ def _apply_effective_series_settings(
                 args.line_colors = None
 
     source_for_reorder = [
-        d for d in (list(series_descriptors) if isinstance(series_descriptors, list) else [])
+        d
+        for d in (list(series_descriptors) if isinstance(series_descriptors, list) else [])
         if str(d.get("source_kind") or "source").strip().lower() != "group"
     ]
     if len(source_for_reorder) != total_series:
@@ -4388,7 +4402,6 @@ def _merge_gui_only_plot_settings(
         "series_enabled",
         "series_show_in_legend",
         "series_alpha",
-        "_gui_locked_fields",
         "_gui_sync_modes",
     ):
         if key in saved:
@@ -5657,11 +5670,13 @@ def _render_profile_plot(
     ordered_profile = profile
     ordered_descriptors = list(series_descriptors or [])
     source_ordered_descriptors = [
-        d for d in ordered_descriptors
+        d
+        for d in ordered_descriptors
         if str(d.get("source_kind") or "source").strip().lower() != "group"
     ]
     group_ordered_descriptors = [
-        d for d in ordered_descriptors
+        d
+        for d in ordered_descriptors
         if str(d.get("source_kind") or "source").strip().lower() == "group"
     ]
     if (
@@ -5699,6 +5714,10 @@ def _render_profile_plot(
         "y_ticks": args.y_ticks,
         "x_tick_rotation": args.x_tick_rotation,
         "y_tick_rotation": args.y_tick_rotation,
+        "x_label_font_size": getattr(args, "x_label_font_size", None),
+        "y_label_font_size": getattr(args, "y_label_font_size", None),
+        "x_tick_font_size": getattr(args, "x_tick_font_size", None),
+        "y_tick_font_size": getattr(args, "y_tick_font_size", None),
         "x_label_pad": getattr(args, "x_label_pad", None),
         "y_label_pad": getattr(args, "y_label_pad", None),
         "title_visible": args.title_visible,
@@ -5734,7 +5753,9 @@ def _render_profile_plot(
         "line_colors": (
             args.line_colors
             if getattr(args, "line_colors", None) is not None
-            else _default_series_family_colors(source_ordered_descriptors, len(source_ordered_descriptors))
+            else _default_series_family_colors(
+                source_ordered_descriptors, len(source_ordered_descriptors)
+            )
             if source_ordered_descriptors
             else None
         ),
@@ -5833,29 +5854,32 @@ def _collect_plot_settings_for_persistence(
     return candidate
 
 
-def _derive_gui_locked_fields(settings: dict[str, Any]) -> dict[str, bool]:
-    x_lim = settings.get("x_lim")
-    y_lim = settings.get("y_lim")
-    return {
-        "title": settings.get("title") is not None,
-        "x_label": settings.get("x_label") is not None,
-        "y_label": settings.get("y_label") is not None,
-        "x_lim": isinstance(x_lim, (list, tuple)) and any(value is not None for value in x_lim[:2]),
-        "y_lim": isinstance(y_lim, (list, tuple)) and any(value is not None for value in y_lim[:2]),
-        "x_ticks": settings.get("x_ticks") is not None,
-        "y_ticks": settings.get("y_ticks") is not None,
-        "x_label_pad": settings.get("x_label_pad") is not None,
-        "y_label_pad": settings.get("y_label_pad") is not None,
-    }
-
-
 def _derive_gui_sync_modes(settings: dict[str, Any]) -> dict[str, str]:
     resolved: dict[str, str] = {}
-    for key in ("title", "x_label", "y_label"):
-        if settings.get(key) is None:
-            resolved[key] = "auto"
-        else:
-            resolved[key] = "manual"
+    x_lim = settings.get("x_lim")
+    y_lim = settings.get("y_lim")
+    inferred = {
+        "title": "off"
+        if settings.get("title_visible") is False
+        else "manual"
+        if settings.get("title") is not None
+        else "auto",
+        "x_label": "manual" if settings.get("x_label") is not None else "auto",
+        "y_label": "manual" if settings.get("y_label") is not None else "auto",
+        "x_lim": "manual"
+        if isinstance(x_lim, (list, tuple)) and any(value is not None for value in x_lim[:2])
+        else "auto",
+        "y_lim": "manual"
+        if isinstance(y_lim, (list, tuple)) and any(value is not None for value in y_lim[:2])
+        else "auto",
+        "x_ticks": "manual" if settings.get("x_ticks") is not None else "auto",
+        "y_ticks": "manual" if settings.get("y_ticks") is not None else "auto",
+        "x_label_pad": "manual" if settings.get("x_label_pad") is not None else "auto",
+        "y_label_pad": "manual" if settings.get("y_label_pad") is not None else "auto",
+    }
+    for key, mode in inferred.items():
+        if mode != "auto":
+            resolved[key] = mode
     return resolved
 
 
@@ -5974,7 +5998,6 @@ def _launch_profile_plot_gui(
     if build_full_context is None:
         build_full_context = build_context
     initial_settings = _collect_plot_settings_for_persistence(args, keys=setting_keys)
-    initial_settings["_gui_locked_fields"] = _derive_gui_locked_fields(initial_settings)
     initial_settings["_gui_sync_modes"] = _derive_gui_sync_modes(initial_settings)
     initial_settings["series_count"] = max(1, int(initial_context.series_count))
     initial_settings["series_descriptors"] = deepcopy(initial_context.series_descriptors)
@@ -6034,6 +6057,14 @@ def _launch_profile_plot_gui(
         )
     if initial_render_state:
         initial_settings.update(_without_preview_series_state(initial_render_state))
+        # Render-state values are matplotlib defaults, not explicit user choices.
+        # Explicitly mark any synced field without a stored mode as "auto" so
+        # _derive_synced_field_modes in the GUI does not infer "manual" from them.
+        _render_sync_modes = dict(initial_settings.get("_gui_sync_modes") or {})
+        for _k in ("title", "x_label", "y_label", "x_lim", "y_lim",
+                   "x_ticks", "y_ticks", "x_label_pad", "y_label_pad"):
+            _render_sync_modes.setdefault(_k, "auto")
+        initial_settings["_gui_sync_modes"] = _render_sync_modes
 
     def _preview(gui_settings: dict[str, Any]) -> dict[str, Any]:
         preview_args = deepcopy(args)
@@ -6043,7 +6074,9 @@ def _launch_profile_plot_gui(
         context = build_context(preview_args)
         group_descriptors = _extract_group_descriptors(gui_settings)
         if group_descriptors:
-            context = replace(context, series_descriptors=context.series_descriptors + group_descriptors)
+            context = replace(
+                context, series_descriptors=context.series_descriptors + group_descriptors
+            )
         if context.series_count <= 0:
             raise ValueError("No series are enabled. Turn on at least one series to preview.")
         _apply_effective_series_settings(
@@ -6095,8 +6128,6 @@ def _launch_profile_plot_gui(
                 "series_normalization_x_refs",
             ):
                 candidate.pop(key, None)
-        if "_gui_locked_fields" in gui_settings:
-            candidate["_gui_locked_fields"] = deepcopy(gui_settings["_gui_locked_fields"])
         if "_gui_sync_modes" in gui_settings:
             candidate["_gui_sync_modes"] = deepcopy(gui_settings["_gui_sync_modes"])
         write_plot_profile(
@@ -6116,7 +6147,9 @@ def _launch_profile_plot_gui(
         context = build_context(save_args)
         group_descriptors = _extract_group_descriptors(gui_settings)
         if group_descriptors:
-            context = replace(context, series_descriptors=context.series_descriptors + group_descriptors)
+            context = replace(
+                context, series_descriptors=context.series_descriptors + group_descriptors
+            )
         if context.series_count <= 0:
             raise ValueError("No series are enabled. Turn on at least one series before exporting.")
         _apply_effective_series_settings(

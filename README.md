@@ -8,7 +8,7 @@ LiNaK is a lightweight Python toolkit for molecular dynamics trajectory analysis
 
 LiNaK provides four top-level commands:
 - `linak compute`: generate LiNaK HDF5 analysis files
-- `linak plot`: plot LiNaK density, MSD, RDF, position, coordination, and potential HDF5 files by auto-detecting the analysis from the HDF5 metadata
+- `linak plot`: plot LiNaK density, MSD, RDF, position, coordination, potential, and orientation HDF5 files by auto-detecting the analysis from the HDF5 metadata
 - `linak apply`: convert trajectories, apply PBC, or compress CP2K output files
 - `linak hdf5` (`linak hd`, `linak h5`): inspect, combine, transform, and plot generic tabular HDF5 data
 
@@ -42,7 +42,24 @@ pip install -e .[dev]
 
 ## Quick Start
 
-Trajectory to HDF5 to plot:
+The recommended workflow for repeated analysis is to convert a raw trajectory
+first. `linak apply convert` writes a `*.traj.h5` file that embeds cell,
+timestep, fixed-atom, and surface-cache metadata so all later `linak compute`
+commands can run faster and without re-reading the original text file:
+
+```bash
+linak apply convert traj.xyz --input input.inp
+linak compute density traj.traj.h5
+linak compute msd traj.traj.h5 --species O
+linak compute rdf traj.traj.h5 --species-a O --species-b H
+linak compute coordination traj.traj.h5 --species-a O --species-b H --cutoff-from-rdf
+linak compute position traj.traj.h5 --species O
+linak compute orientation traj.traj.h5
+linak plot LiNaK_outputs/traj.traj_density_z.h5
+linak plot LiNaK_outputs/traj.traj_rdf_o_h.h5
+```
+
+You can also run `linak compute` directly on a raw trajectory without converting first:
 
 ```bash
 linak compute density traj.xyz
@@ -59,6 +76,8 @@ linak compute rdf traj.xyz --species-a O --species-b H
 linak plot traj_rdf_o_h.h5
 linak compute coordination traj.xyz --species-a O --species-b H --cutoff-from-rdf
 linak plot traj_coordination_o_h.h5
+linak compute orientation traj.xyz
+linak plot traj_orientation_z.h5
 ```
 
 Run `linak` for information or `linak --help` for the full CLI overview.
@@ -84,14 +103,6 @@ print(density.species, density.units, density.n_frames)
 print(msd.species, msd.msd[-1], "A^2")
 ```
 
-Recommended CLI workflow for repeated analysis:
-
-```bash
-linak apply convert traj.xyz
-linak compute rdf traj.traj.h5
-linak plot LiNaK_outputs/traj.traj_rdf.h5
-```
-
 ## CLI Overview
 
 ### `linak compute`
@@ -106,6 +117,7 @@ Available analyses:
 - `rdf`: radial distribution function
 - `coordination`: continuous coordination number vs time and/or distance to surface
 - `potential`: CP2K cSHE-related quantities from Hartree cube files
+- `orientation`: H2O polar and azimuthal orientation profiles vs distance to surface
 
 Examples:
 
@@ -116,13 +128,14 @@ linak compute msd traj.xyz --species O --timestep-fs 0.5
 linak compute position traj.xyz --species O --axis z
 linak compute rdf traj.xyz --species-a O --species-b H --bin-width 0.05
 linak compute coordination traj.xyz --species-a O --species-b H --cutoff-from-rdf
+linak compute orientation traj.xyz
 linak compute potential -f run1/*-v_hartree-1_0.cube run2/*-v_hartree-1_0.cube --output potentials.h5
 ```
 
 ### `linak plot`
 
 The `plot` command reads LiNaK analysis HDF5 files and auto-detects whether the
-file contains density, MSD, RDF, position, coordination, or potential data.
+file contains density, MSD, RDF, position, coordination, potential, or orientation data.
 
 Examples:
 
@@ -133,6 +146,7 @@ linak plot traj_msd_o.h5
 linak plot traj_position_o_z.h5
 linak plot traj_rdf_o_h.h5 
 linak plot traj_coordination_o_h.h5
+linak plot traj_orientation_z.h5
 linak plot potentials.h5
 ```
 
@@ -350,6 +364,33 @@ Output behaviour for `compute potential`:
 - writes rows incrementally so partial progress is retained if a later source fails
 
 Use `--strict` when a failed or incomplete source should cause a non-zero exit code.
+
+### Orientation
+
+`linak compute orientation` computes H2O polar and azimuthal orientation
+statistics binned by distance to the detected surface. For each water molecule
+in each frame, LiNaK stores:
+
+- `cos_polar_mean`: mean cosine of the angle between the water bisector and the
+  surface-normal reference axis, binned by distance to surface
+- `cos_azimuthal_mean`: mean cosine of the in-plane molecular plane orientation
+- density-weighted variants of both (`cos_polar_density`, `cos_azimuthal_density`)
+- 2D `heatmap_polar` and `heatmap_azimuthal` arrays over distance and cosine bins
+
+Orientation uses the same surface estimator as density, position, and
+coordination. When a trusted frame-wise surface reference is available, distances
+are surface-relative; otherwise the raw axis coordinate is used.
+
+Surface options shared with density (`--surface-mode`, `--surface-elements`,
+`--include-fixed-surface-atoms`, `--rough-surface-envelope`) and `--bin-width`,
+`--angle-bins`, `--axis`, and `--reference-axis` are all supported.
+
+```bash
+linak compute orientation traj.xyz
+linak compute orientation traj.traj.h5 --axis z --reference-axis z --bin-width 0.05
+linak plot traj_orientation_z.h5
+linak plot traj_orientation_z.h5 --component heatmap --angle polar
+```
 
 ## Plotting and Plot Studio
 

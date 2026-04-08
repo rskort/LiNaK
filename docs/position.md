@@ -41,7 +41,10 @@ If `--species all` is used, LiNaK computes one profile per element species.
 
 ## Coordinate Handling
 
-LiNaK stores raw Cartesian coordinates directly from the trajectory:
+When a usable periodic cell is available, LiNaK stores PBC-corrected
+(wrapped) Cartesian coordinates. The source trajectory files are not modified.
+When no usable cell is available, LiNaK stores the raw Cartesian coordinates
+directly from the trajectory. In both cases the stored arrays are:
 
 - `x_A`
 - `y_A`

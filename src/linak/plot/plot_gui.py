@@ -43,7 +43,6 @@ _NORMALIZATION_MODES = ("none", "max", "area", "value_at_x", "factor")
 _GRID_AXES = ("both", "x", "y")
 _GRID_WHICH = ("major", "minor", "both")
 _TICK_AXES = ("both", "x", "y")
-_TICK_VISIBILITY_MODES = ("both", "x", "y", "none")
 _TICK_DIRECTIONS = ("out", "in", "inout")
 _MINOR_TICKS_MODES = ("off", "on")
 _TOGGLE_MODES = ("on", "off")
@@ -72,7 +71,7 @@ _HEATMAP_NORMALIZATION_LABEL_BY_MODE = {
 _HEATMAP_NORMALIZATION_MODE_BY_LABEL = {
     label: mode for mode, label in _HEATMAP_NORMALIZATION_LABEL_BY_MODE.items()
 }
-_TRI_STATE_SYNC_FIELD_KEYS = frozenset({"title", "x_label", "y_label"})
+_TEXT_SYNC_FIELD_KEYS = frozenset({"title", "x_label", "y_label"})
 _SERIES_SPECIFIC_SETTINGS = frozenset(
     {
         "series_order",
@@ -169,6 +168,7 @@ _TOOLTIPS: dict[str, str] = {
     "series.duplicate": "Duplicates the selected base or grouped series.",
     "series.add_group": "Adds a grouped series that can aggregate several loaded base series.",
     "series.show_in_legend": "Shows or hides this series in the legend.",
+    "series.show_raw_line": "When off, the raw data line is hidden. Trendlines and cumulative averages remain visible if enabled.",
     "series.label": "Sets the legend name for this series.",
     "series.color": "Sets the line color for this series.",
     "series.alpha": "Sets the line transparency for this series.",
@@ -254,7 +254,9 @@ _TOOLTIPS: dict[str, str] = {
     "figure.axes.y_limits": "Sets the y-axis limits.",
     "figure.axes.x_label_pad": "Sets the space below the x-axis label.",
     "figure.axes.y_label_pad": "Sets the space beside the y-axis label.",
-    "figure.ticks.show": "Chooses which axes show ticks.",
+    "figure.axes.x_label_font": "Sets the x-axis label font size.",
+    "figure.axes.y_label_font": "Sets the y-axis label font size.",
+    "figure.ticks.show": "Shows or hides ticks for this axis.",
     "figure.ticks.x_ticks": "Sets the x-axis tick positions.",
     "figure.ticks.y_ticks": "Sets the y-axis tick positions.",
     "figure.ticks.x_rotation": "Rotates the x-axis tick labels.",
@@ -276,6 +278,8 @@ _TOOLTIPS: dict[str, str] = {
     "figure.lines.alpha": "Sets the default line transparency.",
     "figure.lines.markers": "Shows or hides markers on lines.",
     "figure.lines.marker_size": "Sets the default marker size.",
+    "figure.lines.marker_type": "Sets the default marker shape.",
+    "figure.lines.marker_color": "Sets the default marker color.",
     "figure.heatmap.vmin": "Minimum value for the colorbar range. Leave blank for auto.",
     "figure.heatmap.vmax": "Maximum value for the colorbar range. Leave blank for auto.",
     "figure.heatmap.cmap": "Matplotlib colormap name for the heatmap.",
@@ -294,7 +298,9 @@ _TOOLTIPS: dict[str, str] = {
     "figure.canvas.dpi": "Sets the render resolution.",
     "figure.canvas.font_family": "Sets the main font family.",
     "figure.canvas.font_size": "Sets the default font size used when title, label, tick, and legend font fields are left blank.",
+    "figure.canvas.font_color": "Sets the base color for title, labels, ticks, and legend text.",
     "figure.canvas.facecolor": "Sets the figure background color.",
+    "figure.canvas.alpha": "Sets the figure background opacity from 0 to 1.",
     "advanced.matplotlib_guide_link": "Opens the official Matplotlib user guide.",
     "advanced.rcparams": "Sets raw Matplotlib rcParams.",
     "advanced.figure_kwargs": "Sets raw figure options.",
@@ -350,14 +356,6 @@ def _border_spines_from_setting(value: Any) -> dict[str, bool]:
         return {s: bool(value.get(s, True)) for s in ("left", "right", "top", "bottom")}
     visible = value is not False
     return {"left": visible, "right": visible, "top": visible, "bottom": visible}
-
-
-def _lock_to_sync_mode(locked: bool) -> str:
-    return "Manual" if bool(locked) else "Auto"
-
-
-def _sync_mode_to_lock(value: str) -> bool:
-    return str(value).strip().lower() == "manual"
 
 
 def _preview_button_enabled(*, auto_update_enabled: bool, preview_loading: bool) -> bool:
@@ -802,10 +800,13 @@ def _coerce_sync_mode_map(value: Any) -> dict[str, str]:
     resolved: dict[str, str] = {}
     for raw_key, raw_value in value.items():
         key = str(raw_key).strip()
-        if key not in _TRI_STATE_SYNC_FIELD_KEYS:
+        if key not in _SYNCED_FIELD_KEYS:
             continue
         mode = str(raw_value).strip().lower()
-        if mode in {"auto", "manual", "off"}:
+        allowed_modes = (
+            {"auto", "manual", "off"} if key in _TEXT_SYNC_FIELD_KEYS else {"auto", "manual"}
+        )
+        if mode in allowed_modes:
             resolved[key] = mode
     return resolved
 
@@ -823,6 +824,10 @@ def _cumulative_defaults_for_gui() -> dict[str, Any]:
         "enabled": False,
         "label_override": None,
         "show_in_legend": True,
+        "color": None,
+        "alpha": None,
+        "line_width": None,
+        "line_style": None,
     }
 
 
@@ -836,6 +841,22 @@ def _coerce_series_cumulative_config(value: Any) -> dict[str, Any]:
         config["label_override"] = str(value.get("label_override")).strip() or None
     if "show_in_legend" in value:
         config["show_in_legend"] = bool(value.get("show_in_legend"))
+    if value.get("color") is not None:
+        config["color"] = str(value.get("color")).strip() or None
+    alpha_value = value.get("alpha")
+    if alpha_value is not None:
+        try:
+            config["alpha"] = str(float(alpha_value))
+        except (ValueError, TypeError):
+            pass
+    line_width_value = value.get("line_width")
+    if line_width_value is not None:
+        try:
+            config["line_width"] = str(float(line_width_value))
+        except (ValueError, TypeError):
+            pass
+    if value.get("line_style") is not None:
+        config["line_style"] = str(value.get("line_style")).strip() or None
     return config
 
 
@@ -986,35 +1007,35 @@ def _coerce_degree_text(value: Any) -> int | None:
 
 def _derive_synced_field_modes(settings: dict[str, Any]) -> dict[str, str]:
     metadata = _coerce_sync_mode_map(settings.get("_gui_sync_modes"))
-    if metadata:
-        return metadata
     resolved: dict[str, str] = {}
-    for key in _TRI_STATE_SYNC_FIELD_KEYS:
-        resolved[key] = "manual" if settings.get(key) is not None else "auto"
+    x_lim = settings.get("x_lim")
+    y_lim = settings.get("y_lim")
+    inferred = {
+        "title": "off"
+        if settings.get("title_visible") is False
+        else "manual"
+        if settings.get("title") is not None
+        else "auto",
+        "x_label": "manual" if settings.get("x_label") is not None else "auto",
+        "y_label": "manual" if settings.get("y_label") is not None else "auto",
+        "x_lim": "manual"
+        if isinstance(x_lim, (list, tuple)) and any(value is not None for value in x_lim[:2])
+        else "auto",
+        "y_lim": "manual"
+        if isinstance(y_lim, (list, tuple)) and any(value is not None for value in y_lim[:2])
+        else "auto",
+        "x_ticks": "manual" if settings.get("x_ticks") is not None else "auto",
+        "y_ticks": "manual" if settings.get("y_ticks") is not None else "auto",
+        "x_label_pad": "manual" if settings.get("x_label_pad") is not None else "auto",
+        "y_label_pad": "manual" if settings.get("y_label_pad") is not None else "auto",
+    }
+    for key in _SYNCED_FIELD_KEYS:
+        resolved[key] = metadata.get(key, inferred[key])
     return resolved
 
 
 def _coerce_profile_filter_options(value: Any) -> dict[str, Any]:
     return dict(value) if isinstance(value, dict) else {}
-
-
-def _derive_synced_field_locks(settings: dict[str, Any]) -> dict[str, bool]:
-    modes = _coerce_sync_mode_map(settings.get("_gui_sync_modes"))
-    if modes:
-        return {key: mode != "auto" for key, mode in modes.items()}
-    x_lim = settings.get("x_lim")
-    y_lim = settings.get("y_lim")
-    return {
-        "title": settings.get("title") is not None,
-        "x_label": settings.get("x_label") is not None,
-        "y_label": settings.get("y_label") is not None,
-        "x_lim": isinstance(x_lim, (list, tuple)) and any(value is not None for value in x_lim[:2]),
-        "y_lim": isinstance(y_lim, (list, tuple)) and any(value is not None for value in y_lim[:2]),
-        "x_ticks": settings.get("x_ticks") is not None,
-        "y_ticks": settings.get("y_ticks") is not None,
-        "x_label_pad": settings.get("x_label_pad") is not None,
-        "y_label_pad": settings.get("y_label_pad") is not None,
-    }
 
 
 def _derive_warning_messages(
@@ -1182,7 +1203,16 @@ def launch_plot_settings_panel(
     """Open a PySide6 panel that previews and persists plot settings."""
     try:
         from PySide6.QtCore import QEvent, QTimer, Qt
-        from PySide6.QtGui import QColor, QIcon, QPainter, QPalette, QPen, QPixmap
+        from PySide6.QtGui import (
+            QColor,
+            QDoubleValidator,
+            QIcon,
+            QIntValidator,
+            QPainter,
+            QPalette,
+            QPen,
+            QPixmap,
+        )
         from PySide6.QtWidgets import (
             QAbstractItemView,
             QApplication,
@@ -1381,16 +1411,46 @@ def launch_plot_settings_panel(
             text_color = self.palette().color(QPalette.ColorRole.Text)
             if not enabled:
                 text_color.setAlpha(150)
-            background = "transparent"
-            border = "transparent"
+
+            _pal = self.palette()
+            _win = _pal.color(QPalette.ColorRole.Window)
+            _wtxt = _pal.color(QPalette.ColorRole.WindowText)
+            _is_dark = _win.lightness() < _wtxt.lightness()
+            if _is_dark:
+                _accent = "#2aa7b8"
+                _accent_soft = "#163e47"
+            else:
+                _accent = "#0f8f95"
+                _accent_soft = "#d9f0f2"
+
             if selected:
-                background = self.palette().color(QPalette.ColorRole.Highlight).lighter(160).name()
-                border = self.palette().color(QPalette.ColorRole.Highlight).name()
+                row_bg = _accent_soft
+                left_border = f"4px solid {_accent}"
+                edge_border = f"1px solid {_accent}"
+                tl_radius = "4px"
+                bl_radius = "4px"
+                tr_radius = "8px"
+                br_radius = "8px"
+            else:
+                row_bg = "transparent"
+                left_border = "4px solid transparent"
+                edge_border = "1px solid transparent"
+                tl_radius = "4px"
+                bl_radius = "4px"
+                tr_radius = "8px"
+                br_radius = "8px"
+
             self.setStyleSheet(
                 "QWidget#seriesRowWidget {"
-                f"background-color: {background};"
-                f"border: 1px solid {border};"
-                "border-radius: 8px;"
+                f"background-color: {row_bg};"
+                f"border-left: {left_border};"
+                f"border-top: {edge_border};"
+                f"border-right: {edge_border};"
+                f"border-bottom: {edge_border};"
+                f"border-top-left-radius: {tl_radius};"
+                f"border-bottom-left-radius: {bl_radius};"
+                f"border-top-right-radius: {tr_radius};"
+                f"border-bottom-right-radius: {br_radius};"
                 "}"
                 "QToolButton#seriesRowButton {"
                 "padding: 0px;"
@@ -1409,9 +1469,12 @@ def launch_plot_settings_panel(
             )
 
             label_font_style = "italic" if not enabled else "normal"
-            label_font_weight = (
-                "700" if kind == "fit" else "600" if kind in {"error", "cumulative"} else "400"
-            )
+            if kind == "fit":
+                label_font_weight = "700"
+            elif kind in {"error", "cumulative"}:
+                label_font_weight = "700" if selected else "600"
+            else:
+                label_font_weight = "600" if selected else "400"
             self.text_label.setStyleSheet(
                 "border: none;"
                 f"color: {text_color.name()};"
@@ -1425,6 +1488,133 @@ def launch_plot_settings_panel(
             self.move_up_button.setVisible(control_enabled)
             self.move_down_button.setVisible(control_enabled)
             self.grip_widget.setVisible(control_enabled)
+
+    class _PreviewPane(QFrame):
+        def __init__(
+            self,
+            *,
+            title_text: str,
+            object_name: str,
+            on_refresh: Callable[[], None],
+            on_fit: Callable[[], None],
+            on_actual_size: Callable[[], None],
+            on_save_figure_callback: Callable[[], None],
+            on_auto_update: Callable[[bool], None],
+            on_detach: Callable[[], None] | None,
+            on_dock: Callable[[], None] | None,
+            register_tooltip: Callable[[QWidget, str], None],
+            apply_tooltip: Callable[[QWidget], None],
+            event_filter_owner: QWidget,
+            auto_update_enabled: bool,
+            parent: QWidget | None = None,
+        ) -> None:
+            super().__init__(parent)
+            self.setObjectName(object_name)
+            self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
+            layout = QVBoxLayout(self)
+            layout.setContentsMargins(14, 14, 14, 14)
+            layout.setSpacing(10)
+
+            preview_title = QLabel(title_text)
+            preview_title.setObjectName("pageTitle")
+            layout.addWidget(preview_title)
+
+            preview_controls = QHBoxLayout()
+            self.preview_button = QPushButton("Refresh Preview")
+            self.preview_button.clicked.connect(on_refresh)
+            register_tooltip(self.preview_button, "preview.refresh")
+            apply_tooltip(self.preview_button)
+            preview_controls.addWidget(self.preview_button)
+
+            self.fit_button = QPushButton("Fit")
+            self.fit_button.clicked.connect(on_fit)
+            register_tooltip(self.fit_button, "preview.fit")
+            apply_tooltip(self.fit_button)
+            preview_controls.addWidget(self.fit_button)
+
+            self.actual_size_button = QPushButton("100%")
+            self.actual_size_button.clicked.connect(on_actual_size)
+            register_tooltip(self.actual_size_button, "preview.actual_size")
+            apply_tooltip(self.actual_size_button)
+            preview_controls.addWidget(self.actual_size_button)
+
+            self.save_figure_button = QPushButton("Export Figure")
+            self.save_figure_button.setEnabled(auto_update_enabled)
+            self.save_figure_button.clicked.connect(on_save_figure_callback)
+            register_tooltip(self.save_figure_button, "export.figure")
+            apply_tooltip(self.save_figure_button)
+            preview_controls.addWidget(self.save_figure_button)
+
+            self.auto_preview_checkbox = QCheckBox("Auto update")
+            self.auto_preview_checkbox.setChecked(auto_update_enabled)
+            self.auto_preview_checkbox.setEnabled(auto_update_enabled)
+            self.auto_preview_checkbox.toggled.connect(on_auto_update)
+            register_tooltip(self.auto_preview_checkbox, "preview.auto_update")
+            apply_tooltip(self.auto_preview_checkbox)
+            preview_controls.addWidget(self.auto_preview_checkbox)
+
+            self.detach_button: QPushButton | None = None
+            if on_detach is not None:
+                self.detach_button = QPushButton("Detach Preview")
+                self.detach_button.clicked.connect(on_detach)
+                preview_controls.addWidget(self.detach_button)
+
+            self.dock_button: QPushButton | None = None
+            if on_dock is not None:
+                self.dock_button = QPushButton("Dock Back")
+                self.dock_button.clicked.connect(on_dock)
+                preview_controls.addWidget(self.dock_button)
+
+            preview_controls.addStretch(1)
+            self.preview_status = QLabel("Preview ready.")
+            preview_controls.addWidget(self.preview_status)
+            layout.addLayout(preview_controls)
+
+            self.preview_frame = QFrame(self)
+            self.preview_frame.setObjectName("previewFrame")
+            self.preview_frame.setFrameShape(QFrame.Shape.StyledPanel)
+            self.preview_frame.installEventFilter(event_filter_owner)
+            preview_frame_layout = QVBoxLayout(self.preview_frame)
+            preview_frame_layout.setContentsMargins(6, 6, 6, 6)
+
+            self.preview_scroll = QScrollArea(self.preview_frame)
+            self.preview_scroll.setWidgetResizable(False)
+            self.preview_scroll.setFrameShape(QFrame.Shape.NoFrame)
+            self.preview_scroll.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.preview_scroll.viewport().installEventFilter(event_filter_owner)
+
+            self.preview_label = QLabel("Preview will appear here.\nUse mouse wheel to zoom.")
+            self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.preview_label.setWordWrap(True)
+            self.preview_label.setMinimumSize(1, 1)
+            self.preview_label.installEventFilter(event_filter_owner)
+            self.preview_scroll.setWidget(self.preview_label)
+            preview_frame_layout.addWidget(self.preview_scroll, stretch=1)
+            layout.addWidget(self.preview_frame, stretch=1)
+
+    class _DetachedPreviewWindow(QMainWindow):
+        def __init__(
+            self,
+            *,
+            on_dock_requested: Callable[[], None],
+            parent: QWidget | None = None,
+        ) -> None:
+            super().__init__(parent)
+            self._on_dock_requested = on_dock_requested
+            self._allow_close = False
+            self.setWindowTitle("LiNaK Figure Preview")
+
+        def close_from_dock(self) -> None:
+            self._allow_close = True
+            self.close()
+
+        def closeEvent(self, event: Any) -> None:  # pragma: no cover - UI flow
+            if self._allow_close:
+                super().closeEvent(event)
+                return
+            event.ignore()
+            QTimer.singleShot(0, self._on_dock_requested)
 
     class _PlotSettingsWindow(QMainWindow):
         def __init__(self) -> None:
@@ -1464,6 +1654,8 @@ def launch_plot_settings_panel(
             self._legend_rows: list[tuple[QFormLayout, QWidget]] = []
             self._ticks_rows: list[tuple[QFormLayout, QWidget]] = []
             self._grid_rows: list[tuple[QFormLayout, QWidget]] = []
+            self._x_ticks_rows: list[tuple[QFormLayout, QWidget]] = []
+            self._y_ticks_rows: list[tuple[QFormLayout, QWidget]] = []
             self._marker_rows: list[tuple[QFormLayout, QWidget]] = []
             self._colorbar_rows: list[tuple[QFormLayout, QWidget]] = []
             self._border_custom_rows: list[tuple[QFormLayout, QWidget]] = []
@@ -1487,6 +1679,7 @@ def launch_plot_settings_panel(
             self._series_colors_data: list[str] = []
             self._series_enabled_data: list[bool] = []
             self._series_show_in_legend_data: list[bool] = []
+            self._series_show_raw_line_data: list[bool] = []
             self._series_alpha_data: list[str] = []
             self._series_error_enabled_data: list[bool] = []
             self._series_error_stats_data: list[str] = []
@@ -1502,9 +1695,17 @@ def launch_plot_settings_panel(
             self._series_fit_range_modes_data: list[str] = []
             self._series_fit_x_mins_data: list[str] = []
             self._series_fit_x_maxs_data: list[str] = []
+            self._series_fit_color_data: list[str] = []
+            self._series_fit_alpha_data: list[str] = []
+            self._series_fit_line_width_data: list[str] = []
+            self._series_fit_line_style_data: list[str] = []
             self._series_cumulative_enabled_data: list[bool] = []
             self._series_cumulative_label_overrides_data: list[str] = []
             self._series_cumulative_show_in_legend_data: list[bool] = []
+            self._series_cumulative_color_data: list[str] = []
+            self._series_cumulative_alpha_data: list[str] = []
+            self._series_cumulative_line_width_data: list[str] = []
+            self._series_cumulative_line_style_data: list[str] = []
             self._series_line_widths_data: list[str] = []
             self._series_markers_data: list[str] = []
             self._series_line_kwargs_data: list[str] = []
@@ -1520,15 +1721,26 @@ def launch_plot_settings_panel(
             self._series_active_is_cumulative_child = False
             self._series_display_rows: list[dict[str, Any]] = []
             self._last_preview_state: dict[str, Any] = {}
-            self._synced_field_locks: dict[str, bool] = {}
             self._synced_field_modes: dict[str, str] = {}
             self._advanced_json_syncing = False
             self._suspend_preview_events = False
             self._preview_pixmap: QPixmap | None = None
             self._preview_zoom_factor = 1.0
+            self._splitter: QSplitter | None = None
+            self._preview_splitter_sizes: list[int] | None = None
+            self._embedded_preview_pane: _PreviewPane | None = None
+            self._detached_preview_window: _DetachedPreviewWindow | None = None
+            self._detached_preview_pane: _PreviewPane | None = None
+            self._active_preview_pane: _PreviewPane | None = None
             self._preview_frame: QFrame | None = None
             self._preview_scroll: QScrollArea | None = None
             self._preview_label: QLabel | None = None
+            self._preview_status: QLabel | None = None
+            self._preview_button: QPushButton | None = None
+            self._save_figure_button: QPushButton | None = None
+            self._auto_preview_checkbox: QCheckBox | None = None
+            self._detach_preview_button: QPushButton | None = None
+            self._dock_preview_button: QPushButton | None = None
             self._nav_list: QListWidget | None = None
             self._page_stack: QStackedWidget | None = None
             self._page_title_label: QLabel | None = None
@@ -1576,7 +1788,9 @@ def launch_plot_settings_panel(
             self._annotation_summary_group: QGroupBox | None = None
             self._figure_tabs: QTabWidget | None = None
             self._figure_legend_section: QWidget | None = None
+            self._figure_lines_section: QGroupBox | None = None
             self._figure_lines_group: QGroupBox | None = None
+            self._figure_heatmap_section: QGroupBox | None = None
             self._figure_heatmap_group: QGroupBox | None = None
             self._figure_colorbar_group: QGroupBox | None = None
             self._y_bin_width_row: tuple[QFormLayout, QWidget] | None = None
@@ -1639,6 +1853,29 @@ def launch_plot_settings_panel(
             if placeholder:
                 widget.setPlaceholderText(placeholder)
             self._configure_horizontal_growth(widget)
+            return widget
+
+        def _bounded_float_line(
+            self,
+            placeholder: str = "",
+            *,
+            bottom: float | None = None,
+            top: float | None = None,
+            decimals: int = 6,
+        ) -> QLineEdit:
+            widget = self._line(placeholder)
+            validator = QDoubleValidator(widget)
+            validator.setDecimals(decimals)
+            if bottom is not None:
+                validator.setBottom(float(bottom))
+            if top is not None:
+                validator.setTop(float(top))
+            widget.setValidator(validator)
+            return widget
+
+        def _positive_int_line(self, placeholder: str = "") -> QLineEdit:
+            widget = self._line(placeholder)
+            widget.setValidator(QIntValidator(1, 1_000_000, widget))
             return widget
 
         def _register_tooltip(self, widget: QWidget, tooltip_id: str | None) -> None:
@@ -1848,36 +2085,21 @@ def launch_plot_settings_panel(
             tab_layout.addWidget(scroll)
             return content
 
-        def _set_synced_field_lock(self, key: str, locked: bool) -> None:
-            mode_widget = getattr(self, f"_{key}_lock", None)
-            if mode_widget is None:
-                return
-            self._synced_field_locks[key] = bool(locked)
-            if key in _TRI_STATE_SYNC_FIELD_KEYS:
-                self._synced_field_modes[key] = "manual" if bool(locked) else "auto"
-            mode_widget.blockSignals(True)
-            try:
-                self._set_combo_value(mode_widget, _lock_to_sync_mode(locked))
-            finally:
-                mode_widget.blockSignals(False)
-
         def _synced_field_mode(self, key: str) -> str:
-            if key in _TRI_STATE_SYNC_FIELD_KEYS:
-                token = str(self._synced_field_modes.get(key, "auto")).strip().lower()
-                if token in {"auto", "manual", "off"}:
-                    return token
-                return "auto"
-            return "manual" if self._synced_field_locks.get(key, False) else "auto"
+            token = str(self._synced_field_modes.get(key, "auto")).strip().lower()
+            allowed_modes = (
+                {"auto", "manual", "off"} if key in _TEXT_SYNC_FIELD_KEYS else {"auto", "manual"}
+            )
+            return token if token in allowed_modes else "auto"
 
         def _set_synced_field_mode(self, key: str, mode: str) -> None:
             normalized = str(mode).strip().lower()
-            if key not in _TRI_STATE_SYNC_FIELD_KEYS:
-                self._set_synced_field_lock(key, normalized == "manual")
-                return
-            if normalized not in {"auto", "manual", "off"}:
+            allowed_modes = (
+                {"auto", "manual", "off"} if key in _TEXT_SYNC_FIELD_KEYS else {"auto", "manual"}
+            )
+            if normalized not in allowed_modes:
                 normalized = "auto"
             self._synced_field_modes[key] = normalized
-            self._synced_field_locks[key] = normalized == "manual"
             mode_widget = getattr(self, f"_{key}_lock", None)
             if mode_widget is not None:
                 mode_widget.blockSignals(True)
@@ -1898,18 +2120,9 @@ def launch_plot_settings_panel(
             field.textEdited.connect(
                 lambda _text, sync_key=key: self._handle_synced_field_edit(sync_key)
             )
-            if allow_off:
-                lock.currentTextChanged.connect(
-                    lambda value, sync_key=key: self._handle_synced_field_mode_changed(
-                        sync_key, value
-                    )
-                )
-            else:
-                lock.currentTextChanged.connect(
-                    lambda value, sync_key=key: self._handle_synced_field_lock_toggled(
-                        sync_key, _sync_mode_to_lock(value)
-                    )
-                )
+            lock.currentTextChanged.connect(
+                lambda value, sync_key=key: self._handle_synced_field_mode_changed(sync_key, value)
+            )
 
         def _apply_preview_state_to_synced_fields(self, settings: dict[str, Any]) -> None:
             self._last_preview_state = dict(settings)
@@ -1921,20 +2134,20 @@ def launch_plot_settings_panel(
                     self.x_label.setText(str(settings.get("x_label") or ""))
                 if self._synced_field_mode("y_label") == "auto":
                     self.y_label.setText(str(settings.get("y_label") or ""))
-                if not self._synced_field_locks.get("x_lim", False):
+                if self._synced_field_mode("x_lim") == "auto":
                     self.x_min.setText(_extract_limit(settings, key="x_lim", index=0))
                     self.x_max.setText(_extract_limit(settings, key="x_lim", index=1))
-                if not self._synced_field_locks.get("y_lim", False):
+                if self._synced_field_mode("y_lim") == "auto":
                     self.y_min.setText(_extract_limit(settings, key="y_lim", index=0))
                     self.y_max.setText(_extract_limit(settings, key="y_lim", index=1))
-                if not self._synced_field_locks.get("x_ticks", False):
+                if self._synced_field_mode("x_ticks") == "auto":
                     self.x_ticks.setText(_format_float_list(settings.get("x_ticks")))
-                if not self._synced_field_locks.get("y_ticks", False):
+                if self._synced_field_mode("y_ticks") == "auto":
                     self.y_ticks.setText(_format_float_list(settings.get("y_ticks")))
-                if not self._synced_field_locks.get("x_label_pad", False):
+                if self._synced_field_mode("x_label_pad") == "auto":
                     x_label_pad = settings.get("x_label_pad")
                     self.x_label_pad.setText("" if x_label_pad is None else str(x_label_pad))
-                if not self._synced_field_locks.get("y_label_pad", False):
+                if self._synced_field_mode("y_label_pad") == "auto":
                     y_label_pad = settings.get("y_label_pad")
                     self.y_label_pad.setText("" if y_label_pad is None else str(y_label_pad))
             finally:
@@ -1948,17 +2161,7 @@ def launch_plot_settings_panel(
             self._update_annotation_preview_summary(self._annotation_active_index)
 
         def _handle_synced_field_edit(self, key: str) -> None:
-            if key in _TRI_STATE_SYNC_FIELD_KEYS:
-                self._set_synced_field_mode(key, "manual")
-            else:
-                self._set_synced_field_lock(key, True)
-
-        def _handle_synced_field_lock_toggled(self, key: str, checked: bool) -> None:
-            self._synced_field_locks[key] = bool(checked)
-            if checked:
-                self._schedule_preview_update()
-                return
-            self._apply_preview_state_to_synced_fields(self._last_preview_state)
+            self._set_synced_field_mode(key, "manual")
             self._schedule_preview_update()
 
         def _handle_synced_field_mode_changed(self, key: str, value: str) -> None:
@@ -1966,7 +2169,7 @@ def launch_plot_settings_panel(
             if normalized not in {"auto", "manual", "off"}:
                 normalized = "auto"
             self._set_synced_field_mode(key, normalized)
-            if normalized == "auto":
+            if self._synced_field_mode(key) == "auto":
                 self._apply_preview_state_to_synced_fields(self._last_preview_state)
             self._refresh_widget_states()
             self._schedule_preview_update()
@@ -2366,6 +2569,7 @@ def launch_plot_settings_panel(
 
             splitter = QSplitter(Qt.Orientation.Horizontal, root)
             splitter.setChildrenCollapsible(False)
+            self._splitter = splitter
             root_layout.addWidget(splitter, stretch=1)
 
             left_panel = QWidget(splitter)
@@ -2428,91 +2632,38 @@ def launch_plot_settings_panel(
             if self._nav_list is not None:
                 self._nav_list.setCurrentRow(0)
 
-            right_panel = QFrame(splitter)
-            right_panel.setObjectName("previewPanel")
-            right_panel.setMinimumWidth(320)
-            right_panel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-            right_layout = QVBoxLayout(right_panel)
-            right_layout.setContentsMargins(14, 14, 14, 14)
-            right_layout.setSpacing(10)
-
-            preview_title = QLabel("Figure Preview")
-            preview_title.setObjectName("pageTitle")
-            right_layout.addWidget(preview_title)
-
-            preview_controls = QHBoxLayout()
-            self._preview_button = QPushButton("Refresh Preview")
-            self._preview_button.clicked.connect(self._handle_preview)
-            self._register_tooltip(self._preview_button, "preview.refresh")
-            self._apply_widget_tooltip(self._preview_button)
-            preview_controls.addWidget(self._preview_button)
-            fit_button = QPushButton("Fit")
-            fit_button.clicked.connect(self._handle_fit_preview)
-            self._register_tooltip(fit_button, "preview.fit")
-            self._apply_widget_tooltip(fit_button)
-            preview_controls.addWidget(fit_button)
-            actual_size_button = QPushButton("100%")
-            actual_size_button.clicked.connect(self._handle_actual_size_preview)
-            self._register_tooltip(actual_size_button, "preview.actual_size")
-            self._apply_widget_tooltip(actual_size_button)
-            preview_controls.addWidget(actual_size_button)
-            transparent_label = QLabel("Transparent save")
-            preview_controls.addWidget(transparent_label)
-            self.transparent_mode = self._combo(_TOGGLE_MODES, minimum_contents_length=4)
-            self.transparent_mode.setEnabled(on_save_figure is not None)
-            self._register_tooltip(self.transparent_mode, "export.transparent")
-            self._apply_widget_tooltip(self.transparent_mode)
-            preview_controls.addWidget(self.transparent_mode)
-            self._save_figure_button = QPushButton("Export Figure")
-            self._save_figure_button.setEnabled(on_save_figure is not None)
-            self._save_figure_button.clicked.connect(self._handle_save_figure)
-            self._register_tooltip(self._save_figure_button, "export.figure")
-            self._apply_widget_tooltip(self._save_figure_button)
-            preview_controls.addWidget(self._save_figure_button)
-            self._auto_preview_checkbox = QCheckBox("Auto update")
-            self._auto_preview_checkbox.setChecked(on_save_figure is not None)
-            self._auto_preview_checkbox.setEnabled(on_save_figure is not None)
-            self._auto_preview_checkbox.toggled.connect(self._handle_auto_preview_toggle)
-            self._register_tooltip(self._auto_preview_checkbox, "preview.auto_update")
-            self._apply_widget_tooltip(self._auto_preview_checkbox)
-            preview_controls.addWidget(self._auto_preview_checkbox)
-            preview_controls.addStretch(1)
-            self._preview_status = QLabel("Preview ready.")
-            preview_controls.addWidget(self._preview_status)
-            right_layout.addLayout(preview_controls)
-
-            self._preview_frame = QFrame(right_panel)
-            self._preview_frame.setObjectName("previewFrame")
-            self._preview_frame.setFrameShape(QFrame.Shape.StyledPanel)
-            self._preview_frame.installEventFilter(self)
-            preview_frame_layout = QVBoxLayout(self._preview_frame)
-            preview_frame_layout.setContentsMargins(6, 6, 6, 6)
-            self._preview_scroll = QScrollArea(self._preview_frame)
-            self._preview_scroll.setWidgetResizable(False)
-            self._preview_scroll.setFrameShape(QFrame.Shape.NoFrame)
-            self._preview_scroll.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            self._preview_scroll.viewport().installEventFilter(self)
-
-            self._preview_label = QLabel("Preview will appear here.\nUse mouse wheel to zoom.")
-            self._preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            self._preview_label.setWordWrap(True)
-            self._preview_label.setMinimumSize(1, 1)
-            self._preview_label.installEventFilter(self)
-            self._preview_scroll.setWidget(self._preview_label)
-            preview_frame_layout.addWidget(self._preview_scroll, stretch=1)
-            right_layout.addWidget(self._preview_frame, stretch=1)
-
-            self._status_label.setObjectName("statusBar")
-            self._status_label.setAlignment(
-                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+            right_panel = _PreviewPane(
+                title_text="Figure Preview",
+                object_name="previewPanel",
+                on_refresh=self._handle_preview,
+                on_fit=self._handle_fit_preview,
+                on_actual_size=self._handle_actual_size_preview,
+                on_save_figure_callback=self._handle_save_figure,
+                on_auto_update=self._handle_auto_preview_toggle,
+                on_detach=self._handle_detach_preview,
+                on_dock=None,
+                register_tooltip=self._register_tooltip,
+                apply_tooltip=self._apply_widget_tooltip,
+                event_filter_owner=self,
+                auto_update_enabled=on_save_figure is not None,
+                parent=splitter,
             )
-            right_layout.addWidget(self._status_label)
+            right_panel.setMinimumWidth(320)
+            self._embedded_preview_pane = right_panel
+            self._activate_preview_pane(right_panel)
 
             splitter.addWidget(left_panel)
             splitter.addWidget(right_panel)
             splitter.setStretchFactor(0, 1)
             splitter.setStretchFactor(1, 1)
             splitter.setSizes([760, 840])
+            self._preview_splitter_sizes = splitter.sizes()
+
+            self._status_label.setObjectName("statusBar")
+            self._status_label.setAlignment(
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+            )
+            root_layout.addWidget(self._status_label)
 
             self._apply_theme_styles()
 
@@ -2612,7 +2763,8 @@ def launch_plot_settings_panel(
                 f"  border: 1px solid {colors['border']};"
                 f"  border-radius: 14px;"
                 f"}}"
-                f"QFrame#navPanel, QFrame#inspectorPanel, QFrame#previewPanel {{"
+                f"QFrame#navPanel, QFrame#inspectorPanel, QFrame#previewPanel, "
+                f"QFrame#detachedPreviewPanel {{"
                 f"  background-color: {colors['panel_bg']};"
                 f"  border: 1px solid {colors['border']};"
                 f"  border-radius: 14px;"
@@ -2869,6 +3021,8 @@ def launch_plot_settings_panel(
                 f"  border-radius: 2px;"
                 f"}}"
             )
+            if self._detached_preview_window is not None:
+                self._detached_preview_window.setStyleSheet(self.styleSheet())
 
         def _register_workspace_page(self, label: str, page: QWidget) -> None:
             if self._page_stack is None or self._nav_list is None:
@@ -2955,6 +3109,10 @@ def launch_plot_settings_panel(
                         self.figure_facecolor,
                         str(parsed.get("facecolor") or ""),
                     )
+                    self._set_line_text_if_different(
+                        self.figure_alpha,
+                        "" if parsed.get("alpha") is None else str(parsed.get("alpha")),
+                    )
                 elif section_key == "line_kwargs":
                     self._set_combo_value(
                         self.line_style,
@@ -2967,6 +3125,17 @@ def launch_plot_settings_panel(
                     self._set_line_text_if_different(
                         self.marker_size,
                         "" if parsed.get("markersize") is None else str(parsed.get("markersize")),
+                    )
+                    marker = str(parsed.get("marker") or "").strip()
+                    self._set_combo_value(self.marker_type, marker)
+                    marker_color = (
+                        parsed.get("markerfacecolor")
+                        if parsed.get("markerfacecolor") is not None
+                        else parsed.get("markeredgecolor")
+                    )
+                    self._set_line_text_if_different(
+                        self.marker_color,
+                        "" if marker_color is None else str(marker_color),
                     )
                 elif section_key == "legend_kwargs":
                     frameon = parsed.get("frameon")
@@ -2994,40 +3163,90 @@ def launch_plot_settings_panel(
                     if which_value in _GRID_WHICH:
                         self._set_combo_value(self.grid_which, which_value)
                 elif section_key == "tick_params_kwargs":
-                    direction = str(parsed.get("direction") or "out").strip().lower()
+                    x_params = parsed.get("_x_tick_params")
+                    y_params = parsed.get("_y_tick_params")
+                    x_params = x_params if isinstance(x_params, dict) else {}
+                    y_params = y_params if isinstance(y_params, dict) else {}
+                    direction = (
+                        str(x_params.get("direction", parsed.get("direction") or "out"))
+                        .strip()
+                        .lower()
+                    )
+                    y_direction = (
+                        str(y_params.get("direction", parsed.get("direction") or "out"))
+                        .strip()
+                        .lower()
+                    )
                     axis_value = (
                         str(parsed.get("_ticks_axis", parsed.get("axis", "both"))).strip().lower()
                     )
-                    minor_value = str(parsed.get("_minor_ticks_mode") or "off").strip().lower()
+                    minor_value = (
+                        str(
+                            parsed.get(
+                                "_x_minor_ticks_mode",
+                                parsed.get("_minor_ticks_mode") or "off",
+                            )
+                        )
+                        .strip()
+                        .lower()
+                    )
+                    y_minor_value = (
+                        str(
+                            parsed.get(
+                                "_y_minor_ticks_mode",
+                                parsed.get("_minor_ticks_mode") or "off",
+                            )
+                        )
+                        .strip()
+                        .lower()
+                    )
                     if direction in _TICK_DIRECTIONS:
-                        self._set_combo_value(self.tick_direction, direction)
+                        self._set_combo_value(self.x_tick_direction, direction)
+                    if y_direction in _TICK_DIRECTIONS:
+                        self._set_combo_value(self.y_tick_direction, y_direction)
                     if axis_value in _TICK_AXES:
-                        current_ticks_value = (
-                            self.ticks_visibility.currentText().strip().lower()
-                            if hasattr(self, "ticks_visibility")
-                            else "both"
-                        )
-                        if current_ticks_value != "none":
-                            self._set_combo_value(self.ticks_visibility, axis_value)
-                    if minor_value in _MINOR_TICKS_MODES:
-                        self._set_combo_value(self.minor_ticks_mode, minor_value)
-                    self._set_line_text_if_different(
-                        self.tick_length,
-                        "" if parsed.get("length") is None else str(parsed.get("length")),
-                    )
-                    self._set_line_text_if_different(
-                        self.tick_width,
-                        "" if parsed.get("width") is None else str(parsed.get("width")),
-                    )
-                elif section_key == "savefig_kwargs":
-                    transparent = parsed.get("transparent")
-                    if isinstance(transparent, bool):
                         self._set_combo_value(
-                            self.transparent_mode,
-                            _toggle_to_mode(transparent, auto_mode="off"),
+                            self.x_ticks_mode, "on" if axis_value in {"x", "both"} else "off"
                         )
-                    else:
-                        self._set_combo_value(self.transparent_mode, "off")
+                        self._set_combo_value(
+                            self.y_ticks_mode, "on" if axis_value in {"y", "both"} else "off"
+                        )
+                    if minor_value in _MINOR_TICKS_MODES:
+                        self._set_combo_value(self.x_minor_ticks_mode, minor_value)
+                    if y_minor_value in _MINOR_TICKS_MODES:
+                        self._set_combo_value(self.y_minor_ticks_mode, y_minor_value)
+                    self._set_line_text_if_different(
+                        self.x_tick_length,
+                        ""
+                        if x_params.get("length", parsed.get("length")) is None
+                        else str(x_params.get("length", parsed.get("length"))),
+                    )
+                    self._set_line_text_if_different(
+                        self.y_tick_length,
+                        ""
+                        if y_params.get("length", parsed.get("length")) is None
+                        else str(y_params.get("length", parsed.get("length"))),
+                    )
+                    self._set_line_text_if_different(
+                        self.x_tick_width,
+                        ""
+                        if x_params.get("width", parsed.get("width")) is None
+                        else str(x_params.get("width", parsed.get("width"))),
+                    )
+                    self._set_line_text_if_different(
+                        self.y_tick_width,
+                        ""
+                        if y_params.get("width", parsed.get("width")) is None
+                        else str(y_params.get("width", parsed.get("width"))),
+                    )
+                    self._set_line_text_if_different(
+                        self.x_tick_font,
+                        "" if x_params.get("labelsize") is None else str(x_params.get("labelsize")),
+                    )
+                    self._set_line_text_if_different(
+                        self.y_tick_font,
+                        "" if y_params.get("labelsize") is None else str(y_params.get("labelsize")),
+                    )
             finally:
                 self._suspend_preview_events = False
                 self._advanced_json_syncing = False
@@ -3082,7 +3301,11 @@ def launch_plot_settings_panel(
             self._refresh_shell_state()
 
         def _refresh_disabled_tooltips(self) -> None:
-            if hasattr(self, "_preview_button") and self._preview_button is not None:
+            if (
+                hasattr(self, "_preview_button")
+                and self._preview_button is not None
+                and self._auto_preview_checkbox is not None
+            ):
                 reason = "Auto Update is on." if self._auto_preview_checkbox.isChecked() else None
                 self._apply_widget_tooltip(
                     self._preview_button,
@@ -3155,7 +3378,10 @@ def launch_plot_settings_panel(
             series_count = len(self._series_labels_data)
             visible_count = sum(1 for value in self._series_enabled_data if value)
             layer_count = series_count + len(self._annotations_data)
-            preview_mode = "Auto" if self._auto_preview_checkbox.isChecked() else "Manual"
+            auto_preview_enabled = (
+                self._auto_preview_checkbox is not None and self._auto_preview_checkbox.isChecked()
+            )
+            preview_mode = "Auto" if auto_preview_enabled else "Manual"
             warnings = _derive_warning_messages(settings, error=error)
             if self._preview_error:
                 warnings = [f"Preview paused: {self._preview_error}"] + list(warnings)
@@ -3194,7 +3420,8 @@ def launch_plot_settings_panel(
         def _handle_fit_preview(self) -> None:
             self._set_preview_zoom(1.0)
             self._refresh_preview_pixmap()
-            self._preview_status.setText("Preview fit to workspace.")
+            if self._preview_status is not None:
+                self._preview_status.setText("Preview fit to workspace.")
 
         def _handle_actual_size_preview(self) -> None:
             if (
@@ -3213,7 +3440,118 @@ def launch_plot_settings_panel(
                 return
             self._set_preview_zoom(1.0 / fit_scale)
             self._refresh_preview_pixmap()
-            self._preview_status.setText("Preview shown at 100%.")
+            if self._preview_status is not None:
+                self._preview_status.setText("Preview shown at 100%.")
+
+        def _activate_preview_pane(
+            self,
+            pane: _PreviewPane,
+            *,
+            auto_update_checked: bool | None = None,
+        ) -> None:
+            if auto_update_checked is None and self._auto_preview_checkbox is not None:
+                auto_update_checked = self._auto_preview_checkbox.isChecked()
+            if auto_update_checked is None:
+                auto_update_checked = on_save_figure is not None
+
+            self._active_preview_pane = pane
+            self._preview_frame = pane.preview_frame
+            self._preview_scroll = pane.preview_scroll
+            self._preview_label = pane.preview_label
+            self._preview_status = pane.preview_status
+            self._preview_button = pane.preview_button
+            self._save_figure_button = pane.save_figure_button
+            self._auto_preview_checkbox = pane.auto_preview_checkbox
+            self._detach_preview_button = pane.detach_button
+            self._dock_preview_button = pane.dock_button
+
+            self._auto_preview_checkbox.blockSignals(True)
+            try:
+                self._auto_preview_checkbox.setChecked(bool(auto_update_checked))
+                self._auto_preview_checkbox.setEnabled(on_save_figure is not None)
+            finally:
+                self._auto_preview_checkbox.blockSignals(False)
+            self._save_figure_button.setEnabled(on_save_figure is not None)
+            self._set_preview_loading(self._preview_loading)
+            self._refresh_preview_pixmap()
+
+        def _handle_detach_preview(self) -> None:
+            if self._detached_preview_window is not None:
+                self._detached_preview_window.raise_()
+                self._detached_preview_window.activateWindow()
+                return
+            if self._embedded_preview_pane is None:
+                return
+            auto_update_checked = (
+                self._auto_preview_checkbox.isChecked()
+                if self._auto_preview_checkbox is not None
+                else on_save_figure is not None
+            )
+            if self._splitter is not None:
+                self._preview_splitter_sizes = self._splitter.sizes()
+
+            detached_window = _DetachedPreviewWindow(
+                on_dock_requested=self._handle_dock_preview,
+                parent=self,
+            )
+            detached_window.setStyleSheet(self.styleSheet())
+            detached_pane = _PreviewPane(
+                title_text="Figure Preview",
+                object_name="detachedPreviewPanel",
+                on_refresh=self._handle_preview,
+                on_fit=self._handle_fit_preview,
+                on_actual_size=self._handle_actual_size_preview,
+                on_save_figure_callback=self._handle_save_figure,
+                on_auto_update=self._handle_auto_preview_toggle,
+                on_detach=None,
+                on_dock=self._handle_dock_preview,
+                register_tooltip=self._register_tooltip,
+                apply_tooltip=self._apply_widget_tooltip,
+                event_filter_owner=self,
+                auto_update_enabled=on_save_figure is not None,
+                parent=detached_window,
+            )
+            detached_window.setCentralWidget(detached_pane)
+            self._detached_preview_window = detached_window
+            self._detached_preview_pane = detached_pane
+            self._embedded_preview_pane.setVisible(False)
+            if self._splitter is not None:
+                left_width = max(1, sum(self._preview_splitter_sizes or [1]))
+                self._splitter.setSizes([left_width, 0])
+
+            self._activate_preview_pane(detached_pane, auto_update_checked=auto_update_checked)
+            detached_window.resize(1100, 820)
+            detached_window.show()
+            self._status_label.setText("Preview detached to a separate window.")
+            self._refresh_shell_state()
+            QTimer.singleShot(0, self._refresh_preview_pixmap)
+
+        def _handle_dock_preview(self) -> None:
+            if self._detached_preview_window is None or self._embedded_preview_pane is None:
+                return
+            auto_update_checked = (
+                self._auto_preview_checkbox.isChecked()
+                if self._auto_preview_checkbox is not None
+                else on_save_figure is not None
+            )
+            detached_window = self._detached_preview_window
+            self._detached_preview_window = None
+            self._detached_preview_pane = None
+
+            self._embedded_preview_pane.setVisible(True)
+            self._activate_preview_pane(
+                self._embedded_preview_pane,
+                auto_update_checked=auto_update_checked,
+            )
+            if self._splitter is not None:
+                sizes = self._preview_splitter_sizes or [760, 840]
+                self._splitter.setSizes(sizes)
+
+            detached_window.close_from_dock()
+            detached_window.deleteLater()
+            self._status_label.setText("Preview docked in the workspace.")
+            self._refresh_shell_state()
+            QTimer.singleShot(0, self._refresh_preview_pixmap)
 
         def _build_content_page(self) -> QWidget:
             self._tab_data = QWidget()
@@ -3261,28 +3599,24 @@ def launch_plot_settings_panel(
             hint.setObjectName("sectionNote")
             layout.addWidget(hint)
             self._figure_tabs = None
-            self._tab_text_content = QGroupBox("Text & Labels")
-            layout.addWidget(self._tab_text_content)
+            self._tab_canvas_content = QGroupBox("Canvas & Typography")
+            layout.addWidget(self._tab_canvas_content)
+            self._tab_lines_content = QGroupBox("Lines & Markers")
+            self._figure_lines_section = self._tab_lines_content
+            layout.addWidget(self._tab_lines_content)
+            self._tab_axes_content = QGroupBox("Axes, Ticks & Grid")
+            layout.addWidget(self._tab_axes_content)
             self._tab_legend_content = QGroupBox("Legend")
             layout.addWidget(self._tab_legend_content)
-            self._tab_axes_content = QGroupBox("Axes & Limits")
-            layout.addWidget(self._tab_axes_content)
-            self._tab_ticks_grid_content = QGroupBox("Ticks & Grid")
-            layout.addWidget(self._tab_ticks_grid_content)
-            self._tab_lines_content = QGroupBox("Line / Marker Style")
-            layout.addWidget(self._tab_lines_content)
-            self._tab_heatmap_content = QGroupBox("Heatmap / Colorbar")
+            self._tab_heatmap_content = QGroupBox("Heatmap & Colorbar")
+            self._figure_heatmap_section = self._tab_heatmap_content
             layout.addWidget(self._tab_heatmap_content)
-            self._tab_canvas_content = QGroupBox("Canvas / Font / Figure Size")
-            layout.addWidget(self._tab_canvas_content)
 
-            self._build_text_tab()
-            self._build_legend_tab()
-            self._build_axes_tab()
-            self._build_ticks_grid_tab()
-            self._build_lines_tab()
-            self._build_heatmap_tab()
             self._build_canvas_tab()
+            self._build_lines_tab()
+            self._build_axes_tab()
+            self._build_legend_tab()
+            self._build_heatmap_tab()
             layout.addStretch(1)
             return page
 
@@ -3383,53 +3717,18 @@ def launch_plot_settings_panel(
             self._sync_profile_selector()
             return page
 
-        def _build_export_page(self) -> QWidget:
-            page = QWidget()
-            content = self._make_scrollable_tab(page)
-            layout = QVBoxLayout(content)
-            layout.setSpacing(12)
-
-            export_group = QGroupBox("Figure Export")
-            export_form = QFormLayout(export_group)
-            self.transparent_mode = self._combo(_TOGGLE_MODES)
-            self._add_form_row(
-                export_form,
-                "Transparent save",
-                self.transparent_mode,
-                tooltip_id="export.transparent",
-            )
-            export_note = QLabel(
-                "Export creates an image file from the current preview. It does not replace saving the current plot profile."
-            )
-            export_note.setWordWrap(True)
-            export_form.addRow("", export_note)
-            layout.addWidget(export_group)
-
-            actions_group = QGroupBox("Export Actions")
-            actions_layout = QGridLayout(actions_group)
-
-            def _page_button(label: str, callback: Callable[[], None]) -> QPushButton:
-                button = QPushButton(label)
-                button.clicked.connect(callback)
-                return button
-
-            export_button = _page_button("Export Figure", self._handle_save_figure)
-            export_button.setEnabled(on_save_figure is not None)
-            self._register_tooltip(export_button, "export.figure")
-            self._apply_widget_tooltip(export_button)
-            actions_layout.addWidget(export_button, 0, 0)
-            layout.addWidget(actions_group)
-            layout.addStretch(1)
-            return page
-
         def _build_advanced_page(self) -> QWidget:
             self._tab_advanced = QWidget()
             self._tab_advanced_content = self._make_scrollable_tab(self._tab_advanced)
             self._build_advanced_tab()
             return self._tab_advanced
 
-        def _build_text_tab(self) -> None:
-            form = QFormLayout(self._tab_text_content)
+        def _build_axes_tab(self) -> None:
+            layout = QVBoxLayout(self._tab_axes_content)
+            layout.setSpacing(12)
+
+            top_form = QFormLayout()
+
             title_row, self.title_text, title_lock = self._lockable_line(
                 placeholder="Leave blank to hide the title",
                 allow_off=True,
@@ -3442,27 +3741,344 @@ def launch_plot_settings_panel(
                 placeholder="e.g. Density ($g/cm^3$)",
                 allow_off=True,
             )
+
             self._connect_lockable_line("title", self.title_text, title_lock, allow_off=True)
             self._connect_lockable_line("x_label", self.x_label, x_label_lock, allow_off=True)
             self._connect_lockable_line("y_label", self.y_label, y_label_lock, allow_off=True)
-            self.title_font = self._line()
 
-            self._add_form_row(form, "Title", title_row, tooltip_id="figure.text.title")
-            self._add_form_row(form, "X label", x_label_row, tooltip_id="figure.text.x_label")
-            self._add_form_row(form, "Y label", y_label_row, tooltip_id="figure.text.y_label")
+            self.title_font = self._positive_int_line()
+
+            self._add_form_row(top_form, "Title", title_row, tooltip_id="figure.text.title")
             self._add_form_row(
-                form,
+                top_form,
                 "Title font",
                 self.title_font,
                 tooltip_id="figure.text.title_font",
             )
-            math_hint = QLabel("Math labels: e.g. $cm^3$, $\\Delta G$, $\\rho$.")
-            math_hint.setWordWrap(True)
-            self._add_form_row(form, "", math_hint)
-            self._title_rows = [(form, self.title_font)]
+
+            layout.addLayout(top_form)
+
+            x_axis_box = QGroupBox("X-axis")
+            x_axis_form = QFormLayout(x_axis_box)
+
+            self.x_label_font = self._positive_int_line()
+            self.x_scale = self._combo(("linear", "log", "symlog", "logit"))
+            x_limits_row, self.x_min, self.x_max, x_limits_lock = self._lockable_pair()
+            self._connect_lockable_line("x_lim", self.x_min, x_limits_lock)
+            self.x_max.textEdited.connect(lambda _text: self._handle_synced_field_edit("x_lim"))
+
+            x_label_pad_row, self.x_label_pad, x_label_pad_lock = self._lockable_line(
+                placeholder="points"
+            )
+            self._connect_lockable_line("x_label_pad", self.x_label_pad, x_label_pad_lock)
+
+            self._add_form_row(
+                x_axis_form, "X label", x_label_row, tooltip_id="figure.text.x_label"
+            )
+            self._add_form_row(
+                x_axis_form,
+                "X label font",
+                self.x_label_font,
+                tooltip_id="figure.axes.x_label_font",
+            )
+            self._add_form_row(
+                x_axis_form,
+                "X scale",
+                self.x_scale,
+                tooltip_id="figure.axes.x_scale",
+            )
+            self._add_form_row(
+                x_axis_form,
+                "X min / max",
+                x_limits_row,
+                tooltip_id="figure.axes.x_limits",
+            )
+            self._add_form_row(
+                x_axis_form,
+                "X label pad",
+                x_label_pad_row,
+                tooltip_id="figure.axes.x_label_pad",
+            )
+
+            x_ticks_box = QGroupBox("X ticks")
+            x_ticks_form = QFormLayout(x_ticks_box)
+            self.x_ticks_mode = self._combo(_TOGGLE_MODES)
+            self.x_ticks_mode.currentTextChanged.connect(self._refresh_widget_states)
+            x_ticks_row, self.x_ticks, x_ticks_lock = self._lockable_line(
+                placeholder="e.g. 0, 1, 2"
+            )
+            self._connect_lockable_line("x_ticks", self.x_ticks, x_ticks_lock)
+            self.x_tick_rotation = self._bounded_float_line("degrees")
+            self.x_tick_font = self._positive_int_line()
+            self.x_tick_direction = self._combo(_TICK_DIRECTIONS)
+            self.x_tick_length = self._bounded_float_line("points", bottom=0.0)
+            self.x_tick_width = self._bounded_float_line("points", bottom=0.0)
+            self.x_minor_ticks_mode = self._combo(_MINOR_TICKS_MODES)
+            self._add_form_row(
+                x_ticks_form,
+                "Show ticks",
+                self.x_ticks_mode,
+                tooltip_id="figure.ticks.show",
+            )
+            self._add_form_row(
+                x_ticks_form,
+                "Ticks",
+                x_ticks_row,
+                tooltip_id="figure.ticks.x_ticks",
+            )
+            self._add_form_row(
+                x_ticks_form,
+                "Rotation",
+                self.x_tick_rotation,
+                tooltip_id="figure.ticks.x_rotation",
+            )
+            self._add_form_row(
+                x_ticks_form,
+                "Font size",
+                self.x_tick_font,
+                tooltip_id="figure.ticks.font",
+            )
+            self._add_form_row(
+                x_ticks_form,
+                "Direction",
+                self.x_tick_direction,
+                tooltip_id="figure.ticks.direction",
+            )
+            self._add_form_row(
+                x_ticks_form,
+                "Length",
+                self.x_tick_length,
+                tooltip_id="figure.ticks.length",
+            )
+            self._add_form_row(
+                x_ticks_form,
+                "Width",
+                self.x_tick_width,
+                tooltip_id="figure.ticks.width",
+            )
+            self._add_form_row(
+                x_ticks_form,
+                "Minor ticks",
+                self.x_minor_ticks_mode,
+                tooltip_id="figure.ticks.minor",
+            )
+            self._x_ticks_rows = [
+                (x_ticks_form, x_ticks_row),
+                (x_ticks_form, self.x_tick_rotation),
+                (x_ticks_form, self.x_tick_font),
+                (x_ticks_form, self.x_tick_direction),
+                (x_ticks_form, self.x_tick_length),
+                (x_ticks_form, self.x_tick_width),
+                (x_ticks_form, self.x_minor_ticks_mode),
+            ]
+            layout.addWidget(x_axis_box)
+            layout.addWidget(x_ticks_box)
+
+            y_axis_box = QGroupBox("Y-axis")
+            y_axis_form = QFormLayout(y_axis_box)
+
+            self.y_label_font = self._positive_int_line()
+            self.y_scale = self._combo(("linear", "log", "symlog", "logit"))
+            y_limits_row, self.y_min, self.y_max, y_limits_lock = self._lockable_pair()
+            self._connect_lockable_line("y_lim", self.y_min, y_limits_lock)
+            self.y_max.textEdited.connect(lambda _text: self._handle_synced_field_edit("y_lim"))
+
+            y_label_pad_row, self.y_label_pad, y_label_pad_lock = self._lockable_line(
+                placeholder="points"
+            )
+            self._connect_lockable_line("y_label_pad", self.y_label_pad, y_label_pad_lock)
+
+            self._add_form_row(
+                y_axis_form, "Y label", y_label_row, tooltip_id="figure.text.y_label"
+            )
+            self._add_form_row(
+                y_axis_form,
+                "Y label font",
+                self.y_label_font,
+                tooltip_id="figure.axes.y_label_font",
+            )
+            self._add_form_row(
+                y_axis_form,
+                "Y scale",
+                self.y_scale,
+                tooltip_id="figure.axes.y_scale",
+            )
+            self._add_form_row(
+                y_axis_form,
+                "Y min / max",
+                y_limits_row,
+                tooltip_id="figure.axes.y_limits",
+            )
+            self._add_form_row(
+                y_axis_form,
+                "Y label pad",
+                y_label_pad_row,
+                tooltip_id="figure.axes.y_label_pad",
+            )
+
+            y_ticks_box = QGroupBox("Y ticks")
+            y_ticks_form = QFormLayout(y_ticks_box)
+            self.y_ticks_mode = self._combo(_TOGGLE_MODES)
+            self.y_ticks_mode.currentTextChanged.connect(self._refresh_widget_states)
+            y_ticks_row, self.y_ticks, y_ticks_lock = self._lockable_line(
+                placeholder="e.g. 0, 5, 10"
+            )
+            self._connect_lockable_line("y_ticks", self.y_ticks, y_ticks_lock)
+            self.y_tick_rotation = self._bounded_float_line("degrees")
+            self.y_tick_font = self._positive_int_line()
+            self.y_tick_direction = self._combo(_TICK_DIRECTIONS)
+            self.y_tick_length = self._bounded_float_line("points", bottom=0.0)
+            self.y_tick_width = self._bounded_float_line("points", bottom=0.0)
+            self.y_minor_ticks_mode = self._combo(_MINOR_TICKS_MODES)
+            self._add_form_row(
+                y_ticks_form,
+                "Show ticks",
+                self.y_ticks_mode,
+                tooltip_id="figure.ticks.show",
+            )
+            self._add_form_row(
+                y_ticks_form,
+                "Ticks",
+                y_ticks_row,
+                tooltip_id="figure.ticks.y_ticks",
+            )
+            self._add_form_row(
+                y_ticks_form,
+                "Rotation",
+                self.y_tick_rotation,
+                tooltip_id="figure.ticks.y_rotation",
+            )
+            self._add_form_row(
+                y_ticks_form,
+                "Font size",
+                self.y_tick_font,
+                tooltip_id="figure.ticks.font",
+            )
+            self._add_form_row(
+                y_ticks_form,
+                "Direction",
+                self.y_tick_direction,
+                tooltip_id="figure.ticks.direction",
+            )
+            self._add_form_row(
+                y_ticks_form,
+                "Length",
+                self.y_tick_length,
+                tooltip_id="figure.ticks.length",
+            )
+            self._add_form_row(
+                y_ticks_form,
+                "Width",
+                self.y_tick_width,
+                tooltip_id="figure.ticks.width",
+            )
+            self._add_form_row(
+                y_ticks_form,
+                "Minor ticks",
+                self.y_minor_ticks_mode,
+                tooltip_id="figure.ticks.minor",
+            )
+            self._y_ticks_rows = [
+                (y_ticks_form, y_ticks_row),
+                (y_ticks_form, self.y_tick_rotation),
+                (y_ticks_form, self.y_tick_font),
+                (y_ticks_form, self.y_tick_direction),
+                (y_ticks_form, self.y_tick_length),
+                (y_ticks_form, self.y_tick_width),
+                (y_ticks_form, self.y_minor_ticks_mode),
+            ]
+            layout.addWidget(y_axis_box)
+            layout.addWidget(y_ticks_box)
+
+            grid_box = QGroupBox("Grid")
+            grid_form = QFormLayout(grid_box)
+            self.grid_mode = self._combo(_TOGGLE_MODES)
+            self.grid_mode.currentTextChanged.connect(self._refresh_widget_states)
+            self.grid_linestyle = self._combo(("-", "--", "-.", ":", ""), editable=True)
+            self.grid_linewidth = self._bounded_float_line(bottom=0.0)
+            self.grid_alpha = self._bounded_float_line(bottom=0.0, top=1.0)
+            grid_color_row, self.grid_color = self._color_field(
+                placeholder="#dddddd",
+                tooltip_id="figure.grid.color",
+            )
+            self.grid_axis = self._combo(_GRID_AXES)
+            self.grid_which = self._combo(_GRID_WHICH)
+            self._add_form_row(
+                grid_form, "Show grid", self.grid_mode, tooltip_id="figure.grid.show"
+            )
+            self._add_form_row(
+                grid_form,
+                "Line style",
+                self.grid_linestyle,
+                tooltip_id="figure.grid.line_style",
+            )
+            self._add_form_row(
+                grid_form,
+                "Line width",
+                self.grid_linewidth,
+                tooltip_id="figure.grid.line_width",
+            )
+            self._add_form_row(
+                grid_form,
+                "Alpha",
+                self.grid_alpha,
+                tooltip_id="figure.grid.alpha",
+            )
+            self._add_form_row(grid_form, "Color", grid_color_row, tooltip_id="figure.grid.color")
+            self._add_form_row(grid_form, "Axis", self.grid_axis, tooltip_id="figure.grid.axis")
+            self._add_form_row(grid_form, "Lines", self.grid_which, tooltip_id="figure.grid.lines")
+            self._grid_rows = [
+                (grid_form, self.grid_linestyle),
+                (grid_form, self.grid_linewidth),
+                (grid_form, self.grid_alpha),
+                (grid_form, grid_color_row),
+                (grid_form, self.grid_axis),
+                (grid_form, self.grid_which),
+            ]
+            layout.addWidget(grid_box)
+
+            border_box = QGroupBox("Border")
+            border_form = QFormLayout(border_box)
+
+            self.axes_border_mode = self._combo(_BORDER_MODES)
+
+            sides_widget = QWidget()
+            sides_layout = QHBoxLayout(sides_widget)
+            sides_layout.setContentsMargins(0, 0, 0, 0)
+            self.border_left = QCheckBox("Left")
+            self.border_right = QCheckBox("Right")
+            self.border_top = QCheckBox("Top")
+            self.border_bottom = QCheckBox("Bottom")
+            for cb in (self.border_left, self.border_right, self.border_top, self.border_bottom):
+                cb.setChecked(True)
+                sides_layout.addWidget(cb)
+            sides_layout.addStretch(1)
+
+            self._add_form_row(
+                border_form,
+                "Plot border",
+                self.axes_border_mode,
+                tooltip_id="figure.axes.border",
+            )
+            self._add_form_row(
+                border_form,
+                "Sides",
+                sides_widget,
+                tooltip_id="figure.axes.border_sides",
+            )
+
+            self._border_custom_rows = [(border_form, sides_widget)]
+            self.axes_border_mode.currentTextChanged.connect(self._refresh_widget_states)
+
+            layout.addWidget(border_box)
+
+            self._title_rows = [(top_form, self.title_font)]
             self._title_detail_widgets = [self.title_text]
             self._x_label_detail_widgets = [self.x_label]
             self._y_label_detail_widgets = [self.y_label]
+            self._ticks_rows = self._x_ticks_rows + self._y_ticks_rows
+
+            layout.addStretch(1)
 
         def _build_legend_tab(self) -> None:
             form = QFormLayout(self._tab_legend_content)
@@ -3472,8 +4088,8 @@ def launch_plot_settings_panel(
             self.legend_title = self._line()
             self.legend_loc = self._combo(_LEGEND_LOCATIONS)
             self.legend_frame_mode = self._combo(_TOGGLE_MODES)
-            self.legend_columns = self._line("1")
-            self.legend_font = self._line()
+            self.legend_columns = self._positive_int_line("1")
+            self.legend_font = self._positive_int_line()
             self._add_form_row(form, "Legend", self.legend_mode, tooltip_id="figure.legend.enabled")
             self._add_form_row(
                 form,
@@ -3514,249 +4130,25 @@ def launch_plot_settings_panel(
                 (form, self.legend_font),
             ]
 
-        def _build_axes_tab(self) -> None:
-            layout = QVBoxLayout(self._tab_axes_content)
-            self.x_scale = self._combo(("linear", "log", "symlog", "logit"))
-            self.y_scale = self._combo(("linear", "log", "symlog", "logit"))
-            self.axes_border_mode = self._combo(_BORDER_MODES)
-            top_form = QFormLayout()
-            self._add_form_row(top_form, "X scale", self.x_scale, tooltip_id="figure.axes.x_scale")
-            self._add_form_row(top_form, "Y scale", self.y_scale, tooltip_id="figure.axes.y_scale")
-            self._add_form_row(
-                top_form,
-                "Plot border",
-                self.axes_border_mode,
-                tooltip_id="figure.axes.border",
-            )
-            sides_widget = QWidget()
-            sides_layout = QHBoxLayout(sides_widget)
-            sides_layout.setContentsMargins(0, 0, 0, 0)
-            self.border_left = QCheckBox("Left")
-            self.border_right = QCheckBox("Right")
-            self.border_top = QCheckBox("Top")
-            self.border_bottom = QCheckBox("Bottom")
-            for cb in (self.border_left, self.border_right, self.border_top, self.border_bottom):
-                cb.setChecked(True)
-                sides_layout.addWidget(cb)
-            sides_layout.addStretch(1)
-            self._add_form_row(
-                top_form,
-                "Sides",
-                sides_widget,
-                tooltip_id="figure.axes.border_sides",
-            )
-            self._border_custom_rows = [(top_form, sides_widget)]
-            self.axes_border_mode.currentTextChanged.connect(self._refresh_widget_states)
-            layout.addLayout(top_form)
-
-            limits = QGroupBox("Limits")
-            limits_form = QFormLayout(limits)
-            x_limits_row, self.x_min, self.x_max, x_limits_lock = self._lockable_pair()
-            y_limits_row, self.y_min, self.y_max, y_limits_lock = self._lockable_pair()
-            self._connect_lockable_line("x_lim", self.x_min, x_limits_lock)
-            self.x_max.textEdited.connect(lambda _text: self._handle_synced_field_edit("x_lim"))
-            self._connect_lockable_line("y_lim", self.y_min, y_limits_lock)
-            self.y_max.textEdited.connect(lambda _text: self._handle_synced_field_edit("y_lim"))
-            self._add_form_row(
-                limits_form,
-                "X min / max",
-                x_limits_row,
-                tooltip_id="figure.axes.x_limits",
-            )
-            self._add_form_row(
-                limits_form,
-                "Y min / max",
-                y_limits_row,
-                tooltip_id="figure.axes.y_limits",
-            )
-            layout.addWidget(limits)
-
-            label_spacing = QGroupBox("Label Spacing")
-            label_spacing_form = QFormLayout(label_spacing)
-            x_label_pad_row, self.x_label_pad, x_label_pad_lock = self._lockable_line(
-                placeholder="points"
-            )
-            y_label_pad_row, self.y_label_pad, y_label_pad_lock = self._lockable_line(
-                placeholder="points"
-            )
-            self._connect_lockable_line("x_label_pad", self.x_label_pad, x_label_pad_lock)
-            self._connect_lockable_line("y_label_pad", self.y_label_pad, y_label_pad_lock)
-            self._add_form_row(
-                label_spacing_form,
-                "X label pad",
-                x_label_pad_row,
-                tooltip_id="figure.axes.x_label_pad",
-            )
-            self._add_form_row(
-                label_spacing_form,
-                "Y label pad",
-                y_label_pad_row,
-                tooltip_id="figure.axes.y_label_pad",
-            )
-            self.label_font = self._line()
-            self._add_form_row(
-                label_spacing_form,
-                "Label font",
-                self.label_font,
-                tooltip_id="figure.axes.label_font",
-            )
-            layout.addWidget(label_spacing)
-            layout.addStretch(1)
-
-        def _build_ticks_grid_tab(self) -> None:
-            layout = QVBoxLayout(self._tab_ticks_grid_content)
-            ticks = QGroupBox("Ticks")
-            ticks_form = QFormLayout(ticks)
-            self.ticks_visibility = self._combo(_TICK_VISIBILITY_MODES)
-            self.ticks_visibility.currentTextChanged.connect(self._refresh_widget_states)
-            self.tick_font = self._line()
-            self.tick_direction = self._combo(_TICK_DIRECTIONS)
-            self.tick_length = self._line("points")
-            self.tick_width = self._line("points")
-            self.minor_ticks_mode = self._combo(_MINOR_TICKS_MODES)
-            x_ticks_row, self.x_ticks, x_ticks_lock = self._lockable_line(
-                placeholder="e.g. 0, 1, 2"
-            )
-            y_ticks_row, self.y_ticks, y_ticks_lock = self._lockable_line(
-                placeholder="e.g. 0, 5, 10"
-            )
-            self._connect_lockable_line("x_ticks", self.x_ticks, x_ticks_lock)
-            self._connect_lockable_line("y_ticks", self.y_ticks, y_ticks_lock)
-            self.x_tick_rotation = self._line("degrees")
-            self.y_tick_rotation = self._line("degrees")
-            self._add_form_row(
-                ticks_form,
-                "Show ticks",
-                self.ticks_visibility,
-                tooltip_id="figure.ticks.show",
-            )
-            self._add_form_row(
-                ticks_form,
-                "X ticks",
-                x_ticks_row,
-                tooltip_id="figure.ticks.x_ticks",
-            )
-            self._add_form_row(
-                ticks_form,
-                "Y ticks",
-                y_ticks_row,
-                tooltip_id="figure.ticks.y_ticks",
-            )
-            self._add_form_row(
-                ticks_form,
-                "X rotation",
-                self.x_tick_rotation,
-                tooltip_id="figure.ticks.x_rotation",
-            )
-            self._add_form_row(
-                ticks_form,
-                "Y rotation",
-                self.y_tick_rotation,
-                tooltip_id="figure.ticks.y_rotation",
-            )
-            self._add_form_row(
-                ticks_form,
-                "Tick font",
-                self.tick_font,
-                tooltip_id="figure.ticks.font",
-            )
-            self._add_form_row(
-                ticks_form,
-                "Direction",
-                self.tick_direction,
-                tooltip_id="figure.ticks.direction",
-            )
-            self._add_form_row(
-                ticks_form,
-                "Length",
-                self.tick_length,
-                tooltip_id="figure.ticks.length",
-            )
-            self._add_form_row(
-                ticks_form,
-                "Width",
-                self.tick_width,
-                tooltip_id="figure.ticks.width",
-            )
-            self._add_form_row(
-                ticks_form,
-                "Minor ticks",
-                self.minor_ticks_mode,
-                tooltip_id="figure.ticks.minor",
-            )
-            layout.addWidget(ticks)
-
-            grid = QGroupBox("Grid")
-            grid_form = QFormLayout(grid)
-            self.grid_mode = self._combo(_TOGGLE_MODES)
-            self.grid_mode.currentTextChanged.connect(self._refresh_widget_states)
-            self.grid_linestyle = self._combo(("-", "--", "-.", ":", ""), editable=True)
-            self.grid_linewidth = self._line()
-            self.grid_alpha = self._line()
-            grid_color_row, self.grid_color = self._color_field(
-                placeholder="#dddddd",
-                tooltip_id="figure.grid.color",
-            )
-            self.grid_axis = self._combo(_GRID_AXES)
-            self.grid_which = self._combo(_GRID_WHICH)
-            self._add_form_row(
-                grid_form, "Show grid", self.grid_mode, tooltip_id="figure.grid.show"
-            )
-            self._add_form_row(
-                grid_form,
-                "Line style",
-                self.grid_linestyle,
-                tooltip_id="figure.grid.line_style",
-            )
-            self._add_form_row(
-                grid_form,
-                "Line width",
-                self.grid_linewidth,
-                tooltip_id="figure.grid.line_width",
-            )
-            self._add_form_row(
-                grid_form,
-                "Alpha",
-                self.grid_alpha,
-                tooltip_id="figure.grid.alpha",
-            )
-            self._add_form_row(grid_form, "Color", grid_color_row, tooltip_id="figure.grid.color")
-            self._add_form_row(grid_form, "Axis", self.grid_axis, tooltip_id="figure.grid.axis")
-            self._add_form_row(grid_form, "Lines", self.grid_which, tooltip_id="figure.grid.lines")
-            layout.addWidget(grid)
-            layout.addStretch(1)
-
-            self._ticks_rows = [
-                (ticks_form, x_ticks_row),
-                (ticks_form, y_ticks_row),
-                (ticks_form, self.x_tick_rotation),
-                (ticks_form, self.y_tick_rotation),
-                (ticks_form, self.tick_font),
-                (ticks_form, self.tick_direction),
-                (ticks_form, self.tick_length),
-                (ticks_form, self.tick_width),
-                (ticks_form, self.minor_ticks_mode),
-            ]
-            self._grid_rows = [
-                (grid_form, self.grid_linestyle),
-                (grid_form, self.grid_linewidth),
-                (grid_form, self.grid_alpha),
-                (grid_form, grid_color_row),
-                (grid_form, self.grid_axis),
-                (grid_form, self.grid_which),
-            ]
-
         def _build_lines_tab(self) -> None:
             layout = QVBoxLayout(self._tab_lines_content)
-            lines = QGroupBox("Lines and Markers")
+            lines = QGroupBox("Base Line Style")
             self._figure_lines_group = lines
             lines_form = QFormLayout(lines)
-            self.line_width = self._line()
+            self.line_width = self._bounded_float_line(bottom=0.0)
             self.line_style = self._combo(("-", "--", "-.", ":", ""), editable=True)
-            self.line_alpha = self._line("0.0 - 1.0")
+            self.line_alpha = self._bounded_float_line("0.0 - 1.0", bottom=0.0, top=1.0)
             self.markers_mode = self._combo(_TOGGLE_MODES)
             self.markers_mode.currentTextChanged.connect(self._refresh_widget_states)
-            self.marker_size = self._line("e.g. 5")
+            self.marker_size = self._bounded_float_line("e.g. 5", bottom=0.0)
+            self.marker_type = self._combo(
+                ("", "o", "s", "^", "v", "D", "x", "+", ".", ","),
+                editable=True,
+            )
+            marker_color_row, self.marker_color = self._color_field(
+                placeholder="auto",
+                tooltip_id="figure.lines.marker_color",
+            )
             self._add_form_row(
                 lines_form,
                 "Line width",
@@ -3787,9 +4179,25 @@ def launch_plot_settings_panel(
                 self.marker_size,
                 tooltip_id="figure.lines.marker_size",
             )
+            self._add_form_row(
+                lines_form,
+                "Marker type",
+                self.marker_type,
+                tooltip_id="figure.lines.marker_type",
+            )
+            self._add_form_row(
+                lines_form,
+                "Marker color",
+                marker_color_row,
+                tooltip_id="figure.lines.marker_color",
+            )
             layout.addWidget(lines)
             layout.addStretch(1)
-            self._marker_rows = [(lines_form, self.marker_size)]
+            self._marker_rows = [
+                (lines_form, self.marker_size),
+                (lines_form, self.marker_type),
+                (lines_form, marker_color_row),
+            ]
 
         def _build_heatmap_tab(self) -> None:
             layout = QVBoxLayout(self._tab_heatmap_content)
@@ -3926,16 +4334,23 @@ def launch_plot_settings_panel(
 
         def _build_canvas_tab(self) -> None:
             form = QFormLayout(self._tab_canvas_content)
-            self.fig_width = self._line()
-            self.fig_height = self._line()
-            self.dpi = self._line()
+            self.fig_width = self._bounded_float_line(bottom=0.0)
+            self.fig_height = self._bounded_float_line(bottom=0.0)
+            self.dpi = self._positive_int_line()
             self.font_family = self._line()
-            self.base_font_size = self._line()
+            self.base_font_size = self._positive_int_line()
             self.base_font_size.setPlaceholderText(str(DEFAULT_PLOT_STYLE.base_font_size))
             self.base_font_size.textChanged.connect(self._handle_base_font_size_changed)
+            self.base_font_size.editingFinished.connect(self._on_base_font_size_committed)
+            self._last_resolved_base_font_size: int = int(DEFAULT_PLOT_STYLE.base_font_size)
             figure_facecolor_row, self.figure_facecolor = self._color_field(
                 placeholder="#ffffff",
                 tooltip_id="figure.canvas.facecolor",
+            )
+            self.figure_alpha = self._bounded_float_line("0.0 - 1.0", bottom=0.0, top=1.0)
+            font_color_row, self.font_color = self._color_field(
+                placeholder="#000000",
+                tooltip_id="figure.canvas.font_color",
             )
             self._add_form_row(
                 form,
@@ -3964,9 +4379,21 @@ def launch_plot_settings_panel(
             )
             self._add_form_row(
                 form,
+                "Base font color",
+                font_color_row,
+                tooltip_id="figure.canvas.font_color",
+            )
+            self._add_form_row(
+                form,
                 "Figure facecolor",
                 figure_facecolor_row,
                 tooltip_id="figure.canvas.facecolor",
+            )
+            self._add_form_row(
+                form,
+                "Figure alpha",
+                self.figure_alpha,
+                tooltip_id="figure.canvas.alpha",
             )
 
         def _resolved_base_font_size_value(self) -> int:
@@ -3984,10 +4411,16 @@ def launch_plot_settings_panel(
             self.title_font.setPlaceholderText(
                 _font_size_placeholder_text(defaults["title_font_size"])
             )
-            self.label_font.setPlaceholderText(
+            self.x_label_font.setPlaceholderText(
                 _font_size_placeholder_text(defaults["label_font_size"])
             )
-            self.tick_font.setPlaceholderText(
+            self.y_label_font.setPlaceholderText(
+                _font_size_placeholder_text(defaults["label_font_size"])
+            )
+            self.x_tick_font.setPlaceholderText(
+                _font_size_placeholder_text(defaults["tick_font_size"])
+            )
+            self.y_tick_font.setPlaceholderText(
                 _font_size_placeholder_text(defaults["tick_font_size"])
             )
             self.legend_font.setPlaceholderText(
@@ -3996,6 +4429,26 @@ def launch_plot_settings_panel(
 
         def _handle_base_font_size_changed(self, *_unused: object) -> None:
             self._refresh_font_size_placeholders()
+
+        def _on_base_font_size_committed(self) -> None:
+            new_base = self._resolved_base_font_size_value()
+            old_base = self._last_resolved_base_font_size
+            if old_base == new_base:
+                return
+            old_auto = default_plot_font_sizes(old_base)
+            new_auto = default_plot_font_sizes(new_base)
+            pairs = [
+                (self.title_font, "title_font_size"),
+                (self.x_label_font, "label_font_size"),
+                (self.y_label_font, "label_font_size"),
+                (self.x_tick_font, "tick_font_size"),
+                (self.y_tick_font, "tick_font_size"),
+                (self.legend_font, "legend_font_size"),
+            ]
+            for widget, key in pairs:
+                if widget.text().strip() == str(old_auto[key]):
+                    widget.setText(str(new_auto[key]))
+            self._last_resolved_base_font_size = new_base
 
         def _build_series_tab(self) -> None:
             layout = QVBoxLayout(self._tab_series_content)
@@ -4051,11 +4504,13 @@ def launch_plot_settings_panel(
             )
             panel_note.setWordWrap(True)
             panel_layout.addWidget(panel_note)
-            visibility_group = QGroupBox("Visibility & Label")
+            visibility_group = QGroupBox("Visibility and Label")
             self._series_visibility_group = visibility_group
             visibility_form = QFormLayout(visibility_group)
             self.series_show_in_legend = self._combo(("on", "off"))
             self.series_show_in_legend.currentTextChanged.connect(self._on_series_editor_changed)
+            self._series_show_raw_line = self._combo(("on", "off"))
+            self._series_show_raw_line.currentTextChanged.connect(self._on_series_editor_changed)
             self.series_label = self._line()
             self.series_label.textChanged.connect(self._on_series_label_changed)
             self._add_form_row(
@@ -4063,6 +4518,12 @@ def launch_plot_settings_panel(
                 "Show in legend",
                 self.series_show_in_legend,
                 tooltip_id="series.show_in_legend",
+            )
+            self._add_form_row(
+                visibility_form,
+                "Raw data",
+                self._series_show_raw_line,
+                tooltip_id="series.show_raw_line",
             )
             self._add_form_row(
                 visibility_form, "Label", self.series_label, tooltip_id="series.label"
@@ -4270,9 +4731,45 @@ def launch_plot_settings_panel(
                 self._series_cumulative_label,
                 tooltip_id="series.cumulative_label",
             )
+            self._series_cumulative_color_row, self._series_cumulative_color = self._color_field(
+                placeholder="inherit from base series",
+            )
+            self._series_cumulative_color.textChanged.connect(self._on_series_editor_changed)
+            self._add_form_row(
+                cumulative_form,
+                "Color",
+                self._series_cumulative_color_row,
+            )
+            self._series_cumulative_alpha = self._line("0.0 - 1.0")
+            self._series_cumulative_alpha.textChanged.connect(self._on_series_editor_changed)
+            self._add_form_row(
+                cumulative_form,
+                "Alpha",
+                self._series_cumulative_alpha,
+            )
+            self._series_cumulative_line_width = self._line("blank: inherit from base")
+            self._series_cumulative_line_width.textChanged.connect(self._on_series_editor_changed)
+            self._add_form_row(
+                cumulative_form,
+                "Line width",
+                self._series_cumulative_line_width,
+            )
+            self._series_cumulative_line_style = self._combo(("", "-", "--", "-.", ":"))
+            self._series_cumulative_line_style.currentTextChanged.connect(
+                self._on_series_editor_changed
+            )
+            self._add_form_row(
+                cumulative_form,
+                "Line style",
+                self._series_cumulative_line_style,
+            )
             self._series_cumulative_detail_rows = [
                 (cumulative_form, self._series_cumulative_show_in_legend),
                 (cumulative_form, self._series_cumulative_label),
+                (cumulative_form, self._series_cumulative_color_row),
+                (cumulative_form, self._series_cumulative_alpha),
+                (cumulative_form, self._series_cumulative_line_width),
+                (cumulative_form, self._series_cumulative_line_style),
             ]
             cumulative_layout.addLayout(cumulative_form)
             self._series_cumulative_summary = QLabel(
@@ -4283,7 +4780,7 @@ def launch_plot_settings_panel(
             self._apply_widget_tooltip(self._series_cumulative_summary)
             cumulative_layout.addWidget(self._series_cumulative_summary)
             self._series_cumulative_style_note = QLabel(
-                "Cumulative rows inherit color, alpha, and width from their base series."
+                "Leave Color/Alpha/Line width/Line style blank to inherit from the base series."
             )
             self._series_cumulative_style_note.setWordWrap(True)
             self._series_cumulative_style_note.hide()
@@ -4382,6 +4879,38 @@ def launch_plot_settings_panel(
                     self._series_fit_label,
                     tooltip_id="series.fit_label",
                 )
+                self._series_fit_color_row, self._series_fit_color = self._color_field(
+                    placeholder="inherit from base series",
+                )
+                self._series_fit_color.textChanged.connect(self._on_series_editor_changed)
+                self._add_form_row(
+                    fit_form,
+                    "Color",
+                    self._series_fit_color_row,
+                )
+                self._series_fit_alpha = self._line("0.0 - 1.0")
+                self._series_fit_alpha.textChanged.connect(self._on_series_editor_changed)
+                self._add_form_row(
+                    fit_form,
+                    "Alpha",
+                    self._series_fit_alpha,
+                )
+                self._series_fit_line_width = self._line("blank: inherit from base")
+                self._series_fit_line_width.textChanged.connect(self._on_series_editor_changed)
+                self._add_form_row(
+                    fit_form,
+                    "Line width",
+                    self._series_fit_line_width,
+                )
+                self._series_fit_line_style = self._combo(("", "-", "--", "-.", ":"))
+                self._series_fit_line_style.currentTextChanged.connect(
+                    self._on_series_editor_changed
+                )
+                self._add_form_row(
+                    fit_form,
+                    "Line style",
+                    self._series_fit_line_style,
+                )
                 self._series_fit_detail_rows = [
                     (fit_form, self._series_fit_type),
                     (fit_form, self._series_fit_degree),
@@ -4390,6 +4919,10 @@ def launch_plot_settings_panel(
                     (fit_form, self._series_fit_x_max),
                     (fit_form, self._series_fit_show_in_legend),
                     (fit_form, self._series_fit_label),
+                    (fit_form, self._series_fit_color_row),
+                    (fit_form, self._series_fit_alpha),
+                    (fit_form, self._series_fit_line_width),
+                    (fit_form, self._series_fit_line_style),
                 ]
                 fit_layout.addLayout(fit_form)
 
@@ -4409,7 +4942,7 @@ def launch_plot_settings_panel(
                 self._apply_widget_tooltip(self._series_fit_warning)
                 fit_summary_layout.addWidget(self._series_fit_warning)
                 self._series_fit_style_note = QLabel(
-                    "Fit rows inherit color, alpha, and width from their base series."
+                    "Leave Color/Alpha/Line width/Line style blank to inherit from the base series."
                 )
                 self._series_fit_style_note.setWordWrap(True)
                 self._series_fit_style_note.hide()
@@ -5497,6 +6030,9 @@ def launch_plot_settings_panel(
                     "show_in_legend": self._series_show_in_legend_data[index]
                     if index < len(self._series_show_in_legend_data)
                     else True,
+                    "show_raw_line": self._series_show_raw_line_data[index]
+                    if index < len(self._series_show_raw_line_data)
+                    else True,
                     "alpha": self._series_alpha_data[index]
                     if index < len(self._series_alpha_data)
                     else "",
@@ -5551,6 +6087,30 @@ def launch_plot_settings_panel(
                     "cumulative_show_in_legend": self._series_cumulative_show_in_legend_data[index]
                     if index < len(self._series_cumulative_show_in_legend_data)
                     else True,
+                    "cumulative_color": self._series_cumulative_color_data[index]
+                    if index < len(self._series_cumulative_color_data)
+                    else "",
+                    "cumulative_alpha": self._series_cumulative_alpha_data[index]
+                    if index < len(self._series_cumulative_alpha_data)
+                    else "",
+                    "cumulative_line_width": self._series_cumulative_line_width_data[index]
+                    if index < len(self._series_cumulative_line_width_data)
+                    else "",
+                    "cumulative_line_style": self._series_cumulative_line_style_data[index]
+                    if index < len(self._series_cumulative_line_style_data)
+                    else "",
+                    "fit_color": self._series_fit_color_data[index]
+                    if index < len(self._series_fit_color_data)
+                    else "",
+                    "fit_alpha": self._series_fit_alpha_data[index]
+                    if index < len(self._series_fit_alpha_data)
+                    else "",
+                    "fit_line_width": self._series_fit_line_width_data[index]
+                    if index < len(self._series_fit_line_width_data)
+                    else "",
+                    "fit_line_style": self._series_fit_line_style_data[index]
+                    if index < len(self._series_fit_line_style_data)
+                    else "",
                     "line_width": self._series_line_widths_data[index]
                     if index < len(self._series_line_widths_data)
                     else "",
@@ -5577,6 +6137,7 @@ def launch_plot_settings_panel(
             new_colors: list[str] = []
             new_enabled: list[bool] = []
             new_show_in_legend: list[bool] = []
+            new_show_raw_line: list[bool] = []
             new_alpha: list[str] = []
             new_error_enabled: list[bool] = []
             new_error_stats: list[str] = []
@@ -5595,6 +6156,14 @@ def launch_plot_settings_panel(
             new_cumulative_enabled: list[bool] = []
             new_cumulative_label_overrides: list[str] = []
             new_cumulative_show_in_legend: list[bool] = []
+            new_cumulative_colors: list[str] = []
+            new_cumulative_alphas: list[str] = []
+            new_cumulative_line_widths: list[str] = []
+            new_cumulative_line_styles: list[str] = []
+            new_fit_colors: list[str] = []
+            new_fit_alphas: list[str] = []
+            new_fit_line_widths: list[str] = []
+            new_fit_line_styles: list[str] = []
             new_widths: list[str] = []
             new_markers: list[str] = []
             new_line_kwargs: list[str] = []
@@ -5623,6 +6192,7 @@ def launch_plot_settings_panel(
                 new_colors.append(str(previous.get("color") or "").strip())
                 new_enabled.append(bool(previous.get("enabled", True)))
                 new_show_in_legend.append(bool(previous.get("show_in_legend", True)))
+                new_show_raw_line.append(bool(previous.get("show_raw_line", True)))
                 new_alpha.append(str(previous.get("alpha") or "").strip())
                 new_error_enabled.append(bool(previous.get("error_enabled", False)))
                 new_error_stats.append(
@@ -5655,6 +6225,18 @@ def launch_plot_settings_panel(
                 new_cumulative_show_in_legend.append(
                     bool(previous.get("cumulative_show_in_legend", True))
                 )
+                new_cumulative_colors.append(str(previous.get("cumulative_color") or "").strip())
+                new_cumulative_alphas.append(str(previous.get("cumulative_alpha") or "").strip())
+                new_cumulative_line_widths.append(
+                    str(previous.get("cumulative_line_width") or "").strip()
+                )
+                new_cumulative_line_styles.append(
+                    str(previous.get("cumulative_line_style") or "").strip()
+                )
+                new_fit_colors.append(str(previous.get("fit_color") or "").strip())
+                new_fit_alphas.append(str(previous.get("fit_alpha") or "").strip())
+                new_fit_line_widths.append(str(previous.get("fit_line_width") or "").strip())
+                new_fit_line_styles.append(str(previous.get("fit_line_style") or "").strip())
                 new_widths.append(str(previous.get("line_width") or "").strip())
                 new_markers.append(str(previous.get("marker") or "").strip())
                 new_line_kwargs.append(str(previous.get("line_kwargs") or "").strip())
@@ -5668,6 +6250,7 @@ def launch_plot_settings_panel(
             self._series_colors_data = new_colors
             self._series_enabled_data = new_enabled
             self._series_show_in_legend_data = new_show_in_legend
+            self._series_show_raw_line_data = new_show_raw_line
             self._series_alpha_data = new_alpha
             self._series_error_enabled_data = new_error_enabled
             self._series_error_stats_data = new_error_stats
@@ -5686,6 +6269,14 @@ def launch_plot_settings_panel(
             self._series_cumulative_enabled_data = new_cumulative_enabled
             self._series_cumulative_label_overrides_data = new_cumulative_label_overrides
             self._series_cumulative_show_in_legend_data = new_cumulative_show_in_legend
+            self._series_cumulative_color_data = new_cumulative_colors
+            self._series_cumulative_alpha_data = new_cumulative_alphas
+            self._series_cumulative_line_width_data = new_cumulative_line_widths
+            self._series_cumulative_line_style_data = new_cumulative_line_styles
+            self._series_fit_color_data = new_fit_colors
+            self._series_fit_alpha_data = new_fit_alphas
+            self._series_fit_line_width_data = new_fit_line_widths
+            self._series_fit_line_style_data = new_fit_line_styles
             self._series_line_widths_data = new_widths
             self._series_markers_data = new_markers
             self._series_line_kwargs_data = new_line_kwargs
@@ -5773,12 +6364,24 @@ def launch_plot_settings_panel(
             self._series_fit_range_modes_data = _reorder(self._series_fit_range_modes_data)
             self._series_fit_x_mins_data = _reorder(self._series_fit_x_mins_data)
             self._series_fit_x_maxs_data = _reorder(self._series_fit_x_maxs_data)
+            self._series_fit_color_data = _reorder(self._series_fit_color_data)
+            self._series_fit_alpha_data = _reorder(self._series_fit_alpha_data)
+            self._series_fit_line_width_data = _reorder(self._series_fit_line_width_data)
+            self._series_fit_line_style_data = _reorder(self._series_fit_line_style_data)
             self._series_cumulative_enabled_data = _reorder(self._series_cumulative_enabled_data)
             self._series_cumulative_label_overrides_data = _reorder(
                 self._series_cumulative_label_overrides_data
             )
             self._series_cumulative_show_in_legend_data = _reorder(
                 self._series_cumulative_show_in_legend_data
+            )
+            self._series_cumulative_color_data = _reorder(self._series_cumulative_color_data)
+            self._series_cumulative_alpha_data = _reorder(self._series_cumulative_alpha_data)
+            self._series_cumulative_line_width_data = _reorder(
+                self._series_cumulative_line_width_data
+            )
+            self._series_cumulative_line_style_data = _reorder(
+                self._series_cumulative_line_style_data
             )
             self._series_line_widths_data = _reorder(self._series_line_widths_data)
             self._series_markers_data = _reorder(self._series_markers_data)
@@ -6214,6 +6817,22 @@ def launch_plot_settings_panel(
                 config["fit_x_min"] = _soft_float(self._series_fit_x_mins_data[index])
             if 0 <= index < len(self._series_fit_x_maxs_data):
                 config["fit_x_max"] = _soft_float(self._series_fit_x_maxs_data[index])
+            if 0 <= index < len(self._series_fit_color_data):
+                config["fit_color"] = self._series_fit_color_data[index].strip() or None
+            if 0 <= index < len(self._series_fit_alpha_data):
+                raw_fa = self._series_fit_alpha_data[index].strip()
+                try:
+                    config["fit_alpha"] = float(raw_fa) if raw_fa else None
+                except ValueError:
+                    config["fit_alpha"] = None
+            if 0 <= index < len(self._series_fit_line_width_data):
+                raw_flw = self._series_fit_line_width_data[index].strip()
+                try:
+                    config["fit_line_width"] = float(raw_flw) if raw_flw else None
+                except ValueError:
+                    config["fit_line_width"] = None
+            if 0 <= index < len(self._series_fit_line_style_data):
+                config["fit_line_style"] = self._series_fit_line_style_data[index].strip() or None
             return config
 
         def _fit_effective_label(self, index: int) -> str:
@@ -6292,6 +6911,10 @@ def launch_plot_settings_panel(
                 (self._series_fit_range_modes_data, self._series_fit_range_modes_data[index]),
                 (self._series_fit_x_mins_data, self._series_fit_x_mins_data[index]),
                 (self._series_fit_x_maxs_data, self._series_fit_x_maxs_data[index]),
+                (self._series_fit_color_data, self._series_fit_color_data[index]),
+                (self._series_fit_alpha_data, self._series_fit_alpha_data[index]),
+                (self._series_fit_line_width_data, self._series_fit_line_width_data[index]),
+                (self._series_fit_line_style_data, self._series_fit_line_style_data[index]),
                 (self._series_cumulative_enabled_data, self._series_cumulative_enabled_data[index]),
                 (
                     self._series_cumulative_label_overrides_data,
@@ -6301,6 +6924,17 @@ def launch_plot_settings_panel(
                     self._series_cumulative_show_in_legend_data,
                     self._series_cumulative_show_in_legend_data[index],
                 ),
+                (self._series_cumulative_color_data, self._series_cumulative_color_data[index]),
+                (self._series_cumulative_alpha_data, self._series_cumulative_alpha_data[index]),
+                (
+                    self._series_cumulative_line_width_data,
+                    self._series_cumulative_line_width_data[index],
+                ),
+                (
+                    self._series_cumulative_line_style_data,
+                    self._series_cumulative_line_style_data[index],
+                ),
+                (self._series_show_raw_line_data, self._series_show_raw_line_data[index]),
                 (self._series_line_widths_data, self._series_line_widths_data[index]),
                 (self._series_markers_data, self._series_markers_data[index]),
                 (self._series_line_kwargs_data, self._series_line_kwargs_data[index]),
@@ -6373,9 +7007,17 @@ def launch_plot_settings_panel(
             self._series_fit_range_modes_data.append("visible")
             self._series_fit_x_mins_data.append("")
             self._series_fit_x_maxs_data.append("")
+            self._series_fit_color_data.append("")
+            self._series_fit_alpha_data.append("")
+            self._series_fit_line_width_data.append("")
+            self._series_fit_line_style_data.append("")
             self._series_cumulative_enabled_data.append(False)
             self._series_cumulative_label_overrides_data.append("")
             self._series_cumulative_show_in_legend_data.append(True)
+            self._series_cumulative_color_data.append("")
+            self._series_cumulative_alpha_data.append("")
+            self._series_cumulative_line_width_data.append("")
+            self._series_cumulative_line_style_data.append("")
             self._series_line_widths_data.append("")
             self._series_markers_data.append("")
             self._series_line_kwargs_data.append("")
@@ -6392,18 +7034,6 @@ def launch_plot_settings_panel(
             rows: list[dict[str, Any]] = []
             for index in range(len(self._series_labels_data)):
                 rows.append({"kind": "base", "base_index": index})
-                if (
-                    index < len(self._series_cumulative_enabled_data)
-                    and self._series_cumulative_enabled_data[index]
-                    and not self._is_orientation_heatmap_mode()
-                ):
-                    rows.append({"kind": "cumulative", "base_index": index})
-                if (
-                    index < len(self._series_fit_enabled_data)
-                    and self._series_fit_enabled_data[index]
-                    and self._fit_supported_for_current_view()
-                ):
-                    rows.append({"kind": "fit", "base_index": index})
             self._series_display_rows = rows
 
         def _display_row(self, row: int) -> dict[str, Any]:
@@ -6445,6 +7075,21 @@ def launch_plot_settings_panel(
                 )
                 suffix = "" if enabled else " (off)"
                 return f"{base_index + 1}.2: Fit - {self._fit_effective_label(base_index)}{suffix}"
+            badges: list[str] = []
+            if (
+                base_index < len(self._series_cumulative_enabled_data)
+                and self._series_cumulative_enabled_data[base_index]
+                and not self._is_orientation_heatmap_mode()
+            ):
+                badges.append("~")
+            if (
+                base_index < len(self._series_fit_enabled_data)
+                and self._series_fit_enabled_data[base_index]
+                and self._fit_supported_for_current_view()
+            ):
+                badges.append("\u2197")
+            if badges:
+                base_label = base_label + "  \u00b7 " + " ".join(badges)
             return _format_series_display_text(
                 base_index,
                 base_label,
@@ -6737,7 +7382,29 @@ def launch_plot_settings_panel(
                     checked=enabled,
                     enabled=enabled,
                     selected=self.series_list.currentRow() == index,
-                    color_token="" if heatmap_active else self._effective_series_color(base_index),
+                    color_token=(
+                        ""
+                        if heatmap_active
+                        else (
+                            (
+                                self._series_fit_color_data[base_index].strip()
+                                if base_index < len(self._series_fit_color_data)
+                                else ""
+                            )
+                            or self._effective_series_color(base_index)
+                        )
+                        if kind == "fit"
+                        else (
+                            (
+                                self._series_cumulative_color_data[base_index].strip()
+                                if base_index < len(self._series_cumulative_color_data)
+                                else ""
+                            )
+                            or self._effective_series_color(base_index)
+                        )
+                        if kind == "cumulative"
+                        else self._effective_series_color(base_index)
+                    ),
                     kind=kind,
                     can_move_up=base_index > 0,
                     can_move_down=base_index < len(self._series_labels_data) - 1,
@@ -7088,6 +7755,7 @@ def launch_plot_settings_panel(
             self._series_colors_data = []
             self._series_enabled_data = []
             self._series_show_in_legend_data = []
+            self._series_show_raw_line_data = []
             self._series_alpha_data = []
             self._series_error_enabled_data = []
             self._series_error_stats_data = []
@@ -7177,6 +7845,13 @@ def launch_plot_settings_panel(
                     )
                 self._series_show_in_legend_data.append(show_in_legend)
 
+                show_raw_line = True
+                if isinstance(series_override, dict) and "show_raw_line" in series_override:
+                    show_raw_line = self._coerce_series_bool(
+                        series_override.get("show_raw_line"), default=True
+                    )
+                self._series_show_raw_line_data.append(show_raw_line)
+
                 alpha = ""
                 if isinstance(series_override, dict) and series_override.get("alpha") is not None:
                     alpha = str(series_override.get("alpha")).strip()
@@ -7264,6 +7939,31 @@ def launch_plot_settings_panel(
                 self._series_cumulative_show_in_legend_data.append(
                     bool(cumulative_config.get("show_in_legend", True))
                 )
+                self._series_cumulative_color_data.append(
+                    str(cumulative_config.get("color") or "").strip()
+                )
+                self._series_cumulative_alpha_data.append(
+                    str(cumulative_config.get("alpha") or "").strip()
+                )
+                self._series_cumulative_line_width_data.append(
+                    str(cumulative_config.get("line_width") or "").strip()
+                )
+                self._series_cumulative_line_style_data.append(
+                    str(cumulative_config.get("line_style") or "").strip()
+                )
+                fit_color_raw = ""
+                fit_alpha_raw = ""
+                fit_line_width_raw = ""
+                fit_line_style_raw = ""
+                if isinstance(series_override, dict):
+                    fit_color_raw = str(series_override.get("fit_color") or "").strip()
+                    fit_alpha_raw = str(series_override.get("fit_alpha") or "").strip()
+                    fit_line_width_raw = str(series_override.get("fit_line_width") or "").strip()
+                    fit_line_style_raw = str(series_override.get("fit_line_style") or "").strip()
+                self._series_fit_color_data.append(fit_color_raw)
+                self._series_fit_alpha_data.append(fit_alpha_raw)
+                self._series_fit_line_width_data.append(fit_line_width_raw)
+                self._series_fit_line_style_data.append(fit_line_style_raw)
 
                 width = ""
                 if (
@@ -7359,6 +8059,13 @@ def launch_plot_settings_panel(
                     self.series_show_in_legend,
                     "on" if self._series_show_in_legend_data[index] else "off",
                 )
+                if hasattr(self, "_series_show_raw_line") and index < len(
+                    self._series_show_raw_line_data
+                ):
+                    self._set_combo_value(
+                        self._series_show_raw_line,
+                        "on" if self._series_show_raw_line_data[index] else "off",
+                    )
                 self.series_label.setPlaceholderText(self._series_labels_data[index])
                 self.series_label.setText(self._series_label_overrides_data[index])
                 self.series_color.setText(self._series_colors_data[index])
@@ -7403,6 +8110,19 @@ def launch_plot_settings_panel(
                     self._series_cumulative_label.setText(
                         self._series_cumulative_label_overrides_data[index]
                     )
+                if hasattr(self, "_series_cumulative_color"):
+                    self._series_cumulative_color.setText(self._series_cumulative_color_data[index])
+                if hasattr(self, "_series_cumulative_alpha"):
+                    self._series_cumulative_alpha.setText(self._series_cumulative_alpha_data[index])
+                if hasattr(self, "_series_cumulative_line_width"):
+                    self._series_cumulative_line_width.setText(
+                        self._series_cumulative_line_width_data[index]
+                    )
+                if hasattr(self, "_series_cumulative_line_style"):
+                    self._set_combo_value(
+                        self._series_cumulative_line_style,
+                        self._series_cumulative_line_style_data[index],
+                    )
                 if self._series_fit_mode is not None:
                     self._set_combo_value(
                         self._series_fit_mode,
@@ -7429,6 +8149,16 @@ def launch_plot_settings_panel(
                 if hasattr(self, "_series_fit_label"):
                     self._series_fit_label.setPlaceholderText(self._fit_effective_label(index))
                     self._series_fit_label.setText(self._series_fit_label_overrides_data[index])
+                if hasattr(self, "_series_fit_color"):
+                    self._series_fit_color.setText(self._series_fit_color_data[index])
+                if hasattr(self, "_series_fit_alpha"):
+                    self._series_fit_alpha.setText(self._series_fit_alpha_data[index])
+                if hasattr(self, "_series_fit_line_width"):
+                    self._series_fit_line_width.setText(self._series_fit_line_width_data[index])
+                if hasattr(self, "_series_fit_line_style"):
+                    self._set_combo_value(
+                        self._series_fit_line_style, self._series_fit_line_style_data[index]
+                    )
                 if hasattr(self, "_series_group_reducer"):
                     descriptor = self._series_descriptor(index)
                     reducer = (
@@ -7467,6 +8197,8 @@ def launch_plot_settings_panel(
                     self.series_line_kwargs_json,
                 ):
                     widget.setEnabled(True)
+                if hasattr(self, "_series_show_raw_line"):
+                    self._series_show_raw_line.setEnabled(True)
                 for widget in (
                     self.norm_mode,
                     self.norm_value,
@@ -7496,6 +8228,10 @@ def launch_plot_settings_panel(
                     getattr(self, "_series_fit_x_max", None),
                     getattr(self, "_series_fit_show_in_legend", None),
                     getattr(self, "_series_fit_label", None),
+                    getattr(self, "_series_fit_color_row", None),
+                    getattr(self, "_series_fit_alpha", None),
+                    getattr(self, "_series_fit_line_width", None),
+                    getattr(self, "_series_fit_line_style", None),
                 ):
                     if widget is not None:
                         widget.setEnabled(fit_supported)
@@ -7593,6 +8329,16 @@ def launch_plot_settings_panel(
                 if hasattr(self, "_series_fit_label"):
                     self._series_fit_label.setPlaceholderText(self._fit_effective_label(index))
                     self._series_fit_label.setText(self._series_fit_label_overrides_data[index])
+                if hasattr(self, "_series_fit_color"):
+                    self._series_fit_color.setText(self._series_fit_color_data[index])
+                if hasattr(self, "_series_fit_alpha"):
+                    self._series_fit_alpha.setText(self._series_fit_alpha_data[index])
+                if hasattr(self, "_series_fit_line_width"):
+                    self._series_fit_line_width.setText(self._series_fit_line_width_data[index])
+                if hasattr(self, "_series_fit_line_style"):
+                    self._set_combo_value(
+                        self._series_fit_line_style, self._series_fit_line_style_data[index]
+                    )
                 self.series_line_kwargs_json.setPlainText(json.dumps({"linestyle": "--"}, indent=2))
                 self._load_normalization_into_editor(index)
                 for widget in (
@@ -7608,6 +8354,8 @@ def launch_plot_settings_panel(
                     widget.setEnabled(False)
                 if self._series_fit_mode is not None:
                     self._series_fit_mode.setEnabled(False)
+                if hasattr(self, "_series_show_raw_line"):
+                    self._series_show_raw_line.setEnabled(False)
                 for widget in (
                     getattr(self, "_series_fit_type", None),
                     getattr(self, "_series_fit_degree", None),
@@ -7620,6 +8368,10 @@ def launch_plot_settings_panel(
                 for widget in (
                     getattr(self, "_series_fit_show_in_legend", None),
                     getattr(self, "_series_fit_label", None),
+                    getattr(self, "_series_fit_color_row", None),
+                    getattr(self, "_series_fit_alpha", None),
+                    getattr(self, "_series_fit_line_width", None),
+                    getattr(self, "_series_fit_line_style", None),
                 ):
                     if widget is not None:
                         widget.setEnabled(True)
@@ -7688,6 +8440,19 @@ def launch_plot_settings_panel(
                     self._series_cumulative_label.setText(
                         self._series_cumulative_label_overrides_data[index]
                     )
+                if hasattr(self, "_series_cumulative_color"):
+                    self._series_cumulative_color.setText(self._series_cumulative_color_data[index])
+                if hasattr(self, "_series_cumulative_alpha"):
+                    self._series_cumulative_alpha.setText(self._series_cumulative_alpha_data[index])
+                if hasattr(self, "_series_cumulative_line_width"):
+                    self._series_cumulative_line_width.setText(
+                        self._series_cumulative_line_width_data[index]
+                    )
+                if hasattr(self, "_series_cumulative_line_style"):
+                    self._set_combo_value(
+                        self._series_cumulative_line_style,
+                        self._series_cumulative_line_style_data[index],
+                    )
                 if self._series_fit_mode is not None:
                     self._set_combo_value(
                         self._series_fit_mode,
@@ -7729,10 +8494,18 @@ def launch_plot_settings_panel(
                     widget.setEnabled(False)
                 if hasattr(self, "_series_cumulative_mode"):
                     self._series_cumulative_mode.setEnabled(False)
-                if hasattr(self, "_series_cumulative_show_in_legend"):
-                    self._series_cumulative_show_in_legend.setEnabled(True)
-                if hasattr(self, "_series_cumulative_label"):
-                    self._series_cumulative_label.setEnabled(True)
+                if hasattr(self, "_series_show_raw_line"):
+                    self._series_show_raw_line.setEnabled(False)
+                for widget in (
+                    getattr(self, "_series_cumulative_show_in_legend", None),
+                    getattr(self, "_series_cumulative_label", None),
+                    getattr(self, "_series_cumulative_color_row", None),
+                    getattr(self, "_series_cumulative_alpha", None),
+                    getattr(self, "_series_cumulative_line_width", None),
+                    getattr(self, "_series_cumulative_line_style", None),
+                ):
+                    if widget is not None:
+                        widget.setEnabled(True)
             finally:
                 self._series_syncing = False
             self._update_series_metadata_panel(index)
@@ -7757,6 +8530,12 @@ def launch_plot_settings_panel(
             self._series_show_in_legend_data[index] = (
                 self.series_show_in_legend.currentText().strip().lower() != "off"
             )
+            if hasattr(self, "_series_show_raw_line") and index < len(
+                self._series_show_raw_line_data
+            ):
+                self._series_show_raw_line_data[index] = (
+                    self._series_show_raw_line.currentText().strip().lower() != "off"
+                )
             self._series_alpha_data[index] = self.series_alpha.text().strip()
             if hasattr(self, "_series_error_mode"):
                 self._series_error_enabled_data[index] = (
@@ -7792,6 +8571,22 @@ def launch_plot_settings_panel(
                 self._series_cumulative_label_overrides_data[index] = (
                     self._series_cumulative_label.text().strip()
                 )
+            if hasattr(self, "_series_cumulative_color"):
+                self._series_cumulative_color_data[index] = (
+                    self._series_cumulative_color.text().strip()
+                )
+            if hasattr(self, "_series_cumulative_alpha"):
+                self._series_cumulative_alpha_data[index] = (
+                    self._series_cumulative_alpha.text().strip()
+                )
+            if hasattr(self, "_series_cumulative_line_width"):
+                self._series_cumulative_line_width_data[index] = (
+                    self._series_cumulative_line_width.text().strip()
+                )
+            if hasattr(self, "_series_cumulative_line_style"):
+                self._series_cumulative_line_style_data[index] = (
+                    self._series_cumulative_line_style.currentText().strip()
+                )
             if self._series_fit_mode is not None:
                 self._series_fit_enabled_data[index] = (
                     self._series_fit_mode.currentText().strip().lower() != "off"
@@ -7816,6 +8611,20 @@ def launch_plot_settings_panel(
                 )
             if hasattr(self, "_series_fit_label"):
                 self._series_fit_label_overrides_data[index] = self._series_fit_label.text().strip()
+            if hasattr(self, "_series_fit_color") and index < len(self._series_fit_color_data):
+                self._series_fit_color_data[index] = self._series_fit_color.text().strip()
+            if hasattr(self, "_series_fit_alpha") and index < len(self._series_fit_alpha_data):
+                self._series_fit_alpha_data[index] = self._series_fit_alpha.text().strip()
+            if hasattr(self, "_series_fit_line_width") and index < len(
+                self._series_fit_line_width_data
+            ):
+                self._series_fit_line_width_data[index] = self._series_fit_line_width.text().strip()
+            if hasattr(self, "_series_fit_line_style") and index < len(
+                self._series_fit_line_style_data
+            ):
+                self._series_fit_line_style_data[index] = (
+                    self._series_fit_line_style.currentText().strip()
+                )
             self._series_line_widths_data[index] = self.series_line_width.text().strip()
             self._series_markers_data[index] = self.series_marker.currentText().strip()
             self._series_line_kwargs_data[index] = (
@@ -7861,6 +8670,16 @@ def launch_plot_settings_panel(
                 self._series_fit_label_overrides_data[index] = self._series_fit_label.text().strip()
             else:
                 self._series_fit_label_overrides_data[index] = self.series_label.text().strip()
+            if hasattr(self, "_series_fit_color"):
+                self._series_fit_color_data[index] = self._series_fit_color.text().strip()
+            if hasattr(self, "_series_fit_alpha"):
+                self._series_fit_alpha_data[index] = self._series_fit_alpha.text().strip()
+            if hasattr(self, "_series_fit_line_width"):
+                self._series_fit_line_width_data[index] = self._series_fit_line_width.text().strip()
+            if hasattr(self, "_series_fit_line_style"):
+                self._series_fit_line_style_data[index] = (
+                    self._series_fit_line_style.currentText().strip()
+                )
             selection_is_fit_child = (
                 self._series_fit_enabled_data[index] and self._fit_supported_for_current_view()
             )
@@ -7896,6 +8715,22 @@ def launch_plot_settings_panel(
             else:
                 self._series_cumulative_label_overrides_data[index] = (
                     self.series_label.text().strip()
+                )
+            if hasattr(self, "_series_cumulative_color"):
+                self._series_cumulative_color_data[index] = (
+                    self._series_cumulative_color.text().strip()
+                )
+            if hasattr(self, "_series_cumulative_alpha"):
+                self._series_cumulative_alpha_data[index] = (
+                    self._series_cumulative_alpha.text().strip()
+                )
+            if hasattr(self, "_series_cumulative_line_width"):
+                self._series_cumulative_line_width_data[index] = (
+                    self._series_cumulative_line_width.text().strip()
+                )
+            if hasattr(self, "_series_cumulative_line_style"):
+                self._series_cumulative_line_style_data[index] = (
+                    self._series_cumulative_line_style.currentText().strip()
                 )
             selection_is_cumulative_child = bool(self._series_cumulative_enabled_data[index]) and (
                 not self._is_orientation_heatmap_mode()
@@ -8664,18 +9499,25 @@ def launch_plot_settings_panel(
                 self.font_family,
                 self.base_font_size,
                 self.title_font,
-                self.label_font,
-                self.tick_font,
+                self.x_label_font,
+                self.y_label_font,
+                self.x_tick_font,
+                self.y_tick_font,
                 self.legend_font,
+                self.font_color,
                 self.line_width,
                 self.line_alpha,
                 self.marker_size,
+                self.marker_color,
                 self.figure_facecolor,
+                self.figure_alpha,
                 self.grid_linewidth,
                 self.grid_alpha,
                 self.grid_color,
-                self.tick_length,
-                self.tick_width,
+                self.x_tick_length,
+                self.x_tick_width,
+                self.y_tick_length,
+                self.y_tick_width,
                 self.x_bin_width,
                 self.min_bin_points,
             )
@@ -8688,18 +9530,21 @@ def launch_plot_settings_panel(
                 self.legend_mode,
                 self.legend_loc,
                 self.legend_frame_mode,
-                self.ticks_visibility,
+                self.x_ticks_mode,
+                self.y_ticks_mode,
                 self.grid_mode,
                 self.markers_mode,
                 self.x_scale,
                 self.y_scale,
-                self.transparent_mode,
                 self.line_style,
+                self.marker_type,
                 self.grid_linestyle,
                 self.grid_axis,
                 self.grid_which,
-                self.tick_direction,
-                self.minor_ticks_mode,
+                self.x_tick_direction,
+                self.y_tick_direction,
+                self.x_minor_ticks_mode,
+                self.y_minor_ticks_mode,
                 self.x_bin_reducer,
                 self.axes_border_mode,
             )
@@ -8713,15 +9558,19 @@ def launch_plot_settings_panel(
         def _handle_auto_preview_toggle(self, checked: bool) -> None:
             if not checked:
                 self._preview_timer.stop()
-                self._preview_status.setText("Auto update paused.")
+                if self._preview_status is not None:
+                    self._preview_status.setText("Auto update paused.")
                 self._refresh_shell_state()
                 return
-            self._preview_status.setText("Auto update enabled.")
+            if self._preview_status is not None:
+                self._preview_status.setText("Auto update enabled.")
             self._refresh_shell_state()
             self._schedule_preview_update()
 
         def _schedule_preview_update(self, *_unused: object) -> None:
             if self._suspend_preview_events:
+                return
+            if self._auto_preview_checkbox is None:
                 return
             if not self._auto_preview_checkbox.isChecked():
                 return
@@ -8749,9 +9598,13 @@ def launch_plot_settings_panel(
                 else:
                     widget.unsetCursor()
             if self._preview_button is not None:
+                auto_update_enabled = (
+                    self._auto_preview_checkbox is not None
+                    and self._auto_preview_checkbox.isChecked()
+                )
                 self._preview_button.setEnabled(
                     _preview_button_enabled(
-                        auto_update_enabled=self._auto_preview_checkbox.isChecked(),
+                        auto_update_enabled=auto_update_enabled,
                         preview_loading=self._preview_loading,
                     )
                 )
@@ -8836,7 +9689,8 @@ def launch_plot_settings_panel(
                     if isinstance(render_state, dict) and render_state:
                         self._apply_preview_state_to_synced_fields(render_state)
                     self._preview_error = None
-                    self._preview_status.setText("External preview opened.")
+                    if self._preview_status is not None:
+                        self._preview_status.setText("External preview opened.")
                     self._refresh_shell_state()
                     return True
                 except Exception as exc:
@@ -8844,7 +9698,8 @@ def launch_plot_settings_panel(
                         self._report_error("Preview failed", exc)
                     else:
                         self._preview_error = str(exc)
-                        self._preview_status.setText("Preview paused.")
+                        if self._preview_status is not None:
+                            self._preview_status.setText("Preview paused.")
                         self._refresh_shell_state()
                     return False
                 finally:
@@ -8866,7 +9721,8 @@ def launch_plot_settings_panel(
                 self._preview_pixmap = pixmap
                 self._refresh_preview_pixmap()
                 self._preview_error = None
-                self._preview_status.setText("Preview updated.")
+                if self._preview_status is not None:
+                    self._preview_status.setText("Preview updated.")
                 self._refresh_shell_state()
                 return True
             except Exception as exc:
@@ -8874,7 +9730,8 @@ def launch_plot_settings_panel(
                     self._report_error("Preview failed", exc)
                 else:
                     self._preview_error = str(exc)
-                    self._preview_status.setText("Preview paused.")
+                    if self._preview_status is not None:
+                        self._preview_status.setText("Preview paused.")
                     self._refresh_shell_state()
                 return False
             finally:
@@ -9015,7 +9872,6 @@ def launch_plot_settings_panel(
             self._handle_series_identity_change()
 
         def _populate(self, settings: dict[str, Any]) -> None:
-            synced_locks = _derive_synced_field_locks(settings)
             synced_modes = _derive_synced_field_modes(settings)
             title_visible = settings.get("title_visible")
             if title_visible is False:
@@ -9050,6 +9906,10 @@ def launch_plot_settings_panel(
                     key="legend_kwargs",
                     nested_key="fontsize",
                 )
+            if legend_font_size in {None, ""}:
+                legend_font_size = default_plot_font_sizes(self._resolved_base_font_size_value())[
+                    "legend_font_size"
+                ]
             self.legend_font.setText(_display_optional_positive_int(legend_font_size))
 
             self._set_combo_value(
@@ -9062,8 +9922,17 @@ def launch_plot_settings_panel(
             )
             tick_params_settings = settings.get("tick_params_kwargs")
             tick_axis_mode = "both"
-            minor_ticks_mode = "off"
+            x_minor_ticks_mode = "off"
+            y_minor_ticks_mode = "off"
+            x_tick_params: dict[str, Any] = {}
+            y_tick_params: dict[str, Any] = {}
             if isinstance(tick_params_settings, dict):
+                raw_x_tick_params = tick_params_settings.get("_x_tick_params")
+                raw_y_tick_params = tick_params_settings.get("_y_tick_params")
+                if isinstance(raw_x_tick_params, dict):
+                    x_tick_params = dict(raw_x_tick_params)
+                if isinstance(raw_y_tick_params, dict):
+                    y_tick_params = dict(raw_y_tick_params)
                 raw_tick_axis = (
                     str(
                         tick_params_settings.get(
@@ -9078,10 +9947,29 @@ def launch_plot_settings_panel(
                 raw_minor_mode = (
                     str(tick_params_settings.get("_minor_ticks_mode", "off")).strip().lower()
                 )
-                if raw_minor_mode in _MINOR_TICKS_MODES:
-                    minor_ticks_mode = raw_minor_mode
-            ticks_visibility_mode = "none" if settings.get("ticks") is False else tick_axis_mode
-            self._set_combo_value(self.ticks_visibility, ticks_visibility_mode)
+                raw_x_minor = (
+                    str(tick_params_settings.get("_x_minor_ticks_mode", raw_minor_mode))
+                    .strip()
+                    .lower()
+                )
+                raw_y_minor = (
+                    str(tick_params_settings.get("_y_minor_ticks_mode", raw_minor_mode))
+                    .strip()
+                    .lower()
+                )
+                if raw_x_minor in _MINOR_TICKS_MODES:
+                    x_minor_ticks_mode = raw_x_minor
+                if raw_y_minor in _MINOR_TICKS_MODES:
+                    y_minor_ticks_mode = raw_y_minor
+            ticks_enabled = settings.get("ticks") is not False
+            self._set_combo_value(
+                self.x_ticks_mode,
+                "on" if ticks_enabled and tick_axis_mode in {"x", "both"} else "off",
+            )
+            self._set_combo_value(
+                self.y_ticks_mode,
+                "on" if ticks_enabled and tick_axis_mode in {"y", "both"} else "off",
+            )
 
             self._set_combo_value(self.x_scale, str(settings.get("x_scale") or "linear"))
             self._set_combo_value(self.y_scale, str(settings.get("y_scale") or "linear"))
@@ -9108,22 +9996,58 @@ def launch_plot_settings_panel(
             )
             self.dpi.setText(str(settings.get("dpi") or defaults.dpi))
             self.font_family.setText(str(settings.get("font_family") or ""))
-            self.base_font_size.setText(_display_optional_positive_int(settings.get("font_size")))
+            self.base_font_size.setText(
+                _display_optional_positive_int(settings.get("font_size") or defaults.base_font_size)
+            )
+            self.font_color.setText(str(settings.get("font_color") or defaults.font_color))
             self.figure_facecolor.setText(
                 _extract_dict_text(settings, key="figure_kwargs", nested_key="facecolor")
+                or "#ffffff"
             )
-            self._set_combo_value(
-                self.transparent_mode,
-                _extract_dict_mode(
-                    settings,
-                    key="savefig_kwargs",
-                    nested_key="transparent",
-                    auto_mode="off",
-                ),
+            figure_alpha_value = settings.get("figure_alpha")
+            if figure_alpha_value is None:
+                figure_alpha_value = _extract_dict_text(
+                    settings, key="figure_kwargs", nested_key="alpha"
+                )
+            self.figure_alpha.setText(
+                "1.0" if figure_alpha_value in {None, ""} else str(figure_alpha_value)
             )
-            self.title_font.setText(_display_optional_positive_int(settings.get("title_font_size")))
-            self.label_font.setText(_display_optional_positive_int(settings.get("label_font_size")))
-            self.tick_font.setText(_display_optional_positive_int(settings.get("tick_font_size")))
+            self.title_font.setText(
+                _display_optional_positive_int(
+                    settings.get("title_font_size")
+                    or default_plot_font_sizes(self._resolved_base_font_size_value())[
+                        "title_font_size"
+                    ]
+                )
+            )
+            label_font_size = (
+                settings.get("label_font_size")
+                or default_plot_font_sizes(self._resolved_base_font_size_value())["label_font_size"]
+            )
+            tick_font_size = (
+                settings.get("tick_font_size")
+                or default_plot_font_sizes(self._resolved_base_font_size_value())["tick_font_size"]
+            )
+            self.x_label_font.setText(
+                _display_optional_positive_int(settings.get("x_label_font_size") or label_font_size)
+            )
+            self.y_label_font.setText(
+                _display_optional_positive_int(settings.get("y_label_font_size") or label_font_size)
+            )
+            self.x_tick_font.setText(
+                _display_optional_positive_int(
+                    settings.get("x_tick_font_size")
+                    or x_tick_params.get("labelsize")
+                    or tick_font_size
+                )
+            )
+            self.y_tick_font.setText(
+                _display_optional_positive_int(
+                    settings.get("y_tick_font_size")
+                    or y_tick_params.get("labelsize")
+                    or tick_font_size
+                )
+            )
             self.line_width.setText(str(settings.get("line_width") or defaults.line_width))
             self._set_combo_value(
                 self.line_style,
@@ -9135,6 +10059,16 @@ def launch_plot_settings_panel(
             self.marker_size.setText(
                 _extract_dict_text(settings, key="line_kwargs", nested_key="markersize")
             )
+            self._set_combo_value(
+                self.marker_type,
+                _extract_dict_text(settings, key="line_kwargs", nested_key="marker") or "o",
+            )
+            marker_color = _extract_dict_text(
+                settings,
+                key="line_kwargs",
+                nested_key="markerfacecolor",
+            ) or _extract_dict_text(settings, key="line_kwargs", nested_key="markeredgecolor")
+            self.marker_color.setText(marker_color)
             self._set_combo_value(
                 self.axes_border_mode,
                 _border_setting_to_mode(settings.get("border")),
@@ -9163,20 +10097,57 @@ def launch_plot_settings_panel(
                 ),
             )
             self._set_combo_value(
-                self.tick_direction,
+                self.x_tick_direction,
                 str(
-                    _extract_dict_value(settings, key="tick_params_kwargs", nested_key="direction")
+                    x_tick_params.get("direction")
+                    or _extract_dict_value(
+                        settings, key="tick_params_kwargs", nested_key="direction"
+                    )
                     or "out"
                 ),
             )
-            self.tick_length.setText(
-                _extract_dict_text(settings, key="tick_params_kwargs", nested_key="length")
+            self._set_combo_value(
+                self.y_tick_direction,
+                str(
+                    y_tick_params.get("direction")
+                    or _extract_dict_value(
+                        settings, key="tick_params_kwargs", nested_key="direction"
+                    )
+                    or "out"
+                ),
+            )
+            self.x_tick_length.setText(
+                str(
+                    x_tick_params.get("length")
+                    or _extract_dict_text(settings, key="tick_params_kwargs", nested_key="length")
+                    or ""
+                )
+            )
+            self.y_tick_length.setText(
+                str(
+                    y_tick_params.get("length")
+                    or _extract_dict_text(settings, key="tick_params_kwargs", nested_key="length")
+                    or ""
+                )
             )
             self._refresh_font_size_placeholders()
-            self.tick_width.setText(
-                _extract_dict_text(settings, key="tick_params_kwargs", nested_key="width")
+            self._last_resolved_base_font_size = self._resolved_base_font_size_value()
+            self.x_tick_width.setText(
+                str(
+                    x_tick_params.get("width")
+                    or _extract_dict_text(settings, key="tick_params_kwargs", nested_key="width")
+                    or ""
+                )
             )
-            self._set_combo_value(self.minor_ticks_mode, minor_ticks_mode)
+            self.y_tick_width.setText(
+                str(
+                    y_tick_params.get("width")
+                    or _extract_dict_text(settings, key="tick_params_kwargs", nested_key="width")
+                    or ""
+                )
+            )
+            self._set_combo_value(self.x_minor_ticks_mode, x_minor_ticks_mode)
+            self._set_combo_value(self.y_minor_ticks_mode, y_minor_ticks_mode)
 
             if hasattr(self, "analysis_species"):
                 self.analysis_species.setText(str(settings.get("species") or ""))
@@ -9370,10 +10341,7 @@ def launch_plot_settings_panel(
                 _format_json_block(settings.get("savefig_kwargs"))
             )
             for key in _SYNCED_FIELD_KEYS:
-                if key in _TRI_STATE_SYNC_FIELD_KEYS:
-                    self._set_synced_field_mode(key, synced_modes.get(key, "auto"))
-                else:
-                    self._set_synced_field_lock(key, synced_locks.get(key, False))
+                self._set_synced_field_mode(key, synced_modes.get(key, "auto"))
             self._apply_preview_state_to_synced_fields(settings)
 
         def _is_orientation_heatmap_mode(self) -> bool:
@@ -9388,8 +10356,10 @@ def launch_plot_settings_panel(
                 hasattr(self, name)
                 for name in (
                     "title_font",
-                    "label_font",
-                    "tick_font",
+                    "x_label_font",
+                    "y_label_font",
+                    "x_tick_font",
+                    "y_tick_font",
                     "legend_font",
                     "base_font_size",
                 )
@@ -9400,8 +10370,8 @@ def launch_plot_settings_panel(
             y_label_enabled = self._synced_field_mode("y_label") != "off"
             legend_enabled = self.legend_mode.currentText().strip().lower() != "off"
             grid_enabled = self.grid_mode.currentText().strip().lower() != "off"
-            ticks_mode = self.ticks_visibility.currentText().strip().lower()
-            ticks_enabled = ticks_mode != "none"
+            x_ticks_enabled = self.x_ticks_mode.currentText().strip().lower() != "off"
+            y_ticks_enabled = self.y_ticks_mode.currentText().strip().lower() != "off"
             markers_enabled = self.markers_mode.currentText().strip().lower() != "off"
             colorbar_enabled = (
                 self.heatmap_colorbar_enabled.isChecked()
@@ -9452,7 +10422,8 @@ def launch_plot_settings_panel(
                 and self.axes_border_mode.currentText().strip().lower() == "custom"
             )
             self._set_rows_visible(self._border_custom_rows, border_custom)
-            self._set_rows_visible(self._ticks_rows, ticks_enabled)
+            self._set_rows_visible(self._x_ticks_rows, x_ticks_enabled)
+            self._set_rows_visible(self._y_ticks_rows, y_ticks_enabled)
             self._set_rows_visible(self._colorbar_rows, colorbar_enabled)
             self._set_rows_enabled(
                 self._title_rows,
@@ -9479,11 +10450,18 @@ def launch_plot_settings_panel(
                 colorbar_enabled,
                 disabled_reason="the colorbar is currently off.",
             )
-            for form, field in self._ticks_rows:
+            for form, field in self._x_ticks_rows:
                 self._set_form_row_enabled(
                     form,
                     field,
-                    ticks_enabled,
+                    x_ticks_enabled,
+                    disabled_reason="ticks are currently off.",
+                )
+            for form, field in self._y_ticks_rows:
+                self._set_form_row_enabled(
+                    form,
+                    field,
+                    y_ticks_enabled,
                     disabled_reason="ticks are currently off.",
                 )
 
@@ -9507,12 +10485,16 @@ def launch_plot_settings_panel(
                 self._series_metadata_group.setVisible(layer_caps.show_metadata)
             if self._figure_legend_section is not None:
                 self._figure_legend_section.setVisible(figure_caps.show_legend)
+            if self._figure_lines_section is not None:
+                self._figure_lines_section.setVisible(figure_caps.show_lines)
             if self._figure_lines_group is not None:
                 self._figure_lines_group.setVisible(figure_caps.show_lines)
             if self._figure_heatmap_group is not None:
                 self._figure_heatmap_group.setVisible(figure_caps.show_heatmap)
             if self._figure_colorbar_group is not None:
                 self._figure_colorbar_group.setVisible(figure_caps.show_colorbar)
+            if self._figure_heatmap_section is not None:
+                self._figure_heatmap_section.setVisible(figure_caps.show_heatmap)
 
             if self._position_map_color_row is not None:
                 self._set_form_row_visible(
@@ -9990,12 +10972,17 @@ def launch_plot_settings_panel(
                 self._series_group_members.setEnabled(
                     selected_group and not self._series_active_is_fit_child
                 )
-            self._preview_button.setEnabled(
-                _preview_button_enabled(
-                    auto_update_enabled=self._auto_preview_checkbox.isChecked(),
-                    preview_loading=self._preview_loading,
+            if self._preview_button is not None:
+                auto_update_enabled = (
+                    self._auto_preview_checkbox is not None
+                    and self._auto_preview_checkbox.isChecked()
                 )
-            )
+                self._preview_button.setEnabled(
+                    _preview_button_enabled(
+                        auto_update_enabled=auto_update_enabled,
+                        preview_loading=self._preview_loading,
+                    )
+                )
             self._update_normalization_warning()
             self._update_series_error_summary(self._series_active_index)
             if hasattr(self, "normalization_warning"):
@@ -10028,7 +11015,7 @@ def launch_plot_settings_panel(
                 return _explicit_text(widget.text())
 
             def _synced_float(key: str, widget: QLineEdit, *, field_name: str) -> float | None:
-                if not self._synced_field_locks.get(key, False):
+                if self._synced_field_mode(key) != "manual":
                     return None
                 return _optional_float(widget.text(), field_name=field_name)
 
@@ -10038,7 +11025,7 @@ def launch_plot_settings_panel(
                 *,
                 field_name: str,
             ) -> list[float] | None:
-                if not self._synced_field_locks.get(key, False):
+                if self._synced_field_mode(key) != "manual":
                     return None
                 return _optional_float_list(widget.text(), field_name=field_name)
 
@@ -10253,6 +11240,11 @@ def launch_plot_settings_panel(
                     entry["enabled"] = False
                 if self._series_show_in_legend_data[index] is False:
                     entry["show_in_legend"] = False
+                if (
+                    index < len(self._series_show_raw_line_data)
+                    and not self._series_show_raw_line_data[index]
+                ):
+                    entry["show_raw_line"] = False
                 fit_type = (
                     self._series_fit_types_data[index].strip().lower()
                     if index < len(self._series_fit_types_data)
@@ -10323,13 +11315,37 @@ def launch_plot_settings_panel(
                 cumulative_show_in_legend_value = bool(
                     self._series_cumulative_show_in_legend_data[index]
                 )
+                cumulative_color_value = self._series_cumulative_color_data[index].strip() or None
+                cumulative_alpha_value = self._series_cumulative_alpha_data[index].strip() or None
+                cumulative_line_width_value = (
+                    self._series_cumulative_line_width_data[index].strip() or None
+                )
+                cumulative_line_style_value = (
+                    self._series_cumulative_line_style_data[index].strip() or None
+                )
                 cumulative_payload = {
                     "enabled": cumulative_enabled_value,
                     "label_override": cumulative_label_override_value,
                     "show_in_legend": cumulative_show_in_legend_value,
+                    "color": cumulative_color_value,
+                    "alpha": cumulative_alpha_value,
+                    "line_width": cumulative_line_width_value,
+                    "line_style": cumulative_line_style_value,
                 }
                 if cumulative_payload != _cumulative_defaults_for_gui():
                     entry["cumulative"] = cumulative_payload
+                fit_color_out = self._series_fit_color_data[index].strip() or None
+                fit_alpha_out = self._series_fit_alpha_data[index].strip() or None
+                fit_line_width_out = self._series_fit_line_width_data[index].strip() or None
+                fit_line_style_out = self._series_fit_line_style_data[index].strip() or None
+                if fit_color_out is not None:
+                    entry["fit_color"] = fit_color_out
+                if fit_alpha_out is not None:
+                    entry["fit_alpha"] = fit_alpha_out
+                if fit_line_width_out is not None:
+                    entry["fit_line_width"] = fit_line_width_out
+                if fit_line_style_out is not None:
+                    entry["fit_line_style"] = fit_line_style_out
                 error_enabled_value = bool(self._series_error_enabled_data[index])
                 error_stat = self._resolved_error_stat_for_series(index)
                 error_style = self._series_error_styles_data[index].strip().lower()
@@ -10427,6 +11443,13 @@ def launch_plot_settings_panel(
                 figure_kwargs_merged["facecolor"] = facecolor
             else:
                 figure_kwargs_merged.pop("facecolor", None)
+            figure_alpha = _optional_float(self.figure_alpha.text(), field_name="figure-alpha")
+            if figure_alpha is not None and not 0.0 <= figure_alpha <= 1.0:
+                raise ValueError("figure-alpha must be between 0 and 1.")
+            if figure_alpha is not None:
+                figure_kwargs_merged["alpha"] = figure_alpha
+            else:
+                figure_kwargs_merged.pop("alpha", None)
             figure_kwargs_value = figure_kwargs_merged or None
 
             axes_kwargs_value = (
@@ -10448,7 +11471,12 @@ def launch_plot_settings_panel(
             )
             line_style = self.line_style.currentText().strip()
             line_alpha = _optional_float(self.line_alpha.text(), field_name="line-alpha")
+            if line_alpha is not None and not 0.0 <= line_alpha <= 1.0:
+                raise ValueError("line-alpha must be between 0 and 1.")
             marker_size = _optional_float(self.marker_size.text(), field_name="marker-size")
+            marker_color = _explicit_text(self.marker_color.text())
+            marker_type = self.marker_type.currentText().strip()
+            markers_on = self.markers_mode.currentText().strip().lower() != "off"
             if line_style:
                 line_kwargs_merged["linestyle"] = line_style
             else:
@@ -10461,6 +11489,15 @@ def launch_plot_settings_panel(
                 line_kwargs_merged["markersize"] = marker_size
             else:
                 line_kwargs_merged.pop("markersize", None)
+            if markers_on:
+                if marker_type:
+                    line_kwargs_merged["marker"] = marker_type
+                if marker_color:
+                    line_kwargs_merged["markerfacecolor"] = marker_color
+                    line_kwargs_merged["markeredgecolor"] = marker_color
+            else:
+                for key in ("marker", "markersize", "markerfacecolor", "markeredgecolor"):
+                    line_kwargs_merged.pop(key, None)
             line_kwargs_value = line_kwargs_merged or None
 
             legend_kwargs_merged = (
@@ -10499,39 +11536,73 @@ def launch_plot_settings_panel(
             tick_params_kwargs_merged = (
                 dict(tick_params_kwargs_value) if isinstance(tick_params_kwargs_value, dict) else {}
             )
-            tick_direction = self.tick_direction.currentText().strip().lower() or "out"
-            if tick_direction not in _TICK_DIRECTIONS:
-                raise ValueError("Tick direction must be out, in, or inout.")
-            tick_params_kwargs_merged["direction"] = tick_direction
-            tick_length = _optional_float(self.tick_length.text(), field_name="tick-length")
-            if tick_length is None or tick_length <= 0:
-                tick_params_kwargs_merged.pop("length", None)
-            else:
-                tick_params_kwargs_merged["length"] = tick_length
-            tick_width = _optional_float(self.tick_width.text(), field_name="tick-width")
-            if tick_width is None or tick_width <= 0:
-                tick_params_kwargs_merged.pop("width", None)
-            else:
-                tick_params_kwargs_merged["width"] = tick_width
-            ticks_axis = self.ticks_visibility.currentText().strip().lower() or "both"
-            if ticks_axis not in _TICK_VISIBILITY_MODES:
-                raise ValueError("Ticks must be both, x, y, or none.")
-            resolved_ticks_axis = "both" if ticks_axis == "none" else ticks_axis
+            for key in (
+                "direction",
+                "length",
+                "width",
+                "_minor_ticks_mode",
+                "_x_tick_params",
+                "_y_tick_params",
+                "_x_minor_ticks_mode",
+                "_y_minor_ticks_mode",
+            ):
+                tick_params_kwargs_merged.pop(key, None)
+
+            def _axis_tick_params(axis: str) -> dict[str, Any]:
+                direction_widget = self.x_tick_direction if axis == "x" else self.y_tick_direction
+                length_widget = self.x_tick_length if axis == "x" else self.y_tick_length
+                width_widget = self.x_tick_width if axis == "x" else self.y_tick_width
+                font_widget = self.x_tick_font if axis == "x" else self.y_tick_font
+                direction = direction_widget.currentText().strip().lower() or "out"
+                if direction not in _TICK_DIRECTIONS:
+                    raise ValueError(f"{axis}-tick direction must be out, in, or inout.")
+                params: dict[str, Any] = {"direction": direction}
+                length = _optional_float(length_widget.text(), field_name=f"{axis}-tick-length")
+                if length is not None:
+                    if length <= 0:
+                        raise ValueError(f"{axis}-tick-length must be positive.")
+                    params["length"] = length
+                width = _optional_float(width_widget.text(), field_name=f"{axis}-tick-width")
+                if width is not None:
+                    if width <= 0:
+                        raise ValueError(f"{axis}-tick-width must be positive.")
+                    params["width"] = width
+                font_size = _optional_positive_int_or_none(
+                    font_widget.text(),
+                    field_name=f"{axis}-tick-font-size",
+                )
+                if font_size is not None:
+                    params["labelsize"] = font_size
+                return params
+
+            x_ticks_on = self.x_ticks_mode.currentText().strip().lower() != "off"
+            y_ticks_on = self.y_ticks_mode.currentText().strip().lower() != "off"
+            resolved_ticks_axis = (
+                "both"
+                if x_ticks_on and y_ticks_on
+                else "x"
+                if x_ticks_on
+                else "y"
+                if y_ticks_on
+                else "both"
+            )
             tick_params_kwargs_merged["_ticks_axis"] = resolved_ticks_axis
             tick_params_kwargs_merged["axis"] = resolved_ticks_axis
-            minor_ticks_mode = self.minor_ticks_mode.currentText().strip().lower() or "off"
-            if minor_ticks_mode not in _MINOR_TICKS_MODES:
-                raise ValueError("Minor ticks mode must be on or off.")
-            tick_params_kwargs_merged["_minor_ticks_mode"] = minor_ticks_mode
+            tick_params_kwargs_merged["_x_tick_params"] = _axis_tick_params("x")
+            tick_params_kwargs_merged["_y_tick_params"] = _axis_tick_params("y")
+            for axis, widget in (
+                ("x", self.x_minor_ticks_mode),
+                ("y", self.y_minor_ticks_mode),
+            ):
+                minor_ticks_mode = widget.currentText().strip().lower() or "off"
+                if minor_ticks_mode not in _MINOR_TICKS_MODES:
+                    raise ValueError(f"{axis}-minor ticks mode must be on or off.")
+                tick_params_kwargs_merged[f"_{axis}_minor_ticks_mode"] = minor_ticks_mode
             tick_params_kwargs_value = tick_params_kwargs_merged or None
 
-            savefig_kwargs_merged = (
-                dict(savefig_kwargs_value) if isinstance(savefig_kwargs_value, dict) else {}
+            savefig_kwargs_value = (
+                dict(savefig_kwargs_value) if isinstance(savefig_kwargs_value, dict) else None
             )
-            transparent = _mode_to_toggle(self.transparent_mode.currentText())
-            if transparent is not None:
-                savefig_kwargs_merged["transparent"] = transparent
-            savefig_kwargs_value = savefig_kwargs_merged or None
 
             x_bin_width = _optional_float(self.x_bin_width.text(), field_name="x-bin-width")
             if x_bin_width is not None and x_bin_width <= 0:
@@ -10585,20 +11656,26 @@ def launch_plot_settings_panel(
                 "title_visible": title_visible_value,
                 "legend": _mode_to_toggle(self.legend_mode.currentText()),
                 "border": (
-                    False if self.axes_border_mode.currentText().strip().lower() == "off"
-                    else {"left": self.border_left.isChecked(), "right": self.border_right.isChecked(),
-                          "top": self.border_top.isChecked(), "bottom": self.border_bottom.isChecked()}
+                    False
+                    if self.axes_border_mode.currentText().strip().lower() == "off"
+                    else {
+                        "left": self.border_left.isChecked(),
+                        "right": self.border_right.isChecked(),
+                        "top": self.border_top.isChecked(),
+                        "bottom": self.border_bottom.isChecked(),
+                    }
                     if self.axes_border_mode.currentText().strip().lower() == "custom"
                     else True
                 ),
                 "grid": _mode_to_toggle(self.grid_mode.currentText()),
-                "ticks": self.ticks_visibility.currentText().strip().lower() != "none",
+                "ticks": x_ticks_on or y_ticks_on,
                 "markers": _mode_to_toggle(self.markers_mode.currentText()),
                 "legend_title": _explicit_text(self.legend_title.text()) or None,
                 "legend_loc": self.legend_loc.currentText().strip() or "best",
                 "figsize": figsize,
                 "dpi": _optional_positive_int_or_none(self.dpi.text(), field_name="dpi"),
                 "font_family": _explicit_text(self.font_family.text()) or None,
+                "font_color": _explicit_text(self.font_color.text()) or None,
                 "font_size": _optional_positive_int_or_none(
                     self.base_font_size.text(), field_name="font-size"
                 ),
@@ -10606,11 +11683,24 @@ def launch_plot_settings_panel(
                     self.title_font.text(), field_name="title-font-size"
                 ),
                 "label_font_size": _optional_positive_int_or_none(
-                    self.label_font.text(), field_name="label-font-size"
+                    self.x_label_font.text(), field_name="x-label-font-size"
+                ),
+                "x_label_font_size": _optional_positive_int_or_none(
+                    self.x_label_font.text(), field_name="x-label-font-size"
+                ),
+                "y_label_font_size": _optional_positive_int_or_none(
+                    self.y_label_font.text(), field_name="y-label-font-size"
                 ),
                 "tick_font_size": _optional_positive_int_or_none(
-                    self.tick_font.text(), field_name="tick-font-size"
+                    self.x_tick_font.text(), field_name="x-tick-font-size"
                 ),
+                "x_tick_font_size": _optional_positive_int_or_none(
+                    self.x_tick_font.text(), field_name="x-tick-font-size"
+                ),
+                "y_tick_font_size": _optional_positive_int_or_none(
+                    self.y_tick_font.text(), field_name="y-tick-font-size"
+                ),
+                "figure_alpha": figure_alpha,
                 "legend_font_size": _optional_positive_int_or_none(
                     self.legend_font.text(), field_name="legend-font-size"
                 ),
@@ -10661,7 +11751,7 @@ def launch_plot_settings_panel(
                 "savefig_kwargs": savefig_kwargs_value,
                 "_gui_sync_modes": {
                     key: self._synced_field_mode(key)
-                    for key in _TRI_STATE_SYNC_FIELD_KEYS
+                    for key in _SYNCED_FIELD_KEYS
                     if self._synced_field_mode(key) != "auto"
                 }
                 or None,
@@ -10937,6 +12027,12 @@ def launch_plot_settings_panel(
 
         def _cleanup_preview_artifacts(self) -> None:
             self._preview_timer.stop()
+            if self._detached_preview_window is not None:
+                detached_window = self._detached_preview_window
+                self._detached_preview_window = None
+                self._detached_preview_pane = None
+                detached_window.close_from_dock()
+                detached_window.deleteLater()
             try:
                 self._preview_image_path.unlink(missing_ok=True)
             except OSError:

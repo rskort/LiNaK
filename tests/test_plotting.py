@@ -162,6 +162,86 @@ def test_plot_heatmap_series_hides_all_spines_when_axes_border_disabled(tmp_path
     assert all(not spine.get_visible() for spine in ax.spines.values())
 
 
+def test_plot_multi_line_series_applies_per_axis_tick_and_font_color_settings(tmp_path):
+    capture_state: dict[str, object] = {}
+    tick_params = {
+        "direction": "out",
+        "length": 2.0,
+        "width": 0.5,
+        "_x_tick_params": {"direction": "in", "length": 7.0, "width": 1.5},
+        "_y_tick_params": {"direction": "out", "length": 4.0, "width": 0.75},
+        "_x_minor_ticks_mode": "on",
+        "_y_minor_ticks_mode": "off",
+    }
+
+    result = plotting_module.plot_multi_line_series(
+        [np.array([0.0, 1.0, 2.0], dtype=float)],
+        [np.array([1.0, 2.0, 3.0], dtype=float)],
+        ["series"],
+        title="Styled",
+        x_label="x",
+        y_label="y",
+        output=tmp_path / "styled_ticks.png",
+        show=False,
+        style=plotting_module.with_style_overrides(font_color="#123456"),
+        tick_params_kwargs=tick_params,
+        x_label_font_size=15,
+        y_label_font_size=16,
+        x_tick_font_size=9,
+        y_tick_font_size=11,
+        capture_state=capture_state,
+    )
+
+    assert result is not None
+    ax = capture_state["axes"]
+    assert ax.title.get_color() == "#123456"
+    assert ax.xaxis.label.get_color() == "#123456"
+    assert ax.yaxis.label.get_color() == "#123456"
+    assert ax.xaxis.label.get_size() == pytest.approx(15)
+    assert ax.yaxis.label.get_size() == pytest.approx(16)
+    assert ax.xaxis.get_major_ticks()[0].label1.get_size() == pytest.approx(9)
+    assert ax.yaxis.get_major_ticks()[0].label1.get_size() == pytest.approx(11)
+    assert ax.xaxis.get_major_ticks()[0].tick1line.get_markersize() == pytest.approx(7)
+    assert ax.yaxis.get_major_ticks()[0].tick1line.get_markersize() == pytest.approx(4)
+
+
+def test_plot_heatmap_series_applies_figure_alpha_and_font_color_settings(tmp_path):
+    capture_state: dict[str, object] = {}
+
+    result = plotting_module.plot_heatmap_series(
+        np.array([0.0, 1.0, 2.0], dtype=float),
+        np.array([-1.0, 0.0, 1.0], dtype=float),
+        np.array([[1.0, 2.0], [3.0, 4.0]], dtype=float),
+        title="Heat",
+        x_label="x",
+        y_label="y",
+        output=tmp_path / "styled_heatmap.png",
+        show=False,
+        style=plotting_module.with_style_overrides(font_color="#654321"),
+        figure_kwargs={"facecolor": "#ffffff", "alpha": 0.35},
+        heatmap_colorbar_label="Colorbar",
+        x_label_font_size=13,
+        y_label_font_size=14,
+        x_tick_font_size=8,
+        y_tick_font_size=10,
+        capture_state=capture_state,
+    )
+
+    assert result is not None
+    fig = capture_state["figure"]
+    ax = capture_state["axes"]
+    colorbar = capture_state["heatmap_colorbar"]
+    assert fig.patch.get_alpha() == pytest.approx(0.35)
+    assert ax.title.get_color() == "#654321"
+    assert ax.xaxis.label.get_color() == "#654321"
+    assert ax.yaxis.label.get_color() == "#654321"
+    assert colorbar.ax.yaxis.label.get_color() == "#654321"
+    assert ax.xaxis.label.get_size() == pytest.approx(13)
+    assert ax.yaxis.label.get_size() == pytest.approx(14)
+    assert ax.xaxis.get_major_ticks()[0].label1.get_size() == pytest.approx(8)
+    assert ax.yaxis.get_major_ticks()[0].label1.get_size() == pytest.approx(10)
+
+
 def test_with_style_overrides_updates_axes_border():
     style = plotting_module.with_style_overrides(axes_border=False)
 
