@@ -166,12 +166,25 @@ The current Studio layout is organized as:
 - `Profiles`
 - `Data`
 - `Layers`
+- `Annotations`
 - `Figure`
 - `Advanced`
 
 Named plot profiles are stored inside the HDF5 file. The `Profiles` page is
 used to select, save, duplicate, rename, delete, import, and export those
 profiles. Figure export lives with the preview controls.
+
+`Layers` controls the plotted series themselves: visibility, labels, copies,
+groups, normalization, uncertainty, fits, cumulative averages, integration, and
+other per-layer display settings. Groups are live aggregations of their member
+layers, so changing a member layer updates the group on the next preview.
+
+`Annotations` controls figure-level overlays such as text labels, guide lines,
+and arrows. These are stored in the plot profile, rendered in the live preview,
+and exported with the figure.
+
+The preview pane can also be detached into a separate live-updating window when
+you want to move the figure to another monitor while keeping the editor open.
 
 For RDF and coordination HDF5 files, `Data > Profile Selection` filters which
 stored profile(s) are loaded from the HDF5. When multiple stored species

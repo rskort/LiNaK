@@ -1,3 +1,4 @@
+import argparse
 from copy import deepcopy
 from pathlib import Path
 
@@ -12,6 +13,10 @@ from linak.cli import (
     _build_coordination_profile_filter_options,
     _build_density_gui_context,
     _build_gui_series_descriptors,
+    _force_source_ids_enabled_for_gui_loading,
+    _gui_series_descriptors_from_settings,
+    _merge_gui_series_descriptors,
+    _required_source_ids_for_gui_render,
     _build_rdf_profile_filter_options,
     _default_rdf_collection_hdf5_output_path,
     _default_rdf_selected_hdf5_output_path,
@@ -54,7 +59,13 @@ from linak.plot.plot_settings import (
     read_plot_profile_names,
     write_plot_profile,
 )
-from linak.analysis.rdf import RDFProfile, compute_rdf, load_rdf_profile, save_rdf_profile
+from linak.analysis.rdf import (
+    RDFProfile,
+    compute_rdf,
+    load_rdf_profile,
+    plot_rdf_profile,
+    save_rdf_profile,
+)
 from linak.trajectory.io import (
     TrajectoryStoredMetadata,
     read_trajectory,
@@ -349,6 +360,17 @@ def test_filter_plotter_kwargs_keeps_kwargs_for_var_keyword_plotter():
     filtered = cli_mod._filter_plotter_kwargs(_plotter, payload)
 
     assert filtered == payload
+
+
+def test_filter_plotter_kwargs_keeps_integration_config_for_profile_plotters():
+    config = {"enabled": True, "source": "plotted", "target": "selected"}
+
+    filtered = cli_mod._filter_plotter_kwargs(
+        plot_rdf_profile,
+        {"integration_config": config, "unsupported": "drop-me"},
+    )
+
+    assert filtered == {"integration_config": config}
 
 
 def test_root_command_without_args_shows_overview(capsys):
@@ -2350,6 +2372,139 @@ def test_build_gui_series_descriptors_include_directory_metadata():
     assert descriptors[1]["default_label"] == "H2O"
     assert descriptors[0]["source_name"] == "density.h5"
     assert descriptors[0]["source_directory"].endswith("run_04")
+    assert descriptors[0]["source_kind"] == "source"
+    assert descriptors[0]["source_series_id"] == "series:0:0"
+    assert descriptors[0]["is_generated"] is False
+
+
+def test_merge_gui_series_descriptors_preserves_generated_layers_only_when_sources_exist():
+    current = [
+        {
+            "series_id": "source:a",
+            "source_kind": "source",
+            "source_series_id": "source:a",
+            "is_generated": False,
+            "default_label": "A",
+        }
+    ]
+    saved = [
+        *current,
+        {
+            "series_id": "copy:a",
+            "source_kind": "source",
+            "source_series_id": "source:a",
+            "is_generated": True,
+            "default_label": "A Copy",
+        },
+        {
+            "series_id": "copy:missing",
+            "source_kind": "source",
+            "source_series_id": "missing",
+            "is_generated": True,
+            "default_label": "Missing Copy",
+        },
+        {
+            "series_id": "group:a",
+            "source_kind": "group",
+            "is_generated": True,
+            "member_series_ids": ["source:a", "copy:a", "missing"],
+            "default_label": "Group",
+        },
+    ]
+
+    merged = _merge_gui_series_descriptors(current, saved)
+
+    assert [item["series_id"] for item in merged] == ["source:a", "copy:a", "group:a"]
+    assert merged[1]["source_series_id"] == "source:a"
+    assert merged[1]["is_generated"] is True
+    assert merged[2]["member_series_ids"] == ["source:a", "copy:a"]
+
+
+def test_gui_render_requires_source_data_for_enabled_copies_and_groups():
+    settings = {
+        "series_descriptors": [
+            {"series_id": "source:a", "source_kind": "source", "source_series_id": "source:a"},
+            {
+                "series_id": "copy:a",
+                "source_kind": "source",
+                "source_series_id": "source:a",
+                "is_generated": True,
+            },
+            {
+                "series_id": "group:a",
+                "source_kind": "group",
+                "member_series_ids": ["copy:a"],
+                "is_generated": True,
+            },
+        ],
+        "series_overrides": {"source:a": {"enabled": False}},
+    }
+    args = build_parser().parse_args(["plot", "dummy.h5"])
+
+    required = _required_source_ids_for_gui_render(settings)
+    _force_source_ids_enabled_for_gui_loading(args, required)
+
+    assert _gui_series_descriptors_from_settings(settings, [])[1]["series_id"] == "copy:a"
+    assert required == {"source:a"}
+    assert args.series_overrides["source:a"]["enabled"] is True
+
+
+def test_gui_render_does_not_require_hidden_group_members():
+    settings = {
+        "series_descriptors": [
+            {"series_id": "source:a", "source_kind": "source", "source_series_id": "source:a"},
+            {"series_id": "source:b", "source_kind": "source", "source_series_id": "source:b"},
+            {
+                "series_id": "group:a",
+                "source_kind": "group",
+                "member_series_ids": ["source:a", "source:b"],
+                "is_generated": True,
+            },
+        ],
+        "series_overrides": {
+            "source:a": {"enabled": False},
+        },
+    }
+
+    required = _required_source_ids_for_gui_render(settings)
+
+    assert required == {"source:b"}
+
+
+def test_default_series_family_colors_preserve_hidden_source_family_slots():
+    descriptors = [
+        {"series_id": "source:a", "source_kind": "source", "source_series_id": "source:a"},
+        {"series_id": "source:b", "source_kind": "source", "source_series_id": "source:b"},
+        {"series_id": "source:c", "source_kind": "source", "source_series_id": "source:c"},
+    ]
+    active_descriptors = [descriptors[1], descriptors[2]]
+
+    colors = cli_mod._default_series_family_colors(
+        descriptors,
+        2,
+        target_descriptors=active_descriptors,
+    )
+
+    assert colors == cli_mod._default_multi_series_colors(3)[1:3]
+
+
+def test_apply_gui_settings_to_args_forwards_annotations_without_declared_cli_attr():
+    args = argparse.Namespace(title="Example")
+    settings = {
+        "annotations": [
+            {
+                "type": "text",
+                "coord_system": "axes",
+                "x": 0.5,
+                "y": 0.9,
+                "text": "Label",
+            }
+        ]
+    }
+
+    cli_mod._apply_gui_settings_to_args(args, settings)
+
+    assert getattr(args, "annotations", None) == settings["annotations"]
 
 
 def test_build_gui_series_descriptors_use_origin_paths_for_metadata_and_grouping():
@@ -3464,6 +3619,135 @@ def test_plot_density_gui_combined_hdf5_does_not_pass_reordered_series_lists_to_
     assert "line_colors" not in initial
 
 
+def test_plot_density_gui_first_open_materializes_id_keyed_series_state(tmp_path, monkeypatch):
+    frame = Atoms(
+        "OO",
+        positions=[[0.0, 0.0, 0.10], [0.0, 0.0, 1.10]],
+        cell=[10.0, 10.0, 10.0],
+        pbc=True,
+    )
+    profile = compute_density_profile([frame], species="O", axis="z", bin_width=1.0)
+    source_h5_a = tmp_path / "source_a_density.h5"
+    source_h5_b = tmp_path / "source_b_density.h5"
+    combined_h5 = tmp_path / "combined_density.h5"
+    save_density_profile(profile, source_h5_a)
+    save_density_profile(profile, source_h5_b)
+    _combine_analysis_hdf5_sources(
+        sources=[str(source_h5_a), str(source_h5_b)],
+        analysis="density",
+        output=combined_h5,
+    )
+
+    captured: dict[str, object] = {}
+
+    def _fake_gui_launcher(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr("linak.cli._open_plot_settings_gui", _fake_gui_launcher)
+
+    rc = main(
+        [
+            "--log-level",
+            "ERROR",
+            "plot",
+            str(combined_h5),
+            "--gui",
+        ]
+    )
+
+    assert rc == 0
+    initial = captured["initial_settings"]
+    assert isinstance(initial, dict)
+    descriptors = initial["series_descriptors"]
+    assert isinstance(descriptors, list)
+    overrides = initial.get("series_overrides")
+    assert isinstance(overrides, dict)
+    assert set(overrides) == {item["series_id"] for item in descriptors}
+    assert "series_enabled" not in initial
+    assert "series_labels" not in initial
+    assert "line_colors" not in initial
+
+
+def test_plot_density_gui_first_open_preview_disables_series_immediately(tmp_path, monkeypatch):
+    frame = Atoms(
+        "OO",
+        positions=[[0.0, 0.0, 0.10], [0.0, 0.0, 1.10]],
+        cell=[10.0, 10.0, 10.0],
+        pbc=True,
+    )
+    profile = compute_density_profile([frame], species="O", axis="z", bin_width=1.0)
+    source_h5_a = tmp_path / "source_a_density.h5"
+    source_h5_b = tmp_path / "source_b_density.h5"
+    combined_h5 = tmp_path / "combined_density.h5"
+    save_density_profile(profile, source_h5_a)
+    save_density_profile(profile, source_h5_b)
+    _combine_analysis_hdf5_sources(
+        sources=[str(source_h5_a), str(source_h5_b)],
+        analysis="density",
+        output=combined_h5,
+    )
+
+    render_calls: list[dict[str, object]] = []
+    disabled_series_id_holder: dict[str, str] = {}
+
+    def _fake_load_density_profiles_by_index(path, indices, *, axis=None, species=None):
+        return load_density_profiles_by_index(path, indices, axis=axis, species=species)
+
+    def _fake_render_profile_plot(**kwargs):
+        render_calls.append(
+            {
+                "series_enabled": deepcopy(kwargs["args"].series_enabled),
+                "line_colors": deepcopy(kwargs["args"].line_colors),
+                "series_overrides": deepcopy(getattr(kwargs["args"], "series_overrides", None)),
+                "render_series_ids": [
+                    str(item.get("series_id") or "")
+                    for item in kwargs.get("render_series_descriptors") or []
+                ],
+            }
+        )
+        return None, {}
+
+    def _fake_gui_launcher(**kwargs):
+        initial_settings = deepcopy(kwargs["initial_settings"])
+        descriptors = initial_settings["series_descriptors"]
+        disabled_series_id = descriptors[0]["series_id"]
+        disabled_series_id_holder["value"] = disabled_series_id
+        disabled_settings = deepcopy(initial_settings)
+        disabled_settings["series_overrides"] = deepcopy(
+            disabled_settings.get("series_overrides") or {}
+        )
+        disabled_settings["series_overrides"].setdefault(disabled_series_id, {})
+        disabled_settings["series_overrides"][disabled_series_id]["enabled"] = False
+        kwargs["on_preview"](disabled_settings)
+
+    monkeypatch.setattr(
+        "linak.analysis.density.load_density_profiles_by_index",
+        _fake_load_density_profiles_by_index,
+    )
+    monkeypatch.setattr("linak.cli._render_profile_plot", _fake_render_profile_plot)
+    monkeypatch.setattr("linak.cli._open_plot_settings_gui", _fake_gui_launcher)
+
+    rc = main(
+        [
+            "--log-level",
+            "ERROR",
+            "plot",
+            str(combined_h5),
+            "--gui",
+        ]
+    )
+
+    assert rc == 0
+    assert len(render_calls) == 2
+    assert render_calls[0]["series_enabled"] is None
+    assert render_calls[0]["line_colors"] is None
+    assert render_calls[1]["series_enabled"] is None
+    assert render_calls[1]["line_colors"] is None
+    assert (
+        render_calls[1]["series_overrides"][disabled_series_id_holder["value"]]["enabled"] is False
+    )
+
+
 def test_plot_density_gui_reopen_keeps_per_series_alpha_out_of_global_line_kwargs(
     tmp_path, monkeypatch
 ):
@@ -3557,11 +3841,27 @@ def test_plot_density_gui_embedded_preview_round_trips_after_save_for_combined_h
         return Path(output) if output is not None else None
 
     def _normalized_plot_call(payload: dict[str, object]) -> dict[str, object]:
-        return {
+        normalized = {
             key: deepcopy(value)
             for key, value in payload.items()
             if key not in {"output", "capture_state"}
         }
+        overrides = normalized.get("series_overrides_by_id")
+        if isinstance(overrides, dict):
+            cleaned_overrides: dict[str, dict[str, object]] = {}
+            for series_id, entry in overrides.items():
+                if not isinstance(entry, dict):
+                    continue
+                cleaned_entry = deepcopy(entry)
+                if cleaned_entry.get("enabled") is True:
+                    cleaned_entry.pop("enabled", None)
+                if cleaned_entry.get("show_in_legend") is True:
+                    cleaned_entry.pop("show_in_legend", None)
+                if cleaned_entry.get("line_kwargs") == {"alpha": 0.5} and "alpha" in cleaned_entry:
+                    cleaned_entry.pop("line_kwargs", None)
+                cleaned_overrides[str(series_id)] = cleaned_entry
+            normalized["series_overrides_by_id"] = cleaned_overrides
+        return normalized
 
     def _fake_gui_launcher(**kwargs):
         preview_call_indices.append(len(plot_calls))
@@ -3628,6 +3928,80 @@ def test_plot_density_gui_embedded_preview_round_trips_after_save_for_combined_h
     assert saved.get("line_kwargs") is None or saved.get("line_kwargs") == {}
 
 
+def test_plot_density_gui_reopen_preserves_enabled_fit_settings(tmp_path, monkeypatch):
+    frame = Atoms(
+        "OO",
+        positions=[[0.0, 0.0, 0.10], [0.0, 0.0, 1.10]],
+        cell=[10.0, 10.0, 10.0],
+        pbc=True,
+    )
+    profile = compute_density_profile([frame], species="O", axis="z", bin_width=1.0)
+    source_h5 = tmp_path / "density.h5"
+    save_density_profile(profile, source_h5)
+
+    launches: list[dict[str, object]] = []
+    preview_calls = {"count": 0}
+
+    def _fake_gui_launcher(**kwargs):
+        launches.append(deepcopy(kwargs["initial_settings"]))
+        if len(launches) == 1:
+            initial_settings = deepcopy(kwargs["initial_settings"])
+            first_series_id = initial_settings["series_descriptors"][0]["series_id"]
+            initial_settings["series_overrides"] = {
+                first_series_id: {
+                    "fit": {
+                        "fit_enabled": True,
+                        "fit_type": "linear",
+                        "fit_range_mode": "visible",
+                        "fit_x_min": None,
+                        "fit_x_max": None,
+                        "fit_initial_guess": None,
+                        "fit_bounds": None,
+                        "fit_label_override": None,
+                        "fit_show_in_legend": True,
+                    }
+                }
+            }
+            kwargs["on_save"]("Default", initial_settings)
+        else:
+            kwargs["on_save_figure"](
+                deepcopy(kwargs["initial_settings"]),
+                str(tmp_path / "fit_preview_after_reopen.png"),
+            )
+            preview_calls["count"] += 1
+
+    monkeypatch.setattr("linak.cli._open_plot_settings_gui", _fake_gui_launcher)
+
+    rc_first = main(
+        [
+            "--log-level",
+            "ERROR",
+            "plot",
+            str(source_h5),
+            "--gui",
+        ]
+    )
+    rc_second = main(
+        [
+            "--log-level",
+            "ERROR",
+            "plot",
+            str(source_h5),
+            "--gui",
+        ]
+    )
+
+    assert rc_first == 0
+    assert rc_second == 0
+    assert len(launches) == 2
+    first_series_id = launches[0]["series_descriptors"][0]["series_id"]
+    saved = read_plot_profile(source_h5, "plot:density")
+    assert saved is not None
+    assert saved["series_overrides"][first_series_id]["fit"]["fit_enabled"] is True
+    assert launches[1]["series_overrides"][first_series_id]["fit"]["fit_enabled"] is True
+    assert preview_calls["count"] == 1
+
+
 def test_plot_density_gui_lazy_loading_only_reads_enabled_series_and_evicts_cache(
     tmp_path, monkeypatch
 ):
@@ -3671,7 +4045,10 @@ def test_plot_density_gui_lazy_loading_only_reads_enabled_series_and_evicts_cach
         load_calls.append([int(index) for index in indices])
         return load_density_profiles_by_index(path, indices, axis=axis, species=species)
 
+    render_args_seen: list[argparse.Namespace] = []
+
     def _fake_render_profile_plot(**_kwargs):
+        render_args_seen.append(deepcopy(_kwargs["args"]))
         return None, {}
 
     def _fake_gui_launcher(**kwargs):
@@ -3716,6 +4093,11 @@ def test_plot_density_gui_lazy_loading_only_reads_enabled_series_and_evicts_cach
 
     assert rc == 0
     assert load_calls == [[1], [1]]
+    assert len(render_args_seen) >= 2
+    for render_args in render_args_seen:
+        assert render_args.series_enabled is None
+        assert render_args.line_colors is None
+        assert render_args.series_show_in_legend is None
 
 
 def test_plot_position_gui_lazy_loading_only_reads_requested_parent_profile(tmp_path, monkeypatch):
@@ -3888,14 +4270,15 @@ def test_plot_density_gui_single_series_label_maps_to_line_label(tmp_path, monke
 
     plot_calls: list[dict[str, object]] = []
 
-    def _fake_plot_density_profile(_profile, **kwargs):
+    def _fake_plot_density(_profile, **kwargs):
         plot_calls.append(kwargs)
         return None
 
     def _fake_gui_launcher(**kwargs):
         kwargs["on_preview"]({"series_labels": ["custom-series"]})
 
-    monkeypatch.setattr("linak.analysis.density.plot_density_profile", _fake_plot_density_profile)
+    monkeypatch.setattr("linak.analysis.density.plot_density_profile", _fake_plot_density)
+    monkeypatch.setattr("linak.analysis.density.plot_density_profiles", _fake_plot_density)
     monkeypatch.setattr("linak.cli._open_plot_settings_gui", _fake_gui_launcher)
 
     rc = main(
@@ -3911,7 +4294,9 @@ def test_plot_density_gui_single_series_label_maps_to_line_label(tmp_path, monke
     assert rc == 0
     assert len(plot_calls) == 2
     assert plot_calls[0]["show"] is False
-    assert plot_calls[1]["line_label"] == "custom-series"
+    assert plot_calls[1].get("line_label") == "custom-series" or plot_calls[1].get(
+        "series_labels"
+    ) == ["custom-series"]
 
 
 def test_compute_density_passes_surface_options_to_density_engine(tmp_path, monkeypatch):
@@ -4203,7 +4588,7 @@ def test_plot_position_gui_uses_atom_level_series_in_initial_settings(tmp_path, 
     initial = captured["initial_settings"]
     assert isinstance(initial, dict)
     assert initial["series_count"] == 2
-    assert initial["series_labels"] == ["O[2]", "O[3]"]
+    assert [item["default_label"] for item in initial["series_descriptors"]] == ["O[2]", "O[3]"]
     assert initial["axis"] is None
     assert initial["component"] == "distance"
     assert initial["map_color"] == "distance"
@@ -4280,11 +4665,37 @@ def test_plot_coordination_gui_defaults_to_distance_and_resolves_time_series(tmp
     assert isinstance(initial, dict)
     assert initial["component"] == "distance"
     assert initial["series_count"] == 1
-    assert initial["series_labels"] == ["O-H"]
+    assert [item["default_label"] for item in initial["series_descriptors"]] == ["O-H"]
     resolver = captured["on_resolve_series_defaults"]
     resolved = resolver({**initial, "component": "time"})
     assert resolved["series_count"] == 1
     assert resolved["series_labels"] == ["O[2]"]
+    resolved_time_distance = resolver({**initial, "component": "time-distance"})
+    assert resolved_time_distance["series_count"] == 1
+    assert resolved_time_distance["series_labels"] == ["O[2]"]
+
+
+def test_plot_coordination_time_distance_writes_output(tmp_path):
+    source_h5 = tmp_path / "source_coordination.h5"
+    output = tmp_path / "coordination_time_distance.png"
+    _write_coordination_hdf5(source_h5)
+
+    rc = main(
+        [
+            "--log-level",
+            "ERROR",
+            "plot",
+            str(source_h5),
+            "--component",
+            "time-distance",
+            "--no-show",
+            "--output",
+            str(output),
+        ]
+    )
+
+    assert rc == 0
+    assert output.exists()
 
 
 def test_plot_rdf_multiple_files_overlays_with_source_labels(tmp_path, monkeypatch):

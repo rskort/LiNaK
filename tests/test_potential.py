@@ -234,6 +234,35 @@ def test_plot_potential_profiles_capture_defaults_and_fit_summary(tmp_path):
     assert fit_summaries["electrode_cshe_ev"]["status"] == "ok"
 
 
+def test_plot_potential_profiles_rescales_record_id_axis(tmp_path):
+    source = tmp_path / "potential_scaled_x.h5"
+    _write_potential_summary_hdf5(
+        source,
+        ids=[1, 2, 3],
+        efermi=[1.0, 1.2, 1.4],
+        water_bulk=[2.0, 2.1, 2.2],
+        cshe=[0.2, 0.3, 0.4],
+        status=["ok", "ok", "ok"],
+    )
+    profiles, _summary = load_potential_plot_profiles(source)
+    capture_state: dict[str, object] = {}
+
+    result = plot_potential_profiles(
+        profiles,
+        show=False,
+        output=tmp_path / "potential_scaled_x.png",
+        x_axis_scale=0.2,
+        x_axis_offset=1.0,
+        capture_state=capture_state,
+    )
+
+    assert result is not None
+    line = capture_state["axes"].lines[0]
+    np.testing.assert_allclose(line.get_xdata(), np.array([1.2, 1.4, 1.6]))
+    assert capture_state["x_axis_scale"] == pytest.approx(0.2)
+    assert capture_state["x_axis_offset"] == pytest.approx(1.0)
+
+
 def test_plot_potential_hdf5_non_gui_renders_png(tmp_path):
     run_dir = tmp_path / "run"
     cube = _write_potential_case(run_dir, fermi_au=0.0367493036)

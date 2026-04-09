@@ -205,6 +205,228 @@ def test_plot_multi_line_series_applies_per_axis_tick_and_font_color_settings(tm
     assert ax.yaxis.get_major_ticks()[0].tick1line.get_markersize() == pytest.approx(4)
 
 
+def test_plot_multi_line_series_integrates_plotted_data_with_boundary_interpolation(tmp_path):
+    capture_state: dict[str, object] = {}
+
+    result = plotting_module.plot_multi_line_series(
+        [np.array([0.0, 1.0, 2.0], dtype=float)],
+        [np.array([0.0, 2.0, 4.0], dtype=float)],
+        ["line"],
+        title="Integrated",
+        x_label="x",
+        y_label="y",
+        output=tmp_path / "integrated.png",
+        show=False,
+        capture_state=capture_state,
+        series_overrides_by_id={
+            "series:0": {
+                "integration": {
+                    "enabled": True,
+                    "source": "plotted",
+                    "x_min": 0.5,
+                    "x_max": 1.5,
+                    "baseline": 0.0,
+                    "color": "#ff0000",
+                    "alpha": 0.4,
+                },
+            },
+        },
+    )
+
+    assert result is not None
+    summaries = capture_state["integration_summaries"]
+    assert summaries[0]["status"] == "ok"
+    assert summaries[0]["signed_area"] == pytest.approx(2.0)
+    assert summaries[0]["absolute_area"] == pytest.approx(2.0)
+    assert summaries[0]["x_min"] == pytest.approx(0.5)
+    assert summaries[0]["x_max"] == pytest.approx(1.5)
+    assert summaries[0]["color"] == "#ff0000"
+    assert summaries[0]["alpha"] == pytest.approx(0.4)
+
+
+def test_plot_multi_line_series_integrates_raw_profile_data_before_normalization(tmp_path):
+    raw_state: dict[str, object] = {}
+    plotted_state: dict[str, object] = {}
+    x_values = np.array([0.0, 1.0, 2.0], dtype=float)
+    y_values = np.array([2.0, 2.0, 2.0], dtype=float)
+
+    plotting_module.plot_multi_line_series(
+        [x_values],
+        [y_values],
+        ["line"],
+        title="Raw",
+        x_label="x",
+        y_label="y",
+        output=tmp_path / "raw_integrated.png",
+        show=False,
+        capture_state=raw_state,
+        series_normalization_modes=["factor"],
+        series_normalization_values=[0.5],
+        series_overrides_by_id={
+            "series:0": {"integration": {"enabled": True, "source": "raw"}},
+        },
+    )
+    plotting_module.plot_multi_line_series(
+        [x_values],
+        [y_values],
+        ["line"],
+        title="Plotted",
+        x_label="x",
+        y_label="y",
+        output=tmp_path / "plotted_integrated.png",
+        show=False,
+        capture_state=plotted_state,
+        series_normalization_modes=["factor"],
+        series_normalization_values=[0.5],
+        series_overrides_by_id={
+            "series:0": {"integration": {"enabled": True, "source": "plotted"}},
+        },
+    )
+
+    assert raw_state["integration_summaries"][0]["signed_area"] == pytest.approx(4.0)
+    assert plotted_state["integration_summaries"][0]["signed_area"] == pytest.approx(2.0)
+
+
+def test_plot_multi_line_series_applies_x_axis_scale_and_offset(tmp_path):
+    capture_state: dict[str, object] = {}
+
+    result = plotting_module.plot_multi_line_series(
+        [np.array([0.0, 50.0, 100.0], dtype=float)],
+        [np.array([1.0, 2.0, 3.0], dtype=float)],
+        ["line"],
+        title="Scaled x",
+        x_label="x",
+        y_label="y",
+        output=tmp_path / "scaled_x.png",
+        show=False,
+        x_axis_scale=0.2,
+        x_axis_offset=1.0,
+        capture_state=capture_state,
+    )
+
+    assert result is not None
+    line = capture_state["axes"].lines[0]
+    np.testing.assert_allclose(line.get_xdata(), np.array([1.0, 11.0, 21.0]))
+    assert capture_state["x_axis_scale"] == pytest.approx(0.2)
+    assert capture_state["x_axis_offset"] == pytest.approx(1.0)
+
+
+def test_plot_multi_line_series_falls_back_to_index_x_before_mapping(tmp_path):
+    capture_state: dict[str, object] = {}
+
+    result = plotting_module.plot_multi_line_series(
+        [np.array([], dtype=float)],
+        [np.array([1.0, 2.0, 3.0], dtype=float)],
+        ["line"],
+        title="Index x",
+        x_label="x",
+        y_label="y",
+        output=tmp_path / "index_x.png",
+        show=False,
+        x_axis_scale=0.2,
+        x_axis_offset=1.0,
+        capture_state=capture_state,
+    )
+
+    assert result is not None
+    line = capture_state["axes"].lines[0]
+    np.testing.assert_allclose(line.get_xdata(), np.array([1.0, 1.2, 1.4]))
+
+
+def test_x_axis_mapping_affects_plotted_integration_but_not_raw_integration(tmp_path):
+    raw_state: dict[str, object] = {}
+    plotted_state: dict[str, object] = {}
+    x_values = np.array([0.0, 1.0, 2.0], dtype=float)
+    y_values = np.array([2.0, 2.0, 2.0], dtype=float)
+
+    plotting_module.plot_multi_line_series(
+        [x_values],
+        [y_values],
+        ["line"],
+        title="Raw scaled",
+        x_label="x",
+        y_label="y",
+        output=tmp_path / "raw_scaled_integrated.png",
+        show=False,
+        x_axis_scale=0.5,
+        capture_state=raw_state,
+        series_overrides_by_id={
+            "series:0": {"integration": {"enabled": True, "source": "raw"}},
+        },
+    )
+    plotting_module.plot_multi_line_series(
+        [x_values],
+        [y_values],
+        ["line"],
+        title="Plotted scaled",
+        x_label="x",
+        y_label="y",
+        output=tmp_path / "plotted_scaled_integrated.png",
+        show=False,
+        x_axis_scale=0.5,
+        capture_state=plotted_state,
+        series_overrides_by_id={
+            "series:0": {"integration": {"enabled": True, "source": "plotted"}},
+        },
+    )
+
+    assert raw_state["integration_summaries"][0]["signed_area"] == pytest.approx(4.0)
+    assert plotted_state["integration_summaries"][0]["signed_area"] == pytest.approx(2.0)
+
+
+def test_plot_multi_line_series_rejects_zero_x_axis_scale(tmp_path):
+    with pytest.raises(ValueError, match="X-axis scale factor"):
+        plotting_module.plot_multi_line_series(
+            [np.array([0.0, 1.0], dtype=float)],
+            [np.array([0.0, 1.0], dtype=float)],
+            ["line"],
+            title="Bad x scale",
+            x_label="x",
+            y_label="y",
+            output=tmp_path / "bad_x_scale.png",
+            show=False,
+            x_axis_scale=0.0,
+        )
+
+
+def test_plot_multi_line_series_rejects_invalid_integration_range(tmp_path):
+    with pytest.raises(ValueError, match="Integration x-min"):
+        plotting_module.plot_multi_line_series(
+            [np.array([0.0, 1.0, 2.0], dtype=float)],
+            [np.array([0.0, 2.0, 4.0], dtype=float)],
+            ["line"],
+            title="Integrated",
+            x_label="x",
+            y_label="y",
+            output=tmp_path / "bad_integrated.png",
+            show=False,
+            series_overrides_by_id={
+                "series:0": {
+                    "integration": {"enabled": True, "x_min": 1.0, "x_max": 1.0},
+                },
+            },
+        )
+
+
+def test_plot_multi_line_series_rejects_all_visible_integration_target(tmp_path):
+    with pytest.raises(ValueError, match="Integration target"):
+        plotting_module.plot_multi_line_series(
+            [np.array([0.0, 1.0], dtype=float)],
+            [np.array([0.0, 1.0], dtype=float)],
+            ["line"],
+            title="Integrated",
+            x_label="x",
+            y_label="y",
+            output=tmp_path / "bad_target.png",
+            show=False,
+            series_overrides_by_id={
+                "series:0": {
+                    "integration": {"enabled": True, "target": "all_visible"},
+                },
+            },
+        )
+
+
 def test_plot_heatmap_series_applies_figure_alpha_and_font_color_settings(tmp_path):
     capture_state: dict[str, object] = {}
 
@@ -809,6 +1031,73 @@ def test_plot_multi_line_series_renders_cumulative_when_base_line_is_hidden(tmp_
     assert ax.lines[0].get_label() == "base cumulative average"
 
 
+def test_plot_multi_line_series_renders_fit_when_base_line_is_hidden(tmp_path):
+    capture_state: dict[str, object] = {}
+
+    result = plotting_module.plot_multi_line_series(
+        [np.array([0.0, 1.0, 2.0], dtype=float)],
+        [np.array([1.0, 3.0, 5.0], dtype=float)],
+        ["base"],
+        series_ids=["series:a"],
+        title="Fit hidden base",
+        x_label="x",
+        y_label="y",
+        output=tmp_path / "fit_hidden_base.png",
+        show=False,
+        series_enabled=[False],
+        series_fit_configs=[{"fit_enabled": True, "fit_type": "linear"}],
+        capture_state=capture_state,
+    )
+
+    assert result is not None
+    assert capture_state["series_fit_summaries"]["series:a"]["status"] == "ok"
+    ax = capture_state["axes"]
+    assert len(ax.lines) == 1
+    assert ax.lines[0].get_label() == "base fit"
+
+
+def test_plot_multi_line_series_renders_error_when_base_line_is_hidden(tmp_path):
+    from linak.analysis.statistics import SeriesStatistics
+
+    capture_state: dict[str, object] = {}
+
+    result = plotting_module.plot_multi_line_series(
+        [np.array([0.0, 1.0, 2.0], dtype=float)],
+        [np.array([1.0, 3.0, 5.0], dtype=float)],
+        ["base"],
+        series_ids=["series:a"],
+        title="Error hidden base",
+        x_label="x",
+        y_label="y",
+        output=tmp_path / "error_hidden_base.png",
+        show=False,
+        series_enabled=[False],
+        series_statistics_data=[
+            SeriesStatistics(
+                point_count=np.array([12, 12, 12], dtype=int),
+                sample_n=np.array([5, 5, 5], dtype=int),
+                sample_std=np.array([0.2, 0.2, 0.2], dtype=float),
+                sample_sem=np.array([0.1, 0.1, 0.1], dtype=float),
+            )
+        ],
+        series_error_configs=[
+            {
+                "enabled": True,
+                "stat": "sample_sem",
+                "style": "band",
+                "color": "#cc5500",
+            }
+        ],
+        capture_state=capture_state,
+    )
+
+    assert result is not None
+    assert capture_state["series_error_summaries"]["series:a"]["status"] == "ok"
+    ax = capture_state["axes"]
+    assert len(ax.lines) == 0
+    assert len(ax.collections) == 1
+
+
 def test_plot_multi_line_series_renders_grouped_mean_series(tmp_path):
     capture_state: dict[str, object] = {}
 
@@ -846,6 +1135,287 @@ def test_plot_multi_line_series_renders_grouped_mean_series(tmp_path):
     ax = capture_state["axes"]
     assert len(ax.lines) == 1
     np.testing.assert_allclose(ax.lines[0].get_ydata(), np.array([1.5, 3.5, 6.5], dtype=float))
+
+
+def test_plot_multi_line_series_groups_currently_normalized_member_layers(tmp_path):
+    capture_state: dict[str, object] = {}
+
+    result = plotting_module.plot_multi_line_series(
+        [
+            np.array([0.0, 1.0, 2.0], dtype=float),
+            np.array([0.0, 1.0, 2.0], dtype=float),
+        ],
+        [
+            np.array([1.0, 2.0, 3.0], dtype=float),
+            np.array([10.0, 20.0, 30.0], dtype=float),
+        ],
+        ["a", "b"],
+        series_ids=["series:a", "series:b"],
+        title="Grouped normalized",
+        x_label="x",
+        y_label="y",
+        output=tmp_path / "grouped_normalized.png",
+        show=False,
+        render_series_descriptors=[
+            {
+                "series_id": "group:1",
+                "default_label": "Grouped mean",
+                "source_kind": "group",
+                "member_series_ids": ["series:a", "series:b"],
+                "group_reducer": "mean",
+            }
+        ],
+        series_overrides_by_id={
+            "series:a": {
+                "normalization_mode": "max",
+                "normalization_value": 1.0,
+            }
+        },
+        capture_state=capture_state,
+    )
+
+    assert result is not None
+    ax = capture_state["axes"]
+    assert len(ax.lines) == 1
+    np.testing.assert_allclose(
+        ax.lines[0].get_ydata(),
+        np.array([5.1666666667, 10.3333333333, 15.5], dtype=float),
+        rtol=1.0e-9,
+        atol=1.0e-9,
+    )
+
+
+def test_plot_multi_line_series_group_excludes_hidden_member_layers(tmp_path):
+    capture_state: dict[str, object] = {}
+
+    result = plotting_module.plot_multi_line_series(
+        [
+            np.array([0.0, 1.0, 2.0], dtype=float),
+            np.array([0.0, 1.0, 2.0], dtype=float),
+        ],
+        [
+            np.array([1.0, 3.0, 5.0], dtype=float),
+            np.array([2.0, 4.0, 6.0], dtype=float),
+        ],
+        ["A", "B"],
+        series_ids=["series:a", "series:b"],
+        title="Grouped hidden member",
+        x_label="x",
+        y_label="y",
+        output=tmp_path / "group_hidden_member.png",
+        show=False,
+        render_series_descriptors=[
+            {
+                "series_id": "series:a",
+                "default_label": "A",
+                "source_kind": "source",
+                "source_series_id": "series:a",
+            },
+            {
+                "series_id": "series:b",
+                "default_label": "B",
+                "source_kind": "source",
+                "source_series_id": "series:b",
+            },
+            {
+                "series_id": "group:1",
+                "default_label": "Grouped",
+                "source_kind": "group",
+                "member_series_ids": ["series:a", "series:b"],
+                "group_reducer": "mean",
+            },
+        ],
+        series_overrides_by_id={"series:a": {"enabled": False}},
+        capture_state=capture_state,
+    )
+
+    assert result is not None
+    ax = capture_state["axes"]
+    assert [line.get_label() for line in ax.lines] == ["B", "Grouped"]
+    np.testing.assert_allclose(ax.lines[1].get_ydata(), np.array([2.0, 4.0, 6.0], dtype=float))
+
+
+def test_plot_multi_line_series_group_includes_raw_hidden_member_layers(tmp_path):
+    capture_state: dict[str, object] = {}
+
+    result = plotting_module.plot_multi_line_series(
+        [
+            np.array([0.0, 1.0, 2.0], dtype=float),
+            np.array([0.0, 1.0, 2.0], dtype=float),
+        ],
+        [
+            np.array([1.0, 3.0, 5.0], dtype=float),
+            np.array([2.0, 4.0, 6.0], dtype=float),
+        ],
+        ["A", "B"],
+        series_ids=["series:a", "series:b"],
+        title="Grouped raw hidden member",
+        x_label="x",
+        y_label="y",
+        output=tmp_path / "group_raw_hidden_member.png",
+        show=False,
+        render_series_descriptors=[
+            {
+                "series_id": "series:a",
+                "default_label": "A",
+                "source_kind": "source",
+                "source_series_id": "series:a",
+            },
+            {
+                "series_id": "series:b",
+                "default_label": "B",
+                "source_kind": "source",
+                "source_series_id": "series:b",
+            },
+            {
+                "series_id": "group:1",
+                "default_label": "Grouped",
+                "source_kind": "group",
+                "member_series_ids": ["series:a", "series:b"],
+                "group_reducer": "mean",
+            },
+        ],
+        series_overrides_by_id={"series:a": {"show_raw_line": False}},
+        capture_state=capture_state,
+    )
+
+    assert result is not None
+    ax = capture_state["axes"]
+    assert [line.get_label() for line in ax.lines] == ["B", "Grouped"]
+    np.testing.assert_allclose(ax.lines[1].get_ydata(), np.array([1.5, 3.5, 5.5], dtype=float))
+
+
+def test_plot_multi_line_series_renders_generated_copy_from_source_series_id(tmp_path):
+    capture_state: dict[str, object] = {}
+
+    result = plotting_module.plot_multi_line_series(
+        [np.array([0.0, 1.0, 2.0], dtype=float)],
+        [np.array([1.0, 3.0, 5.0], dtype=float)],
+        ["original"],
+        series_ids=["series:a"],
+        title="Copy",
+        x_label="x",
+        y_label="y",
+        output=tmp_path / "copy_descriptor.png",
+        show=False,
+        render_series_descriptors=[
+            {
+                "series_id": "series:a",
+                "default_label": "Original",
+                "source_kind": "source",
+                "source_series_id": "series:a",
+            },
+            {
+                "series_id": "source:copy",
+                "default_label": "Copy",
+                "source_kind": "source",
+                "source_series_id": "series:a",
+                "is_generated": True,
+            },
+        ],
+        series_overrides_by_id={"source:copy": {"label_override": "Copy"}},
+        capture_state=capture_state,
+    )
+
+    assert result is not None
+    ax = capture_state["axes"]
+    assert [line.get_label() for line in ax.lines] == ["Original", "Copy"]
+    assert ax.lines[0].get_color() == ax.lines[1].get_color()
+    np.testing.assert_allclose(ax.lines[1].get_ydata(), np.array([1.0, 3.0, 5.0], dtype=float))
+
+
+def test_plot_multi_line_series_hides_disabled_source_render_descriptor(tmp_path):
+    capture_state: dict[str, object] = {}
+
+    result = plotting_module.plot_multi_line_series(
+        [
+            np.array([0.0, 1.0, 2.0], dtype=float),
+            np.array([0.0, 1.0, 2.0], dtype=float),
+        ],
+        [
+            np.array([1.0, 3.0, 5.0], dtype=float),
+            np.array([2.0, 4.0, 6.0], dtype=float),
+        ],
+        ["A", "B"],
+        series_ids=["series:a", "series:b"],
+        title="Hidden source",
+        x_label="x",
+        y_label="y",
+        output=tmp_path / "hidden_source.png",
+        show=False,
+        render_series_descriptors=[
+            {
+                "series_id": "series:a",
+                "default_label": "A",
+                "source_kind": "source",
+                "source_series_id": "series:a",
+            },
+            {
+                "series_id": "series:b",
+                "default_label": "B",
+                "source_kind": "source",
+                "source_series_id": "series:b",
+            },
+        ],
+        series_overrides_by_id={"series:a": {"enabled": False}},
+        capture_state=capture_state,
+    )
+
+    assert result is not None
+    ax = capture_state["axes"]
+    assert [line.get_label() for line in ax.lines] == ["B"]
+
+
+def test_plot_multi_line_series_keeps_hidden_source_members_out_of_visible_output(tmp_path):
+    capture_state: dict[str, object] = {}
+
+    result = plotting_module.plot_multi_line_series(
+        [
+            np.array([0.0, 1.0, 2.0], dtype=float),
+            np.array([0.0, 1.0, 2.0], dtype=float),
+        ],
+        [
+            np.array([1.0, 2.0, 3.0], dtype=float),
+            np.array([2.0, 3.0, 4.0], dtype=float),
+        ],
+        ["A", "B"],
+        series_ids=["series:a", "series:b"],
+        title="Hidden source member",
+        x_label="x",
+        y_label="y",
+        output=tmp_path / "hidden_member_group.png",
+        show=False,
+        render_series_descriptors=[
+            {
+                "series_id": "series:a",
+                "default_label": "A",
+                "source_kind": "source",
+                "source_series_id": "series:a",
+            },
+            {
+                "series_id": "series:b",
+                "default_label": "B",
+                "source_kind": "source",
+                "source_series_id": "series:b",
+            },
+            {
+                "series_id": "group:1",
+                "default_label": "Grouped",
+                "source_kind": "group",
+                "member_series_ids": ["series:a", "series:b"],
+                "group_reducer": "mean",
+            },
+        ],
+        series_overrides_by_id={
+            "series:a": {"enabled": False},
+            "group:1": {"color": "#cc5500"},
+        },
+        capture_state=capture_state,
+    )
+
+    assert result is not None
+    ax = capture_state["axes"]
+    assert [line.get_label() for line in ax.lines] == ["B", "Grouped"]
 
 
 def test_plot_multi_line_series_rebinned_grouped_path_succeeds_without_strict_zip(tmp_path):

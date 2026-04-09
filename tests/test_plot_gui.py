@@ -4,6 +4,7 @@ from pathlib import Path
 from linak.plot.plot_gui import (
     _AUTO_PREVIEW_DEBOUNCE_MS,
     _TOOLTIPS,
+    _annotation_defaults_for_gui,
     _annotation_display_text_from_entry,
     _annotation_fallback_title,
     _border_setting_to_mode,
@@ -24,7 +25,7 @@ from linak.plot.plot_gui import (
     _extract_limit,
     _extract_dict_mode,
     _format_series_display_text,
-    _partition_series_ids_by_enabled_state,
+    _partition_series_ids_for_display_order,
     _resolve_error_stat_for_available,
     _resolve_asset_path,
     _resolve_series_id_order,
@@ -226,6 +227,86 @@ def test_plot_settings_panel_hides_inactive_optional_layer_details():
     assert 'norm_x_ref_enabled = norm_mode == "value_at_x"' in source
 
 
+def test_plot_settings_panel_uses_reusable_collapsible_sections_with_session_state():
+    source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+
+    assert "class _CollapsibleSection(QFrame):" in source
+    assert "QPropertyAnimation" in source
+    assert "QEasingCurve.Type.OutCubic" in source
+    assert "self._collapsible_section_state: dict[str, bool] = {}" in source
+    assert "self._state_store[self._section_id] = self._expanded" in source
+    assert "self.toggle_button.setSizePolicy(" in source
+    assert "QSizePolicy.Policy.Expanding" in source
+    assert "alignment=Qt.AlignmentFlag.AlignVCenter" in source
+    assert (
+        "header_layout.addWidget(\n                self.toggle_button,\n                stretch=1,"
+        in source
+    )
+    assert '"_collapsible_section_state"' not in source
+
+
+def test_plot_settings_panel_themes_message_boxes_and_dialog_buttons():
+    source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+
+    assert 'f"QMessageBox {{' in source
+    assert 'f"QMessageBox QLabel {{' in source
+    assert 'f"QMessageBox QTextEdit, QMessageBox QPlainTextEdit {{' in source
+    assert 'f"QMessageBox QPushButton {{' in source
+    assert 'f"QDialogButtonBox QPushButton {{' in source
+
+
+def test_plot_settings_panel_blocks_series_and_annotation_sync_during_initial_populate():
+    source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+
+    assert "_previous_series_syncing = self._series_syncing" in source
+    assert "_previous_annotation_syncing = self._annotation_syncing" in source
+    assert "self._series_syncing = True" in source
+    assert "self._annotation_syncing = True" in source
+    assert "self._populate(initial_settings)" in source
+
+
+def test_plot_settings_panel_maps_collapsible_section_ids_for_layers_and_figure():
+    source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+
+    for token in (
+        'section_id="layers.visibility"',
+        'section_id="layers.style"',
+        'section_id="layers.integration"',
+        'section_id="layers.derived"',
+        'section_id="layers.derived.uncertainty"',
+        'section_id="layers.derived.fit"',
+        'section_id="layers.derived.cumulative"',
+        'section_id="layers.group_members"',
+        'section_id="layers.normalization"',
+        'section_id="layers.metadata"',
+        'section_id="figure.canvas"',
+        'section_id="figure.lines"',
+        'section_id="figure.axes"',
+        'section_id="figure.axes.title"',
+        'section_id="figure.axes.x"',
+        'section_id="figure.axes.x_ticks"',
+        'section_id="figure.axes.y"',
+        'section_id="figure.axes.y_ticks"',
+        'section_id="figure.axes.grid"',
+        'section_id="figure.axes.border"',
+        'section_id="figure.legend"',
+        'section_id="figure.heatmap"',
+        'section_id="figure.heatmap.rendering"',
+        'section_id="figure.heatmap.colorbar"',
+    ):
+        assert token in source
+
+
+def test_plot_settings_panel_keeps_group_normalization_live_and_editable():
+    source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+
+    assert '"Copied normalization settings to all layers."' in source
+    assert "grouped series aggregate already-transformed member series" not in source
+    assert "non-group base series only" not in source
+    assert "show_normalization=is_line_family," in source
+    assert "self._normalization_group.setEnabled(layer_caps.show_normalization)" in source
+
+
 def test_plot_settings_panel_hides_inactive_figure_data_and_annotation_details():
     source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
 
@@ -243,7 +324,152 @@ def test_plot_settings_panel_hides_inactive_figure_data_and_annotation_details()
     assert "self._set_form_row_visible(\n                    self._y_bin_reducer_row[0]" in source
     assert "self._annotation_common_detail_rows" in source
     assert 'annotation_enabled and annotation_type == "text"' in source
-    assert "self._annotation_summary_group.setVisible(annotation_enabled)" in source
+    assert 'QGroupBox("Preview Summary")' not in source
+    assert "_annotation_preview_summary" not in source
+    assert "annotations.summary" not in source
+    assert "header_widget=" not in source
+    assert '"Legend",' in source
+    assert '"Show ticks",' in source
+    assert '"Show grid",' in source
+    assert '"Colorbar",' in source
+
+
+def test_plot_settings_panel_keeps_x_y_label_font_sizes_independent():
+    source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+
+    assert '(self.x_label_font, "x_label_font_size")' in source
+    assert '(self.y_label_font, "y_label_font_size")' in source
+    assert '"label_font_size": shared_label_font_size_value' in source
+    assert '"x_label_font_size": x_label_font_size_value' in source
+    assert '"y_label_font_size": y_label_font_size_value' in source
+    assert '"tick_font_size": shared_tick_font_size_value' in source
+
+
+def test_plot_settings_panel_uses_explicit_series_row_theme_tokens():
+    source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+
+    assert '"series_row_selected_bg"' in source
+    assert '"series_row_selected_border"' in source
+    assert '"series_row_selected_text"' in source
+    assert '"series_badge_original_bg"' in source
+    assert '"series_badge_copy_bg"' in source
+    assert '"series_badge_group_bg"' in source
+    assert "QToolButton {" in source
+    assert '"tooltip_bg"' in source
+    assert '"tooltip_text"' in source
+    assert '"tooltip_border"' in source
+    assert '"placeholder_text"' in source
+    assert "QToolTip {" in source
+    assert "QMenu {" in source
+    assert "QMenu::item:disabled {" in source
+    assert "placeholder-text-color:" in source
+    assert "QComboBox QAbstractItemView::item {" in source
+    assert "show-decoration-selected: 1;" in source
+    assert "QAbstractItemView::item:selected {" in source
+    assert "QAbstractItemView::indicator:checked {" in source
+    assert "QScrollBar:horizontal {" in source
+    assert "theme=self._theme_tokens()" in source
+    assert "self.palette().color(QPalette.ColorRole.Text)" not in source
+    assert "self.palette().color(QPalette.ColorRole.Mid)" not in source
+    assert "_win.lightness() < _wtxt.lightness()" not in source
+
+
+def test_plot_settings_panel_rebuilds_series_list_with_safe_widget_detach():
+    source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+
+    assert "def _clear_series_list_widget_items(self) -> None:" in source
+    assert "self.series_list.removeItemWidget(item)" in source
+    assert "widget.deleteLater()" in source
+    assert "old_signal_block = self.series_list.blockSignals(True)" in source
+    assert "old_model_block = model.blockSignals(True)" in source
+    assert (
+        'self._set_active_series_child_kind("base")\n            self._clone_series_at_index'
+        in source
+    )
+    assert "(self._series_fit_enabled_data, False)" in source
+
+
+def test_plot_settings_panel_centralizes_parallel_series_state_management():
+    source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+
+    assert "def _series_state_attr_names(self) -> tuple[str, ...]:" in source
+    assert "def _iter_series_state_lists(self) -> list[tuple[str, list[Any]]]:" in source
+    assert "def _validate_series_state_lengths(self) -> None:" in source
+    assert "def _effective_series_state(self, index: int) -> dict[str, Any]:" in source
+    assert "for name, values in self._iter_series_state_lists():" in source
+    assert "Internal GUI layer state is inconsistent:" in source
+    assert "self._series_show_raw_line_data.append(True)" in source
+
+
+def test_plot_settings_panel_has_selected_layer_identity_card_and_generated_delete():
+    source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+
+    assert 'self._selected_layer_card.setObjectName("selectedLayerCard")' in source
+    assert 'self._selected_layer_title = QLabel("No layer selected")' in source
+    assert 'self._series_delete_button = QPushButton("Delete Layer")' in source
+    assert "def _series_is_generated(self, index: int) -> bool:" in source
+    assert "Original data series cannot be deleted here; turn them off instead." in source
+    assert "def _delete_series_at_index(self, index: int) -> None:" in source
+    assert "def _default_generated_series_color(self, index: int) -> str:" in source
+    assert "if original_source_ids:" in source
+    assert "if self._series_is_generated(index):" in source
+    assert 'entry["color"] = generated_color' in source
+
+
+def test_plot_settings_panel_repartitions_layer_order_after_visibility_and_group_changes():
+    source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+
+    assert "def _partition_series_ids_for_display_order(" in source
+    assert "enabled_non_group_ids = [" in source
+    assert "enabled_group_ids = [" in source
+    assert "disabled_ids = [" in source
+    assert "self._apply_series_id_order(self._enabled_partitioned_series_id_order())" in source
+
+
+def test_plot_settings_panel_keeps_base_series_checkbox_enabled_when_row_is_off():
+    source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+
+    assert 'self.checkbox.setEnabled(kind == "base")' in source
+
+
+def test_plot_settings_panel_keeps_base_row_toggle_logic_outside_cumulative_branch():
+    source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+
+    assert 'elif row_kind == "cumulative":' in source
+    assert "else:\n                if checked and self._is_orientation_heatmap_mode():" in source
+    assert "self._series_enabled_data[index] = checked" in source
+
+
+def test_plot_settings_panel_uses_checkable_group_members_under_layer_list():
+    source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+
+    selected_card_index = source.index("tab_layout.addWidget(self._selected_layer_card)")
+    selector_row_index = source.index("layout.addLayout(selector_row)")
+    series_list_index = source.index("layout.addWidget(self.series_list)")
+    group_member_index = source.index("layout.addWidget(self._series_group_group)")
+    visibility_index = source.index(
+        "self._series_visibility_group = self._make_collapsible_section("
+    )
+
+    assert (
+        selected_card_index
+        < selector_row_index
+        < series_list_index
+        < group_member_index
+        < visibility_index
+    )
+    assert "QAbstractItemView.SelectionMode.NoSelection" in source
+    assert "self._series_group_members.itemChanged.connect" in source
+    assert "Qt.ItemFlag.ItemIsUserCheckable" in source
+    assert "item.checkState() == Qt.CheckState.Checked" in source
+
+
+def test_plot_settings_panel_busts_preview_pixmap_cache_before_reload():
+    source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+
+    assert "QPixmapCache," in source
+    assert "QPixmapCache.remove(str(self._preview_image_path))" in source
+    assert "if not pixmap.load(str(self._preview_image_path)):" in source
 
 
 def test_plot_settings_panel_uses_task_first_workspace_pages():
@@ -264,17 +490,75 @@ def test_plot_settings_panel_uses_task_first_workspace_pages():
 def test_plot_settings_panel_flattens_figure_controls_into_one_scroll_page():
     source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
 
-    assert 'QGroupBox("Canvas & Typography")' in source
-    assert 'QGroupBox("Lines & Markers")' in source
-    assert 'QGroupBox("Axes, Ticks & Grid")' in source
+    assert 'QGroupBox("Canvas and Typography")' in source
+    assert 'QGroupBox("Lines and Markers")' in source
+    assert 'QGroupBox("Axes, Ticks and Grid")' in source
     assert 'QGroupBox("Legend")' in source
-    assert 'QGroupBox("Heatmap & Colorbar")' in source
+    assert 'QGroupBox("Heatmap and Colorbar")' in source
     assert 'QGroupBox("Grid")' in source
     assert 'QGroupBox("Border")' in source
     assert 'tabs.addTab(text_legend_tab, "Text && Legend")' not in source
     assert 'tabs.addTab(axes_limits_tab, "Axes && Limits")' not in source
     assert 'tabs.addTab(ticks_grid_tab, "Ticks && Grid")' not in source
     assert 'tabs.addTab(style_tab, "Style")' not in source
+
+
+def test_plot_settings_panel_includes_integration_controls_and_summary():
+    source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+
+    assert "self.integration_mode = self._combo(_TOGGLE_MODES)" in source
+    assert "self.integration_source = self._combo(_INTEGRATION_SOURCES)" in source
+    assert "self.integration_target = self._combo(_INTEGRATION_TARGETS)" not in source
+    assert "_INTEGRATION_TARGETS" not in source
+    assert 'self.integration_x_min = self._bounded_float_line("min")' in source
+    assert 'self.integration_x_max = self._bounded_float_line("max")' in source
+    assert 'self.integration_baseline = self._bounded_float_line("0.0")' in source
+    assert (
+        'self.integration_alpha = self._bounded_float_line("0.0 - 1.0", bottom=0.0, top=1.0)'
+        in source
+    )
+    assert "self._integration_summary_label = QLabel(" in source
+    assert 'entry["integration"] = integration_payload' in source
+    assert 'integration_group = QGroupBox("Integration")' in source
+    assert 'section_id="layers.integration"' in source
+    assert '"Integration",' in source
+    assert "layout.addWidget(self._tab_integration_content)" not in source
+    assert "self._series_integration_group.setVisible(layer_caps.show_integration)" in source
+    assert "self._set_rows_visible(self._integration_rows, integration_enabled)" in source
+
+
+def test_plot_settings_panel_starts_fit_editor_in_off_mode_before_saved_state_load():
+    source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+
+    fit_combo_index = source.index("self._series_fit_mode = self._combo(_TOGGLE_MODES)")
+    fit_off_index = source.index('self._set_combo_value(self._series_fit_mode, "off")')
+    fit_connect_index = source.index(
+        "self._series_fit_mode.currentTextChanged.connect(self._on_series_editor_changed)"
+    )
+
+    assert fit_combo_index < fit_off_index < fit_connect_index
+
+
+def test_plot_settings_panel_nests_tick_sections_inside_axis_sections_and_keeps_annotation_list_open():
+    source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+
+    x_axis_form_index = source.index("x_axis_layout.addLayout(x_axis_form)")
+    x_ticks_group_index = source.index("self._x_ticks_group = self._make_collapsible_section(")
+    x_axis_section_index = source.index('section_id="figure.axes.x"')
+    y_axis_form_index = source.index("y_axis_layout.addLayout(y_axis_form)")
+    y_ticks_group_index = source.index("self._y_ticks_group = self._make_collapsible_section(")
+    y_axis_section_index = source.index('section_id="figure.axes.y"')
+    annotation_splitter_index = source.index(
+        "content_splitter = QSplitter(Qt.Orientation.Horizontal)"
+    )
+    annotation_list_index = source.index("content_splitter.addWidget(list_group)")
+
+    assert x_axis_form_index < x_ticks_group_index < x_axis_section_index
+    assert y_axis_form_index < y_ticks_group_index < y_axis_section_index
+    assert annotation_splitter_index < annotation_list_index
+    assert 'section_id="annotations.list"' not in source
+    assert 'QGroupBox("Base Line Style")' not in source
+    assert 'QGroupBox("Fit Summary")' not in source
 
 
 def test_plot_settings_panel_keeps_export_in_preview_toolbar_without_transparent_save():
@@ -300,6 +584,19 @@ def test_plot_settings_panel_supports_detachable_preview_window():
     assert "QTimer.singleShot(0, self._on_dock_requested)" in source
 
 
+def test_plot_settings_panel_has_manual_light_dark_theme_switch():
+    source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+
+    assert 'self._theme_switch = QCheckBox("Dark mode")' in source
+    assert 'self._theme_switch.setObjectName("themeSwitch")' in source
+    assert "self._theme_switch.toggled.connect(self._handle_theme_switch_toggled)" in source
+    assert "QCheckBox#themeSwitch" in source
+    assert 'if self._theme_mode == "dark":' in source
+    assert 'if self._theme_mode == "light":' in source
+    assert '"_gui_theme_mode"' not in source
+    assert "_GUI_THEME_MODES" not in source
+
+
 def test_plot_settings_panel_keeps_status_outside_hidden_preview_panel():
     source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
 
@@ -311,6 +608,12 @@ def test_plot_settings_panel_keeps_status_outside_hidden_preview_panel():
 def test_plot_settings_panel_exposes_per_axis_ticks_and_color_controls():
     source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
 
+    assert 'self.x_axis_scale = self._bounded_float_line("1.0")' in source
+    assert 'self.x_axis_offset = self._bounded_float_line("0.0")' in source
+    assert '"X scale factor"' in source
+    assert '"X offset"' in source
+    assert '"x_axis_scale": x_axis_scale' in source
+    assert '"x_axis_offset": x_axis_offset' in source
     assert "self.x_ticks_mode = self._combo(_TOGGLE_MODES)" in source
     assert "self.y_ticks_mode = self._combo(_TOGGLE_MODES)" in source
     assert "self.x_tick_direction = self._combo(_TICK_DIRECTIONS)" in source
@@ -341,7 +644,29 @@ def test_plot_settings_panel_gives_annotation_list_a_dedicated_object_name():
     source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
 
     assert 'self.annotation_list.setObjectName("annotationList")' in source
-    assert "QListWidget#annotationList::item" in source
+
+
+def test_plot_settings_panel_uses_inline_annotation_reorder_arrows_instead_of_move_buttons():
+    source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+
+    assert "class _AnnotationRowWidget(QWidget):" in source
+    assert 'self._annotation_move_up_button = QPushButton("Move Up")' not in source
+    assert 'self._annotation_move_down_button = QPushButton("Move Down")' not in source
+    assert "self._handle_annotation_row_move(" in source
+    assert "QWidget#annotationRowWidget {" in source
+
+
+def test_annotation_defaults_start_visible_in_preview_space():
+    entry_text = _annotation_defaults_for_gui("text", index=1)
+    entry_line = _annotation_defaults_for_gui("line", index=1)
+    entry_arrow = _annotation_defaults_for_gui("arrow", index=1)
+
+    assert entry_text["coord_system"] == "axes"
+    assert entry_text["text"] == "Text 1"
+    assert entry_line["coord_system"] == "axes"
+    assert entry_line["x1"] == "0.15"
+    assert entry_line["x2"] == "0.85"
+    assert entry_arrow["coord_system"] == "axes"
 
 
 def test_plot_settings_panel_uses_cumulative_child_ids_in_series_list():
@@ -461,7 +786,8 @@ def test_coerce_series_descriptors_preserves_identity_and_metadata():
             "series_id": "series:0:3",
             "default_label": "O",
             "source_kind": "source",
-            "source_series_id": None,
+            "source_series_id": "series:0:3",
+            "is_generated": False,
             "member_series_ids": [],
             "group_reducer": "mean",
             "source_name": "density.h5",
@@ -471,6 +797,32 @@ def test_coerce_series_descriptors_preserves_identity_and_metadata():
             "series_index": None,
         }
     ]
+
+
+def test_coerce_series_descriptors_preserves_generated_copy_identity():
+    descriptors = _coerce_series_descriptors(
+        [
+            {
+                "series_id": "source:copy",
+                "source_kind": "source",
+                "source_series_id": "source:original",
+                "is_generated": True,
+                "default_label": "O Copy",
+            },
+            {
+                "series_id": "group:1",
+                "source_kind": "group",
+                "default_label": "Group 1",
+                "member_series_ids": ["source:original", "source:copy"],
+            },
+        ]
+    )
+
+    assert descriptors[0]["is_generated"] is True
+    assert descriptors[0]["source_series_id"] == "source:original"
+    assert descriptors[1]["is_generated"] is True
+    assert descriptors[1]["source_kind"] == "group"
+    assert descriptors[1]["member_series_ids"] == ["source:original", "source:copy"]
 
 
 def test_coerce_series_overrides_keeps_sparse_label_override_mapping():
@@ -518,18 +870,24 @@ def test_resolve_series_id_order_appends_new_series_after_requested_order():
     ) == ["series-c", "series-a", "series-b"]
 
 
-def test_partition_series_ids_by_enabled_state_preserves_current_relative_order():
-    resolved = _partition_series_ids_by_enabled_state(
+def test_partition_series_ids_for_display_order_preserves_relative_order_in_partitions():
+    resolved = _partition_series_ids_for_display_order(
         ["series-c", "series-a", "series-b", "series-d"],
-        {
+        enabled_by_id={
             "series-c": True,
+            "series-a": False,
+            "series-b": True,
+            "series-d": True,
+        },
+        group_by_id={
+            "series-c": False,
             "series-a": False,
             "series-b": True,
             "series-d": False,
         },
     )
 
-    assert resolved == ["series-c", "series-b", "series-a", "series-d"]
+    assert resolved == ["series-c", "series-d", "series-b", "series-a"]
 
 
 def test_capture_series_list_view_anchor_uses_top_visible_row_and_offset():

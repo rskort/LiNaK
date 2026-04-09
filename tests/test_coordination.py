@@ -16,6 +16,7 @@ from linak.analysis.coordination import (
     load_coordination_profiles,
     load_coordination_profile,
     plot_coordination_profile,
+    plot_coordination_profiles,
     resolve_coordination_cutoffs,
     resolve_coordination_cutoff,
     save_coordination_profiles,
@@ -966,6 +967,53 @@ def test_plot_coordination_time_distance_ignores_marker_only_line_kwargs(tmp_pat
         profile,
         component="time-distance",
         line_kwargs={"markersize": 9.0, "marker": "o", "alpha": 0.7},
+        output=output,
+        show=False,
+    )
+
+    assert result == output.resolve()
+    assert output.exists()
+
+
+def test_plot_coordination_time_distance_accepts_generated_copy_descriptor(tmp_path):
+    profile = CoordinationProfile(
+        species_a="O",
+        species_b="H",
+        axis="z",
+        atom_indices=np.array([2]),
+        frame_index=np.array([0, 1, 2]),
+        step=np.array([0.0, 1.0, 2.0]),
+        time_fs=np.array([0.0, 2.0, 4.0]),
+        time_ps=np.array([0.0, 0.002, 0.004]),
+        distance_to_surface=np.array([[0.8], [1.0], [1.1]], dtype=float),
+        coordination_number=np.array([[1.0], [0.5], [0.8]], dtype=float),
+        n_frames=3,
+        n_atoms=1,
+        coordinate_mode="distance",
+        cutoff_A=1.0,
+        cutoff_smoothing_width_A=0.4,
+    )
+
+    output = tmp_path / "coordination_time_distance_copy.png"
+    result = plot_coordination_profiles(
+        [profile],
+        component="time-distance",
+        series_ids=["coordination:0:atom:2"],
+        render_series_descriptors=[
+            {
+                "series_id": "coordination:0:atom:2",
+                "source_kind": "source",
+                "source_series_id": "coordination:0:atom:2",
+                "is_generated": False,
+            },
+            {
+                "series_id": "source:copy",
+                "source_kind": "source",
+                "source_series_id": "coordination:0:atom:2",
+                "is_generated": True,
+            },
+        ],
+        series_enabled=[True, True],
         output=output,
         show=False,
     )

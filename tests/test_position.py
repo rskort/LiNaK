@@ -43,6 +43,51 @@ def _surface_test_frames() -> list[Atoms]:
     return [frame0, frame1]
 
 
+def test_plot_position_profiles_keeps_descriptor_render_path_with_single_loaded_profile(
+    monkeypatch, tmp_path
+):
+    profile = compute_position_profile(
+        _surface_test_frames(),
+        species="O",
+        axis="z",
+    )
+
+    calls: list[str] = []
+
+    def _fake_plot_position_profile(*_args, **_kwargs):
+        calls.append("single")
+        return tmp_path / "single.png"
+
+    def _fake_plot_multi_line_series(*_args, **_kwargs):
+        calls.append("multi")
+        return tmp_path / "multi.png"
+
+    monkeypatch.setattr(
+        "linak.analysis.position.plot_position_profile", _fake_plot_position_profile
+    )
+    monkeypatch.setattr(
+        "linak.analysis.position.plot_multi_line_series", _fake_plot_multi_line_series
+    )
+
+    result = plot_position_profiles(
+        [profile],
+        output=tmp_path / "position.png",
+        show=False,
+        render_series_descriptors=[
+            {
+                "series_id": "series:o",
+                "source_kind": "source",
+                "source_series_id": "series:o",
+                "default_label": "O",
+            }
+        ],
+        series_overrides_by_id={"series:o": {"enabled": False}},
+    )
+
+    assert result == tmp_path / "multi.png"
+    assert calls == ["multi"]
+
+
 def test_compute_position_profile_tracks_atom_resolved_coordinates_and_surface_distance():
     profile = compute_position_profile(
         _surface_test_frames(),

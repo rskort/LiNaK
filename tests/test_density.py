@@ -48,6 +48,49 @@ def test_density_profile_linear_density_without_cell():
     assert profile.axis == "z"
 
 
+def test_plot_density_profiles_keeps_descriptor_render_path_with_single_loaded_profile(
+    monkeypatch, tmp_path
+):
+    frame = Atoms(
+        "OO",
+        positions=[[0.0, 0.0, 0.10], [0.0, 0.0, 1.10]],
+        cell=[10.0, 10.0, 10.0],
+        pbc=True,
+    )
+    profile = compute_density_profile([frame], species="O", axis="z", bin_width=1.0)
+
+    calls: list[str] = []
+
+    def _fake_plot_density_profile(*_args, **_kwargs):
+        calls.append("single")
+        return tmp_path / "single.png"
+
+    def _fake_plot_multi_line_series(*_args, **_kwargs):
+        calls.append("multi")
+        return tmp_path / "multi.png"
+
+    monkeypatch.setattr(density_module, "plot_density_profile", _fake_plot_density_profile)
+    monkeypatch.setattr(density_module, "plot_multi_line_series", _fake_plot_multi_line_series)
+
+    result = density_module.plot_density_profiles(
+        [profile],
+        output=tmp_path / "density.png",
+        show=False,
+        render_series_descriptors=[
+            {
+                "series_id": "series:o",
+                "source_kind": "source",
+                "source_series_id": "series:o",
+                "default_label": "O",
+            }
+        ],
+        series_overrides_by_id={"series:o": {"enabled": False}},
+    )
+
+    assert result == tmp_path / "multi.png"
+    assert calls == ["multi"]
+
+
 def test_density_profile_volumetric_density_with_cell():
     frame = Atoms(
         "OO",

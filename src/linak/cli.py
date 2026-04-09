@@ -217,6 +217,8 @@ _PERSISTED_PLOT_SETTING_OPTION_FLAGS = {
     "x_bin_width": ("--x-bin-width",),
     "x_bin_reducer": ("--x-bin-reducer",),
     "x_scale": ("--x-scale",),
+    "x_axis_scale": (),
+    "x_axis_offset": (),
     "x_tick_rotation": ("--x-tick-rotation",),
     "x_ticks": ("--x-ticks",),
     "y": ("--y",),
@@ -239,6 +241,8 @@ _PLOT_SETTINGS_COMMON_KEYS = (
     "x_label",
     "y_label",
     "x_scale",
+    "x_axis_scale",
+    "x_axis_offset",
     "y_scale",
     "x_lim",
     "y_lim",
@@ -259,6 +263,7 @@ _PLOT_SETTINGS_COMMON_KEYS = (
     "series_normalization_values",
     "series_normalization_x_refs",
     "annotations",
+    "integration_config",
     "x_bin_width",
     "x_bin_reducer",
     "min_bin_points",
@@ -3848,9 +3853,52 @@ def _reorder_series_values(values: Any, indices: list[int]) -> Any:
 def _default_series_family_colors(
     series_descriptors: list[dict[str, Any]] | None,
     count: int,
+    *,
+    target_descriptors: list[dict[str, Any]] | None = None,
 ) -> list[str]:
-    _ = series_descriptors
-    return _default_multi_series_colors(count)
+    if count <= 0:
+        return []
+
+    def _is_group(descriptor: dict[str, Any]) -> bool:
+        return str(descriptor.get("source_kind") or "source").strip().lower() == "group"
+
+    def _family_id(descriptor: dict[str, Any], index: int) -> str:
+        return str(
+            descriptor.get("source_series_id") or descriptor.get("series_id") or f"series:{index}"
+        ).strip()
+
+    palette_descriptors = [
+        dict(descriptor)
+        for descriptor in (series_descriptors or [])
+        if isinstance(descriptor, dict) and not _is_group(descriptor)
+    ]
+    target_items = [
+        dict(descriptor)
+        for descriptor in (
+            target_descriptors if isinstance(target_descriptors, list) else palette_descriptors
+        )
+        if isinstance(descriptor, dict) and not _is_group(descriptor)
+    ]
+
+    family_order: list[str] = []
+    for index, descriptor in enumerate(palette_descriptors):
+        family = _family_id(descriptor, index)
+        if family and family not in family_order:
+            family_order.append(family)
+
+    palette = _default_multi_series_colors(max(len(family_order), len(target_items), count))
+    family_colors = {family: palette[index] for index, family in enumerate(family_order)}
+
+    resolved: list[str] = []
+    for index, descriptor in enumerate(target_items):
+        family = _family_id(descriptor, index)
+        resolved.append(family_colors.get(family, palette[index % len(palette)]))
+
+    if len(resolved) == count:
+        return resolved
+    if len(resolved) > count:
+        return resolved[:count]
+    return resolved + palette[len(resolved) : count]
 
 
 def _default_multi_series_colors(count: int) -> list[str]:
@@ -4343,6 +4391,13 @@ def _build_gui_series_descriptors(
                         if id_segment is not None
                         else f"series:{source_index}:{local_index}"
                     ),
+                    "source_kind": "source",
+                    "source_series_id": (
+                        str(id_segment[local_index]).strip()
+                        if id_segment is not None
+                        else f"series:{source_index}:{local_index}"
+                    ),
+                    "is_generated": False,
                     "source_index": resolved_source_index,
                     "series_index": local_index,
                     "source_name": source_name,
@@ -4409,6 +4464,126 @@ def _merge_gui_only_plot_settings(
     return merged
 
 
+def _materialize_gui_series_overrides(settings: dict[str, Any]) -> dict[str, Any]:
+    """Normalize positional per-series GUI state into ID-keyed overrides.
+
+    The GUI should start from the same `series_descriptors + series_overrides`
+    model whether it is opening for the first time from runtime args or
+    reopening a saved profile. Existing override entries remain authoritative;
+    positional lists only fill missing fields.
+    """
+    descriptors = settings.get("series_descriptors")
+    if not isinstance(descriptors, list) or not descriptors:
+        return settings
+
+    normalized_descriptors = [dict(item) for item in descriptors if isinstance(item, dict)]
+    if not normalized_descriptors:
+        return settings
+
+    def _list_or_none(key: str) -> list[Any] | None:
+        value = settings.get(key)
+        return list(value) if isinstance(value, (list, tuple)) else None
+
+    raw_labels = _list_or_none("series_labels") or []
+    raw_colors = _list_or_none("line_colors") or []
+    raw_enabled = _list_or_none("series_enabled") or []
+    raw_show_in_legend = _list_or_none("series_show_in_legend") or []
+    raw_alpha = _list_or_none("series_alpha") or []
+    raw_widths = _list_or_none("series_line_widths") or []
+    raw_markers = _list_or_none("series_markers") or []
+    raw_line_kwargs = _list_or_none("series_line_kwargs") or []
+    raw_norm_modes = _list_or_none("series_normalization_modes") or []
+    raw_norm_values = _list_or_none("series_normalization_values") or []
+    raw_norm_x_refs = _list_or_none("series_normalization_x_refs") or []
+    raw_fit_configs = _list_or_none("series_fit_configs") or []
+    raw_error_configs = _list_or_none("series_error_configs") or []
+
+    overrides = _coerce_series_override_map(settings.get("series_overrides"))
+    has_existing_overrides = bool(overrides)
+    any_entry = bool(overrides)
+
+    for index, descriptor in enumerate(normalized_descriptors):
+        series_id = str(descriptor.get("series_id") or f"series:{index}").strip()
+        if not series_id:
+            continue
+        entry = dict(overrides.get(series_id, {}))
+        default_label = str(descriptor.get("default_label") or "").strip()
+
+        if not has_existing_overrides:
+            if index < len(raw_labels):
+                label_value = str(raw_labels[index] or "").strip()
+                if label_value and label_value != default_label and "label_override" not in entry:
+                    entry["label_override"] = label_value
+
+            if index < len(raw_colors):
+                color_value = str(raw_colors[index] or "").strip()
+                if color_value and "color" not in entry:
+                    entry["color"] = color_value
+
+            if "enabled" not in entry:
+                entry["enabled"] = bool(raw_enabled[index]) if index < len(raw_enabled) else True
+
+            if "show_in_legend" not in entry:
+                entry["show_in_legend"] = (
+                    bool(raw_show_in_legend[index]) if index < len(raw_show_in_legend) else True
+                )
+
+            if index < len(raw_alpha) and raw_alpha[index] is not None and "alpha" not in entry:
+                entry["alpha"] = float(raw_alpha[index])
+
+            if (
+                index < len(raw_widths)
+                and raw_widths[index] is not None
+                and "line_width" not in entry
+            ):
+                entry["line_width"] = float(raw_widths[index])
+
+            if index < len(raw_markers):
+                marker_value = raw_markers[index]
+                if marker_value not in {None, ""} and "marker" not in entry:
+                    entry["marker"] = str(marker_value)
+
+            if index < len(raw_line_kwargs):
+                line_kwargs_value = raw_line_kwargs[index]
+                if isinstance(line_kwargs_value, dict) and "line_kwargs" not in entry:
+                    entry["line_kwargs"] = deepcopy(line_kwargs_value)
+
+            if index < len(raw_norm_modes):
+                mode_value = raw_norm_modes[index]
+                if mode_value not in {None, ""} and "normalization_mode" not in entry:
+                    entry["normalization_mode"] = str(mode_value)
+
+            if index < len(raw_norm_values) and raw_norm_values[index] is not None:
+                entry.setdefault("normalization_value", float(raw_norm_values[index]))
+
+            if index < len(raw_norm_x_refs) and raw_norm_x_refs[index] is not None:
+                entry.setdefault("normalization_x_ref", float(raw_norm_x_refs[index]))
+
+            if index < len(raw_fit_configs):
+                fit_config = raw_fit_configs[index]
+                if isinstance(fit_config, dict) and "fit" not in entry:
+                    entry["fit"] = deepcopy(fit_config)
+
+            if index < len(raw_error_configs):
+                error_config = raw_error_configs[index]
+                if isinstance(error_config, dict) and "error" not in entry:
+                    entry["error"] = deepcopy(error_config)
+        else:
+            entry.setdefault("enabled", True)
+            entry.setdefault("show_in_legend", True)
+
+        if entry:
+            overrides[series_id] = entry
+            any_entry = True
+
+    if not any_entry:
+        return settings
+
+    normalized = dict(settings)
+    normalized["series_overrides"] = overrides
+    return normalized
+
+
 def _strip_redundant_series_lists_for_gui(settings: dict[str, Any]) -> dict[str, Any]:
     """Drop positional per-series lists when ID-keyed overrides are present.
 
@@ -4431,6 +4606,8 @@ def _strip_redundant_series_lists_for_gui(settings: dict[str, Any]) -> dict[str,
         "series_normalization_modes",
         "series_normalization_values",
         "series_normalization_x_refs",
+        "series_fit_configs",
+        "series_error_configs",
     ):
         cleaned.pop(key, None)
     return cleaned
@@ -4454,6 +4631,7 @@ def _without_preview_series_state(settings: dict[str, Any] | None) -> dict[str, 
         "series_normalization_values",
         "series_normalization_x_refs",
         "markers",
+        "integration_config",
     }
     return {key: deepcopy(value) for key, value in settings.items() if key not in blocked}
 
@@ -5648,6 +5826,7 @@ def _render_profile_plot(
     plotter: Callable[..., Path | None],
     plotter_kwargs: dict[str, Any] | None = None,
     series_descriptors: list[dict[str, Any]] | None = None,
+    render_series_descriptors: list[dict[str, Any]] | None = None,
 ) -> tuple[Path | None, dict[str, Any]]:
     from .plot.plotting import configure_matplotlib_backend
 
@@ -5669,6 +5848,7 @@ def _render_profile_plot(
     captured_state: dict[str, Any] = {}
     ordered_profile = profile
     ordered_descriptors = list(series_descriptors or [])
+    ordered_render_descriptors = list(render_series_descriptors or ordered_descriptors)
     source_ordered_descriptors = [
         d
         for d in ordered_descriptors
@@ -5707,6 +5887,8 @@ def _render_profile_plot(
         "x_label": args.x_label,
         "y_label": args.y_label,
         "x_scale": args.x_scale,
+        "x_axis_scale": getattr(args, "x_axis_scale", None),
+        "x_axis_offset": getattr(args, "x_axis_offset", None),
         "y_scale": args.y_scale,
         "x_lim": _resolve_x_lim(args),
         "y_lim": _resolve_y_lim(args),
@@ -5735,6 +5917,7 @@ def _render_profile_plot(
         "series_normalization_values": getattr(args, "series_normalization_values", None),
         "series_normalization_x_refs": getattr(args, "series_normalization_x_refs", None),
         "annotations": getattr(args, "annotations", None),
+        "integration_config": getattr(args, "integration_config", None),
         "x_bin_width": getattr(args, "x_bin_width", None)
         if getattr(args, "x_bin_width", None) is not None
         else getattr(args, "time_section_width", None),
@@ -5754,7 +5937,9 @@ def _render_profile_plot(
             args.line_colors
             if getattr(args, "line_colors", None) is not None
             else _default_series_family_colors(
-                source_ordered_descriptors, len(source_ordered_descriptors)
+                ordered_render_descriptors or ordered_descriptors,
+                len(source_ordered_descriptors),
+                target_descriptors=source_ordered_descriptors,
             )
             if source_ordered_descriptors
             else None
@@ -5765,7 +5950,7 @@ def _render_profile_plot(
     }
     shared_kwargs["series_fit_configs"] = getattr(args, "series_fit_configs", None)
     shared_kwargs["series_error_configs"] = getattr(args, "series_error_configs", None)
-    shared_kwargs["render_series_descriptors"] = ordered_descriptors or None
+    shared_kwargs["render_series_descriptors"] = ordered_render_descriptors or None
     shared_kwargs["series_overrides_by_id"] = getattr(args, "series_overrides", None)
 
     def _render_with_options(show: bool, output: str | Path | None) -> Path | None:
@@ -5884,29 +6069,38 @@ def _derive_gui_sync_modes(settings: dict[str, Any]) -> dict[str, str]:
 
 
 def _apply_gui_settings_to_args(args: argparse.Namespace, settings: dict[str, Any]) -> None:
+    always_forward = {"series_overrides", "series_order", "annotations"}
     for key, value in settings.items():
-        setattr(args, key, value)
+        if key not in always_forward and not hasattr(args, key):
+            continue
+        setattr(args, key, deepcopy(value))
     if isinstance(settings.get("series_overrides"), dict):
-        for key in (
-            "series_labels",
-            "line_colors",
-            "series_enabled",
-            "series_show_in_legend",
-            "series_alpha",
-            "series_line_widths",
-            "series_markers",
-            "series_line_kwargs",
-            "series_normalization_modes",
-            "series_normalization_values",
-            "series_normalization_x_refs",
-        ):
-            setattr(args, key, None)
+        _clear_gui_positional_series_args(args)
     if "x_bin_width" in settings and hasattr(args, "time_section_width"):
         args.time_section_width = settings.get("x_bin_width")
     if hasattr(args, "x_lim"):
         args.x_lim = None
     if hasattr(args, "y_lim"):
         args.y_lim = None
+
+
+def _clear_gui_positional_series_args(args: argparse.Namespace) -> None:
+    for key in (
+        "series_labels",
+        "line_colors",
+        "series_enabled",
+        "series_show_in_legend",
+        "series_alpha",
+        "series_line_widths",
+        "series_markers",
+        "series_line_kwargs",
+        "series_normalization_modes",
+        "series_normalization_values",
+        "series_normalization_x_refs",
+        "series_fit_configs",
+        "series_error_configs",
+    ):
+        setattr(args, key, None)
 
 
 def _open_plot_settings_gui(
@@ -5970,6 +6164,127 @@ def _extract_group_descriptors(gui_settings: dict[str, Any]) -> list[dict[str, A
     ]
 
 
+def _descriptor_is_generated_layer(descriptor: dict[str, Any]) -> bool:
+    return str(descriptor.get("source_kind") or "source").strip().lower() == "group" or bool(
+        descriptor.get("is_generated", False)
+    )
+
+
+def _merge_gui_series_descriptors(
+    current_descriptors: list[dict[str, Any]],
+    saved_descriptors: Any,
+) -> list[dict[str, Any]]:
+    current = [dict(descriptor) for descriptor in current_descriptors]
+    if not isinstance(saved_descriptors, list):
+        return current
+    current_ids = {str(item.get("series_id") or "").strip() for item in current}
+    merged = list(current)
+    generated_sources: list[dict[str, Any]] = []
+    generated_groups: list[dict[str, Any]] = []
+    for raw_descriptor in saved_descriptors:
+        if not isinstance(raw_descriptor, dict):
+            continue
+        descriptor = dict(raw_descriptor)
+        if not _descriptor_is_generated_layer(descriptor):
+            continue
+        source_kind = str(descriptor.get("source_kind") or "source").strip().lower()
+        descriptor["source_kind"] = "group" if source_kind == "group" else "source"
+        descriptor["is_generated"] = True
+        if descriptor["source_kind"] == "group":
+            generated_groups.append(descriptor)
+            continue
+        source_series_id = str(descriptor.get("source_series_id") or "").strip()
+        if source_series_id in current_ids:
+            descriptor["source_series_id"] = source_series_id
+            generated_sources.append(descriptor)
+    generated_ids = set(current_ids)
+    for descriptor in generated_sources:
+        series_id = str(descriptor.get("series_id") or "").strip()
+        if series_id and series_id not in generated_ids:
+            merged.append(descriptor)
+            generated_ids.add(series_id)
+    for descriptor in generated_groups:
+        series_id = str(descriptor.get("series_id") or "").strip()
+        member_ids = [
+            str(member_id).strip()
+            for member_id in descriptor.get("member_series_ids", [])
+            if str(member_id).strip() in generated_ids
+        ]
+        if series_id and series_id not in generated_ids:
+            descriptor["member_series_ids"] = member_ids
+            merged.append(descriptor)
+            generated_ids.add(series_id)
+    return merged
+
+
+def _gui_series_descriptors_from_settings(
+    gui_settings: dict[str, Any],
+    fallback_descriptors: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    descriptors = gui_settings.get("series_descriptors")
+    if isinstance(descriptors, list):
+        return [dict(descriptor) for descriptor in descriptors if isinstance(descriptor, dict)]
+    return [dict(descriptor) for descriptor in fallback_descriptors]
+
+
+def _required_source_ids_for_gui_render(gui_settings: dict[str, Any]) -> set[str]:
+    descriptors = _gui_series_descriptors_from_settings(gui_settings, [])
+    if not descriptors:
+        return set()
+    overrides = _coerce_series_override_map(gui_settings.get("series_overrides"))
+    descriptor_by_id = {
+        str(descriptor.get("series_id") or "").strip(): descriptor
+        for descriptor in descriptors
+        if str(descriptor.get("series_id") or "").strip()
+    }
+
+    def _descriptor_enabled(series_id: str) -> bool:
+        entry = overrides.get(series_id)
+        return not (isinstance(entry, dict) and entry.get("enabled") is False)
+
+    required: set[str] = set()
+    for descriptor in descriptors:
+        series_id = str(descriptor.get("series_id") or "").strip()
+        if not series_id or not _descriptor_enabled(series_id):
+            continue
+        source_kind = str(descriptor.get("source_kind") or "source").strip().lower()
+        if source_kind != "group":
+            source_id = str(descriptor.get("source_series_id") or series_id).strip()
+            if source_id:
+                required.add(source_id)
+            continue
+        for member_id in descriptor.get("member_series_ids", []):
+            member_key = str(member_id).strip()
+            member_descriptor = descriptor_by_id.get(member_key)
+            if member_descriptor is None:
+                continue
+            if not _descriptor_enabled(member_key):
+                continue
+            source_id = str(
+                member_descriptor.get("source_series_id")
+                or member_descriptor.get("series_id")
+                or ""
+            ).strip()
+            if source_id:
+                required.add(source_id)
+    return required
+
+
+def _force_source_ids_enabled_for_gui_loading(
+    args: argparse.Namespace,
+    required_source_ids: set[str],
+) -> None:
+    if not required_source_ids:
+        return
+    overrides = _coerce_series_override_map(getattr(args, "series_overrides", None))
+    for source_id in required_source_ids:
+        entry = dict(overrides.get(source_id, {}))
+        entry["enabled"] = True
+        overrides[source_id] = entry
+    args.series_overrides = overrides
+    args.series_enabled = None
+
+
 def _launch_profile_plot_gui(
     *,
     args: argparse.Namespace,
@@ -6024,61 +6339,43 @@ def _launch_profile_plot_gui(
         profile_name=initial_profile_name,
     )
     initial_settings = _merge_gui_only_plot_settings(initial_settings, initial_saved_profile)
+    initial_settings["series_descriptors"] = _merge_gui_series_descriptors(
+        initial_context.series_descriptors,
+        initial_saved_profile.get("series_descriptors")
+        if isinstance(initial_saved_profile, dict)
+        else None,
+    )
+    initial_settings = _materialize_gui_series_overrides(initial_settings)
     initial_settings = _strip_redundant_series_lists_for_gui(initial_settings)
     gui_render_sources = [
         f"gui-series-source:{index}"
         for index in range(len(initial_context.fallback_labels_by_source))
     ]
 
-    initial_preview_args = deepcopy(args)
-    initial_preview_args.show = False
-    initial_preview_args.output = None
-    initial_preview_args._suppress_output_log = True
-    initial_preview_context = build_context(initial_preview_args)
-    initial_render_state: dict[str, Any] = {}
-    if initial_preview_context.series_count > 0:
-        _apply_effective_series_settings(
-            args=initial_preview_args,
-            sources=gui_render_sources,
-            profile_key=profile_key,
-            fallback_labels_by_source=initial_preview_context.fallback_labels_by_source,
-            series_descriptors=initial_preview_context.series_descriptors,
-            allow_saved_multi_source_merge=False,
-            materialize_default_colors=True,
-        )
-        _initial_saved_path, initial_render_state = _render_profile_plot(
-            args=initial_preview_args,
-            source=initial_preview_context.plot_source_label,
-            analysis_name=analysis_name,
-            profile=initial_preview_context.profile,
-            plotter=plotter,
-            plotter_kwargs=initial_preview_context.plotter_kwargs,
-            series_descriptors=initial_preview_context.series_descriptors,
-        )
-    if initial_render_state:
-        initial_settings.update(_without_preview_series_state(initial_render_state))
-        # Render-state values are matplotlib defaults, not explicit user choices.
-        # Explicitly mark any synced field without a stored mode as "auto" so
-        # _derive_synced_field_modes in the GUI does not infer "manual" from them.
-        _render_sync_modes = dict(initial_settings.get("_gui_sync_modes") or {})
-        for _k in ("title", "x_label", "y_label", "x_lim", "y_lim",
-                   "x_ticks", "y_ticks", "x_label_pad", "y_label_pad"):
-            _render_sync_modes.setdefault(_k, "auto")
-        initial_settings["_gui_sync_modes"] = _render_sync_modes
-
-    def _preview(gui_settings: dict[str, Any]) -> dict[str, Any]:
+    def _render_gui_preview_settings(
+        gui_settings: dict[str, Any],
+        *,
+        show: bool,
+        output: str | None,
+        empty_error_message: str,
+    ) -> tuple[Path | None, dict[str, Any]]:
         preview_args = deepcopy(args)
         _apply_gui_settings_to_args(preview_args, gui_settings)
-        preview_args.show = True
-        preview_args.output = None
-        context = build_context(preview_args)
-        group_descriptors = _extract_group_descriptors(gui_settings)
-        if group_descriptors:
-            context = replace(
-                context, series_descriptors=context.series_descriptors + group_descriptors
-            )
+        preview_args.show = show
+        preview_args.output = output
+        preview_args._suppress_output_log = output is None or _is_gui_preview_output_path(output)
+        render_descriptors = _gui_series_descriptors_from_settings(
+            gui_settings,
+            initial_context.series_descriptors,
+        )
+        load_args = deepcopy(preview_args)
+        _force_source_ids_enabled_for_gui_loading(
+            load_args,
+            _required_source_ids_for_gui_render(gui_settings),
+        )
+        context = build_context(load_args)
         if context.series_count <= 0:
-            raise ValueError("No series are enabled. Turn on at least one series to preview.")
+            raise ValueError(empty_error_message)
         _apply_effective_series_settings(
             args=preview_args,
             sources=gui_render_sources,
@@ -6088,7 +6385,9 @@ def _launch_profile_plot_gui(
             allow_saved_multi_source_merge=False,
             materialize_default_colors=True,
         )
-        _saved_path, render_state = _render_profile_plot(
+        if isinstance(gui_settings.get("series_overrides"), dict):
+            _clear_gui_positional_series_args(preview_args)
+        return _render_profile_plot(
             args=preview_args,
             source=context.plot_source_label,
             analysis_name=analysis_name,
@@ -6096,6 +6395,44 @@ def _launch_profile_plot_gui(
             plotter=plotter,
             plotter_kwargs=context.plotter_kwargs,
             series_descriptors=context.series_descriptors,
+            render_series_descriptors=render_descriptors,
+        )
+
+    initial_render_state: dict[str, Any] = {}
+    initial_required_source_ids = _required_source_ids_for_gui_render(initial_settings)
+    if initial_required_source_ids:
+        _initial_saved_path, initial_render_state = _render_gui_preview_settings(
+            initial_settings,
+            show=False,
+            output=None,
+            empty_error_message="No series are enabled. Turn on at least one series to preview.",
+        )
+    if initial_render_state:
+        initial_settings.update(_without_preview_series_state(initial_render_state))
+        # Render-state values are matplotlib defaults, not explicit user choices.
+        # Explicitly mark any synced field without a stored mode as "auto" so
+        # _derive_synced_field_modes in the GUI does not infer "manual" from them.
+        _render_sync_modes = dict(initial_settings.get("_gui_sync_modes") or {})
+        for _k in (
+            "title",
+            "x_label",
+            "y_label",
+            "x_lim",
+            "y_lim",
+            "x_ticks",
+            "y_ticks",
+            "x_label_pad",
+            "y_label_pad",
+        ):
+            _render_sync_modes.setdefault(_k, "auto")
+        initial_settings["_gui_sync_modes"] = _render_sync_modes
+
+    def _preview(gui_settings: dict[str, Any]) -> dict[str, Any]:
+        _saved_path, render_state = _render_gui_preview_settings(
+            gui_settings,
+            show=True,
+            output=None,
+            empty_error_message="No series are enabled. Turn on at least one series to preview.",
         )
         return render_state
 
@@ -6126,6 +6463,8 @@ def _launch_profile_plot_gui(
                 "series_normalization_modes",
                 "series_normalization_values",
                 "series_normalization_x_refs",
+                "series_fit_configs",
+                "series_error_configs",
             ):
                 candidate.pop(key, None)
         if "_gui_sync_modes" in gui_settings:
@@ -6139,36 +6478,13 @@ def _launch_profile_plot_gui(
         return f"Saved '{profile_name}' to {source_path.name}."
 
     def _save_figure(gui_settings: dict[str, Any], output_path: str) -> tuple[str, dict[str, Any]]:
-        save_args = deepcopy(args)
-        _apply_gui_settings_to_args(save_args, gui_settings)
-        save_args.show = False
-        save_args.output = output_path
-        save_args._suppress_output_log = _is_gui_preview_output_path(output_path)
-        context = build_context(save_args)
-        group_descriptors = _extract_group_descriptors(gui_settings)
-        if group_descriptors:
-            context = replace(
-                context, series_descriptors=context.series_descriptors + group_descriptors
-            )
-        if context.series_count <= 0:
-            raise ValueError("No series are enabled. Turn on at least one series before exporting.")
-        _apply_effective_series_settings(
-            args=save_args,
-            sources=gui_render_sources,
-            profile_key=profile_key,
-            fallback_labels_by_source=context.fallback_labels_by_source,
-            series_descriptors=context.series_descriptors,
-            allow_saved_multi_source_merge=False,
-            materialize_default_colors=True,
-        )
-        saved_path, render_state = _render_profile_plot(
-            args=save_args,
-            source=context.plot_source_label,
-            analysis_name=analysis_name,
-            profile=context.profile,
-            plotter=plotter,
-            plotter_kwargs=context.plotter_kwargs,
-            series_descriptors=context.series_descriptors,
+        saved_path, render_state = _render_gui_preview_settings(
+            gui_settings,
+            show=False,
+            output=output_path,
+            empty_error_message=(
+                "No series are enabled. Turn on at least one series before exporting."
+            ),
         )
         if saved_path is None:
             raise ValueError("No output was generated for the requested figure path.")
@@ -6203,7 +6519,8 @@ def _launch_profile_plot_gui(
             imported_path,
             profile_key,
         )
-        return imported
+        imported = _materialize_gui_series_overrides(imported)
+        return _strip_redundant_series_lists_for_gui(imported)
 
     def _load_profile(profile_name: str) -> dict[str, Any]:
         loaded = read_plot_profile(source_path, profile_key, profile_name=profile_name)
@@ -6216,9 +6533,13 @@ def _launch_profile_plot_gui(
             setattr(load_args, key, deepcopy(value))
         context = build_full_context(load_args)
         merged = _merge_gui_only_plot_settings(loaded, loaded)
-        merged["series_descriptors"] = deepcopy(context.series_descriptors)
+        merged["series_descriptors"] = _merge_gui_series_descriptors(
+            context.series_descriptors,
+            loaded.get("series_descriptors"),
+        )
         merged["_profile_filter_options"] = deepcopy(context.profile_filter_options)
-        return merged
+        merged = _materialize_gui_series_overrides(merged)
+        return _strip_redundant_series_lists_for_gui(merged)
 
     def _delete_profile(profile_name: str) -> tuple[str | None, str]:
         removed, active_profile = delete_named_plot_profile(
@@ -6246,10 +6567,14 @@ def _launch_profile_plot_gui(
         resolved_args = deepcopy(args)
         _apply_gui_settings_to_args(resolved_args, gui_settings)
         context = build_full_context(resolved_args)
+        merged_descriptors = _merge_gui_series_descriptors(
+            context.series_descriptors,
+            gui_settings.get("series_descriptors"),
+        )
         return {
-            "series_count": context.series_count,
+            "series_count": len(merged_descriptors),
             "series_labels": list(context.default_series_labels),
-            "series_descriptors": deepcopy(context.series_descriptors),
+            "series_descriptors": merged_descriptors,
             "_profile_filter_options": deepcopy(context.profile_filter_options),
         }
 

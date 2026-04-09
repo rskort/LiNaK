@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 import json
+import logging
 from pathlib import Path
 from typing import Any, NoReturn
 from uuid import uuid4
@@ -25,6 +26,8 @@ LINAK_HDF5_VERSION = 1
 LINAK_ANALYSIS_SCHEMA_VERSION = 1
 HDF5_SUFFIXES = (".h5", ".hdf5")
 _COLLECTION_GROUP = "profiles"
+LOGGER = logging.getLogger(__name__)
+_WARNED_LINAK_VERSION_MISMATCHES: set[tuple[str, str, str]] = set()
 INCOMPATIBLE_LINAK_HDF5_MESSAGE = (
     "The HDF5 file is either corrupted or originates from the wrong LiNaK version. "
     "Check which LiNaK version generated the file and recompute with the current LiNaK version "
@@ -146,10 +149,16 @@ def _read_required_linak_header(
         path=path,
     )
     if file_linak_version != __version__:
-        _raise_incompatible_linak_hdf5(
-            path,
-            f"File was written by LiNaK {file_linak_version}; current LiNaK is {__version__}.",
-        )
+        path_label = str(Path(path).expanduser().resolve())
+        warning_key = (path_label, file_linak_version, __version__)
+        if warning_key not in _WARNED_LINAK_VERSION_MISMATCHES:
+            _WARNED_LINAK_VERSION_MISMATCHES.add(warning_key)
+            LOGGER.warning(
+                "HDF5 file '%s' was written by LiNaK %s; current LiNaK is %s.",
+                path_label,
+                file_linak_version,
+                __version__,
+            )
 
     analysis = _decode_required_string_attr(attrs=handle.attrs, name="analysis", path=path)
     if expected_analysis is not None and analysis != expected_analysis:

@@ -41,6 +41,8 @@ from .statistics import (
 from ..plot.plotting import (
     DEFAULT_PLOT_STYLE,
     PlotStyle,
+    _coerce_x_axis_linear_transform,
+    _display_x_values,
     _prepare_plot_series_data,
     normalize_backend_name as normalize_backend_name,
     plot_line_series,
@@ -3698,8 +3700,12 @@ def plot_density_profile(
     y_ticks: list[float] | tuple[float, ...] | None = None,
     x_tick_rotation: float | None = None,
     y_tick_rotation: float | None = None,
+    x_label_font_size: int | None = None,
+    y_label_font_size: int | None = None,
     x_label_pad: float | None = None,
     y_label_pad: float | None = None,
+    x_axis_scale: float | None = None,
+    x_axis_offset: float | None = None,
     title_visible: bool | None = None,
     ticks_visible: bool | None = None,
     markers: bool | None = None,
@@ -3707,6 +3713,7 @@ def plot_density_profile(
     legend_title: str | None = None,
     legend_loc: str = "best",
     annotations: list[dict[str, Any]] | None = None,
+    integration_config: dict[str, Any] | None = None,
     line_label: str | None = None,
     line_colors: list[str] | None = None,
     error_config: dict[str, Any] | None = None,
@@ -3761,6 +3768,19 @@ def plot_density_profile(
         series_normalization_values=[single_series.normalization_value],
         series_normalization_x_refs=[single_series.normalization_x_ref],
     )
+    resolved_x_axis_scale, resolved_x_axis_offset = _coerce_x_axis_linear_transform(
+        x_axis_scale,
+        x_axis_offset,
+    )
+    auto_x_series = [
+        _display_x_values(
+            values,
+            auto_y_series[index],
+            scale=resolved_x_axis_scale,
+            offset=resolved_x_axis_offset,
+        )
+        for index, values in enumerate(auto_x_series)
+    ]
     auto_x_lim, auto_y_lim = _density_auto_plot_limits(
         auto_x_series,
         auto_y_series,
@@ -3809,8 +3829,12 @@ def plot_density_profile(
         y_ticks=y_ticks,
         x_tick_rotation=x_tick_rotation,
         y_tick_rotation=y_tick_rotation,
+        x_label_font_size=x_label_font_size,
+        y_label_font_size=y_label_font_size,
         x_label_pad=x_label_pad,
         y_label_pad=y_label_pad,
+        x_axis_scale=x_axis_scale,
+        x_axis_offset=x_axis_offset,
         title_visible=title_visible,
         ticks_visible=ticks_visible,
         markers=markers,
@@ -3819,6 +3843,7 @@ def plot_density_profile(
         legend_loc=legend_loc,
         analysis_name="density",
         annotations=annotations,
+        integration_config=integration_config,
         capture_state=capture_state,
         matplotlib_rc=matplotlib_rc,
         figure_kwargs=figure_kwargs,
@@ -3853,8 +3878,12 @@ def plot_density_profiles(
     y_ticks: list[float] | tuple[float, ...] | None = None,
     x_tick_rotation: float | None = None,
     y_tick_rotation: float | None = None,
+    x_label_font_size: int | None = None,
+    y_label_font_size: int | None = None,
     x_label_pad: float | None = None,
     y_label_pad: float | None = None,
+    x_axis_scale: float | None = None,
+    x_axis_offset: float | None = None,
     title_visible: bool | None = None,
     ticks_visible: bool | None = None,
     markers: bool | None = None,
@@ -3862,6 +3891,7 @@ def plot_density_profiles(
     legend_title: str | None = None,
     legend_loc: str = "best",
     annotations: list[dict[str, Any]] | None = None,
+    integration_config: dict[str, Any] | None = None,
     series_ids: list[str] | None = None,
     series_labels: list[str] | None = None,
     line_colors: list[str] | None = None,
@@ -3903,7 +3933,8 @@ def plot_density_profiles(
         series_kind="density",
     )
 
-    if len(profiles) == 1:
+    use_gui_render_layers = bool(render_series_descriptors) or bool(series_overrides_by_id)
+    if len(profiles) == 1 and not use_gui_render_layers:
         return plot_density_profile(
             profiles[0],
             output=output,
@@ -3924,8 +3955,12 @@ def plot_density_profiles(
             y_ticks=y_ticks,
             x_tick_rotation=x_tick_rotation,
             y_tick_rotation=y_tick_rotation,
+            x_label_font_size=x_label_font_size,
+            y_label_font_size=y_label_font_size,
             x_label_pad=x_label_pad,
             y_label_pad=y_label_pad,
+            x_axis_scale=x_axis_scale,
+            x_axis_offset=x_axis_offset,
             title_visible=title_visible,
             ticks_visible=ticks_visible,
             markers=markers,
@@ -3933,6 +3968,7 @@ def plot_density_profiles(
             legend_title=legend_title,
             legend_loc=legend_loc,
             annotations=annotations,
+            integration_config=integration_config,
             line_label=labels[0] if labels else None,
             line_colors=line_colors,
             error_config=(None if not series_error_configs else series_error_configs[0]),
@@ -3990,6 +4026,19 @@ def plot_density_profiles(
         series_normalization_values=series_normalization_values,
         series_normalization_x_refs=series_normalization_x_refs,
     )
+    resolved_x_axis_scale, resolved_x_axis_offset = _coerce_x_axis_linear_transform(
+        x_axis_scale,
+        x_axis_offset,
+    )
+    auto_x_series = [
+        _display_x_values(
+            values,
+            auto_y_series[index],
+            scale=resolved_x_axis_scale,
+            offset=resolved_x_axis_offset,
+        )
+        for index, values in enumerate(auto_x_series)
+    ]
     auto_x_lim, auto_y_lim = _density_auto_plot_limits(
         auto_x_series,
         auto_y_series,
@@ -4041,8 +4090,12 @@ def plot_density_profiles(
         y_ticks=y_ticks,
         x_tick_rotation=x_tick_rotation,
         y_tick_rotation=y_tick_rotation,
+        x_label_font_size=x_label_font_size,
+        y_label_font_size=y_label_font_size,
         x_label_pad=x_label_pad,
         y_label_pad=y_label_pad,
+        x_axis_scale=x_axis_scale,
+        x_axis_offset=x_axis_offset,
         title_visible=title_visible,
         ticks_visible=ticks_visible,
         markers=markers,
@@ -4051,6 +4104,7 @@ def plot_density_profiles(
         legend_loc=legend_loc,
         analysis_name="density",
         annotations=annotations,
+        integration_config=integration_config,
         capture_state=capture_state,
         matplotlib_rc=matplotlib_rc,
         figure_kwargs=figure_kwargs,

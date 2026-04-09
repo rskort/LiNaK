@@ -54,6 +54,15 @@ _FIT_RANGE_MODES = ("visible", "manual")
 _ERROR_STATS = ("sample_sem", "sample_std", "block_sem", "block_std")
 _ERROR_STYLES = ("band", "whiskers")
 _GROUP_REDUCERS = ("mean", "median", "sum", "min", "max")
+_INTEGRATION_SOURCES = ("Plotted data", "Raw profile data")
+_INTEGRATION_SOURCE_BY_LABEL = {
+    "Plotted data": "plotted",
+    "Raw profile data": "raw",
+}
+_INTEGRATION_SOURCE_LABEL_BY_MODE = {
+    value: label for label, value in _INTEGRATION_SOURCE_BY_LABEL.items()
+}
+_INTEGRATION_COLOR_MODES = ("Auto", "Custom")
 _ANNOTATION_TYPES = ("text", "line", "arrow")
 _ANNOTATION_COORD_SYSTEMS = ("data", "axes")
 _ANNOTATION_LINE_STYLES = ("-", "--", "-.", ":")
@@ -233,7 +242,6 @@ _TOOLTIPS: dict[str, str] = {
     "annotations.line_style": "Line style for a line or arrow.",
     "annotations.arrow_style": "Arrow head style for an arrow annotation.",
     "annotations.mutation_scale": "Arrow head size for an arrow annotation.",
-    "annotations.summary": "Shows the current preview summary for the selected annotation.",
     "figure.text.title": "Sets the plot title.",
     "figure.text.x_label": "Sets the x-axis label.",
     "figure.text.y_label": "Sets the y-axis label.",
@@ -246,6 +254,8 @@ _TOOLTIPS: dict[str, str] = {
     "figure.legend.columns": "Sets how many columns the legend uses.",
     "figure.legend.font": "Sets the legend font size.",
     "figure.axes.x_scale": "Chooses the x-axis scale.",
+    "figure.axes.x_axis_scale": "Multiplies displayed x-values by this factor. Use 0.2 to show 100 count units as 20 display units.",
+    "figure.axes.x_axis_offset": "Adds this offset after x-axis scaling.",
     "figure.axes.y_scale": "Chooses the y-axis scale.",
     "figure.axes.border": "Controls the plot border: 'on' shows all four spines, 'off' hides them all, 'custom' lets you choose each side individually.",
     "figure.axes.border_sides": "Choose which individual spines to show when border mode is set to 'custom'.",
@@ -280,6 +290,14 @@ _TOOLTIPS: dict[str, str] = {
     "figure.lines.marker_size": "Sets the default marker size.",
     "figure.lines.marker_type": "Sets the default marker shape.",
     "figure.lines.marker_color": "Sets the default marker color.",
+    "figure.integration.enabled": "Turns on a shaded integral region for line plots.",
+    "figure.integration.source": "Chooses whether the integral uses the plotted data or stored profile data before GUI transforms.",
+    "figure.integration.range": "Sets the x-range for integration. Leave blank to use the target series range.",
+    "figure.integration.baseline": "Sets the baseline subtracted before integration and used for the shaded fill.",
+    "figure.integration.color_mode": "Chooses whether the shaded fill uses the target line color or a custom color.",
+    "figure.integration.color": "Sets the custom integration fill color.",
+    "figure.integration.alpha": "Sets the integration fill opacity between 0 and 1.",
+    "figure.integration.summary": "Shows integration results from the latest preview; this text is not drawn into the figure.",
     "figure.heatmap.vmin": "Minimum value for the colorbar range. Leave blank for auto.",
     "figure.heatmap.vmax": "Maximum value for the colorbar range. Leave blank for auto.",
     "figure.heatmap.cmap": "Matplotlib colormap name for the heatmap.",
@@ -427,26 +445,27 @@ def _annotation_defaults_for_gui(annotation_type: str, *, index: int) -> dict[st
     normalized_type = str(annotation_type).strip().lower()
     if normalized_type not in _ANNOTATION_TYPES:
         normalized_type = "text"
+    is_text = normalized_type == "text"
     defaults: dict[str, Any] = {
         "id": f"annotation:{uuid4().hex}",
         "type": normalized_type,
         "enabled": True,
         "name": _default_annotation_name(normalized_type, index=index),
-        "coord_system": "axes" if normalized_type == "text" else "data",
+        "coord_system": "axes",
         "color": "#000000",
         "alpha": "1.0",
         "zorder": "5",
-        "text": "",
+        "text": _default_annotation_name(normalized_type, index=index) if is_text else "",
         "x": "0.5",
-        "y": "0.5",
+        "y": "0.92" if is_text else "0.5",
         "font_size": "12",
         "rotation": "0",
         "horizontal_align": "center",
         "vertical_align": "center",
-        "x1": "0",
-        "y1": "0",
-        "x2": "1",
-        "y2": "1",
+        "x1": "0.15",
+        "y1": "0.2",
+        "x2": "0.85",
+        "y2": "0.8",
         "line_width": "1.5",
         "line_style": "-",
         "arrow_style": "->",
@@ -689,12 +708,24 @@ def _resolve_series_id_order(series_ids: list[str], requested_order: list[str] |
     return resolved
 
 
-def _partition_series_ids_by_enabled_state(
-    series_ids: list[str], enabled_by_id: dict[str, bool]
+def _partition_series_ids_for_display_order(
+    series_ids: list[str],
+    *,
+    enabled_by_id: dict[str, bool],
+    group_by_id: dict[str, bool],
 ) -> list[str]:
-    enabled_ids = [series_id for series_id in series_ids if enabled_by_id.get(series_id, True)]
+    enabled_non_group_ids = [
+        series_id
+        for series_id in series_ids
+        if enabled_by_id.get(series_id, True) and not group_by_id.get(series_id, False)
+    ]
+    enabled_group_ids = [
+        series_id
+        for series_id in series_ids
+        if enabled_by_id.get(series_id, True) and group_by_id.get(series_id, False)
+    ]
     disabled_ids = [series_id for series_id in series_ids if not enabled_by_id.get(series_id, True)]
-    return enabled_ids + disabled_ids
+    return enabled_non_group_ids + enabled_group_ids + disabled_ids
 
 
 def _capture_series_list_view_anchor(
@@ -752,16 +783,19 @@ def _coerce_series_descriptors(value: Any) -> list[dict[str, Any]]:
             continue
         series_id = str(raw.get("series_id") or f"series:{index}").strip() or f"series:{index}"
         default_label = str(raw.get("default_label") or "").strip()
+        source_kind = (
+            "group" if str(raw.get("source_kind") or "").strip().lower() == "group" else "source"
+        )
+        source_series_id = str(raw.get("source_series_id") or "").strip()
         descriptors.append(
             {
                 "series_id": series_id,
                 "default_label": default_label,
-                "source_kind": (
-                    "group"
-                    if str(raw.get("source_kind") or "").strip().lower() == "group"
-                    else "source"
+                "source_kind": source_kind,
+                "source_series_id": (
+                    None if source_kind == "group" else source_series_id or series_id
                 ),
-                "source_series_id": str(raw.get("source_series_id") or "").strip() or None,
+                "is_generated": bool(raw.get("is_generated", source_kind == "group")),
                 "member_series_ids": [
                     str(item).strip()
                     for item in raw.get("member_series_ids", [])
@@ -816,6 +850,44 @@ def _fit_defaults_for_gui() -> dict[str, Any]:
     config["fit_type"] = "linear"
     config["fit_degree"] = 2
     config["fit_range_mode"] = "visible"
+    return config
+
+
+def _integration_defaults_for_gui() -> dict[str, Any]:
+    return {
+        "enabled": False,
+        "source": "plotted",
+        "x_min": None,
+        "x_max": None,
+        "baseline": 0.0,
+        "color": None,
+        "alpha": 0.25,
+    }
+
+
+def _coerce_series_integration_config(value: Any) -> dict[str, Any]:
+    config = _integration_defaults_for_gui()
+    if not isinstance(value, dict):
+        return config
+    if "enabled" in value:
+        config["enabled"] = bool(value.get("enabled"))
+    source = str(value.get("source") or "").strip().lower()
+    if source in ("plotted", "raw"):
+        config["source"] = source
+    for key in ("x_min", "x_max", "baseline"):
+        if value.get(key) is not None:
+            try:
+                config[key] = float(value[key])
+            except (ValueError, TypeError):
+                pass
+    if value.get("color") is not None:
+        config["color"] = str(value.get("color")).strip() or None
+    alpha_value = value.get("alpha")
+    if alpha_value is not None:
+        try:
+            config["alpha"] = float(alpha_value)
+        except (ValueError, TypeError):
+            pass
     return config
 
 
@@ -961,6 +1033,7 @@ class _LayerInspectorCapabilities:
     show_derived_lines: bool
     show_uncertainty: bool
     show_normalization: bool
+    show_integration: bool
     show_group_members: bool
     show_metadata: bool
     show_fit_editor: bool
@@ -1202,7 +1275,7 @@ def launch_plot_settings_panel(
 ) -> None:
     """Open a PySide6 panel that previews and persists plot settings."""
     try:
-        from PySide6.QtCore import QEvent, QTimer, Qt
+        from PySide6.QtCore import QEasingCurve, QEvent, QPropertyAnimation, QTimer, Qt
         from PySide6.QtGui import (
             QColor,
             QDoubleValidator,
@@ -1212,6 +1285,7 @@ def launch_plot_settings_panel(
             QPalette,
             QPen,
             QPixmap,
+            QPixmapCache,
         )
         from PySide6.QtWidgets import (
             QAbstractItemView,
@@ -1267,13 +1341,21 @@ def launch_plot_settings_panel(
         def __init__(self, parent: QWidget | None = None) -> None:
             super().__init__(parent)
             self.setFixedSize(12, 16)
+            self._line_color = "#93a4b8"
+
+        def set_line_color(self, color: str) -> None:
+            self._line_color = color
+            self.update()
 
         def paintEvent(self, event: Any) -> None:  # pragma: no cover - UI paint
             super().paintEvent(event)
             painter = QPainter(self)
             try:
                 painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-                pen = QPen(self.palette().color(QPalette.ColorRole.Mid))
+                pen_color = QColor(self._line_color)
+                if not pen_color.isValid():
+                    pen_color = QColor("#93a4b8")
+                pen = QPen(pen_color)
                 pen.setWidth(2)
                 pen.setCapStyle(Qt.PenCapStyle.RoundCap)
                 painter.setPen(pen)
@@ -1320,6 +1402,10 @@ def launch_plot_settings_panel(
             )
             layout.addWidget(self.text_label, stretch=1)
 
+            self.kind_badge = QLabel(self)
+            self.kind_badge.setObjectName("seriesRowKindBadge")
+            layout.addWidget(self.kind_badge)
+
             self.move_up_button = QToolButton(self)
             self.move_up_button.setObjectName("seriesRowButton")
             self.move_up_button.setText("▴")
@@ -1342,17 +1428,13 @@ def launch_plot_settings_panel(
             self.move_down_button.clicked.connect(self._handle_move_down_clicked)
             layout.addWidget(self.move_down_button)
 
-            self.grip_widget = _SeriesGripWidget(self)
-            layout.addWidget(self.grip_widget)
-
-            for target in (self, self.text_label, self.grip_widget, self.color_swatch):
+            for target in (self, self.text_label, self.color_swatch):
                 target.installEventFilter(self)
 
         def eventFilter(self, watched: Any, event: Any) -> bool:  # pragma: no cover - UI flow
             if watched in {
                 self,
                 self.text_label,
-                self.grip_widget,
                 self.color_swatch,
             } and event.type() in {
                 QEvent.Type.MouseButtonPress,
@@ -1378,15 +1460,19 @@ def launch_plot_settings_panel(
             selected: bool,
             color_token: str,
             kind: str,
+            layer_role: str,
             can_move_up: bool,
             can_move_down: bool,
             tooltip_text: str,
+            theme: dict[str, str],
         ) -> None:
             self.checkbox.blockSignals(True)
             try:
                 self.checkbox.setChecked(checked)
             finally:
                 self.checkbox.blockSignals(False)
+            self.checkbox.setEnabled(kind == "base")
+            self.checkbox.setVisible(True)
             self.text_label.setText(text)
             self.setToolTip(tooltip_text)
             self.text_label.setToolTip(tooltip_text)
@@ -1398,41 +1484,59 @@ def launch_plot_settings_panel(
                 swatch_color = QColor(color_token)
                 if swatch_color.isValid():
                     self.color_swatch.setStyleSheet(
-                        f"background-color: {swatch_color.name()}; border: none; border-radius: 6px;"
+                        "background-color: "
+                        f"{swatch_color.name()}; "
+                        f"border: 1px solid {theme['series_row_swatch_border']}; "
+                        "border-radius: 6px;"
                     )
                 else:
-                    border = self.palette().color(QPalette.ColorRole.Mid).name()
-                    background = self.palette().color(QPalette.ColorRole.Base).name()
                     self.color_swatch.setStyleSheet(
                         "background-color: "
-                        f"{background}; border: 1px solid {border}; border-radius: 6px;"
+                        f"{theme['series_row_swatch_bg']}; "
+                        f"border: 1px solid {theme['series_row_swatch_border']}; "
+                        "border-radius: 6px;"
                     )
 
-            text_color = self.palette().color(QPalette.ColorRole.Text)
+            text_color = theme["series_row_selected_text"] if selected else theme["series_row_text"]
             if not enabled:
-                text_color.setAlpha(150)
-
-            _pal = self.palette()
-            _win = _pal.color(QPalette.ColorRole.Window)
-            _wtxt = _pal.color(QPalette.ColorRole.WindowText)
-            _is_dark = _win.lightness() < _wtxt.lightness()
-            if _is_dark:
-                _accent = "#2aa7b8"
-                _accent_soft = "#163e47"
-            else:
-                _accent = "#0f8f95"
-                _accent_soft = "#d9f0f2"
+                text_color = theme["series_row_disabled_text"]
+            normalized_role = layer_role.strip().lower()
+            badge_label = {
+                "group": "Group",
+                "copy": "Copy",
+                "original": "Original",
+            }.get(normalized_role, layer_role.strip().title() or "Layer")
+            badge_prefix = (
+                "series_badge_group"
+                if normalized_role == "group"
+                else "series_badge_copy"
+                if normalized_role == "copy"
+                else "series_badge_original"
+            )
+            badge_bg = theme[f"{badge_prefix}_bg"]
+            badge_border = theme[f"{badge_prefix}_border"]
+            badge_text = theme[f"{badge_prefix}_text"]
+            self.kind_badge.setText(badge_label)
+            self.kind_badge.setStyleSheet(
+                "padding: 2px 8px;"
+                "border-radius: 999px;"
+                f"background-color: {badge_bg};"
+                f"border: 1px solid {badge_border};"
+                f"color: {badge_text};"
+                "font-weight: 700;"
+                "font-size: 10px;"
+            )
 
             if selected:
-                row_bg = _accent_soft
-                left_border = f"4px solid {_accent}"
-                edge_border = f"1px solid {_accent}"
+                row_bg = theme["series_row_selected_bg"]
+                left_border = f"5px solid {theme['series_row_selected_border']}"
+                edge_border = f"1px solid {theme['series_row_selected_border']}"
                 tl_radius = "4px"
                 bl_radius = "4px"
                 tr_radius = "8px"
                 br_radius = "8px"
             else:
-                row_bg = "transparent"
+                row_bg = theme["series_row_bg"]
                 left_border = "4px solid transparent"
                 edge_border = "1px solid transparent"
                 tl_radius = "4px"
@@ -1457,14 +1561,14 @@ def launch_plot_settings_panel(
                 "margin: 0px;"
                 "border: none;"
                 "background: transparent;"
-                f"color: {text_color.name()};"
+                f"color: {text_color};"
                 "}"
                 "QToolButton#seriesRowButton:hover {"
                 "border-radius: 6px;"
-                f"background-color: {self.palette().color(QPalette.ColorRole.Button).name()};"
+                f"background-color: {theme['series_row_button_hover']};"
                 "}"
                 "QToolButton#seriesRowButton:disabled {"
-                f"color: {self.palette().color(QPalette.ColorRole.Mid).name()};"
+                f"color: {theme['series_row_disabled_text']};"
                 "}"
             )
 
@@ -1477,7 +1581,7 @@ def launch_plot_settings_panel(
                 label_font_weight = "600" if selected else "400"
             self.text_label.setStyleSheet(
                 "border: none;"
-                f"color: {text_color.name()};"
+                f"color: {text_color};"
                 f"font-style: {label_font_style};"
                 f"font-weight: {label_font_weight};"
             )
@@ -1487,7 +1591,126 @@ def launch_plot_settings_panel(
             self.move_down_button.setEnabled(control_enabled and can_move_down)
             self.move_up_button.setVisible(control_enabled)
             self.move_down_button.setVisible(control_enabled)
-            self.grip_widget.setVisible(control_enabled)
+
+    class _AnnotationRowWidget(QWidget):
+        def __init__(
+            self,
+            *,
+            on_select: Callable[[], None],
+            on_move_up: Callable[[], None],
+            on_move_down: Callable[[], None],
+        ) -> None:
+            super().__init__()
+            self._on_select = on_select
+            self._on_move_up = on_move_up
+            self._on_move_down = on_move_down
+            self.setObjectName("annotationRowWidget")
+
+            layout = QHBoxLayout(self)
+            layout.setContentsMargins(8, 4, 8, 4)
+            layout.setSpacing(8)
+
+            self.text_label = QLabel(self)
+            self.text_label.setSizePolicy(
+                QSizePolicy.Policy.Expanding,
+                QSizePolicy.Policy.Preferred,
+            )
+            layout.addWidget(self.text_label, stretch=1)
+
+            self.move_up_button = QToolButton(self)
+            self.move_up_button.setObjectName("seriesRowButton")
+            self.move_up_button.setAutoRaise(True)
+            self.move_up_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            self.move_up_button.setFixedSize(22, 22)
+            self.move_up_button.setArrowType(Qt.ArrowType.UpArrow)
+            self.move_up_button.setText("")
+            self.move_up_button.clicked.connect(self._handle_move_up_clicked)
+            layout.addWidget(self.move_up_button)
+
+            self.move_down_button = QToolButton(self)
+            self.move_down_button.setObjectName("seriesRowButton")
+            self.move_down_button.setAutoRaise(True)
+            self.move_down_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            self.move_down_button.setFixedSize(22, 22)
+            self.move_down_button.setArrowType(Qt.ArrowType.DownArrow)
+            self.move_down_button.setText("")
+            self.move_down_button.clicked.connect(self._handle_move_down_clicked)
+            layout.addWidget(self.move_down_button)
+
+            for target in (self, self.text_label):
+                target.installEventFilter(self)
+
+        def eventFilter(self, watched: Any, event: Any) -> bool:  # pragma: no cover - UI flow
+            if watched in {self, self.text_label} and event.type() in {
+                QEvent.Type.MouseButtonPress,
+                QEvent.Type.MouseButtonDblClick,
+            }:
+                QTimer.singleShot(0, self._on_select)
+            return super().eventFilter(watched, event)
+
+        def _handle_move_up_clicked(self) -> None:
+            self._on_select()
+            self._on_move_up()
+
+        def _handle_move_down_clicked(self) -> None:
+            self._on_select()
+            self._on_move_down()
+
+        def update_content(
+            self,
+            *,
+            text: str,
+            enabled: bool,
+            selected: bool,
+            can_move_up: bool,
+            can_move_down: bool,
+            tooltip_text: str,
+            theme: dict[str, str],
+        ) -> None:
+            self.text_label.setText(text)
+            self.setToolTip(tooltip_text)
+            self.text_label.setToolTip(tooltip_text)
+            text_color = theme["series_row_selected_text"] if selected else theme["series_row_text"]
+            if not enabled:
+                text_color = theme["series_row_disabled_text"]
+            if selected:
+                row_bg = theme["series_row_selected_bg"]
+                left_border = f"5px solid {theme['series_row_selected_border']}"
+                edge_border = f"1px solid {theme['series_row_selected_border']}"
+            else:
+                row_bg = theme["series_row_bg"]
+                left_border = "4px solid transparent"
+                edge_border = "1px solid transparent"
+            self.setStyleSheet(
+                "QWidget#annotationRowWidget {"
+                f"background-color: {row_bg};"
+                f"border-left: {left_border};"
+                f"border-top: {edge_border};"
+                f"border-right: {edge_border};"
+                f"border-bottom: {edge_border};"
+                "border-top-left-radius: 4px;"
+                "border-bottom-left-radius: 4px;"
+                "border-top-right-radius: 8px;"
+                "border-bottom-right-radius: 8px;"
+                "}"
+                "QToolButton#seriesRowButton {"
+                "padding: 0px;"
+                "margin: 0px;"
+                "border: none;"
+                "background: transparent;"
+                f"color: {text_color};"
+                "}"
+                "QToolButton#seriesRowButton:hover {"
+                "border-radius: 6px;"
+                f"background-color: {theme['series_row_button_hover']};"
+                "}"
+                "QToolButton#seriesRowButton:disabled {"
+                f"color: {theme['series_row_disabled_text']};"
+                "}"
+            )
+            self.text_label.setStyleSheet(f"color: {text_color};")
+            self.move_up_button.setEnabled(can_move_up)
+            self.move_down_button.setEnabled(can_move_down)
 
     class _PreviewPane(QFrame):
         def __init__(
@@ -1593,6 +1816,155 @@ def launch_plot_settings_panel(
             preview_frame_layout.addWidget(self.preview_scroll, stretch=1)
             layout.addWidget(self.preview_frame, stretch=1)
 
+    class _CollapsibleSection(QFrame):
+        def __init__(
+            self,
+            *,
+            title: str,
+            section_id: str,
+            state_store: dict[str, bool],
+            default_expanded: bool = True,
+            subsection: bool = False,
+            parent: QWidget | None = None,
+        ) -> None:
+            super().__init__(parent)
+            self._section_id = str(section_id).strip()
+            self._state_store = state_store
+            self._subsection = subsection
+            self._body_widget: QWidget | None = None
+            self._expanded = bool(state_store.get(self._section_id, default_expanded))
+            self._collapse_after_animation = False
+            self.setObjectName("collapsibleSubsection" if subsection else "collapsibleSection")
+
+            root_layout = QVBoxLayout(self)
+            root_layout.setContentsMargins(0, 0, 0, 0)
+            root_layout.setSpacing(0)
+
+            self.header_frame = QFrame(self)
+            self.header_frame.setObjectName(
+                "collapsibleSubsectionHeader" if subsection else "collapsibleSectionHeader"
+            )
+            header_layout = QHBoxLayout(self.header_frame)
+            header_layout.setContentsMargins(0, 0, 0, 0)
+            header_layout.setSpacing(8)
+
+            self.toggle_button = QToolButton(self.header_frame)
+            self.toggle_button.setObjectName("collapsibleToggle")
+            self.toggle_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+            self.toggle_button.setCheckable(True)
+            self.toggle_button.setChecked(self._expanded)
+            self.toggle_button.setText(title)
+            self.toggle_button.clicked.connect(self._handle_toggle_clicked)
+            self.toggle_button.setSizePolicy(
+                QSizePolicy.Policy.Expanding,
+                QSizePolicy.Policy.Fixed,
+            )
+            header_layout.addWidget(
+                self.toggle_button,
+                stretch=1,
+                alignment=Qt.AlignmentFlag.AlignVCenter,
+            )
+
+            root_layout.addWidget(self.header_frame)
+
+            self.body_frame = QFrame(self)
+            self.body_frame.setObjectName(
+                "collapsibleSubsectionBody" if subsection else "collapsibleSectionBody"
+            )
+            self.body_layout = QVBoxLayout(self.body_frame)
+            self.body_layout.setContentsMargins(0, 0, 0, 0)
+            self.body_layout.setSpacing(0)
+            root_layout.addWidget(self.body_frame)
+
+            self._animation = QPropertyAnimation(self.body_frame, b"maximumHeight", self)
+            self._animation.setDuration(160)
+            self._animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+            self._animation.finished.connect(self._handle_animation_finished)
+            self._apply_expanded_state(self._expanded, animate=False, persist=False)
+
+        def set_body_widget(self, widget: QWidget) -> None:
+            self._body_widget = widget
+            self.body_layout.addWidget(widget)
+            self._apply_expanded_state(self._expanded, animate=False, persist=False)
+
+        def is_expanded(self) -> bool:
+            return self._expanded
+
+        def set_expanded(self, expanded: bool, *, animate: bool = True) -> None:
+            self._apply_expanded_state(bool(expanded), animate=animate, persist=True)
+
+        def _target_body_height(self) -> int:
+            if self._body_widget is None:
+                return 0
+            hint = self._body_widget.sizeHint()
+            height = int(hint.height()) if hint is not None else 0
+            if height <= 0:
+                layout_hint = self.body_layout.sizeHint()
+                height = int(layout_hint.height()) if layout_hint is not None else 0
+            return max(0, height)
+
+        def _handle_toggle_clicked(self, checked: bool) -> None:
+            self._apply_expanded_state(bool(checked), animate=True, persist=True)
+
+        def _apply_expanded_state(
+            self,
+            expanded: bool,
+            *,
+            animate: bool,
+            persist: bool,
+        ) -> None:
+            self._expanded = bool(expanded)
+            if persist and self._section_id:
+                self._state_store[self._section_id] = self._expanded
+            self.toggle_button.blockSignals(True)
+            try:
+                self.toggle_button.setChecked(self._expanded)
+                self.toggle_button.setArrowType(
+                    Qt.ArrowType.DownArrow if self._expanded else Qt.ArrowType.RightArrow
+                )
+            finally:
+                self.toggle_button.blockSignals(False)
+
+            target_height = self._target_body_height()
+            can_animate = (
+                animate
+                and self.isVisible()
+                and target_height > 0
+                and self._body_widget is not None
+                and not self._body_widget.isWindow()
+            )
+            if not can_animate:
+                self._animation.stop()
+                self._collapse_after_animation = False
+                self.body_frame.setVisible(self._expanded)
+                self.body_frame.setMaximumHeight(16777215 if self._expanded else 0)
+                return
+
+            start_height = max(0, int(self.body_frame.height()))
+            end_height = target_height if self._expanded else 0
+            if start_height == end_height:
+                self.body_frame.setVisible(self._expanded)
+                self.body_frame.setMaximumHeight(16777215 if self._expanded else 0)
+                return
+
+            if self._expanded:
+                self.body_frame.setVisible(True)
+            self._collapse_after_animation = not self._expanded
+            self._animation.stop()
+            self.body_frame.setMaximumHeight(start_height)
+            self._animation.setStartValue(start_height)
+            self._animation.setEndValue(end_height)
+            self._animation.start()
+
+        def _handle_animation_finished(self) -> None:
+            if self._collapse_after_animation:
+                self.body_frame.setVisible(False)
+                self.body_frame.setMaximumHeight(0)
+                self._collapse_after_animation = False
+                return
+            self.body_frame.setVisible(True)
+            self.body_frame.setMaximumHeight(16777215)
+
     class _DetachedPreviewWindow(QMainWindow):
         def __init__(
             self,
@@ -1657,6 +2029,8 @@ def launch_plot_settings_panel(
             self._x_ticks_rows: list[tuple[QFormLayout, QWidget]] = []
             self._y_ticks_rows: list[tuple[QFormLayout, QWidget]] = []
             self._marker_rows: list[tuple[QFormLayout, QWidget]] = []
+            self._integration_rows: list[tuple[QFormLayout, QWidget]] = []
+            self._integration_custom_color_row: tuple[QFormLayout, QWidget] | None = None
             self._colorbar_rows: list[tuple[QFormLayout, QWidget]] = []
             self._border_custom_rows: list[tuple[QFormLayout, QWidget]] = []
             self._x_bin_reducer_row: tuple[QFormLayout, QWidget] | None = None
@@ -1706,6 +2080,14 @@ def launch_plot_settings_panel(
             self._series_cumulative_alpha_data: list[str] = []
             self._series_cumulative_line_width_data: list[str] = []
             self._series_cumulative_line_style_data: list[str] = []
+            self._series_integration_enabled_data: list[bool] = []
+            self._series_integration_source_data: list[str] = []
+            self._series_integration_x_min_data: list[str] = []
+            self._series_integration_x_max_data: list[str] = []
+            self._series_integration_baseline_data: list[str] = []
+            self._series_integration_color_mode_data: list[str] = []
+            self._series_integration_color_data: list[str] = []
+            self._series_integration_alpha_data: list[str] = []
             self._series_line_widths_data: list[str] = []
             self._series_markers_data: list[str] = []
             self._series_line_kwargs_data: list[str] = []
@@ -1722,6 +2104,7 @@ def launch_plot_settings_panel(
             self._series_display_rows: list[dict[str, Any]] = []
             self._last_preview_state: dict[str, Any] = {}
             self._synced_field_modes: dict[str, str] = {}
+            self._collapsible_section_state: dict[str, bool] = {}
             self._advanced_json_syncing = False
             self._suspend_preview_events = False
             self._preview_pixmap: QPixmap | None = None
@@ -1773,8 +2156,16 @@ def launch_plot_settings_panel(
             self._series_uncertainty_group: QGroupBox | None = None
             self._series_derived_group: QGroupBox | None = None
             self._series_metadata_group: QGroupBox | None = None
+            self._selected_layer_card: QFrame | None = None
+            self._selected_layer_title: QLabel | None = None
+            self._selected_layer_badge: QLabel | None = None
+            self._selected_layer_state: QLabel | None = None
+            self._selected_layer_source: QLabel | None = None
+            self._selected_layer_swatch: QFrame | None = None
+            self._series_delete_button: QPushButton | None = None
             self._series_fit_group: QGroupBox | None = None
             self._series_cumulative_group: QGroupBox | None = None
+            self._series_integration_group: QGroupBox | None = None
             self._series_error_detail_rows: list[tuple[QFormLayout, QWidget]] = []
             self._series_error_detail_widgets: list[QWidget] = []
             self._series_fit_detail_rows: list[tuple[QFormLayout, QWidget]] = []
@@ -1785,7 +2176,6 @@ def launch_plot_settings_panel(
             self._normalization_actions_widget: QWidget | None = None
             self._normalization_hint_label: QLabel | None = None
             self._annotation_common_detail_rows: list[tuple[QFormLayout, QWidget]] = []
-            self._annotation_summary_group: QGroupBox | None = None
             self._figure_tabs: QTabWidget | None = None
             self._figure_legend_section: QWidget | None = None
             self._figure_lines_section: QGroupBox | None = None
@@ -1807,11 +2197,21 @@ def launch_plot_settings_panel(
             self._preview_timer.timeout.connect(self._handle_debounced_preview)
             self._preview_loading = False
             self._preview_error: str | None = None
+            self._theme_mode = "system"
+            self._theme_switch: QCheckBox | None = None
             self._status_label = QLabel("Ready.")
             self._build_ui()
             self._suspend_preview_events = True
-            self._populate(initial_settings)
-            self._suspend_preview_events = False
+            _previous_series_syncing = self._series_syncing
+            _previous_annotation_syncing = self._annotation_syncing
+            self._series_syncing = True
+            self._annotation_syncing = True
+            try:
+                self._populate(initial_settings)
+            finally:
+                self._series_syncing = _previous_series_syncing
+                self._annotation_syncing = _previous_annotation_syncing
+                self._suspend_preview_events = False
             self._refresh_widget_states()
             self._bind_live_preview_signals()
             try:
@@ -2085,6 +2485,32 @@ def launch_plot_settings_panel(
             tab_layout.addWidget(scroll)
             return content
 
+        def _prepare_collapsible_body(self, widget: QWidget) -> QWidget:
+            if isinstance(widget, QGroupBox):
+                widget.setProperty("collapsibleBody", True)
+                widget.setTitle("")
+            return widget
+
+        def _make_collapsible_section(
+            self,
+            *,
+            title: str,
+            section_id: str,
+            body_widget: QWidget,
+            default_expanded: bool = True,
+            subsection: bool = False,
+        ) -> _CollapsibleSection:
+            section = _CollapsibleSection(
+                title=title,
+                section_id=section_id,
+                state_store=self._collapsible_section_state,
+                default_expanded=default_expanded,
+                subsection=subsection,
+                parent=self,
+            )
+            section.set_body_widget(self._prepare_collapsible_body(body_widget))
+            return section
+
         def _synced_field_mode(self, key: str) -> str:
             token = str(self._synced_field_modes.get(key, "auto")).strip().lower()
             allowed_modes = (
@@ -2158,7 +2584,7 @@ def launch_plot_settings_panel(
             self._update_series_metadata_panel(self._series_active_index)
             self._update_series_error_summary(self._series_active_index)
             self._update_series_fit_summary(self._series_active_index)
-            self._update_annotation_preview_summary(self._annotation_active_index)
+            self._update_integration_summary()
 
         def _handle_synced_field_edit(self, key: str) -> None:
             self._set_synced_field_mode(key, "manual")
@@ -2555,6 +2981,12 @@ def launch_plot_settings_panel(
 
             header_layout.addStretch(1)
 
+            self._theme_switch = QCheckBox("Dark mode")
+            self._theme_switch.setObjectName("themeSwitch")
+            self._sync_theme_switch_label()
+            self._theme_switch.toggled.connect(self._handle_theme_switch_toggled)
+            header_layout.addWidget(self._theme_switch)
+
             self._save_button = QPushButton("Save Profile")
             self._save_button.setProperty("role", "primary")
             self._save_button.clicked.connect(self._handle_save)
@@ -2668,6 +3100,10 @@ def launch_plot_settings_panel(
             self._apply_theme_styles()
 
         def _is_dark_theme(self) -> bool:
+            if self._theme_mode == "dark":
+                return True
+            if self._theme_mode == "light":
+                return False
             app = QApplication.instance()
             palette = app.palette() if app is not None else self.palette()
             window_color = palette.color(QPalette.ColorRole.Window)
@@ -2698,6 +3134,26 @@ def launch_plot_settings_panel(
                     "accent_hover": "#34bed1",
                     "accent_text": "#07151b",
                     "accent_soft": "#163e47",
+                    "series_row_bg": "transparent",
+                    "series_row_text": "#edf3fb",
+                    "series_row_disabled_text": "#7f8fa6",
+                    "series_row_selected_bg": "#123c46",
+                    "series_row_selected_border": "#34bed1",
+                    "series_row_selected_text": "#f7fbff",
+                    "series_row_button_hover": "#203349",
+                    "series_row_swatch_bg": "#0e1725",
+                    "series_row_swatch_border": "#607086",
+                    "series_badge_original_bg": "#1f2d40",
+                    "series_badge_original_border": "#566b88",
+                    "series_badge_original_text": "#dce8f7",
+                    "series_badge_copy_bg": "#463a16",
+                    "series_badge_copy_border": "#b9973d",
+                    "series_badge_copy_text": "#ffe7a3",
+                    "series_badge_group_bg": "#173f35",
+                    "series_badge_group_border": "#39b990",
+                    "series_badge_group_text": "#cffff0",
+                    "selected_card_bg": "#102f3a",
+                    "selected_card_border": "#34bed1",
                     "nav_hover": "#182637",
                     "nav_selected": "#18424b",
                     "nav_selected_border": "#2aa7b8",
@@ -2708,6 +3164,13 @@ def launch_plot_settings_panel(
                     "warning_bg": "#33250e",
                     "warning_border": "#b98934",
                     "warning_text": "#f5d9a1",
+                    "tooltip_bg": "#1a2435",
+                    "tooltip_border": "#4a607e",
+                    "tooltip_text": "#f7fbff",
+                    "placeholder_text": "#7f8fa6",
+                    "item_hover": "#1c2c40",
+                    "item_selected_bg": "#2aa7b8",
+                    "item_selected_text": "#07151b",
                     "splitter": "#42556f",
                     "scrollbar_track": "#0f1724",
                     "scrollbar_thumb": "#40536d",
@@ -2735,6 +3198,26 @@ def launch_plot_settings_panel(
                 "accent_hover": "#0c7a80",
                 "accent_text": "#f8feff",
                 "accent_soft": "#d9f0f2",
+                "series_row_bg": "transparent",
+                "series_row_text": "#142033",
+                "series_row_disabled_text": "#6d7b8e",
+                "series_row_selected_bg": "#cbecef",
+                "series_row_selected_border": "#0c7a80",
+                "series_row_selected_text": "#082f34",
+                "series_row_button_hover": "#d8edf0",
+                "series_row_swatch_bg": "#ffffff",
+                "series_row_swatch_border": "#93a4b8",
+                "series_badge_original_bg": "#e7edf5",
+                "series_badge_original_border": "#9aacbf",
+                "series_badge_original_text": "#23324a",
+                "series_badge_copy_bg": "#fff0bd",
+                "series_badge_copy_border": "#c6941f",
+                "series_badge_copy_text": "#4f3600",
+                "series_badge_group_bg": "#d8f3e9",
+                "series_badge_group_border": "#15946f",
+                "series_badge_group_text": "#053e31",
+                "selected_card_bg": "#d7f1f4",
+                "selected_card_border": "#087982",
                 "nav_hover": "#edf4fa",
                 "nav_selected": "#0f8f95",
                 "nav_selected_border": "#0c7a80",
@@ -2745,11 +3228,39 @@ def launch_plot_settings_panel(
                 "warning_bg": "#fff3d9",
                 "warning_border": "#d8a94f",
                 "warning_text": "#7c5400",
+                "tooltip_bg": "#f8fbff",
+                "tooltip_border": "#b7c6d8",
+                "tooltip_text": "#102033",
+                "placeholder_text": "#7b8797",
+                "item_hover": "#edf4fa",
+                "item_selected_bg": "#0f8f95",
+                "item_selected_text": "#f8feff",
                 "splitter": "#cad5e1",
                 "scrollbar_track": "#edf2f7",
                 "scrollbar_thumb": "#b9c5d4",
                 "scrollbar_thumb_hover": "#95a6bb",
             }
+
+        def _sync_theme_switch_label(self) -> None:
+            if self._theme_switch is None:
+                return
+            is_dark = self._is_dark_theme()
+            self._theme_switch.blockSignals(True)
+            try:
+                self._theme_switch.setChecked(is_dark)
+                self._theme_switch.setText("Dark mode" if is_dark else "Light mode")
+            finally:
+                self._theme_switch.blockSignals(False)
+
+        def _handle_theme_switch_toggled(self, checked: bool) -> None:
+            self._theme_mode = "dark" if checked else "light"
+            self._sync_theme_switch_label()
+            self._apply_theme_styles()
+            if hasattr(self, "series_list") and self.series_list is not None:
+                for index in range(self.series_list.count()):
+                    self._apply_series_list_item_visuals(self.series_list.item(index), index)
+            self._update_selected_layer_card(self._series_active_index)
+            self._refresh_shell_state()
 
         def _apply_theme_styles(self) -> None:
             colors = self._theme_tokens()
@@ -2786,6 +3297,35 @@ def launch_plot_settings_panel(
                 f"  padding: 0 5px;"
                 f"  color: {colors['heading']};"
                 f"  font-weight: 600;"
+                f"}}"
+                f'QGroupBox[collapsibleBody="true"] {{'
+                f"  margin-top: 0px;"
+                f"  border: none;"
+                f"  border-radius: 0px;"
+                f"  background: transparent;"
+                f"}}"
+                f'QGroupBox[collapsibleBody="true"]::title {{'
+                f"  color: transparent;"
+                f"  padding: 0px;"
+                f"  left: 0px;"
+                f"  height: 0px;"
+                f"}}"
+                f"QFrame#collapsibleSection, QFrame#collapsibleSubsection {{"
+                f"  background-color: {colors['card_bg']};"
+                f"  border: 1px solid {colors['border_soft']};"
+                f"  border-radius: 12px;"
+                f"}}"
+                f"QFrame#collapsibleSubsection {{"
+                f"  background-color: {colors['panel_elevated']};"
+                f"  border-radius: 10px;"
+                f"}}"
+                f"QFrame#collapsibleSectionHeader, QFrame#collapsibleSubsectionHeader {{"
+                f"  background: transparent;"
+                f"  border: none;"
+                f"}}"
+                f"QFrame#collapsibleSectionBody, QFrame#collapsibleSubsectionBody {{"
+                f"  background: transparent;"
+                f"  border: none;"
                 f"}}"
                 f"QPushButton {{"
                 f"  padding: 7px 12px;"
@@ -2824,6 +3364,127 @@ def launch_plot_settings_panel(
                 f"  color: {colors['disabled_text']};"
                 f"  border-color: {colors['border_soft']};"
                 f"}}"
+                f"QToolButton {{"
+                f"  border: 1px solid {colors['border']};"
+                f"  border-radius: 7px;"
+                f"  background-color: {colors['button_bg']};"
+                f"  color: {colors['text']};"
+                f"}}"
+                f"QToolButton:hover {{"
+                f"  border-color: {colors['accent']};"
+                f"  background-color: {colors['button_hover']};"
+                f"}}"
+                f"QToolButton:disabled {{"
+                f"  background-color: {colors['disabled_bg']};"
+                f"  color: {colors['disabled_text']};"
+                f"  border-color: {colors['border_soft']};"
+                f"}}"
+                f"QToolButton#collapsibleToggle {{"
+                f"  padding: 10px 12px;"
+                f"  border: none;"
+                f"  border-radius: 10px;"
+                f"  background: transparent;"
+                f"  color: {colors['heading']};"
+                f"  font-weight: 600;"
+                f"  text-align: left;"
+                f"}}"
+                f"QToolButton#collapsibleToggle:hover {{"
+                f"  background-color: {colors['nav_hover']};"
+                f"  border: none;"
+                f"}}"
+                f"QToolButton#collapsibleToggle:pressed {{"
+                f"  background-color: {colors['button_hover']};"
+                f"}}"
+                f"QToolButton#collapsibleToggle:disabled {{"
+                f"  background: transparent;"
+                f"  color: {colors['disabled_text']};"
+                f"  border: none;"
+                f"}}"
+                f"QMenu {{"
+                f"  background-color: {colors['panel_elevated']};"
+                f"  color: {colors['text']};"
+                f"  border: 1px solid {colors['border']};"
+                f"}}"
+                f"QMenu::item {{"
+                f"  padding: 6px 20px 6px 12px;"
+                f"  color: {colors['text']};"
+                f"  background: transparent;"
+                f"}}"
+                f"QMenu::item:disabled {{"
+                f"  color: {colors['disabled_text']};"
+                f"}}"
+                f"QMenu::item:selected {{"
+                f"  background-color: {colors['item_selected_bg']};"
+                f"  color: {colors['item_selected_text']};"
+                f"}}"
+                f"QMenu::separator {{"
+                f"  height: 1px;"
+                f"  margin: 5px 8px;"
+                f"  background: {colors['border_soft']};"
+                f"}}"
+                f"QToolTip {{"
+                f"  background-color: {colors['tooltip_bg']};"
+                f"  color: {colors['tooltip_text']};"
+                f"  border: 1px solid {colors['tooltip_border']};"
+                f"  padding: 6px 8px;"
+                f"}}"
+                f"QMessageBox {{"
+                f"  background-color: {colors['panel_bg']};"
+                f"  color: {colors['text']};"
+                f"}}"
+                f"QMessageBox QLabel {{"
+                f"  color: {colors['text']};"
+                f"  background: transparent;"
+                f"}}"
+                f"QMessageBox QTextEdit, QMessageBox QPlainTextEdit {{"
+                f"  border: 1px solid {colors['input_border']};"
+                f"  border-radius: 8px;"
+                f"  background-color: {colors['input_bg']};"
+                f"  color: {colors['text']};"
+                f"  selection-background-color: {colors['accent_soft']};"
+                f"  selection-color: {colors['text']};"
+                f"}}"
+                f"QMessageBox QPushButton {{"
+                f"  padding: 7px 12px;"
+                f"  border: 1px solid {colors['border']};"
+                f"  border-radius: 8px;"
+                f"  background-color: {colors['button_bg']};"
+                f"  color: {colors['text']};"
+                f"  min-width: 88px;"
+                f"}}"
+                f"QMessageBox QPushButton:hover {{"
+                f"  border-color: {colors['accent']};"
+                f"  background-color: {colors['button_hover']};"
+                f"}}"
+                f"QMessageBox QPushButton:pressed {{"
+                f"  background-color: {colors['button_pressed']};"
+                f"}}"
+                f"QMessageBox QPushButton:disabled {{"
+                f"  background-color: {colors['disabled_bg']};"
+                f"  color: {colors['disabled_text']};"
+                f"  border-color: {colors['border_soft']};"
+                f"}}"
+                f"QDialogButtonBox QPushButton {{"
+                f"  padding: 7px 12px;"
+                f"  border: 1px solid {colors['border']};"
+                f"  border-radius: 8px;"
+                f"  background-color: {colors['button_bg']};"
+                f"  color: {colors['text']};"
+                f"  min-width: 88px;"
+                f"}}"
+                f"QDialogButtonBox QPushButton:hover {{"
+                f"  border-color: {colors['accent']};"
+                f"  background-color: {colors['button_hover']};"
+                f"}}"
+                f"QDialogButtonBox QPushButton:pressed {{"
+                f"  background-color: {colors['button_pressed']};"
+                f"}}"
+                f"QDialogButtonBox QPushButton:disabled {{"
+                f"  background-color: {colors['disabled_bg']};"
+                f"  color: {colors['disabled_text']};"
+                f"  border-color: {colors['border_soft']};"
+                f"}}"
+                f"QLabel {{ color: {colors['text']}; }}"
                 f"QLineEdit, QComboBox, QPlainTextEdit, QListWidget {{"
                 f"  border: 1px solid {colors['input_border']};"
                 f"  border-radius: 8px;"
@@ -2833,12 +3494,21 @@ def launch_plot_settings_panel(
                 f"  selection-background-color: {colors['accent_soft']};"
                 f"  selection-color: {colors['text']};"
                 f"}}"
+                f"QLineEdit, QPlainTextEdit {{"
+                f"  placeholder-text-color: {colors['placeholder_text']};"
+                f"}}"
                 f"QLineEdit, QComboBox {{ padding: 6px 8px; min-height: 18px; }}"
                 f"QPlainTextEdit {{ padding: 6px; }}"
                 f"QLineEdit:disabled, QComboBox:disabled, QPlainTextEdit:disabled, QListWidget:disabled {{"
                 f"  background-color: {colors['disabled_bg']};"
                 f"  color: {colors['disabled_text']};"
                 f"  border-color: {colors['border_soft']};"
+                f"}}"
+                f"QLabel:disabled, QCheckBox:disabled, QGroupBox:disabled {{"
+                f"  color: {colors['disabled_text']};"
+                f"}}"
+                f"QGroupBox:disabled::title {{"
+                f"  color: {colors['disabled_text']};"
                 f"}}"
                 f"QLineEdit:focus, QComboBox:focus, QPlainTextEdit:focus, QListWidget:focus {{"
                 f"  border-color: {colors['accent']};"
@@ -2849,10 +3519,53 @@ def launch_plot_settings_panel(
                 f"  border: 1px solid {colors['border']};"
                 f"  background-color: {colors['panel_elevated']};"
                 f"  color: {colors['text']};"
-                f"  selection-background-color: {colors['accent']};"
-                f"  selection-color: {colors['accent_text']};"
+                f"  outline: none;"
+                f"  selection-background-color: {colors['item_selected_bg']};"
+                f"  selection-color: {colors['item_selected_text']};"
+                f"  alternate-background-color: {colors['card_bg']};"
+                f"}}"
+                f"QComboBox QAbstractItemView::item {{"
+                f"  padding: 6px 10px;"
+                f"  margin: 0px;"
+                f"  border: none;"
+                f"  show-decoration-selected: 1;"
+                f"}}"
+                f"QComboBox QAbstractItemView::item:selected {{"
+                f"  background-color: {colors['item_selected_bg']};"
+                f"  color: {colors['item_selected_text']};"
+                f"  border: none;"
+                f"}}"
+                f"QAbstractItemView {{"
+                f"  background-color: {colors['panel_elevated']};"
+                f"  color: {colors['text']};"
+                f"  selection-background-color: {colors['item_selected_bg']};"
+                f"  selection-color: {colors['item_selected_text']};"
+                f"}}"
+                f"QAbstractItemView::item:hover {{"
+                f"  background-color: {colors['item_hover']};"
+                f"  color: {colors['text']};"
+                f"}}"
+                f"QAbstractItemView::item:selected {{"
+                f"  background-color: {colors['item_selected_bg']};"
+                f"  color: {colors['item_selected_text']};"
+                f"}}"
+                f"QAbstractItemView::item:selected:active, QAbstractItemView::item:selected:!active {{"
+                f"  background-color: {colors['item_selected_bg']};"
+                f"  color: {colors['item_selected_text']};"
                 f"}}"
                 f"QCheckBox {{ spacing: 6px; }}"
+                f"QCheckBox#themeSwitch {{"
+                f"  padding: 6px 10px;"
+                f"  border: 1px solid {colors['border']};"
+                f"  border-radius: 999px;"
+                f"  background-color: {colors['button_bg']};"
+                f"  color: {colors['text']};"
+                f"  font-weight: 600;"
+                f"}}"
+                f"QCheckBox#themeSwitch:hover {{"
+                f"  border-color: {colors['accent']};"
+                f"  background-color: {colors['button_hover']};"
+                f"}}"
                 f"QCheckBox::indicator {{"
                 f"  width: 16px;"
                 f"  height: 16px;"
@@ -2862,6 +3575,39 @@ def launch_plot_settings_panel(
                 f"}}"
                 f"QCheckBox::indicator:hover {{ border-color: {colors['accent']}; }}"
                 f"QCheckBox::indicator:checked {{"
+                f"  background-color: {colors['accent']};"
+                f"  border-color: {colors['accent']};"
+                f"}}"
+                f"QCheckBox::indicator:disabled {{"
+                f"  background-color: {colors['disabled_bg']};"
+                f"  border-color: {colors['border_soft']};"
+                f"}}"
+                f"QAbstractItemView::indicator {{"
+                f"  width: 16px;"
+                f"  height: 16px;"
+                f"  border-radius: 4px;"
+                f"  border: 1px solid {colors['input_border']};"
+                f"  background-color: {colors['input_bg']};"
+                f"}}"
+                f"QAbstractItemView::indicator:hover {{"
+                f"  border-color: {colors['accent']};"
+                f"}}"
+                f"QAbstractItemView::indicator:checked {{"
+                f"  background-color: {colors['accent']};"
+                f"  border-color: {colors['accent']};"
+                f"}}"
+                f"QAbstractItemView::indicator:disabled {{"
+                f"  background-color: {colors['disabled_bg']};"
+                f"  border-color: {colors['border_soft']};"
+                f"}}"
+                f"QCheckBox#themeSwitch::indicator {{"
+                f"  width: 34px;"
+                f"  height: 18px;"
+                f"  border-radius: 9px;"
+                f"  background-color: {colors['input_bg']};"
+                f"  border: 1px solid {colors['input_border']};"
+                f"}}"
+                f"QCheckBox#themeSwitch::indicator:checked {{"
                 f"  background-color: {colors['accent']};"
                 f"  border-color: {colors['accent']};"
                 f"}}"
@@ -2876,6 +3622,15 @@ def launch_plot_settings_panel(
                 f"  border-radius: 999px;"
                 f"  background-color: {colors['badge_bg']};"
                 f"  color: {colors['badge_text']};"
+                f"  font-weight: 600;"
+                f"}}"
+                f"QFrame#selectedLayerCard {{"
+                f"  background-color: {colors['selected_card_bg']};"
+                f"  border: 1px solid {colors['selected_card_border']};"
+                f"  border-radius: 8px;"
+                f"}}"
+                f"QLabel#selectedLayerTitle {{"
+                f"  color: {colors['heading']};"
                 f"  font-weight: 600;"
                 f"}}"
                 f"QLabel#warningSummary, QLabel#inlineWarning {{"
@@ -2920,6 +3675,9 @@ def launch_plot_settings_panel(
                 f"  background-color: {colors['card_bg']};"
                 f"}}"
                 f"QTabWidget#plotSubtabs {{"
+                f"  background: transparent;"
+                f"}}"
+                f"QTabWidget#plotSubtabs QTabBar {{"
                 f"  background: transparent;"
                 f"}}"
                 f"QTabWidget#plotSubtabs QTabBar::tab {{"
@@ -2980,21 +3738,30 @@ def launch_plot_settings_panel(
                 f"}}"
                 f"QListWidget#annotationList {{"
                 f"  background-color: {colors['input_bg']};"
+                f"  border: 1px solid {colors['border']};"
+                f"  border-radius: 12px;"
+                f"  padding: 6px;"
                 f"}}"
                 f"QListWidget#annotationList::item {{"
-                f"  padding: 8px 10px;"
-                f"  margin: 2px 0;"
-                f"  border-radius: 8px;"
-                f"  border: 1px solid transparent;"
-                f"  color: {colors['text']};"
+                f"  padding: 0px;"
+                f"  margin: 0px;"
+                f"  border: none;"
+                f"  background: transparent;"
+                f"  color: transparent;"
                 f"}}"
                 f"QListWidget#annotationList::item:hover {{"
-                f"  background-color: {colors['nav_hover']};"
+                f"  background: transparent;"
                 f"}}"
                 f"QListWidget#annotationList::item:selected {{"
-                f"  background-color: {colors['accent_soft']};"
-                f"  color: {colors['heading']};"
-                f"  border: 1px solid {colors['accent']};"
+                f"  background: transparent;"
+                f"  color: transparent;"
+                f"  border: none;"
+                f"}}"
+                f"QListWidget#annotationList::indicator {{"
+                f"  width: 0px;"
+                f"  height: 0px;"
+                f"  border: none;"
+                f"  background: transparent;"
                 f"}}"
                 f"QScrollArea {{ border: none; background: transparent; }}"
                 f"QScrollBar:vertical {{"
@@ -3012,6 +3779,23 @@ def launch_plot_settings_panel(
                 f"QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical, "
                 f"QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{"
                 f"  height: 0px;"
+                f"  background: transparent;"
+                f"}}"
+                f"QScrollBar:horizontal {{"
+                f"  background: {colors['scrollbar_track']};"
+                f"  height: 12px;"
+                f"  margin: 2px;"
+                f"  border-radius: 6px;"
+                f"}}"
+                f"QScrollBar::handle:horizontal {{"
+                f"  background: {colors['scrollbar_thumb']};"
+                f"  min-width: 24px;"
+                f"  border-radius: 6px;"
+                f"}}"
+                f"QScrollBar::handle:horizontal:hover {{ background: {colors['scrollbar_thumb_hover']}; }}"
+                f"QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal, "
+                f"QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {{"
+                f"  width: 0px;"
                 f"  background: transparent;"
                 f"}}"
                 f"QSplitter::handle {{"
@@ -3563,19 +4347,12 @@ def launch_plot_settings_panel(
             page = QWidget()
             layout = QVBoxLayout(page)
             layout.setContentsMargins(0, 0, 0, 0)
-            layout.setSpacing(8)
-            hint = QLabel(
-                "Layers collect plotted series, grouped series, derived lines, and annotations. The inspector only shows controls that matter for the selected layer."
-            )
-            hint.setWordWrap(True)
-            hint.setObjectName("sectionNote")
-            layout.addWidget(hint)
+            layout.setSpacing(0)
+
             tabs = QTabWidget(page)
             tabs.setObjectName("plotSubtabs")
-            tabs.setDocumentMode(True)
             self._layers_tabs = tabs
             self._tab_series = QWidget()
-            self._tab_series_content = self._make_scrollable_tab(self._tab_series)
             self._build_series_tab()
             self._tab_annotations = QWidget()
             self._tab_annotations_content = self._make_scrollable_tab(self._tab_annotations)
@@ -3591,32 +4368,57 @@ def launch_plot_settings_panel(
             content = self._make_scrollable_tab(page)
             layout = QVBoxLayout(content)
             layout.setSpacing(12)
-            hint = QLabel(
-                "Figure controls the visual presentation of the current plot. "
-                "All figure-wide settings are collected here in one place."
-            )
-            hint.setWordWrap(True)
-            hint.setObjectName("sectionNote")
-            layout.addWidget(hint)
+            # hint = QLabel(
+            #     "Figure controls the visual presentation of the current plot. "
+            #     "All figure-wide settings are collected here in one place."
+            # )
+            # hint.setWordWrap(True)
+            # hint.setObjectName("sectionNote")
+            # layout.addWidget(hint)
             self._figure_tabs = None
-            self._tab_canvas_content = QGroupBox("Canvas & Typography")
-            layout.addWidget(self._tab_canvas_content)
-            self._tab_lines_content = QGroupBox("Lines & Markers")
-            self._figure_lines_section = self._tab_lines_content
-            layout.addWidget(self._tab_lines_content)
-            self._tab_axes_content = QGroupBox("Axes, Ticks & Grid")
-            layout.addWidget(self._tab_axes_content)
+            self._tab_canvas_content = QGroupBox("Canvas and Typography")
+            self._tab_lines_content = QGroupBox("Lines and Markers")
+            self._tab_axes_content = QGroupBox("Axes, Ticks and Grid")
             self._tab_legend_content = QGroupBox("Legend")
-            layout.addWidget(self._tab_legend_content)
-            self._tab_heatmap_content = QGroupBox("Heatmap & Colorbar")
-            self._figure_heatmap_section = self._tab_heatmap_content
-            layout.addWidget(self._tab_heatmap_content)
+            self._tab_heatmap_content = QGroupBox("Heatmap and Colorbar")
 
             self._build_canvas_tab()
             self._build_lines_tab()
             self._build_axes_tab()
             self._build_legend_tab()
             self._build_heatmap_tab()
+            layout.addWidget(
+                self._make_collapsible_section(
+                    title="Canvas and Typography",
+                    section_id="figure.canvas",
+                    body_widget=self._tab_canvas_content,
+                )
+            )
+            self._figure_lines_section = self._make_collapsible_section(
+                title="Lines and Markers",
+                section_id="figure.lines",
+                body_widget=self._tab_lines_content,
+            )
+            layout.addWidget(self._figure_lines_section)
+            layout.addWidget(
+                self._make_collapsible_section(
+                    title="Axes and Ticks",
+                    section_id="figure.axes",
+                    body_widget=self._tab_axes_content,
+                )
+            )
+            self._figure_legend_section = self._make_collapsible_section(
+                title="Legend",
+                section_id="figure.legend",
+                body_widget=self._tab_legend_content,
+            )
+            layout.addWidget(self._figure_legend_section)
+            self._figure_heatmap_section = self._make_collapsible_section(
+                title="Heatmap and Colorbar",
+                section_id="figure.heatmap",
+                body_widget=self._tab_heatmap_content,
+            )
+            layout.addWidget(self._figure_heatmap_section)
             layout.addStretch(1)
             return page
 
@@ -3644,21 +4446,13 @@ def launch_plot_settings_panel(
                 self._profile_selector,
                 tooltip_id="profiles.selector",
             )
-            layout.addWidget(selection_group)
-
-            current_group = QGroupBox("Current Profile")
-            current_layout = QFormLayout(current_group)
-            self._profiles_current_label = QLabel(self._current_profile_name)
-            self._profiles_current_label.setWordWrap(True)
-            current_note = QLabel(
-                "Profiles store reusable plotting presets inside the current HDF5 source."
-                if self._allow_named_profiles
-                else "Combined plot files store one shared settings document for all plotted series."
+            layout.addWidget(
+                self._make_collapsible_section(
+                    title="Profile Selection",
+                    section_id="profiles.selection",
+                    body_widget=selection_group,
+                )
             )
-            current_note.setWordWrap(True)
-            current_layout.addRow("Active profile", self._profiles_current_label)
-            current_layout.addRow("", current_note)
-            layout.addWidget(current_group)
 
             manage_group = QGroupBox("Manage Profiles")
             manage_layout = QGridLayout(manage_group)
@@ -3700,7 +4494,13 @@ def launch_plot_settings_panel(
             self._register_tooltip(reset_profile_button, "profiles.reset")
             self._apply_widget_tooltip(reset_profile_button)
             manage_layout.addWidget(reset_profile_button, 2, 1)
-            layout.addWidget(manage_group)
+            layout.addWidget(
+                self._make_collapsible_section(
+                    title="Manage Profiles",
+                    section_id="profiles.manage",
+                    body_widget=manage_group,
+                )
+            )
 
             transfer_group = QGroupBox("Transfer Profiles")
             transfer_layout = QGridLayout(transfer_group)
@@ -3712,7 +4512,13 @@ def launch_plot_settings_panel(
             self._register_tooltip(export_json_button, "profiles.export_json")
             self._apply_widget_tooltip(export_json_button)
             transfer_layout.addWidget(export_json_button, 0, 1)
-            layout.addWidget(transfer_group)
+            layout.addWidget(
+                self._make_collapsible_section(
+                    title="Transfer Profiles",
+                    section_id="profiles.transfer",
+                    body_widget=transfer_group,
+                )
+            )
             layout.addStretch(1)
             self._sync_profile_selector()
             return page
@@ -3727,6 +4533,8 @@ def launch_plot_settings_panel(
             layout = QVBoxLayout(self._tab_axes_content)
             layout.setSpacing(12)
 
+            title_box = QGroupBox("Title")
+            title_layout = QVBoxLayout(title_box)
             top_form = QFormLayout()
 
             title_row, self.title_text, title_lock = self._lockable_line(
@@ -3756,13 +4564,24 @@ def launch_plot_settings_panel(
                 tooltip_id="figure.text.title_font",
             )
 
-            layout.addLayout(top_form)
+            title_layout.addLayout(top_form)
+            layout.addWidget(
+                self._make_collapsible_section(
+                    title="Title",
+                    section_id="figure.axes.title",
+                    body_widget=title_box,
+                    subsection=True,
+                )
+            )
 
             x_axis_box = QGroupBox("X-axis")
-            x_axis_form = QFormLayout(x_axis_box)
+            x_axis_layout = QVBoxLayout(x_axis_box)
+            x_axis_form = QFormLayout()
 
             self.x_label_font = self._positive_int_line()
             self.x_scale = self._combo(("linear", "log", "symlog", "logit"))
+            self.x_axis_scale = self._bounded_float_line("1.0")
+            self.x_axis_offset = self._bounded_float_line("0.0")
             x_limits_row, self.x_min, self.x_max, x_limits_lock = self._lockable_pair()
             self._connect_lockable_line("x_lim", self.x_min, x_limits_lock)
             self.x_max.textEdited.connect(lambda _text: self._handle_synced_field_edit("x_lim"))
@@ -3789,6 +4608,18 @@ def launch_plot_settings_panel(
             )
             self._add_form_row(
                 x_axis_form,
+                "X scale factor",
+                self.x_axis_scale,
+                tooltip_id="figure.axes.x_axis_scale",
+            )
+            self._add_form_row(
+                x_axis_form,
+                "X offset",
+                self.x_axis_offset,
+                tooltip_id="figure.axes.x_axis_offset",
+            )
+            self._add_form_row(
+                x_axis_form,
                 "X min / max",
                 x_limits_row,
                 tooltip_id="figure.axes.x_limits",
@@ -3799,11 +4630,18 @@ def launch_plot_settings_panel(
                 x_label_pad_row,
                 tooltip_id="figure.axes.x_label_pad",
             )
+            x_axis_layout.addLayout(x_axis_form)
 
             x_ticks_box = QGroupBox("X ticks")
             x_ticks_form = QFormLayout(x_ticks_box)
             self.x_ticks_mode = self._combo(_TOGGLE_MODES)
             self.x_ticks_mode.currentTextChanged.connect(self._refresh_widget_states)
+            self._add_form_row(
+                x_ticks_form,
+                "Show ticks",
+                self.x_ticks_mode,
+                tooltip_id="figure.ticks.show",
+            )
             x_ticks_row, self.x_ticks, x_ticks_lock = self._lockable_line(
                 placeholder="e.g. 0, 1, 2"
             )
@@ -3814,12 +4652,6 @@ def launch_plot_settings_panel(
             self.x_tick_length = self._bounded_float_line("points", bottom=0.0)
             self.x_tick_width = self._bounded_float_line("points", bottom=0.0)
             self.x_minor_ticks_mode = self._combo(_MINOR_TICKS_MODES)
-            self._add_form_row(
-                x_ticks_form,
-                "Show ticks",
-                self.x_ticks_mode,
-                tooltip_id="figure.ticks.show",
-            )
             self._add_form_row(
                 x_ticks_form,
                 "Ticks",
@@ -3871,11 +4703,25 @@ def launch_plot_settings_panel(
                 (x_ticks_form, self.x_tick_width),
                 (x_ticks_form, self.x_minor_ticks_mode),
             ]
-            layout.addWidget(x_axis_box)
-            layout.addWidget(x_ticks_box)
+            self._x_ticks_group = self._make_collapsible_section(
+                title="X ticks",
+                section_id="figure.axes.x_ticks",
+                body_widget=x_ticks_box,
+                subsection=True,
+            )
+            x_axis_layout.addWidget(self._x_ticks_group)
+            layout.addWidget(
+                self._make_collapsible_section(
+                    title="X-axis",
+                    section_id="figure.axes.x",
+                    body_widget=x_axis_box,
+                    subsection=True,
+                )
+            )
 
             y_axis_box = QGroupBox("Y-axis")
-            y_axis_form = QFormLayout(y_axis_box)
+            y_axis_layout = QVBoxLayout(y_axis_box)
+            y_axis_form = QFormLayout()
 
             self.y_label_font = self._positive_int_line()
             self.y_scale = self._combo(("linear", "log", "symlog", "logit"))
@@ -3915,11 +4761,18 @@ def launch_plot_settings_panel(
                 y_label_pad_row,
                 tooltip_id="figure.axes.y_label_pad",
             )
+            y_axis_layout.addLayout(y_axis_form)
 
             y_ticks_box = QGroupBox("Y ticks")
             y_ticks_form = QFormLayout(y_ticks_box)
             self.y_ticks_mode = self._combo(_TOGGLE_MODES)
             self.y_ticks_mode.currentTextChanged.connect(self._refresh_widget_states)
+            self._add_form_row(
+                y_ticks_form,
+                "Show ticks",
+                self.y_ticks_mode,
+                tooltip_id="figure.ticks.show",
+            )
             y_ticks_row, self.y_ticks, y_ticks_lock = self._lockable_line(
                 placeholder="e.g. 0, 5, 10"
             )
@@ -3930,12 +4783,6 @@ def launch_plot_settings_panel(
             self.y_tick_length = self._bounded_float_line("points", bottom=0.0)
             self.y_tick_width = self._bounded_float_line("points", bottom=0.0)
             self.y_minor_ticks_mode = self._combo(_MINOR_TICKS_MODES)
-            self._add_form_row(
-                y_ticks_form,
-                "Show ticks",
-                self.y_ticks_mode,
-                tooltip_id="figure.ticks.show",
-            )
             self._add_form_row(
                 y_ticks_form,
                 "Ticks",
@@ -3987,13 +4834,32 @@ def launch_plot_settings_panel(
                 (y_ticks_form, self.y_tick_width),
                 (y_ticks_form, self.y_minor_ticks_mode),
             ]
-            layout.addWidget(y_axis_box)
-            layout.addWidget(y_ticks_box)
+            self._y_ticks_group = self._make_collapsible_section(
+                title="Y ticks",
+                section_id="figure.axes.y_ticks",
+                body_widget=y_ticks_box,
+                subsection=True,
+            )
+            y_axis_layout.addWidget(self._y_ticks_group)
+            layout.addWidget(
+                self._make_collapsible_section(
+                    title="Y-axis",
+                    section_id="figure.axes.y",
+                    body_widget=y_axis_box,
+                    subsection=True,
+                )
+            )
 
             grid_box = QGroupBox("Grid")
             grid_form = QFormLayout(grid_box)
             self.grid_mode = self._combo(_TOGGLE_MODES)
             self.grid_mode.currentTextChanged.connect(self._refresh_widget_states)
+            self._add_form_row(
+                grid_form,
+                "Show grid",
+                self.grid_mode,
+                tooltip_id="figure.grid.show",
+            )
             self.grid_linestyle = self._combo(("-", "--", "-.", ":", ""), editable=True)
             self.grid_linewidth = self._bounded_float_line(bottom=0.0)
             self.grid_alpha = self._bounded_float_line(bottom=0.0, top=1.0)
@@ -4003,9 +4869,6 @@ def launch_plot_settings_panel(
             )
             self.grid_axis = self._combo(_GRID_AXES)
             self.grid_which = self._combo(_GRID_WHICH)
-            self._add_form_row(
-                grid_form, "Show grid", self.grid_mode, tooltip_id="figure.grid.show"
-            )
             self._add_form_row(
                 grid_form,
                 "Line style",
@@ -4035,7 +4898,14 @@ def launch_plot_settings_panel(
                 (grid_form, self.grid_axis),
                 (grid_form, self.grid_which),
             ]
-            layout.addWidget(grid_box)
+            layout.addWidget(
+                self._make_collapsible_section(
+                    title="Grid",
+                    section_id="figure.axes.grid",
+                    body_widget=grid_box,
+                    subsection=True,
+                )
+            )
 
             border_box = QGroupBox("Border")
             border_form = QFormLayout(border_box)
@@ -4070,7 +4940,14 @@ def launch_plot_settings_panel(
             self._border_custom_rows = [(border_form, sides_widget)]
             self.axes_border_mode.currentTextChanged.connect(self._refresh_widget_states)
 
-            layout.addWidget(border_box)
+            layout.addWidget(
+                self._make_collapsible_section(
+                    title="Border",
+                    section_id="figure.axes.border",
+                    body_widget=border_box,
+                    subsection=True,
+                )
+            )
 
             self._title_rows = [(top_form, self.title_font)]
             self._title_detail_widgets = [self.title_text]
@@ -4085,12 +4962,17 @@ def launch_plot_settings_panel(
             self._figure_legend_section = self._tab_legend_content
             self.legend_mode = self._combo(_TOGGLE_MODES)
             self.legend_mode.currentTextChanged.connect(self._refresh_widget_states)
+            self._add_form_row(
+                form,
+                "Legend",
+                self.legend_mode,
+                tooltip_id="figure.legend.enabled",
+            )
             self.legend_title = self._line()
             self.legend_loc = self._combo(_LEGEND_LOCATIONS)
             self.legend_frame_mode = self._combo(_TOGGLE_MODES)
             self.legend_columns = self._positive_int_line("1")
             self.legend_font = self._positive_int_line()
-            self._add_form_row(form, "Legend", self.legend_mode, tooltip_id="figure.legend.enabled")
             self._add_form_row(
                 form,
                 "Legend title",
@@ -4132,9 +5014,11 @@ def launch_plot_settings_panel(
 
         def _build_lines_tab(self) -> None:
             layout = QVBoxLayout(self._tab_lines_content)
-            lines = QGroupBox("Base Line Style")
+            lines = QWidget()
             self._figure_lines_group = lines
-            lines_form = QFormLayout(lines)
+            lines_layout = QVBoxLayout(lines)
+            lines_layout.setContentsMargins(0, 0, 0, 0)
+            lines_form = QFormLayout()
             self.line_width = self._bounded_float_line(bottom=0.0)
             self.line_style = self._combo(("-", "--", "-.", ":", ""), editable=True)
             self.line_alpha = self._bounded_float_line("0.0 - 1.0", bottom=0.0, top=1.0)
@@ -4191,6 +5075,7 @@ def launch_plot_settings_panel(
                 marker_color_row,
                 tooltip_id="figure.lines.marker_color",
             )
+            lines_layout.addLayout(lines_form)
             layout.addWidget(lines)
             layout.addStretch(1)
             self._marker_rows = [
@@ -4199,10 +5084,97 @@ def launch_plot_settings_panel(
                 (lines_form, marker_color_row),
             ]
 
+        def _build_integration_tab(self) -> None:
+            layout = QVBoxLayout(self._tab_integration_content)
+            form = QFormLayout()
+            self.integration_mode = self._combo(_TOGGLE_MODES)
+            self.integration_mode.currentTextChanged.connect(self._refresh_widget_states)
+            self.integration_source = self._combo(_INTEGRATION_SOURCES)
+            range_widget = QWidget()
+            range_layout = QHBoxLayout(range_widget)
+            range_layout.setContentsMargins(0, 0, 0, 0)
+            self.integration_x_min = self._bounded_float_line("min")
+            self.integration_x_max = self._bounded_float_line("max")
+            range_layout.addWidget(self.integration_x_min, stretch=1)
+            range_layout.addWidget(self.integration_x_max, stretch=1)
+            self.integration_baseline = self._bounded_float_line("0.0")
+            self.integration_color_mode = self._combo(_INTEGRATION_COLOR_MODES)
+            self.integration_color_mode.currentTextChanged.connect(self._refresh_widget_states)
+            integration_color_row, self.integration_color = self._color_field(
+                placeholder="#4d9de0",
+                tooltip_id="figure.integration.color",
+            )
+            self.integration_alpha = self._bounded_float_line("0.0 - 1.0", bottom=0.0, top=1.0)
+
+            self._register_tooltip(self.integration_mode, "figure.integration.enabled")
+            self._apply_widget_tooltip(self.integration_mode)
+            self._add_form_row(
+                form,
+                "Integration",
+                self.integration_mode,
+                tooltip_id="figure.integration.enabled",
+            )
+            self._add_form_row(
+                form,
+                "Data source",
+                self.integration_source,
+                tooltip_id="figure.integration.source",
+            )
+            self._add_form_row(
+                form,
+                "X min / max",
+                range_widget,
+                tooltip_id="figure.integration.range",
+            )
+            self._add_form_row(
+                form,
+                "Baseline",
+                self.integration_baseline,
+                tooltip_id="figure.integration.baseline",
+            )
+            self._add_form_row(
+                form,
+                "Fill color",
+                self.integration_color_mode,
+                tooltip_id="figure.integration.color_mode",
+            )
+            self._add_form_row(
+                form,
+                "Custom color",
+                integration_color_row,
+                tooltip_id="figure.integration.color",
+            )
+            self._add_form_row(
+                form,
+                "Fill alpha",
+                self.integration_alpha,
+                tooltip_id="figure.integration.alpha",
+            )
+            layout.addLayout(form)
+
+            self._integration_summary_label = QLabel(
+                "Turn integration on to show the area summary after preview refresh."
+            )
+            self._integration_summary_label.setWordWrap(True)
+            self._integration_summary_label.setObjectName("sectionNote")
+            self._register_tooltip(self._integration_summary_label, "figure.integration.summary")
+            self._apply_widget_tooltip(self._integration_summary_label)
+            layout.addWidget(self._integration_summary_label)
+            layout.addStretch(1)
+
+            self._integration_rows = [
+                (form, self.integration_source),
+                (form, range_widget),
+                (form, self.integration_baseline),
+                (form, self.integration_color_mode),
+                (form, integration_color_row),
+                (form, self.integration_alpha),
+            ]
+            self._integration_custom_color_row = (form, integration_color_row)
+
         def _build_heatmap_tab(self) -> None:
             layout = QVBoxLayout(self._tab_heatmap_content)
             group = QGroupBox("Heatmap Rendering")
-            self._figure_heatmap_group = group
             form = QFormLayout(group)
             self.heatmap_cmap = self._combo(
                 (
@@ -4249,18 +5221,25 @@ def launch_plot_settings_panel(
             self._add_form_row(
                 form, "Color scale", self.heatmap_log_scale, tooltip_id="figure.heatmap.log_scale"
             )
-            layout.addWidget(group)
+            self._figure_heatmap_group = self._make_collapsible_section(
+                title="Heatmap",
+                section_id="figure.heatmap.rendering",
+                body_widget=group,
+                subsection=True,
+            )
+            layout.addWidget(self._figure_heatmap_group)
 
             cb_group = QGroupBox("Colorbar")
-            self._figure_colorbar_group = cb_group
             cb_form = QFormLayout(cb_group)
             self.heatmap_colorbar_enabled = QCheckBox("Show colorbar")
             self.heatmap_colorbar_enabled.setChecked(True)
             self.heatmap_colorbar_enabled.stateChanged.connect(self._refresh_widget_states)
             self.heatmap_colorbar_enabled.stateChanged.connect(self._schedule_preview_update)
+            self._register_tooltip(self.heatmap_colorbar_enabled, "figure.heatmap.colorbar_enabled")
+            self._apply_widget_tooltip(self.heatmap_colorbar_enabled)
             self._add_form_row(
                 cb_form,
-                "",
+                "Colorbar",
                 self.heatmap_colorbar_enabled,
                 tooltip_id="figure.heatmap.colorbar_enabled",
             )
@@ -4329,7 +5308,13 @@ def launch_plot_settings_panel(
                 (cb_form, self.heatmap_colorbar_shrink),
                 (cb_form, self.heatmap_colorbar_aspect),
             ]
-            layout.addWidget(cb_group)
+            self._figure_colorbar_group = self._make_collapsible_section(
+                title="Colorbar",
+                section_id="figure.heatmap.colorbar",
+                body_widget=cb_group,
+                subsection=True,
+            )
+            layout.addWidget(self._figure_colorbar_group)
             layout.addStretch(1)
 
         def _build_canvas_tab(self) -> None:
@@ -4439,27 +5424,72 @@ def launch_plot_settings_panel(
             new_auto = default_plot_font_sizes(new_base)
             pairs = [
                 (self.title_font, "title_font_size"),
-                (self.x_label_font, "label_font_size"),
-                (self.y_label_font, "label_font_size"),
-                (self.x_tick_font, "tick_font_size"),
-                (self.y_tick_font, "tick_font_size"),
+                (self.x_label_font, "x_label_font_size"),
+                (self.y_label_font, "y_label_font_size"),
+                (self.x_tick_font, "x_tick_font_size"),
+                (self.y_tick_font, "y_tick_font_size"),
                 (self.legend_font, "legend_font_size"),
             ]
             for widget, key in pairs:
-                if widget.text().strip() == str(old_auto[key]):
-                    widget.setText(str(new_auto[key]))
+                fallback_key = (
+                    "label_font_size"
+                    if key in {"x_label_font_size", "y_label_font_size"}
+                    else "tick_font_size"
+                    if key in {"x_tick_font_size", "y_tick_font_size"}
+                    else key
+                )
+                if widget.text().strip() == str(old_auto[fallback_key]):
+                    widget.setText(str(new_auto[fallback_key]))
             self._last_resolved_base_font_size = new_base
 
         def _build_series_tab(self) -> None:
-            layout = QVBoxLayout(self._tab_series_content)
+            tab_layout = QVBoxLayout(self._tab_series)
+            tab_layout.setContentsMargins(0, 0, 0, 0)
+            tab_layout.setSpacing(4)
 
-            selector_row = QHBoxLayout()
-            hint = QLabel(
-                "Edit the currently loaded plot layers here. Use Data to choose which stored profiles and view modes are loaded."
+            self.series_list = QListWidget()
+            self.series_list.setObjectName("seriesList")
+            self.series_list.setAlternatingRowColors(True)
+            self.series_list.setMinimumHeight(180)
+            self.series_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+            self.series_list.setSpacing(2)
+            self.series_list.currentRowChanged.connect(self._handle_series_list_selection_change)
+            self._selected_layer_card = QFrame()
+            self._selected_layer_card.setObjectName("selectedLayerCard")
+            selected_card_layout = QHBoxLayout(self._selected_layer_card)
+            selected_card_layout.setContentsMargins(8, 6, 8, 6)
+            selected_card_layout.setSpacing(8)
+            self._selected_layer_swatch = QFrame()
+            self._selected_layer_swatch.setObjectName("selectedLayerSwatch")
+            self._selected_layer_swatch.setFixedSize(14, 14)
+            selected_card_layout.addWidget(self._selected_layer_swatch)
+            self._selected_layer_title = QLabel("No layer selected")
+            self._selected_layer_title.setObjectName("selectedLayerTitle")
+            selected_card_layout.addWidget(self._selected_layer_title, stretch=1)
+            self._selected_layer_badge = None
+            self._selected_layer_state = None
+            self._selected_layer_source = None
+            self._series_delete_button = QPushButton("Delete Layer")
+            self._series_delete_button.clicked.connect(self._delete_selected_series)
+            selected_card_layout.addWidget(self._series_delete_button)
+            tab_layout.addWidget(self._selected_layer_card)
+
+            scroll = QScrollArea(self._tab_series)
+            scroll.setWidgetResizable(True)
+            scroll.setFrameShape(QFrame.Shape.NoFrame)
+            scroll.setMinimumWidth(0)
+            scroll.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+            self._tab_series_content = QWidget(scroll)
+            self._tab_series_content.setMinimumWidth(0)
+            self._tab_series_content.setSizePolicy(
+                QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred
             )
-            hint.setObjectName("sectionNote")
-            hint.setWordWrap(True)
-            selector_row.addWidget(hint, stretch=1)
+            scroll.setWidget(self._tab_series_content)
+            tab_layout.addWidget(scroll, stretch=1)
+
+            layout = QVBoxLayout(self._tab_series_content)
+            selector_row = QHBoxLayout()
+            selector_row.addStretch(1)
             enable_all_button = QPushButton("All on")
             enable_all_button.clicked.connect(lambda: self._set_all_series_enabled(True))
             self._register_tooltip(enable_all_button, "series.all_on")
@@ -4481,31 +5511,42 @@ def launch_plot_settings_panel(
             self._apply_widget_tooltip(self._series_add_group_button)
             selector_row.addWidget(self._series_add_group_button)
             layout.addLayout(selector_row)
-
-            self.series_list = QListWidget()
-            self.series_list.setObjectName("seriesList")
-            self.series_list.setAlternatingRowColors(True)
-            self.series_list.setMinimumHeight(180)
-            self.series_list.setDragEnabled(True)
-            self.series_list.setAcceptDrops(True)
-            self.series_list.setDropIndicatorShown(True)
-            self.series_list.setDefaultDropAction(Qt.DropAction.MoveAction)
-            self.series_list.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
-            self.series_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-            self.series_list.setSpacing(2)
-            self.series_list.currentRowChanged.connect(self._handle_series_list_selection_change)
-            self.series_list.model().rowsMoved.connect(self._handle_series_list_rows_moved)
             layout.addWidget(self.series_list)
 
-            panel = QGroupBox("Selected Layer")
-            panel_layout = QVBoxLayout(panel)
-            panel_note = QLabel(
-                "Only controls that apply to the selected layer and current plot mode are shown."
+            group_group = QGroupBox("Group Members")
+            group_layout = QVBoxLayout(group_group)
+            group_note = QLabel(
+                "Grouped series aggregate several loaded base series after their current plot transforms. Grouped lines do not show error overlays in this pass."
             )
-            panel_note.setWordWrap(True)
-            panel_layout.addWidget(panel_note)
+            group_note.setWordWrap(True)
+            group_layout.addWidget(group_note)
+            group_form = QFormLayout()
+            self._series_group_reducer = self._combo(_GROUP_REDUCERS)
+            self._series_group_reducer.currentTextChanged.connect(self._on_series_editor_changed)
+            self._add_form_row(
+                group_form,
+                "Reducer",
+                self._series_group_reducer,
+                tooltip_id="series.group.reducer",
+            )
+            group_layout.addLayout(group_form)
+            self._series_group_members = QListWidget()
+            self._series_group_members.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+            self._series_group_members.itemChanged.connect(self._on_series_editor_changed)
+            self._register_tooltip(self._series_group_members, "series.group.members")
+            self._apply_widget_tooltip(self._series_group_members)
+            group_layout.addWidget(self._series_group_members)
+            self._series_group_summary = QLabel("This series is not grouped.")
+            self._series_group_summary.setWordWrap(True)
+            group_layout.addWidget(self._series_group_summary)
+            self._series_group_group = self._make_collapsible_section(
+                title="Group Members",
+                section_id="layers.group_members",
+                body_widget=group_group,
+            )
+            layout.addWidget(self._series_group_group)
+
             visibility_group = QGroupBox("Visibility and Label")
-            self._series_visibility_group = visibility_group
             visibility_form = QFormLayout(visibility_group)
             self.series_show_in_legend = self._combo(("on", "off"))
             self.series_show_in_legend.currentTextChanged.connect(self._on_series_editor_changed)
@@ -4528,10 +5569,14 @@ def launch_plot_settings_panel(
             self._add_form_row(
                 visibility_form, "Label", self.series_label, tooltip_id="series.label"
             )
-            panel_layout.addWidget(visibility_group)
+            self._series_visibility_group = self._make_collapsible_section(
+                title="Visibility and Label",
+                section_id="layers.visibility",
+                body_widget=visibility_group,
+            )
+            layout.addWidget(self._series_visibility_group)
 
             style_group = QGroupBox("Style")
-            self._series_style_group = style_group
             style_layout = QVBoxLayout(style_group)
             style_note = QLabel(
                 "Style affects the selected layer only. Derived fit and cumulative rows inherit their base-series styling."
@@ -4573,9 +5618,24 @@ def launch_plot_settings_panel(
                 tooltip_id="series.line_kwargs_json",
             )
             style_layout.addLayout(style_form)
-            panel_layout.addWidget(style_group)
+            self._series_style_group = self._make_collapsible_section(
+                title="Style",
+                section_id="layers.style",
+                body_widget=style_group,
+            )
+            layout.addWidget(self._series_style_group)
+
+            integration_group = QGroupBox("Integration")
+            self._tab_integration_content = integration_group
+            self._build_integration_tab()
+            self._series_integration_group = self._make_collapsible_section(
+                title="Integration",
+                section_id="layers.integration",
+                body_widget=integration_group,
+            )
+            layout.addWidget(self._series_integration_group)
+
             derived_group = QGroupBox("Derived Lines")
-            self._series_derived_group = derived_group
             derived_layout = QVBoxLayout(derived_group)
             derived_note = QLabel(
                 "Derived lines are computed from the currently displayed data after transforms, sectioning, and masking."
@@ -4593,7 +5653,6 @@ def launch_plot_settings_panel(
                 "orientation",
             }:
                 error_group = QGroupBox("Uncertainty")
-                self._series_uncertainty_group = error_group
                 error_layout = QVBoxLayout(error_group)
                 error_note = QLabel(
                     "Error overlays belong to the base series. Leave the error color blank to follow the base series color."
@@ -4603,6 +5662,8 @@ def launch_plot_settings_panel(
                 error_form = QFormLayout()
                 self._series_error_mode = self._combo(_TOGGLE_MODES)
                 self._series_error_mode.currentTextChanged.connect(self._on_series_editor_changed)
+                self._register_tooltip(self._series_error_mode, "series.error_enabled")
+                self._apply_widget_tooltip(self._series_error_mode)
                 self._add_form_row(
                     error_form,
                     "Enabled",
@@ -4692,12 +5753,17 @@ def launch_plot_settings_panel(
                     self._series_error_warning,
                     self._series_error_style_note,
                 ]
-                panel_layout.addWidget(error_group)
+                self._series_uncertainty_group = self._make_collapsible_section(
+                    title="Uncertainty",
+                    section_id="layers.derived.uncertainty",
+                    body_widget=error_group,
+                    subsection=True,
+                )
+                derived_layout.addWidget(self._series_uncertainty_group)
             else:
                 self._series_uncertainty_group = None
 
             cumulative_group = QGroupBox("Cumulative Average")
-            self._series_cumulative_group = cumulative_group
             cumulative_layout = QVBoxLayout(cumulative_group)
             cumulative_note = QLabel(
                 "Cumulative lines are running means of the currently displayed y-values, ordered by plotted x."
@@ -4707,6 +5773,8 @@ def launch_plot_settings_panel(
             cumulative_form = QFormLayout()
             self._series_cumulative_mode = self._combo(_TOGGLE_MODES)
             self._series_cumulative_mode.currentTextChanged.connect(self._on_series_editor_changed)
+            self._register_tooltip(self._series_cumulative_mode, "series.cumulative_enabled")
+            self._apply_widget_tooltip(self._series_cumulative_mode)
             self._add_form_row(
                 cumulative_form,
                 "Enabled",
@@ -4790,7 +5858,13 @@ def launch_plot_settings_panel(
                 self._series_cumulative_summary,
                 self._series_cumulative_style_note,
             ]
-            derived_layout.addWidget(cumulative_group)
+            self._series_cumulative_group = self._make_collapsible_section(
+                title="Cumulative Average",
+                section_id="layers.derived.cumulative",
+                body_widget=cumulative_group,
+                subsection=True,
+            )
+            derived_layout.addWidget(self._series_cumulative_group)
 
             if self._analysis_name in {
                 "density",
@@ -4801,7 +5875,6 @@ def launch_plot_settings_panel(
                 "coordination",
             }:
                 fit_group = QGroupBox("Fit")
-                self._series_fit_group = fit_group
                 fit_layout = QVBoxLayout(fit_group)
                 fit_note = QLabel(
                     "Fits are derived child series based on the currently displayed data."
@@ -4810,7 +5883,10 @@ def launch_plot_settings_panel(
                 fit_layout.addWidget(fit_note)
                 fit_form = QFormLayout()
                 self._series_fit_mode = self._combo(_TOGGLE_MODES)
+                self._set_combo_value(self._series_fit_mode, "off")
                 self._series_fit_mode.currentTextChanged.connect(self._on_series_editor_changed)
+                self._register_tooltip(self._series_fit_mode, "series.fit_enabled")
+                self._apply_widget_tooltip(self._series_fit_mode)
                 self._add_form_row(
                     fit_form,
                     "Enabled",
@@ -4926,9 +6002,10 @@ def launch_plot_settings_panel(
                 ]
                 fit_layout.addLayout(fit_form)
 
-                fit_summary = QGroupBox("Fit Summary")
+                fit_summary = QWidget()
                 self._series_fit_summary_group = fit_summary
                 fit_summary_layout = QVBoxLayout(fit_summary)
+                fit_summary_layout.setContentsMargins(0, 0, 0, 0)
                 self._series_fit_summary = QLabel("No fit configured for this series.")
                 self._series_fit_summary.setWordWrap(True)
                 self._register_tooltip(self._series_fit_summary, "series.fit.summary")
@@ -4949,43 +6026,22 @@ def launch_plot_settings_panel(
                 fit_summary_layout.addWidget(self._series_fit_style_note)
                 fit_layout.addWidget(fit_summary)
                 self._series_fit_detail_widgets = [fit_note, fit_summary]
-                derived_layout.addWidget(fit_group)
+                self._series_fit_group = self._make_collapsible_section(
+                    title="Fit",
+                    section_id="layers.derived.fit",
+                    body_widget=fit_group,
+                    subsection=True,
+                )
+                derived_layout.addWidget(self._series_fit_group)
 
-            panel_layout.addWidget(derived_group)
-
-            group_group = QGroupBox("Group Members")
-            self._series_group_group = group_group
-            group_layout = QVBoxLayout(group_group)
-            group_note = QLabel(
-                "Grouped series aggregate several loaded base series after their current plot transforms. Grouped lines do not show error overlays in this pass."
+            self._series_derived_group = self._make_collapsible_section(
+                title="Derived Lines",
+                section_id="layers.derived",
+                body_widget=derived_group,
             )
-            group_note.setWordWrap(True)
-            group_layout.addWidget(group_note)
-            group_form = QFormLayout()
-            self._series_group_reducer = self._combo(_GROUP_REDUCERS)
-            self._series_group_reducer.currentTextChanged.connect(self._on_series_editor_changed)
-            self._add_form_row(
-                group_form,
-                "Reducer",
-                self._series_group_reducer,
-                tooltip_id="series.group.reducer",
-            )
-            group_layout.addLayout(group_form)
-            self._series_group_members = QListWidget()
-            self._series_group_members.setSelectionMode(
-                QAbstractItemView.SelectionMode.MultiSelection
-            )
-            self._series_group_members.itemSelectionChanged.connect(self._on_series_editor_changed)
-            self._register_tooltip(self._series_group_members, "series.group.members")
-            self._apply_widget_tooltip(self._series_group_members)
-            group_layout.addWidget(self._series_group_members)
-            self._series_group_summary = QLabel("This series is not grouped.")
-            self._series_group_summary.setWordWrap(True)
-            group_layout.addWidget(self._series_group_summary)
-            panel_layout.addWidget(group_group)
+            layout.addWidget(self._series_derived_group)
 
             normalize_group = QGroupBox("Normalization")
-            self._normalization_group = normalize_group
             normalize_layout = QVBoxLayout(normalize_group)
             normalize_form = QFormLayout()
             self.norm_mode = self._combo(_NORMALIZATION_MODES)
@@ -4994,6 +6050,8 @@ def launch_plot_settings_panel(
             self.norm_value.textChanged.connect(self._on_normalization_editor_changed)
             self.norm_x_ref = self._line("Reference x (required for value_at_x)")
             self.norm_x_ref.textChanged.connect(self._on_normalization_editor_changed)
+            self._register_tooltip(self.norm_mode, "series.norm.mode")
+            self._apply_widget_tooltip(self.norm_mode)
             self._add_form_row(
                 normalize_form,
                 "Mode",
@@ -5020,7 +6078,7 @@ def launch_plot_settings_panel(
             normalization_actions = QHBoxLayout(normalization_actions_widget)
             normalization_actions.setContentsMargins(0, 0, 0, 0)
             normalization_actions.addStretch(1)
-            self._normalization_copy_button = QPushButton("Copy settings to all series")
+            self._normalization_copy_button = QPushButton("Copy settings to all layers")
             self._normalization_copy_button.clicked.connect(
                 self._copy_normalization_settings_to_all_series
             )
@@ -5040,10 +6098,14 @@ def launch_plot_settings_panel(
             norm_hint.setWordWrap(True)
             self._normalization_hint_label = norm_hint
             normalize_layout.addWidget(norm_hint)
-            panel_layout.addWidget(normalize_group)
+            self._normalization_group = self._make_collapsible_section(
+                title="Normalization",
+                section_id="layers.normalization",
+                body_widget=normalize_group,
+            )
+            layout.addWidget(self._normalization_group)
 
             metadata_group = QGroupBox("Source Metadata")
-            self._series_metadata_group = metadata_group
             metadata_form = QFormLayout(metadata_group)
             self._series_meta_default_label = QLabel("")
             self._series_meta_default_label.setWordWrap(True)
@@ -5080,8 +6142,12 @@ def launch_plot_settings_panel(
             self._series_stats_label = QLabel("No series statistics available yet.")
             self._series_stats_label.setWordWrap(True)
             metadata_form.addRow(QLabel("Series stats"), self._series_stats_label)
-            panel_layout.addWidget(metadata_group)
-            layout.addWidget(panel)
+            self._series_metadata_group = self._make_collapsible_section(
+                title="Source Metadata",
+                section_id="layers.metadata",
+                body_widget=metadata_group,
+            )
+            layout.addWidget(self._series_metadata_group)
             layout.addStretch(1)
 
         def _build_annotations_tab(self) -> None:
@@ -5121,21 +6187,11 @@ def launch_plot_settings_panel(
             self._register_tooltip(self._annotation_delete_button, "annotations.delete")
             self._apply_widget_tooltip(self._annotation_delete_button)
             actions.addWidget(self._annotation_delete_button)
-            self._annotation_move_up_button = QPushButton("Move Up")
-            self._annotation_move_up_button.clicked.connect(lambda: self._move_annotation(-1))
-            self._register_tooltip(self._annotation_move_up_button, "annotations.move_up")
-            self._apply_widget_tooltip(self._annotation_move_up_button)
-            actions.addWidget(self._annotation_move_up_button)
-            self._annotation_move_down_button = QPushButton("Move Down")
-            self._annotation_move_down_button.clicked.connect(lambda: self._move_annotation(1))
-            self._register_tooltip(self._annotation_move_down_button, "annotations.move_down")
-            self._apply_widget_tooltip(self._annotation_move_down_button)
-            actions.addWidget(self._annotation_move_down_button)
             layout.addLayout(actions)
 
             self.annotation_list = QListWidget()
             self.annotation_list.setObjectName("annotationList")
-            self.annotation_list.setAlternatingRowColors(True)
+            self.annotation_list.setAlternatingRowColors(False)
             self.annotation_list.setMinimumHeight(180)
             self.annotation_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
             self.annotation_list.currentRowChanged.connect(
@@ -5155,6 +6211,8 @@ def launch_plot_settings_panel(
             self._annotation_enabled_mode.currentTextChanged.connect(
                 self._on_annotation_editor_changed
             )
+            self._register_tooltip(self._annotation_enabled_mode, "annotations.enabled")
+            self._apply_widget_tooltip(self._annotation_enabled_mode)
             self._add_form_row(
                 panel_form,
                 "Enabled",
@@ -5349,21 +6407,15 @@ def launch_plot_settings_panel(
                 (panel_form, self._annotation_zorder),
             ]
 
-            summary_group = QGroupBox("Preview Summary")
-            self._annotation_summary_group = summary_group
-            summary_layout = QVBoxLayout(summary_group)
-            self._annotation_preview_summary = QLabel(
-                "Preview status will update after the next rendered preview."
-            )
-            self._annotation_preview_summary.setWordWrap(True)
-            self._register_tooltip(self._annotation_preview_summary, "annotations.summary")
-            self._apply_widget_tooltip(self._annotation_preview_summary)
-            summary_layout.addWidget(self._annotation_preview_summary)
-            panel_layout.addWidget(summary_group)
-
             content_splitter = QSplitter(Qt.Orientation.Horizontal)
             content_splitter.addWidget(list_group)
-            content_splitter.addWidget(panel)
+            content_splitter.addWidget(
+                self._make_collapsible_section(
+                    title="Selected Annotation",
+                    section_id="annotations.selected",
+                    body_widget=panel,
+                )
+            )
             content_splitter.setStretchFactor(0, 0)
             content_splitter.setStretchFactor(1, 1)
             content_splitter.setChildrenCollapsible(False)
@@ -5400,18 +6452,23 @@ def launch_plot_settings_panel(
                 self._annotation_arrow_rows,
                 annotation_enabled and annotation_type == "arrow",
             )
-            if self._annotation_summary_group is not None:
-                self._annotation_summary_group.setVisible(annotation_enabled)
 
         def _refresh_annotation_list(self) -> None:
             if not hasattr(self, "annotation_list"):
                 return
             self._annotation_syncing = True
             try:
-                self.annotation_list.clear()
+                while self.annotation_list.count():
+                    item = self.annotation_list.takeItem(0)
+                    if item is None:
+                        continue
+                    widget = self.annotation_list.itemWidget(item)
+                    if widget is not None:
+                        self.annotation_list.removeItemWidget(item)
+                        widget.deleteLater()
                 for index in range(len(self._annotations_data)):
                     entry = self._annotations_data[index]
-                    item = QListWidgetItem(self._annotation_display_text(index))
+                    item = QListWidgetItem()
                     tooltip_text = "\n".join(
                         [
                             _annotation_primary_title(entry, index=index + 1),
@@ -5421,6 +6478,32 @@ def launch_plot_settings_panel(
                     )
                     item.setToolTip(tooltip_text)
                     self.annotation_list.addItem(item)
+
+                    def _select_row(current: int = index) -> None:
+                        self.annotation_list.setCurrentRow(current)
+
+                    def _move_row_up(current: int = index) -> None:
+                        self._handle_annotation_row_move(current, -1)
+
+                    def _move_row_down(current: int = index) -> None:
+                        self._handle_annotation_row_move(current, 1)
+
+                    row_widget = _AnnotationRowWidget(
+                        on_select=_select_row,
+                        on_move_up=_move_row_up,
+                        on_move_down=_move_row_down,
+                    )
+                    row_widget.update_content(
+                        text=self._annotation_display_text(index),
+                        enabled=bool(entry.get("enabled", True)),
+                        selected=index == self._annotation_active_index,
+                        can_move_up=index > 0,
+                        can_move_down=index < len(self._annotations_data) - 1,
+                        tooltip_text=tooltip_text,
+                        theme=self._theme_tokens(),
+                    )
+                    item.setSizeHint(row_widget.sizeHint())
+                    self.annotation_list.setItemWidget(item, row_widget)
                 if self._annotations_data:
                     target = min(
                         max(self._annotation_active_index, 0), len(self._annotations_data) - 1
@@ -5432,6 +6515,14 @@ def launch_plot_settings_panel(
                     self.annotation_list.setCurrentRow(-1)
             finally:
                 self._annotation_syncing = False
+
+        def _handle_annotation_row_move(self, index: int, delta: int) -> None:
+            if self._annotation_syncing:
+                return
+            if index < 0 or index >= len(self._annotations_data):
+                return
+            self.annotation_list.setCurrentRow(index)
+            self._move_annotation(delta)
 
         def _clear_annotation_editor(self) -> None:
             if not hasattr(self, "_annotation_name"):
@@ -5467,8 +6558,6 @@ def launch_plot_settings_panel(
         def _load_annotation_into_editor(self, index: int) -> None:
             if index < 0 or index >= len(self._annotations_data):
                 self._clear_annotation_editor()
-                if getattr(self, "_annotation_preview_summary", None) is not None:
-                    self._annotation_preview_summary.setText("No annotation selected.")
                 return
             entry = dict(self._annotations_data[index])
             self._annotation_syncing = True
@@ -5522,7 +6611,6 @@ def launch_plot_settings_panel(
             finally:
                 self._annotation_syncing = False
             self._refresh_annotation_editor_rows()
-            self._update_annotation_preview_summary(index)
 
         def _persist_annotation_editor(self, index: int) -> None:
             if index < 0 or index >= len(self._annotations_data):
@@ -5565,7 +6653,6 @@ def launch_plot_settings_panel(
                 self._refresh_annotation_list()
             finally:
                 self._annotation_syncing = False
-            self._update_annotation_preview_summary(index)
 
         def _persist_active_annotation_editor(self) -> None:
             self._persist_annotation_editor(self._annotation_active_index)
@@ -5641,8 +6728,6 @@ def launch_plot_settings_panel(
                 self._annotation_active_index = 0
                 self._refresh_annotation_list()
                 self._clear_annotation_editor()
-                if getattr(self, "_annotation_preview_summary", None) is not None:
-                    self._annotation_preview_summary.setText("No annotations configured.")
             self._refresh_widget_states()
             self._schedule_preview_update()
 
@@ -5674,51 +6759,41 @@ def launch_plot_settings_panel(
                 self._load_annotation_into_editor(0)
             else:
                 self._clear_annotation_editor()
-                if getattr(self, "_annotation_preview_summary", None) is not None:
-                    self._annotation_preview_summary.setText("No annotations configured.")
 
-        def _annotation_summary_for_active(self) -> dict[str, Any] | None:
-            if self._annotation_active_index < 0 or self._annotation_active_index >= len(
-                self._annotations_data
-            ):
-                return None
-            annotation_id = str(
-                self._annotations_data[self._annotation_active_index].get("id")
-                or f"annotation:{self._annotation_active_index}"
-            )
-            raw = self._last_preview_state.get("annotations_summary")
+        def _update_integration_summary(self) -> None:
+            summary_label = getattr(self, "_integration_summary_label", None)
+            if summary_label is None:
+                return
+            if not hasattr(self, "integration_mode"):
+                return
+            if self.integration_mode.currentText().strip().lower() == "off":
+                summary_label.setText(
+                    "Turn integration on to show the area summary after preview refresh."
+                )
+                return
+            raw = self._last_preview_state.get("integration_summaries")
             if not isinstance(raw, list):
-                return None
+                summary_label.setText("Integration summary will appear after preview refresh.")
+                return
+            lines: list[str] = []
             for item in raw:
-                if isinstance(item, dict) and str(item.get("id") or "") == annotation_id:
-                    return dict(item)
-            return None
-
-        def _update_annotation_preview_summary(self, index: int) -> None:
-            if getattr(self, "_annotation_preview_summary", None) is None:
-                return
-            if index < 0 or index >= len(self._annotations_data):
-                self._annotation_preview_summary.setText("No annotation selected.")
-                return
-            entry = self._annotations_data[index]
-            summary = self._annotation_summary_for_active()
-            title = _annotation_primary_title(entry, index=index + 1)
-            lines = [
-                f"Title: {title}",
-                f"Type: {_annotation_type_label(str(entry.get('type') or 'text'))}",
-                f"Coordinates: {str(entry.get('coord_system') or 'axes')}",
-            ]
-            if isinstance(summary, dict):
-                status = str(summary.get("status") or "ok").strip().lower()
+                if not isinstance(item, dict):
+                    continue
+                label = str(item.get("label") or item.get("series_id") or "Series").strip()
+                status = str(item.get("status") or "").strip().lower()
+                source = str(item.get("source") or "plotted").strip()
                 if status == "ok":
-                    lines.append("Preview: Rendered in the current preview.")
-                elif status == "disabled":
-                    lines.append("Preview: Disabled and hidden from the current preview.")
+                    lines.append(
+                        f"{label}: area={_format_float_value(item.get('signed_area'))}, "
+                        f"absolute area={_format_float_value(item.get('absolute_area'))}, "
+                        f"x={_format_float_value(item.get('x_min'))}.."
+                        f"{_format_float_value(item.get('x_max'))}, "
+                        f"points={item.get('point_count')}, source={source}"
+                    )
                 else:
-                    lines.append(f"Preview: {status}")
-            else:
-                lines.append("Preview: Waiting for the next rendered preview of this annotation.")
-            self._annotation_preview_summary.setText("\n".join(lines))
+                    reason = str(item.get("reason") or "Integration is unavailable.").strip()
+                    lines.append(f"{label}: {reason}")
+            summary_label.setText("\n".join(lines) if lines else "No integration result available.")
 
         def _build_analysis_data_sections(self, layout: QVBoxLayout) -> None:
             analysis = self._analysis_name
@@ -5753,7 +6828,13 @@ def launch_plot_settings_panel(
                 selection_note.setObjectName("sectionNote")
                 selection_note.setWordWrap(True)
                 selection_form.addRow(selection_note)
-                layout.addWidget(selection)
+                layout.addWidget(
+                    self._make_collapsible_section(
+                        title="Profile Selection",
+                        section_id=f"data.{analysis}.selection",
+                        body_widget=selection,
+                    )
+                )
 
             if analysis == "rdf":
                 selection = QGroupBox("Profile Selection")
@@ -5792,7 +6873,13 @@ def launch_plot_settings_panel(
                 selection_note.setObjectName("sectionNote")
                 selection_note.setWordWrap(True)
                 selection_form.addRow(selection_note)
-                layout.addWidget(selection)
+                layout.addWidget(
+                    self._make_collapsible_section(
+                        title="Profile Selection",
+                        section_id="data.rdf.selection",
+                        body_widget=selection,
+                    )
+                )
 
             if analysis == "coordination":
                 selection = QGroupBox("Profile Selection")
@@ -5841,7 +6928,13 @@ def launch_plot_settings_panel(
                 note.setWordWrap(True)
                 note.setObjectName("sectionNote")
                 selection_form.addRow(note)
-                layout.addWidget(selection)
+                layout.addWidget(
+                    self._make_collapsible_section(
+                        title="Profile Selection",
+                        section_id="data.coordination.selection",
+                        body_widget=selection,
+                    )
+                )
 
             if analysis == "density":
                 view = QGroupBox("Density View")
@@ -5862,7 +6955,13 @@ def launch_plot_settings_panel(
                     self.density_quantity,
                     tooltip_id="data.density.quantity",
                 )
-                layout.addWidget(view)
+                layout.addWidget(
+                    self._make_collapsible_section(
+                        title="Density View",
+                        section_id="data.density.view",
+                        body_widget=view,
+                    )
+                )
 
             if analysis == "potential":
                 summary = QGroupBox("Potential Summary")
@@ -5900,7 +6999,13 @@ def launch_plot_settings_panel(
                     tooltip_id="data.potential.incomplete_rows",
                 )
                 summary_form.addRow("", summary_note)
-                layout.addWidget(summary)
+                layout.addWidget(
+                    self._make_collapsible_section(
+                        title="Potential Summary",
+                        section_id="data.potential.summary",
+                        body_widget=summary,
+                    )
+                )
 
             if analysis == "position":
                 view = QGroupBox("Position View")
@@ -5933,7 +7038,13 @@ def launch_plot_settings_panel(
                 )
                 self._position_map_color_row = (view_form, self.position_map_color)
                 self._position_time_axis_row = (view_form, self.position_time_axis)
-                layout.addWidget(view)
+                layout.addWidget(
+                    self._make_collapsible_section(
+                        title="Position View",
+                        section_id="data.position.view",
+                        body_widget=view,
+                    )
+                )
 
             if analysis == "coordination":
                 view = QGroupBox("Coordination View")
@@ -5959,7 +7070,13 @@ def launch_plot_settings_panel(
                     tooltip_id="data.coordination.time_axis",
                 )
                 self._coordination_time_axis_row = (view_form, self.coordination_time_axis)
-                layout.addWidget(view)
+                layout.addWidget(
+                    self._make_collapsible_section(
+                        title="Coordination View",
+                        section_id="data.coordination.view",
+                        body_widget=view,
+                    )
+                )
 
             if analysis == "orientation":
                 view = QGroupBox("Orientation View")
@@ -5984,7 +7101,13 @@ def launch_plot_settings_panel(
                     self.orientation_angle,
                     tooltip_id="data.orientation.angle",
                 )
-                layout.addWidget(view)
+                layout.addWidget(
+                    self._make_collapsible_section(
+                        title="Orientation View",
+                        section_id="data.orientation.view",
+                        body_widget=view,
+                    )
+                )
 
         def _resize_list_with_defaults(
             self,
@@ -6099,6 +7222,30 @@ def launch_plot_settings_panel(
                     "cumulative_line_style": self._series_cumulative_line_style_data[index]
                     if index < len(self._series_cumulative_line_style_data)
                     else "",
+                    "integration_enabled": self._series_integration_enabled_data[index]
+                    if index < len(self._series_integration_enabled_data)
+                    else False,
+                    "integration_source": self._series_integration_source_data[index]
+                    if index < len(self._series_integration_source_data)
+                    else "plotted",
+                    "integration_x_min": self._series_integration_x_min_data[index]
+                    if index < len(self._series_integration_x_min_data)
+                    else "",
+                    "integration_x_max": self._series_integration_x_max_data[index]
+                    if index < len(self._series_integration_x_max_data)
+                    else "",
+                    "integration_baseline": self._series_integration_baseline_data[index]
+                    if index < len(self._series_integration_baseline_data)
+                    else "0.0",
+                    "integration_color_mode": self._series_integration_color_mode_data[index]
+                    if index < len(self._series_integration_color_mode_data)
+                    else "Auto",
+                    "integration_color": self._series_integration_color_data[index]
+                    if index < len(self._series_integration_color_data)
+                    else "",
+                    "integration_alpha": self._series_integration_alpha_data[index]
+                    if index < len(self._series_integration_alpha_data)
+                    else "0.25",
                     "fit_color": self._series_fit_color_data[index]
                     if index < len(self._series_fit_color_data)
                     else "",
@@ -6160,6 +7307,14 @@ def launch_plot_settings_panel(
             new_cumulative_alphas: list[str] = []
             new_cumulative_line_widths: list[str] = []
             new_cumulative_line_styles: list[str] = []
+            new_integration_enabled: list[bool] = []
+            new_integration_source: list[str] = []
+            new_integration_x_min: list[str] = []
+            new_integration_x_max: list[str] = []
+            new_integration_baseline: list[str] = []
+            new_integration_color_mode: list[str] = []
+            new_integration_color: list[str] = []
+            new_integration_alpha: list[str] = []
             new_fit_colors: list[str] = []
             new_fit_alphas: list[str] = []
             new_fit_line_widths: list[str] = []
@@ -6184,6 +7339,20 @@ def launch_plot_settings_panel(
                     default_label = f"Series {index + 1}"
                 descriptor["series_id"] = str(descriptor.get("series_id") or f"series:{index}")
                 descriptor["default_label"] = default_label
+                source_kind = (
+                    "group"
+                    if str(descriptor.get("source_kind") or "").strip().lower() == "group"
+                    else "source"
+                )
+                descriptor["source_kind"] = source_kind
+                descriptor["is_generated"] = bool(
+                    descriptor.get("is_generated", source_kind == "group")
+                )
+                if source_kind != "group":
+                    descriptor["source_series_id"] = (
+                        str(descriptor.get("source_series_id") or "").strip()
+                        or descriptor["series_id"]
+                    )
                 previous = existing_by_id.get(descriptor["series_id"], {})
 
                 new_descriptors.append(descriptor)
@@ -6233,6 +7402,23 @@ def launch_plot_settings_panel(
                 new_cumulative_line_styles.append(
                     str(previous.get("cumulative_line_style") or "").strip()
                 )
+                new_integration_enabled.append(bool(previous.get("integration_enabled", False)))
+                new_integration_source.append(
+                    str(previous.get("integration_source") or "Plotted data").strip()
+                    or "Plotted data"
+                )
+                new_integration_x_min.append(str(previous.get("integration_x_min") or "").strip())
+                new_integration_x_max.append(str(previous.get("integration_x_max") or "").strip())
+                new_integration_baseline.append(
+                    str(previous.get("integration_baseline") or "0.0").strip() or "0.0"
+                )
+                new_integration_color_mode.append(
+                    str(previous.get("integration_color_mode") or "Auto").strip() or "Auto"
+                )
+                new_integration_color.append(str(previous.get("integration_color") or "").strip())
+                new_integration_alpha.append(
+                    str(previous.get("integration_alpha") or "0.25").strip() or "0.25"
+                )
                 new_fit_colors.append(str(previous.get("fit_color") or "").strip())
                 new_fit_alphas.append(str(previous.get("fit_alpha") or "").strip())
                 new_fit_line_widths.append(str(previous.get("fit_line_width") or "").strip())
@@ -6273,6 +7459,14 @@ def launch_plot_settings_panel(
             self._series_cumulative_alpha_data = new_cumulative_alphas
             self._series_cumulative_line_width_data = new_cumulative_line_widths
             self._series_cumulative_line_style_data = new_cumulative_line_styles
+            self._series_integration_enabled_data = new_integration_enabled
+            self._series_integration_source_data = new_integration_source
+            self._series_integration_x_min_data = new_integration_x_min
+            self._series_integration_x_max_data = new_integration_x_max
+            self._series_integration_baseline_data = new_integration_baseline
+            self._series_integration_color_mode_data = new_integration_color_mode
+            self._series_integration_color_data = new_integration_color
+            self._series_integration_alpha_data = new_integration_alpha
             self._series_fit_color_data = new_fit_colors
             self._series_fit_alpha_data = new_fit_alphas
             self._series_fit_line_width_data = new_fit_line_widths
@@ -6283,6 +7477,7 @@ def launch_plot_settings_panel(
             self._series_normalization_modes_data = new_norm_modes
             self._series_normalization_values_data = new_norm_values
             self._series_normalization_x_refs_data = new_norm_x_refs
+            self._validate_series_state_lengths()
             self._series_natural_order_data = [
                 str(descriptor.get("series_id") or f"series:{index}")
                 for index, descriptor in enumerate(self._series_descriptors_data)
@@ -6315,6 +7510,9 @@ def launch_plot_settings_panel(
                 return dict(self._series_descriptors_data[index])
             return {
                 "series_id": f"series:{index}",
+                "source_kind": "source",
+                "source_series_id": f"series:{index}",
+                "is_generated": False,
                 "default_label": self._series_labels_data[index]
                 if 0 <= index < len(self._series_labels_data)
                 else f"Series {index + 1}",
@@ -6329,6 +7527,80 @@ def launch_plot_settings_panel(
                 for index, descriptor in enumerate(self._series_descriptors_data)
             ]
 
+        def _series_state_attr_names(self) -> tuple[str, ...]:
+            return (
+                "_series_descriptors_data",
+                "_series_labels_data",
+                "_series_label_overrides_data",
+                "_series_colors_data",
+                "_series_enabled_data",
+                "_series_show_in_legend_data",
+                "_series_show_raw_line_data",
+                "_series_alpha_data",
+                "_series_error_enabled_data",
+                "_series_error_stats_data",
+                "_series_error_styles_data",
+                "_series_error_colors_data",
+                "_series_error_label_overrides_data",
+                "_series_error_show_in_legend_data",
+                "_series_fit_enabled_data",
+                "_series_fit_label_overrides_data",
+                "_series_fit_show_in_legend_data",
+                "_series_fit_types_data",
+                "_series_fit_degrees_data",
+                "_series_fit_range_modes_data",
+                "_series_fit_x_mins_data",
+                "_series_fit_x_maxs_data",
+                "_series_fit_color_data",
+                "_series_fit_alpha_data",
+                "_series_fit_line_width_data",
+                "_series_fit_line_style_data",
+                "_series_cumulative_enabled_data",
+                "_series_cumulative_label_overrides_data",
+                "_series_cumulative_show_in_legend_data",
+                "_series_cumulative_color_data",
+                "_series_cumulative_alpha_data",
+                "_series_cumulative_line_width_data",
+                "_series_cumulative_line_style_data",
+                "_series_integration_enabled_data",
+                "_series_integration_source_data",
+                "_series_integration_x_min_data",
+                "_series_integration_x_max_data",
+                "_series_integration_baseline_data",
+                "_series_integration_color_mode_data",
+                "_series_integration_color_data",
+                "_series_integration_alpha_data",
+                "_series_line_widths_data",
+                "_series_markers_data",
+                "_series_line_kwargs_data",
+                "_series_normalization_modes_data",
+                "_series_normalization_values_data",
+                "_series_normalization_x_refs_data",
+            )
+
+        def _iter_series_state_lists(self) -> list[tuple[str, list[Any]]]:
+            state_lists: list[tuple[str, list[Any]]] = []
+            for name in self._series_state_attr_names():
+                values = getattr(self, name)
+                if not isinstance(values, list):
+                    raise RuntimeError(f"Internal GUI layer state '{name}' is not a list.")
+                state_lists.append((name, values))
+            return state_lists
+
+        def _validate_series_state_lengths(self) -> None:
+            expected = len(self._series_descriptors_data)
+            mismatched = [
+                f"{name}={len(values)}"
+                for name, values in self._iter_series_state_lists()
+                if len(values) != expected
+            ]
+            if mismatched:
+                raise RuntimeError(
+                    "Internal GUI layer state is inconsistent: "
+                    + ", ".join(mismatched)
+                    + f" (expected {expected})."
+                )
+
         def _apply_series_id_order(self, requested_order: list[str] | None) -> None:
             current_ids = self._current_series_id_order()
             resolved_order = _resolve_series_id_order(current_ids, requested_order)
@@ -6336,63 +7608,9 @@ def launch_plot_settings_panel(
                 return
             index_by_id = {series_id: index for index, series_id in enumerate(current_ids)}
             indices = [index_by_id[series_id] for series_id in resolved_order]
-
-            def _reorder(values: list[Any]) -> list[Any]:
-                return [values[index] for index in indices]
-
-            self._series_descriptors_data = _reorder(self._series_descriptors_data)
-            self._series_labels_data = _reorder(self._series_labels_data)
-            self._series_label_overrides_data = _reorder(self._series_label_overrides_data)
-            self._series_colors_data = _reorder(self._series_colors_data)
-            self._series_enabled_data = _reorder(self._series_enabled_data)
-            self._series_show_in_legend_data = _reorder(self._series_show_in_legend_data)
-            self._series_alpha_data = _reorder(self._series_alpha_data)
-            self._series_error_enabled_data = _reorder(self._series_error_enabled_data)
-            self._series_error_stats_data = _reorder(self._series_error_stats_data)
-            self._series_error_styles_data = _reorder(self._series_error_styles_data)
-            self._series_error_label_overrides_data = _reorder(
-                self._series_error_label_overrides_data
-            )
-            self._series_error_show_in_legend_data = _reorder(
-                self._series_error_show_in_legend_data
-            )
-            self._series_fit_enabled_data = _reorder(self._series_fit_enabled_data)
-            self._series_fit_label_overrides_data = _reorder(self._series_fit_label_overrides_data)
-            self._series_fit_show_in_legend_data = _reorder(self._series_fit_show_in_legend_data)
-            self._series_fit_types_data = _reorder(self._series_fit_types_data)
-            self._series_fit_degrees_data = _reorder(self._series_fit_degrees_data)
-            self._series_fit_range_modes_data = _reorder(self._series_fit_range_modes_data)
-            self._series_fit_x_mins_data = _reorder(self._series_fit_x_mins_data)
-            self._series_fit_x_maxs_data = _reorder(self._series_fit_x_maxs_data)
-            self._series_fit_color_data = _reorder(self._series_fit_color_data)
-            self._series_fit_alpha_data = _reorder(self._series_fit_alpha_data)
-            self._series_fit_line_width_data = _reorder(self._series_fit_line_width_data)
-            self._series_fit_line_style_data = _reorder(self._series_fit_line_style_data)
-            self._series_cumulative_enabled_data = _reorder(self._series_cumulative_enabled_data)
-            self._series_cumulative_label_overrides_data = _reorder(
-                self._series_cumulative_label_overrides_data
-            )
-            self._series_cumulative_show_in_legend_data = _reorder(
-                self._series_cumulative_show_in_legend_data
-            )
-            self._series_cumulative_color_data = _reorder(self._series_cumulative_color_data)
-            self._series_cumulative_alpha_data = _reorder(self._series_cumulative_alpha_data)
-            self._series_cumulative_line_width_data = _reorder(
-                self._series_cumulative_line_width_data
-            )
-            self._series_cumulative_line_style_data = _reorder(
-                self._series_cumulative_line_style_data
-            )
-            self._series_line_widths_data = _reorder(self._series_line_widths_data)
-            self._series_markers_data = _reorder(self._series_markers_data)
-            self._series_line_kwargs_data = _reorder(self._series_line_kwargs_data)
-            self._series_normalization_modes_data = _reorder(self._series_normalization_modes_data)
-            self._series_normalization_values_data = _reorder(
-                self._series_normalization_values_data
-            )
-            self._series_normalization_x_refs_data = _reorder(
-                self._series_normalization_x_refs_data
-            )
+            for name, values in self._iter_series_state_lists():
+                setattr(self, name, [values[index] for index in indices])
+            self._validate_series_state_lengths()
 
         def _enabled_partitioned_series_id_order(self) -> list[str]:
             current_ids = self._current_series_id_order()
@@ -6403,7 +7621,17 @@ def launch_plot_settings_panel(
                 for index, descriptor in enumerate(self._series_descriptors_data)
                 if index < len(self._series_enabled_data)
             }
-            return _partition_series_ids_by_enabled_state(current_ids, enabled_by_id)
+            group_by_id = {
+                str(descriptor.get("series_id") or f"series:{index}"): (
+                    str(descriptor.get("source_kind") or "source").strip().lower() == "group"
+                )
+                for index, descriptor in enumerate(self._series_descriptors_data)
+            }
+            return _partition_series_ids_for_display_order(
+                current_ids,
+                enabled_by_id=enabled_by_id,
+                group_by_id=group_by_id,
+            )
 
         def _restore_active_series_from_id(self, selected_id: str) -> None:
             if not selected_id:
@@ -6458,16 +7686,124 @@ def launch_plot_settings_panel(
                     return label
             return f"Series {index + 1}"
 
+        def _effective_series_state(self, index: int) -> dict[str, Any]:
+            descriptor = self._series_descriptor(index)
+            series_id = str(descriptor.get("series_id") or f"series:{index}").strip()
+            source_kind = str(descriptor.get("source_kind") or "source").strip().lower()
+            is_group = source_kind == "group"
+            is_generated = is_group or bool(descriptor.get("is_generated", False))
+            return {
+                "series_id": series_id,
+                "descriptor": descriptor,
+                "enabled": bool(
+                    self._series_enabled_data[index]
+                    if 0 <= index < len(self._series_enabled_data)
+                    else True
+                ),
+                "label": self._effective_series_label(index),
+                "color": self._effective_series_color(index),
+                "show_in_legend": bool(
+                    self._series_show_in_legend_data[index]
+                    if 0 <= index < len(self._series_show_in_legend_data)
+                    else True
+                ),
+                "source_kind": source_kind,
+                "is_group": is_group,
+                "is_generated": is_generated,
+                "layer_role": "group" if is_group else "copy" if is_generated else "original",
+                "source_series_id": str(
+                    descriptor.get("source_series_id") or descriptor.get("series_id") or series_id
+                ).strip(),
+                "member_series_ids": [
+                    str(member_id).strip()
+                    for member_id in descriptor.get("member_series_ids", [])
+                    if str(member_id).strip()
+                ],
+            }
+
         def _effective_series_color(self, index: int) -> str:
             explicit_color = ""
             if 0 <= index < len(self._series_colors_data):
                 explicit_color = self._series_colors_data[index].strip()
             if explicit_color:
                 return explicit_color
-            default_colors = default_series_colors(len(self._series_descriptors_data))
-            if 0 <= index < len(default_colors):
-                return default_colors[index]
+            if self._series_is_generated(index):
+                return self._default_generated_series_color(index)
+            original_source_ids: list[str] = []
+            for descriptor_index, descriptor in enumerate(self._series_descriptors_data):
+                if self._series_is_generated(descriptor_index):
+                    continue
+                source_id = str(
+                    descriptor.get("source_series_id")
+                    or descriptor.get("series_id")
+                    or f"series:{descriptor_index}"
+                ).strip()
+                if source_id:
+                    original_source_ids.append(source_id)
+            if original_source_ids:
+                default_colors = default_series_colors(len(original_source_ids))
+                source_id = str(
+                    self._series_descriptor(index).get("source_series_id")
+                    or self._series_descriptor(index).get("series_id")
+                    or f"series:{index}"
+                ).strip()
+                if source_id in original_source_ids:
+                    return default_colors[original_source_ids.index(source_id)]
             return ""
+
+        def _series_layer_role_label(self, index: int) -> str:
+            return {
+                "group": "Group",
+                "copy": "Copy",
+                "original": "Original",
+            }.get(self._series_layer_role(index), "Layer")
+
+        def _series_source_summary(self, index: int) -> str:
+            descriptor = self._series_descriptor(index)
+            if self._series_is_group(index):
+                member_ids = [
+                    str(value).strip()
+                    for value in descriptor.get("member_series_ids", [])
+                    if str(value).strip()
+                ]
+                return f"{len(member_ids)} member(s): {', '.join(member_ids) if member_ids else 'none'}"
+            if self._series_is_generated(index):
+                source_id = str(descriptor.get("source_series_id") or "").strip()
+                return f"Copy of {source_id or 'source series'}"
+            source_name = str(descriptor.get("source_name") or "").strip()
+            return f"Original data series{f' from {source_name}' if source_name else ''}"
+
+        def _update_selected_layer_card(self, index: int | None = None) -> None:
+            if self._selected_layer_card is None:
+                return
+            if index is None:
+                index = self._series_active_index
+            if index < 0 or index >= len(self._series_descriptors_data):
+                if self._selected_layer_title is not None:
+                    self._selected_layer_title.setText("No layer selected")
+                return
+            state = self._effective_series_state(index)
+            label = str(state["label"])
+            if self._selected_layer_title is not None:
+                self._selected_layer_title.setText(label)
+            if self._selected_layer_swatch is not None:
+                color = str(state["color"])
+                swatch_color = QColor(color)
+                if not swatch_color.isValid():
+                    swatch_color = QColor(self._theme_tokens()["accent"])
+                self._selected_layer_swatch.setStyleSheet(
+                    f"background-color: {swatch_color.name()};"
+                    f"border: 1px solid {self._theme_tokens()['border']};"
+                    "border-radius: 4px;"
+                )
+            if self._series_delete_button is not None:
+                can_delete = self._series_is_generated(index)
+                self._series_delete_button.setEnabled(can_delete)
+                self._series_delete_button.setToolTip(
+                    "Delete this generated layer."
+                    if can_delete
+                    else "Original data series cannot be deleted here; turn them off instead."
+                )
 
         def _fit_supported_for_current_view(self) -> bool:
             analysis = self._analysis_name
@@ -6546,6 +7882,7 @@ def launch_plot_settings_panel(
                     show_derived_lines=False,
                     show_uncertainty=False,
                     show_normalization=False,
+                    show_integration=False,
                     show_group_members=False,
                     show_metadata=False,
                     show_fit_editor=False,
@@ -6560,7 +7897,8 @@ def launch_plot_settings_panel(
                     show_markers=is_line_family,
                     show_derived_lines=is_line_family,
                     show_uncertainty=False,
-                    show_normalization=False,
+                    show_normalization=is_line_family,
+                    show_integration=is_line_family,
                     show_group_members=True,
                     show_metadata=True,
                     show_fit_editor=is_line_family,
@@ -6576,6 +7914,7 @@ def launch_plot_settings_panel(
                     show_derived_lines=True,
                     show_uncertainty=False,
                     show_normalization=False,
+                    show_integration=False,
                     show_group_members=False,
                     show_metadata=False,
                     show_fit_editor=is_line_family,
@@ -6591,6 +7930,7 @@ def launch_plot_settings_panel(
                     show_derived_lines=True,
                     show_uncertainty=False,
                     show_normalization=False,
+                    show_integration=False,
                     show_group_members=False,
                     show_metadata=False,
                     show_fit_editor=False,
@@ -6605,6 +7945,7 @@ def launch_plot_settings_panel(
                 show_derived_lines=is_line_family,
                 show_uncertainty=self._error_supported_for_current_view(),
                 show_normalization=is_line_family,
+                show_integration=is_line_family,
                 show_group_members=False,
                 show_metadata=True,
                 show_fit_editor=is_line_family and self._fit_supported_for_current_view(),
@@ -6845,6 +8186,15 @@ def launch_plot_settings_panel(
             descriptor = self._series_descriptor(index)
             return str(descriptor.get("source_kind") or "source").strip().lower() == "group"
 
+        def _series_is_generated(self, index: int) -> bool:
+            descriptor = self._series_descriptor(index)
+            return self._series_is_group(index) or bool(descriptor.get("is_generated", False))
+
+        def _series_layer_role(self, index: int) -> str:
+            if self._series_is_group(index):
+                return "group"
+            return "copy" if self._series_is_generated(index) else "original"
+
         def _group_member_candidate_indices(self) -> list[int]:
             candidates: list[int] = []
             for index, descriptor in enumerate(self._series_descriptors_data):
@@ -6864,6 +8214,22 @@ def launch_plot_settings_panel(
                     return candidate
             return f"Group {len(self._series_labels_data) + 1}"
 
+        def _default_generated_series_color(self, index: int) -> str:
+            generated_series_ids = [
+                str(descriptor.get("series_id") or f"series:{descriptor_index}")
+                for descriptor_index, descriptor in enumerate(self._series_descriptors_data)
+                if self._series_is_generated(descriptor_index)
+            ]
+            if not generated_series_ids:
+                return ""
+            current_id = str(
+                self._series_descriptor(index).get("series_id") or f"series:{index}"
+            ).strip()
+            if current_id not in generated_series_ids:
+                return ""
+            default_colors = default_series_colors(max(1, len(generated_series_ids)))
+            return default_colors[generated_series_ids.index(current_id)]
+
         def _clone_series_at_index(self, index: int) -> None:
             if index < 0 or index >= len(self._series_descriptors_data):
                 return
@@ -6872,6 +8238,14 @@ def launch_plot_settings_panel(
             base_label = self._effective_series_label(index)
             descriptor["series_id"] = f"{source_kind}:{uuid4().hex}"
             descriptor["default_label"] = f"{base_label} Copy"
+            descriptor["is_generated"] = True
+            if source_kind != "group":
+                descriptor["source_kind"] = "source"
+                descriptor["source_series_id"] = str(
+                    descriptor.get("source_series_id") or ""
+                ).strip() or str(
+                    self._series_descriptor(index).get("series_id") or f"series:{index}"
+                )
             insert_at = index + 1
 
             def _insert(values: list[Any], copied: Any) -> None:
@@ -6881,7 +8255,7 @@ def launch_plot_settings_panel(
                 (self._series_descriptors_data, descriptor),
                 (self._series_labels_data, f"{base_label} Copy"),
                 (self._series_label_overrides_data, f"{base_label} Copy"),
-                (self._series_colors_data, self._series_colors_data[index]),
+                (self._series_colors_data, ""),
                 (self._series_enabled_data, self._series_enabled_data[index]),
                 (self._series_show_in_legend_data, self._series_show_in_legend_data[index]),
                 (self._series_alpha_data, self._series_alpha_data[index]),
@@ -6897,7 +8271,7 @@ def launch_plot_settings_panel(
                     self._series_error_show_in_legend_data,
                     self._series_error_show_in_legend_data[index],
                 ),
-                (self._series_fit_enabled_data, self._series_fit_enabled_data[index]),
+                (self._series_fit_enabled_data, False),
                 (
                     self._series_fit_label_overrides_data,
                     self._series_fit_label_overrides_data[index],
@@ -6934,6 +8308,38 @@ def launch_plot_settings_panel(
                     self._series_cumulative_line_style_data,
                     self._series_cumulative_line_style_data[index],
                 ),
+                (
+                    self._series_integration_enabled_data,
+                    self._series_integration_enabled_data[index],
+                ),
+                (
+                    self._series_integration_source_data,
+                    self._series_integration_source_data[index],
+                ),
+                (
+                    self._series_integration_x_min_data,
+                    self._series_integration_x_min_data[index],
+                ),
+                (
+                    self._series_integration_x_max_data,
+                    self._series_integration_x_max_data[index],
+                ),
+                (
+                    self._series_integration_baseline_data,
+                    self._series_integration_baseline_data[index],
+                ),
+                (
+                    self._series_integration_color_mode_data,
+                    self._series_integration_color_mode_data[index],
+                ),
+                (
+                    self._series_integration_color_data,
+                    self._series_integration_color_data[index],
+                ),
+                (
+                    self._series_integration_alpha_data,
+                    self._series_integration_alpha_data[index],
+                ),
                 (self._series_show_raw_line_data, self._series_show_raw_line_data[index]),
                 (self._series_line_widths_data, self._series_line_widths_data[index]),
                 (self._series_markers_data, self._series_markers_data[index]),
@@ -6952,6 +8358,7 @@ def launch_plot_settings_panel(
                 ),
             ):
                 _insert(values, copied)
+            self._validate_series_state_lengths()
             self._series_active_index = insert_at
             self._set_active_series_child_kind("base")
             self._sync_series_selection_widgets(self._series_active_index)
@@ -6960,6 +8367,7 @@ def launch_plot_settings_panel(
 
         def _duplicate_selected_series(self) -> None:
             self._persist_active_series_editor()
+            self._set_active_series_child_kind("base")
             self._clone_series_at_index(self._series_active_index)
 
         def _add_group_series(self) -> None:
@@ -6980,6 +8388,7 @@ def launch_plot_settings_panel(
                 "series_id": f"group:{uuid4().hex}",
                 "default_label": self._next_group_label(),
                 "source_kind": "group",
+                "is_generated": True,
                 "member_series_ids": member_series_ids,
                 "group_reducer": "mean",
                 "source_name": "Grouped series",
@@ -6989,9 +8398,12 @@ def launch_plot_settings_panel(
             self._series_descriptors_data.append(descriptor)
             self._series_labels_data.append(str(descriptor["default_label"]))
             self._series_label_overrides_data.append("")
-            self._series_colors_data.append("")
+            self._series_colors_data.append(
+                self._default_generated_series_color(len(self._series_descriptors_data) - 1)
+            )
             self._series_enabled_data.append(True)
             self._series_show_in_legend_data.append(True)
+            self._series_show_raw_line_data.append(True)
             self._series_alpha_data.append("")
             self._series_error_enabled_data.append(False)
             self._series_error_stats_data.append("sample_sem")
@@ -7018,17 +8430,64 @@ def launch_plot_settings_panel(
             self._series_cumulative_alpha_data.append("")
             self._series_cumulative_line_width_data.append("")
             self._series_cumulative_line_style_data.append("")
+            self._series_integration_enabled_data.append(False)
+            self._series_integration_source_data.append("Plotted data")
+            self._series_integration_x_min_data.append("")
+            self._series_integration_x_max_data.append("")
+            self._series_integration_baseline_data.append("0.0")
+            self._series_integration_color_mode_data.append("Auto")
+            self._series_integration_color_data.append("")
+            self._series_integration_alpha_data.append("0.25")
             self._series_line_widths_data.append("")
             self._series_markers_data.append("")
             self._series_line_kwargs_data.append("")
             self._series_normalization_modes_data.append("none")
             self._series_normalization_values_data.append("")
             self._series_normalization_x_refs_data.append("")
-            self._series_active_index = len(self._series_descriptors_data) - 1
+            self._validate_series_state_lengths()
+            self._apply_series_id_order(self._enabled_partitioned_series_id_order())
+            self._series_active_index = self._current_series_id_order().index(
+                str(descriptor["series_id"])
+            )
             self._set_active_series_child_kind("base")
             self._sync_series_selection_widgets(self._series_active_index)
             self._load_series_into_editor(self._series_active_index)
             self._schedule_preview_update()
+
+        def _delete_series_at_index(self, index: int) -> None:
+            if index < 0 or index >= len(self._series_descriptors_data):
+                return
+            if not self._series_is_generated(index):
+                return
+            removed_id = str(
+                self._series_descriptors_data[index].get("series_id") or f"series:{index}"
+            )
+            for _name, values in self._iter_series_state_lists():
+                if index < len(values):
+                    values.pop(index)
+            for descriptor_index, descriptor in enumerate(self._series_descriptors_data):
+                if str(descriptor.get("source_kind") or "source").strip().lower() != "group":
+                    continue
+                member_ids = [
+                    str(member_id).strip()
+                    for member_id in descriptor.get("member_series_ids", [])
+                    if str(member_id).strip() and str(member_id).strip() != removed_id
+                ]
+                updated = dict(descriptor)
+                updated["member_series_ids"] = member_ids
+                self._series_descriptors_data[descriptor_index] = updated
+            self._validate_series_state_lengths()
+            self._series_active_index = min(index, max(0, len(self._series_descriptors_data) - 1))
+            self._set_active_series_child_kind("base")
+            self._sync_series_selection_widgets(self._series_active_index)
+            if self._series_descriptors_data:
+                self._load_series_into_editor(self._series_active_index)
+            self._schedule_preview_update()
+
+        def _delete_selected_series(self) -> None:
+            self._persist_active_series_editor()
+            self._set_active_series_child_kind("base")
+            self._delete_series_at_index(self._series_active_index)
 
         def _rebuild_series_display_rows(self) -> None:
             rows: list[dict[str, Any]] = []
@@ -7153,6 +8612,10 @@ def launch_plot_settings_panel(
                         if i != index:
                             self._series_enabled_data[i] = False
                 self._series_enabled_data[index] = checked
+                if not checked:
+                    self._series_fit_enabled_data[index] = False
+                    self._series_cumulative_enabled_data[index] = False
+                    self._series_error_enabled_data[index] = False
                 self._apply_series_id_order(self._enabled_partitioned_series_id_order())
                 self._restore_active_series_from_id(selected_id)
             self._series_syncing = True
@@ -7346,6 +8809,20 @@ def launch_plot_settings_panel(
                         self.series_list.item(cumulative_row), cumulative_row
                     )
 
+        def _clear_series_list_widget_items(self) -> None:
+            if not hasattr(self, "series_list") or self.series_list is None:
+                return
+            for row in range(self.series_list.count()):
+                item = self.series_list.item(row)
+                if item is None:
+                    continue
+                widget = self.series_list.itemWidget(item)
+                if widget is not None:
+                    self.series_list.removeItemWidget(item)
+                    widget.setParent(None)
+                    widget.deleteLater()
+            self.series_list.clear()
+
         def _apply_series_list_item_visuals(self, item: Any, index: int) -> None:
             if item is None or index < 0:
                 return
@@ -7353,13 +8830,14 @@ def launch_plot_settings_panel(
             base_index = int(row_descriptor.get("base_index", -1))
             if base_index < 0 or base_index >= len(self._series_enabled_data):
                 return
+            base_state = self._effective_series_state(base_index)
             kind = str(row_descriptor.get("kind") or "base")
             if kind == "fit":
                 enabled = bool(self._series_fit_enabled_data[base_index])
             elif kind == "cumulative":
                 enabled = bool(self._series_cumulative_enabled_data[base_index])
             else:
-                enabled = self._series_enabled_data[base_index]
+                enabled = bool(base_state["enabled"])
             item.setText(self._display_row_text(index).replace("Â·", "-"))
             item.setData(
                 Qt.ItemDataRole.UserRole,
@@ -7403,69 +8881,80 @@ def launch_plot_settings_panel(
                             or self._effective_series_color(base_index)
                         )
                         if kind == "cumulative"
-                        else self._effective_series_color(base_index)
+                        else str(base_state["color"])
                     ),
                     kind=kind,
+                    layer_role=(
+                        "fit"
+                        if kind == "fit"
+                        else "cumulative"
+                        if kind == "cumulative"
+                        else str(base_state["layer_role"])
+                    ),
                     can_move_up=base_index > 0,
                     can_move_down=base_index < len(self._series_labels_data) - 1,
                     tooltip_text=item.toolTip(),
+                    theme=self._theme_tokens(),
                 )
 
         def _sync_series_selection_widgets(self, selected_index: int) -> None:
             view_anchor = self._current_series_list_view_anchor()
             self._rebuild_series_display_rows()
-            self.series_list.clear()
-            for index in range(len(self._series_display_rows)):
-                item = QListWidgetItem()
-                item.setFlags(
-                    item.flags() | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled
-                )
-                row_descriptor = self._display_row(index)
-                if str(row_descriptor.get("kind") or "base") == "base":
-                    item.setFlags(item.flags() | Qt.ItemFlag.ItemIsDragEnabled)
+            old_signal_block = self.series_list.blockSignals(True)
+            model = self.series_list.model()
+            old_model_block = model.blockSignals(True)
+            self.series_list.setUpdatesEnabled(False)
+            try:
+                self._clear_series_list_widget_items()
+                for index in range(len(self._series_display_rows)):
+                    item = QListWidgetItem()
+                    item.setFlags(
+                        item.flags() | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled
+                    )
+                    row_descriptor = self._display_row(index)
+                    if str(row_descriptor.get("kind") or "base") == "base":
+                        item.setFlags(item.flags() | Qt.ItemFlag.ItemIsDragEnabled)
                     base_index = int(row_descriptor.get("base_index", 0))
                     base_series_id = str(
                         self._series_descriptor(base_index).get("series_id")
                         or f"series:{base_index}"
                     )
-                else:
-                    base_index = int(row_descriptor.get("base_index", 0))
-                    base_series_id = str(
-                        self._series_descriptor(base_index).get("series_id")
-                        or f"series:{base_index}"
-                    )
-                self.series_list.addItem(item)
+                    self.series_list.addItem(item)
 
-                def _select_row(row: int = index) -> None:
+                    def _select_row(row: int = index) -> None:
+                        self.series_list.setCurrentRow(row)
+
+                    def _toggle_row(checked: bool, row: int = index) -> None:
+                        self._handle_series_row_widget_toggle(row, checked)
+
+                    def _move_base_up(series_id: str = base_series_id) -> None:
+                        self._move_series_by_delta(series_id, -1)
+
+                    def _move_base_down(series_id: str = base_series_id) -> None:
+                        self._move_series_by_delta(series_id, 1)
+
+                    row_widget = _SeriesRowWidget(
+                        on_select=_select_row,
+                        on_toggle=_toggle_row,
+                        on_move_up=_move_base_up,
+                        on_move_down=_move_base_down,
+                        parent=self.series_list,
+                    )
+                    item.setSizeHint(row_widget.sizeHint())
+                    self.series_list.setItemWidget(item, row_widget)
+                    self._apply_series_list_item_visuals(item, index)
+                if self.series_list.count() > 0:
+                    row = self._display_row_for_selection(
+                        selected_index,
+                        kind=self._active_series_child_kind(),
+                    )
                     self.series_list.setCurrentRow(row)
-
-                def _toggle_row(checked: bool, row: int = index) -> None:
-                    self._handle_series_row_widget_toggle(row, checked)
-
-                def _move_base_up(series_id: str = base_series_id) -> None:
-                    self._move_series_by_delta(series_id, -1)
-
-                def _move_base_down(series_id: str = base_series_id) -> None:
-                    self._move_series_by_delta(series_id, 1)
-
-                row_widget = _SeriesRowWidget(
-                    on_select=_select_row,
-                    on_toggle=_toggle_row,
-                    on_move_up=_move_base_up,
-                    on_move_down=_move_base_down,
-                    parent=self.series_list,
-                )
-                item.setSizeHint(row_widget.sizeHint())
-                self.series_list.setItemWidget(item, row_widget)
-                self._apply_series_list_item_visuals(item, index)
-            if self.series_list.count() > 0:
-                row = self._display_row_for_selection(
-                    selected_index,
-                    kind=self._active_series_child_kind(),
-                )
-                self.series_list.setCurrentRow(row)
-                self._restore_series_list_view_anchor(view_anchor)
-                self._refresh_series_list_widgets()
+                    self._restore_series_list_view_anchor(view_anchor)
+                    self._refresh_series_list_widgets()
+            finally:
+                self.series_list.setUpdatesEnabled(True)
+                model.blockSignals(old_model_block)
+                self.series_list.blockSignals(old_signal_block)
 
         def _handle_series_identity_change(self, *_unused: object) -> None:
             self._refresh_widget_states()
@@ -7551,7 +9040,13 @@ def launch_plot_settings_panel(
                 self._y_bin_width_row = (binning_form, self.y_bin_width)
                 self._y_bin_reducer_row = (binning_form, self.y_bin_reducer)
 
-            layout.addWidget(binning)
+            layout.addWidget(
+                self._make_collapsible_section(
+                    title=binning_title,
+                    section_id="data.binning",
+                    body_widget=binning,
+                )
+            )
 
         def _build_data_tab(self) -> None:
             layout = QVBoxLayout(self._tab_data_content)
@@ -7600,7 +9095,13 @@ def launch_plot_settings_panel(
                 self.matplotlib_rc_json,
                 tooltip_id="advanced.rcparams",
             )
-            layout.addWidget(rc_group)
+            layout.addWidget(
+                self._make_collapsible_section(
+                    title="Matplotlib rcParams",
+                    section_id="advanced.rcparams",
+                    body_widget=rc_group,
+                )
+            )
 
             render_group = QGroupBox("Figure / Axes / Layout")
             render_form = QFormLayout(render_group)
@@ -7641,7 +9142,13 @@ def launch_plot_settings_panel(
                 self.savefig_kwargs_json,
                 tooltip_id="advanced.savefig_kwargs",
             )
-            layout.addWidget(render_group)
+            layout.addWidget(
+                self._make_collapsible_section(
+                    title="Figure / Axes / Layout",
+                    section_id="advanced.render",
+                    body_widget=render_group,
+                )
+            )
 
             style_group = QGroupBox("Raw Matplotlib kwargs")
             style_form = QFormLayout(style_group)
@@ -7685,7 +9192,13 @@ def launch_plot_settings_panel(
                 self.line_kwargs_json,
                 tooltip_id="advanced.line_kwargs",
             )
-            layout.addWidget(style_group)
+            layout.addWidget(
+                self._make_collapsible_section(
+                    title="Raw Matplotlib kwargs",
+                    section_id="advanced.style",
+                    body_widget=style_group,
+                )
+            )
 
             hint = QLabel(
                 "Advanced JSON fields map directly onto Matplotlib API kwargs. "
@@ -7801,6 +9314,20 @@ def launch_plot_settings_panel(
                     default_label = fallback_label
                 descriptor["series_id"] = str(descriptor.get("series_id") or f"series:{index}")
                 descriptor["default_label"] = default_label
+                source_kind = (
+                    "group"
+                    if str(descriptor.get("source_kind") or "").strip().lower() == "group"
+                    else "source"
+                )
+                descriptor["source_kind"] = source_kind
+                descriptor["is_generated"] = bool(
+                    descriptor.get("is_generated", source_kind == "group")
+                )
+                if source_kind != "group":
+                    descriptor["source_series_id"] = (
+                        str(descriptor.get("source_series_id") or "").strip()
+                        or descriptor["series_id"]
+                    )
                 self._series_descriptors_data.append(descriptor)
                 self._series_labels_data.append(default_label)
 
@@ -7864,7 +9391,9 @@ def launch_plot_settings_panel(
                 error_config = _error_defaults_for_gui()
                 if isinstance(series_override, dict):
                     error_config = _coerce_series_error_config(series_override.get("error"))
-                self._series_error_enabled_data.append(bool(error_config.get("enabled", False)))
+                self._series_error_enabled_data.append(
+                    bool(error_config.get("enabled", False)) and enabled
+                )
                 self._series_error_stats_data.append(
                     str(error_config.get("stat") or "block_sem").strip() or "block_sem"
                 )
@@ -7884,21 +9413,27 @@ def launch_plot_settings_panel(
                     fit_config = _coerce_series_fit_config(
                         series_override.get("fit"),
                     )
-                    if "fit_enabled" in series_override:
-                        fit_config["fit_enabled"] = self._coerce_series_bool(
-                            series_override.get("fit_enabled"),
-                            default=bool(fit_config.get("fit_enabled")),
-                        )
-                    if series_override.get("fit_label_override") is not None:
-                        fit_config["fit_label_override"] = str(
-                            series_override.get("fit_label_override")
-                        ).strip()
-                    if "fit_show_in_legend" in series_override:
-                        fit_config["fit_show_in_legend"] = self._coerce_series_bool(
-                            series_override.get("fit_show_in_legend"),
-                            default=bool(fit_config.get("fit_show_in_legend", True)),
-                        )
-                self._series_fit_enabled_data.append(bool(fit_config.get("fit_enabled", False)))
+                    # Legacy compat: apply root-level fit keys only when no
+                    # "fit" sub-dict exists so new-format saves stay
+                    # authoritative.
+                    if not isinstance(series_override.get("fit"), dict):
+                        if "fit_enabled" in series_override:
+                            fit_config["fit_enabled"] = self._coerce_series_bool(
+                                series_override.get("fit_enabled"),
+                                default=bool(fit_config.get("fit_enabled")),
+                            )
+                        if series_override.get("fit_label_override") is not None:
+                            fit_config["fit_label_override"] = str(
+                                series_override.get("fit_label_override")
+                            ).strip()
+                        if "fit_show_in_legend" in series_override:
+                            fit_config["fit_show_in_legend"] = self._coerce_series_bool(
+                                series_override.get("fit_show_in_legend"),
+                                default=bool(fit_config.get("fit_show_in_legend", True)),
+                            )
+                self._series_fit_enabled_data.append(
+                    bool(fit_config.get("fit_enabled", False)) and enabled
+                )
                 self._series_fit_label_overrides_data.append(
                     str(fit_config.get("fit_label_override") or "").strip()
                 )
@@ -7931,7 +9466,7 @@ def launch_plot_settings_panel(
                         series_override.get("cumulative")
                     )
                 self._series_cumulative_enabled_data.append(
-                    bool(cumulative_config.get("enabled", False))
+                    bool(cumulative_config.get("enabled", False)) and enabled
                 )
                 self._series_cumulative_label_overrides_data.append(
                     str(cumulative_config.get("label_override") or "").strip()
@@ -7951,6 +9486,47 @@ def launch_plot_settings_panel(
                 self._series_cumulative_line_style_data.append(
                     str(cumulative_config.get("line_style") or "").strip()
                 )
+
+                integration_config = _integration_defaults_for_gui()
+                if isinstance(series_override, dict):
+                    integration_config = _coerce_series_integration_config(
+                        series_override.get("integration")
+                    )
+                self._series_integration_enabled_data.append(
+                    bool(integration_config.get("enabled", False))
+                )
+                self._series_integration_source_data.append(
+                    _INTEGRATION_SOURCE_LABEL_BY_MODE.get(
+                        str(integration_config.get("source") or "plotted").strip().lower(),
+                        "Plotted data",
+                    )
+                )
+                self._series_integration_x_min_data.append(
+                    ""
+                    if integration_config.get("x_min") is None
+                    else str(integration_config["x_min"])
+                )
+                self._series_integration_x_max_data.append(
+                    ""
+                    if integration_config.get("x_max") is None
+                    else str(integration_config["x_max"])
+                )
+                self._series_integration_baseline_data.append(
+                    "0.0"
+                    if integration_config.get("baseline") is None
+                    else str(integration_config["baseline"])
+                )
+                integration_color = str(integration_config.get("color") or "").strip()
+                self._series_integration_color_mode_data.append(
+                    "Custom" if integration_color else "Auto"
+                )
+                self._series_integration_color_data.append(integration_color)
+                self._series_integration_alpha_data.append(
+                    "0.25"
+                    if integration_config.get("alpha") is None
+                    else str(integration_config["alpha"])
+                )
+
                 fit_color_raw = ""
                 fit_alpha_raw = ""
                 fit_line_width_raw = ""
@@ -8042,6 +9618,7 @@ def launch_plot_settings_panel(
                     for index, descriptor in enumerate(self._series_descriptors_data)
                 ]
                 self._apply_series_id_order(_coerce_series_order(settings.get("series_order")))
+                self._validate_series_state_lengths()
                 selected = self._series_active_index if self._series_active_index < count else 0
                 self._sync_series_selection_widgets(selected)
                 self._series_active_index = selected
@@ -8123,6 +9700,31 @@ def launch_plot_settings_panel(
                         self._series_cumulative_line_style,
                         self._series_cumulative_line_style_data[index],
                     )
+                if hasattr(self, "integration_mode"):
+                    self._set_combo_value(
+                        self.integration_mode,
+                        "on" if self._series_integration_enabled_data[index] else "off",
+                    )
+                if hasattr(self, "integration_source"):
+                    self._set_combo_value(
+                        self.integration_source,
+                        self._series_integration_source_data[index],
+                    )
+                if hasattr(self, "integration_x_min"):
+                    self.integration_x_min.setText(self._series_integration_x_min_data[index])
+                if hasattr(self, "integration_x_max"):
+                    self.integration_x_max.setText(self._series_integration_x_max_data[index])
+                if hasattr(self, "integration_baseline"):
+                    self.integration_baseline.setText(self._series_integration_baseline_data[index])
+                if hasattr(self, "integration_color_mode"):
+                    self._set_combo_value(
+                        self.integration_color_mode,
+                        self._series_integration_color_mode_data[index],
+                    )
+                if hasattr(self, "integration_color"):
+                    self.integration_color.setText(self._series_integration_color_data[index])
+                if hasattr(self, "integration_alpha"):
+                    self.integration_alpha.setText(self._series_integration_alpha_data[index])
                 if self._series_fit_mode is not None:
                     self._set_combo_value(
                         self._series_fit_mode,
@@ -8180,15 +9782,26 @@ def launch_plot_settings_panel(
                             candidate_id = str(
                                 candidate_descriptor.get("series_id") or f"series:{candidate_index}"
                             )
-                            item = QListWidgetItem(self._effective_series_label(candidate_index))
+                            candidate_role = self._series_layer_role(candidate_index).title()
+                            item = QListWidgetItem(
+                                f"{self._effective_series_label(candidate_index)} [{candidate_role}]"
+                            )
                             item.setData(Qt.ItemDataRole.UserRole, candidate_id)
-                            item.setSelected(candidate_id in selected_ids)
+                            item.setFlags(
+                                item.flags()
+                                | Qt.ItemFlag.ItemIsUserCheckable
+                                | Qt.ItemFlag.ItemIsEnabled
+                            )
+                            item.setCheckState(
+                                Qt.CheckState.Checked
+                                if candidate_id in selected_ids
+                                else Qt.CheckState.Unchecked
+                            )
                             self._series_group_members.addItem(item)
                     finally:
                         self._series_group_members.blockSignals(False)
                 self.series_line_kwargs_json.setPlainText(self._series_line_kwargs_data[index])
                 self._load_normalization_into_editor(index)
-                is_group = self._series_is_group(index)
                 for widget in (
                     self.series_color,
                     self.series_alpha,
@@ -8199,12 +9812,6 @@ def launch_plot_settings_panel(
                     widget.setEnabled(True)
                 if hasattr(self, "_series_show_raw_line"):
                     self._series_show_raw_line.setEnabled(True)
-                for widget in (
-                    self.norm_mode,
-                    self.norm_value,
-                    self.norm_x_ref,
-                ):
-                    widget.setEnabled(not is_group)
                 if self._series_fit_mode is not None:
                     self._series_fit_mode.setEnabled(self._fit_supported_for_current_view())
                 if hasattr(self, "_series_error_mode"):
@@ -8242,6 +9849,7 @@ def launch_plot_settings_panel(
             self._update_series_error_summary(self._series_active_index)
             self._update_series_cumulative_summary(self._series_active_index)
             self._update_series_fit_summary(self._series_active_index)
+            self._update_selected_layer_card(self._series_active_index)
             if getattr(self, "_series_error_style_note", None) is not None:
                 self._series_error_style_note.hide()
             if getattr(self, "_series_cumulative_style_note", None) is not None:
@@ -8307,7 +9915,10 @@ def launch_plot_settings_panel(
                     self._series_error_label.setPlaceholderText(self._error_effective_label(index))
                     self._series_error_label.setText(self._series_error_label_overrides_data[index])
                 if self._series_fit_mode is not None:
-                    self._set_combo_value(self._series_fit_mode, "on")
+                    self._set_combo_value(
+                        self._series_fit_mode,
+                        "on" if self._series_fit_enabled_data[index] else "off",
+                    )
                 if hasattr(self, "_series_fit_type"):
                     self._set_combo_value(self._series_fit_type, self._series_fit_types_data[index])
                 if hasattr(self, "_series_fit_degree"):
@@ -8382,6 +9993,7 @@ def launch_plot_settings_panel(
             self._update_series_error_summary(index)
             self._update_series_cumulative_summary(index)
             self._update_series_fit_summary(index)
+            self._update_selected_layer_card(index)
             if getattr(self, "_series_error_style_note", None) is not None:
                 self._series_error_style_note.hide()
             if getattr(self, "_series_cumulative_style_note", None) is not None:
@@ -8453,6 +10065,31 @@ def launch_plot_settings_panel(
                         self._series_cumulative_line_style,
                         self._series_cumulative_line_style_data[index],
                     )
+                if hasattr(self, "integration_mode"):
+                    self._set_combo_value(
+                        self.integration_mode,
+                        "on" if self._series_integration_enabled_data[index] else "off",
+                    )
+                if hasattr(self, "integration_source"):
+                    self._set_combo_value(
+                        self.integration_source,
+                        self._series_integration_source_data[index],
+                    )
+                if hasattr(self, "integration_x_min"):
+                    self.integration_x_min.setText(self._series_integration_x_min_data[index])
+                if hasattr(self, "integration_x_max"):
+                    self.integration_x_max.setText(self._series_integration_x_max_data[index])
+                if hasattr(self, "integration_baseline"):
+                    self.integration_baseline.setText(self._series_integration_baseline_data[index])
+                if hasattr(self, "integration_color_mode"):
+                    self._set_combo_value(
+                        self.integration_color_mode,
+                        self._series_integration_color_mode_data[index],
+                    )
+                if hasattr(self, "integration_color"):
+                    self.integration_color.setText(self._series_integration_color_data[index])
+                if hasattr(self, "integration_alpha"):
+                    self.integration_alpha.setText(self._series_integration_alpha_data[index])
                 if self._series_fit_mode is not None:
                     self._set_combo_value(
                         self._series_fit_mode,
@@ -8513,6 +10150,7 @@ def launch_plot_settings_panel(
             self._update_series_error_summary(index)
             self._update_series_cumulative_summary(index)
             self._update_series_fit_summary(index)
+            self._update_selected_layer_card(index)
             if getattr(self, "_series_error_style_note", None) is not None:
                 self._series_error_style_note.hide()
             if getattr(self, "_series_cumulative_style_note", None) is not None:
@@ -8587,6 +10225,30 @@ def launch_plot_settings_panel(
                 self._series_cumulative_line_style_data[index] = (
                     self._series_cumulative_line_style.currentText().strip()
                 )
+            if hasattr(self, "integration_mode"):
+                self._series_integration_enabled_data[index] = (
+                    self.integration_mode.currentText().strip().lower() != "off"
+                )
+            if hasattr(self, "integration_source"):
+                self._series_integration_source_data[index] = (
+                    self.integration_source.currentText().strip()
+                )
+            if hasattr(self, "integration_x_min"):
+                self._series_integration_x_min_data[index] = self.integration_x_min.text().strip()
+            if hasattr(self, "integration_x_max"):
+                self._series_integration_x_max_data[index] = self.integration_x_max.text().strip()
+            if hasattr(self, "integration_baseline"):
+                self._series_integration_baseline_data[index] = (
+                    self.integration_baseline.text().strip()
+                )
+            if hasattr(self, "integration_color_mode"):
+                self._series_integration_color_mode_data[index] = (
+                    self.integration_color_mode.currentText().strip()
+                )
+            if hasattr(self, "integration_color"):
+                self._series_integration_color_data[index] = self.integration_color.text().strip()
+            if hasattr(self, "integration_alpha"):
+                self._series_integration_alpha_data[index] = self.integration_alpha.text().strip()
             if self._series_fit_mode is not None:
                 self._series_fit_enabled_data[index] = (
                     self._series_fit_mode.currentText().strip().lower() != "off"
@@ -8639,8 +10301,11 @@ def launch_plot_settings_panel(
                 if hasattr(self, "_series_group_members"):
                     descriptor["member_series_ids"] = [
                         str(item.data(Qt.ItemDataRole.UserRole) or "").strip()
-                        for item in self._series_group_members.selectedItems()
-                        if str(item.data(Qt.ItemDataRole.UserRole) or "").strip()
+                        for item_index in range(self._series_group_members.count())
+                        for item in [self._series_group_members.item(item_index)]
+                        if item is not None
+                        and item.checkState() == Qt.CheckState.Checked
+                        and str(item.data(Qt.ItemDataRole.UserRole) or "").strip()
                     ]
                 self._series_descriptors_data[index] = descriptor
             self._persist_normalization_editor(index)
@@ -8654,6 +10319,7 @@ def launch_plot_settings_panel(
             self._update_series_error_summary(index)
             self._update_series_cumulative_summary(index)
             self._update_series_fit_summary(index)
+            self._update_selected_layer_card(index)
 
         def _persist_fit_series_editor(self, index: int) -> None:
             if index < 0 or index >= len(self._series_labels_data):
@@ -8844,7 +10510,10 @@ def launch_plot_settings_panel(
             if not self._series_enabled_data:
                 return
             self._persist_active_series_editor()
+            selected_id = self._active_series_row_id()
             self._series_enabled_data = [enabled] * len(self._series_enabled_data)
+            self._apply_series_id_order(self._enabled_partitioned_series_id_order())
+            self._restore_active_series_from_id(selected_id)
             self._series_syncing = True
             try:
                 self._sync_series_selection_widgets(self._series_active_index)
@@ -8874,6 +10543,7 @@ def launch_plot_settings_panel(
                     self._series_fit_label.setPlaceholderText(self._fit_effective_label(index))
                 if hasattr(self, "_series_error_label") and self._series_error_label is not None:
                     self._series_error_label.setPlaceholderText(self._error_effective_label(index))
+            self._update_selected_layer_card(index)
             self._refresh_active_series_list_widgets()
             self._schedule_preview_update()
 
@@ -8976,7 +10646,7 @@ def launch_plot_settings_panel(
             self._load_normalization_into_editor(self._series_active_index)
             self._update_normalization_warning()
             self._schedule_preview_update()
-            self._status_label.setText("Copied normalization settings to all base series.")
+            self._status_label.setText("Copied normalization settings to all layers.")
 
         def _on_normalization_editor_changed(self, *_unused: object) -> None:
             if self._normalization_syncing:
@@ -9491,6 +11161,8 @@ def launch_plot_settings_panel(
                 self.y_ticks,
                 self.x_tick_rotation,
                 self.y_tick_rotation,
+                self.x_axis_scale,
+                self.x_axis_offset,
                 self.x_label_pad,
                 self.y_label_pad,
                 self.fig_width,
@@ -9518,6 +11190,11 @@ def launch_plot_settings_panel(
                 self.x_tick_width,
                 self.y_tick_length,
                 self.y_tick_width,
+                self.integration_x_min,
+                self.integration_x_max,
+                self.integration_baseline,
+                self.integration_color,
+                self.integration_alpha,
                 self.x_bin_width,
                 self.min_bin_points,
             )
@@ -9545,6 +11222,9 @@ def launch_plot_settings_panel(
                 self.y_tick_direction,
                 self.x_minor_ticks_mode,
                 self.y_minor_ticks_mode,
+                self.integration_mode,
+                self.integration_source,
+                self.integration_color_mode,
                 self.x_bin_reducer,
                 self.axes_border_mode,
             )
@@ -9715,7 +11395,10 @@ def launch_plot_settings_panel(
                     render_state = save_result
                 if isinstance(render_state, dict) and render_state:
                     self._apply_preview_state_to_synced_fields(render_state)
-                pixmap = QPixmap(str(self._preview_image_path))
+                QPixmapCache.remove(str(self._preview_image_path))
+                pixmap = QPixmap()
+                if not pixmap.load(str(self._preview_image_path)):
+                    raise RuntimeError("Could not load rendered preview image.")
                 if pixmap.isNull():
                     raise RuntimeError("Could not load rendered preview image.")
                 self._preview_pixmap = pixmap
@@ -9981,6 +11664,8 @@ def launch_plot_settings_panel(
             self.y_ticks.setText(_format_float_list(settings.get("y_ticks")))
             self.x_tick_rotation.setText(str(settings.get("x_tick_rotation") or ""))
             self.y_tick_rotation.setText(str(settings.get("y_tick_rotation") or ""))
+            self.x_axis_scale.setText(str(settings.get("x_axis_scale") or "1.0"))
+            self.x_axis_offset.setText(str(settings.get("x_axis_offset") or "0.0"))
             self.x_label_pad.setText(
                 "" if settings.get("x_label_pad") is None else str(settings.get("x_label_pad"))
             )
@@ -10069,6 +11754,7 @@ def launch_plot_settings_panel(
                 nested_key="markerfacecolor",
             ) or _extract_dict_text(settings, key="line_kwargs", nested_key="markeredgecolor")
             self.marker_color.setText(marker_color)
+
             self._set_combo_value(
                 self.axes_border_mode,
                 _border_setting_to_mode(settings.get("border")),
@@ -10373,6 +12059,15 @@ def launch_plot_settings_panel(
             x_ticks_enabled = self.x_ticks_mode.currentText().strip().lower() != "off"
             y_ticks_enabled = self.y_ticks_mode.currentText().strip().lower() != "off"
             markers_enabled = self.markers_mode.currentText().strip().lower() != "off"
+            integration_enabled = (
+                hasattr(self, "integration_mode")
+                and self.integration_mode.currentText().strip().lower() != "off"
+            )
+            integration_custom_color = (
+                integration_enabled
+                and hasattr(self, "integration_color_mode")
+                and self.integration_color_mode.currentText().strip().lower() == "custom"
+            )
             colorbar_enabled = (
                 self.heatmap_colorbar_enabled.isChecked()
                 if hasattr(self, "heatmap_colorbar_enabled")
@@ -10417,6 +12112,15 @@ def launch_plot_settings_panel(
             self._set_rows_visible(self._legend_rows, legend_enabled)
             self._set_rows_visible(self._grid_rows, grid_enabled)
             self._set_rows_visible(self._marker_rows, markers_enabled)
+            self._set_rows_visible(self._integration_rows, integration_enabled)
+            if self._integration_custom_color_row is not None:
+                self._set_form_row_visible(
+                    self._integration_custom_color_row[0],
+                    self._integration_custom_color_row[1],
+                    integration_custom_color,
+                )
+            if getattr(self, "_integration_summary_label", None) is not None:
+                self._integration_summary_label.setVisible(integration_enabled)
             border_custom = (
                 hasattr(self, "axes_border_mode")
                 and self.axes_border_mode.currentText().strip().lower() == "custom"
@@ -10481,8 +12185,11 @@ def launch_plot_settings_panel(
                 self._series_group_group.setVisible(layer_caps.show_group_members)
             if self._normalization_group is not None:
                 self._normalization_group.setVisible(layer_caps.show_normalization)
+            if self._series_integration_group is not None:
+                self._series_integration_group.setVisible(layer_caps.show_integration)
             if self._series_metadata_group is not None:
                 self._series_metadata_group.setVisible(layer_caps.show_metadata)
+            self._update_selected_layer_card(self._series_active_index)
             if self._figure_legend_section is not None:
                 self._figure_legend_section.setVisible(figure_caps.show_legend)
             if self._figure_lines_section is not None:
@@ -10620,9 +12327,10 @@ def launch_plot_settings_panel(
                     widget.setVisible(norm_enabled)
             if self._normalization_copy_button is not None:
                 normalization_copy_enabled = (
-                    not self._series_active_is_fit_child
+                    layer_caps.show_normalization
+                    and not is_heatmap
+                    and not self._series_active_is_fit_child
                     and not self._series_active_is_cumulative_child
-                    and not selected_group
                     and norm_enabled
                 )
                 self._normalization_copy_button.setEnabled(normalization_copy_enabled)
@@ -10631,14 +12339,18 @@ def launch_plot_settings_panel(
                     disabled_reason=(
                         None
                         if normalization_copy_enabled
-                        else "normalization is edited on non-group base series only."
+                        else (
+                            "Normalization is unavailable for the current layer."
+                            if not layer_caps.show_normalization or is_heatmap
+                            else "Turn normalization on first."
+                        )
                     ),
                 )
-            if self._normalization_group is not None and selected_group:
-                self._normalization_group.setEnabled(False)
-                self._normalization_group.setToolTip(
-                    "Grouped series aggregate already-transformed member series and do not apply an extra normalization step."
-                )
+            if self._normalization_group is not None and not (
+                self._analysis_name == "orientation" and is_heatmap
+            ):
+                self._normalization_group.setEnabled(layer_caps.show_normalization)
+                self._normalization_group.setToolTip("")
             annotation_selected = bool(self._annotations_data)
             series_selected = bool(self._series_descriptors_data)
             if getattr(self, "_series_duplicate_button", None) is not None:
@@ -10647,21 +12359,21 @@ def launch_plot_settings_panel(
                 self._series_add_group_button.setEnabled(
                     bool(self._group_member_candidate_indices())
                 )
+            delete_button = getattr(self, "_series_delete_button", None)
+            if delete_button is not None:
+                can_delete_series = (
+                    series_selected
+                    and not self._series_active_is_fit_child
+                    and not self._series_active_is_cumulative_child
+                    and self._series_is_generated(self._series_active_index)
+                )
+                delete_button.setEnabled(can_delete_series)
             for button in (
                 getattr(self, "_annotation_duplicate_button", None),
                 getattr(self, "_annotation_delete_button", None),
             ):
                 if button is not None:
                     button.setEnabled(annotation_selected)
-            if getattr(self, "_annotation_move_up_button", None) is not None:
-                self._annotation_move_up_button.setEnabled(
-                    annotation_selected and self._annotation_active_index > 0
-                )
-            if getattr(self, "_annotation_move_down_button", None) is not None:
-                self._annotation_move_down_button.setEnabled(
-                    annotation_selected
-                    and self._annotation_active_index < len(self._annotations_data) - 1
-                )
             for widget in (
                 getattr(self, "_annotation_enabled_mode", None),
                 getattr(self, "_annotation_type", None),
@@ -10985,6 +12697,7 @@ def launch_plot_settings_panel(
                 )
             self._update_normalization_warning()
             self._update_series_error_summary(self._series_active_index)
+            self._update_integration_summary()
             if hasattr(self, "normalization_warning"):
                 self.normalization_warning.setVisible(
                     norm_enabled and bool(self.normalization_warning.text().strip())
@@ -11005,6 +12718,7 @@ def launch_plot_settings_panel(
         def _collect_settings(self) -> dict[str, Any]:
             self._persist_active_series_editor()
             self._persist_active_annotation_editor()
+            self._validate_series_state_lengths()
 
             def _synced_text(key: str, widget: QLineEdit) -> str | None:
                 mode = self._synced_field_mode(key)
@@ -11044,6 +12758,30 @@ def launch_plot_settings_panel(
             figsize: list[float] | None = None
             if fig_width is not None and fig_height is not None:
                 figsize = [fig_width, fig_height]
+            x_label_font_size_value = _optional_positive_int_or_none(
+                self.x_label_font.text(), field_name="x-label-font-size"
+            )
+            y_label_font_size_value = _optional_positive_int_or_none(
+                self.y_label_font.text(), field_name="y-label-font-size"
+            )
+            shared_label_font_size_value = (
+                x_label_font_size_value
+                if x_label_font_size_value is not None
+                and x_label_font_size_value == y_label_font_size_value
+                else None
+            )
+            x_tick_font_size_value = _optional_positive_int_or_none(
+                self.x_tick_font.text(), field_name="x-tick-font-size"
+            )
+            y_tick_font_size_value = _optional_positive_int_or_none(
+                self.y_tick_font.text(), field_name="y-tick-font-size"
+            )
+            shared_tick_font_size_value = (
+                x_tick_font_size_value
+                if x_tick_font_size_value is not None
+                and x_tick_font_size_value == y_tick_font_size_value
+                else None
+            )
 
             series_labels = [
                 self._effective_series_label(index)
@@ -11334,6 +13072,70 @@ def launch_plot_settings_panel(
                 }
                 if cumulative_payload != _cumulative_defaults_for_gui():
                     entry["cumulative"] = cumulative_payload
+                integration_enabled_value = bool(self._series_integration_enabled_data[index])
+                integration_source_label = self._series_integration_source_data[index].strip()
+                integration_source_value = _INTEGRATION_SOURCE_BY_LABEL.get(
+                    integration_source_label, "plotted"
+                )
+                integration_x_min_value = _optional_float(
+                    self._series_integration_x_min_data[index],
+                    field_name=f"Series {index + 1} integration x-min",
+                )
+                integration_x_max_value = _optional_float(
+                    self._series_integration_x_max_data[index],
+                    field_name=f"Series {index + 1} integration x-max",
+                )
+                if (
+                    integration_x_min_value is not None
+                    and integration_x_max_value is not None
+                    and integration_x_min_value >= integration_x_max_value
+                ):
+                    raise ValueError(
+                        f"Series {index + 1} integration x-min must be smaller than x-max."
+                    )
+                integration_baseline_value = _optional_float(
+                    self._series_integration_baseline_data[index],
+                    field_name=f"Series {index + 1} integration baseline",
+                )
+                integration_alpha_value = _optional_float(
+                    self._series_integration_alpha_data[index],
+                    field_name=f"Series {index + 1} integration alpha",
+                )
+                if (
+                    integration_alpha_value is not None
+                    and not 0.0 <= integration_alpha_value <= 1.0
+                ):
+                    raise ValueError(
+                        f"Series {index + 1} integration alpha must be between 0 and 1."
+                    )
+                integration_color_value = (
+                    _explicit_text(self._series_integration_color_data[index])
+                    if self._series_integration_color_mode_data[index].strip().lower() == "custom"
+                    else ""
+                )
+                integration_payload: dict[str, Any] = {
+                    "enabled": integration_enabled_value,
+                    "source": integration_source_value,
+                    "x_min": integration_x_min_value,
+                    "x_max": integration_x_max_value,
+                    "baseline": (
+                        0.0 if integration_baseline_value is None else integration_baseline_value
+                    ),
+                    "color": integration_color_value or None,
+                    "alpha": (0.25 if integration_alpha_value is None else integration_alpha_value),
+                }
+                integration_defaults = _integration_defaults_for_gui()
+                integration_default_payload = {
+                    "enabled": integration_defaults["enabled"],
+                    "source": integration_defaults["source"],
+                    "x_min": integration_defaults["x_min"],
+                    "x_max": integration_defaults["x_max"],
+                    "baseline": integration_defaults["baseline"],
+                    "color": integration_defaults["color"],
+                    "alpha": integration_defaults["alpha"],
+                }
+                if integration_payload != integration_default_payload:
+                    entry["integration"] = integration_payload
                 fit_color_out = self._series_fit_color_data[index].strip() or None
                 fit_alpha_out = self._series_fit_alpha_data[index].strip() or None
                 fit_line_width_out = self._series_fit_line_width_data[index].strip() or None
@@ -11374,6 +13176,10 @@ def launch_plot_settings_panel(
                         raise ValueError(f"Series {index + 1} alpha must be a float.") from exc
                 if line_colors[index]:
                     entry["color"] = line_colors[index]
+                elif self._series_is_generated(index):
+                    generated_color = self._effective_series_color(index).strip()
+                    if generated_color:
+                        entry["color"] = generated_color
                 width_token = self._series_line_widths_data[index].strip()
                 if width_token:
                     try:
@@ -11619,6 +13425,20 @@ def launch_plot_settings_panel(
                 y_bin_width = _optional_float(self.y_bin_width.text(), field_name="y-bin-width")
                 if y_bin_width is not None and y_bin_width <= 0:
                     raise ValueError("y-bin-width must be positive.")
+            x_axis_scale = _optional_float(
+                self.x_axis_scale.text(),
+                field_name="x-axis-scale-factor",
+            )
+            if x_axis_scale is None:
+                x_axis_scale = 1.0
+            if x_axis_scale == 0.0:
+                raise ValueError("x-axis-scale-factor must not be zero.")
+            x_axis_offset = _optional_float(
+                self.x_axis_offset.text(),
+                field_name="x-axis-offset",
+            )
+            if x_axis_offset is None:
+                x_axis_offset = 0.0
 
             x_min = _synced_float("x_lim", self.x_min, field_name="x-min")
             x_max = _synced_float("x_lim", self.x_max, field_name="x-max")
@@ -11644,6 +13464,8 @@ def launch_plot_settings_panel(
                 "y_min": y_min,
                 "y_max": y_max,
                 "x_scale": self.x_scale.currentText().strip() or "linear",
+                "x_axis_scale": x_axis_scale,
+                "x_axis_offset": x_axis_offset,
                 "y_scale": self.y_scale.currentText().strip() or "linear",
                 "x_ticks": _synced_float_list("x_ticks", self.x_ticks, field_name="x-ticks"),
                 "y_ticks": _synced_float_list("y_ticks", self.y_ticks, field_name="y-ticks"),
@@ -11682,30 +13504,18 @@ def launch_plot_settings_panel(
                 "title_font_size": _optional_positive_int_or_none(
                     self.title_font.text(), field_name="title-font-size"
                 ),
-                "label_font_size": _optional_positive_int_or_none(
-                    self.x_label_font.text(), field_name="x-label-font-size"
-                ),
-                "x_label_font_size": _optional_positive_int_or_none(
-                    self.x_label_font.text(), field_name="x-label-font-size"
-                ),
-                "y_label_font_size": _optional_positive_int_or_none(
-                    self.y_label_font.text(), field_name="y-label-font-size"
-                ),
-                "tick_font_size": _optional_positive_int_or_none(
-                    self.x_tick_font.text(), field_name="x-tick-font-size"
-                ),
-                "x_tick_font_size": _optional_positive_int_or_none(
-                    self.x_tick_font.text(), field_name="x-tick-font-size"
-                ),
-                "y_tick_font_size": _optional_positive_int_or_none(
-                    self.y_tick_font.text(), field_name="y-tick-font-size"
-                ),
+                "label_font_size": shared_label_font_size_value,
+                "x_label_font_size": x_label_font_size_value,
+                "y_label_font_size": y_label_font_size_value,
+                "tick_font_size": shared_tick_font_size_value,
+                "x_tick_font_size": x_tick_font_size_value,
+                "y_tick_font_size": y_tick_font_size_value,
                 "figure_alpha": figure_alpha,
                 "legend_font_size": _optional_positive_int_or_none(
                     self.legend_font.text(), field_name="legend-font-size"
                 ),
                 "line_width": _optional_float(self.line_width.text(), field_name="line-width"),
-                "line_colors": line_colors_value,
+                "line_colors": None if series_overrides else line_colors_value,
                 "series_labels": series_labels,
                 "series_order": (
                     self._current_series_id_order()
@@ -11714,15 +13524,23 @@ def launch_plot_settings_panel(
                 ),
                 "series_descriptors": deepcopy(self._series_descriptors_data),
                 "series_overrides": series_overrides or None,
-                "series_enabled": series_enabled_value,
-                "series_show_in_legend": series_show_in_legend_value,
-                "series_alpha": series_alpha_value,
-                "series_line_widths": series_line_widths_value,
-                "series_markers": series_markers_value,
-                "series_line_kwargs": series_line_kwargs_value,
-                "series_normalization_modes": normalization_modes_value,
-                "series_normalization_values": normalization_values_value,
-                "series_normalization_x_refs": normalization_x_refs_value,
+                "series_enabled": None if series_overrides else series_enabled_value,
+                "series_show_in_legend": (
+                    None if series_overrides else series_show_in_legend_value
+                ),
+                "series_alpha": None if series_overrides else series_alpha_value,
+                "series_line_widths": None if series_overrides else series_line_widths_value,
+                "series_markers": None if series_overrides else series_markers_value,
+                "series_line_kwargs": None if series_overrides else series_line_kwargs_value,
+                "series_normalization_modes": (
+                    None if series_overrides else normalization_modes_value
+                ),
+                "series_normalization_values": (
+                    None if series_overrides else normalization_values_value
+                ),
+                "series_normalization_x_refs": (
+                    None if series_overrides else normalization_x_refs_value
+                ),
                 "annotations": annotations_value,
                 "x_bin_width": x_bin_width,
                 "x_bin_reducer": (self.x_bin_reducer.currentText().strip() or "mean")
@@ -12053,6 +13871,7 @@ def launch_plot_settings_panel(
                 QEvent.Type.ApplicationPaletteChange,
             }:
                 self._apply_theme_styles()
+                self._sync_theme_switch_label()
                 if hasattr(self, "series_list") and self.series_list is not None:
                     for index in range(self.series_list.count()):
                         self._apply_series_list_item_visuals(self.series_list.item(index), index)

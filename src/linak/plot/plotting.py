@@ -253,6 +253,57 @@ class PreparedLineSeries:
     error_reason: str | None = None
 
 
+@dataclass(frozen=True)
+class IntegrationConfig:
+    """Requested shaded integral overlay for rendered 1-D series."""
+
+    enabled: bool = False
+    source: str = "plotted"
+    target: str = "selected"
+    target_series_id: str | None = None
+    x_min: float | None = None
+    x_max: float | None = None
+    baseline: float = 0.0
+    color: str | None = None
+    alpha: float = 0.25
+
+
+def _coerce_x_axis_linear_transform(
+    scale: float | None,
+    offset: float | None,
+) -> tuple[float, float]:
+    resolved_scale = 1.0 if scale is None else float(scale)
+    resolved_offset = 0.0 if offset is None else float(offset)
+    if not np.isfinite(resolved_scale):
+        raise ValueError("X-axis scale factor must be finite.")
+    if resolved_scale == 0.0:
+        raise ValueError("X-axis scale factor must not be zero.")
+    if not np.isfinite(resolved_offset):
+        raise ValueError("X-axis offset must be finite.")
+    return resolved_scale, resolved_offset
+
+
+def _base_x_values(
+    x_values: np.ndarray,
+    y_values: np.ndarray,
+) -> np.ndarray:
+    raw_x = np.asarray(x_values, dtype=float)
+    y_array = np.asarray(y_values, dtype=float)
+    if raw_x.size == 0 and y_array.size > 0:
+        raw_x = np.arange(y_array.size, dtype=float)
+    return raw_x
+
+
+def _display_x_values(
+    x_values: np.ndarray,
+    y_values: np.ndarray,
+    *,
+    scale: float,
+    offset: float,
+) -> np.ndarray:
+    return scale * _base_x_values(x_values, y_values) + offset
+
+
 def _error_provenance_family(
     *,
     requested_stat: str | None,
@@ -778,6 +829,146 @@ def _coerce_cumulative_config(value: Any) -> SeriesCumulativeConfig:
         alpha=_alpha,
         line_width=_lw,
         line_style=str(_ls).strip() or None if _ls is not None and str(_ls).strip() else None,
+    )
+
+
+def _coerce_integration_config(value: Any) -> IntegrationConfig:
+    if not isinstance(value, dict):
+        return IntegrationConfig()
+    enabled = bool(value.get("enabled", False))
+    source = str(value.get("source") or "plotted").strip().lower()
+    if source not in {"plotted", "raw"}:
+        raise ValueError("Integration data source must be 'plotted' or 'raw'.")
+    target = str(value.get("target") or "selected").strip().lower()
+    if target != "selected":
+        raise ValueError("Integration target must be 'selected'.")
+
+    def _optional_numeric(key: str) -> float | None:
+        raw = value.get(key)
+        if raw is None or raw == "":
+            return None
+        try:
+            return float(raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Integration {key} must be numeric.") from exc
+
+    x_min = _optional_numeric("x_min")
+    x_max = _optional_numeric("x_max")
+    if x_min is not None and x_max is not None and x_min >= x_max:
+        raise ValueError("Integration x-min must be smaller than integration x-max.")
+    baseline = _optional_numeric("baseline")
+    alpha = _optional_numeric("alpha")
+    if alpha is None:
+        alpha = 0.25
+    if not 0.0 <= alpha <= 1.0:
+        raise ValueError("Integration fill alpha must be between 0 and 1.")
+    color = str(value.get("color") or "").strip() or None
+    target_series_id = str(value.get("target_series_id") or "").strip() or None
+    return IntegrationConfig(
+        enabled=enabled,
+        source=source,
+        target=target,
+        target_series_id=target_series_id,
+        x_min=x_min,
+        x_max=x_max,
+        baseline=0.0 if baseline is None else baseline,
+        color=color,
+        alpha=float(alpha),
+    )
+
+
+def _integration_target_ids(
+    render_items: list[dict[str, Any]],
+    config: IntegrationConfig,
+) -> set[str]:
+    visible_ids = [
+        str(item.get("series_id") or "").strip()
+        for item in render_items
+        if str(item.get("series_id") or "").strip() and bool(item.get("series_enabled", True))
+    ]
+    if config.target_series_id:
+        return {config.target_series_id}
+    return {visible_ids[0]} if visible_ids else set()
+
+
+def _integration_region(
+    x_values: np.ndarray,
+    y_values: np.ndarray,
+    *,
+    x_min: float | None,
+    x_max: float | None,
+    baseline: float,
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+    finite_mask = np.isfinite(x_values) & np.isfinite(y_values)
+    x_finite = np.asarray(x_values[finite_mask], dtype=float)
+    y_finite = np.asarray(y_values[finite_mask], dtype=float)
+    if x_finite.size < 2:
+        return (
+            np.empty(0, dtype=float),
+            np.empty(0, dtype=float),
+            {
+                "status": "empty",
+                "reason": "Fewer than two finite points are available for integration.",
+                "point_count": int(x_finite.size),
+            },
+        )
+
+    order = np.argsort(x_finite, kind="mergesort")
+    x_sorted = x_finite[order]
+    y_sorted = y_finite[order]
+    x_unique, unique_index = np.unique(x_sorted, return_index=True)
+    y_unique = y_sorted[unique_index]
+    if x_unique.size < 2:
+        return (
+            np.empty(0, dtype=float),
+            np.empty(0, dtype=float),
+            {
+                "status": "empty",
+                "reason": "Integration requires at least two distinct finite x-values.",
+                "point_count": int(x_unique.size),
+            },
+        )
+
+    data_min = float(x_unique[0])
+    data_max = float(x_unique[-1])
+    left = data_min if x_min is None else max(float(x_min), data_min)
+    right = data_max if x_max is None else min(float(x_max), data_max)
+    if left >= right:
+        return (
+            np.empty(0, dtype=float),
+            np.empty(0, dtype=float),
+            {
+                "status": "empty",
+                "reason": "Requested integration range does not overlap the available data.",
+                "point_count": 0,
+            },
+        )
+
+    inside_mask = (x_unique > left) & (x_unique < right)
+    region_x = np.concatenate(
+        (
+            np.asarray([left], dtype=float),
+            x_unique[inside_mask],
+            np.asarray([right], dtype=float),
+        )
+    )
+    region_y = np.interp(region_x, x_unique, y_unique)
+    delta_y = region_y - float(baseline)
+    signed_area = _trapezoid_integral(delta_y, region_x)
+    absolute_area = _trapezoid_integral(np.abs(delta_y), region_x)
+    return (
+        region_x,
+        region_y,
+        {
+            "status": "ok",
+            "x_min": float(region_x[0]),
+            "x_max": float(region_x[-1]),
+            "point_count": int(region_x.size),
+            "baseline": float(baseline),
+            "area": signed_area,
+            "signed_area": signed_area,
+            "absolute_area": absolute_area,
+        },
     )
 
 
@@ -2092,7 +2283,10 @@ def plot_line_series(
     x_bin_reducer: str | None = None,
     min_bin_points: int | None = None,
     annotations: list[dict[str, Any]] | None = None,
+    integration_config: dict[str, Any] | None = None,
     style: PlotStyle = DEFAULT_PLOT_STYLE,
+    x_axis_scale: float | None = None,
+    x_axis_offset: float | None = None,
     x_scale: str = "linear",
     y_scale: str = "linear",
     x_lim: tuple[float | None, float | None] | list[float | None] | None = None,
@@ -2168,6 +2362,9 @@ def plot_line_series(
         min_bin_points=min_bin_points,
         line_kwargs=line_kwargs,
         annotations=annotations,
+        integration_config=integration_config,
+        x_axis_scale=x_axis_scale,
+        x_axis_offset=x_axis_offset,
         x_scale=x_scale,
         y_scale=y_scale,
         x_lim=x_lim,
@@ -2512,6 +2709,9 @@ def plot_multi_line_series(
     line_kwargs: dict[str, Any] | None = None,
     series_line_kwargs: list[dict[str, Any] | None] | None = None,
     annotations: list[dict[str, Any]] | None = None,
+    integration_config: dict[str, Any] | None = None,
+    x_axis_scale: float | None = None,
+    x_axis_offset: float | None = None,
     x_scale: str = "linear",
     y_scale: str = "linear",
     x_lim: tuple[float | None, float | None] | list[float | None] | None = None,
@@ -2578,8 +2778,13 @@ def plot_multi_line_series(
         raise ValueError(
             f"series_line_kwargs count must match the number of plotted series ({source_count})."
         )
+    resolved_x_axis_scale, resolved_x_axis_offset = _coerce_x_axis_linear_transform(
+        x_axis_scale,
+        x_axis_offset,
+    )
 
     resolved_line_colors = resolve_series_colors(line_colors, series_count=source_count)
+    default_source_colors = default_series_colors(source_count)
     resolved_fit_configs_source = resolve_series_fit_configs(
         series_count=source_count,
         series_fit_configs=series_fit_configs,
@@ -2591,11 +2796,20 @@ def plot_multi_line_series(
     resolved_error_configs_source = _coerce_error_config_list(source_count, series_error_configs)
     source_entries: dict[str, dict[str, Any]] = {}
     for index in range(source_count):
+        raw_x = np.asarray(x_series[index], dtype=float)
+        y_array = np.asarray(y_series[index], dtype=float)
+        base_x = _base_x_values(raw_x, y_array)
         source_entries[source_ids[index]] = {
             "series_id": source_ids[index],
             "label": str(labels[index]),
-            "x": np.asarray(x_series[index], dtype=float),
-            "y": np.asarray(y_series[index], dtype=float),
+            "x": _display_x_values(
+                base_x,
+                y_array,
+                scale=resolved_x_axis_scale,
+                offset=resolved_x_axis_offset,
+            ),
+            "raw_x": base_x,
+            "y": y_array,
             "statistics": (
                 None if series_statistics_data is None else series_statistics_data[index]
             ),
@@ -2606,7 +2820,11 @@ def plot_multi_line_series(
             "show_in_legend": (
                 True if series_show_in_legend is None else bool(series_show_in_legend[index])
             ),
-            "line_color": (None if resolved_line_colors is None else resolved_line_colors[index]),
+            "line_color": (
+                resolved_line_colors[index]
+                if resolved_line_colors is not None
+                else default_source_colors[index]
+            ),
             "line_width": None if series_line_widths is None else series_line_widths[index],
             "marker": None if series_markers is None else series_markers[index],
             "line_kwargs": None if series_line_kwargs is None else series_line_kwargs[index],
@@ -2700,10 +2918,13 @@ def plot_multi_line_series(
             "kind": "source",
             "source_series_id": source_series_id,
             "x": np.asarray(source_entry["x"], dtype=float),
+            "raw_x": np.asarray(source_entry["raw_x"], dtype=float),
             "y": np.asarray(source_entry["y"], dtype=float),
             "statistics": source_entry["statistics"],
             "raw_statistics": bool(source_entry["raw_statistics"]),
-            "line_visible": bool(current_override.get("enabled", source_entry["line_visible"]))
+            "series_enabled": bool(current_override.get("enabled", True)),
+            "line_visible": bool(current_override.get("enabled", True))
+            and bool(source_entry["line_visible"])
             and bool(current_override.get("show_raw_line", True)),
             "show_in_legend": bool(
                 current_override.get("show_in_legend", source_entry["show_in_legend"])
@@ -2729,6 +2950,11 @@ def plot_multi_line_series(
             "line_kwargs": line_kwargs_value,
             "fit_config": fit_config,
             "cumulative_config": _coerce_cumulative_config(cumulative_value),
+            "integration_config": _coerce_integration_config(
+                current_override.get("integration")
+                if isinstance(current_override.get("integration"), dict)
+                else None
+            ),
             "error_config": _coerce_error_config(
                 current_override.get("error")
                 if isinstance(current_override.get("error"), dict)
@@ -2797,6 +3023,7 @@ def plot_multi_line_series(
                     "group_reducer": _resolve_reducer_name(
                         str(descriptor.get("group_reducer") or "mean").strip().lower() or "mean"
                     ),
+                    "series_enabled": bool(current_override.get("enabled", True)),
                     "line_visible": bool(current_override.get("enabled", True)),
                     "show_in_legend": bool(current_override.get("show_in_legend", True)),
                     "line_color": (
@@ -2889,6 +3116,7 @@ def plot_multi_line_series(
         str(item["series_id"]): item["prepared"]
         for item in source_render_items
         if isinstance(item.get("prepared"), PreparedLineSeries)
+        and bool(item.get("series_enabled", True))
     }
     for item in render_items:
         if item["kind"] != "group":
@@ -2954,6 +3182,8 @@ def plot_multi_line_series(
         point_counts_map: dict[str, list[int]] = {}
         masked_bin_counts: dict[str, int] = {}
         grouped_summaries: dict[str, dict[str, Any]] = {}
+        integration_summaries: list[dict[str, Any]] = []
+        integration_seen_ids: set[str] = set()
         for item in render_items:
             prepared_item = item.get("prepared")
             if not isinstance(prepared_item, PreparedLineSeries):
@@ -2969,6 +3199,7 @@ def plot_multi_line_series(
                 ).tolist()
             masked_bin_counts[fit_key] = int(prepared_item.masked_bin_count)
             is_group = str(item.get("kind") or "source") == "group"
+            layer_enabled = bool(item.get("series_enabled", True))
             line_visible = bool(item.get("line_visible", True))
             if is_group:
                 grouped_summaries[fit_key] = {
@@ -3005,10 +3236,85 @@ def plot_multi_line_series(
                 rendered_colors.append(str(artist.get_color()))
                 rendered_markers.append(str(artist.get_marker()))
                 rendered_labels.append(str(artist.get_label()))
+            item_integration_config: IntegrationConfig = item.get(
+                "integration_config", IntegrationConfig()
+            )
+            if item_integration_config.enabled:
+                integration_seen_ids.add(fit_key)
+                summary: dict[str, Any] = {
+                    "series_id": fit_key,
+                    "label": label,
+                    "source": item_integration_config.source,
+                    "target": "self",
+                    "enabled": True,
+                }
+                if not layer_enabled:
+                    summary.update(
+                        {
+                            "status": "unavailable",
+                            "reason": "Target series is disabled.",
+                        }
+                    )
+                    integration_summaries.append(summary)
+                elif item_integration_config.source == "raw" and is_group:
+                    summary.update(
+                        {
+                            "status": "unavailable",
+                            "reason": (
+                                "Raw-profile integration is unavailable for grouped series; "
+                                "use plotted data instead."
+                            ),
+                        }
+                    )
+                    integration_summaries.append(summary)
+                else:
+                    integration_x = (
+                        np.asarray(item.get("raw_x"), dtype=float)
+                        if item_integration_config.source == "raw"
+                        else x_values
+                    )
+                    integration_y = (
+                        np.asarray(item.get("y"), dtype=float)
+                        if item_integration_config.source == "raw"
+                        else y_values
+                    )
+                    region_x, region_y, region_summary = _integration_region(
+                        integration_x,
+                        integration_y,
+                        x_min=item_integration_config.x_min,
+                        x_max=item_integration_config.x_max,
+                        baseline=item_integration_config.baseline,
+                    )
+                    summary.update(region_summary)
+                    if region_summary.get("status") == "ok":
+                        fill_color = item_integration_config.color or str(
+                            artist.get_color()
+                            if artist is not None
+                            else kwargs.get("color", style.line_color)
+                        )
+                        summary["color"] = fill_color
+                        summary["alpha"] = float(item_integration_config.alpha)
+                        if artist is not None:
+                            zorder = float(artist.get_zorder()) - 0.5
+                        else:
+                            try:
+                                zorder = float(kwargs.get("zorder", 2)) - 0.5
+                            except (TypeError, ValueError):
+                                zorder = 1.5
+                        ax.fill_between(
+                            region_x,
+                            np.full_like(region_x, item_integration_config.baseline),
+                            region_y,
+                            color=fill_color,
+                            alpha=item_integration_config.alpha,
+                            label="_nolegend_",
+                            zorder=zorder,
+                        )
+                    integration_summaries.append(summary)
             series_stats[fit_key] = _series_statistics(x_values, y_values)
             if (
                 not is_group
-                and line_visible
+                and layer_enabled
                 and prepared_item.error_config.enabled
                 and prepared_item.error_status == "ok"
                 and prepared_item.statistics is not None
@@ -3112,7 +3418,7 @@ def plot_multi_line_series(
                 error_summaries[fit_key] = {
                     "enabled": False if is_group else bool(prepared_item.error_config.enabled),
                     "status": (
-                        "disabled" if is_group or not line_visible else prepared_item.error_status
+                        "disabled" if is_group or not layer_enabled else prepared_item.error_status
                     ),
                     "statistics_mode": prepared_item.statistics_mode,
                     "provenance_family": _error_provenance_family(
@@ -3127,13 +3433,20 @@ def plot_multi_line_series(
                     "reason": (
                         "Grouped series do not render error overlays."
                         if is_group
-                        else "Base series is hidden."
-                        if not line_visible and prepared_item.error_config.enabled
+                        else "Series is disabled."
+                        if not layer_enabled and prepared_item.error_config.enabled
                         else prepared_item.error_reason
                     ),
                 }
             fit_config = dict(item.get("fit_config") or {})
-            if not bool(fit_config.get("fit_enabled")):
+            if not layer_enabled:
+                fit_summaries[fit_key] = {
+                    "fit_enabled": bool(fit_config.get("fit_enabled")),
+                    "status": "disabled",
+                    "fit_type": str(fit_config.get("fit_type") or "linear"),
+                    "point_count": 0,
+                }
+            elif not bool(fit_config.get("fit_enabled")):
                 fit_summaries[fit_key] = {
                     "fit_enabled": False,
                     "status": "off",
@@ -3193,7 +3506,11 @@ def plot_multi_line_series(
                     )
 
             cumulative_config = item.get("cumulative_config")
-            if isinstance(cumulative_config, SeriesCumulativeConfig) and cumulative_config.enabled:
+            if (
+                layer_enabled
+                and isinstance(cumulative_config, SeriesCumulativeConfig)
+                and cumulative_config.enabled
+            ):
                 cumulative_x, cumulative_y = _build_cumulative_series(x_values, y_values)
                 cumulative_label = cumulative_config.label_override or f"{label} cumulative average"
                 cumulative_summaries[fit_key] = {
@@ -3232,8 +3549,12 @@ def plot_multi_line_series(
                     ax.plot(cumulative_x, cumulative_y, **cumulative_kwargs)
             else:
                 cumulative_summaries[fit_key] = {
-                    "enabled": False,
-                    "status": "off",
+                    "enabled": (
+                        bool(cumulative_config.enabled)
+                        if isinstance(cumulative_config, SeriesCumulativeConfig)
+                        else False
+                    ),
+                    "status": "disabled" if not layer_enabled else "off",
                     "point_count": 0,
                 }
 
@@ -3388,7 +3709,10 @@ def plot_multi_line_series(
             capture_state["series_point_counts"] = point_counts_map
             capture_state["series_masked_bin_counts"] = masked_bin_counts
             capture_state["series_group_summaries"] = grouped_summaries
+            capture_state["integration_summaries"] = list(integration_summaries)
             capture_state["annotations_summary"] = list(annotation_summaries)
+            capture_state["x_axis_scale"] = float(resolved_x_axis_scale)
+            capture_state["x_axis_offset"] = float(resolved_x_axis_offset)
 
         output_path = None
         if output is not None:

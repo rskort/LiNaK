@@ -83,6 +83,21 @@ valid cell is resolved, and cache the default frame-wise surface reference
 cached surface when their requested surface settings match; explicit different
 surface settings recompute the surface instead.
 
+## Plot Studio Notes
+
+When you open an analysis HDF5 with `linak plot`, LiNaK Studio edits a saved
+plot profile rather than the underlying analysis arrays. In practice this means:
+
+- `Layers` changes how each stored series is rendered
+- `Annotations` adds figure-level text, line, and arrow overlays
+- `Figure` changes axes, legend, styling, and export presentation
+- named plot profiles round-trip through the HDF5 file
+
+Per-layer visibility, raw-line visibility, fits, uncertainty, cumulative lines,
+groups, and annotations are all previewed live and are persisted as part of the
+plot profile. Turning a raw line off hides only that base line; other derived
+overlays for the same enabled layer can still render if they are turned on.
+
 ### Combined HDF5 Files
 
 For combined HDF5 files, LiNaK does not merge the underlying arrays into one

@@ -15,6 +15,9 @@ import numpy as np
 from ..plot.plotting import (
     DEFAULT_PLOT_STYLE,
     PlotStyle,
+    _apply_minor_tick_modes,
+    _axis_tick_params,
+    _extract_tick_controls,
     _render_plot_annotations,
     _sanitize_line_collection_kwargs,
     configure_matplotlib_backend,
@@ -912,6 +915,107 @@ def _deduplicate_ordered_pairs(
     dedup_j = sorted_j[starts]
     dedup_d = np.minimum.reduceat(sorted_d, starts)
     return dedup_i, dedup_j, dedup_d
+
+
+def _expand_time_distance_render_layers(
+    profiles: list[CoordinationProfile],
+    *,
+    series_ids: list[str] | None,
+    render_series_descriptors: list[dict[str, Any]] | None,
+    series_enabled: list[bool] | None,
+    series_line_widths: list[float | None] | None,
+    series_markers: list[str | None] | None,
+    series_normalization_modes: list[str | None] | None,
+    series_normalization_values: list[float | None] | None,
+    series_normalization_x_refs: list[float | None] | None,
+) -> tuple[
+    list[CoordinationProfile],
+    list[bool] | None,
+    list[float | None] | None,
+    list[str | None] | None,
+    list[str | None] | None,
+    list[float | None] | None,
+    list[float | None] | None,
+]:
+    if not render_series_descriptors:
+        return (
+            profiles,
+            series_enabled,
+            series_line_widths,
+            series_markers,
+            series_normalization_modes,
+            series_normalization_values,
+            series_normalization_x_refs,
+        )
+
+    source_ids = (
+        [str(series_id) for series_id in series_ids]
+        if series_ids is not None
+        else [f"series:{index}" for index in range(len(profiles))]
+    )
+    if len(source_ids) != len(profiles):
+        return (
+            profiles,
+            series_enabled,
+            series_line_widths,
+            series_markers,
+            series_normalization_modes,
+            series_normalization_values,
+            series_normalization_x_refs,
+        )
+
+    source_by_id = {
+        series_id: (index, profile)
+        for index, (series_id, profile) in enumerate(zip(source_ids, profiles))
+    }
+    render_indices: list[int] = []
+    source_indices: list[int] = []
+    expanded_profiles: list[CoordinationProfile] = []
+    for render_index, descriptor in enumerate(render_series_descriptors):
+        if str(descriptor.get("source_kind") or "source").strip().lower() == "group":
+            continue
+        source_id = str(
+            descriptor.get("source_series_id") or descriptor.get("series_id") or ""
+        ).strip()
+        source_entry = source_by_id.get(source_id)
+        if source_entry is None:
+            continue
+        source_index, source_profile = source_entry
+        render_indices.append(render_index)
+        source_indices.append(source_index)
+        expanded_profiles.append(source_profile)
+
+    if not expanded_profiles:
+        return (
+            profiles,
+            series_enabled,
+            series_line_widths,
+            series_markers,
+            series_normalization_modes,
+            series_normalization_values,
+            series_normalization_x_refs,
+        )
+
+    def _expand_values(values: list[Any] | None) -> list[Any] | None:
+        if values is None:
+            return None
+        if len(values) == len(render_series_descriptors):
+            return [values[index] for index in render_indices]
+        if len(values) == len(profiles):
+            return [values[index] for index in source_indices]
+        if len(values) == len(expanded_profiles):
+            return list(values)
+        return values
+
+    return (
+        expanded_profiles,
+        _expand_values(series_enabled),
+        _expand_values(series_line_widths),
+        _expand_values(series_markers),
+        _expand_values(series_normalization_modes),
+        _expand_values(series_normalization_values),
+        _expand_values(series_normalization_x_refs),
+    )
 
 
 def _compute_coordination_frame_values(
@@ -1899,14 +2003,18 @@ def _plot_coordination_time_distance_projection(
     y_ticks: list[float] | tuple[float, ...] | None,
     x_tick_rotation: float | None,
     y_tick_rotation: float | None,
+    x_label_font_size: int | None,
+    y_label_font_size: int | None,
     x_label_pad: float | None,
     y_label_pad: float | None,
     title_visible: bool | None,
     ticks_visible: bool | None,
     line_colors: list[str] | None,
+    series_ids: list[str] | None,
     series_enabled: list[bool] | None,
     series_line_widths: list[float | None] | None,
     series_markers: list[str | None] | None,
+    render_series_descriptors: list[dict[str, Any]] | None,
     series_normalization_modes: list[str | None] | None,
     series_normalization_values: list[float | None] | None,
     series_normalization_x_refs: list[float | None] | None,
@@ -1926,6 +2034,26 @@ def _plot_coordination_time_distance_projection(
 ) -> Path | None:
     if not profiles:
         raise ValueError("At least one coordination profile is required.")
+
+    (
+        profiles,
+        series_enabled,
+        series_line_widths,
+        series_markers,
+        series_normalization_modes,
+        series_normalization_values,
+        series_normalization_x_refs,
+    ) = _expand_time_distance_render_layers(
+        profiles,
+        series_ids=series_ids,
+        render_series_descriptors=render_series_descriptors,
+        series_enabled=series_enabled,
+        series_line_widths=series_line_widths,
+        series_markers=series_markers,
+        series_normalization_modes=series_normalization_modes,
+        series_normalization_values=series_normalization_values,
+        series_normalization_x_refs=series_normalization_x_refs,
+    )
 
     series_total = sum(max(0, int(profile.n_atoms)) for profile in profiles)
     if series_enabled is not None and len(series_enabled) != series_total:
@@ -2066,8 +2194,8 @@ def _plot_coordination_time_distance_projection(
             colorbar.set_label("Coordination number", fontsize=style.label_font_size)
             colorbar.ax.tick_params(labelsize=style.tick_font_size)
 
-        xlabel_kwargs: dict[str, Any] = {"fontsize": style.label_font_size}
-        ylabel_kwargs: dict[str, Any] = {"fontsize": style.label_font_size}
+        xlabel_kwargs: dict[str, Any] = {"fontsize": x_label_font_size or style.label_font_size}
+        ylabel_kwargs: dict[str, Any] = {"fontsize": y_label_font_size or style.label_font_size}
         if x_label_pad is not None:
             xlabel_kwargs["labelpad"] = float(x_label_pad)
         if y_label_pad is not None:
@@ -2090,28 +2218,31 @@ def _plot_coordination_time_distance_projection(
             )
 
         ax.tick_params(axis="both", labelsize=style.tick_font_size)
-        resolved_tick_params = dict(tick_params_kwargs) if tick_params_kwargs is not None else {}
-        tick_axis_hint = str(resolved_tick_params.pop("_ticks_axis", "both")).strip().lower()
-        if tick_axis_hint not in {"x", "y", "both"}:
-            tick_axis_hint = "both"
-        minor_ticks_mode = (
-            str(resolved_tick_params.pop("_minor_ticks_mode", "auto")).strip().lower()
+        resolved_tick_params, tick_axis_hint, minor_ticks_mode = _extract_tick_controls(
+            tick_params_kwargs
         )
-        if minor_ticks_mode == "on":
-            ax.minorticks_on()
-        elif minor_ticks_mode == "off":
-            ax.minorticks_off()
+        x_axis_tick_params = _axis_tick_params(tick_params_kwargs, "x")
+        y_axis_tick_params = _axis_tick_params(tick_params_kwargs, "y")
+        if x_tick_rotation is not None:
+            x_axis_tick_params["rotation"] = float(x_tick_rotation)
+        if y_tick_rotation is not None:
+            y_axis_tick_params["rotation"] = float(y_tick_rotation)
         if resolved_tick_params:
             ax.tick_params(**resolved_tick_params)
+        if x_axis_tick_params:
+            ax.tick_params(axis="x", **x_axis_tick_params)
+        if y_axis_tick_params:
+            ax.tick_params(axis="y", **y_axis_tick_params)
+        _apply_minor_tick_modes(
+            ax,
+            tick_params_kwargs=tick_params_kwargs,
+            fallback_mode=minor_ticks_mode,
+        )
         if ticks_visible is False:
             if tick_axis_hint in {"both", "x"}:
                 ax.tick_params(axis="x", which="both", bottom=False, top=False, labelbottom=False)
             if tick_axis_hint in {"both", "y"}:
                 ax.tick_params(axis="y", which="both", left=False, right=False, labelleft=False)
-        if x_tick_rotation is not None:
-            ax.tick_params(axis="x", rotation=float(x_tick_rotation))
-        if y_tick_rotation is not None:
-            ax.tick_params(axis="y", rotation=float(y_tick_rotation))
 
         if style.grid:
             resolved_grid_kwargs: dict[str, Any] = {
@@ -2219,8 +2350,12 @@ def plot_coordination_profile(
     y_ticks: list[float] | tuple[float, ...] | None = None,
     x_tick_rotation: float | None = None,
     y_tick_rotation: float | None = None,
+    x_label_font_size: int | None = None,
+    y_label_font_size: int | None = None,
     x_label_pad: float | None = None,
     y_label_pad: float | None = None,
+    x_axis_scale: float | None = None,
+    x_axis_offset: float | None = None,
     title_visible: bool | None = None,
     ticks_visible: bool | None = None,
     markers: bool | None = None,
@@ -2246,6 +2381,7 @@ def plot_coordination_profile(
     x_bin_reducer: str | None = None,
     min_bin_points: int | None = None,
     annotations: list[dict[str, Any]] | None = None,
+    integration_config: dict[str, Any] | None = None,
     capture_state: dict[str, Any] | None = None,
     suppress_output_log: bool = False,
     matplotlib_rc: dict[str, Any] | None = None,
@@ -2279,14 +2415,18 @@ def plot_coordination_profile(
             y_ticks=y_ticks,
             x_tick_rotation=x_tick_rotation,
             y_tick_rotation=y_tick_rotation,
+            x_label_font_size=x_label_font_size,
+            y_label_font_size=y_label_font_size,
             x_label_pad=x_label_pad,
             y_label_pad=y_label_pad,
             title_visible=title_visible,
             ticks_visible=ticks_visible,
             line_colors=line_colors,
+            series_ids=[series_id] if series_id is not None else None,
             series_enabled=series_enabled,
             series_line_widths=series_line_widths,
             series_markers=series_markers,
+            render_series_descriptors=render_series_descriptors,
             series_normalization_modes=series_normalization_modes,
             series_normalization_values=series_normalization_values,
             series_normalization_x_refs=series_normalization_x_refs,
@@ -2346,6 +2486,7 @@ def plot_coordination_profile(
             min_bin_points=min_bin_points,
             analysis_name="coordination",
             annotations=annotations,
+            integration_config=integration_config,
             x_scale=x_scale,
             y_scale=y_scale,
             x_lim=x_lim,
@@ -2354,6 +2495,8 @@ def plot_coordination_profile(
             y_ticks=y_ticks,
             x_tick_rotation=x_tick_rotation,
             y_tick_rotation=y_tick_rotation,
+            x_label_font_size=x_label_font_size,
+            y_label_font_size=y_label_font_size,
             x_label_pad=x_label_pad,
             y_label_pad=y_label_pad,
             title_visible=title_visible,
@@ -2410,6 +2553,7 @@ def plot_coordination_profile(
         min_bin_points=min_bin_points,
         analysis_name="coordination",
         annotations=annotations,
+        integration_config=integration_config,
         style=style,
         x_scale=x_scale,
         y_scale=y_scale,
@@ -2419,8 +2563,12 @@ def plot_coordination_profile(
         y_ticks=y_ticks,
         x_tick_rotation=x_tick_rotation,
         y_tick_rotation=y_tick_rotation,
+        x_label_font_size=x_label_font_size,
+        y_label_font_size=y_label_font_size,
         x_label_pad=x_label_pad,
         y_label_pad=y_label_pad,
+        x_axis_scale=x_axis_scale,
+        x_axis_offset=x_axis_offset,
         title_visible=title_visible,
         ticks_visible=ticks_visible,
         markers=markers,
@@ -2461,8 +2609,12 @@ def plot_coordination_profiles(
     y_ticks: list[float] | tuple[float, ...] | None = None,
     x_tick_rotation: float | None = None,
     y_tick_rotation: float | None = None,
+    x_label_font_size: int | None = None,
+    y_label_font_size: int | None = None,
     x_label_pad: float | None = None,
     y_label_pad: float | None = None,
+    x_axis_scale: float | None = None,
+    x_axis_offset: float | None = None,
     title_visible: bool | None = None,
     ticks_visible: bool | None = None,
     markers: bool | None = None,
@@ -2488,6 +2640,7 @@ def plot_coordination_profiles(
     x_bin_reducer: str | None = None,
     min_bin_points: int | None = None,
     annotations: list[dict[str, Any]] | None = None,
+    integration_config: dict[str, Any] | None = None,
     capture_state: dict[str, Any] | None = None,
     suppress_output_log: bool = False,
     matplotlib_rc: dict[str, Any] | None = None,
@@ -2525,14 +2678,18 @@ def plot_coordination_profiles(
             y_ticks=y_ticks,
             x_tick_rotation=x_tick_rotation,
             y_tick_rotation=y_tick_rotation,
+            x_label_font_size=x_label_font_size,
+            y_label_font_size=y_label_font_size,
             x_label_pad=x_label_pad,
             y_label_pad=y_label_pad,
             title_visible=title_visible,
             ticks_visible=ticks_visible,
             line_colors=line_colors,
+            series_ids=series_ids,
             series_enabled=series_enabled,
             series_line_widths=series_line_widths,
             series_markers=series_markers,
+            render_series_descriptors=render_series_descriptors,
             series_normalization_modes=series_normalization_modes,
             series_normalization_values=series_normalization_values,
             series_normalization_x_refs=series_normalization_x_refs,
@@ -2551,7 +2708,8 @@ def plot_coordination_profiles(
             savefig_kwargs=savefig_kwargs,
         )
 
-    if len(profiles) == 1:
+    use_gui_render_layers = bool(render_series_descriptors) or bool(series_overrides_by_id)
+    if len(profiles) == 1 and not use_gui_render_layers:
         single_series_labels = series_labels
         if (
             normalized_component == "distance"
@@ -2579,8 +2737,12 @@ def plot_coordination_profiles(
             y_ticks=y_ticks,
             x_tick_rotation=x_tick_rotation,
             y_tick_rotation=y_tick_rotation,
+            x_label_font_size=x_label_font_size,
+            y_label_font_size=y_label_font_size,
             x_label_pad=x_label_pad,
             y_label_pad=y_label_pad,
+            x_axis_scale=x_axis_scale,
+            x_axis_offset=x_axis_offset,
             title_visible=title_visible,
             ticks_visible=ticks_visible,
             markers=markers,
@@ -2609,6 +2771,7 @@ def plot_coordination_profiles(
             x_bin_reducer=x_bin_reducer,
             min_bin_points=min_bin_points,
             annotations=annotations,
+            integration_config=integration_config,
             capture_state=capture_state,
             suppress_output_log=suppress_output_log,
             matplotlib_rc=matplotlib_rc,
@@ -2668,6 +2831,7 @@ def plot_coordination_profiles(
             min_bin_points=min_bin_points,
             analysis_name="coordination",
             annotations=annotations,
+            integration_config=integration_config,
             x_scale=x_scale,
             y_scale=y_scale,
             x_lim=x_lim,
@@ -2676,8 +2840,12 @@ def plot_coordination_profiles(
             y_ticks=y_ticks,
             x_tick_rotation=x_tick_rotation,
             y_tick_rotation=y_tick_rotation,
+            x_label_font_size=x_label_font_size,
+            y_label_font_size=y_label_font_size,
             x_label_pad=x_label_pad,
             y_label_pad=y_label_pad,
+            x_axis_scale=x_axis_scale,
+            x_axis_offset=x_axis_offset,
             title_visible=title_visible,
             ticks_visible=ticks_visible,
             markers=markers,
@@ -2743,6 +2911,7 @@ def plot_coordination_profiles(
         min_bin_points=min_bin_points,
         analysis_name="coordination",
         annotations=annotations,
+        integration_config=integration_config,
         x_scale=x_scale,
         y_scale=y_scale,
         x_lim=x_lim,
