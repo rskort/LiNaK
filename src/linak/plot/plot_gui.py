@@ -49,10 +49,50 @@ _TOGGLE_MODES = ("on", "off")
 _BORDER_MODES = ("on", "off", "custom")
 _SYNC_MODES = ("Auto", "Manual")
 _TEXT_SYNC_MODES = ("Auto", "Manual", "Off")
+_MARKER_TYPES = (
+    "",
+    ".",
+    ",",
+    "o",
+    "v",
+    "^",
+    "<",
+    ">",
+    "1",
+    "2",
+    "3",
+    "4",
+    "8",
+    "s",
+    "p",
+    "P",
+    "*",
+    "h",
+    "H",
+    "+",
+    "x",
+    "X",
+    "D",
+    "d",
+    "|",
+    "_",
+)
 _FIT_TYPES = supported_fit_types()
 _FIT_RANGE_MODES = ("visible", "manual")
 _ERROR_STATS = ("sample_sem", "sample_std", "block_sem", "block_std")
+_ERROR_STAT_DISPLAY: dict[str, str] = {
+    "sample_sem": "Sample SEM",
+    "sample_std": "Sample Std. Dev.",
+    "block_sem": "Block SEM",
+    "block_std": "Block Std. Dev.",
+}
+_ERROR_STAT_INTERNAL: dict[str, str] = {v: k for k, v in _ERROR_STAT_DISPLAY.items()}
 _ERROR_STYLES = ("band", "whiskers")
+_ERROR_STYLE_DISPLAY: dict[str, str] = {
+    "band": "Shaded band",
+    "whiskers": "Whiskers",
+}
+_ERROR_STYLE_INTERNAL: dict[str, str] = {v: k for k, v in _ERROR_STYLE_DISPLAY.items()}
 _GROUP_REDUCERS = ("mean", "median", "sum", "min", "max")
 _INTEGRATION_SOURCES = ("Plotted data", "Raw profile data")
 _INTEGRATION_SOURCE_BY_LABEL = {
@@ -69,9 +109,14 @@ _ANNOTATION_LINE_STYLES = ("-", "--", "-.", ":")
 _ANNOTATION_ARROW_STYLES = ("->", "-|>", "<->", "simple", "fancy")
 _ANNOTATION_HORIZONTAL_ALIGN = ("left", "center", "right")
 _ANNOTATION_VERTICAL_ALIGN = ("top", "center", "bottom", "baseline")
+_POSITION_COMPONENT_LABELS = ("distance", "x", "y", "z", "2D projection")
+_POSITION_PROJECTION_QUANTITIES = ("x", "y", "z", "distance", "ps", "fs", "step", "frame")
+_POSITION_PROJECTION_RENDER_MODES = ("color-scale", "line-colors")
 _PROFILE_FILTER_METADATA_LABEL = "Use stored metadata"
 _PROFILE_FILTER_SPECIES_B_AUTO_LABEL = "Same as Species A / stored metadata"
 _AUTO_PREVIEW_DEBOUNCE_MS = 1000
+_WORKSPACE_PANEL_WIDTH = 760
+_WORKSPACE_PANEL_MIN_WIDTH = 520
 _HEATMAP_NORMALIZATION_LABEL_BY_MODE = {
     "counts": "Raw frequencies",
     "global_probability": "Global normalization",
@@ -142,6 +187,8 @@ _TOOLTIPS: dict[str, str] = {
     "profiles.duplicate": "Copies the current profile under a new name.",
     "profiles.delete": "Deletes the current profile.",
     "profiles.save": "Saves the current settings to this profile.",
+    "profiles.undo": "Reverts the most recent GUI change in this session.",
+    "profiles.redo": "Reapplies the most recently undone GUI change in this session.",
     "profiles.reset": "Restores the default plot settings.",
     "profiles.import": "Loads profile settings from a JSON file.",
     "profiles.export_json": "Saves this profile to a JSON file.",
@@ -157,7 +204,13 @@ _TOOLTIPS: dict[str, str] = {
     "data.coordination.species_b": "Chooses the neighbor species in the stored profile.",
     "data.coordination.axis": "Chooses which stored axis profile to load.",
     "data.position.component": "Chooses which position component to plot.",
-    "data.position.color_by": "Chooses what colors the xy-z map.",
+    "data.position.color_by": "Chooses which quantity is used for projection coloring or range filtering.",
+    "data.position.xy_z_distance_max": "Legacy distance cutoff for the projection view. Use the range controls for the general case.",
+    "data.position.projection_x": "Chooses which quantity is shown on the horizontal axis in 2-D projection mode.",
+    "data.position.projection_y": "Chooses which quantity is shown on the vertical axis in 2-D projection mode.",
+    "data.position.projection_render_mode": "Chooses between a continuous colormap view and normal per-atom line colors.",
+    "data.position.projection_range_min": "Optional lower bound for the selected projection value quantity.",
+    "data.position.projection_range_max": "Optional upper bound for the selected projection value quantity.",
     "data.position.time_axis": "Chooses the time unit on the x-axis.",
     "data.coordination.component": "Chooses which coordination view to plot.",
     "data.coordination.time_axis": "Chooses the time unit on the x-axis.",
@@ -183,11 +236,11 @@ _TOOLTIPS: dict[str, str] = {
     "series.alpha": "Sets the line transparency for this series.",
     "series.line_width": "Sets the line width for this series.",
     "series.marker": "Sets the marker shape for this series.",
-    "series.error_enabled": "Turns uncertainty display for this series on or off.",
-    "series.error_stat": "Chooses the uncertainty statistic. sample_* uses sample spread or SEM, block_* uses contiguous frame-block spread or SEM when saved by the analysis.",
-    "series.error_style": "Chooses whether uncertainty is shown as a shaded band or whiskers around the current series.",
-    "series.error_color": "Sets a separate error-overlay color. Leave blank to follow the base series color.",
-    "series.error.summary": "Shows which uncertainty is currently rendered, what data it is computed from, and any fallback or availability reason.",
+    "series.error_enabled": "Toggle the uncertainty overlay for this series.",
+    "series.error_stat": "Select the uncertainty measure. Sample-based statistics reflect frame-to-frame variation; block-based statistics use averages over contiguous trajectory blocks.",
+    "series.error_style": "Display uncertainty as a shaded band or as whisker bars.",
+    "series.error_color": "Set a custom color for the uncertainty overlay, or leave blank to match the series color.",
+    "series.error.summary": "Summary of the active uncertainty overlay, including the statistic used, its data source, and any availability notes.",
     "series.fit_enabled": "Turns fitting for this series on or off.",
     "series.fit_type": "Chooses the fitting model.",
     "series.fit_degree": "Sets the polynomial degree.",
@@ -246,6 +299,7 @@ _TOOLTIPS: dict[str, str] = {
     "figure.text.x_label": "Sets the x-axis label.",
     "figure.text.y_label": "Sets the y-axis label.",
     "figure.text.title_font": "Sets the title font size.",
+    "figure.text.title_pad": "Sets the space between the graph and the title in points.",
     "figure.text.label_font": "Sets the axis label font size.",
     "figure.legend.enabled": "Shows or hides the legend.",
     "figure.legend.title": "Sets the legend title.",
@@ -997,10 +1051,11 @@ def _resolve_error_stat_for_available(
 
 
 def _default_error_series_label(base_label: str, stat: str) -> str:
-    """Return the default derived label for one error-bar child series."""
+    """Return the default derived label for one uncertainty child series."""
     resolved_label = str(base_label).strip() or "Series"
     resolved_stat = _resolve_error_stat_for_available(stat, None)
-    return f"{resolved_label} {resolved_stat}"
+    friendly = _ERROR_STAT_DISPLAY.get(resolved_stat, resolved_stat)
+    return f"{resolved_label} \u00b1{friendly}"
 
 
 def _error_supported_for_view(
@@ -1017,10 +1072,43 @@ def _error_supported_for_view(
     if normalized_analysis == "orientation":
         return not bool(orientation_heatmap)
     if normalized_analysis == "position":
-        return str(position_component).strip().lower() != "xy-z"
+        return not _is_position_projection_component(position_component)
     if normalized_analysis == "coordination":
         return str(coordination_component).strip().lower() != "time-distance"
     return False
+
+
+def _is_position_projection_component(value: Any) -> bool:
+    token = str(value or "").strip().lower().replace("_", "-").replace(" ", "-")
+    return token in {
+        "xy-z",
+        "xy-z-color",
+        "xy-z-colormap",
+        "trajectory",
+        "xyz",
+        "2d-projection",
+        "2dprojection",
+        "projection-2d",
+        "projection2d",
+        "projection",
+        "2d",
+    }
+
+
+def _position_component_setting_value(value: Any) -> str:
+    return (
+        "2d-projection"
+        if _is_position_projection_component(value)
+        else (str(value or "distance").strip().lower() or "distance")
+    )
+
+
+def _position_component_display_value(value: Any) -> str:
+    return (
+        "2D projection"
+        if _is_position_projection_component(value)
+        else (str(value or "distance").strip().lower() or "distance")
+    )
 
 
 @dataclass(frozen=True)
@@ -1059,7 +1147,7 @@ def _plot_family_for_view(
     normalized_analysis = str(analysis).strip().lower()
     if normalized_analysis == "orientation" and orientation_heatmap:
         return "heatmap"
-    if normalized_analysis == "position" and str(position_component).strip().lower() == "xy-z":
+    if normalized_analysis == "position" and _is_position_projection_component(position_component):
         return "projection2d"
     if normalized_analysis == "coordination":
         component = str(coordination_component).strip().lower()
@@ -1122,16 +1210,34 @@ def _derive_warning_messages(
     if not isinstance(settings, dict):
         return messages
 
-    normalization_modes = settings.get("series_normalization_modes")
-    if isinstance(normalization_modes, (list, tuple)):
-        enabled_values = settings.get("series_enabled")
-        visible_modes = [
-            str(mode).strip().lower()
-            for index, mode in enumerate(normalization_modes)
-            if not isinstance(enabled_values, (list, tuple))
-            or index >= len(enabled_values)
-            or bool(enabled_values[index])
-        ]
+    if str(settings.get("component") or "").strip().lower() != "heatmap":
+        visible_modes: list[str] = []
+        series_overrides = settings.get("series_overrides")
+        series_descriptors = settings.get("series_descriptors")
+        if isinstance(series_overrides, dict) and isinstance(series_descriptors, list):
+            for raw_descriptor in series_descriptors:
+                if not isinstance(raw_descriptor, dict):
+                    continue
+                series_id = str(raw_descriptor.get("series_id") or "").strip()
+                if not series_id:
+                    continue
+                entry = series_overrides.get(series_id)
+                if not isinstance(entry, dict):
+                    continue
+                if entry.get("enabled") is False:
+                    continue
+                visible_modes.append(str(entry.get("normalization_mode") or "none").strip().lower())
+        else:
+            normalization_modes = settings.get("series_normalization_modes")
+            if isinstance(normalization_modes, (list, tuple)):
+                enabled_values = settings.get("series_enabled")
+                visible_modes = [
+                    str(mode).strip().lower()
+                    for index, mode in enumerate(normalization_modes)
+                    if not isinstance(enabled_values, (list, tuple))
+                    or index >= len(enabled_values)
+                    or bool(enabled_values[index])
+                ]
         normalized_count = sum(1 for mode in visible_modes if mode != "none")
         if len(visible_modes) > 1 and 0 < normalized_count < len(visible_modes):
             messages.append(
@@ -1281,11 +1387,13 @@ def launch_plot_settings_panel(
             QDoubleValidator,
             QIcon,
             QIntValidator,
+            QKeySequence,
             QPainter,
             QPalette,
             QPen,
             QPixmap,
             QPixmapCache,
+            QShortcut,
         )
         from PySide6.QtWidgets import (
             QAbstractItemView,
@@ -1965,6 +2073,56 @@ def launch_plot_settings_panel(
             self.body_frame.setVisible(True)
             self.body_frame.setMaximumHeight(16777215)
 
+    class _StaticSection(QFrame):
+        def __init__(
+            self,
+            *,
+            title: str,
+            subsection: bool = False,
+            parent: QWidget | None = None,
+        ) -> None:
+            super().__init__(parent)
+            self.setObjectName("collapsibleSubsection" if subsection else "collapsibleSection")
+
+            root_layout = QVBoxLayout(self)
+            root_layout.setContentsMargins(0, 0, 0, 0)
+            root_layout.setSpacing(0)
+
+            self.header_frame = QFrame(self)
+            self.header_frame.setObjectName(
+                "collapsibleSubsectionHeader" if subsection else "collapsibleSectionHeader"
+            )
+            header_layout = QHBoxLayout(self.header_frame)
+            header_layout.setContentsMargins(0, 0, 0, 0)
+            header_layout.setSpacing(8)
+
+            self.header_label = QLabel(title, self.header_frame)
+            self.header_label.setObjectName(
+                "staticSubsectionHeaderLabel" if subsection else "staticSectionHeaderLabel"
+            )
+            self.header_label.setAlignment(
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+            )
+            self.header_label.setSizePolicy(
+                QSizePolicy.Policy.Expanding,
+                QSizePolicy.Policy.Fixed,
+            )
+            header_layout.addWidget(self.header_label, stretch=1)
+
+            root_layout.addWidget(self.header_frame)
+
+            self.body_frame = QFrame(self)
+            self.body_frame.setObjectName(
+                "collapsibleSubsectionBody" if subsection else "collapsibleSectionBody"
+            )
+            self.body_layout = QVBoxLayout(self.body_frame)
+            self.body_layout.setContentsMargins(0, 0, 0, 0)
+            self.body_layout.setSpacing(0)
+            root_layout.addWidget(self.body_frame)
+
+        def set_body_widget(self, widget: QWidget) -> None:
+            self.body_layout.addWidget(widget)
+
     class _DetachedPreviewWindow(QMainWindow):
         def __init__(
             self,
@@ -1998,6 +2156,14 @@ def launch_plot_settings_panel(
             self._allow_named_profiles = bool(allow_named_profiles)
             self._on_resolve_series_defaults = on_resolve_series_defaults
             self._saved_signature: str | None = None
+            self._undo_stack: list[dict[str, Any]] = []
+            self._redo_stack: list[dict[str, Any]] = []
+            self._undo_syncing = False
+            self._undo_current_settings: dict[str, Any] | None = None
+            self._undo_current_signature: str | None = None
+            self._undo_text_edit_widget_id: int | None = None
+            self._undo_text_edit_signature: str | None = None
+            self._undo_text_edit_settings: dict[str, Any] | None = None
             self._profile_filter_options = _coerce_profile_filter_options(
                 initial_settings.get("_profile_filter_options")
             )
@@ -2036,7 +2202,13 @@ def launch_plot_settings_panel(
             self._x_bin_reducer_row: tuple[QFormLayout, QWidget] | None = None
             self._norm_value_row: tuple[QFormLayout, QWidget] | None = None
             self._norm_x_ref_row: tuple[QFormLayout, QWidget] | None = None
+            self._position_projection_x_row: tuple[QFormLayout, QWidget] | None = None
+            self._position_projection_y_row: tuple[QFormLayout, QWidget] | None = None
+            self._position_projection_render_mode_row: tuple[QFormLayout, QWidget] | None = None
             self._position_map_color_row: tuple[QFormLayout, QWidget] | None = None
+            self._position_projection_filter_min_row: tuple[QFormLayout, QWidget] | None = None
+            self._position_projection_filter_max_row: tuple[QFormLayout, QWidget] | None = None
+            self._position_xy_z_distance_max_row: tuple[QFormLayout, QWidget] | None = None
             self._position_time_axis_row: tuple[QFormLayout, QWidget] | None = None
             self._coordination_time_axis_row: tuple[QFormLayout, QWidget] | None = None
             self._axes_ticks_group: QGroupBox | None = None
@@ -2120,6 +2292,10 @@ def launch_plot_settings_panel(
             self._preview_label: QLabel | None = None
             self._preview_status: QLabel | None = None
             self._preview_button: QPushButton | None = None
+            self._undo_button: QPushButton | None = None
+            self._redo_button: QPushButton | None = None
+            self._undo_shortcut: QShortcut | None = None
+            self._redo_shortcut: QShortcut | None = None
             self._save_figure_button: QPushButton | None = None
             self._auto_preview_checkbox: QCheckBox | None = None
             self._detach_preview_button: QPushButton | None = None
@@ -2201,6 +2377,8 @@ def launch_plot_settings_panel(
             self._theme_switch: QCheckBox | None = None
             self._status_label = QLabel("Ready.")
             self._build_ui()
+            self._install_undo_event_filters()
+            self._bind_undo_change_signals()
             self._suspend_preview_events = True
             _previous_series_syncing = self._series_syncing
             _previous_annotation_syncing = self._annotation_syncing
@@ -2218,6 +2396,7 @@ def launch_plot_settings_panel(
                 self._saved_signature = self._signature(self._collect_settings())
             except Exception:
                 self._saved_signature = None
+            self._reset_undo_history()
             self._update_embedded_preview(interactive=False)
 
         def _signature(self, settings: dict[str, Any]) -> str:
@@ -2511,6 +2690,21 @@ def launch_plot_settings_panel(
             section.set_body_widget(self._prepare_collapsible_body(body_widget))
             return section
 
+        def _make_static_section(
+            self,
+            *,
+            title: str,
+            body_widget: QWidget,
+            subsection: bool = False,
+        ) -> _StaticSection:
+            section = _StaticSection(
+                title=title,
+                subsection=subsection,
+                parent=self,
+            )
+            section.set_body_widget(self._prepare_collapsible_body(body_widget))
+            return section
+
         def _synced_field_mode(self, key: str) -> str:
             token = str(self._synced_field_modes.get(key, "auto")).strip().lower()
             allowed_modes = (
@@ -2701,7 +2895,203 @@ def launch_plot_settings_panel(
                 self._status_label.setText(status_message)
             if mark_saved:
                 self._saved_signature = self._signature(self._collect_settings())
+            self._reset_undo_history()
             self._refresh_shell_state()
+
+        def _reset_undo_history(self, settings: dict[str, Any] | None = None) -> None:
+            baseline_settings = dict(settings) if isinstance(settings, dict) else None
+            if baseline_settings is None:
+                baseline_settings, error = self._safe_collect_history_settings()
+                if error or baseline_settings is None:
+                    self._undo_stack = []
+                    self._redo_stack = []
+                    self._undo_current_settings = None
+                    self._undo_current_signature = None
+                    self._undo_text_edit_widget_id = None
+                    self._undo_text_edit_signature = None
+                    self._undo_text_edit_settings = None
+                    return
+            self._undo_stack = []
+            self._redo_stack = []
+            self._undo_current_settings = deepcopy(baseline_settings)
+            self._undo_current_signature = self._signature(baseline_settings)
+            self._undo_text_edit_widget_id = None
+            self._undo_text_edit_signature = None
+            self._undo_text_edit_settings = None
+
+        def _history_snapshot(self, settings: dict[str, Any]) -> dict[str, Any]:
+            snapshot = deepcopy(settings)
+            if isinstance(self._last_preview_state, dict) and self._last_preview_state:
+                snapshot["_undo_preview_state"] = deepcopy(self._last_preview_state)
+            return snapshot
+
+        @staticmethod
+        def _history_signature(settings: dict[str, Any]) -> str:
+            filtered = {
+                key: value for key, value in settings.items() if key != "_undo_preview_state"
+            }
+            return json.dumps(filtered, sort_keys=True, separators=(",", ":"), default=str)
+
+        def _safe_collect_history_settings(self) -> tuple[dict[str, Any] | None, str | None]:
+            settings, error = self._safe_collect_settings()
+            if error or settings is None:
+                return None, error
+            return self._history_snapshot(settings), None
+
+        def _sender_is_text_editor(self) -> bool:
+            sender = self.sender()
+            return isinstance(sender, (QLineEdit, QPlainTextEdit))
+
+        def _install_undo_event_filters(self) -> None:
+            for widget in self.findChildren(QLineEdit):
+                widget.installEventFilter(self)
+            for widget in self.findChildren(QPlainTextEdit):
+                widget.installEventFilter(self)
+
+        def _bind_undo_change_signals(self) -> None:
+            for widget in self.findChildren(QComboBox):
+                widget.currentTextChanged.connect(self._record_history_after_non_text_change)
+            for widget in self.findChildren(QCheckBox):
+                if widget in {self._theme_switch, self._auto_preview_checkbox}:
+                    continue
+                widget.toggled.connect(self._record_history_after_non_text_change)
+
+        def _set_undo_current(self, settings: dict[str, Any]) -> None:
+            self._undo_current_settings = deepcopy(settings)
+            self._undo_current_signature = self._history_signature(settings)
+
+        def _push_history_snapshot(
+            self,
+            stack: list[dict[str, Any]],
+            settings: dict[str, Any],
+        ) -> None:
+            signature = self._history_signature(settings)
+            if stack:
+                top_signature = self._history_signature(stack[-1])
+                if top_signature == signature:
+                    return
+            stack.append(deepcopy(settings))
+            if len(stack) > 100:
+                del stack[:-100]
+
+        def _begin_text_undo_edit(self, widget: QWidget | None) -> None:
+            if (
+                widget is None
+                or self._undo_syncing
+                or self._suspend_preview_events
+                or self._normalization_syncing
+                or self._series_syncing
+                or self._annotation_syncing
+            ):
+                return
+            widget_id = id(widget)
+            if self._undo_text_edit_widget_id == widget_id:
+                return
+            if self._undo_text_edit_widget_id is not None:
+                self._finalize_text_undo_edit()
+            settings, error = self._safe_collect_history_settings()
+            if error or settings is None:
+                return
+            self._undo_text_edit_widget_id = widget_id
+            self._undo_text_edit_settings = deepcopy(settings)
+            self._undo_text_edit_signature = self._history_signature(settings)
+
+        def _finalize_text_undo_edit(self, widget: QWidget | None = None) -> None:
+            if self._undo_text_edit_widget_id is None:
+                return
+            if widget is not None and id(widget) != self._undo_text_edit_widget_id:
+                return
+            settings, error = self._safe_collect_history_settings()
+            baseline_settings = self._undo_text_edit_settings
+            baseline_signature = self._undo_text_edit_signature
+            self._undo_text_edit_widget_id = None
+            self._undo_text_edit_settings = None
+            self._undo_text_edit_signature = None
+            if error or settings is None or baseline_settings is None or baseline_signature is None:
+                return
+            current_signature = self._history_signature(settings)
+            if current_signature == baseline_signature:
+                self._set_undo_current(settings)
+                return
+            self._push_history_snapshot(self._undo_stack, baseline_settings)
+            self._redo_stack = []
+            self._set_undo_current(settings)
+
+        def _record_history_after_non_text_change(self, *_unused: object) -> None:
+            if (
+                self._undo_syncing
+                or self._suspend_preview_events
+                or self._normalization_syncing
+                or self._series_syncing
+                or self._annotation_syncing
+            ):
+                return
+            self._finalize_text_undo_edit()
+            settings, error = self._safe_collect_history_settings()
+            if error or settings is None:
+                return
+            signature = self._history_signature(settings)
+            if self._undo_current_signature is None or self._undo_current_settings is None:
+                self._set_undo_current(settings)
+                return
+            if signature == self._undo_current_signature:
+                return
+            self._push_history_snapshot(self._undo_stack, self._undo_current_settings)
+            self._redo_stack = []
+            self._set_undo_current(settings)
+
+        def _restore_history_state(self, settings: dict[str, Any], *, status_text: str) -> None:
+            preview_state = settings.get("_undo_preview_state")
+            restore_settings = {
+                key: value for key, value in settings.items() if key != "_undo_preview_state"
+            }
+            self._undo_syncing = True
+            self._suspend_preview_events = True
+            try:
+                self._populate(restore_settings)
+                if isinstance(preview_state, dict) and preview_state:
+                    self._apply_preview_state_to_synced_fields(preview_state)
+            finally:
+                self._suspend_preview_events = False
+                self._undo_syncing = False
+            self._refresh_widget_states()
+            self._set_undo_current(settings)
+            self._undo_text_edit_widget_id = None
+            self._undo_text_edit_signature = None
+            self._undo_text_edit_settings = None
+            self._status_label.setText(status_text)
+            self._refresh_shell_state()
+            self._schedule_preview_update()
+
+        def _handle_undo(self) -> None:
+            self._finalize_text_undo_edit()
+            if not self._undo_stack:
+                self._status_label.setText("Nothing to undo.")
+                self._refresh_shell_state()
+                return
+            current_settings = self._undo_current_settings
+            settings, error = self._safe_collect_history_settings()
+            if not error and settings is not None:
+                current_settings = deepcopy(settings)
+            target_settings = deepcopy(self._undo_stack.pop())
+            if current_settings is not None:
+                self._push_history_snapshot(self._redo_stack, current_settings)
+            self._restore_history_state(target_settings, status_text="Undid last change.")
+
+        def _handle_redo(self) -> None:
+            self._finalize_text_undo_edit()
+            if not self._redo_stack:
+                self._status_label.setText("Nothing to redo.")
+                self._refresh_shell_state()
+                return
+            current_settings = self._undo_current_settings
+            settings, error = self._safe_collect_history_settings()
+            if not error and settings is not None:
+                current_settings = deepcopy(settings)
+            target_settings = deepcopy(self._redo_stack.pop())
+            if current_settings is not None:
+                self._push_history_snapshot(self._undo_stack, current_settings)
+            self._restore_history_state(target_settings, status_text="Redid last change.")
 
         def _save_current_profile(self, *, status_prefix: str | None = None) -> bool:
             try:
@@ -2987,12 +3377,33 @@ def launch_plot_settings_panel(
             self._theme_switch.toggled.connect(self._handle_theme_switch_toggled)
             header_layout.addWidget(self._theme_switch)
 
+            self._undo_button = QPushButton("Undo")
+            self._undo_button.clicked.connect(self._handle_undo)
+            self._register_tooltip(self._undo_button, "profiles.undo")
+            self._apply_widget_tooltip(
+                self._undo_button, disabled_reason="there is nothing to undo."
+            )
+            header_layout.addWidget(self._undo_button)
+
+            self._redo_button = QPushButton("Redo")
+            self._redo_button.clicked.connect(self._handle_redo)
+            self._register_tooltip(self._redo_button, "profiles.redo")
+            self._apply_widget_tooltip(
+                self._redo_button, disabled_reason="there is nothing to redo."
+            )
+            header_layout.addWidget(self._redo_button)
+
             self._save_button = QPushButton("Save Profile")
             self._save_button.setProperty("role", "primary")
             self._save_button.clicked.connect(self._handle_save)
             self._register_tooltip(self._save_button, "profiles.save")
             self._apply_widget_tooltip(self._save_button)
             header_layout.addWidget(self._save_button)
+
+            self._undo_shortcut = QShortcut(QKeySequence("Ctrl+Z"), self)
+            self._undo_shortcut.activated.connect(self._handle_undo)
+            self._redo_shortcut = QShortcut(QKeySequence("Ctrl+Shift+Z"), self)
+            self._redo_shortcut.activated.connect(self._handle_redo)
 
             self._exit_button = QPushButton("Exit")
             self._exit_button.clicked.connect(self.close)
@@ -3005,8 +3416,9 @@ def launch_plot_settings_panel(
             root_layout.addWidget(splitter, stretch=1)
 
             left_panel = QWidget(splitter)
-            left_panel.setMinimumWidth(0)
-            left_panel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+            left_panel.setMinimumWidth(_WORKSPACE_PANEL_MIN_WIDTH)
+            left_panel.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
+            self._workspace_panel = left_panel
             left_layout = QHBoxLayout(left_panel)
             left_layout.setContentsMargins(0, 0, 0, 0)
             left_layout.setSpacing(12)
@@ -3088,7 +3500,7 @@ def launch_plot_settings_panel(
             splitter.addWidget(right_panel)
             splitter.setStretchFactor(0, 1)
             splitter.setStretchFactor(1, 1)
-            splitter.setSizes([760, 840])
+            splitter.setSizes([_WORKSPACE_PANEL_WIDTH, 840])
             self._preview_splitter_sizes = splitter.sizes()
 
             self._status_label.setObjectName("statusBar")
@@ -3399,6 +3811,11 @@ def launch_plot_settings_panel(
                 f"  background: transparent;"
                 f"  color: {colors['disabled_text']};"
                 f"  border: none;"
+                f"}}"
+                f"QLabel#staticSectionHeaderLabel, QLabel#staticSubsectionHeaderLabel {{"
+                f"  padding: 10px 12px;"
+                f"  color: {colors['heading']};"
+                f"  font-weight: 600;"
                 f"}}"
                 f"QMenu {{"
                 f"  background-color: {colors['panel_elevated']};"
@@ -3989,11 +4406,27 @@ def launch_plot_settings_panel(
                     if y_direction in _TICK_DIRECTIONS:
                         self._set_combo_value(self.y_tick_direction, y_direction)
                     if axis_value in _TICK_AXES:
+                        x_ticks_visible = parsed.get("_x_ticks_visible")
+                        y_ticks_visible = parsed.get("_y_ticks_visible")
                         self._set_combo_value(
-                            self.x_ticks_mode, "on" if axis_value in {"x", "both"} else "off"
+                            self.x_ticks_mode,
+                            (
+                                "on"
+                                if bool(x_ticks_visible)
+                                else "off"
+                                if x_ticks_visible is not None
+                                else ("on" if axis_value in {"x", "both"} else "off")
+                            ),
                         )
                         self._set_combo_value(
-                            self.y_ticks_mode, "on" if axis_value in {"y", "both"} else "off"
+                            self.y_ticks_mode,
+                            (
+                                "on"
+                                if bool(y_ticks_visible)
+                                else "off"
+                                if y_ticks_visible is not None
+                                else ("on" if axis_value in {"y", "both"} else "off")
+                            ),
                         )
                     if minor_value in _MINOR_TICKS_MODES:
                         self._set_combo_value(self.x_minor_ticks_mode, minor_value)
@@ -4105,6 +4538,12 @@ def launch_plot_settings_panel(
                     if self._saved_signature is not None and signature == self._saved_signature:
                         save_reason = "this profile is already saved."
                 self._apply_widget_tooltip(self._save_button, disabled_reason=save_reason)
+            if hasattr(self, "_undo_button") and self._undo_button is not None:
+                undo_reason = None if self._undo_stack else "there is nothing to undo."
+                self._apply_widget_tooltip(self._undo_button, disabled_reason=undo_reason)
+            if hasattr(self, "_redo_button") and self._redo_button is not None:
+                redo_reason = None if self._redo_stack else "there is nothing to redo."
+                self._apply_widget_tooltip(self._redo_button, disabled_reason=redo_reason)
 
         def _refresh_shell_state(self) -> None:
             self._update_header_state()
@@ -4118,6 +4557,10 @@ def launch_plot_settings_panel(
         def _update_header_state(self) -> None:
             if not hasattr(self, "_save_button") or self._save_button is None:
                 return
+            if hasattr(self, "_undo_button") and self._undo_button is not None:
+                self._undo_button.setEnabled(bool(self._undo_stack))
+            if hasattr(self, "_redo_button") and self._redo_button is not None:
+                self._redo_button.setEnabled(bool(self._redo_stack))
             settings, error = self._safe_collect_settings()
             if error:
                 self._save_button.setEnabled(False)
@@ -4300,8 +4743,10 @@ def launch_plot_settings_panel(
             self._detached_preview_pane = detached_pane
             self._embedded_preview_pane.setVisible(False)
             if self._splitter is not None:
-                left_width = max(1, sum(self._preview_splitter_sizes or [1]))
-                self._splitter.setSizes([left_width, 0])
+                left_width = (
+                    self._splitter.sizes()[0] if self._splitter.sizes() else _WORKSPACE_PANEL_WIDTH
+                )
+                self._splitter.setSizes([max(_WORKSPACE_PANEL_MIN_WIDTH, left_width), 0])
 
             self._activate_preview_pane(detached_pane, auto_update_checked=auto_update_checked)
             detached_window.resize(1100, 820)
@@ -4328,8 +4773,17 @@ def launch_plot_settings_panel(
                 auto_update_checked=auto_update_checked,
             )
             if self._splitter is not None:
-                sizes = self._preview_splitter_sizes or [760, 840]
-                self._splitter.setSizes(sizes)
+                if (
+                    isinstance(self._preview_splitter_sizes, list)
+                    and len(self._preview_splitter_sizes) > 1
+                ):
+                    left_width = max(
+                        _WORKSPACE_PANEL_MIN_WIDTH, int(self._preview_splitter_sizes[0])
+                    )
+                    right_width = max(1, int(self._preview_splitter_sizes[1]))
+                    self._splitter.setSizes([left_width, right_width])
+                else:
+                    self._splitter.setSizes([_WORKSPACE_PANEL_WIDTH, 840])
 
             detached_window.close_from_dock()
             detached_window.deleteLater()
@@ -4555,6 +5009,7 @@ def launch_plot_settings_panel(
             self._connect_lockable_line("y_label", self.y_label, y_label_lock, allow_off=True)
 
             self.title_font = self._positive_int_line()
+            self.title_pad = self._bounded_float_line("6.0")
 
             self._add_form_row(top_form, "Title", title_row, tooltip_id="figure.text.title")
             self._add_form_row(
@@ -4562,6 +5017,12 @@ def launch_plot_settings_panel(
                 "Title font",
                 self.title_font,
                 tooltip_id="figure.text.title_font",
+            )
+            self._add_form_row(
+                top_form,
+                "Title pad",
+                self.title_pad,
+                tooltip_id="figure.text.title_pad",
             )
 
             title_layout.addLayout(top_form)
@@ -4949,7 +5410,7 @@ def launch_plot_settings_panel(
                 )
             )
 
-            self._title_rows = [(top_form, self.title_font)]
+            self._title_rows = [(top_form, self.title_font), (top_form, self.title_pad)]
             self._title_detail_widgets = [self.title_text]
             self._x_label_detail_widgets = [self.x_label]
             self._y_label_detail_widgets = [self.y_label]
@@ -4969,6 +5430,8 @@ def launch_plot_settings_panel(
                 tooltip_id="figure.legend.enabled",
             )
             self.legend_title = self._line()
+            self.legend_title.textChanged.connect(self._refresh_widget_states)
+            self.legend_title_font = self._positive_int_line()
             self.legend_loc = self._combo(_LEGEND_LOCATIONS)
             self.legend_frame_mode = self._combo(_TOGGLE_MODES)
             self.legend_columns = self._positive_int_line("1")
@@ -4978,6 +5441,12 @@ def launch_plot_settings_panel(
                 "Legend title",
                 self.legend_title,
                 tooltip_id="figure.legend.title",
+            )
+            self._add_form_row(
+                form,
+                "Legend title font",
+                self.legend_title_font,
+                tooltip_id="figure.legend.font",
             )
             self._add_form_row(
                 form,
@@ -5006,6 +5475,7 @@ def launch_plot_settings_panel(
 
             self._legend_rows = [
                 (form, self.legend_title),
+                (form, self.legend_title_font),
                 (form, self.legend_loc),
                 (form, self.legend_frame_mode),
                 (form, self.legend_columns),
@@ -5025,10 +5495,7 @@ def launch_plot_settings_panel(
             self.markers_mode = self._combo(_TOGGLE_MODES)
             self.markers_mode.currentTextChanged.connect(self._refresh_widget_states)
             self.marker_size = self._bounded_float_line("e.g. 5", bottom=0.0)
-            self.marker_type = self._combo(
-                ("", "o", "s", "^", "v", "D", "x", "+", ".", ","),
-                editable=True,
-            )
+            self.marker_type = self._combo(_MARKER_TYPES)
             marker_color_row, self.marker_color = self._color_field(
                 placeholder="auto",
                 tooltip_id="figure.lines.marker_color",
@@ -5593,9 +6060,7 @@ def launch_plot_settings_panel(
             self.series_alpha.textChanged.connect(self._on_series_editor_changed)
             self.series_line_width = self._line("blank: use global line width")
             self.series_line_width.textChanged.connect(self._on_series_editor_changed)
-            self.series_marker = self._combo(
-                ("", "o", "s", "^", "v", "d", "x", "+", ".", "*"), editable=True
-            )
+            self.series_marker = self._combo(_MARKER_TYPES)
             self.series_marker.currentTextChanged.connect(self._on_series_editor_changed)
             self.series_line_kwargs_json = QPlainTextEdit()
             self.series_line_kwargs_json.setPlaceholderText('{"linestyle": "--", "alpha": 0.8}')
@@ -5655,7 +6120,7 @@ def launch_plot_settings_panel(
                 error_group = QGroupBox("Uncertainty")
                 error_layout = QVBoxLayout(error_group)
                 error_note = QLabel(
-                    "Error overlays belong to the base series. Leave the error color blank to follow the base series color."
+                    "Uncertainty overlays are tied to the base series. Leave the color field blank to match the series color automatically."
                 )
                 error_note.setWordWrap(True)
                 error_layout.addWidget(error_note)
@@ -5670,7 +6135,9 @@ def launch_plot_settings_panel(
                     self._series_error_mode,
                     tooltip_id="series.error_enabled",
                 )
-                self._series_error_stat = self._combo(_ERROR_STATS)
+                self._series_error_stat = self._combo(
+                    tuple(_ERROR_STAT_DISPLAY[s] for s in _ERROR_STATS)
+                )
                 self._series_error_stat.currentTextChanged.connect(self._on_series_editor_changed)
                 self._add_form_row(
                     error_form,
@@ -5678,7 +6145,9 @@ def launch_plot_settings_panel(
                     self._series_error_stat,
                     tooltip_id="series.error_stat",
                 )
-                self._series_error_style = self._combo(_ERROR_STYLES)
+                self._series_error_style = self._combo(
+                    tuple(_ERROR_STYLE_DISPLAY[s] for s in _ERROR_STYLES)
+                )
                 self._series_error_style.currentTextChanged.connect(self._on_series_editor_changed)
                 self._add_form_row(
                     error_form,
@@ -5723,7 +6192,9 @@ def launch_plot_settings_panel(
                     (error_form, self._series_error_show_in_legend),
                     (error_form, self._series_error_label),
                 ]
-                self._series_error_summary = QLabel("No error overlay configured for this series.")
+                self._series_error_summary = QLabel(
+                    "No uncertainty overlay configured for this series."
+                )
                 self._series_error_summary.setWordWrap(True)
                 self._register_tooltip(self._series_error_summary, "series.error.summary")
                 self._apply_widget_tooltip(self._series_error_summary)
@@ -5741,7 +6212,7 @@ def launch_plot_settings_panel(
                 self._apply_widget_tooltip(self._series_error_warning)
                 error_layout.addWidget(self._series_error_warning)
                 self._series_error_style_note = QLabel(
-                    "Bands use the default transparency and whiskers use the default capsize."
+                    "Shaded bands use semi-transparent fill; whiskers use thin caps at each point."
                 )
                 self._series_error_style_note.setWordWrap(True)
                 self._series_error_style_note.hide()
@@ -6199,11 +6670,11 @@ def launch_plot_settings_panel(
             )
             self._register_tooltip(self.annotation_list, "annotations.list")
             self._apply_widget_tooltip(self.annotation_list)
-            list_group = QGroupBox("Annotations")
+            list_group = QGroupBox("")
             list_layout = QVBoxLayout(list_group)
             list_layout.addWidget(self.annotation_list)
 
-            panel = QGroupBox("Selected Annotation")
+            panel = QGroupBox("")
             panel_layout = QVBoxLayout(panel)
             panel_form = QFormLayout()
 
@@ -6408,11 +6879,15 @@ def launch_plot_settings_panel(
             ]
 
             content_splitter = QSplitter(Qt.Orientation.Horizontal)
-            content_splitter.addWidget(list_group)
             content_splitter.addWidget(
-                self._make_collapsible_section(
+                self._make_static_section(
+                    title="Annotations",
+                    body_widget=list_group,
+                )
+            )
+            content_splitter.addWidget(
+                self._make_static_section(
                     title="Selected Annotation",
-                    section_id="annotations.selected",
                     body_widget=panel,
                 )
             )
@@ -6676,6 +7151,8 @@ def launch_plot_settings_panel(
                 return
             self._refresh_annotation_editor_rows()
             self._persist_active_annotation_editor()
+            if not self._sender_is_text_editor():
+                self._record_history_after_non_text_change()
             self._schedule_preview_update()
 
         def _add_annotation(self, annotation_type: str) -> None:
@@ -6694,6 +7171,7 @@ def launch_plot_settings_panel(
             self._refresh_annotation_list()
             self._load_annotation_into_editor(self._annotation_active_index)
             self._refresh_widget_states()
+            self._record_history_after_non_text_change()
             self._schedule_preview_update()
 
         def _duplicate_annotation(self) -> None:
@@ -6711,6 +7189,7 @@ def launch_plot_settings_panel(
             self._refresh_annotation_list()
             self._load_annotation_into_editor(insert_at)
             self._refresh_widget_states()
+            self._record_history_after_non_text_change()
             self._schedule_preview_update()
 
         def _delete_annotation(self) -> None:
@@ -6729,6 +7208,7 @@ def launch_plot_settings_panel(
                 self._refresh_annotation_list()
                 self._clear_annotation_editor()
             self._refresh_widget_states()
+            self._record_history_after_non_text_change()
             self._schedule_preview_update()
 
         def _move_annotation(self, delta: int) -> None:
@@ -6745,6 +7225,7 @@ def launch_plot_settings_panel(
             self._refresh_annotation_list()
             self._load_annotation_into_editor(target)
             self._refresh_widget_states()
+            self._record_history_after_non_text_change()
             self._schedule_preview_update()
 
         def _initialize_annotation_data(self, settings: dict[str, Any]) -> None:
@@ -7010,12 +7491,33 @@ def launch_plot_settings_panel(
             if analysis == "position":
                 view = QGroupBox("Position View")
                 view_form = QFormLayout(view)
-                self.position_component = self._combo(("distance", "x", "y", "z", "xy-z"))
+                self.position_component = self._combo(_POSITION_COMPONENT_LABELS)
                 self.position_component.currentTextChanged.connect(
                     self._handle_series_identity_change
                 )
-                self.position_map_color = self._combo(("distance", "z"))
+                self.position_projection_x = self._combo(_POSITION_PROJECTION_QUANTITIES)
+                self.position_projection_x.currentTextChanged.connect(self._schedule_preview_update)
+                self.position_projection_y = self._combo(_POSITION_PROJECTION_QUANTITIES)
+                self.position_projection_y.currentTextChanged.connect(self._schedule_preview_update)
+                self.position_projection_render_mode = self._combo(
+                    _POSITION_PROJECTION_RENDER_MODES
+                )
+                self.position_projection_render_mode.currentTextChanged.connect(
+                    self._handle_series_identity_change
+                )
+                self.position_projection_render_mode.currentTextChanged.connect(
+                    self._refresh_widget_states
+                )
+                self.position_map_color = self._combo(_POSITION_PROJECTION_QUANTITIES)
                 self.position_map_color.currentTextChanged.connect(self._schedule_preview_update)
+                self.position_projection_filter_min = self._line("")
+                self.position_projection_filter_min.textChanged.connect(
+                    self._schedule_preview_update
+                )
+                self.position_projection_filter_max = self._line("")
+                self.position_projection_filter_max.textChanged.connect(
+                    self._schedule_preview_update
+                )
                 self.position_time_axis = self._combo(("ps", "fs", "step", "frame"))
                 self.position_time_axis.currentTextChanged.connect(self._schedule_preview_update)
                 self._add_form_row(
@@ -7026,9 +7528,47 @@ def launch_plot_settings_panel(
                 )
                 self._add_form_row(
                     view_form,
-                    "Color by",
+                    "X axis",
+                    self.position_projection_x,
+                    tooltip_id="data.position.projection_x",
+                )
+                self._add_form_row(
+                    view_form,
+                    "Y axis",
+                    self.position_projection_y,
+                    tooltip_id="data.position.projection_y",
+                )
+                self._add_form_row(
+                    view_form,
+                    "Render mode",
+                    self.position_projection_render_mode,
+                    tooltip_id="data.position.projection_render_mode",
+                )
+                self._add_form_row(
+                    view_form,
+                    "Color / filter by",
                     self.position_map_color,
                     tooltip_id="data.position.color_by",
+                )
+                self._add_form_row(
+                    view_form,
+                    "Range min",
+                    self.position_projection_filter_min,
+                    tooltip_id="data.position.projection_range_min",
+                )
+                self._add_form_row(
+                    view_form,
+                    "Range max",
+                    self.position_projection_filter_max,
+                    tooltip_id="data.position.projection_range_max",
+                )
+                self.position_xy_z_distance_max = self._line("")
+                self.position_xy_z_distance_max.textChanged.connect(self._schedule_preview_update)
+                self._add_form_row(
+                    view_form,
+                    "Max distance to surface (A)",
+                    self.position_xy_z_distance_max,
+                    tooltip_id="data.position.xy_z_distance_max",
                 )
                 self._add_form_row(
                     view_form,
@@ -7036,7 +7576,25 @@ def launch_plot_settings_panel(
                     self.position_time_axis,
                     tooltip_id="data.position.time_axis",
                 )
+                self._position_projection_x_row = (view_form, self.position_projection_x)
+                self._position_projection_y_row = (view_form, self.position_projection_y)
+                self._position_projection_render_mode_row = (
+                    view_form,
+                    self.position_projection_render_mode,
+                )
                 self._position_map_color_row = (view_form, self.position_map_color)
+                self._position_projection_filter_min_row = (
+                    view_form,
+                    self.position_projection_filter_min,
+                )
+                self._position_projection_filter_max_row = (
+                    view_form,
+                    self.position_projection_filter_max,
+                )
+                self._position_xy_z_distance_max_row = (
+                    view_form,
+                    self.position_xy_z_distance_max,
+                )
                 self._position_time_axis_row = (view_form, self.position_time_axis)
                 layout.addWidget(
                     self._make_collapsible_section(
@@ -7815,7 +8373,7 @@ def launch_plot_settings_panel(
                     if hasattr(self, "position_component")
                     else "distance"
                 )
-                return component != "xy-z"
+                return not _is_position_projection_component(component)
             if analysis == "coordination":
                 component = (
                     self.coordination_component.currentText().strip().lower()
@@ -8033,12 +8591,12 @@ def launch_plot_settings_panel(
                 return resolve_series_error_availability(
                     supported_for_view=False,
                     available_stats=[],
-                    error_reason="Grouped series do not render error overlays.",
+                    error_reason="Grouped series do not support uncertainty overlays.",
                 )
             summary = self._preview_error_summary_for_series(index)
             reason = summary.get("reason") if isinstance(summary, dict) else None
             if reason is None and not self._error_supported_for_current_view():
-                reason = "Error overlays are only available for 1-D line-based views."
+                reason = "Uncertainty overlays are only available for 1-D line plots."
             return resolve_series_error_availability(
                 supported_for_view=self._error_supported_for_current_view(),
                 available_stats=self._available_error_stats_for_series(index),
@@ -8363,6 +8921,7 @@ def launch_plot_settings_panel(
             self._set_active_series_child_kind("base")
             self._sync_series_selection_widgets(self._series_active_index)
             self._load_series_into_editor(self._series_active_index)
+            self._record_history_after_non_text_change()
             self._schedule_preview_update()
 
         def _duplicate_selected_series(self) -> None:
@@ -8452,6 +9011,7 @@ def launch_plot_settings_panel(
             self._set_active_series_child_kind("base")
             self._sync_series_selection_widgets(self._series_active_index)
             self._load_series_into_editor(self._series_active_index)
+            self._record_history_after_non_text_change()
             self._schedule_preview_update()
 
         def _delete_series_at_index(self, index: int) -> None:
@@ -8482,6 +9042,7 @@ def launch_plot_settings_panel(
             self._sync_series_selection_widgets(self._series_active_index)
             if self._series_descriptors_data:
                 self._load_series_into_editor(self._series_active_index)
+            self._record_history_after_non_text_change()
             self._schedule_preview_update()
 
         def _delete_selected_series(self) -> None:
@@ -8631,6 +9192,7 @@ def launch_plot_settings_panel(
                 else:
                     self._load_series_into_editor(index)
             self._refresh_series_list_widgets()
+            self._record_history_after_non_text_change()
             self._schedule_preview_update()
 
         def _move_series_by_delta(self, series_id: str, delta: int) -> None:
@@ -8661,6 +9223,7 @@ def launch_plot_settings_panel(
                     self._load_series_into_editor(self._series_active_index)
             finally:
                 self._series_syncing = False
+            self._record_history_after_non_text_change()
             self._schedule_preview_update()
 
         def _update_series_metadata_panel(self, index: int) -> None:
@@ -9284,9 +9847,25 @@ def launch_plot_settings_panel(
             self._series_fit_range_modes_data = []
             self._series_fit_x_mins_data = []
             self._series_fit_x_maxs_data = []
+            self._series_fit_color_data = []
+            self._series_fit_alpha_data = []
+            self._series_fit_line_width_data = []
+            self._series_fit_line_style_data = []
             self._series_cumulative_enabled_data = []
             self._series_cumulative_label_overrides_data = []
             self._series_cumulative_show_in_legend_data = []
+            self._series_cumulative_color_data = []
+            self._series_cumulative_alpha_data = []
+            self._series_cumulative_line_width_data = []
+            self._series_cumulative_line_style_data = []
+            self._series_integration_enabled_data = []
+            self._series_integration_source_data = []
+            self._series_integration_x_min_data = []
+            self._series_integration_x_max_data = []
+            self._series_integration_baseline_data = []
+            self._series_integration_color_mode_data = []
+            self._series_integration_color_data = []
+            self._series_integration_alpha_data = []
             self._series_line_widths_data = []
             self._series_markers_data = []
             self._series_line_kwargs_data = []
@@ -9532,10 +10111,28 @@ def launch_plot_settings_panel(
                 fit_line_width_raw = ""
                 fit_line_style_raw = ""
                 if isinstance(series_override, dict):
-                    fit_color_raw = str(series_override.get("fit_color") or "").strip()
-                    fit_alpha_raw = str(series_override.get("fit_alpha") or "").strip()
-                    fit_line_width_raw = str(series_override.get("fit_line_width") or "").strip()
-                    fit_line_style_raw = str(series_override.get("fit_line_style") or "").strip()
+                    fit_override = series_override.get("fit")
+                    fit_override_dict = fit_override if isinstance(fit_override, dict) else {}
+                    fit_color_value = fit_override_dict.get("fit_color")
+                    if fit_color_value is None:
+                        fit_color_value = series_override.get("fit_color")
+                    fit_alpha_value = fit_override_dict.get("fit_alpha")
+                    if fit_alpha_value is None:
+                        fit_alpha_value = series_override.get("fit_alpha")
+                    fit_line_width_value = fit_override_dict.get("fit_line_width")
+                    if fit_line_width_value is None:
+                        fit_line_width_value = series_override.get("fit_line_width")
+                    fit_line_style_value = fit_override_dict.get("fit_line_style")
+                    if fit_line_style_value is None:
+                        fit_line_style_value = series_override.get("fit_line_style")
+                    fit_color_raw = str(fit_color_value or "").strip()
+                    fit_alpha_raw = str("" if fit_alpha_value is None else fit_alpha_value).strip()
+                    fit_line_width_raw = str(
+                        "" if fit_line_width_value is None else fit_line_width_value
+                    ).strip()
+                    fit_line_style_raw = str(
+                        "" if fit_line_style_value is None else fit_line_style_value
+                    ).strip()
                 self._series_fit_color_data.append(fit_color_raw)
                 self._series_fit_alpha_data.append(fit_alpha_raw)
                 self._series_fit_line_width_data.append(fit_line_width_raw)
@@ -9658,7 +10255,11 @@ def launch_plot_settings_panel(
                     self._refresh_error_stat_choices(index)
                 if hasattr(self, "_series_error_style"):
                     self._set_combo_value(
-                        self._series_error_style, self._series_error_styles_data[index]
+                        self._series_error_style,
+                        _ERROR_STYLE_DISPLAY.get(
+                            self._series_error_styles_data[index],
+                            self._series_error_styles_data[index],
+                        ),
                     )
                 if hasattr(self, "_series_error_color"):
                     self._series_error_color.setText(self._series_error_colors_data[index])
@@ -9870,11 +10471,13 @@ def launch_plot_settings_panel(
                 current = available[0]
             if 0 <= index < len(self._series_error_stats_data):
                 self._series_error_stats_data[index] = current
+            display_available = tuple(_ERROR_STAT_DISPLAY.get(s, s) for s in available)
+            display_current = _ERROR_STAT_DISPLAY.get(current, current)
             self._series_error_stat.blockSignals(True)
             try:
                 self._series_error_stat.clear()
-                self._series_error_stat.addItems(tuple(available))
-                self._set_combo_value(self._series_error_stat, current)
+                self._series_error_stat.addItems(display_available)
+                self._set_combo_value(self._series_error_stat, display_current)
             finally:
                 self._series_error_stat.blockSignals(False)
 
@@ -9902,7 +10505,11 @@ def launch_plot_settings_panel(
                     self._refresh_error_stat_choices(index)
                 if hasattr(self, "_series_error_style"):
                     self._set_combo_value(
-                        self._series_error_style, self._series_error_styles_data[index]
+                        self._series_error_style,
+                        _ERROR_STYLE_DISPLAY.get(
+                            self._series_error_styles_data[index],
+                            self._series_error_styles_data[index],
+                        ),
                     )
                 if hasattr(self, "_series_error_color"):
                     self._series_error_color.setText(self._series_error_colors_data[index])
@@ -10026,7 +10633,11 @@ def launch_plot_settings_panel(
                     self._refresh_error_stat_choices(index)
                 if hasattr(self, "_series_error_style"):
                     self._set_combo_value(
-                        self._series_error_style, self._series_error_styles_data[index]
+                        self._series_error_style,
+                        _ERROR_STYLE_DISPLAY.get(
+                            self._series_error_styles_data[index],
+                            self._series_error_styles_data[index],
+                        ),
                     )
                 if hasattr(self, "_series_error_color"):
                     self._series_error_color.setText(self._series_error_colors_data[index])
@@ -10180,12 +10791,14 @@ def launch_plot_settings_panel(
                     self._series_error_mode.currentText().strip().lower() != "off"
                 )
             if hasattr(self, "_series_error_stat"):
-                token = self._series_error_stat.currentText().strip().lower()
+                display_text = self._series_error_stat.currentText().strip()
+                token = _ERROR_STAT_INTERNAL.get(display_text, display_text).lower()
                 self._series_error_stats_data[index] = (
                     token if token in _ERROR_STATS else self._default_error_stat_for_series(index)
                 )
             if hasattr(self, "_series_error_style"):
-                token = self._series_error_style.currentText().strip().lower()
+                display_text = self._series_error_style.currentText().strip()
+                token = _ERROR_STYLE_INTERNAL.get(display_text, display_text).lower()
                 self._series_error_styles_data[index] = token if token in _ERROR_STYLES else "band"
             if hasattr(self, "_series_error_color"):
                 self._series_error_colors_data[index] = self._series_error_color.text().strip()
@@ -10490,8 +11103,8 @@ def launch_plot_settings_panel(
                 item_id = str(item.data(Qt.ItemDataRole.UserRole)).strip()
                 if item_id.startswith("fit::") or not item_id:
                     continue
-                if item_id not in desired_order:
-                    desired_order.append(item_id)
+            if item_id not in desired_order:
+                desired_order.append(item_id)
             self._persist_active_series_editor()
             self._apply_series_id_order(desired_order)
             self._restore_active_series_from_id(selected_id)
@@ -10504,6 +11117,7 @@ def launch_plot_settings_panel(
                     self._load_series_into_editor(self._series_active_index)
             finally:
                 self._series_syncing = False
+            self._record_history_after_non_text_change()
             self._schedule_preview_update()
 
         def _set_all_series_enabled(self, enabled: bool) -> None:
@@ -10520,6 +11134,7 @@ def launch_plot_settings_panel(
             finally:
                 self._series_syncing = False
             self._refresh_series_list_widgets()
+            self._record_history_after_non_text_change()
             self._schedule_preview_update()
 
         def _on_series_editor_changed(self, *_unused: object) -> None:
@@ -10527,6 +11142,8 @@ def launch_plot_settings_panel(
                 return
             self._persist_active_series_editor()
             self._refresh_widget_states()
+            if not self._sender_is_text_editor():
+                self._record_history_after_non_text_change()
             self._schedule_preview_update()
 
         def _on_series_label_changed(self, *_unused: object) -> None:
@@ -10559,12 +11176,36 @@ def launch_plot_settings_panel(
 
         def _initialize_normalization_data(self, settings: dict[str, Any]) -> None:
             count = len(self._series_labels_data)
-            if (
-                settings.get("series_overrides") is not None
-                and len(self._series_normalization_modes_data) == count
-                and len(self._series_normalization_values_data) == count
-                and len(self._series_normalization_x_refs_data) == count
-            ):
+            overrides_by_id = _coerce_series_overrides(settings.get("series_overrides"))
+            if overrides_by_id:
+                self._series_normalization_modes_data = []
+                self._series_normalization_values_data = []
+                self._series_normalization_x_refs_data = []
+                for index in range(count):
+                    descriptor = (
+                        self._series_descriptors_data[index]
+                        if index < len(self._series_descriptors_data)
+                        else {"series_id": f"series:{index}"}
+                    )
+                    series_id = str(descriptor.get("series_id") or f"series:{index}")
+                    entry = overrides_by_id.get(series_id, {})
+                    mode = str(entry.get("normalization_mode") or "none").strip().lower()
+                    if mode not in _NORMALIZATION_MODES:
+                        mode = "none"
+                    value = (
+                        ""
+                        if entry.get("normalization_value") is None
+                        else str(entry.get("normalization_value")).strip()
+                    )
+                    x_ref = (
+                        ""
+                        if entry.get("normalization_x_ref") is None
+                        else str(entry.get("normalization_x_ref")).strip()
+                    )
+                    self._series_normalization_modes_data.append(mode)
+                    self._series_normalization_values_data.append(value)
+                    self._series_normalization_x_refs_data.append(x_ref)
+
                 self._normalization_syncing = True
                 try:
                     self._load_normalization_into_editor(self._series_active_index)
@@ -10645,6 +11286,7 @@ def launch_plot_settings_panel(
                 self._series_normalization_x_refs_data[index] = x_ref
             self._load_normalization_into_editor(self._series_active_index)
             self._update_normalization_warning()
+            self._record_history_after_non_text_change()
             self._schedule_preview_update()
             self._status_label.setText("Copied normalization settings to all layers.")
 
@@ -10653,10 +11295,17 @@ def launch_plot_settings_panel(
                 return
             self._persist_normalization_editor(self._series_active_index)
             self._refresh_widget_states()
+            if not self._sender_is_text_editor():
+                self._record_history_after_non_text_change()
             self._schedule_preview_update()
 
         def _update_normalization_warning(self) -> None:
             if not hasattr(self, "normalization_warning"):
+                return
+            layer_caps = self._current_layer_capabilities()
+            if not layer_caps.show_normalization or self._is_orientation_heatmap_mode():
+                self.normalization_warning.setText("")
+                self.normalization_warning.hide()
                 return
             visible_modes = [
                 mode
@@ -10896,7 +11545,9 @@ def launch_plot_settings_panel(
                 return
             explanation_label = getattr(self, "_series_error_explanation", None)
             if index < 0 or index >= len(self._series_labels_data):
-                self._series_error_summary.setText("No error overlay available for this selection.")
+                self._series_error_summary.setText(
+                    "No uncertainty data available for this selection."
+                )
                 self._series_error_summary.show()
                 if explanation_label is not None:
                     explanation_label.setText("")
@@ -10909,7 +11560,7 @@ def launch_plot_settings_panel(
 
             if not self._error_supported_for_current_view():
                 self._series_error_summary.setText(
-                    "Error overlays are only available for 1-D line-based views."
+                    "Uncertainty overlays are only available for 1-D line plots."
                 )
                 self._series_error_summary.show()
                 if explanation_label is not None:
@@ -10929,24 +11580,28 @@ def launch_plot_settings_panel(
             series_id = str(descriptor.get("series_id") or f"series:{index}")
             masked_count = masked_map.get(series_id) if isinstance(masked_map, dict) else None
             if not isinstance(summary, dict):
-                available_text = ", ".join(available) if available else "none yet"
+                available_display = (
+                    [_ERROR_STAT_DISPLAY.get(s, s) for s in available]
+                    if available
+                    else ["none yet"]
+                )
                 configured_stat = self._series_error_stats_data[index]
                 resolved_stat = self._resolved_error_stat_for_series(index)
                 statistics_mode = self._current_error_statistics_mode_for_series(index)
                 statistics_mode_text = {
-                    "direct": "Stored direct statistics",
-                    "raw_grouped": "Raw grouped statistics",
-                    "saved_rebinned_sample": "Rebinned sample statistics from stored data",
-                }.get(statistics_mode or "", "Not yet rendered")
+                    "direct": "Stored statistics",
+                    "raw_grouped": "Grouped raw data",
+                    "saved_rebinned_sample": "Rebinned from stored data",
+                }.get(statistics_mode or "", "Pending")
                 lines = [
-                    "Rendered uncertainty details are not available for the current preview state yet.",
-                    f"Configured statistic: {configured_stat or 'sample_sem'}",
-                    f"Effective statistic: {resolved_stat}",
-                    f"Statistics mode: {statistics_mode_text}",
-                    f"Available stats: {available_text}",
+                    "Uncertainty details will appear after the next render.",
+                    f"Selected: {_ERROR_STAT_DISPLAY.get(configured_stat or 'sample_sem', configured_stat or 'Sample SEM')}",
+                    f"Effective: {_ERROR_STAT_DISPLAY.get(resolved_stat, resolved_stat)}",
+                    f"Source: {statistics_mode_text}",
+                    f"Available: {', '.join(available_display)}",
                 ]
                 if availability.reason:
-                    lines.append(f"Availability: {availability.reason}")
+                    lines.append(availability.reason)
                 self._series_error_summary.setText("\n".join(lines))
                 self._series_error_summary.show()
                 if explanation_label is not None:
@@ -10967,15 +11622,17 @@ def launch_plot_settings_panel(
             if status == "ok":
                 statistics_mode = str(summary.get("statistics_mode") or "").strip().lower()
                 statistics_mode_text = {
-                    "direct": "Stored direct statistics",
-                    "raw_grouped": "Raw grouped statistics",
-                    "saved_rebinned_sample": "Rebinned sample statistics from stored data",
-                }.get(statistics_mode, "Statistics mode unavailable")
+                    "direct": "Stored statistics",
+                    "raw_grouped": "Grouped raw data",
+                    "saved_rebinned_sample": "Rebinned from stored data",
+                }.get(statistics_mode, "Unknown")
+                raw_stat = summary.get("stat") or self._resolved_error_stat_for_series(index)
+                raw_style = summary.get("style") or self._series_error_styles_data[index]
                 lines = [
-                    f"Statistic: {summary.get('stat') or self._resolved_error_stat_for_series(index)}",
-                    f"Style: {summary.get('style') or self._series_error_styles_data[index]}",
-                    f"Color: {summary.get('color') or self._series_error_colors_data[index] or 'Follow series color'}",
-                    f"Statistics mode: {statistics_mode_text}",
+                    f"Statistic: {_ERROR_STAT_DISPLAY.get(raw_stat, raw_stat)}",
+                    f"Style: {_ERROR_STYLE_DISPLAY.get(raw_style, raw_style)}",
+                    f"Color: {summary.get('color') or self._series_error_colors_data[index] or 'Auto (matches series)'}",
+                    f"Source: {statistics_mode_text}",
                     f"Visible bins: {summary.get('point_count') if summary.get('point_count') is not None else 'n/a'}",
                 ]
                 reason = str(summary.get("reason") or "").strip()
@@ -10984,7 +11641,8 @@ def launch_plot_settings_panel(
                 if masked_count is not None:
                     lines.append(f"Masked bins: {masked_count}")
                 if available:
-                    lines.append(f"Available stats: {', '.join(available)}")
+                    available_display = [_ERROR_STAT_DISPLAY.get(s, s) for s in available]
+                    lines.append(f"Available: {', '.join(available_display)}")
                 self._series_error_summary.setText("\n".join(lines))
                 self._series_error_summary.show()
                 provenance = str(summary.get("provenance") or "").strip()
@@ -11002,12 +11660,14 @@ def launch_plot_settings_panel(
                 return
 
             if status == "off":
-                available_text = ", ".join(available) if available else "none"
+                available_display = (
+                    [_ERROR_STAT_DISPLAY.get(s, s) for s in available] if available else ["none"]
+                )
                 self._series_error_summary.setText(
                     "\n".join(
                         [
-                            "No error overlay is currently rendered for this series.",
-                            f"Available stats: {available_text}",
+                            "Uncertainty is not currently shown for this series.",
+                            f"Available: {', '.join(available_display)}",
                         ]
                     )
                 )
@@ -11028,7 +11688,7 @@ def launch_plot_settings_panel(
 
             if status == "disabled":
                 reason = str(
-                    summary.get("reason") or "Error overlay is not active for this series."
+                    summary.get("reason") or "Uncertainty overlay is not active for this series."
                 )
                 self._series_error_summary.setText(reason)
                 self._series_error_summary.show()
@@ -11046,7 +11706,9 @@ def launch_plot_settings_panel(
                     self._series_error_style_note.show()
                 return
 
-            reason = str(summary.get("reason") or "Error overlay is unavailable for this series.")
+            reason = str(
+                summary.get("reason") or "Uncertainty data is unavailable for this series."
+            )
             self._series_error_summary.hide()
             if explanation_label is not None:
                 explanation_label.setText("")
@@ -11152,6 +11814,7 @@ def launch_plot_settings_panel(
                 self.x_label,
                 self.y_label,
                 self.legend_title,
+                self.legend_title_font,
                 self.legend_columns,
                 self.x_min,
                 self.x_max,
@@ -11171,6 +11834,7 @@ def launch_plot_settings_panel(
                 self.font_family,
                 self.base_font_size,
                 self.title_font,
+                self.title_pad,
                 self.x_label_font,
                 self.y_label_font,
                 self.x_tick_font,
@@ -11229,10 +11893,15 @@ def launch_plot_settings_panel(
                 self.axes_border_mode,
             )
             for widget in combo_widgets:
+                widget.currentTextChanged.connect(self._record_history_after_non_text_change)
                 widget.currentTextChanged.connect(self._schedule_preview_update)
             if hasattr(self, "y_bin_reducer"):
+                self.y_bin_reducer.currentTextChanged.connect(
+                    self._record_history_after_non_text_change
+                )
                 self.y_bin_reducer.currentTextChanged.connect(self._schedule_preview_update)
             for cb in (self.border_left, self.border_right, self.border_top, self.border_bottom):
+                cb.toggled.connect(self._record_history_after_non_text_change)
                 cb.toggled.connect(self._schedule_preview_update)
 
         def _handle_auto_preview_toggle(self, checked: bool) -> None:
@@ -11582,6 +12251,9 @@ def launch_plot_settings_panel(
             self.legend_columns.setText(
                 _extract_dict_text(settings, key="legend_kwargs", nested_key="ncols")
             )
+            self.legend_title_font.setText(
+                _extract_dict_text(settings, key="legend_kwargs", nested_key="title_fontsize")
+            )
             legend_font_size = settings.get("legend_font_size")
             if legend_font_size is None:
                 legend_font_size = _extract_dict_text(
@@ -11704,6 +12376,9 @@ def launch_plot_settings_panel(
                         "title_font_size"
                     ]
                 )
+            )
+            self.title_pad.setText(
+                "6.0" if settings.get("title_pad") in {None, ""} else str(settings.get("title_pad"))
             )
             label_font_size = (
                 settings.get("label_font_size")
@@ -11902,13 +12577,47 @@ def launch_plot_settings_panel(
             if hasattr(self, "position_component"):
                 self._set_combo_value(
                     self.position_component,
-                    str(settings.get("component") or "distance"),
+                    _position_component_display_value(settings.get("component") or "distance"),
+                )
+            projection_value = settings.get("projection_value")
+            if projection_value is None:
+                projection_value = settings.get("map_color") or "distance"
+            projection_filter_max = settings.get("projection_filter_max")
+            if (
+                projection_filter_max is None
+                and str(projection_value).strip().lower() == "distance"
+            ):
+                projection_filter_max = settings.get("xy_z_distance_max")
+            if hasattr(self, "position_projection_x"):
+                self._set_combo_value(
+                    self.position_projection_x,
+                    str(settings.get("projection_x") or "x"),
+                )
+            if hasattr(self, "position_projection_y"):
+                self._set_combo_value(
+                    self.position_projection_y,
+                    str(settings.get("projection_y") or "y"),
+                )
+            if hasattr(self, "position_projection_render_mode"):
+                self._set_combo_value(
+                    self.position_projection_render_mode,
+                    str(settings.get("projection_render_mode") or "color-scale"),
                 )
             if hasattr(self, "position_map_color"):
                 self._set_combo_value(
                     self.position_map_color,
-                    str(settings.get("map_color") or "distance"),
+                    str(projection_value or "distance"),
                 )
+            if hasattr(self, "position_projection_filter_min"):
+                raw = settings.get("projection_filter_min")
+                self.position_projection_filter_min.setText(str(raw) if raw is not None else "")
+            if hasattr(self, "position_projection_filter_max"):
+                self.position_projection_filter_max.setText(
+                    str(projection_filter_max) if projection_filter_max is not None else ""
+                )
+            if hasattr(self, "position_xy_z_distance_max"):
+                raw = settings.get("xy_z_distance_max")
+                self.position_xy_z_distance_max.setText(str(raw) if raw is not None else "")
             if hasattr(self, "position_time_axis"):
                 self._set_combo_value(
                     self.position_time_axis,
@@ -12055,6 +12764,9 @@ def launch_plot_settings_panel(
             x_label_enabled = self._synced_field_mode("x_label") != "off"
             y_label_enabled = self._synced_field_mode("y_label") != "off"
             legend_enabled = self.legend_mode.currentText().strip().lower() != "off"
+            legend_title_present = (
+                bool(self.legend_title.text().strip()) if hasattr(self, "legend_title") else False
+            )
             grid_enabled = self.grid_mode.currentText().strip().lower() != "off"
             x_ticks_enabled = self.x_ticks_mode.currentText().strip().lower() != "off"
             y_ticks_enabled = self.y_ticks_mode.currentText().strip().lower() != "off"
@@ -12088,7 +12800,7 @@ def launch_plot_settings_panel(
                 if hasattr(self, "position_component")
                 else ""
             )
-            position_xy_projection = position_component == "xy-z"
+            position_xy_projection = _is_position_projection_component(position_component)
             coordination_component = (
                 self.coordination_component.currentText().strip().lower()
                 if hasattr(self, "coordination_component")
@@ -12110,6 +12822,12 @@ def launch_plot_settings_panel(
                 widget.setVisible(y_label_enabled)
             self._set_rows_visible(self._title_rows, title_enabled)
             self._set_rows_visible(self._legend_rows, legend_enabled)
+            if hasattr(self, "legend_title_font"):
+                self._set_form_row_visible(
+                    self._legend_rows[0][0],
+                    self.legend_title_font,
+                    legend_enabled and legend_title_present,
+                )
             self._set_rows_visible(self._grid_rows, grid_enabled)
             self._set_rows_visible(self._marker_rows, markers_enabled)
             self._set_rows_visible(self._integration_rows, integration_enabled)
@@ -12203,22 +12921,64 @@ def launch_plot_settings_panel(
             if self._figure_heatmap_section is not None:
                 self._figure_heatmap_section.setVisible(figure_caps.show_heatmap)
 
+            if self._position_projection_x_row is not None:
+                self._set_form_row_visible(
+                    self._position_projection_x_row[0],
+                    self._position_projection_x_row[1],
+                    position_xy_projection,
+                )
+            if self._position_projection_y_row is not None:
+                self._set_form_row_visible(
+                    self._position_projection_y_row[0],
+                    self._position_projection_y_row[1],
+                    position_xy_projection,
+                )
+            if self._position_projection_render_mode_row is not None:
+                self._set_form_row_visible(
+                    self._position_projection_render_mode_row[0],
+                    self._position_projection_render_mode_row[1],
+                    position_xy_projection,
+                )
             if self._position_map_color_row is not None:
                 self._set_form_row_visible(
                     self._position_map_color_row[0],
                     self._position_map_color_row[1],
                     position_xy_projection,
                 )
-            if self._position_time_axis_row is not None:
+            if self._position_projection_filter_min_row is not None:
                 self._set_form_row_visible(
-                    self._position_time_axis_row[0],
-                    self._position_time_axis_row[1],
+                    self._position_projection_filter_min_row[0],
+                    self._position_projection_filter_min_row[1],
+                    position_xy_projection,
+                )
+            if self._position_projection_filter_max_row is not None:
+                self._set_form_row_visible(
+                    self._position_projection_filter_max_row[0],
+                    self._position_projection_filter_max_row[1],
+                    position_xy_projection,
+                )
+            if getattr(self, "_position_xy_z_distance_max_row", None) is not None:
+                position_xy_z_distance_max_row = self._position_xy_z_distance_max_row
+                assert position_xy_z_distance_max_row is not None
+                self._set_form_row_visible(
+                    position_xy_z_distance_max_row[0],
+                    position_xy_z_distance_max_row[1],
+                    False,
+                )
+            if self._position_time_axis_row is not None:
+                position_time_axis_row = self._position_time_axis_row
+                assert position_time_axis_row is not None
+                self._set_form_row_visible(
+                    position_time_axis_row[0],
+                    position_time_axis_row[1],
                     not position_xy_projection,
                 )
             if self._coordination_time_axis_row is not None:
+                coordination_time_axis_row = self._coordination_time_axis_row
+                assert coordination_time_axis_row is not None
                 self._set_form_row_visible(
-                    self._coordination_time_axis_row[0],
-                    self._coordination_time_axis_row[1],
+                    coordination_time_axis_row[0],
+                    coordination_time_axis_row[1],
                     not coordination_distance,
                 )
             if self._data_transform_group is not None and self._analysis_name == "position":
@@ -12439,14 +13199,14 @@ def launch_plot_settings_panel(
                 self._apply_widget_tooltip(
                     self._series_error_mode,
                     disabled_reason=(
-                        "error settings are edited on the base series only."
+                        "Uncertainty settings are edited on the base series only."
                         if self._series_active_is_fit_child
                         or self._series_active_is_cumulative_child
-                        else "grouped series do not render error overlays."
+                        else "Grouped series do not support uncertainty overlays."
                         if selected_group
                         else None
                         if error_supported
-                        else "error overlays are only available for 1-D line-based views."
+                        else "Uncertainty overlays are only available for 1-D line plots."
                     ),
                 )
             if hasattr(self, "_series_error_stat"):
@@ -12458,16 +13218,16 @@ def launch_plot_settings_panel(
                 self._apply_widget_tooltip(
                     self._series_error_stat,
                     disabled_reason=(
-                        "error settings are edited on the base series only."
+                        "Uncertainty settings are edited on the base series only."
                         if self._series_active_is_fit_child
                         or self._series_active_is_cumulative_child
-                        else "grouped series do not render error overlays."
+                        else "Grouped series do not support uncertainty overlays."
                         if selected_group
                         else error_availability.reason
                         if error_supported and not error_availability.selector_enabled
                         else None
                         if error_supported
-                        else "error overlays are only available for 1-D line-based views."
+                        else "Uncertainty overlays are only available for 1-D line plots."
                     ),
                 )
             if hasattr(self, "_series_error_style"):
@@ -12475,14 +13235,14 @@ def launch_plot_settings_panel(
                 self._apply_widget_tooltip(
                     self._series_error_style,
                     disabled_reason=(
-                        "error settings are edited on the base series only."
+                        "Uncertainty settings are edited on the base series only."
                         if self._series_active_is_fit_child
                         or self._series_active_is_cumulative_child
-                        else "grouped series do not render error overlays."
+                        else "Grouped series do not support uncertainty overlays."
                         if selected_group
                         else None
                         if error_supported
-                        else "error overlays are only available for 1-D line-based views."
+                        else "Uncertainty overlays are only available for 1-D line plots."
                     ),
                 )
             for widget in (
@@ -12495,14 +13255,14 @@ def launch_plot_settings_panel(
                     self._apply_widget_tooltip(
                         widget,
                         disabled_reason=(
-                            "error settings are edited on the base series only."
+                            "Uncertainty settings are edited on the base series only."
                             if self._series_active_is_fit_child
                             or self._series_active_is_cumulative_child
-                            else "grouped series do not render error overlays."
+                            else "Grouped series do not support uncertainty overlays."
                             if selected_group
                             else None
                             if error_supported
-                            else "error overlays are only available for 1-D line-based views."
+                            else "Uncertainty overlays are only available for 1-D line plots."
                         ),
                     )
             if self._min_bin_points_row is not None:
@@ -13033,6 +13793,14 @@ def launch_plot_settings_panel(
                     "fit_label_override": fit_label_override_value,
                     "fit_show_in_legend": fit_show_in_legend_value,
                 }
+                fit_color_out = self._series_fit_color_data[index].strip() or None
+                fit_alpha_out = self._series_fit_alpha_data[index].strip() or None
+                fit_line_width_out = self._series_fit_line_width_data[index].strip() or None
+                fit_line_style_out = self._series_fit_line_style_data[index].strip() or None
+                fit_config_payload["fit_color"] = fit_color_out
+                fit_config_payload["fit_alpha"] = fit_alpha_out
+                fit_config_payload["fit_line_width"] = fit_line_width_out
+                fit_config_payload["fit_line_style"] = fit_line_style_out
                 if fit_config_payload != {
                     "fit_enabled": fit_defaults["fit_enabled"],
                     "fit_type": fit_defaults["fit_type"],
@@ -13044,6 +13812,10 @@ def launch_plot_settings_panel(
                     "fit_bounds": fit_defaults["fit_bounds"],
                     "fit_label_override": fit_defaults["fit_label_override"],
                     "fit_show_in_legend": fit_defaults["fit_show_in_legend"],
+                    "fit_color": fit_defaults["fit_color"],
+                    "fit_alpha": fit_defaults["fit_alpha"],
+                    "fit_line_width": fit_defaults["fit_line_width"],
+                    "fit_line_style": fit_defaults["fit_line_style"],
                 }:
                     entry["fit"] = fit_config_payload
                 cumulative_enabled_value = bool(self._series_cumulative_enabled_data[index])
@@ -13136,18 +13908,6 @@ def launch_plot_settings_panel(
                 }
                 if integration_payload != integration_default_payload:
                     entry["integration"] = integration_payload
-                fit_color_out = self._series_fit_color_data[index].strip() or None
-                fit_alpha_out = self._series_fit_alpha_data[index].strip() or None
-                fit_line_width_out = self._series_fit_line_width_data[index].strip() or None
-                fit_line_style_out = self._series_fit_line_style_data[index].strip() or None
-                if fit_color_out is not None:
-                    entry["fit_color"] = fit_color_out
-                if fit_alpha_out is not None:
-                    entry["fit_alpha"] = fit_alpha_out
-                if fit_line_width_out is not None:
-                    entry["fit_line_width"] = fit_line_width_out
-                if fit_line_style_out is not None:
-                    entry["fit_line_style"] = fit_line_style_out
                 error_enabled_value = bool(self._series_error_enabled_data[index])
                 error_stat = self._resolved_error_stat_for_series(index)
                 error_style = self._series_error_styles_data[index].strip().lower()
@@ -13315,6 +14075,14 @@ def launch_plot_settings_panel(
                 raise ValueError("legend-columns must be >= 1.")
             if legend_frame is not None:
                 legend_kwargs_merged["frameon"] = legend_frame
+            legend_title_font_size = _optional_positive_int_or_none(
+                self.legend_title_font.text(),
+                field_name="legend-title-font-size",
+            )
+            if legend_title_font_size is not None:
+                legend_kwargs_merged["title_fontsize"] = legend_title_font_size
+            else:
+                legend_kwargs_merged.pop("title_fontsize", None)
             if legend_columns is not None:
                 legend_kwargs_merged["ncols"] = legend_columns
             else:
@@ -13394,6 +14162,8 @@ def launch_plot_settings_panel(
             )
             tick_params_kwargs_merged["_ticks_axis"] = resolved_ticks_axis
             tick_params_kwargs_merged["axis"] = resolved_ticks_axis
+            tick_params_kwargs_merged["_x_ticks_visible"] = x_ticks_on
+            tick_params_kwargs_merged["_y_ticks_visible"] = y_ticks_on
             tick_params_kwargs_merged["_x_tick_params"] = _axis_tick_params("x")
             tick_params_kwargs_merged["_y_tick_params"] = _axis_tick_params("y")
             for axis, widget in (
@@ -13504,6 +14274,7 @@ def launch_plot_settings_panel(
                 "title_font_size": _optional_positive_int_or_none(
                     self.title_font.text(), field_name="title-font-size"
                 ),
+                "title_pad": _optional_float(self.title_pad.text(), field_name="title-pad"),
                 "label_font_size": shared_label_font_size_value,
                 "x_label_font_size": x_label_font_size_value,
                 "y_label_font_size": y_label_font_size_value,
@@ -13604,9 +14375,58 @@ def launch_plot_settings_panel(
                     default_label=_PROFILE_FILTER_SPECIES_B_AUTO_LABEL,
                 )
             if hasattr(self, "position_component"):
-                settings["component"] = self.position_component.currentText().strip() or "distance"
+                settings["component"] = _position_component_setting_value(
+                    self.position_component.currentText()
+                )
+            if hasattr(self, "position_projection_x"):
+                settings["projection_x"] = self.position_projection_x.currentText().strip() or "x"
+            if hasattr(self, "position_projection_y"):
+                settings["projection_y"] = self.position_projection_y.currentText().strip() or "y"
+            if hasattr(self, "position_projection_render_mode"):
+                settings["projection_render_mode"] = (
+                    self.position_projection_render_mode.currentText().strip() or "color-scale"
+                )
             if hasattr(self, "position_map_color"):
-                settings["map_color"] = self.position_map_color.currentText().strip() or "distance"
+                projection_value = self.position_map_color.currentText().strip() or "distance"
+                settings["projection_value"] = projection_value
+                settings["map_color"] = (
+                    projection_value if projection_value in {"distance", "z"} else "distance"
+                )
+            if hasattr(self, "position_projection_filter_min"):
+                settings["projection_filter_min"] = _optional_float(
+                    self.position_projection_filter_min.text(),
+                    field_name="projection range minimum",
+                )
+            if hasattr(self, "position_projection_filter_max"):
+                settings["projection_filter_max"] = _optional_float(
+                    self.position_projection_filter_max.text(),
+                    field_name="projection range maximum",
+                )
+                if (
+                    settings["projection_filter_min"] is not None
+                    and settings["projection_filter_max"] is not None
+                    and settings["projection_filter_min"] > settings["projection_filter_max"]
+                ):
+                    raise ValueError(
+                        "Projection range minimum must not exceed the projection range maximum."
+                    )
+            if hasattr(self, "position_xy_z_distance_max"):
+                settings["xy_z_distance_max"] = _optional_float(
+                    self.position_xy_z_distance_max.text(),
+                    field_name="xy-z distance max",
+                )
+                if (
+                    settings["xy_z_distance_max"] is not None
+                    and settings["xy_z_distance_max"] <= 0.0
+                ):
+                    raise ValueError("xy-z distance max must be positive.")
+                if (
+                    settings.get("projection_value") == "distance"
+                    and settings.get("projection_filter_min") is None
+                    and settings.get("projection_filter_max") is None
+                    and settings["xy_z_distance_max"] is not None
+                ):
+                    settings["projection_filter_max"] = settings["xy_z_distance_max"]
             if hasattr(self, "position_time_axis"):
                 settings["time_axis"] = self.position_time_axis.currentText().strip() or "ps"
             if hasattr(self, "coordination_component"):
@@ -13746,6 +14566,7 @@ def launch_plot_settings_panel(
             finally:
                 self._suspend_preview_events = False
             self._refresh_widget_states()
+            self._reset_undo_history()
             self._status_label.setText("Current profile reset to style defaults.")
             self._schedule_preview_update()
             self._refresh_shell_state()
@@ -13882,6 +14703,38 @@ def launch_plot_settings_panel(
             preview_label = self._preview_label
             preview_frame = self._preview_frame
             preview_viewport = preview_scroll.viewport() if preview_scroll is not None else None
+
+            if isinstance(watched, (QLineEdit, QPlainTextEdit)):
+                if event.type() == QEvent.Type.KeyPress:
+                    key = int(event.key())
+                    modifiers = event.modifiers()
+                    is_ctrl_edit_shortcut = bool(
+                        modifiers & Qt.KeyboardModifier.ControlModifier
+                    ) and key in {
+                        int(Qt.Key.Key_V),
+                        int(Qt.Key.Key_X),
+                    }
+                    if key in {
+                        int(Qt.Key.Key_Return),
+                        int(Qt.Key.Key_Enter),
+                    }:
+                        self._finalize_text_undo_edit(watched)
+                    elif (
+                        key
+                        in {
+                            int(Qt.Key.Key_Backspace),
+                            int(Qt.Key.Key_Delete),
+                        }
+                        or is_ctrl_edit_shortcut
+                        or (
+                            not (modifiers & Qt.KeyboardModifier.ControlModifier)
+                            and not (modifiers & Qt.KeyboardModifier.AltModifier)
+                            and event.text()
+                        )
+                    ):
+                        self._begin_text_undo_edit(watched)
+                elif event.type() == QEvent.Type.FocusOut:
+                    self._finalize_text_undo_edit(watched)
 
             if watched in {preview_viewport, preview_label}:
                 if event.type() == QEvent.Type.Wheel:

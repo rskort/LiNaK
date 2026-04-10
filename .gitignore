@@ -11,11 +11,11 @@ dist/
 .eggs/
 
 # Test / coverage artifacts
-.pytest_cache/
-.pytest_runs/
+.pytest_*
 .coverage
 htmlcov/
 LiNaK_outputs/
+.smoke_plot_complexity/
 
 # Type checking / lint caches
 .mypy_cache/

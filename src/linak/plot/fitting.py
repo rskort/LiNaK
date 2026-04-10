@@ -23,7 +23,18 @@ _DEFAULT_FIT_CONFIG: FitConfigDict = {
     "fit_bounds": None,
     "fit_label_override": None,
     "fit_show_in_legend": True,
+    "fit_color": None,
+    "fit_alpha": None,
+    "fit_line_width": None,
+    "fit_line_style": None,
 }
+
+_OPTIONAL_FIT_STYLE_KEYS = (
+    "fit_color",
+    "fit_alpha",
+    "fit_line_width",
+    "fit_line_style",
+)
 
 _SUPPORTED_FIT_TYPES = frozenset(
     {
@@ -222,6 +233,14 @@ def coerce_fit_config(
         config["fit_label_override"] = None if fit_label in {None, ""} else str(fit_label).strip()
         if "fit_show_in_legend" in raw:
             config["fit_show_in_legend"] = bool(raw.get("fit_show_in_legend"))
+        fit_color = raw.get("fit_color")
+        config["fit_color"] = None if fit_color in {None, ""} else str(fit_color).strip()
+        config["fit_alpha"] = _as_float(raw.get("fit_alpha"))
+        config["fit_line_width"] = _as_float(raw.get("fit_line_width"))
+        fit_line_style = raw.get("fit_line_style")
+        config["fit_line_style"] = (
+            None if fit_line_style in {None, ""} else str(fit_line_style).strip()
+        )
 
     if config["fit_type"] == "polynomial":
         config["fit_degree"] = max(1, int(config.get("fit_degree") or 2))
@@ -247,7 +266,12 @@ def resolve_series_fit_configs(
             if series_fit_configs is None or index >= len(series_fit_configs)
             else series_fit_configs[index]
         )
-        configs.append(coerce_fit_config(raw))
+        config = coerce_fit_config(raw)
+        if isinstance(raw, dict):
+            for key in _OPTIONAL_FIT_STYLE_KEYS:
+                if key not in raw and config.get(key) is None:
+                    config.pop(key, None)
+        configs.append(config)
     return configs
 
 

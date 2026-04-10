@@ -154,10 +154,10 @@ def _read_required_linak_header(
         if warning_key not in _WARNED_LINAK_VERSION_MISMATCHES:
             _WARNED_LINAK_VERSION_MISMATCHES.add(warning_key)
             LOGGER.warning(
-                "HDF5 file '%s' was written by LiNaK %s; current LiNaK is %s.",
-                path_label,
+                "LiNaK version mismatch (%s → %s) for '%s' [Consider file regeneration]",
                 file_linak_version,
                 __version__,
+                Path(path_label).name,
             )
 
     analysis = _decode_required_string_attr(attrs=handle.attrs, name="analysis", path=path)

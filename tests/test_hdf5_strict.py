@@ -44,7 +44,7 @@ def test_linak_hdf5_reader_warns_but_reads_wrong_package_version(tmp_path, caplo
 
     assert "density" in datasets
     assert metadata["analysis"] == "density"
-    assert "was written by LiNaK 0.5.0" in caplog.text
+    assert "LiNaK version mismatch (0.5.0" in caplog.text
 
 
 def test_linak_hdf5_reader_warns_once_for_repeated_version_mismatch_reads(tmp_path, caplog):
@@ -58,7 +58,9 @@ def test_linak_hdf5_reader_warns_once_for_repeated_version_mismatch_reads(tmp_pa
         read_linak_hdf5(source, expected_analysis="density")
 
     warning_records = [
-        record for record in caplog.records if "was written by LiNaK 0.5.0" in record.getMessage()
+        record
+        for record in caplog.records
+        if "LiNaK version mismatch (0.5.0" in record.getMessage()
     ]
     assert len(warning_records) == 1
 

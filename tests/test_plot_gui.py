@@ -79,6 +79,86 @@ def test_plot_settings_panel_opens_maximized_by_default():
     assert "window.showMaximized()" in source
 
 
+def test_plot_settings_panel_exposes_header_undo_button_and_session_history():
+    source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+
+    assert 'self._undo_button = QPushButton("Undo")' in source
+    assert "self._undo_button.clicked.connect(self._handle_undo)" in source
+    assert 'self._register_tooltip(self._undo_button, "profiles.undo")' in source
+    assert "self._undo_stack: list[dict[str, Any]] = []" in source
+    assert "self._redo_stack: list[dict[str, Any]] = []" in source
+    assert 'self._redo_button = QPushButton("Redo")' in source
+    assert "self._redo_button.clicked.connect(self._handle_redo)" in source
+    assert 'self._register_tooltip(self._redo_button, "profiles.redo")' in source
+    assert 'self._undo_shortcut = QShortcut(QKeySequence("Ctrl+Z"), self)' in source
+    assert 'self._redo_shortcut = QShortcut(QKeySequence("Ctrl+Shift+Z"), self)' in source
+    assert "def _record_history_after_non_text_change(self, *_unused: object) -> None:" in source
+    assert "def _handle_undo(self) -> None:" in source
+    assert "def _handle_redo(self) -> None:" in source
+    assert "def _begin_text_undo_edit(self, widget: QWidget | None) -> None:" in source
+    assert "def _finalize_text_undo_edit(self, widget: QWidget | None = None) -> None:" in source
+    assert '"_undo_preview_state"' in source
+    assert "def _history_snapshot(self, settings: dict[str, Any]) -> dict[str, Any]:" in source
+
+
+def test_plot_settings_panel_imports_qshortcut_from_qtgui():
+    source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+
+    qtgui_block_start = source.index("from PySide6.QtGui")
+    qtwidgets_block_start = source.index("from PySide6.QtWidgets")
+    qtwidgets_block_end = source.index(")", qtwidgets_block_start)
+
+    assert "QShortcut" in source[qtgui_block_start:qtwidgets_block_start]
+    assert "QShortcut" not in source[qtwidgets_block_start:qtwidgets_block_end]
+
+
+def test_plot_settings_panel_event_filter_uses_qt_modifier_flags_directly():
+    source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+
+    event_filter_index = source.rindex("def eventFilter(self, watched: Any, event: Any) -> bool:")
+    event_filter_block = source[event_filter_index : event_filter_index + 1800]
+
+    assert "modifiers = event.modifiers()" in event_filter_block
+    assert "int(event.modifiers())" not in event_filter_block
+    assert "modifiers & Qt.KeyboardModifier.ControlModifier" in event_filter_block
+    assert "modifiers & Qt.KeyboardModifier.AltModifier" in event_filter_block
+
+
+def test_plot_settings_panel_no_longer_discovers_undo_history_during_shell_refresh():
+    source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+
+    refresh_shell_state_index = source.index("def _refresh_shell_state(self) -> None:")
+    update_header_state_index = source.index(
+        "self._update_header_state()", refresh_shell_state_index
+    )
+    assert "_record_undo_snapshot_if_needed" not in source
+    assert (
+        "self._record_history_after_non_text_change()"
+        not in source[refresh_shell_state_index : update_header_state_index + 200]
+    )
+
+
+def test_plot_settings_panel_populate_resets_all_parallel_series_style_arrays():
+    source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+
+    assert "self._series_fit_color_data = []" in source
+    assert "self._series_fit_alpha_data = []" in source
+    assert "self._series_fit_line_width_data = []" in source
+    assert "self._series_fit_line_style_data = []" in source
+    assert "self._series_cumulative_color_data = []" in source
+    assert "self._series_cumulative_alpha_data = []" in source
+    assert "self._series_cumulative_line_width_data = []" in source
+    assert "self._series_cumulative_line_style_data = []" in source
+    assert "self._series_integration_enabled_data = []" in source
+    assert "self._series_integration_source_data = []" in source
+    assert "self._series_integration_x_min_data = []" in source
+    assert "self._series_integration_x_max_data = []" in source
+    assert "self._series_integration_baseline_data = []" in source
+    assert "self._series_integration_color_mode_data = []" in source
+    assert "self._series_integration_color_data = []" in source
+    assert "self._series_integration_alpha_data = []" in source
+
+
 def test_plot_settings_panel_uses_item_chooser_for_multi_profile_hdf5_import():
     source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
 
@@ -539,6 +619,19 @@ def test_plot_settings_panel_starts_fit_editor_in_off_mode_before_saved_state_lo
     assert fit_combo_index < fit_off_index < fit_connect_index
 
 
+def test_plot_settings_panel_nests_fit_style_overrides_inside_fit_payload():
+    source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+
+    assert 'fit_config_payload["fit_color"] = fit_color_out' in source
+    assert 'fit_config_payload["fit_alpha"] = fit_alpha_out' in source
+    assert 'fit_config_payload["fit_line_width"] = fit_line_width_out' in source
+    assert 'fit_config_payload["fit_line_style"] = fit_line_style_out' in source
+    assert 'entry["fit_color"] = fit_color_out' not in source
+    assert 'entry["fit_alpha"] = fit_alpha_out' not in source
+    assert 'entry["fit_line_width"] = fit_line_width_out' not in source
+    assert 'entry["fit_line_style"] = fit_line_style_out' not in source
+
+
 def test_plot_settings_panel_nests_tick_sections_inside_axis_sections_and_keeps_annotation_list_open():
     source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
 
@@ -551,11 +644,23 @@ def test_plot_settings_panel_nests_tick_sections_inside_axis_sections_and_keeps_
     annotation_splitter_index = source.index(
         "content_splitter = QSplitter(Qt.Orientation.Horizontal)"
     )
-    annotation_list_index = source.index("content_splitter.addWidget(list_group)")
+    annotation_list_index = source.index(
+        'content_splitter.addWidget(\n                self._make_static_section(\n                    title="Annotations"'
+    )
 
     assert x_axis_form_index < x_ticks_group_index < x_axis_section_index
     assert y_axis_form_index < y_ticks_group_index < y_axis_section_index
     assert annotation_splitter_index < annotation_list_index
+
+
+def test_plot_settings_panel_uses_shared_non_editable_marker_dropdowns():
+    source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+
+    assert "_MARKER_TYPES = (" in source
+    assert "self.marker_type = self._combo(_MARKER_TYPES)" in source
+    assert "self.series_marker = self._combo(_MARKER_TYPES)" in source
+    assert 'self.marker_type = self._combo(\n                ("", "o"' not in source
+    assert 'self.series_marker = self._combo(\n                ("", "o"' not in source
     assert 'section_id="annotations.list"' not in source
     assert 'QGroupBox("Base Line Style")' not in source
     assert 'QGroupBox("Fit Summary")' not in source
@@ -582,6 +687,42 @@ def test_plot_settings_panel_supports_detachable_preview_window():
     assert "self._embedded_preview_pane.setVisible(False)" in source
     assert "detached_window.close_from_dock()" in source
     assert "QTimer.singleShot(0, self._on_dock_requested)" in source
+
+
+def test_plot_settings_panel_allows_resizable_workspace_and_preview_split():
+    source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+
+    assert "_WORKSPACE_PANEL_WIDTH = 760" in source
+    assert "_WORKSPACE_PANEL_MIN_WIDTH = 520" in source
+    assert "left_panel.setMinimumWidth(_WORKSPACE_PANEL_MIN_WIDTH)" in source
+    assert (
+        "left_panel.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)"
+        in source
+    )
+    assert "left_panel.setMaximumWidth(_WORKSPACE_PANEL_WIDTH)" not in source
+    assert "splitter.setStretchFactor(0, 1)" in source
+
+
+def test_plot_settings_panel_exposes_position_projection_controls():
+    source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+
+    assert "_POSITION_COMPONENT_LABELS = (" in source
+    assert "self.position_component = self._combo(_POSITION_COMPONENT_LABELS)" in source
+    assert "self.position_projection_x = self._combo(_POSITION_PROJECTION_QUANTITIES)" in source
+    assert "self.position_projection_y = self._combo(_POSITION_PROJECTION_QUANTITIES)" in source
+    assert "self.position_projection_render_mode = self._combo(" in source
+    assert '"2D projection"' in source
+    assert '"Color / filter by"' in source
+    assert '"Range min"' in source
+    assert '"Range max"' in source
+    assert 'settings["projection_x"]' in source
+    assert 'settings["projection_y"]' in source
+    assert 'settings["projection_value"]' in source
+    assert 'settings["projection_render_mode"]' in source
+    assert 'settings["projection_filter_min"]' in source
+    assert 'settings["projection_filter_max"]' in source
+    assert "_position_component_display_value" in source
+    assert "_position_component_setting_value" in source
 
 
 def test_plot_settings_panel_has_manual_light_dark_theme_switch():
@@ -624,6 +765,18 @@ def test_plot_settings_panel_exposes_per_axis_ticks_and_color_controls():
     assert 'tooltip_id="figure.lines.marker_color"' in source
     assert '"_x_tick_params"' in source
     assert '"_y_tick_params"' in source
+    assert '"_x_ticks_visible"' in source
+    assert '"_y_ticks_visible"' in source
+    assert "self.title_pad," in source
+
+
+def test_plot_settings_panel_exposes_legend_title_font_only_under_legend_title():
+    source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+
+    assert "self.legend_title_font = self._positive_int_line()" in source
+    assert '"Legend title font"' in source
+    assert 'nested_key="title_fontsize"' in source
+    assert 'field_name="legend-title-font-size"' in source
 
 
 def test_plot_settings_panel_keeps_reset_as_a_profile_action():
@@ -654,6 +807,20 @@ def test_plot_settings_panel_uses_inline_annotation_reorder_arrows_instead_of_mo
     assert 'self._annotation_move_down_button = QPushButton("Move Down")' not in source
     assert "self._handle_annotation_row_move(" in source
     assert "QWidget#annotationRowWidget {" in source
+
+
+def test_plot_settings_panel_uses_static_section_headers_for_annotations_page():
+    source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+
+    assert "class _StaticSection(QFrame):" in source
+    assert '"staticSectionHeaderLabel"' in source
+    assert 'title="Annotations"' in source
+    assert 'title="Selected Annotation"' in source
+    assert "self._make_static_section(" in source
+    assert (
+        'self._make_collapsible_section(\n                    title="Selected Annotation"'
+        not in source
+    )
 
 
 def test_annotation_defaults_start_visible_in_preview_space():
@@ -719,13 +886,16 @@ def test_resolve_error_stat_for_available_prefers_available_semantics():
 
 
 def test_default_error_series_label_uses_effective_stat_name():
-    assert _default_error_series_label("H2O density", "sample_sem") == "H2O density sample_sem"
+    assert (
+        _default_error_series_label("H2O density", "sample_sem") == "H2O density \u00b1Sample SEM"
+    )
 
 
 def test_error_supported_for_view_tracks_one_dimensional_modes_only():
     assert _error_supported_for_view("rdf") is True
     assert _error_supported_for_view("orientation", orientation_heatmap=True) is False
     assert _error_supported_for_view("position", position_component="xy-z") is False
+    assert _error_supported_for_view("position", position_component="2d-projection") is False
     assert (
         _error_supported_for_view("coordination", coordination_component="time-distance") is False
     )
@@ -1079,6 +1249,24 @@ def test_derive_warning_messages_reports_disabled_sections_and_partial_normaliza
     assert all("Grid is off" not in message for message in warnings)
     assert all("Ticks are off" not in message for message in warnings)
     assert any("Only part of the plotted series is normalized" in message for message in warnings)
+
+
+def test_derive_warning_messages_uses_series_overrides_and_skips_heatmap_mode():
+    warnings = _derive_warning_messages(
+        {
+            "series_descriptors": [
+                {"series_id": "series:0", "source_kind": "source"},
+                {"series_id": "series:1", "source_kind": "source"},
+            ],
+            "series_overrides": {
+                "series:0": {"normalization_mode": "max", "normalization_value": 1.0},
+                "series:1": {"enabled": False, "normalization_mode": "factor"},
+            },
+            "component": "heatmap",
+        }
+    )
+
+    assert all("normalized" not in message.lower() for message in warnings)
 
 
 def test_derive_warning_messages_ignores_advanced_json_overlap():

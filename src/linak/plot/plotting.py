@@ -90,6 +90,7 @@ class PlotStyle:
     font_color: str = "#000000"
     base_font_size: int = _DEFAULT_BASE_FONT_SIZE
     title_font_size: int = 14
+    title_pad: float = 6.0
     label_font_size: int = 12
     tick_font_size: int = 10
     legend_font_size: int = 10
@@ -200,6 +201,145 @@ def resolve_series_colors(
     return [color or defaults[index] for index, color in enumerate(normalized)]
 
 
+def _auto_axis_limits_from_values(
+    values: np.ndarray,
+    *,
+    scale: str,
+    clamp_nonnegative_to_zero: bool,
+    padding_fraction: float = 0.05,
+) -> list[float] | None:
+    data = np.asarray(values, dtype=float)
+    data = data[np.isfinite(data)]
+    if data.size == 0:
+        return None
+
+    normalized_scale = str(scale).strip().lower()
+    if normalized_scale == "log":
+        data = data[data > 0.0]
+        if data.size == 0:
+            return None
+
+    lower = float(np.min(data))
+    upper = float(np.max(data))
+    if lower == upper:
+        if normalized_scale == "log":
+            pad = max(abs(lower) * padding_fraction, 1.0e-6)
+            lower = max(lower - pad, lower * 0.5, 1.0e-12)
+            upper = upper + pad
+        else:
+            pad = max(abs(lower) * padding_fraction, 1.0)
+            lower -= pad
+            upper += pad
+    elif normalized_scale == "log":
+        log_lower = float(np.log10(lower))
+        log_upper = float(np.log10(upper))
+        log_pad = max((log_upper - log_lower) * padding_fraction, 0.05)
+        lower = float(10 ** (log_lower - log_pad))
+        upper = float(10 ** (log_upper + log_pad))
+    else:
+        pad = (upper - lower) * padding_fraction
+        lower -= pad
+        upper += pad
+
+    if clamp_nonnegative_to_zero and lower >= 0.0 and normalized_scale != "log":
+        lower = 0.0
+    return [lower, upper]
+
+
+def _merge_axis_limits(
+    requested: tuple[float | None, float | None] | list[float | None] | None,
+    auto: list[float] | None,
+) -> list[float | None] | None:
+    if requested is None:
+        return None if auto is None else [float(auto[0]), float(auto[1])]
+
+    resolved: list[float | None] = [
+        None if requested[0] is None else float(requested[0]),
+        None if requested[1] is None else float(requested[1]),
+    ]
+    if auto is None:
+        return resolved
+    if resolved[0] is None:
+        resolved[0] = float(auto[0])
+    if resolved[1] is None:
+        resolved[1] = float(auto[1])
+    return resolved
+
+
+def _union_axis_limits(
+    first: list[float] | None,
+    second: list[float] | None,
+) -> list[float] | None:
+    if first is None:
+        return None if second is None else [float(second[0]), float(second[1])]
+    if second is None:
+        return [float(first[0]), float(first[1])]
+    return [
+        float(min(first[0], second[0])),
+        float(max(first[1], second[1])),
+    ]
+
+
+def _axes_artist_auto_limits(ax: Any) -> tuple[list[float] | None, list[float] | None]:
+    if not bool(ax.has_data()):
+        return None, None
+    x_left, x_right = ax.get_xlim()
+    y_bottom, y_top = ax.get_ylim()
+    auto_x = (
+        [float(x_left), float(x_right)] if np.isfinite(x_left) and np.isfinite(x_right) else None
+    )
+    auto_y = (
+        [float(y_bottom), float(y_top)] if np.isfinite(y_bottom) and np.isfinite(y_top) else None
+    )
+    return auto_x, auto_y
+
+
+def _density_visible_auto_limits(
+    x_series: list[np.ndarray],
+    y_series: list[np.ndarray],
+    *,
+    x_scale: str,
+    y_scale: str,
+) -> tuple[list[float] | None, list[float] | None]:
+    all_x: list[np.ndarray] = []
+    all_y: list[np.ndarray] = []
+    nonzero_x: list[np.ndarray] = []
+    nonzero_y: list[np.ndarray] = []
+
+    for x_values, y_values in zip(x_series, y_series):
+        x_data = np.asarray(x_values, dtype=float)
+        y_data = np.asarray(y_values, dtype=float)
+        finite_mask = np.isfinite(x_data) & np.isfinite(y_data)
+        if not np.any(finite_mask):
+            continue
+        x_finite = x_data[finite_mask]
+        y_finite = y_data[finite_mask]
+        all_x.append(x_finite)
+        all_y.append(y_finite)
+
+        nonzero_mask = y_finite != 0.0
+        if np.any(nonzero_mask):
+            nonzero_x.append(x_finite[nonzero_mask])
+            nonzero_y.append(y_finite[nonzero_mask])
+
+    if not all_x:
+        return None, None
+
+    x_focus = np.concatenate(nonzero_x) if nonzero_x else np.concatenate(all_x)
+    y_focus = np.concatenate(nonzero_y) if nonzero_y else np.concatenate(all_y)
+    auto_x = _auto_axis_limits_from_values(
+        x_focus,
+        scale=x_scale,
+        clamp_nonnegative_to_zero=False,
+    )
+    auto_y = _auto_axis_limits_from_values(
+        y_focus,
+        scale=y_scale,
+        clamp_nonnegative_to_zero=True,
+    )
+    return auto_x, auto_y
+
+
 @dataclass(frozen=True)
 class SingleSeriesPlotOptions:
     """Resolved plotting options for one rendered series."""
@@ -290,7 +430,7 @@ def _base_x_values(
     raw_x = np.asarray(x_values, dtype=float)
     y_array = np.asarray(y_values, dtype=float)
     if raw_x.size == 0 and y_array.size > 0:
-        raw_x = np.arange(y_array.size, dtype=float)
+        raw_x = np.arange(1, y_array.size + 1, dtype=float)
     return raw_x
 
 
@@ -643,6 +783,7 @@ def with_style_overrides(
     font_color: str | None = None,
     font_size: int | None = None,
     title_font_size: int | None = None,
+    title_pad: float | None = None,
     label_font_size: int | None = None,
     tick_font_size: int | None = None,
     legend_font_size: int | None = None,
@@ -682,6 +823,8 @@ def with_style_overrides(
             continue
         if int(getattr(base_style, key)) == int(current_font_defaults[key]):
             updates[key] = int(target_font_defaults[key])
+    if title_pad is not None:
+        updates["title_pad"] = float(title_pad)
     if line_width is not None:
         updates["line_width"] = line_width
     if line_color is not None:
@@ -752,6 +895,18 @@ def _normalize_error_stat_name(value: str | None) -> str | None:
             "Error statistic must be one of: sample_std, sample_sem, block_std, block_sem."
         )
     return token
+
+
+_FRIENDLY_STAT_LABELS: dict[str, str] = {
+    "sample_sem": "Sample SEM",
+    "sample_std": "Sample Std. Dev.",
+    "block_sem": "Block SEM",
+    "block_std": "Block Std. Dev.",
+}
+
+
+def _friendly_stat_label(stat: str) -> str:
+    return _FRIENDLY_STAT_LABELS.get(stat, stat)
 
 
 def _normalize_error_style_name(value: str | None) -> str:
@@ -1425,6 +1580,8 @@ def _extract_tick_controls(
     resolved.pop("_y_tick_params", None)
     resolved.pop("_x_minor_ticks_mode", None)
     resolved.pop("_y_minor_ticks_mode", None)
+    resolved.pop("_x_ticks_visible", None)
+    resolved.pop("_y_ticks_visible", None)
 
     axis_hint = _normalize_tick_axis(axis_hint_raw) if axis_hint_raw is not None else "both"
     if axis_hint_raw is None and "axis" in resolved:
@@ -1432,6 +1589,74 @@ def _extract_tick_controls(
 
     minor_mode = _normalize_minor_ticks_mode(minor_mode_raw)
     return resolved, axis_hint, minor_mode
+
+
+def _resolve_tick_visibility(
+    tick_params_kwargs: dict[str, Any] | None,
+    ticks_visible: bool | None,
+    tick_axis_hint: str,
+) -> tuple[bool, bool]:
+    if isinstance(tick_params_kwargs, dict):
+        raw_x_visible = tick_params_kwargs.get("_x_ticks_visible")
+        raw_y_visible = tick_params_kwargs.get("_y_ticks_visible")
+        if raw_x_visible is not None or raw_y_visible is not None:
+            return (
+                True if raw_x_visible is None else bool(raw_x_visible),
+                True if raw_y_visible is None else bool(raw_y_visible),
+            )
+
+    if ticks_visible is False:
+        return (
+            tick_axis_hint not in {"both", "x"},
+            tick_axis_hint not in {"both", "y"},
+        )
+    if ticks_visible is True and tick_axis_hint in {"x", "y"}:
+        return (
+            tick_axis_hint == "x",
+            tick_axis_hint == "y",
+        )
+    return True, True
+
+
+def _visible_axes_data_bounds(ax: Any) -> tuple[float, float, float, float] | None:
+    x_mins: list[float] = []
+    x_maxs: list[float] = []
+    y_mins: list[float] = []
+    y_maxs: list[float] = []
+
+    for line in getattr(ax, "lines", ()):
+        if not bool(line.get_visible()):
+            continue
+        x_values = np.asarray(line.get_xdata(orig=False), dtype=float)
+        y_values = np.asarray(line.get_ydata(orig=False), dtype=float)
+        finite_mask = np.isfinite(x_values) & np.isfinite(y_values)
+        if not np.any(finite_mask):
+            continue
+        x_visible = x_values[finite_mask]
+        y_visible = y_values[finite_mask]
+        x_mins.append(float(np.min(x_visible)))
+        x_maxs.append(float(np.max(x_visible)))
+        y_mins.append(float(np.min(y_visible)))
+        y_maxs.append(float(np.max(y_visible)))
+
+    for collection in getattr(ax, "collections", ()):
+        if not bool(collection.get_visible()):
+            continue
+        try:
+            data_limits = collection.get_datalim(ax.transData)
+            points = np.asarray(data_limits.get_points(), dtype=float)
+        except Exception:
+            continue
+        if points.shape != (2, 2) or not np.all(np.isfinite(points)):
+            continue
+        x_mins.append(float(points[0, 0]))
+        x_maxs.append(float(points[1, 0]))
+        y_mins.append(float(points[0, 1]))
+        y_maxs.append(float(points[1, 1]))
+
+    if not x_mins or not y_mins:
+        return None
+    return min(x_mins), max(x_maxs), min(y_mins), max(y_maxs)
 
 
 def _apply_figure_kwargs(fig: Any, figure_kwargs: dict[str, Any] | None) -> None:
@@ -1495,6 +1720,7 @@ def _capture_plot_state(
     line_labels: list[str],
     line_markers: list[str],
     legend_loc: str,
+    grid_kwargs: dict[str, Any] | None = None,
     capture_state: dict[str, Any] | None,
     annotation_summaries: list[dict[str, Any]] | None = None,
 ) -> None:
@@ -1518,10 +1744,19 @@ def _capture_plot_state(
     first_line = ax.lines[0] if getattr(ax, "lines", None) else None
     legend_kwargs = None
     if legend is not None:
+        legend_title_fontsize = None
+        title_obj = legend.get_title()
+        if title_obj is not None:
+            try:
+                legend_title_fontsize = int(round(float(title_obj.get_fontsize())))
+            except (TypeError, ValueError):
+                legend_title_fontsize = None
         legend_kwargs = {
             "frameon": bool(legend.get_frame_on()),
             "ncols": int(getattr(legend, "_ncols", 1)),
         }
+        if legend_title_fontsize is not None and legend_title is not None:
+            legend_kwargs["title_fontsize"] = legend_title_fontsize
     axes_kwargs = {
         "xmargin": float(ax.get_xmargin()),
         "ymargin": float(ax.get_ymargin()),
@@ -1578,6 +1813,7 @@ def _capture_plot_state(
             "font_family": style.font_family,
             "font_size": int(style.base_font_size),
             "title_font_size": int(style.title_font_size),
+            "title_pad": float(style.title_pad),
             "label_font_size": int(style.label_font_size),
             "tick_font_size": int(style.tick_font_size),
             "legend_font_size": int(style.legend_font_size),
@@ -1596,6 +1832,7 @@ def _capture_plot_state(
             "grid_linestyle": style.grid_linestyle,
             "grid_linewidth": float(style.grid_linewidth),
             "grid_alpha": float(style.grid_alpha),
+            "grid_kwargs": None if grid_kwargs is None else dict(grid_kwargs),
             "annotations_summary": list(annotation_summaries or []),
         }
     )
@@ -2301,6 +2538,7 @@ def plot_line_series(
     y_tick_font_size: int | None = None,
     x_label_pad: float | None = None,
     y_label_pad: float | None = None,
+    title_pad: float | None = None,
     title_visible: bool | None = None,
     ticks_visible: bool | None = None,
     markers: bool | None = None,
@@ -2379,6 +2617,7 @@ def plot_line_series(
         y_tick_font_size=y_tick_font_size,
         x_label_pad=x_label_pad,
         y_label_pad=y_label_pad,
+        title_pad=title_pad,
         title_visible=title_visible,
         ticks_visible=ticks_visible,
         markers=markers,
@@ -2424,6 +2663,7 @@ def plot_heatmap_series(
     y_tick_font_size: int | None = None,
     x_label_pad: float | None = None,
     y_label_pad: float | None = None,
+    title_pad: float | None = None,
     title_visible: bool | None = None,
     ticks_visible: bool | None = None,
     capture_state: dict[str, Any] | None = None,
@@ -2548,12 +2788,18 @@ def plot_heatmap_series(
         ax.set_xlabel(format_axis_label_units(x_label), **xlabel_kwargs)
         ax.set_ylabel(format_axis_label_units(y_label), **ylabel_kwargs)
         if title_visible is False:
-            ax.set_title("", fontsize=style.title_font_size, color=style.font_color)
+            ax.set_title(
+                "",
+                fontsize=style.title_font_size,
+                color=style.font_color,
+                pad=style.title_pad,
+            )
         else:
             ax.set_title(
                 normalize_plot_text(title),
                 fontsize=style.title_font_size,
                 color=style.font_color,
+                pad=style.title_pad,
             )
         ax.tick_params(axis="both", labelsize=style.tick_font_size, colors=style.font_color)
         resolved_tick_params_kwargs, tick_axis_hint, minor_ticks_mode = _extract_tick_controls(
@@ -2571,23 +2817,15 @@ def plot_heatmap_series(
             ax.grid(True, **resolved_grid_kwargs)
         else:
             ax.grid(False)
-        if ticks_visible is False:
-            if tick_axis_hint in {"both", "x"}:
-                ax.tick_params(axis="x", which="both", bottom=False, top=False, labelbottom=False)
-            if tick_axis_hint in {"both", "y"}:
-                ax.tick_params(axis="y", which="both", left=False, right=False, labelleft=False)
-        else:
-            if ticks_visible is True and tick_axis_hint in {"x", "y"}:
-                if tick_axis_hint == "x":
-                    ax.tick_params(axis="y", which="both", left=False, right=False, labelleft=False)
-                else:
-                    ax.tick_params(
-                        axis="x",
-                        which="both",
-                        bottom=False,
-                        top=False,
-                        labelbottom=False,
-                    )
+        x_ticks_visible, y_ticks_visible = _resolve_tick_visibility(
+            tick_params_kwargs,
+            ticks_visible,
+            tick_axis_hint,
+        )
+        if not x_ticks_visible:
+            ax.tick_params(axis="x", which="both", bottom=False, top=False, labelbottom=False)
+        if not y_ticks_visible:
+            ax.tick_params(axis="y", which="both", left=False, right=False, labelleft=False)
         if resolved_tick_params_kwargs:
             ax.tick_params(**resolved_tick_params_kwargs)
         x_axis_tick_params = _axis_tick_params(tick_params_kwargs, "x")
@@ -2613,14 +2851,30 @@ def plot_heatmap_series(
             ax.set_xticks([float(value) for value in x_ticks])
         if y_ticks is not None:
             ax.set_yticks([float(value) for value in y_ticks])
-        if x_lim is not None:
-            left = None if x_lim[0] is None else float(x_lim[0])
-            right = None if x_lim[1] is None else float(x_lim[1])
-            ax.set_xlim(left=left, right=right)
-        if y_lim is not None:
-            bottom = None if y_lim[0] is None else float(y_lim[0])
-            top = None if y_lim[1] is None else float(y_lim[1])
-            ax.set_ylim(bottom=bottom, top=top)
+        visible_bounds = _visible_axes_data_bounds(ax)
+        if visible_bounds is not None:
+            auto_left, auto_right, auto_bottom, auto_top = visible_bounds
+            if x_lim is None:
+                ax.set_xlim(left=auto_left, right=auto_right)
+            else:
+                left = auto_left if x_lim[0] is None else float(x_lim[0])
+                right = auto_right if x_lim[1] is None else float(x_lim[1])
+                ax.set_xlim(left=left, right=right)
+            if y_lim is None:
+                ax.set_ylim(bottom=auto_bottom, top=auto_top)
+            else:
+                bottom = auto_bottom if y_lim[0] is None else float(y_lim[0])
+                top = auto_top if y_lim[1] is None else float(y_lim[1])
+                ax.set_ylim(bottom=bottom, top=top)
+        else:
+            if x_lim is not None:
+                left_value: float | None = None if x_lim[0] is None else float(x_lim[0])
+                right_value: float | None = None if x_lim[1] is None else float(x_lim[1])
+                ax.set_xlim(left=left_value, right=right_value)
+            if y_lim is not None:
+                bottom_value: float | None = None if y_lim[0] is None else float(y_lim[0])
+                top_value: float | None = None if y_lim[1] is None else float(y_lim[1])
+                ax.set_ylim(bottom=bottom_value, top=top_value)
         _apply_axes_border(ax, visible=style.axes_border)
         if axes_kwargs is not None:
             ax.set(**dict(axes_kwargs))
@@ -2726,6 +2980,7 @@ def plot_multi_line_series(
     y_tick_font_size: int | None = None,
     x_label_pad: float | None = None,
     y_label_pad: float | None = None,
+    title_pad: float | None = None,
     title_visible: bool | None = None,
     ticks_visible: bool | None = None,
     markers: bool | None = None,
@@ -2782,6 +3037,8 @@ def plot_multi_line_series(
         x_axis_scale,
         x_axis_offset,
     )
+    if title_pad is not None:
+        style = with_style_overrides(base_style=style, title_pad=title_pad)
 
     resolved_line_colors = resolve_series_colors(line_colors, series_count=source_count)
     default_source_colors = default_series_colors(source_count)
@@ -3024,7 +3281,8 @@ def plot_multi_line_series(
                         str(descriptor.get("group_reducer") or "mean").strip().lower() or "mean"
                     ),
                     "series_enabled": bool(current_override.get("enabled", True)),
-                    "line_visible": bool(current_override.get("enabled", True)),
+                    "line_visible": bool(current_override.get("enabled", True))
+                    and bool(current_override.get("show_raw_line", True)),
                     "show_in_legend": bool(current_override.get("show_in_legend", True)),
                     "line_color": (
                         None
@@ -3182,6 +3440,9 @@ def plot_multi_line_series(
         point_counts_map: dict[str, list[int]] = {}
         masked_bin_counts: dict[str, int] = {}
         grouped_summaries: dict[str, dict[str, Any]] = {}
+        density_visible_x_series: list[np.ndarray] = []
+        density_visible_y_series: list[np.ndarray] = []
+        has_visible_overlay_bounds = False
         integration_summaries: list[dict[str, Any]] = []
         integration_seen_ids: set[str] = set()
         for item in render_items:
@@ -3236,6 +3497,9 @@ def plot_multi_line_series(
                 rendered_colors.append(str(artist.get_color()))
                 rendered_markers.append(str(artist.get_marker()))
                 rendered_labels.append(str(artist.get_label()))
+                if str(analysis_name or "").strip().lower() == "density":
+                    density_visible_x_series.append(np.asarray(x_values, dtype=float))
+                    density_visible_y_series.append(np.asarray(y_values, dtype=float))
             item_integration_config: IntegrationConfig = item.get(
                 "integration_config", IntegrationConfig()
             )
@@ -3310,6 +3574,7 @@ def plot_multi_line_series(
                             label="_nolegend_",
                             zorder=zorder,
                         )
+                        has_visible_overlay_bounds = True
                     integration_summaries.append(summary)
             series_stats[fit_key] = _series_statistics(x_values, y_values)
             if (
@@ -3337,7 +3602,7 @@ def plot_multi_line_series(
                         if np.any(finite_mask):
                             error_label = (
                                 prepared_item.error_config.label_override
-                                or f"{label} {requested_stat}"
+                                or f"{label} \u00b1{_friendly_stat_label(requested_stat)}"
                             )
                             error_color = (
                                 str(prepared_item.error_config.color).strip()
@@ -3377,6 +3642,7 @@ def plot_multi_line_series(
                                     if prepared_item.error_config.show_in_legend
                                     else "_nolegend_",
                                 )
+                            has_visible_overlay_bounds = True
                             error_summaries[fit_key] = {
                                 "enabled": True,
                                 "status": "ok",
@@ -3504,6 +3770,7 @@ def plot_multi_line_series(
                         np.asarray(fit_summary.get("y_fit", []), dtype=float),
                         **fit_kwargs,
                     )
+                    has_visible_overlay_bounds = True
 
             cumulative_config = item.get("cumulative_config")
             if (
@@ -3547,6 +3814,7 @@ def plot_multi_line_series(
                     elif artist is not None and artist.get_alpha() is not None:
                         cumulative_kwargs["alpha"] = float(artist.get_alpha())
                     ax.plot(cumulative_x, cumulative_y, **cumulative_kwargs)
+                    has_visible_overlay_bounds = True
             else:
                 cumulative_summaries[fit_key] = {
                     "enabled": (
@@ -3568,10 +3836,30 @@ def plot_multi_line_series(
             }
             if legend_kwargs is not None:
                 resolved_legend_kwargs.update(dict(legend_kwargs))
+            if "ncols" in resolved_legend_kwargs and "ncol" not in resolved_legend_kwargs:
+                resolved_legend_kwargs["ncol"] = resolved_legend_kwargs["ncols"]
             legend_obj = ax.legend(**resolved_legend_kwargs)
             for text in legend_obj.get_texts():
                 text.set_color(style.font_color)
             legend_obj.get_title().set_color(style.font_color)
+        auto_x_lim, auto_y_lim = _axes_artist_auto_limits(ax)
+        if str(analysis_name or "").strip().lower() == "density":
+            density_auto_x_lim, density_auto_y_lim = _density_visible_auto_limits(
+                density_visible_x_series,
+                density_visible_y_series,
+                x_scale=x_scale,
+                y_scale=y_scale,
+            )
+            auto_x_lim = density_auto_x_lim if density_auto_x_lim is not None else auto_x_lim
+            auto_y_lim = (
+                _union_axis_limits(density_auto_y_lim, auto_y_lim)
+                if has_visible_overlay_bounds
+                else density_auto_y_lim
+                if density_auto_y_lim is not None
+                else auto_y_lim
+            )
+        x_lim = _merge_axis_limits(x_lim, auto_x_lim)
+        y_lim = _merge_axis_limits(y_lim, auto_y_lim)
         xlabel_kwargs: dict[str, Any] = {
             "fontsize": x_label_font_size or style.label_font_size,
             "color": style.font_color,
@@ -3587,12 +3875,18 @@ def plot_multi_line_series(
         ax.set_xlabel(format_axis_label_units(x_label), **xlabel_kwargs)
         ax.set_ylabel(format_axis_label_units(y_label), **ylabel_kwargs)
         if title_visible is False:
-            ax.set_title("", fontsize=style.title_font_size, color=style.font_color)
+            ax.set_title(
+                "",
+                fontsize=style.title_font_size,
+                color=style.font_color,
+                pad=style.title_pad,
+            )
         else:
             ax.set_title(
                 normalize_plot_text(title),
                 fontsize=style.title_font_size,
                 color=style.font_color,
+                pad=style.title_pad,
             )
         ax.tick_params(axis="both", labelsize=style.tick_font_size, colors=style.font_color)
         resolved_tick_params_kwargs, tick_axis_hint, minor_ticks_mode = _extract_tick_controls(
@@ -3610,41 +3904,27 @@ def plot_multi_line_series(
             ax.grid(True, **resolved_grid_kwargs)
         else:
             ax.grid(False)
-        if ticks_visible is False:
-            if tick_axis_hint in {"both", "x"}:
-                ax.tick_params(
-                    axis="x",
-                    which="both",
-                    bottom=False,
-                    top=False,
-                    labelbottom=False,
-                )
-            if tick_axis_hint in {"both", "y"}:
-                ax.tick_params(
-                    axis="y",
-                    which="both",
-                    left=False,
-                    right=False,
-                    labelleft=False,
-                )
-        else:
-            if ticks_visible is True and tick_axis_hint in {"x", "y"}:
-                if tick_axis_hint == "x":
-                    ax.tick_params(
-                        axis="y",
-                        which="both",
-                        left=False,
-                        right=False,
-                        labelleft=False,
-                    )
-                else:
-                    ax.tick_params(
-                        axis="x",
-                        which="both",
-                        bottom=False,
-                        top=False,
-                        labelbottom=False,
-                    )
+        x_ticks_visible, y_ticks_visible = _resolve_tick_visibility(
+            tick_params_kwargs,
+            ticks_visible,
+            tick_axis_hint,
+        )
+        if not x_ticks_visible:
+            ax.tick_params(
+                axis="x",
+                which="both",
+                bottom=False,
+                top=False,
+                labelbottom=False,
+            )
+        if not y_ticks_visible:
+            ax.tick_params(
+                axis="y",
+                which="both",
+                left=False,
+                right=False,
+                labelleft=False,
+            )
         if resolved_tick_params_kwargs:
             ax.tick_params(**resolved_tick_params_kwargs)
         x_axis_tick_params = _axis_tick_params(tick_params_kwargs, "x")
@@ -3697,6 +3977,7 @@ def plot_multi_line_series(
             line_labels=rendered_labels or legend_labels,
             line_markers=rendered_markers,
             legend_loc=legend_loc,
+            grid_kwargs=grid_kwargs,
             capture_state=capture_state,
             annotation_summaries=annotation_summaries,
         )

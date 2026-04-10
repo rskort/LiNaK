@@ -20,11 +20,7 @@ from ase.neighborlist import neighbor_list
 from scipy.spatial import cKDTree
 
 from ..storage.hdf5_utils import (
-    is_hdf5_path,
-    read_linak_hdf5_profiles_by_index,
-    read_linak_hdf5_profiles,
     write_linak_hdf5,
-    write_linak_hdf5_profile_collection,
 )
 from .binning import (
     reconstruct_uniform_bin_edges_from_centers,
@@ -53,6 +49,14 @@ from ..plot.plotting import (
 )
 from ..progress import ProgressBar
 from ..utils import ensure_positive
+from .common import (
+    available_element_species as _available_element_species,
+    normalize_species_label as _normalize_species,
+    read_profile_payloads,
+    read_profile_payloads_by_index,
+    use_multi_series_plot,
+    write_profile_collection,
+)
 
 LOGGER = logging.getLogger(__name__)
 _NEIGHBORLIST_DENSITY_THRESHOLD = 0.25
@@ -330,18 +334,6 @@ def _finalize_rdf_statistics_moments(
     )
 
 
-def _normalize_species(species: str | None) -> str:
-    """Normalize species selection for atom-resolved analyses."""
-    if species is None:
-        return "ALL"
-
-    species = species.strip()
-    if not species or species.lower() == "all" or species == "*":
-        return "ALL"
-
-    return species[0].upper() + species[1:].lower()
-
-
 def _format_atom_selector_label(atom_indices: Sequence[int] | np.ndarray) -> str:
     values = [int(value) for value in np.asarray(atom_indices, dtype=int).tolist()]
     if not values:
@@ -395,14 +387,6 @@ def _resolve_rdf_selector(
         species_label=normalized_species,
         atom_indices=None,
     )
-
-
-def _available_element_species(frames: list[Atoms]) -> list[str]:
-    """Return sorted unique element symbols across a trajectory."""
-    species_set: set[str] = set()
-    for frame in frames:
-        species_set.update(frame.get_chemical_symbols())
-    return sorted(species_set)
 
 
 def _canonical_rdf_pair(species_a: str, species_b: str) -> tuple[str, str]:
@@ -1299,7 +1283,7 @@ def _accumulate_rdf_pair_collection(
         rtol=1.0e-9,
         atol=1.0e-12,
     ):
-        LOGGER.info(
+        LOGGER.debug(
             "Rounded auto RDF r_max down from %.6g to %.6g Angstrom to match bin_width=%.6g.",
             float(auto_r_max_raw),
             resolved_r_max,
@@ -2046,7 +2030,7 @@ def compute_rdf(
     if auto_r_max_raw is not None and not np.isclose(
         float(r_max), float(auto_r_max_raw), rtol=1.0e-9, atol=1.0e-12
     ):
-        LOGGER.info(
+        LOGGER.debug(
             "Rounded auto RDF r_max down from %.6g to %.6g Angstrom to match bin_width=%.6g.",
             float(auto_r_max_raw),
             float(r_max),
@@ -2056,7 +2040,7 @@ def compute_rdf(
     same_selection = label_a == label_b
     shell_volumes = _shell_volumes_from_edges(bin_edges)
 
-    LOGGER.info(
+    LOGGER.debug(
         "Computing RDF (species_a=%s, species_b=%s, r_max=%.6g, bin_width=%.6g).",
         label_a,
         label_b,
@@ -2200,7 +2184,7 @@ def compute_rdf(
     ) as progress:
         statistics = _finalize_rdf_statistics_moments(moments)
         progress.update()
-    LOGGER.info(
+    LOGGER.debug(
         "Computed RDF profile with saved %s statistics.",
         "sample+block" if statistics.block_sem is not None else "sample",
     )
@@ -2240,7 +2224,7 @@ def compute_rdf_profiles(
         raise ValueError("No elements found in trajectory.")
     pairs = list(combinations_with_replacement(species_labels, 2))
     requested_bin_width = float(bin_width)
-    LOGGER.info(
+    LOGGER.debug(
         "Computing pairwise RDF collection (%d profile(s), species=%s, r_max=%s, bin_width=%.6g).",
         len(pairs),
         ", ".join(species_labels),
@@ -2300,7 +2284,7 @@ def compute_rdf_profiles(
         and profile.series_statistics["g_r"].block_sem is not None
         for profile in resolved_profiles
     )
-    LOGGER.info(
+    LOGGER.debug(
         "Computed %d RDF profiles with saved %s statistics.",
         len(resolved_profiles),
         "sample+block" if any_block_statistics else "sample",
@@ -2400,7 +2384,7 @@ def save_rdf_profiles(
             additional_metadata=additional_metadata,
         )
 
-    output_path = write_linak_hdf5_profile_collection(
+    output_path = write_profile_collection(
         output,
         analysis="rdf",
         profiles=[_rdf_profile_hdf5_payload(profile) for profile in profiles],
@@ -2434,20 +2418,17 @@ def load_rdf_profiles(
     species_b: str | None = None,
 ) -> list[RDFProfile]:
     """Load one or more RDF profiles from LiNaK HDF5."""
-    source_path = Path(path).expanduser().resolve()
-    if not source_path.exists():
-        raise FileNotFoundError(f"RDF profile not found: {source_path}")
-
-    if is_hdf5_path(source_path):
-        payloads = read_linak_hdf5_profiles(source_path, expected_analysis="rdf")
-        return _load_rdf_profiles_from_payloads(
-            source_path,
-            payloads,
-            species_a=species_a,
-            species_b=species_b,
-        )
-
-    raise ValueError(f"Unsupported RDF profile format for '{source_path}'. Use .h5/.hdf5.")
+    source_path, payloads = read_profile_payloads(
+        path,
+        analysis="rdf",
+        label="RDF",
+    )
+    return _load_rdf_profiles_from_payloads(
+        source_path,
+        payloads,
+        species_a=species_a,
+        species_b=species_b,
+    )
 
 
 def _load_rdf_profiles_from_payloads(
@@ -2571,15 +2552,11 @@ def load_rdf_profiles_by_index(
     species_b: str | None = None,
 ) -> list[RDFProfile]:
     """Load selected RDF profiles by profile index from LiNaK HDF5."""
-    source_path = Path(path).expanduser().resolve()
-    if not source_path.exists():
-        raise FileNotFoundError(f"RDF profile not found: {source_path}")
-    if not is_hdf5_path(source_path):
-        raise ValueError(f"Unsupported RDF profile format for '{source_path}'. Use .h5/.hdf5.")
-    payloads = read_linak_hdf5_profiles_by_index(
-        source_path,
+    source_path, payloads = read_profile_payloads_by_index(
+        path,
         profile_indices,
-        expected_analysis="rdf",
+        analysis="rdf",
+        label="RDF",
     )
     return _load_rdf_profiles_from_payloads(
         source_path,
@@ -2612,6 +2589,7 @@ def plot_rdf_profile(
     y_label_font_size: int | None = None,
     x_label_pad: float | None = None,
     y_label_pad: float | None = None,
+    title_pad: float | None = None,
     x_axis_scale: float | None = None,
     x_axis_offset: float | None = None,
     title_visible: bool | None = None,
@@ -2710,6 +2688,7 @@ def plot_rdf_profile(
         y_label_font_size=y_label_font_size,
         x_label_pad=x_label_pad,
         y_label_pad=y_label_pad,
+        title_pad=title_pad,
         x_axis_scale=x_axis_scale,
         x_axis_offset=x_axis_offset,
         title_visible=title_visible,
@@ -2754,6 +2733,7 @@ def plot_rdf_profiles(
     y_label_font_size: int | None = None,
     x_label_pad: float | None = None,
     y_label_pad: float | None = None,
+    title_pad: float | None = None,
     x_axis_scale: float | None = None,
     x_axis_offset: float | None = None,
     title_visible: bool | None = None,
@@ -2808,8 +2788,11 @@ def plot_rdf_profiles(
         series_kind="RDF",
     )
 
-    use_gui_render_layers = bool(render_series_descriptors) or bool(series_overrides_by_id)
-    if len(profiles) == 1 and not use_gui_render_layers:
+    if not use_multi_series_plot(
+        profile_count=len(profiles),
+        render_series_descriptors=render_series_descriptors,
+        series_overrides_by_id=series_overrides_by_id,
+    ):
         return plot_rdf_profile(
             profiles[0],
             output=output,
@@ -2832,6 +2815,7 @@ def plot_rdf_profiles(
             y_label_font_size=y_label_font_size,
             x_label_pad=x_label_pad,
             y_label_pad=y_label_pad,
+            title_pad=title_pad,
             x_axis_scale=x_axis_scale,
             x_axis_offset=x_axis_offset,
             title_visible=title_visible,
@@ -2919,6 +2903,7 @@ def plot_rdf_profiles(
         y_label_font_size=y_label_font_size,
         x_label_pad=x_label_pad,
         y_label_pad=y_label_pad,
+        title_pad=title_pad,
         x_axis_scale=x_axis_scale,
         x_axis_offset=x_axis_offset,
         title_visible=title_visible,

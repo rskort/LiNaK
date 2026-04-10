@@ -12,11 +12,14 @@ import numpy as np
 from ase import Atoms
 from ase.geometry import find_mic
 
-from ..storage.hdf5_utils import (
-    is_hdf5_path,
-    read_linak_hdf5_profiles_by_index,
-    read_linak_hdf5_profiles,
-    write_linak_hdf5,
+from ..storage.hdf5_utils import write_linak_hdf5
+from .common import (
+    frame_has_usable_cell as _common_frame_has_usable_cell,
+    normalize_species_label as _normalize_species,
+    read_profile_payloads,
+    read_profile_payloads_by_index,
+    select_species_indices as _select_indices,
+    use_multi_series_plot,
 )
 from .schema import build_profile_metadata, default_plot_labels
 from .statistics import (
@@ -53,36 +56,9 @@ class MSDProfile:
     series_statistics: dict[str, SeriesStatistics] | None = None
 
 
-def _normalize_species(species: str | None) -> str:
-    """Normalize species selection for atom-resolved analyses."""
-    if species is None:
-        return "ALL"
-
-    species = species.strip()
-    if not species or species.lower() == "all" or species == "*":
-        return "ALL"
-
-    return species[0].upper() + species[1:].lower()
-
-
-def _select_indices(frame: Atoms, species: str) -> np.ndarray:
-    """Return selected atom indices for one frame."""
-    if species == "ALL":
-        return np.arange(len(frame), dtype=int)
-
-    symbols = np.asarray(frame.get_chemical_symbols())
-    return np.where(symbols == species)[0]
-
-
 def _frame_has_usable_cell(frame: Atoms) -> bool:
-    """Check whether a frame has finite non-zero cell and enabled periodicity."""
-    if not bool(np.all(frame.get_pbc())):
-        return False
-    cell = np.asarray(frame.cell.array, dtype=float)
-    if cell.shape != (3, 3):
-        return False
-    volume = abs(float(np.linalg.det(cell)))
-    return volume > 0.0
+    """Preserve MSD's stricter periodic-cell requirement."""
+    return _common_frame_has_usable_cell(frame, require_all_pbc=True)
 
 
 def compute_msd(
@@ -91,7 +67,7 @@ def compute_msd(
     timestep_fs: float = 1.0,
 ) -> MSDProfile:
     """Compute mean-squared displacement from the first frame reference."""
-    LOGGER.info(
+    LOGGER.debug(
         "Computing MSD (species=%s, timestep_fs=%.6g).",
         species,
         timestep_fs,
@@ -113,7 +89,7 @@ def compute_msd(
     use_pbc_mic = all(_frame_has_usable_cell(frame) for frame in frames)
 
     if use_pbc_mic:
-        LOGGER.info("MSD mode: periodic minimum-image accumulation.")
+        LOGGER.debug("MSD mode: periodic minimum-image accumulation.")
         prev_positions = np.asarray(reference.positions[reference_indices], dtype=float)
         unwrapped_positions = reference_positions.copy()
         msd[0] = 0.0
@@ -288,30 +264,23 @@ def load_msd_profiles_by_index(
     species: str | None = None,
 ) -> list[MSDProfile]:
     """Load selected MSD profiles by profile index from LiNaK HDF5."""
-    source_path = Path(path).expanduser().resolve()
-    if not source_path.exists():
-        raise FileNotFoundError(f"MSD profile not found: {source_path}")
-    if not is_hdf5_path(source_path):
-        raise ValueError(f"Unsupported MSD profile format for '{source_path}'. Use .h5/.hdf5.")
-    payloads = read_linak_hdf5_profiles_by_index(
-        source_path,
+    source_path, payloads = read_profile_payloads_by_index(
+        path,
         profile_indices,
-        expected_analysis="msd",
+        analysis="msd",
+        label="MSD",
     )
     return _load_msd_profiles_from_payloads(source_path, payloads, species=species)
 
 
 def load_msd_profiles(path: str | Path, *, species: str | None = None) -> list[MSDProfile]:
     """Load one or more MSD profiles from LiNaK HDF5."""
-    source_path = Path(path).expanduser().resolve()
-    if not source_path.exists():
-        raise FileNotFoundError(f"MSD profile not found: {source_path}")
-
-    if is_hdf5_path(source_path):
-        payloads = read_linak_hdf5_profiles(source_path, expected_analysis="msd")
-        return _load_msd_profiles_from_payloads(source_path, payloads, species=species)
-
-    raise ValueError(f"Unsupported MSD profile format for '{source_path}'. Use .h5/.hdf5.")
+    source_path, payloads = read_profile_payloads(
+        path,
+        analysis="msd",
+        label="MSD",
+    )
+    return _load_msd_profiles_from_payloads(source_path, payloads, species=species)
 
 
 def plot_msd_profile(
@@ -337,6 +306,7 @@ def plot_msd_profile(
     y_label_font_size: int | None = None,
     x_label_pad: float | None = None,
     y_label_pad: float | None = None,
+    title_pad: float | None = None,
     x_axis_scale: float | None = None,
     x_axis_offset: float | None = None,
     title_visible: bool | None = None,
@@ -435,6 +405,7 @@ def plot_msd_profile(
         y_label_font_size=y_label_font_size,
         x_label_pad=x_label_pad,
         y_label_pad=y_label_pad,
+        title_pad=title_pad,
         x_axis_scale=x_axis_scale,
         x_axis_offset=x_axis_offset,
         title_visible=title_visible,
@@ -479,6 +450,7 @@ def plot_msd_profiles(
     y_label_font_size: int | None = None,
     x_label_pad: float | None = None,
     y_label_pad: float | None = None,
+    title_pad: float | None = None,
     x_axis_scale: float | None = None,
     x_axis_offset: float | None = None,
     title_visible: bool | None = None,
@@ -533,8 +505,11 @@ def plot_msd_profiles(
         series_kind="MSD",
     )
 
-    use_gui_render_layers = bool(render_series_descriptors) or bool(series_overrides_by_id)
-    if len(profiles) == 1 and not use_gui_render_layers:
+    if not use_multi_series_plot(
+        profile_count=len(profiles),
+        render_series_descriptors=render_series_descriptors,
+        series_overrides_by_id=series_overrides_by_id,
+    ):
         return plot_msd_profile(
             profiles[0],
             output=output,
@@ -557,6 +532,7 @@ def plot_msd_profiles(
             y_label_font_size=y_label_font_size,
             x_label_pad=x_label_pad,
             y_label_pad=y_label_pad,
+            title_pad=title_pad,
             x_axis_scale=x_axis_scale,
             x_axis_offset=x_axis_offset,
             title_visible=title_visible,
@@ -644,6 +620,7 @@ def plot_msd_profiles(
         y_label_font_size=y_label_font_size,
         x_label_pad=x_label_pad,
         y_label_pad=y_label_pad,
+        title_pad=title_pad,
         x_axis_scale=x_axis_scale,
         x_axis_offset=x_axis_offset,
         title_visible=title_visible,

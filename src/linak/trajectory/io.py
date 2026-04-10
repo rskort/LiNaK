@@ -436,7 +436,7 @@ def _normalize_surface_cache_elements(
 ) -> tuple[str, ...] | None:
     if surface_elements is None:
         return None
-    from ..analysis.density import _normalize_surface_elements_argument
+    from ..analysis.surface import _normalize_surface_elements_argument
 
     normalized = _normalize_surface_elements_argument(surface_elements)
     return None if normalized is None else tuple(normalized)

@@ -18,6 +18,7 @@ from ..plot.plotting import (
     _apply_minor_tick_modes,
     _axis_tick_params,
     _extract_tick_controls,
+    _resolve_tick_visibility,
     _render_plot_annotations,
     _sanitize_line_collection_kwargs,
     configure_matplotlib_backend,
@@ -29,31 +30,37 @@ from ..plot.plotting import (
 )
 from ..progress import ProgressBar
 from ..storage.hdf5_utils import (
-    is_hdf5_path,
-    read_linak_hdf5_profiles_by_index,
-    read_linak_hdf5_profiles,
     write_linak_hdf5,
-    write_linak_hdf5_profile_collection,
+)
+from .common import (
+    available_element_species,
+    frame_has_usable_cell as _common_frame_has_usable_cell,
+    normalize_species_label as _normalize_species,
+    optional_cell_lengths as _optional_cell_lengths,
+    optional_finite_float as _optional_finite_float,
+    read_profile_payloads,
+    read_profile_payloads_by_index,
+    select_species_indices as _select_indices,
+    use_multi_series_plot,
+    write_profile_collection,
 )
 from ..utils import ensure_positive
 from .position import (
     _build_xy_segments,
     compute_position_profile,
 )
-from .density import (
+from .surface import (
     _surface_estimate_datasets,
     _surface_estimate_from_payload,
     _surface_metadata_payload,
     _surface_metadata_view,
     SurfaceEstimate,
     SurfaceEstimatorOptions,
-    available_element_species,
 )
 from .rdf import (
     _accumulate_rdf_pair_collection,
     _auto_r_max_from_frames,
     _canonical_rdf_pair,
-    _normalize_species as _normalize_rdf_species,
 )
 from .schema import build_profile_metadata
 
@@ -123,6 +130,11 @@ class CoordinationProfile:
     cutoff_diagnostic_plot_path: str | None = None
 
 
+def _frame_has_usable_cell(frame: Atoms) -> bool:
+    """Preserve coordination's periodic-cell requirement."""
+    return _common_frame_has_usable_cell(frame, require_all_pbc=True)
+
+
 @dataclass(frozen=True)
 class _CoordinationSelectionCache:
     """Stable per-run center/neighbor selection metadata reused across frames."""
@@ -136,10 +148,6 @@ class _CoordinationSelectionCache:
     center_count: int
     neighbor_count: int
     pair_count: int
-
-
-def _normalize_species(species: str | None) -> str:
-    return _normalize_rdf_species(species)
 
 
 def _ordered_coordination_pairs_from_frames(frames: list[Atoms]) -> list[tuple[str, str]]:
@@ -182,23 +190,6 @@ def _normalize_component_token(component: str) -> str:
         f"Unsupported coordination component '{component}'. "
         "Choose 'distance', 'time', or 'time-distance'."
     )
-
-
-def _frame_has_usable_cell(frame: Atoms) -> bool:
-    if not bool(np.all(frame.get_pbc())):
-        return False
-    cell = np.asarray(frame.cell.array, dtype=float)
-    if cell.shape != (3, 3):
-        return False
-    volume = abs(float(np.linalg.det(cell)))
-    return volume > 0.0
-
-
-def _select_indices(frame: Atoms, species: str) -> np.ndarray:
-    if species == "ALL":
-        return np.arange(len(frame), dtype=int)
-    symbols = np.asarray(frame.get_chemical_symbols(), dtype=object)
-    return np.where(symbols == species)[0].astype(int, copy=False)
 
 
 def _build_coordination_selection_cache(
@@ -255,46 +246,11 @@ def _build_coordination_selection_cache(
     )
 
 
-def _optional_finite_float(value: Any) -> float | None:
-    if value is None:
-        return None
-    try:
-        parsed = float(value)
-    except (TypeError, ValueError):
-        return None
-    if not np.isfinite(parsed):
-        return None
-    return parsed
-
-
 def _ensure_nonnegative(name: str, value: float) -> float:
     parsed = float(value)
     if not np.isfinite(parsed) or parsed < 0.0:
         raise ValueError(f"{name} must be >= 0.")
     return parsed
-
-
-def _optional_cell_lengths(value: Any) -> tuple[float, float, float] | None:
-    if value is None:
-        return None
-    if isinstance(value, np.ndarray):
-        items = value.tolist()
-    elif isinstance(value, (list, tuple)):
-        items = list(value)
-    else:
-        return None
-    if len(items) < 3:
-        return None
-    parsed: list[float] = []
-    for raw in items[:3]:
-        try:
-            numeric = float(raw)
-        except (TypeError, ValueError):
-            return None
-        if not np.isfinite(numeric) or numeric <= 0.0:
-            return None
-        parsed.append(numeric)
-    return (parsed[0], parsed[1], parsed[2])
 
 
 def _gaussian_kernel(*, sigma_bins: float) -> np.ndarray:
@@ -1673,7 +1629,7 @@ def save_coordination_profiles(
             additional_metadata=additional_metadata,
         )
 
-    output_path = write_linak_hdf5_profile_collection(
+    output_path = write_profile_collection(
         output,
         analysis="coordination",
         profiles=[_coordination_profile_hdf5_payload(profile) for profile in profiles],
@@ -1706,15 +1662,11 @@ def load_coordination_profiles(
     species_b: str | None = None,
     axis: str | None = None,
 ) -> list[CoordinationProfile]:
-    source_path = Path(path).expanduser().resolve()
-    if not source_path.exists():
-        raise FileNotFoundError(f"Coordination profile not found: {source_path}")
-    if not is_hdf5_path(source_path):
-        raise ValueError(
-            f"Unsupported coordination profile format for '{source_path}'. Use .h5/.hdf5."
-        )
-
-    payloads = read_linak_hdf5_profiles(source_path, expected_analysis="coordination")
+    source_path, payloads = read_profile_payloads(
+        path,
+        analysis="coordination",
+        label="Coordination",
+    )
     return _load_coordination_profiles_from_payloads(
         source_path,
         payloads,
@@ -1893,17 +1845,11 @@ def load_coordination_profiles_by_index(
     axis: str | None = None,
 ) -> list[CoordinationProfile]:
     """Load selected coordination profiles by profile index from LiNaK HDF5."""
-    source_path = Path(path).expanduser().resolve()
-    if not source_path.exists():
-        raise FileNotFoundError(f"Coordination profile not found: {source_path}")
-    if not is_hdf5_path(source_path):
-        raise ValueError(
-            f"Unsupported coordination profile format for '{source_path}'. Use .h5/.hdf5."
-        )
-    payloads = read_linak_hdf5_profiles_by_index(
-        source_path,
+    source_path, payloads = read_profile_payloads_by_index(
+        path,
         profile_indices,
-        expected_analysis="coordination",
+        analysis="coordination",
+        label="Coordination",
     )
     return _load_coordination_profiles_from_payloads(
         source_path,
@@ -2007,6 +1953,7 @@ def _plot_coordination_time_distance_projection(
     y_label_font_size: int | None,
     x_label_pad: float | None,
     y_label_pad: float | None,
+    title_pad: float | None,
     title_visible: bool | None,
     ticks_visible: bool | None,
     line_colors: list[str] | None,
@@ -2208,13 +2155,15 @@ def _plot_coordination_time_distance_projection(
             format_axis_label_units(resolve_explicit_plot_text(y_label, default_y_label)),
             **ylabel_kwargs,
         )
+        effective_title_pad = style.title_pad if title_pad is None else float(title_pad)
         if title_visible is False:
-            ax.set_title("", fontsize=style.title_font_size)
+            ax.set_title("", fontsize=style.title_font_size, pad=effective_title_pad)
         else:
             ax.set_title(
                 title
                 or f"{profiles[0].species_a}-{profiles[0].species_b} distance vs time colored by CN",
                 fontsize=style.title_font_size,
+                pad=effective_title_pad,
             )
 
         ax.tick_params(axis="both", labelsize=style.tick_font_size)
@@ -2238,11 +2187,15 @@ def _plot_coordination_time_distance_projection(
             tick_params_kwargs=tick_params_kwargs,
             fallback_mode=minor_ticks_mode,
         )
-        if ticks_visible is False:
-            if tick_axis_hint in {"both", "x"}:
-                ax.tick_params(axis="x", which="both", bottom=False, top=False, labelbottom=False)
-            if tick_axis_hint in {"both", "y"}:
-                ax.tick_params(axis="y", which="both", left=False, right=False, labelleft=False)
+        x_ticks_visible, y_ticks_visible = _resolve_tick_visibility(
+            tick_params_kwargs,
+            ticks_visible,
+            tick_axis_hint,
+        )
+        if not x_ticks_visible:
+            ax.tick_params(axis="x", which="both", bottom=False, top=False, labelbottom=False)
+        if not y_ticks_visible:
+            ax.tick_params(axis="y", which="both", left=False, right=False, labelleft=False)
 
         if style.grid:
             resolved_grid_kwargs: dict[str, Any] = {
@@ -2354,6 +2307,7 @@ def plot_coordination_profile(
     y_label_font_size: int | None = None,
     x_label_pad: float | None = None,
     y_label_pad: float | None = None,
+    title_pad: float | None = None,
     x_axis_scale: float | None = None,
     x_axis_offset: float | None = None,
     title_visible: bool | None = None,
@@ -2419,6 +2373,7 @@ def plot_coordination_profile(
             y_label_font_size=y_label_font_size,
             x_label_pad=x_label_pad,
             y_label_pad=y_label_pad,
+            title_pad=title_pad,
             title_visible=title_visible,
             ticks_visible=ticks_visible,
             line_colors=line_colors,
@@ -2499,6 +2454,7 @@ def plot_coordination_profile(
             y_label_font_size=y_label_font_size,
             x_label_pad=x_label_pad,
             y_label_pad=y_label_pad,
+            title_pad=title_pad,
             title_visible=title_visible,
             ticks_visible=ticks_visible,
             markers=markers,
@@ -2567,6 +2523,7 @@ def plot_coordination_profile(
         y_label_font_size=y_label_font_size,
         x_label_pad=x_label_pad,
         y_label_pad=y_label_pad,
+        title_pad=title_pad,
         x_axis_scale=x_axis_scale,
         x_axis_offset=x_axis_offset,
         title_visible=title_visible,
@@ -2613,6 +2570,7 @@ def plot_coordination_profiles(
     y_label_font_size: int | None = None,
     x_label_pad: float | None = None,
     y_label_pad: float | None = None,
+    title_pad: float | None = None,
     x_axis_scale: float | None = None,
     x_axis_offset: float | None = None,
     title_visible: bool | None = None,
@@ -2682,6 +2640,7 @@ def plot_coordination_profiles(
             y_label_font_size=y_label_font_size,
             x_label_pad=x_label_pad,
             y_label_pad=y_label_pad,
+            title_pad=title_pad,
             title_visible=title_visible,
             ticks_visible=ticks_visible,
             line_colors=line_colors,
@@ -2708,8 +2667,11 @@ def plot_coordination_profiles(
             savefig_kwargs=savefig_kwargs,
         )
 
-    use_gui_render_layers = bool(render_series_descriptors) or bool(series_overrides_by_id)
-    if len(profiles) == 1 and not use_gui_render_layers:
+    if not use_multi_series_plot(
+        profile_count=len(profiles),
+        render_series_descriptors=render_series_descriptors,
+        series_overrides_by_id=series_overrides_by_id,
+    ):
         single_series_labels = series_labels
         if (
             normalized_component == "distance"
@@ -2741,6 +2703,7 @@ def plot_coordination_profiles(
             y_label_font_size=y_label_font_size,
             x_label_pad=x_label_pad,
             y_label_pad=y_label_pad,
+            title_pad=title_pad,
             x_axis_scale=x_axis_scale,
             x_axis_offset=x_axis_offset,
             title_visible=title_visible,

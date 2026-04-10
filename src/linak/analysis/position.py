@@ -11,13 +11,19 @@ from typing import Any
 import numpy as np
 from ase import Atoms
 
-from ..storage.hdf5_utils import (
-    is_hdf5_path,
-    read_linak_hdf5_profiles_by_index,
-    read_linak_hdf5_profiles,
-    write_linak_hdf5,
+from ..storage.hdf5_utils import write_linak_hdf5
+from .common import (
+    available_element_species,
+    frame_has_usable_cell as _common_frame_has_usable_cell,
+    normalize_species_label as _normalize_species,
+    optional_cell_lengths as _optional_cell_lengths,
+    optional_finite_float as _optional_finite_float,
+    read_profile_payloads,
+    read_profile_payloads_by_index,
+    use_multi_series_plot,
+    validate_stable_atom_layout as _validate_stable_atom_layout,
 )
-from .density import (
+from .surface import (
     _log_framewise_surface_alignment,
     _select_surface_estimate,
     _surface_estimate_datasets,
@@ -27,15 +33,17 @@ from .density import (
     _surface_metadata_view,
     SurfaceEstimate,
     SurfaceEstimatorOptions,
-    available_element_species,
 )
 from .schema import build_profile_metadata, default_plot_labels
 from ..plot.plotting import (
     DEFAULT_PLOT_STYLE,
     PlotStyle,
+    _extract_tick_controls,
+    _resolve_tick_visibility,
     _render_plot_annotations,
     _sanitize_line_collection_kwargs,
     configure_matplotlib_backend,
+    default_series_colors,
     format_axis_label_units,
     plot_line_series,
     plot_multi_line_series,
@@ -46,6 +54,18 @@ from ..plot.plotting import (
 from ..utils import axis_to_index, ensure_positive
 
 LOGGER = logging.getLogger(__name__)
+_POSITION_PROJECTION_COMPONENT = "2d-projection"
+_POSITION_PROJECTION_QUANTITIES = (
+    "x",
+    "y",
+    "z",
+    "distance",
+    "ps",
+    "fs",
+    "step",
+    "frame",
+)
+_POSITION_PROJECTION_RENDER_MODES = ("color-scale", "line-colors")
 
 
 @dataclass(frozen=True)
@@ -73,32 +93,9 @@ class PositionProfile:
     cell_lengths_angstrom: tuple[float, float, float] | None = None
 
 
-def _normalize_species(species: str | None) -> str:
-    if species is None:
-        return "ALL"
-    token = species.strip()
-    if not token or token.lower() == "all" or token == "*":
-        return "ALL"
-    return token[0].upper() + token[1:].lower()
-
-
-def _validate_stable_atom_layout(frames: list[Atoms]) -> np.ndarray:
-    if not frames:
-        raise ValueError("At least one trajectory frame is required.")
-    reference_symbols = np.asarray(frames[0].get_chemical_symbols(), dtype=object)
-    for frame_index, frame in enumerate(frames[1:], start=1):
-        symbols = np.asarray(frame.get_chemical_symbols(), dtype=object)
-        if symbols.size != reference_symbols.size:
-            raise ValueError(
-                "Atom-resolved position tracking requires all frames to have the same atom count "
-                f"(frame 0: {reference_symbols.size}, frame {frame_index}: {symbols.size})."
-            )
-        if not np.array_equal(symbols, reference_symbols):
-            raise ValueError(
-                "Atom-resolved position tracking requires a stable atom ordering/symbol layout "
-                f"across frames (mismatch at frame {frame_index})."
-            )
-    return reference_symbols
+def _frame_has_usable_cell(frame: Atoms) -> bool:
+    """Preserve position-profile periodic-cell validation semantics."""
+    return _common_frame_has_usable_cell(frame, require_all_pbc=True)
 
 
 def _resolve_step_values(frames: list[Atoms]) -> np.ndarray:
@@ -127,52 +124,6 @@ def _resolve_step_values(frames: list[Atoms]) -> np.ndarray:
     if all_have_steps:
         return values
     return np.arange(len(frames), dtype=float)
-
-
-def _optional_finite_float(value: Any) -> float | None:
-    if value is None:
-        return None
-    try:
-        parsed = float(value)
-    except (TypeError, ValueError):
-        return None
-    if not np.isfinite(parsed):
-        return None
-    return parsed
-
-
-def _optional_cell_lengths(value: Any) -> tuple[float, float, float] | None:
-    if value is None:
-        return None
-    if isinstance(value, np.ndarray):
-        items = value.tolist()
-    elif isinstance(value, (list, tuple)):
-        items = list(value)
-    else:
-        return None
-    if len(items) < 3:
-        return None
-    parsed: list[float] = []
-    for raw in items[:3]:
-        try:
-            numeric = float(raw)
-        except (TypeError, ValueError):
-            return None
-        if not np.isfinite(numeric) or numeric <= 0.0:
-            return None
-        parsed.append(numeric)
-    return (parsed[0], parsed[1], parsed[2])
-
-
-def _frame_has_usable_cell(frame: Atoms) -> bool:
-    if not bool(np.all(frame.get_pbc())):
-        return False
-    lengths = np.asarray(frame.cell.lengths(), dtype=float)
-    if lengths.shape != (3,):
-        return False
-    if np.any(~np.isfinite(lengths)) or np.any(lengths <= 0.0):
-        return False
-    return True
 
 
 def _resolve_cell_lengths_from_frames(
@@ -212,6 +163,7 @@ def _resolve_surface_distance_values(
             surface_elements=surface_elements,
             include_fixed_surface_atoms=include_fixed_surface_atoms,
             surface_options=surface_options,
+            logger=LOGGER,
         )
     if surface_estimate is None:
         LOGGER.warning(
@@ -264,7 +216,10 @@ def _compute_position_profiles_for_labels(
     precomputed_surface_estimate: SurfaceEstimate | None,
 ) -> list[PositionProfile]:
     ensure_positive("timestep_fs", timestep_fs)
-    symbols = _validate_stable_atom_layout(frames)
+    symbols = _validate_stable_atom_layout(
+        frames,
+        description="Atom-resolved position tracking",
+    )
     cell_lengths_angstrom = _resolve_cell_lengths_from_frames(frames)
     positions = np.stack([np.asarray(frame.positions, dtype=float) for frame in frames], axis=0)
     axis_index = axis_to_index(axis)
@@ -483,14 +438,11 @@ def load_position_profiles(
     axis: str | None = None,
 ) -> list[PositionProfile]:
     """Load one or more position profiles from LiNaK HDF5."""
-    source_path = Path(path).expanduser().resolve()
-    if not source_path.exists():
-        raise FileNotFoundError(f"Position profile not found: {source_path}")
-
-    if not is_hdf5_path(source_path):
-        raise ValueError(f"Unsupported position profile format for '{source_path}'. Use .h5/.hdf5.")
-
-    payloads = read_linak_hdf5_profiles(source_path, expected_analysis="position")
+    source_path, payloads = read_profile_payloads(
+        path,
+        analysis="position",
+        label="Position",
+    )
     return _load_position_profiles_from_payloads(
         source_path,
         payloads,
@@ -632,15 +584,11 @@ def load_position_profiles_by_index(
     axis: str | None = None,
 ) -> list[PositionProfile]:
     """Load selected position profiles by profile index from LiNaK HDF5."""
-    source_path = Path(path).expanduser().resolve()
-    if not source_path.exists():
-        raise FileNotFoundError(f"Position profile not found: {source_path}")
-    if not is_hdf5_path(source_path):
-        raise ValueError(f"Unsupported position profile format for '{source_path}'. Use .h5/.hdf5.")
-    payloads = read_linak_hdf5_profiles_by_index(
-        source_path,
+    source_path, payloads = read_profile_payloads_by_index(
+        path,
         profile_indices,
-        expected_analysis="position",
+        analysis="position",
+        label="Position",
     )
     return _load_position_profiles_from_payloads(
         source_path,
@@ -670,14 +618,25 @@ def _position_time_data(
 
 
 def _normalize_component_token(component: str) -> str:
-    token = component.strip().lower().replace("_", "-")
-    if token in {"distance", "x", "y", "z", "xy-z"}:
+    token = component.strip().lower().replace("_", "-").replace(" ", "-")
+    if token in {"distance", "x", "y", "z"}:
         return token
-    if token in {"xy-z-color", "xy-z-colormap", "trajectory", "xyz"}:
-        return "xy-z"
+    if token in {
+        "xy-z",
+        "xy-z-color",
+        "xy-z-colormap",
+        "trajectory",
+        "xyz",
+        "2d-projection",
+        "2dprojection",
+        "projection-2d",
+        "projection2d",
+        "projection",
+    }:
+        return _POSITION_PROJECTION_COMPONENT
     raise ValueError(
         f"Unsupported position component '{component}'. "
-        "Choose 'distance', 'x', 'y', 'z', or 'xy-z'."
+        "Choose 'distance', 'x', 'y', 'z', or '2d-projection' (alias 'xy-z')."
     )
 
 
@@ -688,6 +647,33 @@ def _normalize_map_color_token(map_color: str) -> str:
     if token in {"surface-distance", "dist"}:
         return "distance"
     raise ValueError(f"Unsupported position map_color '{map_color}'. Choose 'distance' or 'z'.")
+
+
+def _normalize_projection_quantity_token(quantity: str) -> str:
+    token = quantity.strip().lower().replace("_", "-").replace(" ", "-")
+    if token in _POSITION_PROJECTION_QUANTITIES:
+        return token
+    if token in {"surface-distance", "dist"}:
+        return "distance"
+    raise ValueError(
+        f"Unsupported position projection quantity '{quantity}'. Choose one of "
+        + ", ".join(f"'{value}'" for value in _POSITION_PROJECTION_QUANTITIES)
+        + "."
+    )
+
+
+def _normalize_projection_render_mode_token(render_mode: str) -> str:
+    token = render_mode.strip().lower().replace("_", "-").replace(" ", "-")
+    if token in _POSITION_PROJECTION_RENDER_MODES:
+        return token
+    if token in {"color", "colormap", "colorscale"}:
+        return "color-scale"
+    if token in {"lines", "line-colour", "line-colours", "line-colors"}:
+        return "line-colors"
+    raise ValueError(
+        f"Unsupported position projection render mode '{render_mode}'. "
+        "Choose 'color-scale' or 'line-colors'."
+    )
 
 
 def _position_component_data(
@@ -711,7 +697,9 @@ def _position_component_data(
         return profile.y, "Y (A)"
     if normalized == "z":
         return profile.z, "Z (A)"
-    raise ValueError("Component 'xy-z' must be rendered via XY trajectory plotting.")
+    raise ValueError(
+        "2-D projection components must be rendered via trajectory projection plotting."
+    )
 
 
 def _position_map_color_data(
@@ -723,6 +711,39 @@ def _position_map_color_data(
     if normalized == "distance":
         return _position_component_data(profile, component="distance")
     return np.asarray(profile.z, dtype=float), "Z (A)"
+
+
+def _position_projection_quantity_data(
+    profile: PositionProfile,
+    *,
+    quantity: str,
+) -> tuple[np.ndarray, str]:
+    normalized = _normalize_projection_quantity_token(quantity)
+    if normalized == "distance":
+        return (
+            np.asarray(profile.distance_to_surface, dtype=float),
+            "Distance to the surface ($\\mathrm{\\AA}$)",
+        )
+    if normalized in {"x", "y", "z"}:
+        return _position_component_data(profile, component=normalized)
+    time_values, label = _position_time_data(profile, time_axis=normalized)
+    matrix = np.repeat(np.asarray(time_values, dtype=float)[:, np.newaxis], profile.n_atoms, axis=1)
+    return matrix, label
+
+
+def _projection_default_title(
+    *,
+    x_quantity: str,
+    y_quantity: str,
+    value_quantity: str,
+    render_mode: str,
+) -> str:
+    x_token = _normalize_projection_quantity_token(x_quantity)
+    y_token = _normalize_projection_quantity_token(y_quantity)
+    value_token = _normalize_projection_quantity_token(value_quantity)
+    if render_mode == "color-scale":
+        return f"{x_token.upper()}-{y_token.upper()} trajectories colored by {value_token}"
+    return f"{x_token.upper()}-{y_token.upper()} trajectories"
 
 
 def _build_xy_segments(
@@ -758,6 +779,127 @@ def _build_xy_segments(
     # Break PBC-jump connectors so trajectories do not draw artificial lines across the box.
     keep = (dx <= (0.5 * x_length + 1e-12)) & (dy <= (0.5 * y_length + 1e-12))
     return np.asarray(segments[keep], dtype=float), np.asarray(segment_colors[keep], dtype=float)
+
+
+def _contiguous_true_runs(mask: np.ndarray) -> list[tuple[int, int]]:
+    runs: list[tuple[int, int]] = []
+    start: int | None = None
+    for index, flag in enumerate(np.asarray(mask, dtype=bool)):
+        if flag:
+            if start is None:
+                start = index
+            continue
+        if start is not None:
+            runs.append((start, index))
+            start = None
+    if start is not None:
+        runs.append((start, int(mask.size)))
+    return runs
+
+
+def _build_projection_paths(
+    x_values: np.ndarray,
+    y_values: np.ndarray,
+    *,
+    cell_lengths_xy: tuple[float, float] | None,
+) -> list[np.ndarray]:
+    if x_values.size != y_values.size:
+        raise ValueError("x and y arrays must have matching length for projection path building.")
+    if x_values.size == 0:
+        return []
+
+    points = np.column_stack((x_values, y_values))
+    if x_values.size == 1 or cell_lengths_xy is None:
+        return [np.asarray(points, dtype=float)]
+
+    x_length, y_length = cell_lengths_xy
+    if x_length <= 0.0 or y_length <= 0.0:
+        return [np.asarray(points, dtype=float)]
+
+    dx = np.abs(np.diff(x_values))
+    dy = np.abs(np.diff(y_values))
+    keep = (dx <= (0.5 * x_length + 1e-12)) & (dy <= (0.5 * y_length + 1e-12))
+    paths: list[np.ndarray] = []
+    start = 0
+    for index, segment_kept in enumerate(keep):
+        if segment_kept:
+            continue
+        if index + 1 > start:
+            paths.append(np.asarray(points[start : index + 1], dtype=float))
+        start = index + 1
+    if points.shape[0] > start:
+        paths.append(np.asarray(points[start:], dtype=float))
+    return [path for path in paths if path.size > 0]
+
+
+def _coerce_projection_filter_bound(
+    value: float | None,
+    *,
+    field_name: str,
+) -> float | None:
+    if value is None:
+        return None
+    parsed = float(value)
+    if not np.isfinite(parsed):
+        raise ValueError(f"{field_name} must be finite.")
+    return parsed
+
+
+def _resolve_projection_settings(
+    *,
+    component: str,
+    map_color: str,
+    projection_x: str | None,
+    projection_y: str | None,
+    projection_value: str | None,
+    projection_render_mode: str | None,
+    projection_filter_min: float | None,
+    projection_filter_max: float | None,
+    xy_z_distance_max: float | None,
+) -> tuple[str, str, str, str, float | None, float | None]:
+    normalized_component = _normalize_component_token(component)
+    if normalized_component != _POSITION_PROJECTION_COMPONENT:
+        raise ValueError("Projection settings can only be resolved for 2-D position projections.")
+
+    resolved_x = _normalize_projection_quantity_token(projection_x or "x")
+    resolved_y = _normalize_projection_quantity_token(projection_y or "y")
+    resolved_value = _normalize_projection_quantity_token(
+        projection_value if projection_value is not None else _normalize_map_color_token(map_color)
+    )
+    resolved_render_mode = _normalize_projection_render_mode_token(
+        projection_render_mode or "color-scale"
+    )
+    resolved_filter_min = _coerce_projection_filter_bound(
+        projection_filter_min,
+        field_name="projection filter minimum",
+    )
+    resolved_filter_max = _coerce_projection_filter_bound(
+        projection_filter_max,
+        field_name="projection filter maximum",
+    )
+    if (
+        resolved_filter_max is None
+        and xy_z_distance_max is not None
+        and resolved_value == "distance"
+    ):
+        resolved_filter_max = _coerce_projection_filter_bound(
+            xy_z_distance_max,
+            field_name="xy-z distance max",
+        )
+    if (
+        resolved_filter_min is not None
+        and resolved_filter_max is not None
+        and resolved_filter_min > resolved_filter_max
+    ):
+        raise ValueError("Projection filter minimum must not exceed the projection filter maximum.")
+    return (
+        resolved_x,
+        resolved_y,
+        resolved_value,
+        resolved_render_mode,
+        resolved_filter_min,
+        resolved_filter_max,
+    )
 
 
 def _default_position_series_labels(profile: PositionProfile) -> list[str]:
@@ -797,17 +939,26 @@ def _plot_position_xy_z_projection(
     y_label_font_size: int | None,
     x_label_pad: float | None,
     y_label_pad: float | None,
+    title_pad: float | None,
     title_visible: bool | None,
     ticks_visible: bool | None,
     line_colors: list[str] | None,
     series_enabled: list[bool] | None,
+    series_show_in_legend: list[bool] | None = None,
     series_line_widths: list[float | None] | None,
     series_markers: list[str | None] | None,
+    render_series_descriptors: list[dict[str, Any]] | None = None,
+    series_overrides_by_id: dict[str, dict[str, Any]] | None = None,
+    series_line_kwargs: list[dict[str, Any] | None] | None = None,
     series_normalization_modes: list[str | None] | None,
     series_normalization_values: list[float | None] | None,
     series_normalization_x_refs: list[float | None] | None,
     x_bin_width: float | None,
     x_bin_reducer: str | None,
+    legend: bool | None = None,
+    legend_title: str | None = None,
+    legend_loc: str = "best",
+    legend_kwargs: dict[str, Any] | None = None,
     annotations: list[dict[str, Any]] | None,
     capture_state: dict[str, Any] | None,
     suppress_output_log: bool,
@@ -819,9 +970,80 @@ def _plot_position_xy_z_projection(
     tick_params_kwargs: dict[str, Any] | None,
     tight_layout_kwargs: dict[str, Any] | None,
     savefig_kwargs: dict[str, Any] | None,
+    component: str = "xy-z",
+    projection_x: str | None = None,
+    projection_y: str | None = None,
+    projection_value: str | None = None,
+    projection_render_mode: str | None = None,
+    projection_filter_min: float | None = None,
+    projection_filter_max: float | None = None,
+    xy_z_distance_max: float | None = None,
 ) -> Path | None:
     if not profiles:
         raise ValueError("At least one position profile is required.")
+    return _plot_position_projection(
+        profiles,
+        output=output,
+        show=show,
+        show_blocking=show_blocking,
+        preferred_backend=preferred_backend,
+        style=style,
+        title=title,
+        x_label=x_label,
+        y_label=y_label,
+        x_scale=x_scale,
+        y_scale=y_scale,
+        x_lim=x_lim,
+        y_lim=y_lim,
+        x_ticks=x_ticks,
+        y_ticks=y_ticks,
+        x_tick_rotation=x_tick_rotation,
+        y_tick_rotation=y_tick_rotation,
+        x_label_font_size=x_label_font_size,
+        y_label_font_size=y_label_font_size,
+        x_label_pad=x_label_pad,
+        y_label_pad=y_label_pad,
+        title_pad=title_pad,
+        title_visible=title_visible,
+        ticks_visible=ticks_visible,
+        line_colors=line_colors,
+        series_enabled=series_enabled,
+        series_show_in_legend=series_show_in_legend,
+        series_line_widths=series_line_widths,
+        series_markers=series_markers,
+        render_series_descriptors=render_series_descriptors,
+        series_overrides_by_id=series_overrides_by_id,
+        series_line_kwargs=series_line_kwargs,
+        series_normalization_modes=series_normalization_modes,
+        series_normalization_values=series_normalization_values,
+        series_normalization_x_refs=series_normalization_x_refs,
+        x_bin_width=x_bin_width,
+        x_bin_reducer=x_bin_reducer,
+        legend=legend,
+        legend_title=legend_title,
+        legend_loc=legend_loc,
+        legend_kwargs=legend_kwargs,
+        annotations=annotations,
+        capture_state=capture_state,
+        suppress_output_log=suppress_output_log,
+        matplotlib_rc=matplotlib_rc,
+        figure_kwargs=figure_kwargs,
+        axes_kwargs=axes_kwargs,
+        line_kwargs=line_kwargs,
+        grid_kwargs=grid_kwargs,
+        tick_params_kwargs=tick_params_kwargs,
+        tight_layout_kwargs=tight_layout_kwargs,
+        savefig_kwargs=savefig_kwargs,
+        component=component,
+        map_color=map_color,
+        projection_x=projection_x,
+        projection_y=projection_y,
+        projection_value=projection_value,
+        projection_render_mode=projection_render_mode,
+        projection_filter_min=projection_filter_min,
+        projection_filter_max=projection_filter_max,
+        xy_z_distance_max=xy_z_distance_max,
+    )
 
     series_total = sum(max(0, int(profile.n_atoms)) for profile in profiles)
     if series_enabled is not None and len(series_enabled) != series_total:
@@ -859,6 +1081,8 @@ def _plot_position_xy_z_projection(
             "series_normalization_x_refs count must match the number of plotted position atom series "
             f"({series_total})."
         )
+    if xy_z_distance_max is not None and float(xy_z_distance_max) <= 0.0:
+        raise ValueError("xy-z distance max must be positive.")
 
     if x_bin_width is not None:
         LOGGER.warning(
@@ -868,8 +1092,8 @@ def _plot_position_xy_z_projection(
         )
     if series_normalization_modes is not None:
         LOGGER.warning("Position component 'xy-z' ignores per-series y-normalization settings.")
-    if line_colors is not None:
-        LOGGER.warning(
+    if line_colors is not None and any(str(color).strip() for color in line_colors):
+        LOGGER.debug(
             "Position component 'xy-z' ignores per-series fixed line colors and uses %s colormap values.",
             _normalize_map_color_token(map_color),
         )
@@ -913,26 +1137,42 @@ def _plot_position_xy_z_projection(
             x_values = x_matrix[:, atom_column]
             y_values = y_matrix[:, atom_column]
             color_values = color_matrix[:, atom_column]
-            if x_values.size == 0:
-                continue
-            if x_values.size == 1:
-                point_x_values.append(float(x_values[0]))
-                point_y_values.append(float(y_values[0]))
-                point_color_values.append(float(color_values[0]))
-                continue
-
-            segments, segment_colors = _build_xy_segments(
-                x_values,
-                y_values,
-                color_values,
-                cell_lengths_xy=cell_lengths_xy,
+            distance_values = np.asarray(profile.distance_to_surface[:, atom_column], dtype=float)
+            visible_mask = (
+                np.isfinite(x_values)
+                & np.isfinite(y_values)
+                & np.isfinite(color_values)
+                & np.isfinite(distance_values)
             )
-            if segments.size == 0:
+            if xy_z_distance_max is not None:
+                visible_mask &= distance_values <= float(xy_z_distance_max)
+            if not np.any(visible_mask):
                 continue
-            segment_blocks.append(segments)
-            segment_color_blocks.append(segment_colors)
+            visible_x = np.asarray(x_values[visible_mask], dtype=float)
+            visible_y = np.asarray(y_values[visible_mask], dtype=float)
+            visible_colors = np.asarray(color_values[visible_mask], dtype=float)
+            point_x_values.extend(float(value) for value in visible_x)
+            point_y_values.extend(float(value) for value in visible_y)
+            point_color_values.extend(float(value) for value in visible_colors)
+
+            for start, stop in _contiguous_true_runs(visible_mask):
+                run_x = np.asarray(x_values[start:stop], dtype=float)
+                run_y = np.asarray(y_values[start:stop], dtype=float)
+                run_colors = np.asarray(color_values[start:stop], dtype=float)
+                segments, segment_colors = _build_xy_segments(
+                    run_x,
+                    run_y,
+                    run_colors,
+                    cell_lengths_xy=cell_lengths_xy,
+                )
+                if segments.size == 0:
+                    continue
+                segment_blocks.append(segments)
+                segment_color_blocks.append(segment_colors)
 
     if not segment_blocks and not point_x_values:
+        if xy_z_distance_max is not None:
+            raise ValueError("No atom trajectories remain after applying the xy-z distance cutoff.")
         raise ValueError("No enabled atom trajectories available for 'xy-z' position plotting.")
 
     color_samples: list[np.ndarray] = []
@@ -1021,7 +1261,7 @@ def _plot_position_xy_z_projection(
             **ylabel_kwargs,
         )
         if title_visible is False:
-            ax.set_title("", fontsize=style.title_font_size)
+            ax.set_title("", fontsize=style.title_font_size, pad=style.title_pad)
         else:
             ax.set_title(
                 title
@@ -1031,15 +1271,12 @@ def _plot_position_xy_z_projection(
                     else "XY trajectories colored by Z"
                 ),
                 fontsize=style.title_font_size,
+                pad=style.title_pad,
             )
 
         ax.tick_params(axis="both", labelsize=style.tick_font_size)
-        resolved_tick_params = dict(tick_params_kwargs) if tick_params_kwargs is not None else {}
-        tick_axis_hint = str(resolved_tick_params.pop("_ticks_axis", "both")).strip().lower()
-        if tick_axis_hint not in {"x", "y", "both"}:
-            tick_axis_hint = "both"
-        minor_ticks_mode = (
-            str(resolved_tick_params.pop("_minor_ticks_mode", "auto")).strip().lower()
+        resolved_tick_params, tick_axis_hint, minor_ticks_mode = _extract_tick_controls(
+            tick_params_kwargs
         )
         if minor_ticks_mode == "on":
             ax.minorticks_on()
@@ -1047,23 +1284,27 @@ def _plot_position_xy_z_projection(
             ax.minorticks_off()
         if resolved_tick_params:
             ax.tick_params(**resolved_tick_params)
-        if ticks_visible is False:
-            if tick_axis_hint in {"both", "x"}:
-                ax.tick_params(
-                    axis="x",
-                    which="both",
-                    bottom=False,
-                    top=False,
-                    labelbottom=False,
-                )
-            if tick_axis_hint in {"both", "y"}:
-                ax.tick_params(
-                    axis="y",
-                    which="both",
-                    left=False,
-                    right=False,
-                    labelleft=False,
-                )
+        x_ticks_visible, y_ticks_visible = _resolve_tick_visibility(
+            tick_params_kwargs,
+            ticks_visible,
+            tick_axis_hint,
+        )
+        if not x_ticks_visible:
+            ax.tick_params(
+                axis="x",
+                which="both",
+                bottom=False,
+                top=False,
+                labelbottom=False,
+            )
+        if not y_ticks_visible:
+            ax.tick_params(
+                axis="y",
+                which="both",
+                left=False,
+                right=False,
+                labelleft=False,
+            )
         if x_tick_rotation is not None:
             ax.tick_params(axis="x", rotation=float(x_tick_rotation))
         if y_tick_rotation is not None:
@@ -1125,6 +1366,8 @@ def _plot_position_xy_z_projection(
             capture_state.clear()
             capture_state.update(
                 {
+                    "figure": fig,
+                    "axes": ax,
                     "title": str(ax.get_title()),
                     "title_visible": bool(
                         ax.title.get_visible() and bool(str(ax.get_title()).strip())
@@ -1179,6 +1422,590 @@ def _plot_position_xy_z_projection(
         return output_path
 
 
+def _plot_position_projection(
+    profiles: list[PositionProfile],
+    *,
+    output: str | Path | None,
+    show: bool,
+    show_blocking: bool,
+    preferred_backend: str | None,
+    style: PlotStyle,
+    title: str | None,
+    x_label: str | None,
+    y_label: str | None,
+    x_scale: str,
+    y_scale: str,
+    x_lim: tuple[float | None, float | None] | list[float | None] | None,
+    y_lim: tuple[float | None, float | None] | list[float | None] | None,
+    x_ticks: list[float] | tuple[float, ...] | None,
+    y_ticks: list[float] | tuple[float, ...] | None,
+    x_tick_rotation: float | None,
+    y_tick_rotation: float | None,
+    x_label_font_size: int | None,
+    y_label_font_size: int | None,
+    x_label_pad: float | None,
+    y_label_pad: float | None,
+    title_pad: float | None,
+    title_visible: bool | None,
+    ticks_visible: bool | None,
+    line_colors: list[str] | None,
+    series_enabled: list[bool] | None,
+    series_show_in_legend: list[bool] | None,
+    series_line_widths: list[float | None] | None,
+    series_markers: list[str | None] | None,
+    render_series_descriptors: list[dict[str, Any]] | None,
+    series_overrides_by_id: dict[str, dict[str, Any]] | None,
+    series_line_kwargs: list[dict[str, Any] | None] | None,
+    series_normalization_modes: list[str | None] | None,
+    series_normalization_values: list[float | None] | None,
+    series_normalization_x_refs: list[float | None] | None,
+    x_bin_width: float | None,
+    x_bin_reducer: str | None,
+    legend: bool | None,
+    legend_title: str | None,
+    legend_loc: str,
+    legend_kwargs: dict[str, Any] | None,
+    annotations: list[dict[str, Any]] | None,
+    capture_state: dict[str, Any] | None,
+    suppress_output_log: bool,
+    matplotlib_rc: dict[str, Any] | None,
+    figure_kwargs: dict[str, Any] | None,
+    axes_kwargs: dict[str, Any] | None,
+    line_kwargs: dict[str, Any] | None,
+    grid_kwargs: dict[str, Any] | None,
+    tick_params_kwargs: dict[str, Any] | None,
+    tight_layout_kwargs: dict[str, Any] | None,
+    savefig_kwargs: dict[str, Any] | None,
+    component: str,
+    map_color: str,
+    projection_x: str | None,
+    projection_y: str | None,
+    projection_value: str | None,
+    projection_render_mode: str | None,
+    projection_filter_min: float | None,
+    projection_filter_max: float | None,
+    xy_z_distance_max: float | None,
+) -> Path | None:
+    if not profiles:
+        raise ValueError("At least one position profile is required.")
+    component_token = str(component).strip().lower().replace("_", "-").replace(" ", "-")
+    legacy_xy_z_alias = component_token in {
+        "xy-z",
+        "xy-z-color",
+        "xy-z-colormap",
+        "trajectory",
+        "xyz",
+    }
+
+    (
+        resolved_projection_x,
+        resolved_projection_y,
+        resolved_projection_value,
+        resolved_render_mode,
+        resolved_filter_min,
+        resolved_filter_max,
+    ) = _resolve_projection_settings(
+        component=component,
+        map_color=map_color,
+        projection_x=projection_x,
+        projection_y=projection_y,
+        projection_value=projection_value,
+        projection_render_mode=projection_render_mode,
+        projection_filter_min=projection_filter_min,
+        projection_filter_max=projection_filter_max,
+        xy_z_distance_max=xy_z_distance_max,
+    )
+    raw_line_colors = line_colors
+    if resolved_render_mode == "color-scale":
+        line_colors = None
+    series_total = sum(max(0, int(profile.n_atoms)) for profile in profiles)
+    for values, field_name in (
+        (series_enabled, "series_enabled"),
+        (line_colors, "line_colors"),
+        (series_show_in_legend, "series_show_in_legend"),
+        (series_line_widths, "series_line_widths"),
+        (series_markers, "series_markers"),
+        (series_line_kwargs, "series_line_kwargs"),
+        (series_normalization_modes, "series_normalization_modes"),
+        (series_normalization_values, "series_normalization_values"),
+        (series_normalization_x_refs, "series_normalization_x_refs"),
+    ):
+        if values is not None and len(values) != series_total:
+            raise ValueError(
+                f"{field_name} count must match the number of plotted position atom series "
+                f"({series_total})."
+            )
+
+    if x_bin_width is not None:
+        LOGGER.warning(
+            "Position 2-D projection ignores time-section/x-bin settings (received %.6g; reducer=%s).",
+            x_bin_width,
+            x_bin_reducer or "mean",
+        )
+    if series_normalization_modes is not None:
+        LOGGER.warning("Position 2-D projection ignores per-series y-normalization settings.")
+    if (
+        resolved_render_mode == "color-scale"
+        and raw_line_colors is not None
+        and any(str(color).strip() for color in raw_line_colors)
+    ):
+        LOGGER.debug(
+            "Position 2-D projection ignores per-series fixed line colors in color-scale mode and uses %s values.",
+            resolved_projection_value,
+        )
+
+    from matplotlib.collections import LineCollection
+    import matplotlib.colors as mcolors
+    import matplotlib.pyplot as plt
+
+    color_scale_segment_blocks: list[np.ndarray] = []
+    color_scale_segment_color_blocks: list[np.ndarray] = []
+    color_scale_point_x: list[float] = []
+    color_scale_point_y: list[float] = []
+    color_scale_point_values: list[float] = []
+    visible_x_values: list[float] = []
+    visible_y_values: list[float] = []
+    line_series_payloads: list[dict[str, Any]] = []
+    default_labels: list[str] = []
+    value_label_reference: str | None = None
+    default_x_label = "X (A)"
+    default_y_label = "Y (A)"
+    default_line_colors = default_series_colors(series_total)
+    default_projection_x_lim: tuple[float | None, float | None] | None = None
+    default_projection_y_lim: tuple[float | None, float | None] | None = None
+    ordered_descriptors = list(render_series_descriptors or [])
+    overrides = dict(series_overrides_by_id) if isinstance(series_overrides_by_id, Mapping) else {}
+    profile_descriptor_mode = resolved_render_mode == "color-scale" and len(
+        ordered_descriptors
+    ) == len(profiles)
+    atom_descriptor_mode = (
+        resolved_render_mode == "line-colors" and len(ordered_descriptors) == series_total
+    )
+
+    def _override_entry(series_id: str | None) -> dict[str, Any]:
+        token = str(series_id or "").strip()
+        value = overrides.get(token)
+        return dict(value) if isinstance(value, Mapping) else {}
+
+    if legacy_xy_z_alias:
+        cell_x_lengths = [
+            float(profile.cell_lengths_angstrom[0])
+            for profile in profiles
+            if profile.cell_lengths_angstrom is not None
+            and np.isfinite(float(profile.cell_lengths_angstrom[0]))
+        ]
+        cell_y_lengths = [
+            float(profile.cell_lengths_angstrom[1])
+            for profile in profiles
+            if profile.cell_lengths_angstrom is not None
+            and np.isfinite(float(profile.cell_lengths_angstrom[1]))
+        ]
+        if resolved_projection_x == "x" and cell_x_lengths:
+            default_projection_x_lim = (0.0, max(cell_x_lengths))
+        if resolved_projection_y == "y" and cell_y_lengths:
+            default_projection_y_lim = (0.0, max(cell_y_lengths))
+
+    series_index = 0
+    for profile_index, profile in enumerate(profiles):
+        profile_override: dict[str, Any] = {}
+        profile_enabled = True
+        if profile_descriptor_mode:
+            profile_descriptor = ordered_descriptors[profile_index]
+            profile_override = _override_entry(profile_descriptor.get("series_id"))
+            profile_enabled = bool(profile_override.get("enabled", True)) and bool(
+                profile_override.get("show_raw_line", True)
+            )
+        x_matrix, default_x_label = _position_projection_quantity_data(
+            profile, quantity=resolved_projection_x
+        )
+        y_matrix, default_y_label = _position_projection_quantity_data(
+            profile, quantity=resolved_projection_y
+        )
+        value_matrix, value_label = _position_projection_quantity_data(
+            profile, quantity=resolved_projection_value
+        )
+        cell_lengths_xy = None
+        if profile.cell_lengths_angstrom is not None:
+            cell_lengths_xy = (
+                float(profile.cell_lengths_angstrom[0]),
+                float(profile.cell_lengths_angstrom[1]),
+            )
+        value_label_reference = (
+            value_label if value_label_reference is None else value_label_reference
+        )
+        if not (x_matrix.shape == y_matrix.shape == value_matrix.shape):
+            raise ValueError(
+                f"Position profile '{profile.species}' has inconsistent projection matrix shapes."
+            )
+        for atom_column, atom_default_label in enumerate(_default_position_series_labels(profile)):
+            descriptor_label = atom_default_label
+            current_override: dict[str, Any] = {}
+            if atom_descriptor_mode:
+                descriptor = ordered_descriptors[series_index]
+                current_override = _override_entry(descriptor.get("series_id"))
+                descriptor_label = str(current_override.get("label_override") or "").strip() or str(
+                    descriptor.get("default_label") or atom_default_label
+                )
+            default_labels.append(descriptor_label)
+            is_enabled = True if series_enabled is None else bool(series_enabled[series_index])
+            if atom_descriptor_mode:
+                is_enabled = bool(current_override.get("enabled", True)) and bool(
+                    current_override.get("show_raw_line", True)
+                )
+            elif profile_descriptor_mode:
+                is_enabled = profile_enabled
+            show_in_legend = (
+                True if series_show_in_legend is None else bool(series_show_in_legend[series_index])
+            )
+            if atom_descriptor_mode:
+                show_in_legend = bool(current_override.get("show_in_legend", show_in_legend))
+            line_width_value = (
+                None if series_line_widths is None else series_line_widths[series_index]
+            )
+            line_width = style.line_width if line_width_value is None else float(line_width_value)
+            if atom_descriptor_mode and current_override.get("line_width") not in {None, ""}:
+                line_width = float(current_override["line_width"])
+            marker = (
+                None
+                if series_markers is None or series_markers[series_index] in {None, ""}
+                else str(series_markers[series_index])
+            )
+            if atom_descriptor_mode and current_override.get("marker") not in {None, ""}:
+                marker = str(current_override.get("marker"))
+            line_color = (
+                default_line_colors[series_index]
+                if line_colors is None or not str(line_colors[series_index]).strip()
+                else str(line_colors[series_index]).strip()
+            )
+            if atom_descriptor_mode and current_override.get("color") not in {None, ""}:
+                line_color = str(current_override.get("color"))
+            extra_line_kwargs = (
+                {}
+                if series_line_kwargs is None or series_line_kwargs[series_index] is None
+                else dict(series_line_kwargs[series_index] or {})
+            )
+            if atom_descriptor_mode and isinstance(current_override.get("line_kwargs"), Mapping):
+                extra_line_kwargs.update(dict(current_override.get("line_kwargs") or {}))
+            series_index += 1
+            if not is_enabled:
+                continue
+
+            x_values = np.asarray(x_matrix[:, atom_column], dtype=float)
+            y_values = np.asarray(y_matrix[:, atom_column], dtype=float)
+            value_values = np.asarray(value_matrix[:, atom_column], dtype=float)
+            visible_mask = np.isfinite(x_values) & np.isfinite(y_values) & np.isfinite(value_values)
+            if resolved_filter_min is not None:
+                visible_mask &= value_values >= resolved_filter_min
+            if resolved_filter_max is not None:
+                visible_mask &= value_values <= resolved_filter_max
+            if not np.any(visible_mask):
+                continue
+
+            visible_x = np.asarray(x_values[visible_mask], dtype=float)
+            visible_y = np.asarray(y_values[visible_mask], dtype=float)
+            visible_values = np.asarray(value_values[visible_mask], dtype=float)
+            visible_x_values.extend(float(value) for value in visible_x)
+            visible_y_values.extend(float(value) for value in visible_y)
+            if resolved_render_mode == "color-scale":
+                color_scale_point_x.extend(float(value) for value in visible_x)
+                color_scale_point_y.extend(float(value) for value in visible_y)
+                color_scale_point_values.extend(float(value) for value in visible_values)
+                for start, stop in _contiguous_true_runs(visible_mask):
+                    segments, segment_values = _build_xy_segments(
+                        np.asarray(x_values[start:stop], dtype=float),
+                        np.asarray(y_values[start:stop], dtype=float),
+                        np.asarray(value_values[start:stop], dtype=float),
+                        cell_lengths_xy=cell_lengths_xy,
+                    )
+                    if segments.size == 0:
+                        continue
+                    color_scale_segment_blocks.append(segments)
+                    color_scale_segment_color_blocks.append(segment_values)
+            else:
+                paths: list[np.ndarray] = []
+                for start, stop in _contiguous_true_runs(visible_mask):
+                    paths.extend(
+                        _build_projection_paths(
+                            np.asarray(x_values[start:stop], dtype=float),
+                            np.asarray(y_values[start:stop], dtype=float),
+                            cell_lengths_xy=cell_lengths_xy,
+                        )
+                    )
+                line_series_payloads.append(
+                    {
+                        "label": descriptor_label,
+                        "show_in_legend": show_in_legend,
+                        "color": line_color,
+                        "line_width": line_width,
+                        "marker": marker,
+                        "line_kwargs": extra_line_kwargs,
+                        "paths": [path for path in paths if len(path) >= 2],
+                        "single_points": [path[0] for path in paths if len(path) == 1],
+                    }
+                )
+
+    if not visible_x_values:
+        if (
+            legacy_xy_z_alias
+            and xy_z_distance_max is not None
+            and projection_filter_min is None
+            and projection_filter_max is None
+            and resolved_projection_value == "distance"
+        ):
+            raise ValueError("No atom trajectories remain after applying the xy-z distance cutoff.")
+        if resolved_filter_min is not None or resolved_filter_max is not None:
+            raise ValueError(
+                "No atom trajectories remain after applying the projection value filter."
+            )
+        raise ValueError("No enabled atom trajectories available for 2-D position plotting.")
+
+    configure_matplotlib_backend(
+        interactive=show,
+        preferred_backend=preferred_backend,
+    )
+    rc_context_args: dict[str, Any] = {"font.family": style.font_family, "text.parse_math": True}
+    if matplotlib_rc is not None:
+        rc_context_args.update(dict(matplotlib_rc))
+
+    labels = resolve_series_labels(default_labels, None, series_kind="position")
+    effective_legend = (len(labels) <= 12) if legend is None else bool(legend)
+    marker_size = max(9.0, (style.line_width * 7.0) ** 2)
+
+    with plt.rc_context(rc_context_args):
+        fig, ax = plt.subplots(figsize=style.figure_size)
+        if figure_kwargs is not None:
+            fig.set(**dict(figure_kwargs))
+
+        if resolved_render_mode == "color-scale":
+            color_samples = []
+            if color_scale_segment_color_blocks:
+                color_samples.extend(color_scale_segment_color_blocks)
+            if color_scale_point_values:
+                color_samples.append(np.asarray(color_scale_point_values, dtype=float))
+            color_all = np.concatenate(color_samples)
+            color_min = float(np.nanmin(color_all))
+            color_max = float(np.nanmax(color_all))
+            if color_min == color_max:
+                color_min -= 0.5
+                color_max += 0.5
+            norm = mcolors.Normalize(vmin=color_min, vmax=color_max)
+            projection_line_kwargs = _sanitize_line_collection_kwargs(line_kwargs)
+            explicit_line_width = _first_non_none(series_line_widths)
+            projection_line_kwargs.setdefault(
+                "linewidths",
+                style.line_width if explicit_line_width is None else explicit_line_width,
+            )
+            mappable = None
+            if color_scale_segment_blocks:
+                collection = LineCollection(
+                    np.concatenate(color_scale_segment_blocks, axis=0),
+                    cmap="turbo",
+                    norm=norm,
+                    **projection_line_kwargs,
+                )
+                collection.set_array(np.concatenate(color_scale_segment_color_blocks, axis=0))
+                ax.add_collection(collection)
+                mappable = collection
+            if color_scale_point_x:
+                scatter = ax.scatter(
+                    np.asarray(color_scale_point_x, dtype=float),
+                    np.asarray(color_scale_point_y, dtype=float),
+                    c=np.asarray(color_scale_point_values, dtype=float),
+                    cmap="turbo",
+                    norm=norm,
+                    s=marker_size,
+                    edgecolors="none",
+                )
+                if mappable is None:
+                    mappable = scatter
+            if mappable is not None:
+                colorbar = fig.colorbar(mappable, ax=ax)
+                colorbar.set_label(
+                    value_label_reference or "Projection value",
+                    fontsize=style.label_font_size,
+                )
+                colorbar.ax.tick_params(labelsize=style.tick_font_size)
+        else:
+            for payload, resolved_label in zip(line_series_payloads, labels):
+                label_used = False
+                plot_kwargs = dict(line_kwargs or {})
+                plot_kwargs.update(payload["line_kwargs"])
+                plot_kwargs.setdefault("linewidth", payload["line_width"])
+                plot_kwargs.setdefault("color", payload["color"])
+                for path in payload["paths"]:
+                    ax.plot(
+                        path[:, 0],
+                        path[:, 1],
+                        marker=payload["marker"],
+                        label=(
+                            resolved_label
+                            if payload["show_in_legend"] and effective_legend and not label_used
+                            else None
+                        ),
+                        **plot_kwargs,
+                    )
+                    label_used = True
+                for point in payload["single_points"]:
+                    ax.scatter(
+                        [float(point[0])],
+                        [float(point[1])],
+                        color=payload["color"],
+                        marker=payload["marker"] or "o",
+                        s=marker_size,
+                        label=(
+                            resolved_label
+                            if payload["show_in_legend"] and effective_legend and not label_used
+                            else None
+                        ),
+                    )
+                    label_used = True
+            if effective_legend:
+                resolved_legend_kwargs = dict(legend_kwargs or {})
+                if legend_title is not None:
+                    resolved_legend_kwargs.setdefault("title", legend_title)
+                ax.legend(loc=legend_loc, **resolved_legend_kwargs)
+
+        ax.autoscale()
+        xlabel_kwargs: dict[str, Any] = {"fontsize": x_label_font_size or style.label_font_size}
+        ylabel_kwargs: dict[str, Any] = {"fontsize": y_label_font_size or style.label_font_size}
+        if x_label_pad is not None:
+            xlabel_kwargs["labelpad"] = float(x_label_pad)
+        if y_label_pad is not None:
+            ylabel_kwargs["labelpad"] = float(y_label_pad)
+        ax.set_xlabel(
+            format_axis_label_units(resolve_explicit_plot_text(x_label, default_x_label)),
+            **xlabel_kwargs,
+        )
+        ax.set_ylabel(
+            format_axis_label_units(resolve_explicit_plot_text(y_label, default_y_label)),
+            **ylabel_kwargs,
+        )
+        ax.set_title(
+            ""
+            if title_visible is False
+            else title
+            or _projection_default_title(
+                x_quantity=resolved_projection_x,
+                y_quantity=resolved_projection_y,
+                value_quantity=resolved_projection_value,
+                render_mode=resolved_render_mode,
+            ),
+            fontsize=style.title_font_size,
+            pad=style.title_pad if title_pad is None else float(title_pad),
+        )
+        ax.tick_params(axis="both", labelsize=style.tick_font_size)
+        resolved_tick_params, tick_axis_hint, minor_ticks_mode = _extract_tick_controls(
+            tick_params_kwargs
+        )
+        if minor_ticks_mode == "on":
+            ax.minorticks_on()
+        elif minor_ticks_mode == "off":
+            ax.minorticks_off()
+        if resolved_tick_params:
+            ax.tick_params(**resolved_tick_params)
+        x_ticks_visible, y_ticks_visible = _resolve_tick_visibility(
+            tick_params_kwargs,
+            ticks_visible,
+            tick_axis_hint,
+        )
+        if not x_ticks_visible:
+            ax.tick_params(axis="x", which="both", bottom=False, top=False, labelbottom=False)
+        if not y_ticks_visible:
+            ax.tick_params(axis="y", which="both", left=False, right=False, labelleft=False)
+        if x_tick_rotation is not None:
+            ax.tick_params(axis="x", rotation=float(x_tick_rotation))
+        if y_tick_rotation is not None:
+            ax.tick_params(axis="y", rotation=float(y_tick_rotation))
+        if style.grid:
+            resolved_grid_kwargs: dict[str, Any] = {
+                "linestyle": style.grid_linestyle,
+                "linewidth": style.grid_linewidth,
+                "alpha": style.grid_alpha,
+            }
+            if grid_kwargs is not None:
+                resolved_grid_kwargs.update(dict(grid_kwargs))
+            ax.grid(True, **resolved_grid_kwargs)
+        elif grid_kwargs is not None:
+            ax.grid(**dict(grid_kwargs))
+        ax.set_xscale(x_scale)
+        ax.set_yscale(y_scale)
+        if x_ticks is not None:
+            ax.set_xticks([float(value) for value in x_ticks])
+        if y_ticks is not None:
+            ax.set_yticks([float(value) for value in y_ticks])
+        effective_x_lim = default_projection_x_lim if x_lim is None else x_lim
+        effective_y_lim = default_projection_y_lim if y_lim is None else y_lim
+        if effective_x_lim is not None:
+            ax.set_xlim(
+                left=None if effective_x_lim[0] is None else float(effective_x_lim[0]),
+                right=None if effective_x_lim[1] is None else float(effective_x_lim[1]),
+            )
+        if effective_y_lim is not None:
+            ax.set_ylim(
+                bottom=None if effective_y_lim[0] is None else float(effective_y_lim[0]),
+                top=None if effective_y_lim[1] is None else float(effective_y_lim[1]),
+            )
+        if axes_kwargs is not None:
+            ax.set(**dict(axes_kwargs))
+        annotation_summaries = _render_plot_annotations(ax, annotations)
+        if tight_layout_kwargs is not None:
+            fig.tight_layout(**dict(tight_layout_kwargs))
+        else:
+            fig.tight_layout()
+
+        if capture_state is not None:
+            capture_state.clear()
+            capture_state.update(
+                {
+                    "figure": fig,
+                    "axes": ax,
+                    "title": str(ax.get_title()),
+                    "title_visible": bool(
+                        ax.title.get_visible() and bool(str(ax.get_title()).strip())
+                    ),
+                    "x_label": str(ax.get_xlabel()),
+                    "y_label": str(ax.get_ylabel()),
+                    "x_scale": str(ax.get_xscale()),
+                    "y_scale": str(ax.get_yscale()),
+                    "x_lim": [float(value) for value in ax.get_xlim()],
+                    "y_lim": [float(value) for value in ax.get_ylim()],
+                    "x_ticks": [float(value) for value in ax.get_xticks()],
+                    "y_ticks": [float(value) for value in ax.get_yticks()],
+                    "legend": bool(ax.get_legend() is not None),
+                    "legend_title": (
+                        None
+                        if ax.get_legend() is None or ax.get_legend().get_title() is None
+                        else str(ax.get_legend().get_title().get_text())
+                    ),
+                    "legend_loc": legend_loc,
+                    "annotations_summary": annotation_summaries,
+                    "projection_x": resolved_projection_x,
+                    "projection_y": resolved_projection_y,
+                    "projection_value": resolved_projection_value,
+                    "projection_render_mode": resolved_render_mode,
+                }
+            )
+
+        output_path = None
+        if output is not None:
+            output_path = Path(output).expanduser().resolve()
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            save_kwargs: dict[str, Any] = {}
+            if savefig_kwargs is not None:
+                save_kwargs.update(dict(savefig_kwargs))
+            save_kwargs.setdefault("dpi", style.dpi)
+            fig.savefig(output_path, **save_kwargs)
+            if not suppress_output_log:
+                LOGGER.info("Saved plot to '%s'.", output_path)
+        if show:
+            plt.show(block=show_blocking)
+            if not show_blocking:
+                plt.pause(0.001)
+        if not (show and not show_blocking):
+            plt.close(fig)
+        return output_path
+
+
 def plot_position_profile(
     profile: PositionProfile,
     output: str | Path | None = None,
@@ -1205,6 +2032,7 @@ def plot_position_profile(
     y_label_font_size: int | None = None,
     x_label_pad: float | None = None,
     y_label_pad: float | None = None,
+    title_pad: float | None = None,
     x_axis_scale: float | None = None,
     x_axis_offset: float | None = None,
     title_visible: bool | None = None,
@@ -1246,10 +2074,17 @@ def plot_position_profile(
     tick_params_kwargs: dict[str, Any] | None = None,
     tight_layout_kwargs: dict[str, Any] | None = None,
     savefig_kwargs: dict[str, Any] | None = None,
+    projection_x: str | None = None,
+    projection_y: str | None = None,
+    projection_value: str | None = None,
+    projection_render_mode: str | None = None,
+    projection_filter_min: float | None = None,
+    projection_filter_max: float | None = None,
+    xy_z_distance_max: float | None = None,
 ) -> Path | None:
     """Plot one atom-resolved position profile."""
     normalized_component = _normalize_component_token(component)
-    if normalized_component == "xy-z":
+    if normalized_component == _POSITION_PROJECTION_COMPONENT:
         return _plot_position_xy_z_projection(
             [profile],
             map_color=map_color,
@@ -1273,17 +2108,26 @@ def plot_position_profile(
             y_label_font_size=y_label_font_size,
             x_label_pad=x_label_pad,
             y_label_pad=y_label_pad,
+            title_pad=title_pad,
             title_visible=title_visible,
             ticks_visible=ticks_visible,
             line_colors=line_colors,
             series_enabled=series_enabled,
+            series_show_in_legend=series_show_in_legend,
             series_line_widths=series_line_widths,
             series_markers=series_markers,
+            render_series_descriptors=render_series_descriptors,
+            series_overrides_by_id=series_overrides_by_id,
+            series_line_kwargs=series_line_kwargs,
             series_normalization_modes=series_normalization_modes,
             series_normalization_values=series_normalization_values,
             series_normalization_x_refs=series_normalization_x_refs,
             x_bin_width=x_bin_width,
             x_bin_reducer=x_bin_reducer,
+            legend=legend,
+            legend_title=legend_title,
+            legend_loc=legend_loc,
+            legend_kwargs=legend_kwargs,
             annotations=annotations,
             capture_state=capture_state,
             suppress_output_log=suppress_output_log,
@@ -1295,6 +2139,14 @@ def plot_position_profile(
             tick_params_kwargs=tick_params_kwargs,
             tight_layout_kwargs=tight_layout_kwargs,
             savefig_kwargs=savefig_kwargs,
+            component=component,
+            projection_x=projection_x,
+            projection_y=projection_y,
+            projection_value=projection_value,
+            projection_render_mode=projection_render_mode,
+            projection_filter_min=projection_filter_min,
+            projection_filter_max=projection_filter_max,
+            xy_z_distance_max=xy_z_distance_max,
         )
 
     x_values, default_x_label = _position_time_data(profile, time_axis=time_axis)
@@ -1365,6 +2217,7 @@ def plot_position_profile(
             y_label_font_size=y_label_font_size,
             x_label_pad=x_label_pad,
             y_label_pad=y_label_pad,
+            title_pad=title_pad,
             title_visible=title_visible,
             ticks_visible=ticks_visible,
             markers=markers,
@@ -1430,6 +2283,7 @@ def plot_position_profile(
         y_label_font_size=y_label_font_size,
         x_label_pad=x_label_pad,
         y_label_pad=y_label_pad,
+        title_pad=title_pad,
         x_axis_scale=x_axis_scale,
         x_axis_offset=x_axis_offset,
         title_visible=title_visible,
@@ -1477,6 +2331,7 @@ def plot_position_profiles(
     y_label_font_size: int | None = None,
     x_label_pad: float | None = None,
     y_label_pad: float | None = None,
+    title_pad: float | None = None,
     x_axis_scale: float | None = None,
     x_axis_offset: float | None = None,
     title_visible: bool | None = None,
@@ -1517,12 +2372,19 @@ def plot_position_profiles(
     tick_params_kwargs: dict[str, Any] | None = None,
     tight_layout_kwargs: dict[str, Any] | None = None,
     savefig_kwargs: dict[str, Any] | None = None,
+    projection_x: str | None = None,
+    projection_y: str | None = None,
+    projection_value: str | None = None,
+    projection_render_mode: str | None = None,
+    projection_filter_min: float | None = None,
+    projection_filter_max: float | None = None,
+    xy_z_distance_max: float | None = None,
 ) -> Path | None:
     """Plot one or more atom-resolved position profiles."""
     if not profiles:
         raise ValueError("At least one position profile is required.")
     normalized_component = _normalize_component_token(component)
-    if normalized_component == "xy-z":
+    if normalized_component == _POSITION_PROJECTION_COMPONENT:
         return _plot_position_xy_z_projection(
             profiles,
             map_color=map_color,
@@ -1546,17 +2408,26 @@ def plot_position_profiles(
             y_label_font_size=y_label_font_size,
             x_label_pad=x_label_pad,
             y_label_pad=y_label_pad,
+            title_pad=title_pad,
             title_visible=title_visible,
             ticks_visible=ticks_visible,
             line_colors=line_colors,
             series_enabled=series_enabled,
+            series_show_in_legend=series_show_in_legend,
             series_line_widths=series_line_widths,
             series_markers=series_markers,
+            render_series_descriptors=render_series_descriptors,
+            series_overrides_by_id=series_overrides_by_id,
+            series_line_kwargs=series_line_kwargs,
             series_normalization_modes=series_normalization_modes,
             series_normalization_values=series_normalization_values,
             series_normalization_x_refs=series_normalization_x_refs,
             x_bin_width=x_bin_width,
             x_bin_reducer=x_bin_reducer,
+            legend=legend,
+            legend_title=legend_title,
+            legend_loc=legend_loc,
+            legend_kwargs=legend_kwargs,
             annotations=annotations,
             capture_state=capture_state,
             suppress_output_log=suppress_output_log,
@@ -1568,10 +2439,21 @@ def plot_position_profiles(
             tick_params_kwargs=tick_params_kwargs,
             tight_layout_kwargs=tight_layout_kwargs,
             savefig_kwargs=savefig_kwargs,
+            component=component,
+            projection_x=projection_x,
+            projection_y=projection_y,
+            projection_value=projection_value,
+            projection_render_mode=projection_render_mode,
+            projection_filter_min=projection_filter_min,
+            projection_filter_max=projection_filter_max,
+            xy_z_distance_max=xy_z_distance_max,
         )
 
-    use_gui_render_layers = bool(render_series_descriptors) or bool(series_overrides_by_id)
-    if len(profiles) == 1 and not use_gui_render_layers:
+    if not use_multi_series_plot(
+        profile_count=len(profiles),
+        render_series_descriptors=render_series_descriptors,
+        series_overrides_by_id=series_overrides_by_id,
+    ):
         return plot_position_profile(
             profiles[0],
             output=output,
@@ -1581,6 +2463,13 @@ def plot_position_profiles(
             style=style,
             component=normalized_component,
             map_color=map_color,
+            projection_x=projection_x,
+            projection_y=projection_y,
+            projection_value=projection_value,
+            projection_render_mode=projection_render_mode,
+            projection_filter_min=projection_filter_min,
+            projection_filter_max=projection_filter_max,
+            xy_z_distance_max=xy_z_distance_max,
             time_axis=time_axis,
             title=title,
             x_label=x_label,
@@ -1597,6 +2486,7 @@ def plot_position_profiles(
             y_label_font_size=y_label_font_size,
             x_label_pad=x_label_pad,
             y_label_pad=y_label_pad,
+            title_pad=title_pad,
             x_axis_scale=x_axis_scale,
             x_axis_offset=x_axis_offset,
             title_visible=title_visible,
@@ -1709,6 +2599,7 @@ def plot_position_profiles(
         y_label_font_size=y_label_font_size,
         x_label_pad=x_label_pad,
         y_label_pad=y_label_pad,
+        title_pad=title_pad,
         x_axis_scale=x_axis_scale,
         x_axis_offset=x_axis_offset,
         title_visible=title_visible,

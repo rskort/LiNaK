@@ -128,7 +128,7 @@ The position analysis is the shared atom-tracking backbone for several other
 features:
 
 - direct time-vs-position plotting
-- XY path visualization
+- configurable 2D trajectory projection plotting
 - coordination as a function of time and distance to surface
 
 In particular, the coordination workflow reuses the atom tracking and
@@ -141,6 +141,25 @@ surface-distance logic produced here.
   systems or long trajectories.
 - `distance_to_surface_A` must be interpreted together with `coordinate_mode`.
 - Surface-aware output quality depends on the success of the surface estimator.
+
+## Plotting Notes
+
+The stored position profile can be plotted in two broad ways:
+
+- 1D time-based components such as `distance`, `x`, `y`, and `z`
+- `2d-projection` (legacy alias: `xy-z`)
+
+The 2D projection plot is a plot-only view built from the stored matrices. It
+does not change the HDF5 data model. The projection view lets the user choose:
+
+- which stored quantity is used on the X axis
+- which stored quantity is used on the Y axis
+- which quantity drives the colormap or value filter
+- whether rendering uses one colormap-driven overlay (`color-scale`) or one
+  normal layer per tracked atom (`line-colors`)
+
+Projection value filters are pointwise masks on the chosen value quantity.
+Hidden points do not get bridged by artificial connector lines.
 
 ## Related Documentation
 

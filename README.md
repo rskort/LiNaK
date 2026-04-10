@@ -45,10 +45,14 @@ pip install -e .[dev]
 The recommended workflow for repeated analysis is to convert a raw trajectory
 first. `linak apply convert` writes a `*.traj.h5` file that embeds cell,
 timestep, fixed-atom, and surface-cache metadata so all later `linak compute`
-commands can run faster and without re-reading the original text file:
+commands can run faster and without re-reading the original text file. 
+
+When working on **an HPC cluster**, it is recommended to convert the trajectory 
+on the cluster first and then copy the much smaller HDF5 file back to the local 
+machine for fast iteration with `linak compute` and `linak plot`.
 
 ```bash
-linak apply convert traj.xyz --input input.inp
+linak apply convert traj.xyz
 linak compute density traj.traj.h5
 linak compute msd traj.traj.h5 --species O
 linak compute rdf traj.traj.h5 --species-a O --species-b H
@@ -86,6 +90,11 @@ Method documentation for the compute analyses lives under
 [`docs/`](docs/README.md). Those notes explain
 what each analysis actually computes, which assumptions are made, and what is
 written into the HDF5 output.
+
+Internally, the analysis layer now uses shared helper modules for common
+analysis plumbing and surface estimation:
+- `src/linak/analysis/common.py` for reusable species, cell, and HDF5 helpers
+- `src/linak/analysis/surface.py` for the shared surface-reference estimator
 
 
 Python API example:
@@ -355,10 +364,14 @@ Surface handling for position uses the same logic as density (`--surface-mode`, 
 Position plotting components:
 - `--component distance` (default): distance to detected surface vs time
 - `--component x|y|z`: Cartesian coordinate vs time
-- `--component xy-z`: XY trajectory with colormap along the path
-  - default colormap source is distance-to-surface (`--map-color distance`)
-  - use `--map-color z` for raw Z-coordinate coloring
-  - default axes limits use cell dimensions (`x: 0..A`, `y: 0..B`) when cell data is available
+- `--component 2d-projection` (legacy alias: `xy-z`): configurable 2D trajectory projection
+  - choose projection axes with `--projection-x` and `--projection-y`
+  - choose the value used for colormap/filtering with `--projection-value`
+  - choose `--projection-render-mode color-scale` for one colormap-driven trajectory overlay
+  - choose `--projection-render-mode line-colors` for one normal layer per atom with per-layer styling
+  - limit the visible data with `--projection-filter-min` and `--projection-filter-max`
+  - legacy `--map-color` and `--xy-z-distance-max` still work as compatibility shims
+  - default axes limits use cell dimensions (`x: 0..A`, `y: 0..B`) for legacy `xy-z` when cell data is available
   - PBC boundary jumps are rendered without artificial cross-box connector lines
 
 ### Potential
@@ -416,11 +429,27 @@ installed. Use:
 
 The easiest, and recommended method to change plot styles is to use the interactive controls in Plot Studio. For more advanced users, or when using `--no-gui`, LiNaK supports a wide range of CLI options to customize plot styles and settings.
 
+`linak plot <analysis-file>.h5 -h` is also analysis-aware: when the input HDF5
+cleanly resolves to one LiNaK analysis, the help view shows the shared plot
+options plus only that analysis' option group. Plain `linak plot --help`
+remains the full generic help view.
+
 When multiple LiNaK HDF5 sources are plotted together, LiNaK combines the data
 into a temporary or saved combined HDF5 and starts from default plot settings
 rather than inheriting saved plot profiles from one input file.
 
-For position plots specifically, `--time-section-width` can be used to aggregate points into larger time sections for display (plot-only, source HDF5 unchanged). This applies to time-axis components (`distance`, `x`, `y`, `z`); `xy-z` ignores time sectioning.
+For position plots specifically, `--time-section-width` can be used to
+aggregate points into larger time sections for display (plot-only, source HDF5
+unchanged). This applies to time-axis components (`distance`, `x`, `y`, `z`);
+`2d-projection` ignores time sectioning.
+
+For very large interactive position plots, LiNaK applies a GUI complexity guard
+before opening the Studio. The most practical ways to reduce the interactive
+load are:
+- switch to `--component 2d-projection`
+- narrow the visible projection values with `--projection-filter-min` / `--projection-filter-max`
+- use `--no-gui` for direct non-interactive rendering
+- use `--force-gui` only when you explicitly want to bypass the guard
 
 Shared style controls include:
 - `--figsize WIDTH HEIGHT`

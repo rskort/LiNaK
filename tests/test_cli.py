@@ -1,5 +1,6 @@
 import argparse
 from copy import deepcopy
+import logging
 from pathlib import Path
 
 import h5py
@@ -36,6 +37,7 @@ from linak.analysis.density import (
     save_density_profile,
 )
 from linak.analysis.position import (
+    PositionProfile,
     compute_position_profile,
     load_position_profile,
     load_position_profiles_by_index,
@@ -239,6 +241,40 @@ def _write_position_hdf5(path: Path) -> None:
         timestep_fs=2.0,
         surface_mode="rough",
         surface_elements=["Pt"],
+    )
+    save_position_profile(profile, path)
+
+
+def _write_large_position_hdf5(path: Path, *, n_atoms: int, n_frames: int = 3) -> None:
+    frame_index = np.arange(n_frames, dtype=int)
+    step = np.arange(n_frames, dtype=float)
+    time_fs = np.arange(n_frames, dtype=float) * 1000.0
+    time_ps = time_fs / 1000.0
+    atom_indices = np.arange(n_atoms, dtype=int)
+    x = np.tile(np.linspace(0.0, 1.0, n_frames, dtype=float).reshape(-1, 1), (1, n_atoms))
+    y = np.tile(np.linspace(0.5, 1.5, n_frames, dtype=float).reshape(-1, 1), (1, n_atoms))
+    z = np.tile(np.linspace(1.0, 2.0, n_frames, dtype=float).reshape(-1, 1), (1, n_atoms))
+    distance = np.tile(np.linspace(2.0, 3.0, n_frames, dtype=float).reshape(-1, 1), (1, n_atoms))
+    profile = PositionProfile(
+        species="H",
+        axis="z",
+        atom_indices=atom_indices,
+        frame_index=frame_index,
+        step=step,
+        time_fs=time_fs,
+        time_ps=time_ps,
+        x=x,
+        y=y,
+        z=z,
+        distance_to_surface=distance,
+        n_frames=n_frames,
+        n_atoms=n_atoms,
+        coordinate_mode="distance",
+        surface_position=0.0,
+        surface_position_std=0.0,
+        surface_position_per_frame=np.zeros(n_frames, dtype=float),
+        surface_estimate=None,
+        cell_lengths_angstrom=(10.0, 10.0, 10.0),
     )
     save_position_profile(profile, path)
 
@@ -1754,6 +1790,102 @@ def test_plot_help_lists_analysis_and_style_options(capsys):
     assert "--title-font-size" in out
 
 
+def test_plot_density_source_help_is_analysis_specific(tmp_path, capsys):
+    source = tmp_path / "density.h5"
+    _write_density_hdf5(source)
+
+    rc = main(["--log-level", "ERROR", "plot", str(source), "--help"])
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "Detected analysis from input: density" in out
+    assert "--x-mode" in out
+    assert "--quantity" in out
+    assert "--component" not in out
+    assert "--projection-x" not in out
+
+
+def test_plot_position_source_help_is_analysis_specific(tmp_path, capsys):
+    source = tmp_path / "position.h5"
+    _write_position_hdf5(source)
+
+    rc = main(["--log-level", "ERROR", "plot", str(source), "--help"])
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "Detected analysis from input: position" in out
+    assert "--component" in out
+    assert "--projection-x" in out
+    assert "--time-axis" in out
+    assert "--x-mode" not in out
+    assert "--quantity" not in out
+
+
+def test_plot_help_with_files_uses_uniform_detected_analysis(tmp_path, capsys):
+    source_a = tmp_path / "density_a.h5"
+    source_b = tmp_path / "density_b.h5"
+    _write_density_hdf5(source_a)
+    _write_density_hdf5(source_b)
+
+    rc = main(["--log-level", "ERROR", "plot", "-f", str(source_a), str(source_b), "--help"])
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "Detected analysis from input: density" in out
+    assert "--x-mode" in out
+    assert "--component" not in out
+
+
+def test_plot_help_with_mixed_sources_falls_back_to_generic_help(tmp_path, capsys):
+    density_source = tmp_path / "density.h5"
+    position_source = tmp_path / "position.h5"
+    _write_density_hdf5(density_source)
+    _write_position_hdf5(position_source)
+
+    rc = main(
+        [
+            "--log-level",
+            "ERROR",
+            "plot",
+            "-f",
+            str(density_source),
+            str(position_source),
+            "--help",
+        ]
+    )
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "Detected analysis from input:" not in out
+    assert "--x-mode" in out
+    assert "--component" in out
+
+
+def test_plot_help_for_generic_hdf5_falls_back_to_generic_help(tmp_path, capsys):
+    source = tmp_path / "generic.h5"
+    _write_simple_hdf5(source)
+
+    rc = main(["--log-level", "ERROR", "plot", str(source), "--help"])
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "Detected analysis from input:" not in out
+    assert "--x-mode" in out
+    assert "--component" in out
+
+
+def test_plot_help_for_missing_hdf5_falls_back_to_generic_help(tmp_path, capsys):
+    source = tmp_path / "missing.h5"
+
+    rc = main(["--log-level", "ERROR", "plot", str(source), "--help"])
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "Detected analysis from input:" not in out
+    assert "--x-mode" in out
+    assert "--component" in out
+
+
 @pytest.mark.parametrize("token", ["density", "position"])
 def test_plot_analysis_name_tokens_are_not_subcommands(tmp_path, capsys, token):
     source = tmp_path / "density.h5"
@@ -1799,6 +1931,37 @@ def test_plot_position_accepts_xy_z_component():
     args = build_parser().parse_args(["plot", "input.h5", "--component", "xy-z"])
     assert args.component == "xy-z"
     assert args.map_color == "distance"
+
+
+def test_plot_position_accepts_public_2d_projection_arguments():
+    args = build_parser().parse_args(
+        [
+            "plot",
+            "input.h5",
+            "--component",
+            "2d-projection",
+            "--projection-x",
+            "x",
+            "--projection-y",
+            "distance",
+            "--projection-value",
+            "y",
+            "--projection-render-mode",
+            "line-colors",
+            "--projection-filter-min",
+            "4.0",
+            "--projection-filter-max",
+            "6.0",
+        ]
+    )
+
+    assert args.component == "2d-projection"
+    assert args.projection_x == "x"
+    assert args.projection_y == "distance"
+    assert args.projection_value == "y"
+    assert args.projection_render_mode == "line-colors"
+    assert args.projection_filter_min == pytest.approx(4.0)
+    assert args.projection_filter_max == pytest.approx(6.0)
 
 
 def test_plot_position_accepts_xy_z_map_color_override():
@@ -2505,6 +2668,238 @@ def test_apply_gui_settings_to_args_forwards_annotations_without_declared_cli_at
     cli_mod._apply_gui_settings_to_args(args, settings)
 
     assert getattr(args, "annotations", None) == settings["annotations"]
+
+
+def test_apply_gui_settings_to_args_forwards_legend_kwargs_without_declared_cli_attr():
+    args = argparse.Namespace(title="Example")
+    settings = {"legend_kwargs": {"frameon": False, "ncols": 2}}
+
+    cli_mod._apply_gui_settings_to_args(args, settings)
+
+    assert getattr(args, "legend_kwargs", None) == settings["legend_kwargs"]
+
+
+def test_apply_gui_settings_to_args_forwards_heatmap_and_padding_without_declared_cli_attr():
+    args = argparse.Namespace(title="Example")
+    settings = {
+        "x_label_pad": 7.5,
+        "heatmap_vmin": 0.1,
+        "heatmap_vmax": 2.0,
+        "heatmap_cmap": "viridis",
+        "heatmap_colorbar_enabled": False,
+    }
+
+    cli_mod._apply_gui_settings_to_args(args, settings)
+
+    assert getattr(args, "x_label_pad", None) == 7.5
+    assert getattr(args, "heatmap_vmin", None) == 0.1
+    assert getattr(args, "heatmap_vmax", None) == 2.0
+    assert getattr(args, "heatmap_cmap", None) == "viridis"
+    assert getattr(args, "heatmap_colorbar_enabled", None) is False
+
+
+def test_apply_gui_settings_to_args_preserves_gui_manual_axis_limits():
+    args = argparse.Namespace(
+        x_min=1.0,
+        x_max=2.0,
+        y_min=3.0,
+        y_max=4.0,
+        x_lim=[1.0, 2.0],
+        y_lim=[3.0, 4.0],
+    )
+    settings = {"x_lim": [5.0, 6.0], "y_lim": [7.0, 8.0]}
+
+    cli_mod._apply_gui_settings_to_args(args, settings)
+
+    assert args.x_min is None
+    assert args.x_max is None
+    assert args.y_min is None
+    assert args.y_max is None
+    assert args.x_lim == [5.0, 6.0]
+    assert args.y_lim == [7.0, 8.0]
+
+
+def test_apply_gui_settings_to_args_clears_stale_saved_axis_limits_for_auto_mode():
+    args = argparse.Namespace(
+        x_min=1.0,
+        x_max=2.0,
+        y_min=3.0,
+        y_max=4.0,
+        x_lim=[1.0, 2.0],
+        y_lim=[3.0, 4.0],
+    )
+    settings = {
+        "title": "Auto axes",
+        "x_min": None,
+        "x_max": None,
+        "y_min": None,
+        "y_max": None,
+    }
+
+    cli_mod._apply_gui_settings_to_args(args, settings)
+
+    assert args.x_min is None
+    assert args.x_max is None
+    assert args.y_min is None
+    assert args.y_max is None
+    assert args.x_lim is None
+    assert args.y_lim is None
+
+
+def test_collect_plot_settings_for_persistence_drops_stale_auto_axis_limits():
+    args = argparse.Namespace(
+        x_min=1.0,
+        x_max=2.0,
+        y_min=3.0,
+        y_max=4.0,
+        x_lim=[1.0, 2.0],
+        y_lim=[3.0, 4.0],
+    )
+
+    cli_mod._apply_gui_settings_to_args(
+        args,
+        {
+            "title": "Auto axes",
+            "x_min": None,
+            "x_max": None,
+            "y_min": None,
+            "y_max": None,
+        },
+    )
+    persisted = cli_mod._collect_plot_settings_for_persistence(
+        args,
+        keys=("x_lim", "y_lim"),
+    )
+
+    assert persisted["x_lim"] is None
+    assert persisted["y_lim"] is None
+
+
+def test_apply_gui_settings_to_args_auto_axis_fields_clear_stale_limits_with_gui_shape():
+    args = argparse.Namespace(
+        x_min=None,
+        x_max=None,
+        y_min=None,
+        y_max=None,
+        x_lim=[10.0, 20.0],
+        y_lim=[30.0, 40.0],
+    )
+
+    cli_mod._apply_gui_settings_to_args(
+        args,
+        {
+            "x_min": None,
+            "x_max": None,
+            "y_min": None,
+            "y_max": None,
+            "_gui_sync_modes": {"x_lim": "auto", "y_lim": "auto"},
+        },
+    )
+
+    assert args.x_lim is None
+    assert args.y_lim is None
+
+
+def test_apply_gui_settings_to_args_forwards_position_xy_z_distance_max():
+    args = argparse.Namespace(title="Example")
+    settings = {"xy_z_distance_max": 2.5}
+
+    cli_mod._apply_gui_settings_to_args(args, settings)
+
+    assert getattr(args, "xy_z_distance_max", None) == 2.5
+
+
+def test_apply_gui_settings_to_args_forwards_position_projection_settings():
+    args = argparse.Namespace(title="Example")
+    settings = {
+        "projection_x": "x",
+        "projection_y": "distance",
+        "projection_value": "y",
+        "projection_render_mode": "line-colors",
+        "projection_filter_min": 4.0,
+        "projection_filter_max": 6.0,
+    }
+
+    cli_mod._apply_gui_settings_to_args(args, settings)
+
+    assert getattr(args, "projection_x", None) == "x"
+    assert getattr(args, "projection_y", None) == "distance"
+    assert getattr(args, "projection_value", None) == "y"
+    assert getattr(args, "projection_render_mode", None) == "line-colors"
+    assert getattr(args, "projection_filter_min", None) == pytest.approx(4.0)
+    assert getattr(args, "projection_filter_max", None) == pytest.approx(6.0)
+
+
+def test_merge_preview_defaults_into_gui_settings_preserves_manual_synced_fields():
+    settings = {
+        "x_lim": [10.0, 20.0],
+        "x_label_pad": 6.0,
+        "_gui_sync_modes": {"x_lim": "manual", "x_label_pad": "manual"},
+    }
+    preview_state = {
+        "x_lim": [0.0, 2.0],
+        "x_label_pad": 14.0,
+        "y_lim": [1.0, 3.0],
+    }
+
+    merged = cli_mod._merge_preview_defaults_into_gui_settings(settings, preview_state)
+
+    assert merged["x_lim"] == [10.0, 20.0]
+    assert merged["x_label_pad"] == 6.0
+    assert merged["y_lim"] == [1.0, 3.0]
+
+
+def test_merge_preview_defaults_into_gui_settings_does_not_touch_series_overrides():
+    settings = {
+        "series_overrides": {
+            "series:0": {
+                "normalization_mode": "max",
+                "normalization_value": 1.0,
+            }
+        }
+    }
+    preview_state = {
+        "series_overrides": {
+            "series:0": {
+                "normalization_mode": "none",
+            }
+        },
+        "x_lim": [0.0, 2.0],
+    }
+
+    merged = cli_mod._merge_preview_defaults_into_gui_settings(settings, preview_state)
+
+    assert merged["series_overrides"]["series:0"]["normalization_mode"] == "max"
+    assert merged["series_overrides"]["series:0"]["normalization_value"] == 1.0
+    assert merged["x_lim"] == [0.0, 2.0]
+
+
+def test_materialize_gui_series_overrides_promotes_legacy_normalization_lists():
+    settings = {
+        "series_descriptors": [
+            {"series_id": "series:0", "default_label": "A"},
+            {"series_id": "series:1", "default_label": "B"},
+        ],
+        "series_overrides": {
+            "series:1": {
+                "normalization_mode": "factor",
+                "normalization_value": 2.0,
+            }
+        },
+        "series_normalization_modes": ["max", None],
+        "series_normalization_values": [1.0, None],
+        "series_normalization_x_refs": [None, None],
+    }
+
+    materialized = cli_mod._materialize_gui_series_overrides(settings)
+
+    assert "series_normalization_modes" not in materialized
+    assert "series_normalization_values" not in materialized
+    assert "series_normalization_x_refs" not in materialized
+    assert materialized["series_overrides"]["series:0"]["normalization_mode"] == "max"
+    assert materialized["series_overrides"]["series:0"]["normalization_value"] == 1.0
+    assert materialized["series_overrides"]["series:1"]["normalization_mode"] == "factor"
+    assert materialized["series_overrides"]["series:1"]["normalization_value"] == 2.0
 
 
 def test_build_gui_series_descriptors_use_origin_paths_for_metadata_and_grouping():
@@ -4002,6 +4397,137 @@ def test_plot_density_gui_reopen_preserves_enabled_fit_settings(tmp_path, monkey
     assert preview_calls["count"] == 1
 
 
+def test_plot_density_gui_reopen_preserves_normalization_settings(tmp_path, monkeypatch):
+    frame = Atoms(
+        "OO",
+        positions=[[0.0, 0.0, 0.10], [0.0, 0.0, 1.10]],
+        cell=[10.0, 10.0, 10.0],
+        pbc=True,
+    )
+    profile = compute_density_profile([frame], species="O", axis="z", bin_width=1.0)
+    source_h5 = tmp_path / "density.h5"
+    save_density_profile(profile, source_h5)
+
+    launches: list[dict[str, object]] = []
+
+    def _fake_gui_launcher(**kwargs):
+        launches.append(deepcopy(kwargs["initial_settings"]))
+        if len(launches) == 1:
+            initial_settings = deepcopy(kwargs["initial_settings"])
+            first_series_id = initial_settings["series_descriptors"][0]["series_id"]
+            initial_settings["series_overrides"] = {
+                first_series_id: {
+                    "normalization_mode": "max",
+                    "normalization_value": 1.0,
+                }
+            }
+            kwargs["on_save"]("Default", initial_settings)
+
+    monkeypatch.setattr("linak.cli._open_plot_settings_gui", _fake_gui_launcher)
+
+    rc_first = main(
+        [
+            "--log-level",
+            "ERROR",
+            "plot",
+            str(source_h5),
+            "--gui",
+        ]
+    )
+    rc_second = main(
+        [
+            "--log-level",
+            "ERROR",
+            "plot",
+            str(source_h5),
+            "--gui",
+        ]
+    )
+
+    assert rc_first == 0
+    assert rc_second == 0
+    assert len(launches) == 2
+    first_series_id = launches[0]["series_descriptors"][0]["series_id"]
+    saved = read_plot_profile(source_h5, "plot:density")
+    assert saved is not None
+    assert saved["series_overrides"][first_series_id]["normalization_mode"] == "max"
+    assert saved["series_overrides"][first_series_id]["normalization_value"] == 1.0
+    assert launches[1]["series_overrides"][first_series_id]["normalization_mode"] == "max"
+    assert launches[1]["series_overrides"][first_series_id]["normalization_value"] == 1.0
+
+
+def test_plot_density_gui_reopen_preserves_normalization_for_all_series(tmp_path, monkeypatch):
+    frame = Atoms(
+        "OO",
+        positions=[[0.0, 0.0, 0.10], [0.0, 0.0, 1.10]],
+        cell=[10.0, 10.0, 10.0],
+        pbc=True,
+    )
+    profile = compute_density_profile([frame], species="O", axis="z", bin_width=1.0)
+    source_h5_a = tmp_path / "source_a_density.h5"
+    source_h5_b = tmp_path / "source_b_density.h5"
+    combined_h5 = tmp_path / "combined_density.h5"
+    save_density_profile(profile, source_h5_a)
+    save_density_profile(profile, source_h5_b)
+    _combine_analysis_hdf5_sources(
+        sources=[str(source_h5_a), str(source_h5_b)],
+        analysis="density",
+        output=combined_h5,
+    )
+
+    launches: list[dict[str, object]] = []
+
+    def _fake_gui_launcher(**kwargs):
+        launches.append(deepcopy(kwargs["initial_settings"]))
+        if len(launches) == 1:
+            initial_settings = deepcopy(kwargs["initial_settings"])
+            overrides: dict[str, dict[str, object]] = {}
+            for descriptor in initial_settings["series_descriptors"]:
+                series_id = descriptor["series_id"]
+                overrides[series_id] = {
+                    "normalization_mode": "max",
+                    "normalization_value": 1.0,
+                }
+            initial_settings["series_overrides"] = overrides
+            kwargs["on_save"]("Default", initial_settings)
+
+    monkeypatch.setattr("linak.cli._open_plot_settings_gui", _fake_gui_launcher)
+
+    rc_first = main(
+        [
+            "--log-level",
+            "ERROR",
+            "plot",
+            str(combined_h5),
+            "--gui",
+        ]
+    )
+    rc_second = main(
+        [
+            "--log-level",
+            "ERROR",
+            "plot",
+            str(combined_h5),
+            "--gui",
+        ]
+    )
+
+    assert rc_first == 0
+    assert rc_second == 0
+    assert len(launches) == 2
+
+    saved = read_plot_profile(combined_h5, "plot:density")
+    assert saved is not None
+    reopened_overrides = launches[1]["series_overrides"]
+    assert isinstance(reopened_overrides, dict)
+    for descriptor in launches[0]["series_descriptors"]:
+        series_id = descriptor["series_id"]
+        assert saved["series_overrides"][series_id]["normalization_mode"] == "max"
+        assert saved["series_overrides"][series_id]["normalization_value"] == 1.0
+        assert reopened_overrides[series_id]["normalization_mode"] == "max"
+        assert reopened_overrides[series_id]["normalization_value"] == 1.0
+
+
 def test_plot_density_gui_lazy_loading_only_reads_enabled_series_and_evicts_cache(
     tmp_path, monkeypatch
 ):
@@ -4499,8 +5025,6 @@ def test_plot_position_multiple_files_overlays_with_source_labels(tmp_path, monk
     assert rc == 0
     assert captured["species"] == [
         f"{source_h5_1.name}:O",
-        f"{source_h5_1.name}:O",
-        f"{source_h5_2.name}:O",
         f"{source_h5_2.name}:O",
     ]
     assert captured["component"] == "xy-z"
@@ -4597,6 +5121,306 @@ def test_plot_position_gui_uses_atom_level_series_in_initial_settings(tmp_path, 
     resolved = resolver(initial)
     assert resolved["series_count"] == 2
     assert resolved["series_labels"] == ["O[2]", "O[3]"]
+
+
+def test_plot_position_gui_refuses_excessive_atom_series(tmp_path):
+    source_h5 = tmp_path / "large_position.h5"
+    _write_large_position_hdf5(source_h5, n_atoms=200, n_frames=3)
+
+    argv = ["plot", str(source_h5), "--gui"]
+    args = build_parser().parse_args(argv)
+    args._runtime_argv = tuple(argv)
+    default_args = deepcopy(args)
+    catalog = cli_mod._build_position_gui_lazy_catalog(args, sources=[str(source_h5)])
+    catalog.default_series_labels = cli_mod._resolve_gui_default_series_labels(
+        args=args,
+        sources=[str(source_h5)],
+        profile_key="plot:position",
+        fallback_labels_by_source=catalog.fallback_labels_by_source,
+    )
+    initial_context = catalog.build_initial_context()
+
+    with pytest.raises(ValueError, match="too large for interactive GUI controls"):
+        cli_mod._launch_profile_plot_gui(
+            args=args,
+            default_args=default_args,
+            source_path=source_h5,
+            profile_key="plot:position",
+            setting_keys=cli_mod._PLOT_SETTINGS_POSITION_KEYS,
+            gui_title="LiNaK Plot Controls: Position",
+            analysis_name="position",
+            plotter=lambda *_args, **_kwargs: None,
+            initial_context=initial_context,
+            build_context=lambda current_args: catalog.build_render_context(current_args),
+            build_full_context=lambda current_args: catalog.build_initial_context(),
+        )
+
+
+def test_plot_position_gui_combined_sources_refuses_after_descriptor_expansion(tmp_path):
+    source_h5_a = tmp_path / "large_a_position.h5"
+    source_h5_b = tmp_path / "large_b_position.h5"
+    _write_large_position_hdf5(source_h5_a, n_atoms=100, n_frames=3)
+    _write_large_position_hdf5(source_h5_b, n_atoms=100, n_frames=3)
+
+    argv = ["plot", "-f", str(source_h5_a), str(source_h5_b), "--gui"]
+    args = build_parser().parse_args(argv)
+    args._runtime_argv = tuple(argv)
+    default_args = deepcopy(args)
+    combined_source = cli_mod._combine_analysis_hdf5_sources(
+        sources=[str(source_h5_a), str(source_h5_b)],
+        analysis="position",
+        output=None,
+    )
+    catalog = cli_mod._build_position_gui_lazy_catalog(args, sources=[str(combined_source)])
+    catalog.default_series_labels = cli_mod._resolve_gui_default_series_labels(
+        args=args,
+        sources=[str(combined_source)],
+        profile_key="plot:position",
+        fallback_labels_by_source=catalog.fallback_labels_by_source,
+    )
+    initial_context = catalog.build_initial_context()
+
+    with pytest.raises(ValueError, match="200 series"):
+        cli_mod._launch_profile_plot_gui(
+            args=args,
+            default_args=default_args,
+            source_path=combined_source,
+            profile_key="plot:position",
+            setting_keys=cli_mod._PLOT_SETTINGS_POSITION_KEYS,
+            gui_title="LiNaK Plot Controls: Position",
+            analysis_name="position",
+            plotter=lambda *_args, **_kwargs: None,
+            initial_context=initial_context,
+            build_context=lambda current_args: catalog.build_render_context(current_args),
+            build_full_context=lambda current_args: catalog.build_initial_context(),
+        )
+
+
+def test_plot_position_gui_uses_saved_projection_filter_before_initial_guard(tmp_path, monkeypatch):
+    source_h5 = tmp_path / "large_position.h5"
+    _write_large_position_hdf5(source_h5, n_atoms=200, n_frames=3)
+
+    write_plot_profile(
+        source_h5,
+        "plot:position",
+        {
+            "component": "2d-projection",
+            "projection_render_mode": "color-scale",
+            "projection_value": "distance",
+            "projection_filter_max": 2.1,
+        },
+    )
+
+    args = cli_mod.build_parser().parse_args(["plot", str(source_h5), "--gui"])
+    args._runtime_argv = ("plot", str(source_h5), "--gui")
+    cli_mod._apply_saved_plot_settings(
+        args=args,
+        source_path=source_h5,
+        profile_key="plot:position",
+        keys=cli_mod._PLOT_SETTINGS_POSITION_KEYS,
+        profile_name=None,
+    )
+    default_args = deepcopy(args)
+    catalog = cli_mod._build_position_gui_lazy_catalog(args, sources=[str(source_h5)])
+    catalog.default_series_labels = cli_mod._resolve_gui_default_series_labels(
+        args=args,
+        sources=[str(source_h5)],
+        profile_key="plot:position",
+        fallback_labels_by_source=catalog.fallback_labels_by_source,
+    )
+    initial_context = catalog.build_initial_context()
+
+    monkeypatch.setattr("linak.cli._render_profile_plot", lambda **_kwargs: (None, {}))
+    monkeypatch.setattr("linak.cli._open_plot_settings_gui", lambda **_kwargs: None)
+
+    cli_mod._launch_profile_plot_gui(
+        args=args,
+        default_args=default_args,
+        source_path=source_h5,
+        profile_key="plot:position",
+        setting_keys=cli_mod._PLOT_SETTINGS_POSITION_KEYS,
+        gui_title="LiNaK Plot Controls: Position",
+        analysis_name="position",
+        plotter=lambda *_args, **_kwargs: None,
+        initial_context=initial_context,
+        build_context=lambda current_args: catalog.build_render_context(current_args),
+        build_full_context=lambda current_args: cli_mod._build_position_gui_lazy_catalog(
+            current_args, sources=[str(source_h5)]
+        ).build_initial_context(),
+    )
+
+
+def test_position_projection_lazy_catalog_uses_filtered_point_count_in_line_colors_mode(
+    tmp_path, caplog
+):
+    source_h5 = tmp_path / "large_position.h5"
+    _write_large_position_hdf5(source_h5, n_atoms=80, n_frames=3)
+
+    args = cli_mod.build_parser().parse_args(
+        [
+            "plot",
+            str(source_h5),
+            "--component",
+            "2d-projection",
+            "--projection-render-mode",
+            "line-colors",
+            "--projection-value",
+            "distance",
+            "--projection-filter-max",
+            "2.1",
+        ]
+    )
+    args._runtime_argv = (
+        "plot",
+        str(source_h5),
+        "--component",
+        "2d-projection",
+        "--projection-render-mode",
+        "line-colors",
+        "--projection-value",
+        "distance",
+        "--projection-filter-max",
+        "2.1",
+    )
+
+    caplog.set_level(logging.DEBUG, logger="linak.cli")
+    catalog = cli_mod._build_position_gui_lazy_catalog(args, sources=[str(source_h5)])
+    context = catalog.build_initial_context()
+
+    assert context.series_count == 80
+    assert context.estimated_total_points == 80
+    assert "position GUI complexity at lazy_catalog" in caplog.text
+    assert "raw_points=240" in caplog.text
+    assert "final_points=80" in caplog.text
+
+
+def test_position_projection_lazy_catalog_uses_filtered_point_count_in_color_scale_render_context(
+    tmp_path, caplog
+):
+    source_h5 = tmp_path / "large_position.h5"
+    _write_large_position_hdf5(source_h5, n_atoms=120, n_frames=10_000)
+
+    args = cli_mod.build_parser().parse_args(
+        [
+            "plot",
+            str(source_h5),
+            "--component",
+            "2d-projection",
+            "--projection-x",
+            "x",
+            "--projection-y",
+            "y",
+            "--projection-value",
+            "distance",
+            "--projection-render-mode",
+            "color-scale",
+            "--projection-filter-max",
+            "2.0",
+        ]
+    )
+    args._runtime_argv = (
+        "plot",
+        str(source_h5),
+        "--component",
+        "2d-projection",
+        "--projection-x",
+        "x",
+        "--projection-y",
+        "y",
+        "--projection-value",
+        "distance",
+        "--projection-render-mode",
+        "color-scale",
+        "--projection-filter-max",
+        "2.0",
+    )
+
+    caplog.set_level(logging.DEBUG, logger="linak.cli")
+    catalog = cli_mod._build_position_gui_lazy_catalog(args, sources=[str(source_h5)])
+    initial_context = catalog.build_initial_context()
+    render_context = catalog.build_render_context(args)
+
+    assert initial_context.series_count == 1
+    assert initial_context.estimated_total_points == 120
+    assert render_context.series_count == 1
+    assert render_context.estimated_total_points == 120
+    assert "position projection guard at lazy_catalog" in caplog.text
+    assert "position projection guard at render_context" in caplog.text
+    assert "filter_max=2.0" in caplog.text
+    assert "raw_candidate_points=1200000" in caplog.text
+    assert "final_visible_points=120" in caplog.text
+
+
+def test_plot_position_gui_uses_cli_projection_filter_before_initial_preview_guard(
+    tmp_path, monkeypatch
+):
+    source_h5 = tmp_path / "large_position.h5"
+    _write_large_position_hdf5(source_h5, n_atoms=120, n_frames=10_000)
+
+    monkeypatch.setattr("linak.cli._render_profile_plot", lambda **_kwargs: (None, {}))
+    monkeypatch.setattr("linak.cli._open_plot_settings_gui", lambda **_kwargs: None)
+
+    rc = main(
+        [
+            "--log-level",
+            "ERROR",
+            "plot",
+            str(source_h5),
+            "--gui",
+            "--component",
+            "2d-projection",
+            "--projection-x",
+            "x",
+            "--projection-y",
+            "y",
+            "--projection-value",
+            "distance",
+            "--projection-render-mode",
+            "color-scale",
+            "--projection-filter-max",
+            "2.0",
+        ]
+    )
+
+    assert rc == 0
+
+
+def test_plot_position_gui_force_gui_bypasses_complexity_guard(tmp_path, monkeypatch):
+    source_h5 = tmp_path / "large_position.h5"
+    _write_large_position_hdf5(source_h5, n_atoms=200, n_frames=3)
+
+    monkeypatch.setattr("linak.cli._open_plot_settings_gui", lambda **_kwargs: None)
+
+    rc = main(
+        [
+            "--log-level",
+            "ERROR",
+            "plot",
+            str(source_h5),
+            "--gui",
+            "--force-gui",
+        ]
+    )
+
+    assert rc == 0
+
+
+def test_plot_position_non_gui_warns_for_excessive_complexity(tmp_path, monkeypatch, caplog):
+    source_h5 = tmp_path / "large_position.h5"
+    _write_large_position_hdf5(source_h5, n_atoms=200, n_frames=3)
+
+    monkeypatch.setattr("linak.cli._render_profile_plot", lambda **_kwargs: (None, {}))
+
+    argv = ["plot", str(source_h5), "--no-show"]
+    args = build_parser().parse_args(argv)
+    args._runtime_argv = tuple(argv)
+
+    caplog.set_level(logging.WARNING, logger="linak.cli")
+    rc = args.handler(args)
+
+    assert rc == 0
+    assert "Position plot is too large for non-GUI plotting" in caplog.text
+    assert "Proceeding anyway" in caplog.text
 
 
 def test_plot_coordination_multiple_files_overlays_with_source_labels(tmp_path, monkeypatch):

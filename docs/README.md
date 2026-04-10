@@ -98,6 +98,12 @@ groups, and annotations are all previewed live and are persisted as part of the
 plot profile. Turning a raw line off hides only that base line; other derived
 overlays for the same enabled layer can still render if they are turned on.
 
+For `position` plots, Studio now exposes the public `2D projection` view rather
+than only the legacy `xy-z` controls. That projection view lets the user choose
+the X quantity, Y quantity, value quantity, render mode (`color-scale` or
+`line-colors`), and optional value filter range. The legacy `xy-z` name is
+still accepted as a compatibility alias in the CLI and saved profiles.
+
 ### Combined HDF5 Files
 
 For combined HDF5 files, LiNaK does not merge the underlying arrays into one
@@ -122,6 +128,7 @@ interpreted.
 
 The current implementations described in this folder are primarily defined in:
 
+- `src/linak/analysis/common.py`
 - `src/linak/analysis/density.py`
 - `src/linak/analysis/msd.py`
 - `src/linak/analysis/position.py`
@@ -129,5 +136,6 @@ The current implementations described in this folder are primarily defined in:
 - `src/linak/analysis/coordination.py`
 - `src/linak/analysis/potential.py`
 - `src/linak/analysis/orientation.py`
+- `src/linak/analysis/surface.py`
 - `src/linak/analysis/water.py`
 - `src/linak/analysis/schema.py`

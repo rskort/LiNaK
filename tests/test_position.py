@@ -416,3 +416,270 @@ def test_plot_position_profile_xy_z_projection_rejects_invalid_map_color():
             map_color="not-a-mode",
             show=False,
         )
+
+
+def test_plot_position_profile_xy_z_respects_private_per_axis_tick_visibility():
+    profile = compute_position_profile(
+        _surface_test_frames(),
+        species="O",
+        axis="z",
+        timestep_fs=2.0,
+        surface_mode="rough",
+        surface_elements=["Pt"],
+    )
+    captured: dict[str, object] = {}
+
+    result = plot_position_profile(
+        profile,
+        component="xy-z",
+        show=False,
+        capture_state=captured,
+        tick_params_kwargs={"_x_ticks_visible": False, "_y_ticks_visible": True},
+    )
+
+    assert result is None
+    assert "x_lim" in captured
+    assert "y_lim" in captured
+
+
+def test_plot_position_profile_xy_z_logs_fixed_line_color_ignore_at_debug_only(caplog):
+    profile = compute_position_profile(
+        _surface_test_frames(),
+        species="O",
+        axis="z",
+        timestep_fs=2.0,
+        surface_mode="rough",
+        surface_elements=["Pt"],
+    )
+
+    with caplog.at_level("DEBUG", logger="linak.analysis.position"):
+        plot_position_profile(
+            profile,
+            component="xy-z",
+            show=False,
+            line_colors=["#ff0000", "#00ff00"],
+        )
+
+    assert any("ignores per-series fixed line colors" in message for message in caplog.messages)
+    assert not any(record.levelname == "WARNING" for record in caplog.records)
+
+
+def test_plot_position_profile_xy_z_distance_cutoff_masks_points_without_bridging_gaps(
+    monkeypatch,
+):
+    profile = PositionProfile(
+        species="H",
+        axis="z",
+        atom_indices=np.array([0]),
+        frame_index=np.array([0, 1, 2]),
+        step=np.array([0.0, 1.0, 2.0]),
+        time_fs=np.array([0.0, 1.0, 2.0]),
+        time_ps=np.array([0.0, 0.001, 0.002]),
+        x=np.array([[0.0], [1.0], [2.0]]),
+        y=np.array([[0.0], [1.0], [2.0]]),
+        z=np.array([[0.1], [0.2], [0.3]]),
+        distance_to_surface=np.array([[1.0], [3.0], [1.5]]),
+        n_frames=3,
+        n_atoms=1,
+        cell_lengths_angstrom=(10.0, 10.0, 10.0),
+    )
+
+    original_builder = _build_xy_segments
+    call_lengths: list[int] = []
+
+    def _capture_runs(x_values, y_values, color_values, *, cell_lengths_xy):
+        call_lengths.append(int(len(x_values)))
+        return original_builder(
+            x_values,
+            y_values,
+            color_values,
+            cell_lengths_xy=cell_lengths_xy,
+        )
+
+    monkeypatch.setattr("linak.analysis.position._build_xy_segments", _capture_runs)
+
+    plot_position_profile(
+        profile,
+        component="xy-z",
+        show=False,
+        xy_z_distance_max=2.0,
+    )
+
+    assert call_lengths == [1, 1]
+
+
+def test_plot_position_profile_xy_z_distance_cutoff_raises_when_all_filtered():
+    profile = PositionProfile(
+        species="H",
+        axis="z",
+        atom_indices=np.array([0]),
+        frame_index=np.array([0, 1]),
+        step=np.array([0.0, 1.0]),
+        time_fs=np.array([0.0, 1.0]),
+        time_ps=np.array([0.0, 0.001]),
+        x=np.array([[0.0], [1.0]]),
+        y=np.array([[0.0], [1.0]]),
+        z=np.array([[0.1], [0.2]]),
+        distance_to_surface=np.array([[3.0], [4.0]]),
+        n_frames=2,
+        n_atoms=1,
+        cell_lengths_angstrom=(10.0, 10.0, 10.0),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="No atom trajectories remain after applying the xy-z distance cutoff.",
+    ):
+        plot_position_profile(
+            profile,
+            component="xy-z",
+            show=False,
+            xy_z_distance_max=2.0,
+        )
+
+
+def test_plot_position_profile_2d_projection_line_colors_uses_per_series_colors():
+    profile = compute_position_profile(
+        _surface_test_frames(),
+        species="O",
+        axis="z",
+        timestep_fs=2.0,
+        surface_mode="rough",
+        surface_elements=["Pt"],
+    )
+    captured: dict[str, object] = {}
+
+    result = plot_position_profile(
+        profile,
+        component="2d-projection",
+        projection_x="x",
+        projection_y="distance",
+        projection_value="y",
+        projection_render_mode="line-colors",
+        line_colors=["#ff0000", "#00ff00"],
+        show=False,
+        capture_state=captured,
+    )
+
+    assert result is None
+    ax = captured["axes"]
+    assert ax.get_legend() is not None
+    assert [line.get_color() for line in ax.lines] == ["#ff0000", "#00ff00"]
+
+
+def test_plot_position_profile_2d_projection_filter_uses_selected_value_quantity():
+    profile = PositionProfile(
+        species="H",
+        axis="z",
+        atom_indices=np.array([0]),
+        frame_index=np.array([0, 1, 2]),
+        step=np.array([0.0, 1.0, 2.0]),
+        time_fs=np.array([0.0, 1.0, 2.0]),
+        time_ps=np.array([0.0, 0.001, 0.002]),
+        x=np.array([[0.0], [1.0], [2.0]]),
+        y=np.array([[4.0], [5.0], [7.0]]),
+        z=np.array([[0.1], [0.2], [0.3]]),
+        distance_to_surface=np.array([[1.0], [1.5], [2.0]]),
+        n_frames=3,
+        n_atoms=1,
+        cell_lengths_angstrom=(10.0, 10.0, 10.0),
+    )
+    captured: dict[str, object] = {}
+
+    plot_position_profile(
+        profile,
+        component="2d-projection",
+        projection_x="x",
+        projection_y="distance",
+        projection_value="y",
+        projection_filter_min=4.5,
+        projection_filter_max=5.5,
+        projection_render_mode="line-colors",
+        show=False,
+        capture_state=captured,
+    )
+
+    ax = captured["axes"]
+    assert len(ax.lines) == 0
+    assert len(ax.collections) == 1
+    offsets = ax.collections[0].get_offsets()
+    assert offsets.shape[0] == 1
+    assert offsets[0, 0] == pytest.approx(1.0)
+    assert offsets[0, 1] == pytest.approx(1.5)
+
+
+def test_plot_position_profiles_2d_projection_line_colors_honors_descriptor_overrides():
+    profile = compute_position_profile(
+        _surface_test_frames(),
+        species="O",
+        axis="z",
+        timestep_fs=2.0,
+        surface_mode="rough",
+        surface_elements=["Pt"],
+    )
+    captured: dict[str, object] = {}
+
+    plot_position_profiles(
+        [profile],
+        component="2d-projection",
+        projection_x="x",
+        projection_y="distance",
+        projection_value="y",
+        projection_render_mode="line-colors",
+        show=False,
+        capture_state=captured,
+        render_series_descriptors=[
+            {
+                "series_id": "atom:0",
+                "source_kind": "source",
+                "source_series_id": "atom:0",
+                "default_label": "O[2]",
+            },
+            {
+                "series_id": "atom:1",
+                "source_kind": "source",
+                "source_series_id": "atom:1",
+                "default_label": "O[3]",
+            },
+        ],
+        series_overrides_by_id={
+            "atom:0": {"enabled": True, "color": "#ff0000", "label_override": "Visible atom"},
+            "atom:1": {"enabled": False},
+        },
+    )
+
+    ax = captured["axes"]
+    assert len(ax.lines) == 1
+    assert ax.lines[0].get_color() == "#ff0000"
+    legend = ax.get_legend()
+    assert legend is not None
+    assert [text.get_text() for text in legend.get_texts()] == ["Visible atom"]
+
+
+def test_plot_position_profile_2d_projection_color_scale_ignores_mismatched_line_colors(caplog):
+    profile = compute_position_profile(
+        _surface_test_frames(),
+        species="O",
+        axis="z",
+        timestep_fs=2.0,
+        surface_mode="rough",
+        surface_elements=["Pt"],
+    )
+
+    with caplog.at_level("DEBUG", logger="linak.analysis.position"):
+        result = plot_position_profile(
+            profile,
+            component="2d-projection",
+            projection_x="x",
+            projection_y="y",
+            projection_value="distance",
+            projection_render_mode="color-scale",
+            line_colors=["#ff0000"],
+            show=False,
+        )
+
+    assert result is None
+    assert any(
+        "ignores per-series fixed line colors in color-scale mode" in message
+        for message in caplog.messages
+    )

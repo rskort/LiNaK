@@ -205,6 +205,104 @@ def test_plot_multi_line_series_applies_per_axis_tick_and_font_color_settings(tm
     assert ax.yaxis.get_major_ticks()[0].tick1line.get_markersize() == pytest.approx(4)
 
 
+def test_plot_multi_line_series_applies_axis_specific_tick_visibility(tmp_path):
+    capture_state: dict[str, object] = {}
+
+    result = plotting_module.plot_multi_line_series(
+        [np.array([0.0, 1.0, 2.0], dtype=float)],
+        [np.array([1.0, 2.0, 3.0], dtype=float)],
+        ["series"],
+        title="Ticks",
+        x_label="x",
+        y_label="y",
+        output=tmp_path / "axis_ticks_visibility.png",
+        show=False,
+        ticks_visible=True,
+        tick_params_kwargs={
+            "_x_ticks_visible": False,
+            "_y_ticks_visible": True,
+            "_ticks_axis": "both",
+            "axis": "both",
+        },
+        capture_state=capture_state,
+    )
+
+    assert result is not None
+    ax = capture_state["axes"]
+    assert ax.xaxis.get_major_ticks()[0].tick1line.get_visible() is False
+    assert ax.xaxis.get_major_ticks()[0].label1.get_visible() is False
+    assert ax.yaxis.get_major_ticks()[0].tick1line.get_visible() is True
+    assert ax.yaxis.get_major_ticks()[0].label1.get_visible() is True
+
+
+def test_plot_multi_line_series_applies_axis_specific_grid_visibility(tmp_path):
+    capture_state_x: dict[str, object] = {}
+    capture_state_y: dict[str, object] = {}
+
+    result_x = plotting_module.plot_multi_line_series(
+        [np.array([0.0, 1.0, 2.0], dtype=float)],
+        [np.array([1.0, 2.0, 3.0], dtype=float)],
+        ["series"],
+        title="Grid X",
+        x_label="x",
+        y_label="y",
+        output=tmp_path / "grid_x.png",
+        show=False,
+        style=plotting_module.with_style_overrides(grid=True),
+        grid_kwargs={"axis": "x", "which": "major"},
+        capture_state=capture_state_x,
+    )
+    result_y = plotting_module.plot_multi_line_series(
+        [np.array([0.0, 1.0, 2.0], dtype=float)],
+        [np.array([1.0, 2.0, 3.0], dtype=float)],
+        ["series"],
+        title="Grid Y",
+        x_label="x",
+        y_label="y",
+        output=tmp_path / "grid_y.png",
+        show=False,
+        style=plotting_module.with_style_overrides(grid=True),
+        grid_kwargs={"axis": "y", "which": "major"},
+        capture_state=capture_state_y,
+    )
+
+    assert result_x is not None
+    assert result_y is not None
+
+    ax_x = capture_state_x["axes"]
+    ax_y = capture_state_y["axes"]
+    assert capture_state_x["grid_kwargs"] == {"axis": "x", "which": "major"}
+    assert capture_state_y["grid_kwargs"] == {"axis": "y", "which": "major"}
+    assert any(line.get_visible() for line in ax_x.get_xgridlines())
+    assert not any(line.get_visible() for line in ax_x.get_ygridlines())
+    assert not any(line.get_visible() for line in ax_y.get_xgridlines())
+    assert any(line.get_visible() for line in ax_y.get_ygridlines())
+
+
+def test_plot_multi_line_series_preserves_legend_title_fontsize_in_capture_state(tmp_path):
+    capture_state: dict[str, object] = {}
+
+    result = plotting_module.plot_multi_line_series(
+        [np.array([0.0, 1.0, 2.0], dtype=float)],
+        [np.array([1.0, 2.0, 3.0], dtype=float)],
+        ["series"],
+        title="Legend",
+        x_label="x",
+        y_label="y",
+        output=tmp_path / "legend_title_font.png",
+        show=False,
+        legend=True,
+        legend_title="Runs",
+        legend_kwargs={"title_fontsize": 17, "ncols": 2, "frameon": False},
+        capture_state=capture_state,
+    )
+
+    assert result is not None
+    assert capture_state["legend_kwargs"]["title_fontsize"] == 17
+    assert capture_state["legend_kwargs"]["ncols"] == 2
+    assert capture_state["legend_kwargs"]["frameon"] is False
+
+
 def test_plot_multi_line_series_integrates_plotted_data_with_boundary_interpolation(tmp_path):
     capture_state: dict[str, object] = {}
 
@@ -311,7 +409,7 @@ def test_plot_multi_line_series_applies_x_axis_scale_and_offset(tmp_path):
     assert capture_state["x_axis_offset"] == pytest.approx(1.0)
 
 
-def test_plot_multi_line_series_falls_back_to_index_x_before_mapping(tmp_path):
+def test_plot_multi_line_series_falls_back_to_count_axis_before_mapping(tmp_path):
     capture_state: dict[str, object] = {}
 
     result = plotting_module.plot_multi_line_series(
@@ -330,7 +428,7 @@ def test_plot_multi_line_series_falls_back_to_index_x_before_mapping(tmp_path):
 
     assert result is not None
     line = capture_state["axes"].lines[0]
-    np.testing.assert_allclose(line.get_xdata(), np.array([1.0, 1.2, 1.4]))
+    np.testing.assert_allclose(line.get_xdata(), np.array([1.2, 1.4, 1.6]))
 
 
 def test_x_axis_mapping_affects_plotted_integration_but_not_raw_integration(tmp_path):
@@ -1054,6 +1152,225 @@ def test_plot_multi_line_series_renders_fit_when_base_line_is_hidden(tmp_path):
     ax = capture_state["axes"]
     assert len(ax.lines) == 1
     assert ax.lines[0].get_label() == "base fit"
+
+
+def test_plot_multi_line_series_hides_group_raw_line_when_show_raw_line_is_off(tmp_path):
+    capture_state: dict[str, object] = {}
+
+    result = plotting_module.plot_multi_line_series(
+        [np.array([0.0, 1.0, 2.0], dtype=float)],
+        [np.array([1.0, 2.0, 3.0], dtype=float)],
+        ["base"],
+        series_ids=["series:a"],
+        title="Group hidden raw",
+        x_label="x",
+        y_label="y",
+        output=tmp_path / "group_hidden_raw.png",
+        show=False,
+        render_series_descriptors=[
+            {
+                "series_id": "series:a",
+                "default_label": "base",
+                "source_kind": "source",
+                "source_series_id": "series:a",
+            },
+            {
+                "series_id": "group:1",
+                "default_label": "Group 1",
+                "source_kind": "group",
+                "member_series_ids": ["series:a"],
+                "group_reducer": "mean",
+            },
+        ],
+        series_overrides_by_id={
+            "series:a": {"enabled": True, "show_raw_line": False},
+            "group:1": {"enabled": True, "show_raw_line": False},
+        },
+        capture_state=capture_state,
+    )
+
+    assert result is not None
+    assert capture_state["series_group_summaries"]["group:1"]["status"] == "ok"
+    assert len(capture_state["axes"].lines) == 0
+
+
+def test_plot_multi_line_series_applies_nested_fit_style_overrides(tmp_path):
+    capture_state: dict[str, object] = {}
+
+    result = plotting_module.plot_multi_line_series(
+        [np.array([0.0, 1.0, 2.0], dtype=float)],
+        [np.array([1.0, 3.0, 5.0], dtype=float)],
+        ["base"],
+        series_ids=["series:a"],
+        title="Fit style override",
+        x_label="x",
+        y_label="y",
+        output=tmp_path / "fit_style_override.png",
+        show=False,
+        render_series_descriptors=[
+            {
+                "series_id": "series:a",
+                "default_label": "base",
+                "source_kind": "source",
+                "source_series_id": "series:a",
+            }
+        ],
+        series_overrides_by_id={
+            "series:a": {
+                "fit": {
+                    "fit_enabled": True,
+                    "fit_type": "linear",
+                    "fit_color": "#ff0000",
+                    "fit_alpha": 0.4,
+                    "fit_line_width": 4.0,
+                    "fit_line_style": ":",
+                }
+            }
+        },
+        capture_state=capture_state,
+    )
+
+    assert result is not None
+    ax = capture_state["axes"]
+    assert len(ax.lines) == 2
+    fit_line = ax.lines[1]
+    assert fit_line.get_color() == "#ff0000"
+    assert fit_line.get_alpha() == pytest.approx(0.4)
+    assert fit_line.get_linewidth() == pytest.approx(4.0)
+    assert fit_line.get_linestyle() == ":"
+
+
+def test_plot_multi_line_series_autoscales_to_visible_normalized_fit_when_base_line_hidden(
+    tmp_path,
+):
+    capture_state: dict[str, object] = {}
+
+    result = plotting_module.plot_multi_line_series(
+        [np.array([0.0, 1.0, 2.0], dtype=float)],
+        [np.array([100.0, 200.0, 300.0], dtype=float)],
+        ["base"],
+        series_ids=["series:a"],
+        title="Normalized fit hidden base",
+        x_label="x",
+        y_label="y",
+        output=tmp_path / "normalized_fit_hidden_base.png",
+        show=False,
+        series_enabled=[False],
+        series_fit_configs=[{"fit_enabled": True, "fit_type": "linear"}],
+        series_normalization_modes=["factor"],
+        series_normalization_values=[0.01],
+        capture_state=capture_state,
+    )
+
+    assert result is not None
+    ax = capture_state["axes"]
+    line = ax.lines[0]
+    assert np.nanmin(np.asarray(line.get_ydata(), dtype=float)) < 5.0
+    assert np.nanmax(np.asarray(line.get_ydata(), dtype=float)) < 5.0
+    bottom, top = ax.get_ylim()
+    assert bottom < 10.0
+    assert top < 10.0
+
+
+def test_plot_multi_line_series_density_autolimits_ignore_all_zero_tails(tmp_path):
+    capture_state: dict[str, object] = {}
+
+    x_values = np.arange(40, dtype=float)
+    y_values_a = np.concatenate(
+        (np.zeros(10, dtype=float), np.ones(20, dtype=float), np.zeros(10, dtype=float))
+    )
+    y_values_b = y_values_a * 2.0
+
+    result = plotting_module.plot_multi_line_series(
+        [x_values, x_values],
+        [y_values_a, y_values_b],
+        ["run-a", "run-b"],
+        analysis_name="density",
+        title="Density zero tails",
+        x_label="Distance",
+        y_label="Density",
+        output=tmp_path / "density_zero_tails.png",
+        show=False,
+        capture_state=capture_state,
+    )
+
+    assert result is not None
+    x_lim = capture_state["x_lim"]
+    y_lim = capture_state["y_lim"]
+    assert isinstance(x_lim, list)
+    assert isinstance(y_lim, list)
+    assert x_lim[0] > 0.0
+    assert x_lim[1] < 39.0
+    assert y_lim[0] == pytest.approx(0.0)
+
+
+def test_plot_multi_line_series_density_autolimits_ignore_zero_tails_with_explicit_ticks(tmp_path):
+    capture_state: dict[str, object] = {}
+
+    x_values = np.arange(40, dtype=float)
+    y_values = np.concatenate(
+        (np.zeros(10, dtype=float), np.ones(20, dtype=float), np.zeros(10, dtype=float))
+    )
+
+    result = plotting_module.plot_multi_line_series(
+        [x_values],
+        [y_values],
+        ["run-a"],
+        analysis_name="density",
+        title="Density zero tails with ticks",
+        x_label="Distance",
+        y_label="Density",
+        output=tmp_path / "density_zero_tails_ticks.png",
+        show=False,
+        x_ticks=[0.0, 10.0, 20.0, 30.0, 40.0],
+        capture_state=capture_state,
+    )
+
+    assert result is not None
+    x_lim = capture_state["x_lim"]
+    assert isinstance(x_lim, list)
+    assert x_lim[0] > 0.0
+    assert x_lim[1] < 39.0
+
+
+def test_plot_multi_line_series_autoscales_to_visible_errorbars(tmp_path):
+    from linak.analysis.statistics import SeriesStatistics
+
+    capture_state: dict[str, object] = {}
+
+    result = plotting_module.plot_multi_line_series(
+        [np.array([0.0, 1.0, 2.0], dtype=float)],
+        [np.array([1.0, 2.0, 3.0], dtype=float)],
+        ["base"],
+        series_ids=["series:a"],
+        title="Visible error autoscale",
+        x_label="x",
+        y_label="y",
+        output=tmp_path / "visible_error_autoscale.png",
+        show=False,
+        series_statistics_data=[
+            SeriesStatistics(
+                point_count=np.array([10, 10, 10], dtype=int),
+                sample_n=np.array([5, 5, 5], dtype=int),
+                sample_std=np.array([0.5, 4.0, 8.0], dtype=float),
+                sample_sem=np.array([0.25, 2.0, 4.0], dtype=float),
+            )
+        ],
+        series_error_configs=[
+            {
+                "enabled": True,
+                "stat": "sample_std",
+                "style": "whiskers",
+                "color": "#cc5500",
+            }
+        ],
+        capture_state=capture_state,
+    )
+
+    assert result is not None
+    bottom, top = capture_state["axes"].get_ylim()
+    assert bottom < 1.0
+    assert top > 10.0
 
 
 def test_plot_multi_line_series_renders_error_when_base_line_is_hidden(tmp_path):

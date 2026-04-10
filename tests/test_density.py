@@ -1726,8 +1726,123 @@ def test_plot_density_profiles_auto_limits_follow_normalized_data(monkeypatch):
         series_normalization_x_refs=[None, None],
     )
 
-    assert captured_kwargs["x_lim"] == pytest.approx([-0.05, 1.05])
-    assert captured_kwargs["y_lim"] == pytest.approx([0.0, 1.05])
+    assert captured_kwargs["x_lim"] is None
+    assert captured_kwargs["y_lim"] is None
+
+
+def test_plot_density_profiles_gui_overrides_skip_wrapper_auto_limits(monkeypatch):
+    from linak.analysis.density import DensityProfile, plot_density_profiles
+
+    captured_kwargs = {}
+
+    def _fake_plot_multi_line_series(_x_series, _y_series, _labels, **kwargs):
+        captured_kwargs.update(kwargs)
+        return None
+
+    monkeypatch.setattr(
+        density_module,
+        "plot_multi_line_series",
+        _fake_plot_multi_line_series,
+    )
+
+    profile_a = DensityProfile(
+        axis="z",
+        species="Au",
+        bin_edges=np.array([-0.5, 0.5, 1.5], dtype=float),
+        bin_centers=np.array([0.0, 1.0], dtype=float),
+        counts_per_frame=np.array([1.0, 2.0], dtype=float),
+        density=np.array([10.0, 20.0], dtype=float),
+        units="g/cm^3",
+        n_frames=2,
+        coordinate_mode="distance",
+        surface_position=0.0,
+        surface_position_std=0.0,
+    )
+    profile_b = DensityProfile(
+        axis="z",
+        species="H2O",
+        bin_edges=np.array([-0.5, 0.5, 1.5], dtype=float),
+        bin_centers=np.array([0.0, 1.0], dtype=float),
+        counts_per_frame=np.array([2.0, 3.0], dtype=float),
+        density=np.array([100.0, 200.0], dtype=float),
+        units="g/cm^3",
+        n_frames=2,
+        coordinate_mode="distance",
+        surface_position=0.0,
+        surface_position_std=0.0,
+    )
+
+    plot_density_profiles(
+        [profile_a, profile_b],
+        show=False,
+        render_series_descriptors=[
+            {
+                "series_id": "series:0",
+                "default_label": "Au",
+                "source_kind": "source",
+                "source_series_id": "series:0",
+            },
+            {
+                "series_id": "series:1",
+                "default_label": "H2O",
+                "source_kind": "source",
+                "source_series_id": "series:1",
+            },
+        ],
+        series_overrides_by_id={
+            "series:0": {"normalization_mode": "max", "normalization_value": 1.0}
+        },
+    )
+
+    assert captured_kwargs["x_lim"] is None
+    assert captured_kwargs["y_lim"] is None
+
+
+def test_plot_density_profiles_autoscale_to_visible_normalized_data(tmp_path):
+    from linak.analysis.density import DensityProfile, plot_density_profiles
+
+    profile_a = DensityProfile(
+        axis="z",
+        species="Au",
+        bin_edges=np.array([-0.5, 0.5, 1.5], dtype=float),
+        bin_centers=np.array([0.0, 1.0], dtype=float),
+        counts_per_frame=np.array([1.0, 2.0], dtype=float),
+        density=np.array([10.0, 20.0], dtype=float),
+        units="g/cm^3",
+        n_frames=2,
+        coordinate_mode="distance",
+        surface_position=0.0,
+        surface_position_std=0.0,
+    )
+    profile_b = DensityProfile(
+        axis="z",
+        species="H2O",
+        bin_edges=np.array([-0.5, 0.5, 1.5], dtype=float),
+        bin_centers=np.array([0.0, 1.0], dtype=float),
+        counts_per_frame=np.array([2.0, 3.0], dtype=float),
+        density=np.array([100.0, 200.0], dtype=float),
+        units="g/cm^3",
+        n_frames=2,
+        coordinate_mode="distance",
+        surface_position=0.0,
+        surface_position_std=0.0,
+    )
+
+    capture_state: dict[str, object] = {}
+    plot_density_profiles(
+        [profile_a, profile_b],
+        output=tmp_path / "normalized_density.png",
+        show=False,
+        series_normalization_modes=["max", "max"],
+        series_normalization_values=[1.0, 1.0],
+        series_normalization_x_refs=[None, None],
+        capture_state=capture_state,
+    )
+
+    ax = capture_state["axes"]
+    bottom, top = ax.get_ylim()
+    assert bottom >= -0.2
+    assert top <= 1.2
 
 
 def test_plot_multi_line_series_rejects_invalid_series_line_kwargs_length():

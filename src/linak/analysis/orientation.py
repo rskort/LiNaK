@@ -28,10 +28,11 @@ from typing import Any
 import numpy as np
 from ase import Atoms
 
-from ..storage.hdf5_utils import (
-    read_linak_hdf5_profiles,
-    read_linak_hdf5_profiles_by_index,
-    write_linak_hdf5,
+from ..storage.hdf5_utils import write_linak_hdf5
+from .common import (
+    frame_has_usable_cell as _frame_has_usable_cell,
+    read_profile_payloads,
+    read_profile_payloads_by_index,
 )
 from .schema import build_profile_metadata
 from .statistics import (
@@ -43,9 +44,8 @@ from .statistics import (
     statistics_series_map_from_datasets,
     resolve_block_slices,
 )
-from .density import (
+from .surface import (
     _cell_histogram_bounds,
-    _frame_has_usable_cell,
     _surface_estimate_datasets,
     _surface_estimate_from_payload,
     _surface_estimate_supports_distance_mode,
@@ -142,286 +142,6 @@ class _OrientationFrameData:
     azimuthal_valid: np.ndarray
 
 
-# Compute
-
-
-def _unused_orientation_profile(
-    frames: list[Atoms],
-    *,
-    axis: str = "z",
-    reference_axis: str = "z",
-    bin_width: float = 0.1,
-    angle_bin_count: int = _DEFAULT_ANGLE_BIN_COUNT,
-    surface_mode: str = "auto",
-    surface_elements: list[str] | None = None,
-    include_fixed_surface_atoms: bool = False,
-    surface_options: SurfaceEstimatorOptions | None = None,
-    binning: str = "cell",
-    oh_cutoff: float = H2O_OH_CUTOFF_A,
-) -> OrientationProfile:
-    """Compute water-orientation profiles from a trajectory.
-
-    Parameters
-    ----------
-    frames
-        Trajectory frames (ASE ``Atoms`` list).
-    axis
-        Spatial axis for distance binning (default ``"z"``).
-    reference_axis
-        Axis treated as the surface normal (default ``"z"``).
-    bin_width
-        Spatial bin width in Angstrom (default 0.1).
-    angle_bin_count
-        Number of bins over ``cos(angle) in [-1, +1]`` for heatmaps.
-    surface_mode / surface_elements / include_fixed_surface_atoms
-        Forwarded to the surface estimator in *density.py*.
-    binning
-        ``"cell"`` (span full cell) or ``"observed"`` (data range only).
-    oh_cutoff
-        O-H cutoff for water-molecule detection.
-
-    Returns
-    -------
-    OrientationProfile
-    """
-    if not frames:
-        raise ValueError("At least one trajectory frame is required.")
-
-    axis_index = axis_to_index(axis)
-    ref_index = axis_to_index(reference_axis)
-    ref_vec = np.zeros(3, dtype=float)
-    ref_vec[ref_index] = 1.0
-
-    # Surface estimation reuses density machinery.
-    from .density import _select_surface_estimate
-
-    surface_estimate, _method = _select_surface_estimate(
-        frames,
-        axis,
-        mode=surface_mode,
-        surface_elements=surface_elements,
-        include_fixed_surface_atoms=include_fixed_surface_atoms,
-        surface_options=surface_options,
-    )
-    surface_position: float | None = None
-    surface_position_std: float | None = None
-    surface_per_frame: np.ndarray | None = None
-    if surface_estimate is not None:
-        surface_position = surface_estimate.position
-        surface_position_std = surface_estimate.std
-        surface_per_frame = surface_estimate.per_frame
-        if not _surface_estimate_supports_distance_mode(surface_estimate, frame_count=len(frames)):
-            surface_per_frame = None
-
-    coordinate_mode = "distance" if surface_per_frame is not None else "axis"
-
-    # Determine histogram bounds.
-    dist_min, dist_max = _unused_determine_distance_bounds(
-        frames,
-        axis_index,
-        binning,
-        coordinate_mode,
-        surface_per_frame,
-    )
-    dist_bin_edges = np.arange(dist_min, dist_max + bin_width, bin_width)
-    n_dist_bins = len(dist_bin_edges) - 1
-    if n_dist_bins < 1:
-        raise ValueError(
-            f"No distance bins produced (range [{dist_min:.3f}, {dist_max:.3f}], "
-            f"bin_width={bin_width})."
-        )
-    dist_bin_centers = 0.5 * (dist_bin_edges[:-1] + dist_bin_edges[1:])
-
-    # Angle bin edges over [-1, +1].
-    angle_bin_edges = np.linspace(-1.0, 1.0, angle_bin_count + 1)
-    angle_bin_centers = 0.5 * (angle_bin_edges[:-1] + angle_bin_edges[1:])
-
-    # Accumulators.
-    cos_polar_sum = np.zeros(n_dist_bins, dtype=float)
-    cos_azimuthal_sum = np.zeros(n_dist_bins, dtype=float)
-    count = np.zeros(n_dist_bins, dtype=float)
-    heatmap_polar = np.zeros((n_dist_bins, angle_bin_count), dtype=float)
-    heatmap_azimuthal = np.zeros((n_dist_bins, angle_bin_count), dtype=float)
-
-    # Cell lengths for volume normalization.
-    cell_lengths = _extract_cell_lengths(frames[0], axis_index)
-
-    # Frame loop.
-    cached_triplets: np.ndarray | None = None
-    n_molecules_per_frame = 0
-
-    with ProgressBar(
-        desc="Computing orientation",
-        total=len(frames),
-        unit="frame",
-    ) as progress:
-        for frame_idx, frame in enumerate(frames):
-            # water detection (cached, periodic re-validation)
-            if cached_triplets is None:
-                cached_triplets = water_molecule_triplets(frame, oh_cutoff=oh_cutoff)
-            elif frame_idx % H2O_VALIDATION_STRIDE == 0:
-                validated = water_molecule_triplets(frame, oh_cutoff=oh_cutoff)
-                if not np.array_equal(validated, cached_triplets):
-                    LOGGER.warning(
-                        "H2O topology change at frame %d; refreshing water triplets.",
-                        frame_idx,
-                    )
-                    cached_triplets = validated
-
-            geom = water_triplet_geometry(frame, cached_triplets)
-            n_mol = geom.com_positions.shape[0]
-            if n_mol == 0:
-                progress.update()
-                continue
-            if frame_idx == 0:
-                n_molecules_per_frame = n_mol
-
-            # distance coordinate
-            dist_values = geom.com_positions[:, axis_index]
-            if surface_per_frame is not None:
-                dist_values = dist_values - float(surface_per_frame[frame_idx])
-
-            # bisector and plane-normal vectors
-            oh1 = geom.hydrogen1_positions - geom.oxygen_positions  # (n_mol, 3)
-            oh2 = geom.hydrogen2_positions - geom.oxygen_positions
-            oh1_norm = oh1 / np.linalg.norm(oh1, axis=1, keepdims=True)
-            oh2_norm = oh2 / np.linalg.norm(oh2, axis=1, keepdims=True)
-
-            bisector = oh1_norm + oh2_norm  # unnormalised bisector
-            bisector_len = np.linalg.norm(bisector, axis=1, keepdims=True)
-            # Guard against degenerate geometry (180 degree H-O-H).
-            bisector_len = np.maximum(bisector_len, 1.0e-12)
-            bisector = bisector / bisector_len
-
-            plane_normal = np.cross(oh1, oh2)
-            pn_len = np.linalg.norm(plane_normal, axis=1, keepdims=True)
-            pn_len = np.maximum(pn_len, 1.0e-12)
-            plane_normal = plane_normal / pn_len
-
-            # cos(polar) = bisector dot ref_axis.
-            cos_polar = bisector @ ref_vec  # (n_mol,)
-
-            # cos(azimuthal): project plane_normal onto the plane perpendicular to ref_axis,
-            # then measure cos of angle from first in-plane Cartesian axis.
-            # Pick the two Cartesian axes that span the perpendicular plane.
-            in_plane_axes = [i for i in range(3) if i != ref_index]
-            proj = plane_normal[:, in_plane_axes]  # (n_mol, 2)
-            proj_len = np.linalg.norm(proj, axis=1)
-            proj_len = np.maximum(proj_len, 1.0e-12)
-            cos_azimuthal = proj[:, 0] / proj_len  # angle from first in-plane axis
-
-            # bin assignment
-            dist_idx = np.searchsorted(dist_bin_edges, dist_values, side="right") - 1
-            valid = (dist_idx >= 0) & (dist_idx < n_dist_bins)
-            dist_idx_v = dist_idx[valid]
-            cos_polar_v = cos_polar[valid]
-            cos_azimuthal_v = cos_azimuthal[valid]
-
-            # 1-D accumulation
-            np.add.at(cos_polar_sum, dist_idx_v, cos_polar_v)
-            np.add.at(cos_azimuthal_sum, dist_idx_v, cos_azimuthal_v)
-            np.add.at(count, dist_idx_v, 1.0)
-
-            # 2-D heatmap accumulation
-            angle_idx_polar = np.searchsorted(angle_bin_edges, cos_polar_v, side="right") - 1
-            angle_idx_polar = np.clip(angle_idx_polar, 0, angle_bin_count - 1)
-            angle_idx_azi = np.searchsorted(angle_bin_edges, cos_azimuthal_v, side="right") - 1
-            angle_idx_azi = np.clip(angle_idx_azi, 0, angle_bin_count - 1)
-
-            np.add.at(heatmap_polar, (dist_idx_v, angle_idx_polar), 1.0)
-            np.add.at(heatmap_azimuthal, (dist_idx_v, angle_idx_azi), 1.0)
-
-            progress.update()
-
-    # Finalize averages.
-    n_frames = len(frames)
-    safe_count = np.where(count > 0, count, 1.0)
-    count_total = np.asarray(count, dtype=int)
-    count_polar_valid = np.asarray(count, dtype=int)
-    count_azimuthal_valid = np.asarray(count, dtype=int)
-
-    cos_polar_mean = cos_polar_sum / safe_count
-    cos_azimuthal_mean = cos_azimuthal_sum / safe_count
-
-    # number density: count / (n_frames * bin_volume_or_length)
-    density = _unused_number_density(
-        count=count,
-        n_frames=n_frames,
-        bin_width=bin_width,
-        cell_lengths=cell_lengths,
-        axis_index=axis_index,
-    )
-
-    cos_polar_density = cos_polar_mean * density
-    cos_azimuthal_density = cos_azimuthal_mean * density
-
-    return OrientationProfile(
-        axis=axis,
-        reference_axis=reference_axis,
-        n_frames=n_frames,
-        n_molecules_per_frame=n_molecules_per_frame,
-        bin_edges=dist_bin_edges,
-        bin_centers=dist_bin_centers,
-        cos_polar_mean=cos_polar_mean,
-        cos_azimuthal_mean=cos_azimuthal_mean,
-        count_total=count_total,
-        count_polar_valid=count_polar_valid,
-        count_azimuthal_valid=count_azimuthal_valid,
-        cos_polar_density=cos_polar_density,
-        cos_azimuthal_density=cos_azimuthal_density,
-        density=density,
-        heatmap_polar=heatmap_polar,
-        heatmap_azimuthal=heatmap_azimuthal,
-        heatmap_angle_bin_edges=angle_bin_edges,
-        heatmap_angle_bin_centers=angle_bin_centers,
-        coordinate_mode=coordinate_mode,
-        surface_position=surface_position,
-        surface_position_std=surface_position_std,
-        surface_estimate=surface_estimate,
-        cell_lengths_angstrom=cell_lengths,
-    )
-
-
-# Internal helpers
-
-
-def _unused_determine_distance_bounds(
-    frames: list[Atoms],
-    axis_index: int,
-    binning: str,
-    coordinate_mode: str,
-    surface_per_frame: np.ndarray | None,
-) -> tuple[float, float]:
-    """Return ``(min, max)`` of the distance coordinate across all frames."""
-    normalized_binning = binning.strip().lower()
-    if normalized_binning == "cell":
-        cell = np.asarray(frames[0].cell.array, dtype=float)
-        axis_len = float(np.linalg.norm(cell[axis_index]))
-        if axis_len > 0:
-            if coordinate_mode == "distance" and surface_per_frame is not None:
-                offsets = surface_per_frame[np.isfinite(surface_per_frame)]
-                if offsets.size > 0:
-                    mean_offset = float(np.mean(offsets))
-                    return -mean_offset, axis_len - mean_offset
-            return 0.0, axis_len
-
-    # fallback: scan data (only invoked under "observed" or if cell is unusable)
-    global_min = float("inf")
-    global_max = float("-inf")
-    for fi, frame in enumerate(frames):
-        pos = np.asarray(frame.positions[:, axis_index], dtype=float)
-        if surface_per_frame is not None and np.isfinite(surface_per_frame[fi]):
-            pos = pos - float(surface_per_frame[fi])
-        if pos.size > 0:
-            global_min = min(global_min, float(np.min(pos)))
-            global_max = max(global_max, float(np.max(pos)))
-    if not np.isfinite(global_min):
-        global_min = 0.0
-    if not np.isfinite(global_max):
-        global_max = global_min + 1.0
-    return global_min, global_max
-
-
 def _extract_cell_lengths(
     frame: Atoms,
     axis_index: int,
@@ -434,29 +154,6 @@ def _extract_cell_lengths(
     if any(length <= 0.0 for length in lengths):
         return None
     return (lengths[0], lengths[1], lengths[2])
-
-
-def _unused_number_density(
-    count: np.ndarray,
-    n_frames: int,
-    bin_width: float,
-    cell_lengths: tuple[float, float, float] | None,
-    axis_index: int,
-) -> np.ndarray:
-    """Convert raw molecule counts into number density.
-
-    If cell dimensions are known the volume of each bin slab is used;
-    otherwise only bin-width normalisation is applied (linear density).
-    """
-    if cell_lengths is not None:
-        cross_axes = [i for i in range(3) if i != axis_index]
-        cross_area = cell_lengths[cross_axes[0]] * cell_lengths[cross_axes[1]]
-        bin_volume = cross_area * bin_width
-    else:
-        bin_volume = bin_width  # linear fallback
-
-    density = count / (n_frames * bin_volume)
-    return density
 
 
 # HDF5 save/load
@@ -612,7 +309,7 @@ def _per_frame_slab_volumes(
 ) -> np.ndarray | None:
     if not frames:
         return None
-    if not all(_frame_has_usable_cell(frame, axis_index) for frame in frames):
+    if not all(_frame_has_usable_cell(frame, axis_index=axis_index) for frame in frames):
         return None
     slab_volumes = np.empty(len(frames), dtype=float)
     for frame_index, frame in enumerate(frames):
@@ -1135,7 +832,11 @@ def load_orientation_profile(path: str | Path) -> OrientationProfile:
 
 def load_orientation_profiles(path: str | Path) -> list[OrientationProfile]:
     """Load all orientation profiles from a LiNaK HDF5 file."""
-    raw_profiles = read_linak_hdf5_profiles(path, expected_analysis=_ANALYSIS_NAME)
+    _source_path, raw_profiles = read_profile_payloads(
+        path,
+        analysis=_ANALYSIS_NAME,
+        label="Orientation",
+    )
     return [
         _build_orientation_profile_from_hdf5(datasets, metadata)
         for datasets, metadata in raw_profiles
@@ -1147,10 +848,11 @@ def load_orientation_profiles_by_index(
     indices: list[int],
 ) -> list[OrientationProfile]:
     """Load selected orientation profiles by index."""
-    raw = read_linak_hdf5_profiles_by_index(
+    _source_path, raw = read_profile_payloads_by_index(
         path,
         indices,
-        expected_analysis=_ANALYSIS_NAME,
+        analysis=_ANALYSIS_NAME,
+        label="Orientation",
     )
     return [_build_orientation_profile_from_hdf5(datasets, metadata) for datasets, metadata in raw]
 
@@ -1245,6 +947,7 @@ def plot_orientation_profile(
     y_label_font_size: int | None = None,
     x_label_pad: float | None = None,
     y_label_pad: float | None = None,
+    title_pad: float | None = None,
     x_axis_scale: float | None = None,
     x_axis_offset: float | None = None,
     title_visible: bool | None = None,
@@ -1347,6 +1050,7 @@ def plot_orientation_profile(
             y_ticks=y_ticks,
             x_label_pad=x_label_pad,
             y_label_pad=y_label_pad,
+            title_pad=title_pad,
             capture_state=capture_state,
             suppress_output_log=suppress_output_log,
             matplotlib_rc=matplotlib_rc,
@@ -1411,6 +1115,7 @@ def plot_orientation_profile(
         y_label_font_size=y_label_font_size,
         x_label_pad=x_label_pad,
         y_label_pad=y_label_pad,
+        title_pad=title_pad,
         x_axis_scale=x_axis_scale,
         x_axis_offset=x_axis_offset,
         title_visible=title_visible,
@@ -1457,6 +1162,7 @@ def plot_orientation_profiles(
     y_label_font_size: int | None = None,
     x_label_pad: float | None = None,
     y_label_pad: float | None = None,
+    title_pad: float | None = None,
     x_axis_scale: float | None = None,
     x_axis_offset: float | None = None,
     title_visible: bool | None = None,
@@ -1566,6 +1272,7 @@ def plot_orientation_profiles(
             y_ticks=y_ticks,
             x_label_pad=x_label_pad,
             y_label_pad=y_label_pad,
+            title_pad=title_pad,
             capture_state=capture_state,
             suppress_output_log=suppress_output_log,
             matplotlib_rc=matplotlib_rc,
@@ -1646,6 +1353,7 @@ def plot_orientation_profiles(
         y_label_font_size=y_label_font_size,
         x_label_pad=x_label_pad,
         y_label_pad=y_label_pad,
+        title_pad=title_pad,
         x_axis_scale=x_axis_scale,
         x_axis_offset=x_axis_offset,
         title_visible=title_visible,
@@ -1867,6 +1575,7 @@ def _plot_orientation_heatmap(
     y_ticks: list[float] | tuple[float, ...] | None,
     x_label_pad: float | None,
     y_label_pad: float | None,
+    title_pad: float | None,
     capture_state: dict[str, Any] | None,
     suppress_output_log: bool,
     matplotlib_rc: dict[str, Any] | None,
@@ -1988,6 +1697,7 @@ def _plot_orientation_heatmap(
         y_label_font_size=y_label_font_size,
         x_label_pad=x_label_pad,
         y_label_pad=y_label_pad,
+        title_pad=title_pad,
         title_visible=title_visible,
         ticks_visible=ticks_visible,
         capture_state=capture_state,

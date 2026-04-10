@@ -64,6 +64,27 @@ _ANALYSIS_TO_PROFILE_KEY = {
 }
 _PROFILE_KEY_TO_ANALYSIS = {value: key for key, value in _ANALYSIS_TO_PROFILE_KEY.items()}
 _LINAK_OUTPUT_DIRNAME = "LiNaK_outputs"
+_GUI_COMPLEXITY_MAX_SERIES = 128
+_GUI_COMPLEXITY_MAX_POINTS = 1_000_000
+
+
+@dataclass(frozen=True)
+class _PlotComplexityEstimate:
+    analysis_name: str
+    series_count: int
+    estimated_total_points: int | None = None
+    entity_expanded: bool = False
+
+    @property
+    def exceeds_limits(self) -> bool:
+        if self.series_count > _GUI_COMPLEXITY_MAX_SERIES:
+            return True
+        if (
+            self.estimated_total_points is not None
+            and self.estimated_total_points > _GUI_COMPLEXITY_MAX_POINTS
+        ):
+            return True
+        return False
 
 
 @dataclass(frozen=True)
@@ -75,6 +96,7 @@ class _GuiPlotRenderContext:
     default_series_labels: list[str]
     series_descriptors: list[dict[str, Any]]
     profile_filter_options: dict[str, Any] | None = None
+    estimated_total_points: int | None = None
 
     @property
     def series_count(self) -> int:
@@ -90,6 +112,10 @@ class _LazyGuiSeriesCatalog:
     profile_filter_options: dict[str, Any] | None
     load_profiles: Callable[[list[dict[str, Any]]], list[Any]]
     default_series_labels: list[str] = field(default_factory=list)
+    estimated_total_points: int | None = None
+    estimate_render_points: (
+        Callable[[list[Any], argparse.Namespace, list[dict[str, Any]]], int | None] | None
+    ) = None
     _active_profiles_by_series_id: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -119,6 +145,7 @@ class _LazyGuiSeriesCatalog:
             default_series_labels=list(self.default_series_labels),
             series_descriptors=self.series_descriptors,
             profile_filter_options=deepcopy(self.profile_filter_options),
+            estimated_total_points=self.estimated_total_points,
         )
 
     def build_render_context(self, args: argparse.Namespace) -> _GuiPlotRenderContext:
@@ -149,6 +176,24 @@ class _LazyGuiSeriesCatalog:
                     raise ValueError("Lazy GUI descriptor is missing a series_id.")
                 self._active_profiles_by_series_id[series_id] = profile
 
+        estimated_total_points = (
+            self.estimate_render_points(
+                [
+                    self._active_profiles_by_series_id[str(descriptor.get("series_id") or "")]
+                    for descriptor in active_descriptors
+                ],
+                args,
+                active_descriptors,
+            )
+            if self.estimate_render_points is not None
+            else _estimate_total_points_from_loaded_profiles(
+                [
+                    self._active_profiles_by_series_id[str(descriptor.get("series_id") or "")]
+                    for descriptor in active_descriptors
+                ]
+            )
+        )
+
         return _GuiPlotRenderContext(
             profile=[
                 self._active_profiles_by_series_id[str(descriptor.get("series_id") or "")]
@@ -169,7 +214,196 @@ class _LazyGuiSeriesCatalog:
             ],
             series_descriptors=active_descriptors,
             profile_filter_options=deepcopy(self.profile_filter_options),
+            estimated_total_points=estimated_total_points,
         )
+
+
+def _estimate_points_for_loaded_profile(profile: Any) -> int | None:
+    for attr_name in (
+        "coordination_number",
+        "distance_to_surface",
+        "x",
+        "density",
+        "number_density",
+        "g_r",
+        "msd",
+        "values",
+        "bin_centers",
+    ):
+        values = getattr(profile, attr_name, None)
+        if isinstance(values, np.ndarray) and values.ndim >= 1 and values.size > 0:
+            return int(values.size)
+    return None
+
+
+def _estimate_total_points_from_loaded_profiles(profile: Any) -> int | None:
+    if profile is None:
+        return None
+    profiles = profile if isinstance(profile, list) else [profile]
+    total = 0
+    counted_any = False
+    for item in profiles:
+        count = _estimate_points_for_loaded_profile(item)
+        if count is None:
+            continue
+        total += count
+        counted_any = True
+    return total if counted_any else None
+
+
+def _series_descriptors_are_entity_expanded(
+    series_descriptors: list[dict[str, Any]] | None,
+) -> bool:
+    for descriptor in series_descriptors or []:
+        if descriptor.get("atom_index") is not None:
+            return True
+        series_id = str(descriptor.get("series_id") or "").strip()
+        if ":atom:" in series_id:
+            return True
+    return False
+
+
+def _estimate_plot_complexity(
+    *,
+    analysis_name: str,
+    series_descriptors: list[dict[str, Any]] | None,
+    profile: Any = None,
+    estimated_total_points: int | None = None,
+) -> _PlotComplexityEstimate:
+    point_count = estimated_total_points
+    if point_count is None:
+        point_count = _estimate_total_points_from_loaded_profiles(profile)
+    return _PlotComplexityEstimate(
+        analysis_name=analysis_name,
+        series_count=len(series_descriptors or []),
+        estimated_total_points=point_count,
+        entity_expanded=_series_descriptors_are_entity_expanded(series_descriptors),
+    )
+
+
+def _log_plot_complexity_debug(
+    *,
+    analysis_name: str,
+    stage: str,
+    raw_series_count: int | None = None,
+    raw_point_count: int | None = None,
+    final_series_count: int | None = None,
+    final_point_count: int | None = None,
+) -> None:
+    LOGGER.debug(
+        "%s GUI complexity at %s: raw_series=%s, raw_points=%s, final_series=%s, final_points=%s",
+        analysis_name,
+        stage,
+        "NA" if raw_series_count is None else raw_series_count,
+        "NA" if raw_point_count is None else raw_point_count,
+        "NA" if final_series_count is None else final_series_count,
+        "NA" if final_point_count is None else final_point_count,
+    )
+
+
+def _format_plot_complexity_message(
+    estimate: _PlotComplexityEstimate,
+    *,
+    interactive_gui: bool,
+) -> str:
+    render_target = "interactive GUI controls" if interactive_gui else "non-GUI plotting"
+    details = [f"{estimate.series_count} series"]
+    if estimate.estimated_total_points is not None:
+        details.append(f"~{estimate.estimated_total_points:,} plotted points")
+    if estimate.entity_expanded:
+        details.append("per-entity expanded")
+    message = (
+        f"{estimate.analysis_name.capitalize()} plot is too large for {render_target}: "
+        f"{', '.join(details)}."
+    )
+    suggestions = ["Use --no-gui"]
+    if estimate.analysis_name in {"position", "coordination"}:
+        suggestions.append("filter species/axis or narrow the input sources")
+    else:
+        suggestions.append("narrow the input sources or filter the data")
+    if estimate.analysis_name == "position":
+        suggestions.append(
+            "use --component 2d-projection with --projection-filter-min/--projection-filter-max when that lighter view is sufficient"
+        )
+    if interactive_gui:
+        return f"{message} {'; '.join(suggestions)}."
+    return f"{message} Proceeding anyway. {'; '.join(suggestions)}."
+
+
+def _raise_or_warn_for_plot_complexity(
+    estimate: _PlotComplexityEstimate,
+    *,
+    interactive_gui: bool,
+) -> None:
+    if not estimate.exceeds_limits:
+        return
+    message = _format_plot_complexity_message(estimate, interactive_gui=interactive_gui)
+    if interactive_gui:
+        raise ValueError(message)
+    LOGGER.warning(message)
+
+
+def _warn_for_non_gui_plot_complexity(
+    *,
+    analysis_name: str,
+    render_context: _GuiPlotRenderContext,
+) -> None:
+    _raise_or_warn_for_plot_complexity(
+        _estimate_plot_complexity(
+            analysis_name=analysis_name,
+            series_descriptors=render_context.series_descriptors,
+            profile=render_context.profile,
+            estimated_total_points=render_context.estimated_total_points,
+        ),
+        interactive_gui=False,
+    )
+
+
+def _normalize_position_projection_component_token(component: str | None) -> str:
+    token = str(component or "distance").strip().lower().replace("_", "-").replace(" ", "-")
+    if token in {
+        "xy-z",
+        "xy-z-color",
+        "xy-z-colormap",
+        "trajectory",
+        "xyz",
+        "2d-projection",
+        "2dprojection",
+        "projection-2d",
+        "projection2d",
+        "projection",
+    }:
+        return "2d-projection"
+    return token
+
+
+def _normalize_position_projection_render_mode_token(render_mode: str | None) -> str:
+    token = str(render_mode or "color-scale").strip().lower().replace("_", "-").replace(" ", "-")
+    if token in {"color", "colormap", "colorscale"}:
+        return "color-scale"
+    if token in {"lines", "line-colour", "line-colours", "line-colors"}:
+        return "line-colors"
+    return token
+
+
+def _position_projection_uses_profile_descriptors(
+    args: argparse.Namespace,
+    *,
+    resolved_projection: dict[str, Any] | None = None,
+) -> bool:
+    if resolved_projection is None:
+        return (
+            _normalize_position_projection_component_token(getattr(args, "component", None))
+            == "2d-projection"
+            and _normalize_position_projection_render_mode_token(
+                getattr(args, "projection_render_mode", None)
+            )
+            != "line-colors"
+        )
+    return (
+        resolved_projection.get("component") == "2d-projection"
+        and str(resolved_projection.get("projection_render_mode") or "color-scale") != "line-colors"
+    )
 
 
 _PERSISTED_PLOT_SETTING_OPTION_FLAGS = {
@@ -210,6 +444,7 @@ _PERSISTED_PLOT_SETTING_OPTION_FLAGS = {
     "title": ("--title",),
     "title_visible": ("--title-mode",),
     "title_font_size": ("--title-font-size",),
+    "title_pad": (),
     "x": ("--x",),
     "x_label": ("--x-label",),
     "x_lim": ("--x-min", "--x-max"),
@@ -231,6 +466,13 @@ _PERSISTED_PLOT_SETTING_OPTION_FLAGS = {
     "markers": ("--markers",),
     "component": ("--component",),
     "map_color": ("--map-color",),
+    "projection_x": ("--projection-x",),
+    "projection_y": ("--projection-y",),
+    "projection_value": ("--projection-value",),
+    "projection_render_mode": ("--projection-render-mode",),
+    "projection_filter_min": ("--projection-filter-min",),
+    "projection_filter_max": ("--projection-filter-max",),
+    "xy_z_distance_max": ("--xy-z-distance-max",),
     "time_axis": ("--time-axis",),
     "time_section_width": ("--time-section-width",),
 }
@@ -288,6 +530,7 @@ _PLOT_SETTINGS_COMMON_KEYS = (
     "font_color",
     "font_size",
     "title_font_size",
+    "title_pad",
     "label_font_size",
     "x_label_font_size",
     "y_label_font_size",
@@ -326,6 +569,13 @@ _PLOT_SETTINGS_POSITION_KEYS = (
     "axis",
     "component",
     "map_color",
+    "projection_x",
+    "projection_y",
+    "projection_value",
+    "projection_render_mode",
+    "projection_filter_min",
+    "projection_filter_max",
+    "xy_z_distance_max",
     "time_axis",
     "time_section_width",
     *_PLOT_SETTINGS_COMMON_KEYS,
@@ -1211,7 +1461,7 @@ def _conversion_metadata_with_surface_cache(
         )
 
     if estimate is None:
-        LOGGER.info("Conversion surface cache unavailable: no surface reference found.")
+        LOGGER.warning("Conversion surface cache unavailable: no surface reference found.")
         return replace(
             base,
             surface_cache_status="unavailable",
@@ -1318,6 +1568,153 @@ def _position_series_labels_for_profile(profile: Any) -> list[str]:
         except (TypeError, ValueError):
             labels.append(f"{species}[{raw_index}]")
     return labels
+
+
+def _resolve_position_plotter_kwargs(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        "component": getattr(args, "component", "distance"),
+        "map_color": getattr(args, "map_color", "distance"),
+        "projection_x": getattr(args, "projection_x", None),
+        "projection_y": getattr(args, "projection_y", None),
+        "projection_value": getattr(args, "projection_value", None),
+        "projection_render_mode": getattr(args, "projection_render_mode", None),
+        "projection_filter_min": getattr(args, "projection_filter_min", None),
+        "projection_filter_max": getattr(args, "projection_filter_max", None),
+        "xy_z_distance_max": getattr(args, "xy_z_distance_max", None),
+        "time_axis": getattr(args, "time_axis", "ps"),
+    }
+
+
+def _resolve_position_projection_estimation_settings(args: argparse.Namespace) -> dict[str, Any]:
+    from .analysis.position import _normalize_component_token, _resolve_projection_settings
+
+    resolved_component = _normalize_component_token(getattr(args, "component", "distance"))
+    resolved: dict[str, Any] = {"component": resolved_component}
+    if resolved_component != "2d-projection":
+        return resolved
+
+    (
+        resolved_projection_x,
+        resolved_projection_y,
+        resolved_projection_value,
+        resolved_render_mode,
+        resolved_filter_min,
+        resolved_filter_max,
+    ) = _resolve_projection_settings(
+        component=getattr(args, "component", "distance"),
+        map_color=getattr(args, "map_color", "distance"),
+        projection_x=getattr(args, "projection_x", None),
+        projection_y=getattr(args, "projection_y", None),
+        projection_value=getattr(args, "projection_value", None),
+        projection_render_mode=getattr(args, "projection_render_mode", None),
+        projection_filter_min=getattr(args, "projection_filter_min", None),
+        projection_filter_max=getattr(args, "projection_filter_max", None),
+        xy_z_distance_max=getattr(args, "xy_z_distance_max", None),
+    )
+    resolved.update(
+        {
+            "projection_x": resolved_projection_x,
+            "projection_y": resolved_projection_y,
+            "projection_value": resolved_projection_value,
+            "projection_render_mode": resolved_render_mode,
+            "projection_filter_min": resolved_filter_min,
+            "projection_filter_max": resolved_filter_max,
+        }
+    )
+    return resolved
+
+
+def _estimate_position_projection_point_counts(
+    profile: Any,
+    *,
+    resolved_projection: dict[str, Any],
+) -> tuple[int, int]:
+    from .analysis.position import _position_projection_quantity_data
+
+    x_matrix, _ = _position_projection_quantity_data(
+        profile,
+        quantity=str(resolved_projection["projection_x"]),
+    )
+    y_matrix, _ = _position_projection_quantity_data(
+        profile,
+        quantity=str(resolved_projection["projection_y"]),
+    )
+    value_matrix, _ = _position_projection_quantity_data(
+        profile,
+        quantity=str(resolved_projection["projection_value"]),
+    )
+    visible_mask = np.isfinite(x_matrix) & np.isfinite(y_matrix) & np.isfinite(value_matrix)
+    raw_candidate_points = int(np.count_nonzero(visible_mask))
+    filter_min = resolved_projection.get("projection_filter_min")
+    filter_max = resolved_projection.get("projection_filter_max")
+    if filter_min is not None:
+        visible_mask &= value_matrix >= float(filter_min)
+    if filter_max is not None:
+        visible_mask &= value_matrix <= float(filter_max)
+    final_visible_points = int(np.count_nonzero(visible_mask))
+    return raw_candidate_points, final_visible_points
+
+
+def _estimate_position_gui_point_counts(
+    profiles: Sequence[Any],
+    *,
+    resolved_projection: dict[str, Any],
+) -> tuple[int, int]:
+    if resolved_projection.get("component") != "2d-projection":
+        raw_total = 0
+        for profile in profiles:
+            points = _estimate_points_for_loaded_profile(profile)
+            if points is not None:
+                raw_total += int(points)
+        return raw_total, raw_total
+
+    raw_total = 0
+    final_total = 0
+    for profile in profiles:
+        raw_points, final_points = _estimate_position_projection_point_counts(
+            profile,
+            resolved_projection=resolved_projection,
+        )
+        raw_total += raw_points
+        final_total += final_points
+    return raw_total, final_total
+
+
+def _log_position_projection_guard_debug(
+    *,
+    stage: str,
+    resolved_projection: dict[str, Any],
+    raw_candidate_points: int,
+    final_visible_points: int,
+) -> None:
+    if resolved_projection.get("component") != "2d-projection":
+        return
+    LOGGER.debug(
+        "position projection guard at %s: value=%s, render_mode=%s, filter_min=%s, "
+        "filter_max=%s, raw_candidate_points=%d, final_visible_points=%d",
+        stage,
+        resolved_projection.get("projection_value"),
+        resolved_projection.get("projection_render_mode"),
+        resolved_projection.get("projection_filter_min"),
+        resolved_projection.get("projection_filter_max"),
+        raw_candidate_points,
+        final_visible_points,
+    )
+
+
+def _estimate_position_projection_visible_points(
+    profile: Any,
+    args: argparse.Namespace,
+) -> int:
+    resolved_projection = _resolve_position_projection_estimation_settings(args)
+    if resolved_projection.get("component") != "2d-projection":
+        return _estimate_points_for_loaded_profile(profile) or 0
+
+    _raw_points, final_points = _estimate_position_projection_point_counts(
+        profile,
+        resolved_projection=resolved_projection,
+    )
+    return final_points
 
 
 def _coordination_series_labels_for_profile(profile: Any) -> list[str]:
@@ -3132,6 +3529,14 @@ def _add_plot_common_options(parser: argparse.ArgumentParser) -> None:
             "for direct Matplotlib rendering."
         ),
     )
+    render_group.add_argument(
+        "--force-gui",
+        action="store_true",
+        help=(
+            "Bypass the interactive GUI size guard and open plot controls even when the "
+            "estimated plot complexity is very large."
+        ),
+    )
     render_group.add_argument("-o", "--output", help="Output image path (PNG, PDF, SVG, ...)")
     render_group.add_argument(
         "--show",
@@ -3387,6 +3792,327 @@ def _add_plot_source_options(parser: argparse.ArgumentParser, *, help_text: str)
         metavar="PATH",
         help="Input HDF5 file path(s). Use -f/--files even for one file; required for multiple.",
     )
+
+
+_PLOT_PARSER_DESCRIPTION = (
+    "Plot LiNaK analysis HDF5 data by auto-detecting density, MSD, RDF, position, "
+    "coordination, potential, or orientation from HDF5 metadata. If the input HDF5 is "
+    f"not a supported LiNaK analysis file, LiNaK falls back to `{_TABULAR_COMMAND} plot`."
+)
+
+_PLOT_PARSER_EPILOG = (
+    "Trajectory inputs are intentionally not supported here: run `linak compute ...` "
+    "first. For generic tabular HDF5 plotting, use `linak hdf5 plot` directly."
+)
+
+
+def _plot_parser_description(*, analysis: str | None = None) -> str:
+    if analysis is None:
+        return _PLOT_PARSER_DESCRIPTION
+    return (
+        f"Detected analysis from input: {analysis}. Showing shared plot options plus "
+        f"{analysis}-specific options.\n\n{_PLOT_PARSER_DESCRIPTION}"
+    )
+
+
+def _add_species_override_options(
+    parser: argparse.ArgumentParser,
+    *,
+    group_title: str = "Analysis selection filters",
+) -> None:
+    group = parser.add_argument_group(group_title)
+    group.add_argument(
+        "--species",
+        default=None,
+        help=(
+            "Optional species override for density/MSD/position loaded profile labels "
+            "(default: use file metadata)"
+        ),
+    )
+
+
+def _add_density_plot_options(
+    parser: argparse.ArgumentParser,
+    *,
+    include_axis: bool,
+    group_title: str = "Density plot options",
+) -> None:
+    group = parser.add_argument_group(group_title)
+    if include_axis:
+        group.add_argument(
+            "--axis",
+            choices=["x", "y", "z"],
+            default=None,
+            help=(
+                "Optional axis override for loaded density/position/coordination profiles "
+                "(default: use file metadata)"
+            ),
+        )
+    group.add_argument(
+        "--x-mode",
+        choices=["distance", "axis"],
+        default="distance",
+        help="Density x-axis mode: distance to surface (default) or raw axis coordinate.",
+    )
+    group.add_argument(
+        "--quantity",
+        choices=["mass", "number"],
+        default="mass",
+        help="Density quantity to plot (default: mass; use number for atoms/A^3).",
+    )
+
+
+def _add_rdf_plot_options(
+    parser: argparse.ArgumentParser,
+    *,
+    group_title: str = "RDF plot options",
+) -> None:
+    group = parser.add_argument_group(group_title)
+    group.add_argument(
+        "--species-a",
+        default=None,
+        help=(
+            "Optional first-species override for RDF/coordination profiles "
+            "(default: use file metadata)"
+        ),
+    )
+    group.add_argument(
+        "--species-b",
+        default=None,
+        help=(
+            "Optional second-species override for RDF/coordination profiles "
+            "(default: use file metadata or species-a)"
+        ),
+    )
+
+
+def _add_position_plot_options(
+    parser: argparse.ArgumentParser,
+    *,
+    include_axis: bool,
+    include_component: bool,
+    include_map_color: bool,
+    include_projection: bool,
+    include_time_axis: bool,
+    include_time_section_width: bool,
+    group_title: str = "Position plot options",
+) -> None:
+    group = parser.add_argument_group(group_title)
+    if include_axis:
+        group.add_argument(
+            "--axis",
+            choices=["x", "y", "z"],
+            default=None,
+            help=(
+                "Optional axis override for loaded density/position/coordination profiles "
+                "(default: use file metadata)"
+            ),
+        )
+    if include_component:
+        group.add_argument(
+            "--component",
+            choices=[
+                "distance",
+                "x",
+                "y",
+                "z",
+                "xy-z",
+                "2d-projection",
+                "time",
+                "time-distance",
+                "average",
+                "density-weighted",
+                "heatmap",
+            ],
+            default="distance",
+            help=(
+                "Plot component. Position supports distance/x/y/z and 2d-projection "
+                "(alias: xy-z). Coordination supports distance, time, and time-distance. "
+                "Orientation supports average, density-weighted, and heatmap."
+            ),
+        )
+    if include_map_color:
+        group.add_argument(
+            "--map-color",
+            choices=["distance", "z"],
+            default="distance",
+            help=(
+                "Legacy color source for projection mode (default: distance). "
+                "Equivalent to --projection-value when projection-specific settings are not set."
+            ),
+        )
+    if include_projection:
+        group.add_argument(
+            "--projection-x",
+            choices=["x", "y", "z", "distance", "ps", "fs", "step", "frame"],
+            default=None,
+            help="X quantity for --component 2d-projection (default: x).",
+        )
+        group.add_argument(
+            "--projection-y",
+            choices=["x", "y", "z", "distance", "ps", "fs", "step", "frame"],
+            default=None,
+            help="Y quantity for --component 2d-projection (default: y).",
+        )
+        group.add_argument(
+            "--projection-value",
+            choices=["x", "y", "z", "distance", "ps", "fs", "step", "frame"],
+            default=None,
+            help=(
+                "Color/filter quantity for --component 2d-projection. "
+                "Defaults to --map-color compatibility behavior."
+            ),
+        )
+        group.add_argument(
+            "--projection-render-mode",
+            choices=["color-scale", "line-colors"],
+            default=None,
+            help=(
+                "How --component 2d-projection is rendered: a continuous color scale or "
+                "normal per-atom line colors."
+            ),
+        )
+        group.add_argument(
+            "--projection-filter-min",
+            type=float,
+            default=None,
+            help="Optional lower bound for the selected projection value quantity.",
+        )
+        group.add_argument(
+            "--projection-filter-max",
+            type=float,
+            default=None,
+            help="Optional upper bound for the selected projection value quantity.",
+        )
+        group.add_argument(
+            "--xy-z-distance-max",
+            type=_positive_float,
+            default=None,
+            help=(
+                "Legacy compatibility alias for a projection distance cutoff. "
+                "Equivalent to --projection-filter-max when filtering by distance."
+            ),
+        )
+    if include_time_axis:
+        group.add_argument(
+            "--time-axis",
+            choices=["ps", "fs", "step", "frame"],
+            default="ps",
+            help="Time axis for position/coordination plots (default: ps).",
+        )
+    if include_time_section_width:
+        group.add_argument(
+            "--time-section-width",
+            type=_positive_float,
+            default=None,
+            help=(
+                "Optional time-section width for display-only rebinning in position plots. "
+                "Equivalent to x-bin width."
+            ),
+        )
+
+
+def _add_orientation_plot_options(
+    parser: argparse.ArgumentParser,
+    *,
+    include_component: bool,
+    group_title: str = "Orientation plot options",
+) -> None:
+    group = parser.add_argument_group(group_title)
+    if include_component:
+        group.add_argument(
+            "--component",
+            choices=["average", "density-weighted", "heatmap"],
+            default="average",
+            help=("Plot component. Orientation supports average, density-weighted, and heatmap."),
+        )
+    group.add_argument(
+        "--angle",
+        choices=["polar", "azimuthal"],
+        default="polar",
+        help=(
+            "Which angle component to plot for orientation analysis "
+            "(default: polar). Ignored by non-orientation analyses."
+        ),
+    )
+
+
+def _configure_plot_parser(parser: argparse.ArgumentParser, *, analysis: str | None = None) -> None:
+    _add_plot_common_options(parser)
+    _add_plot_source_options(
+        parser,
+        help_text="LiNaK analysis HDF5 input (use `linak hdf5 plot` for generic tables)",
+    )
+
+    if analysis is None:
+        _add_species_override_options(parser)
+        _add_density_plot_options(parser, include_axis=True)
+        _add_rdf_plot_options(parser)
+        _add_position_plot_options(
+            parser,
+            include_axis=False,
+            include_component=True,
+            include_map_color=True,
+            include_projection=True,
+            include_time_axis=True,
+            include_time_section_width=True,
+        )
+        _add_orientation_plot_options(parser, include_component=False)
+        return
+
+    normalized = str(analysis).strip().lower()
+    if normalized == "density":
+        _add_species_override_options(parser)
+        _add_density_plot_options(parser, include_axis=True)
+        return
+    if normalized == "msd":
+        _add_species_override_options(parser)
+        return
+    if normalized == "rdf":
+        _add_rdf_plot_options(parser)
+        return
+    if normalized == "position":
+        _add_species_override_options(parser)
+        _add_position_plot_options(
+            parser,
+            include_axis=True,
+            include_component=True,
+            include_map_color=True,
+            include_projection=True,
+            include_time_axis=True,
+            include_time_section_width=True,
+            group_title="Position plot options",
+        )
+        return
+    if normalized == "coordination":
+        _add_rdf_plot_options(parser, group_title="Coordination plot options")
+        _add_position_plot_options(
+            parser,
+            include_axis=True,
+            include_component=True,
+            include_map_color=False,
+            include_projection=False,
+            include_time_axis=True,
+            include_time_section_width=False,
+            group_title="Coordination plot options",
+        )
+        return
+    if normalized == "orientation":
+        _add_orientation_plot_options(parser, include_component=True)
+        return
+    if normalized == "potential":
+        return
+
+
+def build_plot_parser(*, analysis: str | None = None) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="linak plot",
+        description=_plot_parser_description(analysis=analysis),
+        epilog=_PLOT_PARSER_EPILOG,
+    )
+    _configure_plot_parser(parser, analysis=analysis)
+    _add_dry_run_option(parser)
+    return parser
 
 
 def _resolve_apply_output_path(args: argparse.Namespace) -> Path:
@@ -3710,6 +4436,7 @@ def _build_plot_style(args: argparse.Namespace) -> PlotStyle:
         font_color=getattr(args, "font_color", None),
         font_size=getattr(args, "font_size", None),
         title_font_size=args.title_font_size,
+        title_pad=getattr(args, "title_pad", None),
         label_font_size=args.label_font_size,
         tick_font_size=args.tick_font_size,
         legend_font_size=args.legend_font_size,
@@ -4072,7 +4799,6 @@ def _apply_effective_series_settings(
         any_width = False
         any_marker = False
         any_line_kwargs = False
-        any_norm = False
         for descriptor in source_ordered_descriptors:
             default_label = str(descriptor.get("default_label") or "Series").strip() or "Series"
             series_id = str(descriptor.get("series_id") or "").strip()
@@ -4135,7 +4861,6 @@ def _apply_effective_series_settings(
                 if entry.get("normalization_x_ref") is None
                 else float(entry["normalization_x_ref"])
             )
-            any_norm = any_norm or (mode_value is not None)
 
         merged_labels = override_labels
         merged_colors = override_colors if any_color else None
@@ -4146,9 +4871,9 @@ def _apply_effective_series_settings(
         args.series_line_widths = override_widths if any_width else None
         args.series_markers = override_markers if any_marker else None
         args.series_line_kwargs = override_line_kwargs if any_line_kwargs else None
-        args.series_normalization_modes = override_norm_modes if any_norm else None
-        args.series_normalization_values = override_norm_values if any_norm else None
-        args.series_normalization_x_refs = override_norm_x_refs if any_norm else None
+        args.series_normalization_modes = override_norm_modes
+        args.series_normalization_values = override_norm_values
+        args.series_normalization_x_refs = override_norm_x_refs
     else:
         args.series_fit_configs = None
         args.series_error_configs = None
@@ -4457,6 +5182,9 @@ def _merge_gui_only_plot_settings(
         "series_enabled",
         "series_show_in_legend",
         "series_alpha",
+        "series_normalization_modes",
+        "series_normalization_values",
+        "series_normalization_x_refs",
         "_gui_sync_modes",
     ):
         if key in saved:
@@ -4548,17 +5276,6 @@ def _materialize_gui_series_overrides(settings: dict[str, Any]) -> dict[str, Any
                 if isinstance(line_kwargs_value, dict) and "line_kwargs" not in entry:
                     entry["line_kwargs"] = deepcopy(line_kwargs_value)
 
-            if index < len(raw_norm_modes):
-                mode_value = raw_norm_modes[index]
-                if mode_value not in {None, ""} and "normalization_mode" not in entry:
-                    entry["normalization_mode"] = str(mode_value)
-
-            if index < len(raw_norm_values) and raw_norm_values[index] is not None:
-                entry.setdefault("normalization_value", float(raw_norm_values[index]))
-
-            if index < len(raw_norm_x_refs) and raw_norm_x_refs[index] is not None:
-                entry.setdefault("normalization_x_ref", float(raw_norm_x_refs[index]))
-
             if index < len(raw_fit_configs):
                 fit_config = raw_fit_configs[index]
                 if isinstance(fit_config, dict) and "fit" not in entry:
@@ -4572,6 +5289,17 @@ def _materialize_gui_series_overrides(settings: dict[str, Any]) -> dict[str, Any
             entry.setdefault("enabled", True)
             entry.setdefault("show_in_legend", True)
 
+        if index < len(raw_norm_modes):
+            mode_value = raw_norm_modes[index]
+            if mode_value not in {None, ""} and "normalization_mode" not in entry:
+                entry["normalization_mode"] = str(mode_value)
+
+        if index < len(raw_norm_values) and raw_norm_values[index] is not None:
+            entry.setdefault("normalization_value", float(raw_norm_values[index]))
+
+        if index < len(raw_norm_x_refs) and raw_norm_x_refs[index] is not None:
+            entry.setdefault("normalization_x_ref", float(raw_norm_x_refs[index]))
+
         if entry:
             overrides[series_id] = entry
             any_entry = True
@@ -4581,6 +5309,9 @@ def _materialize_gui_series_overrides(settings: dict[str, Any]) -> dict[str, Any
 
     normalized = dict(settings)
     normalized["series_overrides"] = overrides
+    normalized.pop("series_normalization_modes", None)
+    normalized.pop("series_normalization_values", None)
+    normalized.pop("series_normalization_x_refs", None)
     return normalized
 
 
@@ -4618,6 +5349,7 @@ def _without_preview_series_state(settings: dict[str, Any] | None) -> dict[str, 
         return {}
     blocked = {
         "series_order",
+        "series_overrides",
         "series_labels",
         "line_colors",
         "line_color",
@@ -4634,6 +5366,36 @@ def _without_preview_series_state(settings: dict[str, Any] | None) -> dict[str, 
         "integration_config",
     }
     return {key: deepcopy(value) for key, value in settings.items() if key not in blocked}
+
+
+def _merge_preview_defaults_into_gui_settings(
+    settings: dict[str, Any],
+    preview_state: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Merge preview-derived defaults without overwriting explicit manual GUI choices."""
+    if not isinstance(preview_state, dict):
+        return dict(settings)
+    merged = dict(settings)
+    preview_defaults = _without_preview_series_state(preview_state)
+    explicit_sync_modes = _derive_gui_sync_modes(settings)
+    guarded_keys = {
+        "title": "title",
+        "title_visible": "title",
+        "x_label": "x_label",
+        "y_label": "y_label",
+        "x_lim": "x_lim",
+        "y_lim": "y_lim",
+        "x_ticks": "x_ticks",
+        "y_ticks": "y_ticks",
+        "x_label_pad": "x_label_pad",
+        "y_label_pad": "y_label_pad",
+    }
+    for key, value in preview_defaults.items():
+        mode_key = guarded_keys.get(key)
+        if mode_key is not None and explicit_sync_modes.get(mode_key, "auto") != "auto":
+            continue
+        merged[key] = deepcopy(value)
+    return merged
 
 
 def _build_density_gui_context(
@@ -4671,6 +5433,7 @@ def _build_density_gui_context(
             series_id_segments_by_source=series_id_segments_by_source,
             origin_path_segments_by_source=origin_path_segments_by_source,
         ),
+        estimated_total_points=_estimate_total_points_from_loaded_profiles(plot_profiles),
     )
 
 
@@ -4705,6 +5468,7 @@ def _build_msd_gui_context(
             series_id_segments_by_source=series_id_segments_by_source,
             origin_path_segments_by_source=origin_path_segments_by_source,
         ),
+        estimated_total_points=_estimate_total_points_from_loaded_profiles(plot_profiles),
     )
 
 
@@ -4745,6 +5509,7 @@ def _build_rdf_gui_context(
             origin_path_segments_by_source=origin_path_segments_by_source,
         ),
         profile_filter_options=_build_rdf_profile_filter_options(raw_payloads_by_source),
+        estimated_total_points=_estimate_total_points_from_loaded_profiles(plot_profiles),
     )
 
 
@@ -4753,6 +5518,110 @@ def _build_position_gui_context(
     *,
     sources: list[str],
 ) -> _GuiPlotRenderContext:
+    resolved_projection = _resolve_position_projection_estimation_settings(args)
+    projection_mode = resolved_projection.get("component") == "2d-projection"
+    if _position_projection_uses_profile_descriptors(args, resolved_projection=resolved_projection):
+        from .analysis.position import load_position_profiles
+
+        raw_payloads_by_source = _read_analysis_profile_payloads_by_source(
+            sources=sources,
+            analysis="position",
+        )
+        prefix_source_labels = _should_prefix_combined_source_labels(
+            sources=sources,
+            metadata_items=[
+                dict(payload.get("metadata", {}))
+                for _source, source_payloads in raw_payloads_by_source
+                for payload in source_payloads
+            ],
+        )
+        profiles_by_source: list[tuple[str, list[Any]]] = []
+        for source in sources:
+            profiles_by_source.append(
+                (
+                    source,
+                    load_position_profiles(source, species=args.species, axis=args.axis),
+                )
+            )
+
+        plot_profiles: list[Any] = []
+        fallback_labels_by_source: list[list[str]] = []
+        series_id_segments_by_source: list[list[str]] = []
+        origin_path_segments_by_source: list[list[str]] = []
+        raw_estimated_total_points = 0
+        for source_index, (source, profiles) in enumerate(profiles_by_source):
+            raw_payloads = raw_payloads_by_source[source_index][1]
+            if len(raw_payloads) != len(profiles):
+                raise ValueError("Position profile metadata does not match loaded profiles.")
+            source_labels: list[str] = []
+            source_ids: list[str] = []
+            source_origins: list[str] = []
+            for profile_index, profile in enumerate(profiles):
+                payload = raw_payloads[profile_index]
+                metadata = dict(payload.get("metadata", {}))
+                profile_uid = _profile_uid_from_payload(
+                    payload,
+                    fallback_prefix="position",
+                    index=profile_index,
+                )
+                source_label = _metadata_source_label(metadata, fallback_source=source)
+                rendered_species = (
+                    f"{source_label}:{profile.species}" if prefix_source_labels else profile.species
+                )
+                rendered_profile = replace(profile, species=rendered_species)
+                plot_profiles.append(rendered_profile)
+                source_labels.append(rendered_species)
+                source_ids.append(str(profile_uid))
+                source_origins.append(str(metadata.get("origin_hdf5_path") or source))
+                points = _estimate_points_for_loaded_profile(rendered_profile)
+                if points is not None:
+                    raw_estimated_total_points += int(points)
+            fallback_labels_by_source.append(source_labels)
+            series_id_segments_by_source.append(source_ids)
+            origin_path_segments_by_source.append(source_origins)
+
+        raw_candidate_points = raw_estimated_total_points
+        estimated_total_points = raw_estimated_total_points
+        if projection_mode:
+            raw_candidate_points, estimated_total_points = _estimate_position_gui_point_counts(
+                plot_profiles,
+                resolved_projection=resolved_projection,
+            )
+            _log_position_projection_guard_debug(
+                stage="full_context",
+                resolved_projection=resolved_projection,
+                raw_candidate_points=raw_candidate_points,
+                final_visible_points=estimated_total_points,
+            )
+        _log_plot_complexity_debug(
+            analysis_name="position",
+            stage="full_context",
+            raw_series_count=len(plot_profiles),
+            raw_point_count=raw_candidate_points,
+            final_series_count=len(plot_profiles),
+            final_point_count=estimated_total_points,
+        )
+
+        return _GuiPlotRenderContext(
+            profile=plot_profiles,
+            plot_source_label=sources[0] if len(sources) == 1 else "multi_source_position",
+            plotter_kwargs=_resolve_position_plotter_kwargs(args),
+            fallback_labels_by_source=fallback_labels_by_source,
+            default_series_labels=_resolve_gui_default_series_labels(
+                args=args,
+                sources=sources,
+                profile_key=_PLOT_PROFILE_POSITION,
+                fallback_labels_by_source=fallback_labels_by_source,
+            ),
+            series_descriptors=_build_gui_series_descriptors(
+                sources=sources,
+                fallback_labels_by_source=fallback_labels_by_source,
+                series_id_segments_by_source=series_id_segments_by_source,
+                origin_path_segments_by_source=origin_path_segments_by_source,
+            ),
+            estimated_total_points=estimated_total_points,
+        )
+
     (
         plot_profiles,
         fallback_labels_by_source,
@@ -4763,14 +5632,32 @@ def _build_position_gui_context(
         species=args.species,
         axis=args.axis,
     )
+    raw_estimated_total_points = _estimate_total_points_from_loaded_profiles(plot_profiles) or 0
+    raw_candidate_points = raw_estimated_total_points
+    estimated_total_points = raw_estimated_total_points
+    if projection_mode:
+        raw_candidate_points, estimated_total_points = _estimate_position_gui_point_counts(
+            plot_profiles,
+            resolved_projection=resolved_projection,
+        )
+        _log_position_projection_guard_debug(
+            stage="full_context",
+            resolved_projection=resolved_projection,
+            raw_candidate_points=raw_candidate_points,
+            final_visible_points=estimated_total_points,
+        )
+    _log_plot_complexity_debug(
+        analysis_name="position",
+        stage="full_context",
+        raw_series_count=len(plot_profiles),
+        raw_point_count=raw_candidate_points,
+        final_series_count=len(plot_profiles),
+        final_point_count=estimated_total_points,
+    )
     return _GuiPlotRenderContext(
         profile=plot_profiles,
         plot_source_label=sources[0] if len(sources) == 1 else "multi_source_position",
-        plotter_kwargs={
-            "component": args.component,
-            "map_color": args.map_color,
-            "time_axis": args.time_axis,
-        },
+        plotter_kwargs=_resolve_position_plotter_kwargs(args),
         fallback_labels_by_source=fallback_labels_by_source,
         default_series_labels=_resolve_gui_default_series_labels(
             args=args,
@@ -4784,6 +5671,7 @@ def _build_position_gui_context(
             series_id_segments_by_source=series_id_segments_by_source,
             origin_path_segments_by_source=origin_path_segments_by_source,
         ),
+        estimated_total_points=estimated_total_points,
     )
 
 
@@ -4829,6 +5717,7 @@ def _build_coordination_gui_context(
             origin_path_segments_by_source=origin_path_segments_by_source,
         ),
         profile_filter_options=_build_coordination_profile_filter_options(raw_payloads_by_source),
+        estimated_total_points=_estimate_total_points_from_loaded_profiles(plot_profiles),
     )
 
 
@@ -5248,6 +6137,12 @@ def _build_position_gui_lazy_catalog(
     origin_path_segments_by_source: list[list[str]] = []
     load_source_path_segments_by_source: list[list[str]] = []
     extra_segments_by_source: list[list[dict[str, Any]]] = []
+    raw_estimated_total_points = 0
+    resolved_projection = _resolve_position_projection_estimation_settings(args)
+    profile_level_projection = _position_projection_uses_profile_descriptors(
+        args,
+        resolved_projection=resolved_projection,
+    )
     for source, headers in headers_by_source:
         source_path = Path(source).expanduser().resolve()
         lightweight_payloads = read_linak_hdf5_profiles_by_index(
@@ -5280,20 +6175,36 @@ def _build_position_gui_lazy_catalog(
                 index=profile_index,
             )
             atom_indices = np.asarray(datasets.get("atom_indices", []), dtype=int)
-            for atom_index in atom_indices.tolist():
-                atom_token = int(atom_index)
-                source_labels.append(f"{rendered_species}[{atom_token}]")
-                source_ids.append(f"{profile_uid}:atom:{atom_token}")
+            raw_estimated_total_points += int(header.get("n_frames", 0) or 0) * int(
+                atom_indices.size
+            )
+            if profile_level_projection:
+                source_labels.append(rendered_species)
+                source_ids.append(str(profile_uid))
                 source_origins.append(str(header.get("origin_hdf5_path") or source))
                 source_load_paths.append(str(header.get("source_path") or source))
                 source_extras.append(
                     {
                         "profile_index": profile_index,
                         "profile_uid": profile_uid,
-                        "atom_index": atom_token,
                         "rendered_species": rendered_species,
                     }
                 )
+            else:
+                for atom_index in atom_indices.tolist():
+                    atom_token = int(atom_index)
+                    source_labels.append(f"{rendered_species}[{atom_token}]")
+                    source_ids.append(f"{profile_uid}:atom:{atom_token}")
+                    source_origins.append(str(header.get("origin_hdf5_path") or source))
+                    source_load_paths.append(str(header.get("source_path") or source))
+                    source_extras.append(
+                        {
+                            "profile_index": profile_index,
+                            "profile_uid": profile_uid,
+                            "atom_index": atom_token,
+                            "rendered_species": rendered_species,
+                        }
+                    )
         fallback_labels_by_source.append(source_labels)
         series_id_segments_by_source.append(source_ids)
         origin_path_segments_by_source.append(source_origins)
@@ -5335,27 +6246,92 @@ def _build_position_gui_lazy_catalog(
             for profile_index in parent_order:
                 parent_profile = parent_by_index[profile_index]
                 for descriptor in grouped_parents[profile_index]:
-                    child_profile = _extract_position_profile_atom_series(
-                        parent_profile,
-                        int(descriptor["atom_index"]),
-                    )
-                    loaded_by_id[str(descriptor["series_id"])] = replace(
-                        child_profile,
-                        species=str(descriptor.get("rendered_species") or child_profile.species),
-                    )
+                    if profile_level_projection:
+                        loaded_by_id[str(descriptor["series_id"])] = replace(
+                            parent_profile,
+                            species=str(
+                                descriptor.get("rendered_species") or parent_profile.species
+                            ),
+                        )
+                    else:
+                        child_profile = _extract_position_profile_atom_series(
+                            parent_profile,
+                            int(descriptor["atom_index"]),
+                        )
+                        loaded_by_id[str(descriptor["series_id"])] = replace(
+                            child_profile,
+                            species=str(
+                                descriptor.get("rendered_species") or child_profile.species
+                            ),
+                        )
         return [loaded_by_id[str(descriptor["series_id"])] for descriptor in descriptors]
+
+    raw_candidate_points = raw_estimated_total_points
+    estimated_total_points = raw_estimated_total_points
+    if resolved_projection.get("component") == "2d-projection":
+        raw_candidate_points = 0
+        estimated_total_points = 0
+        for source, headers in headers_by_source:
+            source_path = Path(source).expanduser().resolve()
+            indices = [int(header.get("profile_index", 0)) for header in headers]
+            loaded_profiles = load_position_profiles_by_index(
+                source_path,
+                indices,
+                species=args.species,
+                axis=args.axis,
+            )
+            for profile in loaded_profiles:
+                profile_raw_points, profile_final_points = (
+                    _estimate_position_projection_point_counts(
+                        profile,
+                        resolved_projection=resolved_projection,
+                    )
+                )
+                raw_candidate_points += profile_raw_points
+                estimated_total_points += profile_final_points
+        _log_position_projection_guard_debug(
+            stage="lazy_catalog",
+            resolved_projection=resolved_projection,
+            raw_candidate_points=raw_candidate_points,
+            final_visible_points=estimated_total_points,
+        )
+    descriptor_count = sum(len(segment) for segment in descriptor_segments)
+    _log_plot_complexity_debug(
+        analysis_name="position",
+        stage="lazy_catalog",
+        raw_series_count=descriptor_count,
+        raw_point_count=raw_candidate_points,
+        final_series_count=descriptor_count,
+        final_point_count=estimated_total_points,
+    )
+
+    def _estimate_render_points(
+        active_profiles: list[Any],
+        current_args: argparse.Namespace,
+        _active_descriptors: list[dict[str, Any]],
+    ) -> int | None:
+        resolved_current_projection = _resolve_position_projection_estimation_settings(current_args)
+        raw_points, final_points = _estimate_position_gui_point_counts(
+            active_profiles,
+            resolved_projection=resolved_current_projection,
+        )
+        _log_position_projection_guard_debug(
+            stage="render_context",
+            resolved_projection=resolved_current_projection,
+            raw_candidate_points=raw_points,
+            final_visible_points=final_points,
+        )
+        return final_points
 
     return _LazyGuiSeriesCatalog(
         sources=list(sources),
         plot_source_label=sources[0] if len(sources) == 1 else "multi_source_position",
-        plotter_kwargs={
-            "component": args.component,
-            "map_color": args.map_color,
-            "time_axis": args.time_axis,
-        },
+        plotter_kwargs=_resolve_position_plotter_kwargs(args),
         descriptor_segments_by_source=descriptor_segments,
         profile_filter_options=None,
         load_profiles=_load_profiles,
+        estimated_total_points=estimated_total_points,
+        estimate_render_points=_estimate_render_points,
         _active_profiles_by_series_id=(
             active_profiles_by_series_id if active_profiles_by_series_id is not None else {}
         ),
@@ -5409,6 +6385,7 @@ def _build_coordination_gui_lazy_catalog(
     origin_path_segments_by_source: list[list[str]] = []
     load_source_path_segments_by_source: list[list[str]] = []
     extra_segments_by_source: list[list[dict[str, Any]]] = []
+    estimated_total_points = 0
     for source, headers in headers_by_source:
         source_path = Path(source).expanduser().resolve()
         matching_headers: list[dict[str, Any]] = []
@@ -5480,6 +6457,10 @@ def _build_coordination_gui_lazy_catalog(
 
             atom_indices = np.asarray(
                 payloads_by_index.get(profile_index, {}).get("atom_indices", []), dtype=int
+            )
+            estimated_total_points += int(header.get("n_frames", 0) or 0) * max(
+                1 if normalized_component == "distance" else int(atom_indices.size),
+                1,
             )
             for atom_index in atom_indices.tolist():
                 atom_token = int(atom_index)
@@ -5579,6 +6560,7 @@ def _build_coordination_gui_lazy_catalog(
             _headers_by_source_as_metadata_payloads(filtered_headers_by_source)
         ),
         load_profiles=_load_profiles,
+        estimated_total_points=estimated_total_points or None,
         _active_profiles_by_series_id=(
             active_profiles_by_series_id if active_profiles_by_series_id is not None else {}
         ),
@@ -5650,6 +6632,7 @@ def _build_potential_gui_context(
                 "incomplete_rows": incomplete_rows,
             }
         },
+        estimated_total_points=_estimate_total_points_from_loaded_profiles(flattened_profiles),
     )
 
 
@@ -5704,6 +6687,7 @@ def _build_orientation_gui_context(
             series_id_segments_by_source=series_id_segments_by_source,
             origin_path_segments_by_source=origin_path_segments_by_source,
         ),
+        estimated_total_points=_estimate_total_points_from_loaded_profiles(plot_profiles),
     )
 
 
@@ -6069,7 +7053,64 @@ def _derive_gui_sync_modes(settings: dict[str, Any]) -> dict[str, str]:
 
 
 def _apply_gui_settings_to_args(args: argparse.Namespace, settings: dict[str, Any]) -> None:
-    always_forward = {"series_overrides", "series_order", "annotations"}
+    always_forward = {
+        "title",
+        "title_visible",
+        "x_label",
+        "y_label",
+        "x_lim",
+        "y_lim",
+        "x_ticks",
+        "y_ticks",
+        "x_scale",
+        "y_scale",
+        "x_axis_scale",
+        "x_axis_offset",
+        "x_tick_rotation",
+        "y_tick_rotation",
+        "x_label_font_size",
+        "y_label_font_size",
+        "x_tick_font_size",
+        "y_tick_font_size",
+        "x_label_pad",
+        "y_label_pad",
+        "series_overrides",
+        "series_order",
+        "annotations",
+        "title_pad",
+        "heatmap_vmin",
+        "heatmap_vmax",
+        "heatmap_cmap",
+        "heatmap_normalize",
+        "heatmap_normalization_mode",
+        "heatmap_log_scale",
+        "heatmap_colorbar_enabled",
+        "heatmap_colorbar_label",
+        "heatmap_colorbar_label_size",
+        "heatmap_colorbar_tick_size",
+        "heatmap_colorbar_position",
+        "heatmap_colorbar_pad",
+        "heatmap_colorbar_shrink",
+        "heatmap_colorbar_aspect",
+        "projection_x",
+        "projection_y",
+        "projection_value",
+        "projection_render_mode",
+        "projection_filter_min",
+        "projection_filter_max",
+        "y_bin_width",
+        "y_bin_reducer",
+        "xy_z_distance_max",
+        "figure_kwargs",
+        "axes_kwargs",
+        "line_kwargs",
+        "series_line_kwargs",
+        "grid_kwargs",
+        "legend_kwargs",
+        "tick_params_kwargs",
+        "tight_layout_kwargs",
+        "savefig_kwargs",
+    }
     for key, value in settings.items():
         if key not in always_forward and not hasattr(args, key):
             continue
@@ -6078,9 +7119,27 @@ def _apply_gui_settings_to_args(args: argparse.Namespace, settings: dict[str, An
         _clear_gui_positional_series_args(args)
     if "x_bin_width" in settings and hasattr(args, "time_section_width"):
         args.time_section_width = settings.get("x_bin_width")
-    if hasattr(args, "x_lim"):
+    if "x_min" not in settings and hasattr(args, "x_min"):
+        args.x_min = None
+    if "x_max" not in settings and hasattr(args, "x_max"):
+        args.x_max = None
+    if "y_min" not in settings and hasattr(args, "y_min"):
+        args.y_min = None
+    if "y_max" not in settings and hasattr(args, "y_max"):
+        args.y_max = None
+    if (
+        "x_lim" not in settings
+        and settings.get("x_min") is None
+        and settings.get("x_max") is None
+        and hasattr(args, "x_lim")
+    ):
         args.x_lim = None
-    if hasattr(args, "y_lim"):
+    if (
+        "y_lim" not in settings
+        and settings.get("y_min") is None
+        and settings.get("y_max") is None
+        and hasattr(args, "y_lim")
+    ):
         args.y_lim = None
 
 
@@ -6347,6 +7406,38 @@ def _launch_profile_plot_gui(
     )
     initial_settings = _materialize_gui_series_overrides(initial_settings)
     initial_settings = _strip_redundant_series_lists_for_gui(initial_settings)
+
+    effective_guard_args = deepcopy(args)
+    _apply_gui_settings_to_args(effective_guard_args, initial_settings)
+    effective_context = build_full_context(effective_guard_args)
+    effective_series_descriptors = _merge_gui_series_descriptors(
+        effective_context.series_descriptors,
+        initial_saved_profile.get("series_descriptors")
+        if isinstance(initial_saved_profile, dict)
+        else None,
+    )
+    _log_plot_complexity_debug(
+        analysis_name=analysis_name,
+        stage="gui_launch_guard",
+        raw_series_count=len(initial_context.series_descriptors),
+        raw_point_count=initial_context.estimated_total_points,
+        final_series_count=len(effective_series_descriptors),
+        final_point_count=effective_context.estimated_total_points,
+    )
+    if not getattr(args, "force_gui", False):
+        _raise_or_warn_for_plot_complexity(
+            _estimate_plot_complexity(
+                analysis_name=analysis_name,
+                series_descriptors=effective_series_descriptors,
+                profile=effective_context.profile,
+                estimated_total_points=effective_context.estimated_total_points,
+            ),
+            interactive_gui=True,
+        )
+    else:
+        LOGGER.debug(
+            "Bypassing %s GUI complexity guard because --force-gui was provided.", analysis_name
+        )
     gui_render_sources = [
         f"gui-series-source:{index}"
         for index in range(len(initial_context.fallback_labels_by_source))
@@ -6376,6 +7467,30 @@ def _launch_profile_plot_gui(
         context = build_context(load_args)
         if context.series_count <= 0:
             raise ValueError(empty_error_message)
+        if output is None:
+            _log_plot_complexity_debug(
+                analysis_name=analysis_name,
+                stage="gui_preview_guard",
+                raw_series_count=len(initial_context.series_descriptors),
+                raw_point_count=initial_context.estimated_total_points,
+                final_series_count=len(context.series_descriptors),
+                final_point_count=context.estimated_total_points,
+            )
+            if not getattr(preview_args, "force_gui", False):
+                _raise_or_warn_for_plot_complexity(
+                    _estimate_plot_complexity(
+                        analysis_name=analysis_name,
+                        series_descriptors=context.series_descriptors,
+                        profile=context.profile,
+                        estimated_total_points=context.estimated_total_points,
+                    ),
+                    interactive_gui=True,
+                )
+            else:
+                LOGGER.debug(
+                    "Bypassing %s GUI preview complexity guard because --force-gui was provided.",
+                    analysis_name,
+                )
         _apply_effective_series_settings(
             args=preview_args,
             sources=gui_render_sources,
@@ -6408,7 +7523,10 @@ def _launch_profile_plot_gui(
             empty_error_message="No series are enabled. Turn on at least one series to preview.",
         )
     if initial_render_state:
-        initial_settings.update(_without_preview_series_state(initial_render_state))
+        initial_settings = _merge_preview_defaults_into_gui_settings(
+            initial_settings,
+            initial_render_state,
+        )
         # Render-state values are matplotlib defaults, not explicit user choices.
         # Explicitly mark any synced field without a stored mode as "auto" so
         # _derive_synced_field_modes in the GUI does not infer "manual" from them.
@@ -6789,117 +7907,11 @@ def build_parser() -> argparse.ArgumentParser:
     plot_parser = commands.add_parser(
         "plot",
         help="Generate plots from precomputed LiNaK HDF5 data.",
-        description=(
-            "Plot LiNaK analysis HDF5 data by auto-detecting density, MSD, RDF, position, coordination, potential, or orientation from HDF5 "
-            "metadata. If the input HDF5 is not a supported LiNaK analysis file, LiNaK falls "
-            f"back to `{_TABULAR_COMMAND} plot`."
-        ),
-        epilog=(
-            "Trajectory inputs are intentionally not supported here: run `linak compute ...` "
-            "first. For generic tabular HDF5 plotting, use `linak hdf5 plot` directly."
-        ),
+        description=_plot_parser_description(),
+        epilog=_PLOT_PARSER_EPILOG,
     )
     plot_parser.set_defaults(handler=_handle_plot)
-    _add_plot_common_options(plot_parser)
-    _add_plot_source_options(
-        plot_parser,
-        help_text="LiNaK analysis HDF5 input (use `linak hdf5 plot` for generic tables)",
-    )
-    common_analysis_group = plot_parser.add_argument_group("Analysis selection filters")
-    common_analysis_group.add_argument(
-        "--species",
-        default=None,
-        help="Optional species override for density/MSD/position loaded profile labels (default: use file metadata)",
-    )
-    density_group = plot_parser.add_argument_group("Density plot options")
-    density_group.add_argument(
-        "--axis",
-        choices=["x", "y", "z"],
-        default=None,
-        help=(
-            "Optional axis override for loaded density/position/coordination profiles "
-            "(default: use file metadata)"
-        ),
-    )
-    density_group.add_argument(
-        "--x-mode",
-        choices=["distance", "axis"],
-        default="distance",
-        help="Density x-axis mode: distance to surface (default) or raw axis coordinate.",
-    )
-    density_group.add_argument(
-        "--quantity",
-        choices=["mass", "number"],
-        default="mass",
-        help="Density quantity to plot (default: mass; use number for atoms/A^3).",
-    )
-    rdf_group = plot_parser.add_argument_group("RDF plot options")
-    rdf_group.add_argument(
-        "--species-a",
-        default=None,
-        help="Optional first-species override for RDF/coordination profiles (default: use file metadata)",
-    )
-    rdf_group.add_argument(
-        "--species-b",
-        default=None,
-        help="Optional second-species override for RDF/coordination profiles (default: use file metadata or species-a)",
-    )
-    position_group = plot_parser.add_argument_group("Position plot options")
-    position_group.add_argument(
-        "--component",
-        choices=[
-            "distance",
-            "x",
-            "y",
-            "z",
-            "xy-z",
-            "time",
-            "time-distance",
-            "average",
-            "density-weighted",
-            "heatmap",
-        ],
-        default="distance",
-        help=(
-            "Plot component. Position supports distance/x/y/z and xy-z. "
-            "Coordination supports distance, time, and time-distance. "
-            "Orientation supports average, density-weighted, and heatmap."
-        ),
-    )
-    position_group.add_argument(
-        "--map-color",
-        choices=["distance", "z"],
-        default="distance",
-        help=(
-            "Color source for --component xy-z (default: distance). "
-            "Ignored by time-axis components."
-        ),
-    )
-    position_group.add_argument(
-        "--time-axis",
-        choices=["ps", "fs", "step", "frame"],
-        default="ps",
-        help="Time axis for position/coordination plots (default: ps).",
-    )
-    position_group.add_argument(
-        "--time-section-width",
-        type=_positive_float,
-        default=None,
-        help=(
-            "Optional time-section width for display-only rebinning in position plots. "
-            "Equivalent to x-bin width."
-        ),
-    )
-    orientation_group = plot_parser.add_argument_group("Orientation plot options")
-    orientation_group.add_argument(
-        "--angle",
-        choices=["polar", "azimuthal"],
-        default="polar",
-        help=(
-            "Which angle component to plot for orientation analysis "
-            "(default: polar). Ignored by non-orientation analyses."
-        ),
-    )
+    _configure_plot_parser(plot_parser)
     _add_dry_run_option(plot_parser)
 
     compute_parser = commands.add_parser(
@@ -9437,6 +10449,67 @@ def _resolve_auto_plot_analysis_from_sources(sources: list[str]) -> str | None:
     return first
 
 
+def _resolve_uniform_plot_analysis_from_sources(sources: list[str]) -> str | None:
+    if not sources:
+        return None
+    detected = [_detect_plot_analysis_from_hdf5_source(source) for source in sources]
+    if any(name in {None, "table"} for name in detected):
+        return None
+    first = detected[0]
+    if any(name != first for name in detected[1:]):
+        return None
+    return first
+
+
+def _extract_plot_help_sources(argv: list[str]) -> list[str]:
+    probe = argparse.ArgumentParser(add_help=False)
+    _add_plot_source_options(
+        probe,
+        help_text="LiNaK analysis HDF5 input (use `linak hdf5 plot` for generic tables)",
+    )
+    try:
+        args, _unknown = probe.parse_known_args(argv)
+    except SystemExit:
+        return []
+
+    positional_sources = [
+        source
+        for source in _normalize_source_values(getattr(args, "source", None))
+        if _is_hdf5_source(source)
+    ]
+    option_sources = [
+        source
+        for source in _normalize_source_values(getattr(args, "files", None))
+        if _is_hdf5_source(source)
+    ]
+    if option_sources and positional_sources:
+        return [*option_sources, *positional_sources]
+    return option_sources or positional_sources
+
+
+def _maybe_handle_analysis_specific_plot_help(argv: list[str]) -> int | None:
+    root_probe = argparse.ArgumentParser(add_help=False)
+    root_probe.add_argument("--log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+    root_probe.add_argument("--log-file")
+    root_probe.add_argument("command", nargs="?")
+    try:
+        args, remaining = root_probe.parse_known_args(argv)
+    except SystemExit:
+        return None
+
+    if getattr(args, "command", None) != "plot":
+        return None
+    if "-h" not in remaining and "--help" not in remaining:
+        return None
+
+    sources = _extract_plot_help_sources(remaining)
+    if not sources:
+        return None
+    detected_analysis = _resolve_uniform_plot_analysis_from_sources(sources)
+    build_plot_parser(analysis=detected_analysis).print_help()
+    return 0
+
+
 def _read_analysis_profile_payloads(
     *,
     sources: list[str],
@@ -9704,6 +10777,7 @@ def _handle_plot_density(args: argparse.Namespace) -> int:
     from .analysis.density import plot_density_profiles
 
     render_context = _build_density_gui_context(args, sources=sources)
+    _warn_for_non_gui_plot_complexity(analysis_name="density", render_context=render_context)
 
     _apply_effective_series_settings(
         args=args,
@@ -9845,6 +10919,7 @@ def _handle_plot_msd(args: argparse.Namespace) -> int:
     from .analysis.msd import plot_msd_profiles
 
     render_context = _build_msd_gui_context(args, sources=sources)
+    _warn_for_non_gui_plot_complexity(analysis_name="msd", render_context=render_context)
 
     _apply_effective_series_settings(
         args=args,
@@ -9987,6 +11062,7 @@ def _handle_plot_rdf(args: argparse.Namespace) -> int:
     from .analysis.rdf import plot_rdf_profiles
 
     render_context = _build_rdf_gui_context(args, sources=sources)
+    _warn_for_non_gui_plot_complexity(analysis_name="rdf", render_context=render_context)
 
     _apply_effective_series_settings(
         args=args,
@@ -10145,6 +11221,7 @@ def _handle_plot_position(args: argparse.Namespace) -> int:
     from .analysis.position import plot_position_profiles
 
     render_context = _build_position_gui_context(args, sources=sources)
+    _warn_for_non_gui_plot_complexity(analysis_name="position", render_context=render_context)
 
     _apply_effective_series_settings(
         args=args,
@@ -10290,6 +11367,10 @@ def _handle_plot_coordination(args: argparse.Namespace) -> int:
     from .analysis.coordination import plot_coordination_profiles
 
     render_context = _build_coordination_gui_context(args, sources=sources)
+    _warn_for_non_gui_plot_complexity(
+        analysis_name="coordination",
+        render_context=render_context,
+    )
 
     _apply_effective_series_settings(
         args=args,
@@ -10369,6 +11450,8 @@ def _handle_plot_potential(args: argparse.Namespace) -> int:
     from .analysis.potential import combine_potential_hdf5_sources, plot_potential_profiles
 
     render_context = _build_potential_gui_context(args, sources=sources)
+    if not use_gui:
+        _warn_for_non_gui_plot_complexity(analysis_name="potential", render_context=render_context)
     _apply_effective_series_settings(
         args=args,
         sources=sources,
@@ -10477,6 +11560,11 @@ def _handle_plot_orientation(args: argparse.Namespace) -> int:
     from .analysis.orientation import plot_orientation_profiles
 
     render_context = _build_orientation_gui_context(args, sources=sources)
+    if not use_gui:
+        _warn_for_non_gui_plot_complexity(
+            analysis_name="orientation",
+            render_context=render_context,
+        )
     _apply_effective_series_settings(
         args=args,
         sources=sources,
@@ -12028,6 +13116,9 @@ def _rewrite_implicit_csv_interactive(argv: list[str]) -> list[str]:
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point used by the ``linak`` console script."""
     runtime_argv = list(argv) if argv is not None else sys.argv[1:]
+    specialized_help_rc = _maybe_handle_analysis_specific_plot_help(runtime_argv)
+    if specialized_help_rc is not None:
+        return specialized_help_rc
     runtime_argv = _rewrite_implicit_plot_csv(runtime_argv)
     runtime_argv = _rewrite_implicit_csv_interactive(runtime_argv)
     parser = build_parser()
