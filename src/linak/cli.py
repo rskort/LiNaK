@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 from copy import deepcopy
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from importlib.metadata import PackageNotFoundError, metadata as package_metadata
 import importlib
@@ -89,6 +89,8 @@ class _PlotComplexityEstimate:
 
 @dataclass(frozen=True)
 class _GuiPlotRenderContext:
+    # Current bridge object between analysis-specific data loading and the
+    # shared CLI/GUI rendering path.
     profile: Any
     plot_source_label: str
     plotter_kwargs: dict[str, Any] | None
@@ -101,6 +103,19 @@ class _GuiPlotRenderContext:
     @property
     def series_count(self) -> int:
         return len(self.series_descriptors)
+
+
+def _cached_gui_profile_matches_descriptor(profile: Any, descriptor: dict[str, Any]) -> bool:
+    active_mode = str(descriptor.get("active_coordinate_mode") or "").strip().lower()
+    if not active_mode:
+        return True
+    profile_coordinate_mode = str(getattr(profile, "coordinate_mode", "") or "").strip().lower()
+    profile_axis = str(getattr(profile, "axis", "") or "").strip().lower()
+    if active_mode == "distance":
+        return profile_coordinate_mode == "distance"
+    if active_mode in {"x", "y", "z"}:
+        return profile_coordinate_mode != "distance" and profile_axis == active_mode
+    return True
 
 
 @dataclass
@@ -149,6 +164,8 @@ class _LazyGuiSeriesCatalog:
         )
 
     def build_render_context(self, args: argparse.Namespace) -> _GuiPlotRenderContext:
+        # GUI preview re-enters the normal plot path by rebuilding a fresh
+        # render context from the currently active descriptor/filter state.
         active_descriptors_by_source, active_ids = _filter_active_gui_descriptor_segments(
             args=args,
             descriptor_segments_by_source=self.descriptor_segments_by_source,
@@ -166,11 +183,21 @@ class _LazyGuiSeriesCatalog:
             for descriptor in active_descriptors
             if str(descriptor.get("series_id") or "") not in self._active_profiles_by_series_id
         ]
-        if missing_descriptors:
-            loaded_profiles = self.load_profiles(missing_descriptors)
-            if len(loaded_profiles) != len(missing_descriptors):
+        stale_descriptors = [
+            descriptor
+            for descriptor in active_descriptors
+            if str(descriptor.get("series_id") or "") in self._active_profiles_by_series_id
+            and not _cached_gui_profile_matches_descriptor(
+                self._active_profiles_by_series_id[str(descriptor.get("series_id") or "")],
+                descriptor,
+            )
+        ]
+        descriptors_to_load = missing_descriptors + stale_descriptors
+        if descriptors_to_load:
+            loaded_profiles = self.load_profiles(descriptors_to_load)
+            if len(loaded_profiles) != len(descriptors_to_load):
                 raise ValueError("Lazy GUI series loader returned mismatched profile count.")
-            for descriptor, profile in zip(missing_descriptors, loaded_profiles):
+            for descriptor, profile in zip(descriptors_to_load, loaded_profiles):
                 series_id = str(descriptor.get("series_id") or "").strip()
                 if not series_id:
                     raise ValueError("Lazy GUI descriptor is missing a series_id.")
@@ -963,14 +990,14 @@ def _resolve_single_analysis_hdf5_output_path(
     return _resolve_non_overwriting_hdf5_path(base_path)
 
 
-def _default_density_hdf5_output_path(source: str | Path, species: str, axis: str) -> Path:
+def _default_density_hdf5_output_path(source: str | Path, species: str) -> Path:
     source_path = Path(source).expanduser().resolve()
     stem = source_path.stem or "trajectory"
     normalized_species = str(species).strip().lower()
     if normalized_species in {"", "all", "*"}:
-        filename = f"{stem}_density_{axis.lower()}.h5"
+        filename = f"{stem}_density.h5"
     else:
-        filename = f"{stem}_density_{_sanitize_token(species)}_{axis.lower()}.h5"
+        filename = f"{stem}_density_{_sanitize_token(species)}.h5"
     return _linak_output_dir_for_source(source_path) / filename
 
 
@@ -979,11 +1006,10 @@ def _density_hdf5_output_path(
     source: str | Path,
     *,
     species: str,
-    axis: str,
 ) -> Path:
     return _resolve_single_analysis_hdf5_output_path(
         base_output,
-        _default_density_hdf5_output_path(source, species, axis),
+        _default_density_hdf5_output_path(source, species),
     )
 
 
@@ -1931,7 +1957,7 @@ def _load_density_plot_profiles(
     species: str | None,
     axis: str | None,
 ) -> tuple[list[Any], list[list[str]], list[list[str]], list[list[str]]]:
-    from .analysis.density import load_density_profiles
+    from .analysis.density import load_density_profiles, _density_payload_matches_selection
 
     raw_payloads_by_source = _read_analysis_profile_payloads_by_source(
         sources=sources,
@@ -1946,9 +1972,21 @@ def _load_density_plot_profiles(
         ],
     )
     profiles_by_source: list[tuple[str, list[Any]]] = []
+    filtered_payloads_by_source: list[tuple[str, list[dict[str, Any]]]] = []
     for source in sources:
         profiles = load_density_profiles(source, axis=axis, species=species)
         profiles_by_source.append((source, profiles))
+    for source, source_payloads in raw_payloads_by_source:
+        filtered_payloads = [
+            payload
+            for payload in source_payloads
+            if _density_payload_matches_selection(
+                dict(payload.get("metadata", {})),
+                axis=axis,
+                species=species,
+            )
+        ]
+        filtered_payloads_by_source.append((source, filtered_payloads))
 
     plot_profiles: list[Any] = []
     fallback_labels_by_source: list[list[str]] = []
@@ -1956,7 +1994,7 @@ def _load_density_plot_profiles(
     origin_path_segments_by_source: list[list[str]] = []
     if prefix_source_labels:
         for source_index, (source, profiles) in enumerate(profiles_by_source):
-            raw_payloads = raw_payloads_by_source[source_index][1]
+            raw_payloads = filtered_payloads_by_source[source_index][1]
             if len(raw_payloads) != len(profiles):
                 raise ValueError("Density profile metadata does not match loaded profiles.")
             source_labels: list[str] = []
@@ -1984,7 +2022,7 @@ def _load_density_plot_profiles(
         flattened = _flatten_profiles_by_source(profiles_by_source)
         plot_profiles.extend(flattened)
         fallback_labels_by_source.append([profile.species for profile in flattened])
-        raw_payloads = raw_payloads_by_source[0][1]
+        raw_payloads = filtered_payloads_by_source[0][1]
         if len(raw_payloads) != len(flattened):
             raise ValueError("Density profile metadata does not match loaded profiles.")
         series_id_segments_by_source.append(
@@ -2006,6 +2044,278 @@ def _load_density_plot_profiles(
         series_id_segments_by_source,
         origin_path_segments_by_source,
     )
+
+
+def _normalize_density_x_mode(x_mode: str | None) -> str:
+    normalized = str(x_mode or "distance").strip().lower() or "distance"
+    if normalized not in {"distance", "x", "y", "z", "axis"}:
+        raise ValueError(
+            f"Unsupported density x_mode '{x_mode}'. Choose 'distance', 'x', 'y', 'z', or legacy 'axis'."
+        )
+    return normalized
+
+
+def _resolve_density_plot_axis_and_x_mode(
+    *,
+    axis: str | None,
+    x_mode: str | None,
+) -> tuple[str | None, str]:
+    resolved_x_mode = _normalize_density_x_mode(x_mode)
+    resolved_axis = None if axis is None or not str(axis).strip() else str(axis).strip().lower()
+    if resolved_axis is not None and resolved_axis not in {"x", "y", "z"}:
+        raise ValueError("Density plot axis override must be one of x, y, or z.")
+    return resolved_axis, resolved_x_mode
+
+
+def _build_density_profile_filter_options(
+    raw_payloads_by_source: list[tuple[str, list[dict[str, Any]]]],
+    *,
+    axis: str | None,
+    species: str | None,
+) -> dict[str, Any] | None:
+    from .analysis.density import _density_payload_matches_selection
+
+    available_modes: list[str] = []
+    seen_modes: set[str] = set()
+    for _source, source_payloads in raw_payloads_by_source:
+        for payload in source_payloads:
+            metadata = dict(payload.get("metadata", {}))
+            if not _density_payload_matches_selection(metadata, axis=axis, species=species):
+                continue
+            coordinate_mode = str(metadata.get("coordinate_mode", "axis")).strip().lower()
+            axis_value = str(metadata.get("axis", "z")).strip().lower() or "z"
+            if coordinate_mode == "distance":
+                mode = "distance"
+            else:
+                mode = axis_value if axis_value in {"x", "y", "z"} else "z"
+            if mode not in seen_modes:
+                available_modes.append(mode)
+                seen_modes.add(mode)
+    return (
+        {
+            "density_x_modes": list(available_modes),
+            "available_modes": list(available_modes),
+        }
+        if available_modes
+        else None
+    )
+
+
+def _density_profile_mode_from_metadata(metadata: Mapping[str, Any]) -> str:
+    coordinate_mode = str(metadata.get("coordinate_mode", "axis")).strip().lower()
+    axis_value = str(metadata.get("axis", "z")).strip().lower() or "z"
+    if coordinate_mode == "distance":
+        return "distance"
+    return axis_value if axis_value in {"x", "y", "z"} else "z"
+
+
+def _density_effective_render_mode(*, axis: str | None, x_mode: str) -> str:
+    normalized_x_mode = _normalize_density_x_mode(x_mode)
+    if normalized_x_mode in {"distance", "x", "y", "z"}:
+        return normalized_x_mode
+    if axis in {"x", "y", "z"}:
+        return axis
+    return "z"
+
+
+def _density_logical_series_id(*, source_path: str, species: str) -> str:
+    return f"density:{Path(source_path).expanduser().resolve()}:{species.strip()}"
+
+
+def _flatten_descriptor_segments(
+    descriptor_segments_by_source: list[list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    return [
+        dict(descriptor)
+        for segment in descriptor_segments_by_source
+        for descriptor in segment
+    ]
+
+
+def _build_density_logical_descriptor_segments(
+    *,
+    sources: list[str],
+    metadata_by_source: list[tuple[str, list[dict[str, Any]]]],
+    axis: str | None,
+    species: str | None,
+) -> tuple[list[list[dict[str, Any]]], dict[str, Any] | None]:
+    from .analysis.density import _density_payload_matches_selection, _normalize_species_query
+
+    prefix_source_labels = _should_prefix_combined_source_labels(
+        sources=sources,
+        metadata_items=[
+            dict(metadata)
+            for _source, source_metadata in metadata_by_source
+            for metadata in source_metadata
+        ],
+    )
+    resolved_species_label: str | None = None
+    if species is not None and str(species).strip():
+        _selection_mode, resolved_species_label = _normalize_species_query(species)
+
+    source_group_indices: dict[str, int] = {}
+    seen_modes: set[str] = set()
+    available_modes: list[str] = []
+    descriptor_segments_by_source: list[list[dict[str, Any]]] = []
+    for source, metadata_items in metadata_by_source:
+        grouped_descriptors: dict[tuple[str, str], dict[str, Any]] = {}
+        descriptor_order: list[tuple[str, str]] = []
+        for metadata in metadata_items:
+            if not _density_payload_matches_selection(metadata, axis=axis, species=species):
+                continue
+
+            mode = _density_profile_mode_from_metadata(metadata)
+            if mode not in seen_modes:
+                available_modes.append(mode)
+                seen_modes.add(mode)
+
+            base_species = (
+                resolved_species_label or str(metadata.get("species", "")).strip() or "UNKNOWN"
+            )
+            source_label = _metadata_source_label(dict(metadata), fallback_source=source)
+            rendered_species = (
+                f"{source_label}:{base_species}" if prefix_source_labels else base_species
+            )
+            resolved_source_path = Path(
+                str(metadata.get("origin_hdf5_path") or source)
+            ).expanduser()
+            resolved_load_source_path = Path(
+                str(metadata.get("source_path") or source)
+            ).expanduser()
+            logical_key = (str(resolved_source_path), base_species)
+            if logical_key not in grouped_descriptors:
+                source_group_key = str(resolved_source_path)
+                resolved_source_index = source_group_indices.setdefault(
+                    source_group_key,
+                    len(source_group_indices),
+                )
+                grouped_descriptors[logical_key] = {
+                    "series_id": _density_logical_series_id(
+                        source_path=str(resolved_source_path),
+                        species=base_species,
+                    ),
+                    "source_kind": "source",
+                    "source_series_id": _density_logical_series_id(
+                        source_path=str(resolved_source_path),
+                        species=base_species,
+                    ),
+                    "is_generated": False,
+                    "source_index": resolved_source_index,
+                    "series_index": len(descriptor_order),
+                    "source_name": resolved_source_path.name or str(resolved_source_path),
+                    "source_directory": (
+                        str(resolved_source_path.parent)
+                        if str(resolved_source_path.parent) not in {"", "."}
+                        else ""
+                    ),
+                    "source_path": str(resolved_source_path),
+                    "load_source_path": str(resolved_load_source_path),
+                    "default_label": rendered_species,
+                    "density_species": base_species,
+                    "density_backing_profiles_by_mode": {},
+                    "_density_axis_fallbacks": {},
+                }
+                descriptor_order.append(logical_key)
+
+            active_profile = {
+                "profile_index": int(metadata.get("profile_index", 0)),
+                "profile_uid": _profile_uid_from_payload(
+                    {"metadata": dict(metadata)},
+                    fallback_prefix="density",
+                    index=int(metadata.get("profile_index", 0)),
+                ),
+                "coordinate_mode": mode,
+            }
+            grouped_descriptors[logical_key]["density_backing_profiles_by_mode"][mode] = (
+                active_profile
+            )
+            if mode == "distance":
+                axis_mode = str(metadata.get("axis", "")).strip().lower()
+                if axis_mode in {"x", "y", "z"}:
+                    grouped_descriptors[logical_key]["_density_axis_fallbacks"].setdefault(
+                        axis_mode,
+                        dict(active_profile),
+                    )
+
+        for key in descriptor_order:
+            descriptor = grouped_descriptors[key]
+            fallback_profiles = descriptor.pop("_density_axis_fallbacks", {})
+            if not isinstance(fallback_profiles, dict):
+                continue
+            backing_profiles = descriptor.get("density_backing_profiles_by_mode", {})
+            if not isinstance(backing_profiles, dict):
+                continue
+            for fallback_mode, fallback_profile in fallback_profiles.items():
+                if fallback_mode in backing_profiles:
+                    continue
+                backing_profiles[fallback_mode] = dict(fallback_profile)
+                if fallback_mode not in seen_modes:
+                    available_modes.append(fallback_mode)
+                    seen_modes.add(fallback_mode)
+
+        descriptor_segments_by_source.append(
+            [dict(grouped_descriptors[key]) for key in descriptor_order]
+        )
+
+    return (
+        descriptor_segments_by_source,
+        {"available_modes": available_modes, "density_x_modes": available_modes}
+        if available_modes
+        else None,
+    )
+
+
+def _resolve_density_render_descriptor_segments(
+    descriptor_segments_by_source: list[list[dict[str, Any]]],
+    *,
+    axis: str | None,
+    x_mode: str,
+) -> list[list[dict[str, Any]]]:
+    active_mode = _density_effective_render_mode(axis=axis, x_mode=x_mode)
+    resolved_segments: list[list[dict[str, Any]]] = []
+    for segment in descriptor_segments_by_source:
+        resolved_segment: list[dict[str, Any]] = []
+        for descriptor in segment:
+            backing_profiles = descriptor.get("density_backing_profiles_by_mode")
+            if not isinstance(backing_profiles, dict):
+                continue
+            active_profile = backing_profiles.get(active_mode)
+            if not isinstance(active_profile, dict):
+                continue
+            resolved_descriptor = dict(descriptor)
+            resolved_descriptor["profile_index"] = int(active_profile["profile_index"])
+            resolved_descriptor["profile_uid"] = str(active_profile["profile_uid"])
+            resolved_descriptor["active_coordinate_mode"] = active_mode
+            resolved_segment.append(resolved_descriptor)
+        resolved_segments.append(resolved_segment)
+    return resolved_segments
+
+
+def _load_density_profiles_for_render_descriptors(
+    descriptors: list[dict[str, Any]],
+    *,
+    axis: str | None,
+    species: str | None,
+) -> list[Any]:
+    from .analysis.density import load_density_profiles_by_index
+
+    loaded_by_id: dict[str, Any] = {}
+    for load_source_path, source_descriptors in _group_descriptors_by_load_source(descriptors):
+        indices = [int(descriptor["profile_index"]) for descriptor in source_descriptors]
+        profiles = load_density_profiles_by_index(
+            load_source_path,
+            indices,
+            axis=axis,
+            species=species,
+        )
+        if len(profiles) != len(source_descriptors):
+            raise ValueError("Density profile metadata does not match loaded profiles.")
+        for descriptor, profile in zip(source_descriptors, profiles):
+            loaded_by_id[str(descriptor["series_id"])] = replace(
+                profile,
+                species=str(descriptor.get("default_label") or profile.species),
+            )
+    return [loaded_by_id[str(descriptor["series_id"])] for descriptor in descriptors]
 
 
 def _load_orientation_plot_profiles(
@@ -3850,15 +4160,18 @@ def _add_density_plot_options(
         )
     group.add_argument(
         "--x-mode",
-        choices=["distance", "axis"],
+        choices=["distance", "x", "y", "z", "axis"],
         default="distance",
-        help="Density x-axis mode: distance to surface (default) or raw axis coordinate.",
+        help=(
+            "Density x-axis values to plot: distance to surface (default) or the stored X/Y/Z "
+            "coordinate axis. Legacy 'axis' remains accepted for existing scripts/settings."
+        ),
     )
     group.add_argument(
         "--quantity",
         choices=["mass", "number"],
         default="mass",
-        help="Density quantity to plot (default: mass; use number for atoms/A^3).",
+        help="Density quantity to plot (default: mass; use number for entity number density).",
     )
 
 
@@ -5403,21 +5716,46 @@ def _build_density_gui_context(
     *,
     sources: list[str],
 ) -> _GuiPlotRenderContext:
-    (
-        plot_profiles,
-        fallback_labels_by_source,
-        series_id_segments_by_source,
-        origin_path_segments_by_source,
-    ) = _load_density_plot_profiles(
-        sources=sources,
-        species=args.species,
-        axis=args.axis,
+    _load_axis, resolved_x_mode = _resolve_density_plot_axis_and_x_mode(
+        axis=getattr(args, "axis", None),
+        x_mode=getattr(args, "x_mode", None),
     )
+    raw_payloads_by_source = _read_analysis_profile_payloads_by_source(
+        sources=sources,
+        analysis="density",
+    )
+    logical_descriptor_segments, filter_options = _build_density_logical_descriptor_segments(
+        sources=sources,
+        metadata_by_source=[
+            (source, [dict(payload.get("metadata", {})) for payload in source_payloads])
+            for source, source_payloads in raw_payloads_by_source
+        ],
+        axis=None,
+        species=args.species,
+    )
+    render_descriptor_segments = _resolve_density_render_descriptor_segments(
+        logical_descriptor_segments,
+        axis=getattr(args, "axis", None),
+        x_mode=resolved_x_mode,
+    )
+    render_descriptors = _flatten_descriptor_segments(render_descriptor_segments)
+    plot_profiles = _load_density_profiles_for_render_descriptors(
+        render_descriptors,
+        axis=None,
+        species=None,
+    )
+    fallback_labels_by_source = [
+        [
+            str(descriptor.get("default_label") or f"Series {index + 1}")
+            for index, descriptor in enumerate(segment)
+        ]
+        for segment in render_descriptor_segments
+    ]
     return _GuiPlotRenderContext(
         profile=plot_profiles,
         plot_source_label=sources[0] if len(sources) == 1 else "multi_source_density",
         plotter_kwargs={
-            "x_mode": args.x_mode,
+            "x_mode": resolved_x_mode,
             "quantity": args.quantity,
         },
         fallback_labels_by_source=fallback_labels_by_source,
@@ -5427,13 +5765,69 @@ def _build_density_gui_context(
             profile_key=_PLOT_PROFILE_DENSITY,
             fallback_labels_by_source=fallback_labels_by_source,
         ),
-        series_descriptors=_build_gui_series_descriptors(
-            sources=sources,
-            fallback_labels_by_source=fallback_labels_by_source,
-            series_id_segments_by_source=series_id_segments_by_source,
-            origin_path_segments_by_source=origin_path_segments_by_source,
+        series_descriptors=render_descriptors,
+        profile_filter_options=filter_options
+        or _build_density_profile_filter_options(
+            raw_payloads_by_source,
+            axis=None,
+            species=args.species,
         ),
         estimated_total_points=_estimate_total_points_from_loaded_profiles(plot_profiles),
+    )
+
+
+def _build_density_gui_logical_context(
+    args: argparse.Namespace,
+    *,
+    sources: list[str],
+) -> _GuiPlotRenderContext:
+    _load_axis, resolved_x_mode = _resolve_density_plot_axis_and_x_mode(
+        axis=getattr(args, "axis", None),
+        x_mode=getattr(args, "x_mode", None),
+    )
+    raw_payloads_by_source = _read_analysis_profile_payloads_by_source(
+        sources=sources,
+        analysis="density",
+    )
+    logical_descriptor_segments, filter_options = _build_density_logical_descriptor_segments(
+        sources=sources,
+        metadata_by_source=[
+            (source, [dict(payload.get("metadata", {})) for payload in source_payloads])
+            for source, source_payloads in raw_payloads_by_source
+        ],
+        axis=None,
+        species=args.species,
+    )
+    logical_descriptors = _flatten_descriptor_segments(logical_descriptor_segments)
+    fallback_labels_by_source = [
+        [
+            str(descriptor.get("default_label") or f"Series {index + 1}")
+            for index, descriptor in enumerate(segment)
+        ]
+        for segment in logical_descriptor_segments
+    ]
+    return _GuiPlotRenderContext(
+        profile=[],
+        plot_source_label=sources[0] if len(sources) == 1 else "multi_source_density",
+        plotter_kwargs={
+            "x_mode": resolved_x_mode,
+            "quantity": args.quantity,
+        },
+        fallback_labels_by_source=fallback_labels_by_source,
+        default_series_labels=_resolve_gui_default_series_labels(
+            args=args,
+            sources=sources,
+            profile_key=_PLOT_PROFILE_DENSITY,
+            fallback_labels_by_source=fallback_labels_by_source,
+        ),
+        series_descriptors=logical_descriptors,
+        profile_filter_options=filter_options
+        or _build_density_profile_filter_options(
+            raw_payloads_by_source,
+            axis=None,
+            species=args.species,
+        ),
+        estimated_total_points=None,
     )
 
 
@@ -5518,6 +5912,10 @@ def _build_position_gui_context(
     *,
     sources: list[str],
 ) -> _GuiPlotRenderContext:
+    # Position is the clearest current example of analysis-specific view
+    # mapping entering the flow: component/projection choices influence both
+    # profile loading and whether render series stay profile-level or expand to
+    # per-atom descriptors.
     resolved_projection = _resolve_position_projection_estimation_settings(args)
     projection_mode = resolved_projection.get("component") == "2d-projection"
     if _position_projection_uses_profile_descriptors(args, resolved_projection=resolved_projection):
@@ -5752,101 +6150,46 @@ def _build_density_gui_lazy_catalog(
     sources: list[str],
     active_profiles_by_series_id: dict[str, Any] | None = None,
 ) -> _LazyGuiSeriesCatalog:
-    from .analysis.density import load_density_profiles_by_index, _normalize_species_query
+    _load_axis, resolved_x_mode = _resolve_density_plot_axis_and_x_mode(
+        axis=getattr(args, "axis", None),
+        x_mode=getattr(args, "x_mode", None),
+    )
 
     headers_by_source = _read_analysis_profile_headers_by_source(
         sources=sources,
         analysis="density",
     )
-    prefix_source_labels = _should_prefix_combined_source_labels(
+    logical_descriptor_segments, filter_options = _build_density_logical_descriptor_segments(
         sources=sources,
-        metadata_items=[
-            dict(header) for _source, headers in headers_by_source for header in headers
-        ],
+        metadata_by_source=headers_by_source,
+        axis=None,
+        species=args.species,
     )
-    resolved_species_label: str | None = None
-    if args.species is not None and str(args.species).strip():
-        _selection_mode, resolved_species_label = _normalize_species_query(args.species)
-
-    fallback_labels_by_source: list[list[str]] = []
-    series_id_segments_by_source: list[list[str]] = []
-    origin_path_segments_by_source: list[list[str]] = []
-    load_source_path_segments_by_source: list[list[str]] = []
-    extra_segments_by_source: list[list[dict[str, Any]]] = []
-    for source, headers in headers_by_source:
-        source_labels: list[str] = []
-        source_ids: list[str] = []
-        source_origins: list[str] = []
-        source_load_paths: list[str] = []
-        source_extras: list[dict[str, Any]] = []
-        for header in headers:
-            source_label = _metadata_source_label(header, fallback_source=source)
-            base_species = (
-                resolved_species_label or str(header.get("species", "")).strip() or "UNKNOWN"
-            )
-            rendered_species = (
-                f"{source_label}:{base_species}" if prefix_source_labels else base_species
-            )
-            profile_index = int(header.get("profile_index", len(source_labels)))
-            profile_uid = _profile_uid_from_payload(
-                {"metadata": header},
-                fallback_prefix="density",
-                index=profile_index,
-            )
-            source_labels.append(rendered_species)
-            source_ids.append(profile_uid)
-            source_origins.append(str(header.get("origin_hdf5_path") or source))
-            source_load_paths.append(str(header.get("source_path") or source))
-            source_extras.append(
-                {
-                    "profile_index": profile_index,
-                    "profile_uid": profile_uid,
-                    "rendered_species": rendered_species,
-                }
-            )
-        fallback_labels_by_source.append(source_labels)
-        series_id_segments_by_source.append(source_ids)
-        origin_path_segments_by_source.append(source_origins)
-        load_source_path_segments_by_source.append(source_load_paths)
-        extra_segments_by_source.append(source_extras)
-
-    descriptor_segments = _build_gui_descriptor_segments(
-        sources=sources,
-        fallback_labels_by_source=fallback_labels_by_source,
-        series_id_segments_by_source=series_id_segments_by_source,
-        origin_path_segments_by_source=origin_path_segments_by_source,
-        load_source_path_segments_by_source=load_source_path_segments_by_source,
-        extra_segments_by_source=extra_segments_by_source,
+    descriptor_segments = _resolve_density_render_descriptor_segments(
+        logical_descriptor_segments,
+        axis=getattr(args, "axis", None),
+        x_mode=resolved_x_mode,
     )
 
     def _load_profiles(descriptors: list[dict[str, Any]]) -> list[Any]:
-        loaded_by_id: dict[str, Any] = {}
-        for load_source_path, source_descriptors in _group_descriptors_by_load_source(descriptors):
-            indices = [int(descriptor["profile_index"]) for descriptor in source_descriptors]
-            profiles = load_density_profiles_by_index(
-                load_source_path,
-                indices,
-                axis=args.axis,
-                species=args.species,
-            )
-            if len(profiles) != len(source_descriptors):
-                raise ValueError("Lazy density loader returned mismatched profile count.")
-            for descriptor, profile in zip(source_descriptors, profiles):
-                loaded_by_id[str(descriptor["series_id"])] = replace(
-                    profile,
-                    species=str(descriptor.get("rendered_species") or profile.species),
-                )
-        return [loaded_by_id[str(descriptor["series_id"])] for descriptor in descriptors]
+        loaded = _load_density_profiles_for_render_descriptors(
+            descriptors,
+            axis=None,
+            species=None,
+        )
+        if len(loaded) != len(descriptors):
+            raise ValueError("Lazy density loader returned mismatched profile count.")
+        return loaded
 
     return _LazyGuiSeriesCatalog(
         sources=list(sources),
         plot_source_label=sources[0] if len(sources) == 1 else "multi_source_density",
         plotter_kwargs={
-            "x_mode": args.x_mode,
+            "x_mode": resolved_x_mode,
             "quantity": args.quantity,
         },
         descriptor_segments_by_source=descriptor_segments,
-        profile_filter_options=None,
+        profile_filter_options=filter_options,
         load_profiles=_load_profiles,
         _active_profiles_by_series_id=(
             active_profiles_by_series_id if active_profiles_by_series_id is not None else {}
@@ -6860,6 +7203,9 @@ def _render_profile_plot(
             source_ordered_descriptors = [source_ordered_descriptors[index] for index in indices]
             ordered_descriptors = source_ordered_descriptors + group_ordered_descriptors
 
+    # Final transition point: generic style options from argparse are merged
+    # here with analysis-specific plotter kwargs and series identity metadata
+    # before dispatch to the selected analysis plotter.
     shared_kwargs = {
         "series_ids": [
             str(d.get("series_id") or f"series:{i}")
@@ -7371,6 +7717,8 @@ def _launch_profile_plot_gui(
     allow_named_profiles = supports_named_plot_profiles(source_path)
     if build_full_context is None:
         build_full_context = build_context
+    # The GUI currently persists one broad settings payload that mixes source
+    # filters, view-mapping choices, layer state, and pure figure style.
     initial_settings = _collect_plot_settings_for_persistence(args, keys=setting_keys)
     initial_settings["_gui_sync_modes"] = _derive_gui_sync_modes(initial_settings)
     initial_settings["series_count"] = max(1, int(initial_context.series_count))
@@ -7450,6 +7798,9 @@ def _launch_profile_plot_gui(
         output: str | None,
         empty_error_message: str,
     ) -> tuple[Path | None, dict[str, Any]]:
+        # Preview/export do not use a separate render path. They replay GUI
+        # settings back into argparse-like state, rebuild context, and then
+        # call the same renderer bridge used by non-GUI plotting.
         preview_args = deepcopy(args)
         _apply_gui_settings_to_args(preview_args, gui_settings)
         preview_args.show = show
@@ -7728,9 +8079,9 @@ def _handle_root_overview(_args: argparse.Namespace) -> int:
                 "",
                 "Core workflow",
                 "  1) Compute analysis HDF5 from trajectory data",
-                "     linak compute density /path/to/traj.xyz --species O --axis z",
+                "     linak compute density /path/to/traj.xyz",
                 "  2) Plot from HDF5 only",
-                "     linak plot /path/to/traj_density_o_z.h5",
+                "     linak plot /path/to/traj_density.h5",
                 "",
                 "Fast HDF5 plotting shorthand",
                 (
@@ -7769,8 +8120,8 @@ def _handle_plot_overview(_args: argparse.Namespace) -> int:
                 "Plot accepts LiNaK density/MSD/RDF/position/coordination/potential HDF5 inputs and auto-detects the analysis.",
                 "",
                 "Examples",
-                "  linak compute density /path/to/traj.xyz --species O --axis z",
-                "  linak plot /path/to/traj_density_o_z.h5",
+                "  linak compute density /path/to/traj.xyz",
+                "  linak plot /path/to/traj_density.h5",
                 "  linak plot -f run1_density.h5 run2_density.h5 --no-show --output density.png",
                 "  linak plot /path/to/traj_msd_o.h5 --no-show --output msd.png",
                 "  linak plot /path/to/traj_rdf_o_h.h5 --species-a O --species-b H",
@@ -7959,7 +8310,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--axis",
         choices=["x", "y", "z"],
         default="z",
-        help="Axis for profile (default: z)",
+        help="Surface/distance reference axis (default: z)",
     )
     compute_density.add_argument(
         "--bin-width",
@@ -10680,6 +11031,12 @@ def _handle_plot_density(args: argparse.Namespace) -> int:
             keys=_PLOT_SETTINGS_DENSITY_KEYS,
             profile_name=getattr(args, "settings_profile", None),
         )
+    resolved_axis, resolved_x_mode = _resolve_density_plot_axis_and_x_mode(
+        axis=getattr(args, "axis", None),
+        x_mode=getattr(args, "x_mode", None),
+    )
+    args.axis = resolved_axis
+    args.x_mode = resolved_x_mode
     use_gui = _resolve_gui_mode(args)
     if len(sources) > 1:
         LOGGER.info("Processing %d density HDF5 input file(s).", len(sources))
@@ -10743,8 +11100,7 @@ def _handle_plot_density(args: argparse.Namespace) -> int:
             )
             return catalog
 
-        initial_catalog = _build_catalog(args)
-        initial_context = initial_catalog.build_initial_context()
+        initial_context = _build_density_gui_logical_context(args, sources=gui_sources)
         _apply_effective_series_settings(
             args=args,
             sources=gui_sources,
@@ -10767,9 +11123,10 @@ def _handle_plot_density(args: argparse.Namespace) -> int:
             build_context=lambda current_args: _build_catalog(current_args).build_render_context(
                 current_args
             ),
-            build_full_context=lambda current_args: _build_catalog(
-                current_args
-            ).build_initial_context(),
+            build_full_context=lambda current_args: _build_density_gui_logical_context(
+                current_args,
+                sources=gui_sources,
+            ),
         )
         LOGGER.info("Density GUI plotting session finished in %.2f s.", perf_counter() - start)
         return 0
@@ -11713,6 +12070,8 @@ def _handle_compute_density(args: argparse.Namespace) -> int:
         source_label="trajectory input file",
     )
 
+    surface_axis: str = args.axis
+
     if args.dry_run:
         source_path = Path(args.trajectory).expanduser().resolve()
         cell_preview = _describe_cell_resolution_preview(
@@ -11726,18 +12085,19 @@ def _handle_compute_density(args: argparse.Namespace) -> int:
                     args.output,
                     args.trajectory,
                     species=args.species,
-                    axis=args.axis,
                 )
             )
         else:
             output_preview = str(
-                _default_density_hdf5_output_path(args.trajectory, args.species, args.axis)
+                _default_density_hdf5_output_path(args.trajectory, args.species)
             )
 
         plan = [
             f"trajectory source: {source_path}",
             (
-                f"species={args.species}, axis={args.axis}, bin_width={args.bin_width}, "
+                f"species={args.species}, raw axes=x/y/z, "
+                f"distance axis={surface_axis}, "
+                f"bin_width={args.bin_width}, "
                 f"{_describe_surface_cli_options(args)}"
             ),
             (
@@ -11751,7 +12111,7 @@ def _handle_compute_density(args: argparse.Namespace) -> int:
         LOGGER.info("Density compute dry run finished in %.2f s.", perf_counter() - start)
         return 0
 
-    from .analysis.density import compute_density_profiles, save_density_profiles
+    from .analysis.density import compute_all_density_profiles, save_density_profiles
     from .trajectory.io import read_trajectory
 
     source_path = Path(args.trajectory).expanduser().resolve()
@@ -11776,10 +12136,10 @@ def _handle_compute_density(args: argparse.Namespace) -> int:
         args,
         frames,
     )
-    profiles = compute_density_profiles(
+    all_profiles = compute_all_density_profiles(
         frames=frames,
         species=args.species,
-        axis=args.axis,
+        surface_axis=surface_axis,
         bin_width=args.bin_width,
         surface_mode=args.surface_mode,
         surface_elements=args.surface_elements,
@@ -11792,18 +12152,18 @@ def _handle_compute_density(args: argparse.Namespace) -> int:
         args.output,
         args.trajectory,
         species=args.species,
-        axis=args.axis,
     )
     density_metadata: dict[str, Any] = {
         "source_path": str(source_path),
         "cell_source": cell_source,
+        "surface_axis": surface_axis,
     }
     if cell_input_path is not None:
         density_metadata["input_path"] = cell_input_path
     if resolved_cell is not None:
         density_metadata["resolved_cell_angstrom"] = list(resolved_cell)
     save_density_profiles(
-        profiles,
+        all_profiles,
         output_path,
         additional_metadata=density_metadata,
     )

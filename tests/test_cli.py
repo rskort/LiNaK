@@ -30,11 +30,13 @@ from linak.cli import (
     main,
 )
 from linak.analysis.density import (
+    compute_all_density_profiles,
     compute_density_profile,
     load_density_profile,
     load_density_profiles,
     load_density_profiles_by_index,
     save_density_profile,
+    save_density_profiles,
 )
 from linak.analysis.position import (
     PositionProfile,
@@ -194,7 +196,7 @@ def test_read_project_author_falls_back_to_installed_package_metadata(tmp_path, 
     assert cli_mod._read_project_author(default="Unknown") == "R.S. Kort"
 
 
-def _write_density_hdf5(path: Path) -> None:
+def _write_density_hdf5(path: Path, *, axis: str = "z") -> None:
     frame0 = Atoms(
         "OO",
         positions=[[0.0, 0.0, 0.02], [0.0, 0.0, 0.08]],
@@ -207,8 +209,38 @@ def _write_density_hdf5(path: Path) -> None:
         cell=[10.0, 10.0, 10.0],
         pbc=True,
     )
-    profile = compute_density_profile([frame0, frame1], species="O", axis="z", bin_width=0.1)
+    profile = compute_density_profile([frame0, frame1], species="O", axis=axis, bin_width=0.1)
     save_density_profile(profile, path)
+
+
+def _write_density_collection_hdf5(path: Path, *, species: str = "all", surface_axis: str = "z") -> None:
+    frame0 = Atoms(
+        "OHH",
+        positions=[
+            [0.0, 0.0, 0.02],
+            [0.8, 0.0, 0.02],
+            [-0.4, 0.7, 0.02],
+        ],
+        cell=[10.0, 10.0, 10.0],
+        pbc=True,
+    )
+    frame1 = Atoms(
+        "OHH",
+        positions=[
+            [0.0, 0.0, 0.18],
+            [0.8, 0.0, 0.18],
+            [-0.4, 0.7, 0.18],
+        ],
+        cell=[10.0, 10.0, 10.0],
+        pbc=True,
+    )
+    profiles = compute_all_density_profiles(
+        [frame0, frame1],
+        species=species,
+        surface_axis=surface_axis,
+        bin_width=0.1,
+    )
+    save_density_profiles(profiles, path)
 
 
 def _write_position_hdf5(path: Path) -> None:
@@ -436,7 +468,7 @@ def test_plot_command_without_subcommand_shows_overview(capsys):
     assert rc == 0
     out = capsys.readouterr().out
     assert "LiNaK Plot Usage (HDF5-only)" in out
-    assert "linak plot /path/to/traj_density_o_z.h5" in out
+    assert "linak plot /path/to/traj_density.h5" in out
 
 
 def test_compute_command_without_subcommand_shows_overview(capsys):
@@ -1992,10 +2024,77 @@ def test_plot_density_no_gui_flag_disables_gui_with_show_enabled():
 
 def test_compute_density_defaults_surface_detection_options():
     args = build_parser().parse_args(["compute", "density", "traj.xyz"])
+    assert args.axis == "z"
     assert args.surface_mode == "auto"
     assert args.surface_elements is None
     assert args.include_fixed_surface_atoms is False
     assert args.rough_surface_envelope is None
+
+
+def test_compute_density_default_axis_produces_all_three_axes(tmp_path, monkeypatch):
+    """Default --axis z produces raw x/y/z profiles and a distance profile."""
+    monkeypatch.chdir(tmp_path)
+    trajectory = tmp_path / "traj.xyz"
+    _write_xyz(trajectory)
+
+    rc = main(
+        [
+            "--log-level",
+            "ERROR",
+            "compute",
+            "density",
+            str(trajectory),
+            "--species",
+            "O",
+            "--bin-width",
+            "0.1",
+        ]
+    )
+
+    assert rc == 0
+    output = _linak_output_dir(tmp_path) / "traj_density_o.h5"
+    assert output.exists()
+    profiles = load_density_profiles(output)
+    raw_profiles = [p for p in profiles if p.coordinate_mode != "distance"]
+    distance_profiles = [p for p in profiles if p.coordinate_mode == "distance"]
+    assert {p.axis for p in raw_profiles} == {"x", "y", "z"}
+    assert len(distance_profiles) >= 1
+    assert all(p.axis == "z" for p in distance_profiles)
+
+
+def test_compute_density_axis_y_stores_all_axes_with_y_as_surface(tmp_path, monkeypatch):
+    """--axis y produces raw x/y/z profiles and a distance profile using y as surface axis."""
+    monkeypatch.chdir(tmp_path)
+    trajectory = tmp_path / "traj.xyz"
+    _write_xyz(trajectory)
+
+    rc = main(
+        [
+            "--log-level",
+            "ERROR",
+            "compute",
+            "density",
+            str(trajectory),
+            "--species",
+            "O",
+            "--axis",
+            "y",
+            "--bin-width",
+            "0.1",
+        ]
+    )
+
+    assert rc == 0
+    output = _linak_output_dir(tmp_path) / "traj_density_o.h5"
+    assert output.exists()
+    profiles = load_density_profiles(output)
+    raw_profiles = [p for p in profiles if p.coordinate_mode != "distance"]
+    distance_profiles = [p for p in profiles if p.coordinate_mode == "distance"]
+    assert {p.axis for p in raw_profiles} == {"x", "y", "z"}
+    assert len(distance_profiles) >= 1
+    assert all(p.axis == "y" for p in distance_profiles)
+    _datasets, metadata = read_linak_hdf5(output, expected_analysis="density")
+    assert metadata["surface_axis"] == "y"
 
 
 def test_compute_position_defaults_surface_detection_options():
@@ -2039,7 +2138,7 @@ def test_plot_density_dry_run_skips_rendering(tmp_path):
 
 def test_compute_density_dry_run_skips_trajectory_read_and_csv_write(tmp_path):
     missing_trajectory = tmp_path / "missing_traj.xyz"
-    expected_default_output = _linak_output_dir(tmp_path) / "missing_traj_density_o_z.h5"
+    expected_default_output = _linak_output_dir(tmp_path) / "missing_traj_density_o.h5"
 
     rc = main(
         [
@@ -2293,7 +2392,7 @@ def test_compute_density_uses_trajectory_hdf5_cell_without_adjacent_input_lookup
 
     assert rc == 0
     _datasets, metadata = read_linak_hdf5(
-        _linak_output_dir(tmp_path) / "traj.traj_density_o_z.h5",
+        _linak_output_dir(tmp_path) / "traj.traj_density_o.h5",
         expected_analysis="density",
     )
     assert metadata["cell_source"] == "trajectory HDF5 metadata"
@@ -3266,6 +3365,15 @@ def test_plot_density_passes_x_mode_and_quantity_to_plotter(tmp_path, monkeypatc
     assert captured_kwargs == {"x_mode": "axis", "quantity": "number"}
 
 
+def test_resolve_density_plot_axis_and_x_mode_prefers_explicit_cartesian_values():
+    assert cli_mod._resolve_density_plot_axis_and_x_mode(axis=None, x_mode="x") == (None, "x")
+    assert cli_mod._resolve_density_plot_axis_and_x_mode(axis="z", x_mode="y") == ("z", "y")
+    assert cli_mod._resolve_density_plot_axis_and_x_mode(axis="y", x_mode="axis") == (
+        "y",
+        "axis",
+    )
+
+
 def test_plot_density_gui_mode_uses_gui_launcher(tmp_path, monkeypatch):
     frame = Atoms(
         "OO",
@@ -3310,7 +3418,7 @@ def test_plot_parser_no_border_flag_reaches_shared_plot_style():
 
 def test_plot_density_gui_initial_settings_include_analysis_controls(tmp_path, monkeypatch):
     source_h5 = tmp_path / "source_density.h5"
-    _write_density_hdf5(source_h5)
+    _write_density_collection_hdf5(source_h5)
 
     captured: dict[str, object] = {}
 
@@ -3351,6 +3459,244 @@ def test_plot_density_gui_initial_settings_include_analysis_controls(tmp_path, m
     assert resolved["series_labels"] == ["H2O"]
     assert captured["title"] == "LiNaK Plot Controls: Density"
     assert captured["initial_profile_name"] == "Default"
+
+
+def test_plot_density_gui_explicit_cartesian_x_mode_sets_matching_axis(tmp_path, monkeypatch):
+    source_h5 = tmp_path / "source_density_y.h5"
+    _write_density_collection_hdf5(source_h5, surface_axis="y")
+
+    captured: dict[str, object] = {}
+
+    def _fake_gui_launcher(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr("linak.cli._open_plot_settings_gui", _fake_gui_launcher)
+
+    rc = main(
+        [
+            "--log-level",
+            "ERROR",
+            "plot",
+            str(source_h5),
+            "--x-mode",
+            "y",
+            "--quantity",
+            "number",
+            "--gui",
+        ]
+    )
+
+    assert rc == 0
+    initial = captured["initial_settings"]
+    assert isinstance(initial, dict)
+    assert initial["x_mode"] == "y"
+    assert initial["quantity"] == "number"
+
+
+def test_plot_density_gui_accepts_combined_all_axis_density_hdf5(tmp_path, monkeypatch):
+    source_h5 = tmp_path / "traj_density.h5"
+    _write_density_collection_hdf5(source_h5)
+
+    captured: dict[str, object] = {}
+
+    def _fake_gui_launcher(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr("linak.cli._open_plot_settings_gui", _fake_gui_launcher)
+
+    rc = main(
+        [
+            "--log-level",
+            "ERROR",
+            "plot",
+            str(source_h5),
+            "--gui",
+        ]
+    )
+
+    assert rc == 0
+    initial = captured["initial_settings"]
+    assert isinstance(initial, dict)
+    assert initial["series_count"] == 3
+    assert len(initial["series_descriptors"]) == initial["series_count"]
+    assert [item["default_label"] for item in initial["series_descriptors"]] == ["H", "O", "H2O"]
+
+
+def test_density_gui_combined_all_axis_uses_species_based_logical_descriptors(tmp_path):
+    source_h5 = tmp_path / "traj_density.h5"
+    _write_density_collection_hdf5(source_h5)
+
+    args = cli_mod.argparse.Namespace(
+        species=None,
+        axis=None,
+        x_mode="distance",
+        quantity="mass",
+        series_labels=None,
+        line_colors=None,
+        series_overrides=None,
+        _runtime_argv=(),
+    )
+
+    context = cli_mod._build_density_gui_logical_context(args, sources=[str(source_h5)])
+
+    assert [item["default_label"] for item in context.series_descriptors] == ["H", "O", "H2O"]
+    assert all(
+        set(item["density_backing_profiles_by_mode"]) == {"distance", "x", "y", "z"}
+        for item in context.series_descriptors
+    )
+
+
+def test_density_gui_mode_switch_keeps_series_ids_and_labels_stable(tmp_path):
+    source_h5 = tmp_path / "traj_density.h5"
+    _write_density_collection_hdf5(source_h5)
+
+    base_kwargs = {
+        "species": None,
+        "axis": None,
+        "quantity": "mass",
+        "series_labels": None,
+        "line_colors": None,
+        "series_overrides": None,
+        "_runtime_argv": (),
+    }
+    distance_args = cli_mod.argparse.Namespace(**base_kwargs, x_mode="distance")
+    x_args = cli_mod.argparse.Namespace(**base_kwargs, x_mode="x")
+
+    logical_distance = cli_mod._build_density_gui_logical_context(
+        distance_args,
+        sources=[str(source_h5)],
+    )
+    logical_x = cli_mod._build_density_gui_logical_context(
+        x_args,
+        sources=[str(source_h5)],
+    )
+
+    assert [item["series_id"] for item in logical_distance.series_descriptors] == [
+        item["series_id"] for item in logical_x.series_descriptors
+    ]
+    assert [item["default_label"] for item in logical_distance.series_descriptors] == [
+        item["default_label"] for item in logical_x.series_descriptors
+    ]
+
+
+def test_density_gui_render_context_switches_active_backing_mode_without_changing_layers(tmp_path):
+    source_h5 = tmp_path / "traj_density.h5"
+    _write_density_collection_hdf5(source_h5)
+
+    base_kwargs = {
+        "species": None,
+        "axis": None,
+        "quantity": "mass",
+        "series_labels": None,
+        "line_colors": None,
+        "series_overrides": None,
+        "_runtime_argv": (),
+    }
+    distance_args = cli_mod.argparse.Namespace(**base_kwargs, x_mode="distance")
+    x_args = cli_mod.argparse.Namespace(**base_kwargs, x_mode="x")
+
+    logical_context = cli_mod._build_density_gui_logical_context(
+        distance_args,
+        sources=[str(source_h5)],
+    )
+    distance_render = cli_mod._build_density_gui_context(
+        distance_args,
+        sources=[str(source_h5)],
+    )
+    x_render = cli_mod._build_density_gui_context(
+        x_args,
+        sources=[str(source_h5)],
+    )
+
+    logical_ids = {item["series_id"] for item in logical_context.series_descriptors}
+    assert {item["series_id"] for item in distance_render.series_descriptors} == logical_ids
+    assert {item["series_id"] for item in x_render.series_descriptors} == logical_ids
+    assert {profile.coordinate_mode for profile in distance_render.profile} == {"distance"}
+    assert {profile.coordinate_mode for profile in x_render.profile} == {"axis"}
+    assert {profile.axis for profile in x_render.profile} == {"x"}
+
+
+def test_density_gui_ignores_axis_prefilter_when_switching_x_mode(tmp_path):
+    source_h5 = tmp_path / "traj_density.h5"
+    _write_density_collection_hdf5(source_h5)
+
+    args = cli_mod.argparse.Namespace(
+        species=None,
+        axis="z",
+        x_mode="x",
+        quantity="mass",
+        series_labels=None,
+        line_colors=None,
+        series_overrides=None,
+        _runtime_argv=(),
+    )
+
+    logical_context = cli_mod._build_density_gui_logical_context(args, sources=[str(source_h5)])
+    render_context = cli_mod._build_density_gui_context(args, sources=[str(source_h5)])
+
+    assert len(logical_context.series_descriptors) == 3
+    assert len(render_context.series_descriptors) == 3
+    assert {profile.coordinate_mode for profile in render_context.profile} == {"axis"}
+    assert {profile.axis for profile in render_context.profile} == {"x"}
+
+
+def test_plot_density_gui_preview_switch_to_x_mode_does_not_drop_all_profiles(tmp_path, monkeypatch):
+    source_h5 = tmp_path / "traj_density.h5"
+    _write_density_collection_hdf5(source_h5)
+
+    preview_calls: list[dict[str, object]] = []
+
+    def _fake_render_profile_plot(**kwargs):
+        preview_calls.append(kwargs)
+        return None, {}
+
+    def _fake_gui_launcher(**kwargs):
+        initial_settings = deepcopy(kwargs["initial_settings"])
+        preview_settings = deepcopy(initial_settings)
+        preview_settings["x_mode"] = "x"
+        preview_settings["axis"] = "x"
+        kwargs["on_preview"](preview_settings)
+
+    monkeypatch.setattr("linak.cli._render_profile_plot", _fake_render_profile_plot)
+    monkeypatch.setattr("linak.cli._open_plot_settings_gui", _fake_gui_launcher)
+
+    rc = main(
+        [
+            "--log-level",
+            "ERROR",
+            "plot",
+            str(source_h5),
+            "--gui",
+        ]
+    )
+
+    assert rc == 0
+    assert preview_calls
+    x_mode_calls = [call for call in preview_calls if call["args"].x_mode == "x"]
+    assert x_mode_calls
+    rendered_profiles = x_mode_calls[-1]["profile"]
+    assert len(rendered_profiles) == 3
+    assert {profile.coordinate_mode for profile in rendered_profiles} == {"axis"}
+    assert {profile.axis for profile in rendered_profiles} == {"x"}
+
+
+def test_plot_density_combined_all_axis_hdf5_supports_number_quantity(tmp_path):
+    source_h5 = tmp_path / "traj_density.h5"
+    _write_density_collection_hdf5(source_h5)
+
+    rc = main(
+        [
+            "--log-level",
+            "ERROR",
+            "plot",
+            str(source_h5),
+            "--quantity",
+            "number",
+            "--no-show",
+        ]
+    )
+
+    assert rc == 0
 
 
 def test_plot_density_gui_multi_sources_create_combined_hdf5(tmp_path, monkeypatch):
@@ -3569,17 +3915,10 @@ def test_plot_density_gui_multi_source_first_open_matches_reopened_combined_hdf5
 
     reopened_args = cli_mod.build_parser().parse_args(["plot", str(combined_source)])
     reopened_args._runtime_argv = ("plot", str(combined_source))
-    reopened_catalog = cli_mod._build_density_gui_lazy_catalog(
+    reopened_context = cli_mod._build_density_gui_logical_context(
         reopened_args,
         sources=[str(combined_source)],
     )
-    reopened_catalog.default_series_labels = cli_mod._resolve_gui_default_series_labels(
-        args=reopened_args,
-        sources=[str(combined_source)],
-        profile_key=cli_mod._PLOT_PROFILE_DENSITY,
-        fallback_labels_by_source=reopened_catalog.fallback_labels_by_source,
-    )
-    reopened_context = reopened_catalog.build_initial_context()
 
     assert reopened_context.default_series_labels == [
         f"{source_h5_a.name}:O",
@@ -4840,7 +5179,7 @@ def test_compute_density_passes_surface_options_to_density_engine(tmp_path, monk
     def _fake_read_trajectory(_source):
         return [frame]
 
-    def _fake_compute_density_profiles(**kwargs):
+    def _fake_compute_all_density_profiles(**kwargs):
         captured["surface_mode"] = kwargs["surface_mode"]
         captured["surface_elements"] = kwargs["surface_elements"]
         captured["include_fixed_surface_atoms"] = kwargs["include_fixed_surface_atoms"]
@@ -4848,14 +5187,14 @@ def test_compute_density_passes_surface_options_to_density_engine(tmp_path, monk
         profile = compute_density_profile(
             [frame],
             species=kwargs["species"],
-            axis=kwargs["axis"],
+            axis=kwargs["surface_axis"],
             bin_width=kwargs["bin_width"],
         )
         return [profile]
 
     monkeypatch.setattr("linak.trajectory.io.read_trajectory", _fake_read_trajectory)
     monkeypatch.setattr(
-        "linak.analysis.density.compute_density_profiles", _fake_compute_density_profiles
+        "linak.analysis.density.compute_all_density_profiles", _fake_compute_all_density_profiles
     )
 
     rc = main(
@@ -6262,7 +6601,7 @@ def test_compute_density_writes_default_csv(tmp_path, monkeypatch):
     )
 
     assert rc == 0
-    assert (_linak_output_dir(tmp_path) / "traj_density_o_z.h5").exists()
+    assert (_linak_output_dir(tmp_path) / "traj_density_o.h5").exists()
 
 
 def test_compute_density_accepts_single_source_via_files_option(tmp_path, monkeypatch):
@@ -6288,7 +6627,7 @@ def test_compute_density_accepts_single_source_via_files_option(tmp_path, monkey
     )
 
     assert rc == 0
-    assert (_linak_output_dir(tmp_path) / "traj_density_o_z.h5").exists()
+    assert (_linak_output_dir(tmp_path) / "traj_density_o.h5").exists()
 
 
 def test_compute_density_default_hdf5_uses_linak_output_dir_in_source_folder(tmp_path, monkeypatch):
@@ -6318,8 +6657,8 @@ def test_compute_density_default_hdf5_uses_linak_output_dir_in_source_folder(tmp
     )
 
     assert rc == 0
-    assert (_linak_output_dir(trajectory_dir) / "traj_density_o_z.h5").exists()
-    assert not (work_dir / "traj_density_o_z.h5").exists()
+    assert (_linak_output_dir(trajectory_dir) / "traj_density_o.h5").exists()
+    assert not (work_dir / "traj_density_o.h5").exists()
 
 
 def test_compute_density_output_trailing_slash_uses_directory_with_default_filename(
@@ -6349,7 +6688,7 @@ def test_compute_density_output_trailing_slash_uses_directory_with_default_filen
     )
 
     assert rc == 0
-    assert (output_dir / "traj_density_o_z.h5").exists()
+    assert (output_dir / "traj_density_o.h5").exists()
     assert not (tmp_path / "custom_output.h5").exists()
 
 
@@ -6379,7 +6718,7 @@ def test_compute_density_output_without_suffix_stays_file_path(tmp_path, monkeyp
 
     assert rc == 0
     assert (tmp_path / "custom_output.h5").exists()
-    assert not (output_base / "traj_density_o_z.h5").exists()
+    assert not (output_base / "traj_density_o.h5").exists()
 
 
 def test_compute_msd_default_hdf5_uses_linak_output_dir_in_source_folder(tmp_path, monkeypatch):
@@ -6612,8 +6951,8 @@ def test_compute_density_default_output_avoids_overwriting_existing_hdf5(tmp_pat
 
     assert first_rc == 0
     assert second_rc == 0
-    assert (_linak_output_dir(tmp_path) / "traj_density_o_z.h5").exists()
-    assert (_linak_output_dir(tmp_path) / "traj_density_o_z_1.h5").exists()
+    assert (_linak_output_dir(tmp_path) / "traj_density_o.h5").exists()
+    assert (_linak_output_dir(tmp_path) / "traj_density_o_1.h5").exists()
 
 
 def test_default_combined_analysis_hdf5_path_uses_pwd_linak_output_dir_for_multi_source(
@@ -6664,7 +7003,7 @@ def test_compute_density_auto_detects_cell_for_volumetric_units(tmp_path, monkey
     )
 
     assert rc == 0
-    profile = load_density_profile(_linak_output_dir(tmp_path) / "traj_density_o_z.h5")
+    profile = load_density_profile(_linak_output_dir(tmp_path) / "traj_density_o.h5")
     assert profile.units == "g/cm^3"
 
 
@@ -6689,7 +7028,7 @@ def test_compute_density_writes_resolution_metadata_to_hdf5(tmp_path, monkeypatc
 
     assert rc == 0
     _datasets, metadata = read_linak_hdf5(
-        _linak_output_dir(tmp_path) / "traj_density_o_z.h5",
+        _linak_output_dir(tmp_path) / "traj_density_o.h5",
         expected_analysis="density",
     )
     assert metadata["source_path"] == str(trajectory.resolve())
@@ -6744,7 +7083,7 @@ def test_compute_density_accepts_cp2k_input_alias(tmp_path, monkeypatch):
     )
 
     assert rc == 0
-    profile = load_density_profile(_linak_output_dir(tmp_path) / "traj_density_o_z.h5")
+    profile = load_density_profile(_linak_output_dir(tmp_path) / "traj_density_o.h5")
     assert profile.units == "g/cm^3"
 
 
@@ -6778,10 +7117,15 @@ def test_compute_density_all_writes_one_hdf5_with_all_species_series(tmp_path, m
     )
 
     assert rc == 0
-    output = _linak_output_dir(tmp_path) / "traj_density_z.h5"
+    output = _linak_output_dir(tmp_path) / "traj_density.h5"
     assert output.exists()
     profiles = load_density_profiles(output)
-    assert [profile.species for profile in profiles] == ["H", "O", "H2O"]
+    species_set = {profile.species for profile in profiles}
+    raw_axes_set = {profile.axis for profile in profiles if profile.coordinate_mode != "distance"}
+    assert species_set == {"H", "O", "H2O"}
+    assert raw_axes_set == {"x", "y", "z"}
+    distance_profiles = [p for p in profiles if p.coordinate_mode == "distance"]
+    assert len(distance_profiles) >= 1
 
 
 def test_compute_density_h2o_stays_single_dataset(tmp_path, monkeypatch):
@@ -6817,9 +7161,9 @@ def test_compute_density_h2o_stays_single_dataset(tmp_path, monkeypatch):
     )
 
     assert rc == 0
-    assert (_linak_output_dir(tmp_path) / "water_density_h2o_z.h5").exists()
-    assert not (_linak_output_dir(tmp_path) / "water_density_h_z.h5").exists()
-    assert not (_linak_output_dir(tmp_path) / "water_density_o_z.h5").exists()
+    assert (_linak_output_dir(tmp_path) / "water_density_h2o.h5").exists()
+    assert not (_linak_output_dir(tmp_path) / "water_density_h.h5").exists()
+    assert not (_linak_output_dir(tmp_path) / "water_density_o.h5").exists()
 
 
 def test_apply_pbc_with_explicit_cell(tmp_path):

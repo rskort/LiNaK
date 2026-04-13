@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from contextlib import nullcontext
 from dataclasses import dataclass
 import logging
 from pathlib import Path
+import re
 from typing import Any
 
 import numpy as np
@@ -76,6 +78,7 @@ from .surface import (
 from .water import (
     water_molecule_triplets as _water_molecule_triplets,
     water_triplet_axis_values_with_masses as _water_triplet_axis_values_with_masses,
+    water_triplet_geometry as _water_triplet_geometry,
     water_axis_values_per_frame as _water_axis_values_per_frame_impl,
     water_oxygen_indices as _water_oxygen_indices_impl,
 )
@@ -245,6 +248,8 @@ def _compute_density_profile_from_selected(
     surface_position_std: float | None = None,
     surface_estimate: SurfaceEstimate | None = None,
     histogram_bounds: tuple[float, float] | None = None,
+    show_binning_progress: bool = True,
+    aggregate_binning_progress: ProgressBar | None = None,
 ) -> DensityProfile:
     """Build a :class:`DensityProfile` from already-selected axis values."""
     _validate_selected_density_inputs(
@@ -339,9 +344,16 @@ def _compute_density_profile_from_selected(
     )
     per_frame_density_values: list[np.ndarray] = []
     per_frame_number_density_values: list[np.ndarray] = []
-    with ProgressBar(
-        desc=f"Binning {species_label} density", total=n_frames, unit="frame"
-    ) as progress:
+    progress_cm = (
+        ProgressBar(
+            desc=f"Binning {species_label} density",
+            total=n_frames,
+            unit="frame",
+        )
+        if show_binning_progress
+        else nullcontext(None)
+    )
+    with progress_cm as progress:
         for frame_index, (axis_values, masses) in enumerate(
             zip(selected_per_frame, selected_masses_per_frame)
         ):
@@ -384,7 +396,10 @@ def _compute_density_profile_from_selected(
                 frame_volume = float(slice_volumes[frame_index])
                 framewise_mass_density_sum += per_frame_mass_histogram / frame_volume
                 framewise_entity_density_sum += per_frame_entity_histogram / frame_volume
-            progress.update()
+            if progress is not None:
+                progress.update()
+    if aggregate_binning_progress is not None:
+        aggregate_binning_progress.update()
 
     if use_volumetric_density and slice_volumes is not None:
         # With a variable cell, density is the time average of per-frame
@@ -533,7 +548,9 @@ def compute_density_profile(
         raise ValueError("binning must be one of: observed, cell")
     axis_index = axis_to_index(axis)
     surface_estimate: SurfaceEstimate | None
-    if precomputed_surface_estimate is not None:
+    if str(surface_mode).strip().lower() == "none":
+        surface_estimate = None
+    elif precomputed_surface_estimate is not None:
         if precomputed_surface_estimate.frame_values.shape != (len(frames),):
             raise ValueError(
                 "precomputed_surface_estimate frame count does not match the trajectory."
@@ -551,14 +568,15 @@ def compute_density_profile(
         )
     surface_position = None if surface_estimate is None else surface_estimate.position
     surface_position_std = None if surface_estimate is None else surface_estimate.std
-    if surface_position is None:
+    _surface_skipped = str(surface_mode).strip().lower() == "none"
+    if surface_position is None and not _surface_skipped:
         LOGGER.warning(
             "Could not estimate a surface position along %s; distance-to-surface plotting will "
             "fall back to raw %s coordinates.",
             axis.lower(),
             axis.lower(),
         )
-    else:
+    elif surface_position is not None:
         _log_framewise_surface_alignment(
             logger=LOGGER,
             axis=axis,
@@ -689,7 +707,9 @@ def compute_density_profiles(
         raise ValueError("At least one trajectory frame is required.")
 
     surface_estimate: SurfaceEstimate | None
-    if precomputed_surface_estimate is not None:
+    if str(surface_mode).strip().lower() == "none":
+        surface_estimate = None
+    elif precomputed_surface_estimate is not None:
         if precomputed_surface_estimate.frame_values.shape != (len(frames),):
             raise ValueError(
                 "precomputed_surface_estimate frame count does not match the trajectory."
@@ -706,14 +726,15 @@ def compute_density_profiles(
         )
     surface_position = None if surface_estimate is None else surface_estimate.position
     surface_position_std = None if surface_estimate is None else surface_estimate.std
-    if surface_position is None:
+    _surface_skipped = str(surface_mode).strip().lower() == "none"
+    if surface_position is None and not _surface_skipped:
         LOGGER.warning(
             "Could not estimate a surface position along %s; distance-to-surface plotting will "
             "fall back to raw %s coordinates.",
             axis.lower(),
             axis.lower(),
         )
-    else:
+    elif surface_position is not None:
         _log_framewise_surface_alignment(
             logger=LOGGER,
             axis=axis,
@@ -783,8 +804,17 @@ def compute_density_profiles(
                 "cell was unavailable. Falling back to observed-data binning.",
                 axis.lower(),
             )
+    water_selected_per_frame: list[np.ndarray] = []
+    water_masses_per_frame: list[np.ndarray] = []
+    water_selected_per_frame, water_masses_per_frame = _select_water_axis_values_per_frame(
+        frames, axis_index
+    )
+    total_binning_jobs = len(element_species)
+    if any(values.size > 0 for values in water_selected_per_frame):
+        total_binning_jobs += 1
+    LOGGER.info("Binning %d density profiles.", total_binning_jobs)
     with ProgressBar(
-        desc="Computing element-resolved densities", total=len(element_species), unit="species"
+        desc="Binning density profiles", total=total_binning_jobs, unit="profile"
     ) as progress:
         for element in element_species:
             selected_for_binning, coordinate_mode = _shift_axis_values_by_surface_per_frame(
@@ -808,39 +838,338 @@ def compute_density_profiles(
                     surface_position_std=profile_surface_position_std,
                     surface_estimate=surface_estimate,
                     histogram_bounds=histogram_bounds,
+                    show_binning_progress=False,
+                    aggregate_binning_progress=progress,
                 )
             )
-            progress.update()
-    water_selected_per_frame: list[np.ndarray] = []
-    water_masses_per_frame: list[np.ndarray] = []
-    water_selected_per_frame, water_masses_per_frame = _select_water_axis_values_per_frame(
-        frames, axis_index
+
+        if any(values.size > 0 for values in water_selected_per_frame):
+            selected_for_binning, coordinate_mode = _shift_axis_values_by_surface_per_frame(
+                water_selected_per_frame,
+                per_frame_surface,
+            )
+            profile_surface_position = surface_position
+            profile_surface_position_std = surface_position_std
+            profiles.append(
+                _compute_density_profile_from_selected(
+                    frames=frames,
+                    selected_per_frame=selected_for_binning,
+                    selected_masses_per_frame=water_masses_per_frame,
+                    axis=axis,
+                    axis_index=axis_index,
+                    species_label="H2O",
+                    count_label="molecules",
+                    bin_width=bin_width,
+                    coordinate_mode=coordinate_mode,
+                    surface_position=profile_surface_position,
+                    surface_position_std=profile_surface_position_std,
+                    surface_estimate=surface_estimate,
+                    histogram_bounds=histogram_bounds,
+                    show_binning_progress=False,
+                    aggregate_binning_progress=progress,
+                )
+            )
+    return profiles
+
+
+def compute_all_density_profiles(
+    frames: list[Atoms],
+    species: str | None = "all",
+    surface_axis: str = "z",
+    bin_width: float = 0.1,
+    surface_mode: str = "auto",
+    surface_elements: list[str] | tuple[str, ...] | None = None,
+    include_fixed_surface_atoms: bool = False,
+    binning: str = "cell",
+    surface_options: SurfaceEstimatorOptions | None = None,
+    precomputed_surface_estimate: SurfaceEstimate | None = None,
+) -> list[DensityProfile]:
+    """Compute raw X/Y/Z and distance density profiles in a single pass.
+
+    This is the efficient replacement for calling ``compute_density_profiles``
+    four times (once per raw axis and once for surface-distance).  All frame
+    iteration, species selection, and water detection happen exactly once.
+    """
+    ensure_positive("bin_width", bin_width)
+    normalized_binning = binning.strip().lower()
+    if normalized_binning not in {"observed", "cell"}:
+        raise ValueError("binning must be one of: observed, cell")
+    if not frames:
+        raise ValueError("At least one trajectory frame is required.")
+
+    selection_mode, species_label = _normalize_species_query(species, allow_h2o=True)
+    surface_axis_index = axis_to_index(surface_axis)
+    raw_axes = ("x", "y", "z")
+    axis_indices = {ax: axis_to_index(ax) for ax in raw_axes}
+
+    # ---- Surface estimation (once, for distance mode only) ----
+    surface_estimate: SurfaceEstimate | None
+    if str(surface_mode).strip().lower() == "none":
+        surface_estimate = None
+    elif precomputed_surface_estimate is not None:
+        if precomputed_surface_estimate.frame_values.shape != (len(frames),):
+            raise ValueError(
+                "precomputed_surface_estimate frame count does not match the trajectory."
+            )
+        surface_estimate = precomputed_surface_estimate
+    else:
+        surface_estimate, _surface_method = _select_surface_estimate(
+            frames,
+            surface_axis,
+            mode=surface_mode,
+            surface_elements=surface_elements,
+            include_fixed_surface_atoms=include_fixed_surface_atoms,
+            surface_options=surface_options,
+            logger=LOGGER,
+        )
+    surface_position = None if surface_estimate is None else surface_estimate.position
+    surface_position_std = None if surface_estimate is None else surface_estimate.std
+    if surface_position is None and str(surface_mode).strip().lower() != "none":
+        LOGGER.warning(
+            "Could not estimate a surface position along %s; distance-to-surface plotting will "
+            "fall back to raw %s coordinates.",
+            surface_axis.lower(),
+            surface_axis.lower(),
+        )
+    elif surface_position is not None:
+        _log_framewise_surface_alignment(
+            logger=LOGGER,
+            axis=surface_axis,
+            surface_position=surface_position,
+            surface_position_std=surface_position_std,
+        )
+
+    trusted_surface_estimate = (
+        surface_estimate
+        if _surface_estimate_supports_distance_mode(surface_estimate, frame_count=len(frames))
+        else None
+    )
+    per_frame_surface = (
+        None if trusted_surface_estimate is None else trusted_surface_estimate.per_frame
     )
 
-    if any(values.size > 0 for values in water_selected_per_frame):
-        selected_for_binning, coordinate_mode = _shift_axis_values_by_surface_per_frame(
-            water_selected_per_frame,
+    # ---- Determine species to iterate ----
+    if selection_mode == "all":
+        element_species = available_element_species(frames)
+        if not element_species:
+            raise ValueError("No elements found in trajectory.")
+    elif selection_mode == "h2o":
+        element_species = []
+    else:
+        element_species = [species_label]
+
+    include_water = selection_mode in ("all", "h2o")
+
+    # ---- Single pass: extract per-frame data for all axes at once ----
+    # selected[axis][element] = list of per-frame arrays
+    selected: dict[str, dict[str, list[np.ndarray]]] = {
+        ax: {el: [] for el in element_species} for ax in raw_axes
+    }
+    masses_by_species: dict[str, list[np.ndarray]] = {el: [] for el in element_species}
+    water_selected: dict[str, list[np.ndarray]] = {ax: [] for ax in raw_axes}
+    water_masses: list[np.ndarray] = []
+    empty = np.array([], dtype=float)
+    cached_water_triplets: np.ndarray | None = None
+
+    with ProgressBar(
+        desc="Selecting species for density (all axes)", total=len(frames), unit="frame"
+    ) as progress:
+        for frame_index, frame in enumerate(frames):
+            # -- Element selection (all axes extracted at once) --
+            if element_species:
+                if selection_mode == "all":
+                    symbols = np.asarray(frame.get_chemical_symbols())
+                    positions = np.asarray(frame.positions, dtype=float)
+                    masses = np.asarray(frame.get_masses(), dtype=float) * AMU_TO_G
+                    frame_selected: dict[str, np.ndarray] = {}
+                    frame_selected_masses: dict[str, np.ndarray] = {}
+                    for symbol in np.unique(symbols):
+                        mask = symbols == symbol
+                        frame_selected[str(symbol)] = positions[mask]
+                        frame_selected_masses[str(symbol)] = masses[mask]
+                    for element in element_species:
+                        pos_block = frame_selected.get(element)
+                        mass_block = frame_selected_masses.get(element, empty)
+                        if pos_block is not None:
+                            for ax in raw_axes:
+                                selected[ax][element].append(pos_block[:, axis_indices[ax]])
+                            masses_by_species[element].append(mass_block)
+                        else:
+                            for ax in raw_axes:
+                                selected[ax][element].append(empty)
+                            masses_by_species[element].append(empty)
+                else:
+                    # Single element selection
+                    el = element_species[0]
+                    ax_vals, masses = _select_axis_values_with_masses(
+                        frame, el, 0
+                    )
+                    if ax_vals.size > 0:
+                        positions = np.asarray(frame.positions, dtype=float)
+                        symbols = np.asarray(frame.get_chemical_symbols())
+                        mask = symbols == el
+                        full_pos = positions[mask]
+                        for ax in raw_axes:
+                            selected[ax][el].append(full_pos[:, axis_indices[ax]])
+                        masses_by_species[el].append(masses)
+                    else:
+                        for ax in raw_axes:
+                            selected[ax][el].append(empty)
+                        masses_by_species[el].append(empty)
+
+            # -- Water detection (once per frame, all axes extracted) --
+            if include_water:
+                if cached_water_triplets is None:
+                    cached_water_triplets = _water_molecule_triplets(frame)
+                elif frame_index % H2O_VALIDATION_STRIDE == 0:
+                    validated = _water_molecule_triplets(frame)
+                    if not np.array_equal(validated, cached_water_triplets):
+                        LOGGER.warning(
+                            "Detected H2O topology change at frame %d; "
+                            "refreshing cached water triplets.",
+                            frame_index,
+                        )
+                        cached_water_triplets = validated
+
+                geom = _water_triplet_geometry(frame, cached_water_triplets)
+                if geom.com_positions.size > 0:
+                    for ax in raw_axes:
+                        water_selected[ax].append(
+                            np.asarray(geom.com_positions[:, axis_indices[ax]], dtype=float)
+                        )
+                    water_masses.append(
+                        np.asarray(geom.molecular_masses_amu * AMU_TO_G, dtype=float)
+                    )
+                else:
+                    for ax in raw_axes:
+                        water_selected[ax].append(empty)
+                    water_masses.append(empty)
+
+            progress.update()
+
+    LOGGER.info(
+        "Single-pass selection complete: %d element species + %s water, %d frames.",
+        len(element_species),
+        "with" if include_water else "no",
+        len(frames),
+    )
+
+    # ---- Build profiles for each (species, axis/mode) combination ----
+    profiles: list[DensityProfile] = []
+    water_present = include_water and any(v.size > 0 for v in water_selected.get("x", []))
+    total_binning_jobs = len(element_species) * 4 + (4 if water_present else 0)
+    LOGGER.info("Binning %d density profiles.", total_binning_jobs)
+
+    # Helper to compute histogram bounds and build profiles for a species
+    def _build_profiles_for_species(
+        species_lbl: str,
+        count_lbl: str,
+        raw_data: dict[str, list[np.ndarray]],
+        mass_data: list[np.ndarray],
+        *,
+        progress: ProgressBar,
+    ) -> None:
+        # Raw axis profiles (surface_mode="none")
+        for ax in raw_axes:
+            axis_idx = axis_indices[ax]
+            hist_bounds = None
+            if normalized_binning == "cell":
+                hist_bounds = _cell_histogram_bounds(
+                    frames=frames,
+                    axis_index=axis_idx,
+                    coordinate_mode="axis",
+                    surface_per_frame=None,
+                )
+                if hist_bounds is None:
+                    LOGGER.warning(
+                        "Cell binning requested for '%s' along %s, but a usable cell was "
+                        "unavailable. Falling back to observed-data binning.",
+                        species_lbl,
+                        ax,
+                    )
+            profiles.append(
+                _compute_density_profile_from_selected(
+                    frames=frames,
+                    selected_per_frame=raw_data[ax],
+                    selected_masses_per_frame=mass_data,
+                    axis=ax,
+                    axis_index=axis_idx,
+                    species_label=species_lbl,
+                    count_label=count_lbl,
+                    bin_width=bin_width,
+                    coordinate_mode="axis",
+                    surface_position=None,
+                    surface_position_std=None,
+                    surface_estimate=None,
+                    histogram_bounds=hist_bounds,
+                    show_binning_progress=False,
+                    aggregate_binning_progress=progress,
+                )
+            )
+
+        # Distance profile (surface-shifted along surface_axis)
+        shifted_data, coord_mode = _shift_axis_values_by_surface_per_frame(
+            raw_data[surface_axis],
             per_frame_surface,
         )
-        profile_surface_position = surface_position
-        profile_surface_position_std = surface_position_std
+        dist_hist_bounds = None
+        if normalized_binning == "cell":
+            dist_hist_bounds = _cell_histogram_bounds(
+                frames=frames,
+                axis_index=surface_axis_index,
+                coordinate_mode=coord_mode,
+                surface_per_frame=per_frame_surface if coord_mode == "distance" else None,
+            )
+            if dist_hist_bounds is None:
+                LOGGER.warning(
+                    "Cell binning requested for '%s' distance along %s, but a usable cell was "
+                    "unavailable. Falling back to observed-data binning.",
+                    species_lbl,
+                    surface_axis,
+                )
         profiles.append(
             _compute_density_profile_from_selected(
                 frames=frames,
-                selected_per_frame=selected_for_binning,
-                selected_masses_per_frame=water_masses_per_frame,
-                axis=axis,
-                axis_index=axis_index,
-                species_label="H2O",
-                count_label="molecules",
+                selected_per_frame=shifted_data,
+                selected_masses_per_frame=mass_data,
+                axis=surface_axis,
+                axis_index=surface_axis_index,
+                species_label=species_lbl,
+                count_label=count_lbl,
                 bin_width=bin_width,
-                coordinate_mode=coordinate_mode,
-                surface_position=profile_surface_position,
-                surface_position_std=profile_surface_position_std,
+                coordinate_mode=coord_mode,
+                surface_position=surface_position,
+                surface_position_std=surface_position_std,
                 surface_estimate=surface_estimate,
-                histogram_bounds=histogram_bounds,
+                histogram_bounds=dist_hist_bounds,
+                show_binning_progress=False,
+                aggregate_binning_progress=progress,
             )
         )
+
+    # Element species
+    with ProgressBar(
+        desc="Binning density profiles", total=total_binning_jobs, unit="profile"
+    ) as progress:
+        for element in element_species:
+            _build_profiles_for_species(
+                element,
+                "atoms",
+                {ax: selected[ax][element] for ax in raw_axes},
+                masses_by_species[element],
+                progress=progress,
+            )
+
+        # Water
+        if water_present:
+            _build_profiles_for_species(
+                "H2O",
+                "molecules",
+                water_selected,
+                water_masses,
+                progress=progress,
+            )
+
     return profiles
 
 
@@ -981,6 +1310,38 @@ def load_density_profile(
     return profiles[0]
 
 
+def _density_payload_matches_selection(
+    metadata: Mapping[str, Any],
+    *,
+    axis: str | None = None,
+    species: str | None = None,
+) -> bool:
+    requested_axis = None if axis is None or not str(axis).strip() else str(axis).strip().lower()
+    if requested_axis is not None:
+        metadata_axis = str(metadata.get("axis", "z")).strip().lower() or "z"
+        if metadata_axis != requested_axis:
+            return False
+
+    requested_species = None if species is None or not str(species).strip() else str(species)
+    if requested_species is not None:
+        selection_mode, requested_label = _normalize_species_query(
+            requested_species,
+            allow_h2o=True,
+        )
+        if selection_mode != "all":
+            metadata_species = str(metadata.get("species", "")).strip()
+            if not metadata_species:
+                return False
+            metadata_mode, metadata_label = _normalize_species_query(
+                metadata_species,
+                allow_h2o=True,
+            )
+            if metadata_mode != selection_mode or metadata_label != requested_label:
+                return False
+
+    return True
+
+
 def _load_density_profiles_from_payloads(
     source_path: Path,
     payloads: list[tuple[dict[str, np.ndarray], dict[str, Any]]],
@@ -990,6 +1351,8 @@ def _load_density_profiles_from_payloads(
 ) -> list[DensityProfile]:
     profiles: list[DensityProfile] = []
     for datasets, metadata in payloads:
+        if not _density_payload_matches_selection(metadata, axis=axis, species=species):
+            continue
         required = ("bin_centers_A", "density")
         missing = [name for name in required if name not in datasets]
         if missing:
@@ -1156,6 +1519,27 @@ def _format_plot_density_units(units: str) -> str:
     return units.replace("Angstrom", "A")
 
 
+_ENTITY_NUMBER_DENSITY_PATTERN = re.compile(r"^(atom|molecule|atoms|molecules)(/.*)")
+
+
+def _unify_number_density_units(all_units: list[str]) -> str | None:
+    """Return a unified unit string when units differ only in the entity label (atom vs molecule).
+
+    Returns ``None`` when the units are incompatible beyond the entity label.
+    """
+    if not all_units:
+        return None
+    suffixes: set[str] = set()
+    for unit in all_units:
+        match = _ENTITY_NUMBER_DENSITY_PATTERN.match(unit)
+        if match is None:
+            return None
+        suffixes.add(match.group(2))
+    if len(suffixes) != 1:
+        return None
+    return f"entities{suffixes.pop()}"
+
+
 def _profile_has_surface_reference(profile: DensityProfile) -> bool:
     if profile.coordinate_mode == "distance":
         return True
@@ -1167,7 +1551,14 @@ def _density_x_data(
     *,
     x_mode: str,
 ) -> tuple[np.ndarray, str]:
-    if x_mode == "axis":
+    normalized_x_mode = str(x_mode).strip().lower() or "distance"
+    if normalized_x_mode in {"x", "y", "z"} and profile.axis != normalized_x_mode:
+        raise ValueError(
+            f"Density profile '{profile.species}' is stored along the {profile.axis.upper()} axis, "
+            f"so it cannot be plotted against {normalized_x_mode.upper()} coordinates."
+        )
+
+    if normalized_x_mode in {"axis", "x", "y", "z"}:
         if profile.coordinate_mode == "distance":
             if profile.surface_position is not None and np.isfinite(profile.surface_position):
                 return profile.bin_centers + float(
@@ -1181,7 +1572,7 @@ def _density_x_data(
             return profile.bin_centers, "Distance to the surface ($\\mathrm{\\AA}$)"
         return profile.bin_centers, f"{profile.axis.upper()} (A)"
 
-    if x_mode == "distance":
+    if normalized_x_mode == "distance":
         if profile.coordinate_mode == "distance":
             return profile.bin_centers, "Distance to the surface ($\\mathrm{\\AA}$)"
         if _profile_has_surface_reference(profile):
@@ -1196,7 +1587,9 @@ def _density_x_data(
         )
         return profile.bin_centers, f"{profile.axis.upper()} (A)"
 
-    raise ValueError(f"Unsupported density x_mode '{x_mode}'. Choose 'distance' or 'axis'.")
+    raise ValueError(
+        f"Unsupported density x_mode '{x_mode}'. Choose 'distance', 'x', 'y', 'z', or legacy 'axis'."
+    )
 
 
 def _density_y_data(
@@ -1230,6 +1623,16 @@ def _density_y_data(
         return density_values, units, "Density"
 
     raise ValueError(f"Unsupported density quantity '{quantity}'. Choose 'mass' or 'number'.")
+
+
+def _density_profile_visible_for_x_mode(profile: DensityProfile, *, x_mode: str) -> bool:
+    normalized_x_mode = str(x_mode).strip().lower() or "distance"
+    if normalized_x_mode in {"x", "y", "z"}:
+        return (
+            profile.coordinate_mode != "distance"
+            and str(profile.axis).strip().lower() == normalized_x_mode
+        )
+    return True
 
 
 def _expand_linear_limits(lower: float, upper: float) -> list[float]:
@@ -1725,6 +2128,37 @@ def plot_density_profiles(
             savefig_kwargs=savefig_kwargs,
         )
 
+    if x_mode in {"x", "y", "z"}:
+        compat = [
+            i for i, p in enumerate(profiles)
+            if _density_profile_visible_for_x_mode(p, x_mode=x_mode)
+        ]
+        if not compat:
+            raise ValueError(
+                f"No density profiles match the selected axis '{x_mode.upper()}'."
+            )
+
+        def _pick(lst: list[Any] | None) -> list[Any] | None:
+            return None if lst is None else [lst[i] for i in compat]
+
+        profiles = _pick(profiles)  # type: ignore[assignment]
+        labels = _pick(labels)  # type: ignore[assignment]
+        series_ids = _pick(series_ids)
+        line_colors = _pick(line_colors)
+        series_error_configs = _pick(series_error_configs)
+        series_enabled = _pick(series_enabled)
+        series_show_in_legend = _pick(series_show_in_legend)
+        series_line_widths = _pick(series_line_widths)
+        series_markers = _pick(series_markers)
+        series_fit_configs = _pick(series_fit_configs)
+        series_cumulative_configs = _pick(series_cumulative_configs)
+        series_normalization_modes = _pick(series_normalization_modes)
+        series_normalization_values = _pick(series_normalization_values)
+        series_normalization_x_refs = _pick(series_normalization_x_refs)
+        series_line_kwargs = _pick(series_line_kwargs)
+        if render_series_descriptors is not None:
+            render_series_descriptors = _pick(render_series_descriptors)  # type: ignore[assignment]
+
     first = profiles[0]
     if x_mode == "distance" and any(
         not _profile_has_surface_reference(profile) for profile in profiles
@@ -1738,7 +2172,11 @@ def plot_density_profiles(
     y_units = y_resolved[0][1]
     y_label_prefix = y_resolved[0][2]
     if any(units != y_units for _, units, _ in y_resolved[1:]):
-        raise ValueError("All density profiles must use the same units for combined plotting.")
+        unified = _unify_number_density_units([units for _, units, _ in y_resolved])
+        if unified is not None:
+            y_units = unified
+        else:
+            raise ValueError("All density profiles must use the same units for combined plotting.")
     y_series = [values for values, _, _ in y_resolved]
     x_series = [_density_x_data(profile, x_mode=x_mode)[0] for profile in profiles]
     default_x_label = _density_x_data(first, x_mode=x_mode)[1]

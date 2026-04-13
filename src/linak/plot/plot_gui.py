@@ -112,6 +112,14 @@ _ANNOTATION_VERTICAL_ALIGN = ("top", "center", "bottom", "baseline")
 _POSITION_COMPONENT_LABELS = ("distance", "x", "y", "z", "2D projection")
 _POSITION_PROJECTION_QUANTITIES = ("x", "y", "z", "distance", "ps", "fs", "step", "frame")
 _POSITION_PROJECTION_RENDER_MODES = ("color-scale", "line-colors")
+_DENSITY_X_MODE_LABELS = ("Distance", "X", "Y", "Z")
+_DENSITY_X_MODE_BY_LABEL = {
+    "distance": "distance",
+    "x": "x",
+    "y": "y",
+    "z": "z",
+    "axis": "axis",
+}
 _PROFILE_FILTER_METADATA_LABEL = "Use stored metadata"
 _PROFILE_FILTER_SPECIES_B_AUTO_LABEL = "Same as Species A / stored metadata"
 _AUTO_PREVIEW_DEBOUNCE_MS = 1000
@@ -7420,7 +7428,18 @@ def launch_plot_settings_panel(
             if analysis == "density":
                 view = QGroupBox("Density View")
                 view_form = QFormLayout(view)
-                self.density_x_mode = self._combo(("distance", "axis"))
+                available_modes = self._profile_filter_options.get("available_modes")
+                if isinstance(available_modes, list) and available_modes:
+                    mode_labels: list[str] = []
+                    for mode in available_modes:
+                        if mode == "distance":
+                            mode_labels.append("Distance")
+                        elif mode in {"x", "y", "z"}:
+                            mode_labels.append(mode.upper())
+                    density_x_mode_labels = tuple(mode_labels) if mode_labels else _DENSITY_X_MODE_LABELS
+                else:
+                    density_x_mode_labels = _DENSITY_X_MODE_LABELS
+                self.density_x_mode = self._combo(density_x_mode_labels)
                 self.density_x_mode.currentTextChanged.connect(self._schedule_preview_update)
                 self.density_quantity = self._combo(("mass", "number"))
                 self.density_quantity.currentTextChanged.connect(self._schedule_preview_update)
@@ -12140,6 +12159,24 @@ def launch_plot_settings_panel(
             token = widget.currentText().strip()
             return None if token == default_label or token == "" else token
 
+        def _density_x_mode_display_label(
+            self,
+            x_mode: str | None,
+            *,
+            axis: str | None,
+        ) -> str:
+            normalized_mode = str(x_mode or "distance").strip().lower() or "distance"
+            normalized_axis = str(axis or "").strip().lower()
+            if normalized_mode == "axis" and normalized_axis in {"x", "y", "z"}:
+                return normalized_axis.upper()
+            if normalized_mode in {"x", "y", "z"}:
+                return normalized_mode.upper()
+            return "Distance"
+
+        def _selected_density_x_mode(self) -> str:
+            label = self.density_x_mode.currentText().strip().lower()
+            return _DENSITY_X_MODE_BY_LABEL.get(label, "distance")
+
         def _rdf_species_b_choices(self, species_a: str | None) -> list[str]:
             mapping = self._profile_filter_options.get("species_b_by_species_a", {})
             if not isinstance(mapping, dict):
@@ -12517,7 +12554,10 @@ def launch_plot_settings_panel(
             if hasattr(self, "density_x_mode"):
                 self._set_combo_value(
                     self.density_x_mode,
-                    str(settings.get("x_mode") or "distance"),
+                    self._density_x_mode_display_label(
+                        str(settings.get("x_mode") or "distance"),
+                        axis=str(settings.get("axis") or ""),
+                    ),
                 )
             if hasattr(self, "density_quantity"):
                 self._set_combo_value(
@@ -13479,6 +13519,9 @@ def launch_plot_settings_panel(
             self._persist_active_series_editor()
             self._persist_active_annotation_editor()
             self._validate_series_state_lengths()
+            # Plot Studio currently serializes one settings payload for
+            # preview/save that includes data selection, view mapping,
+            # per-series state, and pure style fields together.
 
             def _synced_text(key: str, widget: QLineEdit) -> str | None:
                 mode = self._synced_field_mode(key)
@@ -14351,7 +14394,10 @@ def launch_plot_settings_panel(
                 axis_value = self.analysis_axis.currentText().strip().lower()
                 settings["axis"] = None if axis_value == "" else axis_value
             if hasattr(self, "density_x_mode"):
-                settings["x_mode"] = self.density_x_mode.currentText().strip() or "distance"
+                density_x_mode = self._selected_density_x_mode()
+                settings["x_mode"] = density_x_mode
+                if density_x_mode in {"x", "y", "z"}:
+                    settings["axis"] = density_x_mode
             if hasattr(self, "density_quantity"):
                 settings["quantity"] = self.density_quantity.currentText().strip() or "mass"
             if hasattr(self, "rdf_species_a"):

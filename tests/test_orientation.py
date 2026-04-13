@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from types import SimpleNamespace
 
 import h5py
@@ -108,6 +109,44 @@ def test_compute_orientation_basic():
     assert len(profile.count_azimuthal_valid) == len(profile.bin_centers)
     assert profile.heatmap_polar.shape[0] == len(profile.bin_centers)
     assert profile.heatmap_azimuthal.shape[0] == len(profile.bin_centers)
+
+
+def test_compute_orientation_reports_frame_and_aggregation_progress(monkeypatch, caplog):
+    events: list[tuple[str, object]] = []
+
+    class _DummyProgressBar:
+        def __init__(self, *, desc, total=None, unit="it", **_kwargs):
+            self.desc = desc
+            self.total = total
+            self.unit = unit
+
+        def __enter__(self):
+            events.append(("enter", self.desc, self.total, self.unit))
+            return self
+
+        def update(self, n=1):
+            events.append(("update", self.desc, n))
+
+        def close(self):
+            events.append(("close", self.desc))
+
+        def __exit__(self, exc_type, exc, tb):
+            self.close()
+
+    monkeypatch.setattr(orientation_mod, "ProgressBar", _DummyProgressBar)
+    caplog.set_level(logging.INFO, logger=orientation_mod.LOGGER.name)
+
+    profile = compute_orientation_profile(frames=_multi_frame_trajectory(3), axis="z", bin_width=1.0)
+
+    assert profile.n_frames == 3
+    entered = [event[1] for event in events if event[0] == "enter"]
+    assert "Computing orientation" in entered
+    assert "Aggregating orientation bins" in entered
+    updates = [event for event in events if event[0] == "update"]
+    assert any(event[1] == "Computing orientation" for event in updates)
+    assert any(event[1] == "Aggregating orientation bins" for event in updates)
+    assert "Orientation frame analysis complete: 3 frames, 1 H2O/frame." in caplog.text
+    assert "Aggregating cached frame data into distance and angle bins." in caplog.text
 
 
 def test_compute_orientation_empty_raises():

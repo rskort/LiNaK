@@ -12,6 +12,7 @@ import linak.analysis.water as water_module
 from linak.analysis.density import (
     SurfaceEstimatorOptions,
     available_element_species,
+    compute_all_density_profiles,
     compute_density_profiles,
     compute_density_profile,
     estimate_surface_reference,
@@ -1371,7 +1372,9 @@ def test_plot_density_profile_supports_number_density(monkeypatch):
 
     captured = {}
 
-    def _fake_plot_line_series(_x, y, **kwargs):
+    def _fake_plot_line_series(x, y, **kwargs):
+        captured["x"] = x
+        captured["x_label"] = kwargs["x_label"]
         captured["y"] = y
         captured["y_label"] = kwargs["y_label"]
         return None
@@ -1394,6 +1397,76 @@ def test_plot_density_profile_supports_number_density(monkeypatch):
     plot_density_profile(profile, show=False, quantity="number")
     np.testing.assert_allclose(captured["y"], np.array([250.0]))
     assert captured["y_label"] == "Entity density (atom/nm^3)"
+
+
+def test_plot_density_profile_supports_explicit_cartesian_x_modes(monkeypatch):
+    from linak.analysis.density import DensityProfile, plot_density_profile
+
+    captured = {}
+
+    def _fake_plot_line_series(x, _y, **kwargs):
+        captured["x"] = x
+        captured["x_label"] = kwargs["x_label"]
+        return None
+
+    monkeypatch.setattr("linak.analysis.density.plot_line_series", _fake_plot_line_series)
+    profile = DensityProfile(
+        axis="x",
+        species="Li",
+        bin_edges=np.array([0.0, 1.0, 2.0]),
+        bin_centers=np.array([0.5, 1.5]),
+        counts_per_frame=np.array([1.0, 2.0]),
+        density=np.array([0.1, 0.2]),
+        units="g/cm^3",
+        n_frames=1,
+        surface_position=0.0,
+    )
+
+    plot_density_profile(profile, show=False, x_mode="x")
+
+    np.testing.assert_allclose(captured["x"], np.array([0.5, 1.5]))
+    assert captured["x_label"] == "X (A)"
+
+
+def test_plot_density_profiles_explicit_cartesian_x_mode_filters_to_matching_axis(monkeypatch):
+    from linak.analysis.density import DensityProfile, plot_density_profiles
+
+    captured = {}
+
+    def _fake_plot_multi_line_series(x_series, y_series, labels, **kwargs):
+        captured["series_count"] = len(x_series)
+        captured["labels"] = labels
+        return None
+
+    monkeypatch.setattr("linak.analysis.density.plot_multi_line_series", _fake_plot_multi_line_series)
+
+    profiles = [
+        DensityProfile(
+            axis="x",
+            species="O",
+            bin_edges=np.array([0.0, 1.0]),
+            bin_centers=np.array([0.5]),
+            counts_per_frame=np.array([1.0]),
+            density=np.array([0.1]),
+            units="g/cm^3",
+            n_frames=1,
+        ),
+        DensityProfile(
+            axis="y",
+            species="O",
+            bin_edges=np.array([0.0, 1.0]),
+            bin_centers=np.array([0.5]),
+            counts_per_frame=np.array([1.0]),
+            density=np.array([0.2]),
+            units="g/cm^3",
+            n_frames=1,
+        ),
+    ]
+
+    plot_density_profiles(profiles, show=False, x_mode="y")
+
+    assert captured["series_count"] == 1
+    assert captured["labels"] == ["O"]
 
 
 def test_plot_line_series_keeps_explicit_y_limits_when_ticks_are_outside_range():
@@ -1988,6 +2061,155 @@ def test_compute_density_profiles_logs_one_compact_info_summary(caplog):
     ]
     assert len(summary_messages) == 1
     assert "3 profile(s): H, O, H2O;" in summary_messages[0]
+    assert any("Binning 3 density profiles." in message for message in info_messages)
     assert not any("Selected " in message for message in info_messages)
     assert not any("Density mode:" in message for message in info_messages)
     assert not any("Density normalization path" in message for message in info_messages)
+
+
+def test_compute_all_density_profiles_logs_single_pass_and_aggregate_binning(caplog):
+    frame = Atoms(
+        "OH2",
+        positions=[
+            [0.0, 0.0, 0.50],
+            [0.8, 0.0, 0.55],
+            [-0.2, 0.75, 0.45],
+        ],
+        cell=[10.0, 10.0, 10.0],
+        pbc=True,
+    )
+
+    with caplog.at_level(logging.INFO, logger="linak.analysis.density"):
+        profiles = compute_all_density_profiles(
+            frames=[frame],
+            species="all",
+            surface_axis="z",
+            bin_width=1.0,
+        )
+
+    assert len(profiles) == 12
+    info_messages = [
+        record.getMessage() for record in caplog.records if record.levelno == logging.INFO
+    ]
+    assert any("Single-pass selection complete:" in message for message in info_messages)
+    assert any("Binning 12 density profiles." in message for message in info_messages)
+
+
+def test_unify_number_density_units_merges_atom_and_molecule():
+    from linak.analysis.density import _unify_number_density_units
+
+    result = _unify_number_density_units(["atom/nm^3", "molecule/nm^3"])
+    assert result == "entities/nm^3"
+
+
+def test_unify_number_density_units_returns_none_for_incompatible():
+    from linak.analysis.density import _unify_number_density_units
+
+    assert _unify_number_density_units(["atom/nm^3", "g/cm^3"]) is None
+
+
+def test_unify_number_density_units_returns_none_for_different_denominators():
+    from linak.analysis.density import _unify_number_density_units
+
+    assert _unify_number_density_units(["atom/nm^3", "molecule/Angstrom^3"]) is None
+
+
+def test_unify_number_density_units_single_unit():
+    from linak.analysis.density import _unify_number_density_units
+
+    assert _unify_number_density_units(["atom/nm^3"]) == "entities/nm^3"
+
+
+def test_plot_density_profiles_filters_by_axis_in_x_mode(monkeypatch):
+    from linak.analysis.density import DensityProfile, plot_density_profiles
+
+    captured = {}
+
+    def _fake_plot_multi(x_series, y_series, labels, **kwargs):
+        captured["labels"] = labels
+        captured["x_series"] = x_series
+        return None
+
+    monkeypatch.setattr("linak.analysis.density.plot_multi_line_series", _fake_plot_multi)
+
+    profiles = [
+        DensityProfile(
+            axis="x",
+            species="O",
+            bin_edges=np.array([0.0, 1.0]),
+            bin_centers=np.array([0.5]),
+            counts_per_frame=np.array([1.0]),
+            density=np.array([1.0]),
+            units="g/cm^3",
+            n_frames=1,
+        ),
+        DensityProfile(
+            axis="y",
+            species="O",
+            bin_edges=np.array([0.0, 1.0]),
+            bin_centers=np.array([0.5]),
+            counts_per_frame=np.array([1.0]),
+            density=np.array([1.2]),
+            units="g/cm^3",
+            n_frames=1,
+        ),
+        DensityProfile(
+            axis="z",
+            species="O",
+            bin_edges=np.array([0.0, 1.0]),
+            bin_centers=np.array([0.5]),
+            counts_per_frame=np.array([1.0]),
+            density=np.array([0.8]),
+            units="g/cm^3",
+            n_frames=1,
+        ),
+    ]
+
+    plot_density_profiles(profiles, show=False, x_mode="z", quantity="mass")
+    assert len(captured["labels"]) == 1
+    assert captured["labels"][0] == "O"
+
+
+def test_plot_density_profiles_unifies_number_density_units_across_atom_and_molecule(monkeypatch):
+    from linak.analysis.density import DensityProfile, plot_density_profiles
+
+    captured = {}
+
+    def _fake_plot_multi(x_series, y_series, labels, **kwargs):
+        captured["y_label"] = kwargs["y_label"]
+        captured["y_series"] = y_series
+        return None
+
+    monkeypatch.setattr("linak.analysis.density.plot_multi_line_series", _fake_plot_multi)
+
+    profiles = [
+        DensityProfile(
+            axis="z",
+            species="O",
+            bin_edges=np.array([0.0, 1.0]),
+            bin_centers=np.array([0.5]),
+            counts_per_frame=np.array([1.0]),
+            density=np.array([1.0]),
+            units="g/cm^3",
+            n_frames=1,
+            number_density=np.array([0.25]),
+            number_density_units="atoms/Angstrom^3",
+            surface_position=0.0,
+        ),
+        DensityProfile(
+            axis="z",
+            species="H2O",
+            bin_edges=np.array([0.0, 1.0]),
+            bin_centers=np.array([0.5]),
+            counts_per_frame=np.array([1.0]),
+            density=np.array([0.5]),
+            units="g/cm^3",
+            n_frames=1,
+            number_density=np.array([0.10]),
+            number_density_units="molecules/Angstrom^3",
+            surface_position=0.0,
+        ),
+    ]
+
+    plot_density_profiles(profiles, show=False, x_mode="distance", quantity="number")
+    assert "entities" in captured["y_label"]

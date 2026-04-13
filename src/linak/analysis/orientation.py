@@ -493,6 +493,13 @@ def compute_orientation_profile(
             )
             progress.update()
 
+    LOGGER.info(
+        "Orientation frame analysis complete: %d frames, %d H2O/frame. "
+        "Aggregating cached frame data into distance and angle bins.",
+        len(frame_data),
+        n_molecules_per_frame,
+    )
+
     histogram_bounds = _determine_distance_bounds(
         frames=frames,
         axis_index=axis_index,
@@ -545,68 +552,74 @@ def compute_orientation_profile(
     sample_cos_polar_density = np.full((len(frames), n_dist_bins), np.nan, dtype=float)
     sample_cos_azimuthal_density = np.full((len(frames), n_dist_bins), np.nan, dtype=float)
 
-    for frame_idx, data in enumerate(frame_data):
-        total_mask = _distance_bin_membership_mask(data.distances, dist_bin_edges)
-        frame_total_hist = np.zeros(n_dist_bins, dtype=int)
-        frame_polar_count = np.zeros(n_dist_bins, dtype=int)
-        frame_azimuthal_count = np.zeros(n_dist_bins, dtype=int)
-        frame_polar_sum = np.zeros(n_dist_bins, dtype=float)
-        frame_azimuthal_sum = np.zeros(n_dist_bins, dtype=float)
-        if np.any(total_mask):
-            dist_idx_total = _distance_bin_indices(data.distances[total_mask], dist_bin_edges)
-            frame_total_hist = np.bincount(dist_idx_total, minlength=n_dist_bins).astype(int)
-            count_total += frame_total_hist
-            if framewise_density_sum is not None and slab_volumes is not None:
-                framewise_density_sum += frame_total_hist / float(slab_volumes[frame_idx])
+    with ProgressBar(
+        desc="Aggregating orientation bins",
+        total=len(frame_data),
+        unit="frame",
+    ) as progress:
+        for frame_idx, data in enumerate(frame_data):
+            total_mask = _distance_bin_membership_mask(data.distances, dist_bin_edges)
+            frame_total_hist = np.zeros(n_dist_bins, dtype=int)
+            frame_polar_count = np.zeros(n_dist_bins, dtype=int)
+            frame_azimuthal_count = np.zeros(n_dist_bins, dtype=int)
+            frame_polar_sum = np.zeros(n_dist_bins, dtype=float)
+            frame_azimuthal_sum = np.zeros(n_dist_bins, dtype=float)
+            if np.any(total_mask):
+                dist_idx_total = _distance_bin_indices(data.distances[total_mask], dist_bin_edges)
+                frame_total_hist = np.bincount(dist_idx_total, minlength=n_dist_bins).astype(int)
+                count_total += frame_total_hist
+                if framewise_density_sum is not None and slab_volumes is not None:
+                    framewise_density_sum += frame_total_hist / float(slab_volumes[frame_idx])
 
-        polar_mask = total_mask & data.polar_valid
-        if np.any(polar_mask):
-            dist_idx_polar = _distance_bin_indices(data.distances[polar_mask], dist_bin_edges)
-            polar_values = np.asarray(data.cos_polar[polar_mask], dtype=float)
-            frame_polar_count = np.bincount(dist_idx_polar, minlength=n_dist_bins).astype(int)
-            count_polar_valid += frame_polar_count
-            frame_polar_sum = np.bincount(
-                dist_idx_polar,
-                weights=polar_values,
-                minlength=n_dist_bins,
-            )
-            cos_polar_sum += frame_polar_sum
-            angle_idx_polar = _angle_bin_indices(polar_values, angle_bin_edges)
-            np.add.at(heatmap_polar, (dist_idx_polar, angle_idx_polar), 1.0)
+            polar_mask = total_mask & data.polar_valid
+            if np.any(polar_mask):
+                dist_idx_polar = _distance_bin_indices(data.distances[polar_mask], dist_bin_edges)
+                polar_values = np.asarray(data.cos_polar[polar_mask], dtype=float)
+                frame_polar_count = np.bincount(dist_idx_polar, minlength=n_dist_bins).astype(int)
+                count_polar_valid += frame_polar_count
+                frame_polar_sum = np.bincount(
+                    dist_idx_polar,
+                    weights=polar_values,
+                    minlength=n_dist_bins,
+                )
+                cos_polar_sum += frame_polar_sum
+                angle_idx_polar = _angle_bin_indices(polar_values, angle_bin_edges)
+                np.add.at(heatmap_polar, (dist_idx_polar, angle_idx_polar), 1.0)
 
-        azimuthal_mask = total_mask & data.azimuthal_valid
-        if np.any(azimuthal_mask):
-            dist_idx_azimuthal = _distance_bin_indices(
-                data.distances[azimuthal_mask],
-                dist_bin_edges,
-            )
-            azimuthal_values = np.asarray(data.cos_azimuthal[azimuthal_mask], dtype=float)
-            frame_azimuthal_count = np.bincount(
-                dist_idx_azimuthal,
-                minlength=n_dist_bins,
-            ).astype(int)
-            count_azimuthal_valid += frame_azimuthal_count
-            frame_azimuthal_sum = np.bincount(
-                dist_idx_azimuthal,
-                weights=azimuthal_values,
-                minlength=n_dist_bins,
-            )
-            cos_azimuthal_sum += frame_azimuthal_sum
-            angle_idx_azimuthal = _angle_bin_indices(azimuthal_values, angle_bin_edges)
-            np.add.at(heatmap_azimuthal, (dist_idx_azimuthal, angle_idx_azimuthal), 1.0)
+            azimuthal_mask = total_mask & data.azimuthal_valid
+            if np.any(azimuthal_mask):
+                dist_idx_azimuthal = _distance_bin_indices(
+                    data.distances[azimuthal_mask],
+                    dist_bin_edges,
+                )
+                azimuthal_values = np.asarray(data.cos_azimuthal[azimuthal_mask], dtype=float)
+                frame_azimuthal_count = np.bincount(
+                    dist_idx_azimuthal,
+                    minlength=n_dist_bins,
+                ).astype(int)
+                count_azimuthal_valid += frame_azimuthal_count
+                frame_azimuthal_sum = np.bincount(
+                    dist_idx_azimuthal,
+                    weights=azimuthal_values,
+                    minlength=n_dist_bins,
+                )
+                cos_azimuthal_sum += frame_azimuthal_sum
+                angle_idx_azimuthal = _angle_bin_indices(azimuthal_values, angle_bin_edges)
+                np.add.at(heatmap_azimuthal, (dist_idx_azimuthal, angle_idx_azimuthal), 1.0)
 
-        frame_density = (
-            np.asarray(frame_total_hist, dtype=float) / float(slab_volumes[frame_idx])
-            if slab_volumes is not None
-            else np.asarray(frame_total_hist, dtype=float) / float(bin_width)
-        )
-        frame_cos_polar_mean = _mean_with_nan(frame_polar_sum, frame_polar_count)
-        frame_cos_azimuthal_mean = _mean_with_nan(frame_azimuthal_sum, frame_azimuthal_count)
-        sample_density[frame_idx] = frame_density
-        sample_cos_polar_mean[frame_idx] = frame_cos_polar_mean
-        sample_cos_azimuthal_mean[frame_idx] = frame_cos_azimuthal_mean
-        sample_cos_polar_density[frame_idx] = frame_cos_polar_mean * frame_density
-        sample_cos_azimuthal_density[frame_idx] = frame_cos_azimuthal_mean * frame_density
+            frame_density = (
+                np.asarray(frame_total_hist, dtype=float) / float(slab_volumes[frame_idx])
+                if slab_volumes is not None
+                else np.asarray(frame_total_hist, dtype=float) / float(bin_width)
+            )
+            frame_cos_polar_mean = _mean_with_nan(frame_polar_sum, frame_polar_count)
+            frame_cos_azimuthal_mean = _mean_with_nan(frame_azimuthal_sum, frame_azimuthal_count)
+            sample_density[frame_idx] = frame_density
+            sample_cos_polar_mean[frame_idx] = frame_cos_polar_mean
+            sample_cos_azimuthal_mean[frame_idx] = frame_cos_azimuthal_mean
+            sample_cos_polar_density[frame_idx] = frame_cos_polar_mean * frame_density
+            sample_cos_azimuthal_density[frame_idx] = frame_cos_azimuthal_mean * frame_density
+            progress.update()
 
     n_frames = len(frames)
     cos_polar_mean = _mean_with_nan(cos_polar_sum, count_polar_valid)
