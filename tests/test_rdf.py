@@ -19,6 +19,7 @@ from linak.analysis.rdf import (
     save_rdf_profile,
     save_rdf_profiles,
 )
+from linak.plot.mappings.rdf_mapping import rdf_plot_options_to_view_mapping
 from linak.storage.hdf5_utils import read_linak_hdf5_profiles, write_linak_hdf5_profile_collection
 
 
@@ -906,6 +907,126 @@ def test_save_rdf_profiles_writes_profile_collection(tmp_path):
     assert len(payloads) == 2
 
 
+def test_save_rdf_profiles_can_force_collection_for_single_profile(tmp_path):
+    profile = RDFProfile(
+        species_a="O",
+        species_b="H",
+        bin_edges=np.array([0.0, 1.0, 2.0], dtype=float),
+        bin_centers=np.array([0.5, 1.5], dtype=float),
+        g_r=np.array([0.1, 0.2], dtype=float),
+        n_frames=2,
+    )
+
+    out = tmp_path / "rdf_single_collection.h5"
+    save_rdf_profiles([profile], out, force_collection=True)
+
+    payloads = read_linak_hdf5_profiles(out, expected_analysis="rdf")
+    assert len(payloads) == 1
+
+
+def test_save_rdf_profiles_merge_replaces_existing_pair_without_duplicate(tmp_path, caplog):
+    out = tmp_path / "rdf_collection.h5"
+    source_path = tmp_path / "traj.xyz"
+
+    save_rdf_profiles(
+        [
+            RDFProfile(
+                species_a="O",
+                species_b="H",
+                bin_edges=np.array([0.0, 1.0, 2.0], dtype=float),
+                bin_centers=np.array([0.5, 1.5], dtype=float),
+                g_r=np.array([0.1, 0.2], dtype=float),
+                n_frames=2,
+            ),
+            RDFProfile(
+                species_a="H",
+                species_b="H",
+                bin_edges=np.array([0.0, 1.0, 2.0], dtype=float),
+                bin_centers=np.array([0.5, 1.5], dtype=float),
+                g_r=np.array([0.3, 0.4], dtype=float),
+                n_frames=2,
+            ),
+        ],
+        out,
+        additional_metadata={"source_path": str(source_path)},
+        force_collection=True,
+    )
+
+    caplog.set_level("WARNING")
+    save_rdf_profiles(
+        [
+            RDFProfile(
+                species_a="H",
+                species_b="O",
+                bin_edges=np.array([0.0, 1.0, 2.0], dtype=float),
+                bin_centers=np.array([0.5, 1.5], dtype=float),
+                g_r=np.array([0.9, 1.2], dtype=float),
+                n_frames=2,
+            )
+        ],
+        out,
+        additional_metadata={"source_path": str(source_path)},
+        force_collection=True,
+        merge_existing=True,
+    )
+
+    loaded = load_rdf_profiles(out)
+    assert len(loaded) == 2
+    assert {(profile.species_a, profile.species_b) for profile in loaded} == {
+        ("H", "O"),
+        ("H", "H"),
+    }
+    replaced = {
+        (profile.species_a, profile.species_b): profile for profile in loaded
+    }[("H", "O")]
+    np.testing.assert_allclose(replaced.g_r, np.array([0.9, 1.2], dtype=float))
+    assert "Replaced existing RDF profile(s)" in caplog.text
+
+
+def test_save_rdf_profiles_merge_uses_fallback_on_incompatible_existing_file(tmp_path, caplog):
+    out = tmp_path / "rdf_collection.h5"
+    source_path = tmp_path / "traj.xyz"
+
+    save_rdf_profiles(
+        [
+            RDFProfile(
+                species_a="O",
+                species_b="H",
+                bin_edges=np.array([0.0, 1.0, 2.0], dtype=float),
+                bin_centers=np.array([0.5, 1.5], dtype=float),
+                g_r=np.array([0.1, 0.2], dtype=float),
+                n_frames=2,
+            )
+        ],
+        out,
+        additional_metadata={"source_path": str(source_path)},
+        force_collection=True,
+    )
+
+    caplog.set_level("WARNING")
+    written = save_rdf_profiles(
+        [
+            RDFProfile(
+                species_a="H",
+                species_b="H",
+                bin_edges=np.array([0.0, 0.5, 1.0], dtype=float),
+                bin_centers=np.array([0.25, 0.75], dtype=float),
+                g_r=np.array([0.3, 0.4], dtype=float),
+                n_frames=2,
+            )
+        ],
+        out,
+        additional_metadata={"source_path": str(source_path)},
+        force_collection=True,
+        merge_existing=True,
+    )
+
+    assert written == tmp_path / "rdf_collection_1.h5"
+    assert out.exists()
+    assert written.exists()
+    assert "Writing fallback file" in caplog.text
+
+
 def test_load_rdf_profile_rejects_missing_v1_bin_width_metadata(tmp_path):
     out = tmp_path / "old_rdf.h5"
     with h5py.File(out, "w") as handle:
@@ -1193,3 +1314,34 @@ def test_compute_rdf_parallel_path_uses_thread_executor(monkeypatch):
     assert captured["max_workers"] == 2
     assert captured["chunks"] >= 2
     assert profile.n_frames == len(frames)
+
+
+def test_plot_rdf_profile_accepts_generic_view_mapping(monkeypatch):
+    captured: dict[str, object] = {}
+
+    def _fake_plot_line_series(x_values, y_values, **kwargs):
+        captured["x_values"] = np.asarray(x_values, dtype=float)
+        captured["y_values"] = np.asarray(y_values, dtype=float)
+        captured["x_label"] = kwargs["x_label"]
+        return None
+
+    monkeypatch.setattr("linak.analysis.rdf.plot_line_series", _fake_plot_line_series)
+
+    profile = RDFProfile(
+        species_a="O",
+        species_b="H",
+        bin_edges=np.array([0.0, 1.0, 2.0]),
+        bin_centers=np.array([0.5, 1.5]),
+        g_r=np.array([0.0, 2.0]),
+        n_frames=2,
+    )
+
+    plot_rdf_profile(
+        profile,
+        show=False,
+        view_mapping=rdf_plot_options_to_view_mapping(),
+    )
+
+    np.testing.assert_allclose(captured["x_values"], np.array([0.5, 1.5]))
+    np.testing.assert_allclose(captured["y_values"], np.array([0.0, 2.0]))
+    assert captured["x_label"] == "r (Angstrom)"

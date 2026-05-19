@@ -36,6 +36,7 @@ The pages in this folder describe:
 - [Surface Estimation](surface-estimation.md)
 - [Water Detection And Water Geometry](water-detection.md)
 - [HDF5 Data Model And Metadata Conventions](hdf5-data-model.md)
+- [Plot Data/View Architecture Proposal](plot-data-view-architecture.md)
 
 ## Common Conventions
 

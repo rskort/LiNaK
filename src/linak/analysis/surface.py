@@ -712,72 +712,6 @@ def _resolve_surface_elements(
     return selected[:4], "auto"
 
 
-def _surface_axis_values_for_frame(
-    frame: Atoms,
-    *,
-    axis_index: int,
-    surface_elements: set[str],
-    include_fixed_surface_atoms: bool = True,
-) -> np.ndarray:
-    """Return axis coordinates for the configured surface reference elements."""
-    if not surface_elements:
-        return np.array([], dtype=float)
-    symbols = np.asarray(frame.get_chemical_symbols(), dtype=object)
-    mask = np.isin(symbols, list(surface_elements))
-    if not include_fixed_surface_atoms:
-        mask &= ~_fixed_atom_mask(frame)
-    if not np.any(mask):
-        return np.array([], dtype=float)
-    return np.asarray(frame.positions[mask, axis_index], dtype=float)
-
-
-def _surface_quantile_per_frame(
-    frames: list[Atoms],
-    *,
-    axis_index: int,
-    surface_elements: set[str],
-    include_fixed_surface_atoms: bool,
-) -> np.ndarray:
-    """Return per-frame high-quantile surface coordinates for fallback filling."""
-    quantiles = np.full(len(frames), np.nan, dtype=float)
-    for frame_index, frame in enumerate(frames):
-        axis_values = _surface_axis_values_for_frame(
-            frame,
-            axis_index=axis_index,
-            surface_elements=surface_elements,
-            include_fixed_surface_atoms=include_fixed_surface_atoms,
-        )
-        if axis_values.size == 0:
-            continue
-        quantiles[frame_index] = float(np.quantile(axis_values, SURFACE_POSITION_QUANTILE))
-    return quantiles
-
-
-def _extract_top_layer(
-    sorted_axis_values: np.ndarray,
-) -> tuple[np.ndarray | None, int]:
-    """Extract top-layer values based on significant gaps in sorted axis positions."""
-    if sorted_axis_values.size < 2:
-        return None, 1
-
-    diffs = np.diff(sorted_axis_values)
-    small_half = max(1, diffs.size // 2)
-    baseline = float(np.median(np.partition(diffs, small_half - 1)[:small_half]))
-    gap_threshold = max(SURFACE_LAYER_GAP_MIN, SURFACE_LAYER_GAP_FACTOR * baseline)
-    significant_gaps = np.where(diffs >= gap_threshold)[0]
-
-    if significant_gaps.size == 0:
-        largest_gap_index = int(np.argmax(diffs))
-        largest_gap = float(diffs[largest_gap_index])
-        if largest_gap >= 2.0 * SURFACE_LAYER_GAP_MIN:
-            return sorted_axis_values[largest_gap_index + 1 :], 2
-        return None, 1
-
-    top_start = int(significant_gaps[-1] + 1)
-    layer_count = int(significant_gaps.size + 1)
-    return sorted_axis_values[top_start:], layer_count
-
-
 def _nearest_valid_layer_indices(
     top_layer_indices_by_frame: list[np.ndarray | None],
     *,
@@ -810,56 +744,6 @@ def _nearest_valid_layer_indices(
     if shared.size >= 2:
         return np.asarray(shared, dtype=int)
     return np.asarray(previous, dtype=int)
-
-
-def _fill_missing_surface_per_frame(
-    estimate: SurfaceEstimate,
-    *,
-    fallback_per_frame: np.ndarray,
-    fallback_label: str,
-) -> SurfaceEstimate:
-    """Fill missing frame-wise surface values with a frame-local fallback estimate."""
-    primary_per_frame = np.asarray(estimate.per_frame, dtype=float)
-    if primary_per_frame.shape[0] == 0 or np.all(np.isfinite(primary_per_frame)):
-        return estimate
-    if fallback_per_frame.shape[0] != primary_per_frame.shape[0]:
-        return estimate
-
-    missing_mask = ~np.isfinite(primary_per_frame)
-    fill_mask = missing_mask & np.isfinite(fallback_per_frame)
-    if not np.any(fill_mask):
-        return estimate
-
-    merged = np.array(primary_per_frame, dtype=float, copy=True)
-    merged[fill_mask] = fallback_per_frame[fill_mask]
-    valid_mask = np.isfinite(merged)
-    if not np.any(valid_mask):
-        return estimate
-
-    summary = SurfaceSummary(
-        position=float(np.median(merged[valid_mask])),
-        std=float(np.std(merged[valid_mask], ddof=0)),
-        valid_fraction=float(np.count_nonzero(valid_mask)) / merged.size,
-        median_confidence=float(np.median(estimate.confidence[valid_mask]))
-        if np.any(valid_mask)
-        else 0.0,
-        method_label=f"{estimate.method}+{fallback_label}_fill",
-        composite_score=estimate.summary.composite_score,
-    )
-    return SurfaceEstimate(
-        frame_values=merged,
-        valid_mask=np.asarray(valid_mask, dtype=bool),
-        confidence=np.asarray(estimate.confidence, dtype=float),
-        provenance=np.asarray(estimate.provenance, copy=True),
-        candidate_indices=None
-        if estimate.candidate_indices is None
-        else np.asarray(estimate.candidate_indices, dtype=int),
-        selected_elements=tuple(estimate.selected_elements),
-        mode=estimate.mode,
-        side=estimate.side,
-        summary=summary,
-        diagnostics=estimate.diagnostics,
-    )
 
 
 def _cell_lengths_if_periodic_all(frames: list[Atoms]) -> np.ndarray | None:
@@ -1896,6 +1780,46 @@ def _select_surface_estimate_object(
     return candidates[0]
 
 
+def _any_frame_has_fixed_atoms(frames: list[Atoms]) -> bool:
+    """Return True if any frame contains index-based ASE constraints."""
+    for frame in frames:
+        if np.any(_fixed_atom_mask(frame)):
+            return True
+    return False
+
+
+def _inject_effective_option(
+    estimate: SurfaceEstimate,
+    key: str,
+    value: Any,
+) -> SurfaceEstimate:
+    """Return a copy of *estimate* with an extra key in effective_options."""
+    updated_options = dict(estimate.diagnostics.effective_options)
+    updated_options[key] = _json_ready(value)
+    diagnostics = SurfaceDiagnostics(
+        candidate_count_per_frame=estimate.diagnostics.candidate_count_per_frame,
+        top_layer_size_per_frame=estimate.diagnostics.top_layer_size_per_frame,
+        largest_gap_A_per_frame=estimate.diagnostics.largest_gap_A_per_frame,
+        baseline_gap_A_per_frame=estimate.diagnostics.baseline_gap_A_per_frame,
+        reference_spread_A_per_frame=estimate.diagnostics.reference_spread_A_per_frame,
+        jump_rejection_mask=estimate.diagnostics.jump_rejection_mask,
+        rejection_reason=estimate.diagnostics.rejection_reason,
+        effective_options=updated_options,
+    )
+    return SurfaceEstimate(
+        frame_values=estimate.frame_values,
+        valid_mask=estimate.valid_mask,
+        confidence=estimate.confidence,
+        provenance=estimate.provenance,
+        candidate_indices=estimate.candidate_indices,
+        selected_elements=estimate.selected_elements,
+        mode=estimate.mode,
+        side=estimate.side,
+        summary=estimate.summary,
+        diagnostics=diagnostics,
+    )
+
+
 def estimate_surface_reference(
     frames: list[Atoms],
     axis: str = "z",
@@ -1905,6 +1829,7 @@ def estimate_surface_reference(
     include_fixed_surface_atoms: bool = False,
     surface_options: SurfaceEstimatorOptions | None = None,
     logger: logging.Logger | None = None,
+    _fixed_atom_fallback_retry: bool = False,
 ) -> SurfaceEstimate | None:
     if not frames:
         return None
@@ -1920,6 +1845,27 @@ def estimate_surface_reference(
     active_logger = LOGGER if logger is None else logger
     context = _build_surface_context(frames, axis, options=options)
     if context is None:
+        # --- fixed-atom fallback: context failed ---
+        if (
+            not include_fixed_surface_atoms
+            and surface_options is None
+            and _any_frame_has_fixed_atoms(frames)
+        ):
+            active_logger.info(
+                "Surface estimation along %s found no candidates with fixed atoms excluded; "
+                "retrying with include_fixed_surface_atoms=True.",
+                axis.upper(),
+            )
+            return estimate_surface_reference(
+                frames,
+                axis,
+                mode=mode,
+                surface_elements=surface_elements,
+                include_fixed_surface_atoms=True,
+                surface_options=None,
+                logger=logger,
+                _fixed_atom_fallback_retry=True,
+            )
         return None
     reference_source = "automatic"
     if options.surface_atom_indices is not None or options.surface_atom_mask is not None:
@@ -1934,7 +1880,31 @@ def estimate_surface_reference(
     )
     estimate = _select_surface_estimate_object(context)
     if estimate is None:
+        # --- fixed-atom fallback: estimate selection failed ---
+        if (
+            not include_fixed_surface_atoms
+            and surface_options is None
+            and _any_frame_has_fixed_atoms(frames)
+        ):
+            active_logger.info(
+                "Surface estimation along %s produced no usable estimate with fixed atoms "
+                "excluded; retrying with include_fixed_surface_atoms=True.",
+                axis.upper(),
+            )
+            return estimate_surface_reference(
+                frames,
+                axis,
+                mode=mode,
+                surface_elements=surface_elements,
+                include_fixed_surface_atoms=True,
+                surface_options=None,
+                logger=logger,
+                _fixed_atom_fallback_retry=True,
+            )
         return None
+    # Tag the estimate when the fixed-atom fallback path was used.
+    if _fixed_atom_fallback_retry:
+        estimate = _inject_effective_option(estimate, "fixed_atom_fallback", True)
     active_logger.info(
         "Surface estimator along %s: %s.",
         axis.upper(),
@@ -2024,20 +1994,6 @@ def _shift_axis_values_by_surface_per_frame(
         for axis_values, surface_value in zip(selected_per_frame, surface_per_frame)
     ]
     return shifted, "distance"
-
-
-def _coordinate_mode_from_surface_per_frame(
-    *,
-    surface_per_frame: np.ndarray | None,
-    frame_count: int,
-) -> str:
-    if surface_per_frame is None:
-        return "axis"
-    if surface_per_frame.shape[0] != frame_count:
-        return "axis"
-    if not np.all(np.isfinite(surface_per_frame)):
-        return "axis"
-    return "distance"
 
 
 def _surface_effective_options_payload(estimate: SurfaceEstimate) -> dict[str, Any]:

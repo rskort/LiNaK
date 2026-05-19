@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
@@ -14,12 +15,17 @@ from ..storage.hdf5_utils import decode_hdf5_string, hdf5_string_dtype, require_
 
 _PRIVATE_GROUP = "_linak"
 _SETTINGS_GROUP = "plot_settings"
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 _SCHEMA_ATTR = "schema_version"
 _UPDATED_ATTR = "updated_utc"
 _PROFILES_DATASET = "profiles_json"
 _NAMED_PROFILE_STORE_SENTINEL = "__linak_named_plot_profiles__"
 _NAMED_PROFILE_STORE_VERSION = 1
+_PLOT_PROFILE_SENTINEL = "__linak_plot_profile__"
+_PLOT_PROFILE_VERSION = 2
+_PLOT_PROFILE_SOURCE_SELECTION = "source_selection"
+_PLOT_PROFILE_VIEW_MAPPING = "view_mapping"
+_PLOT_PROFILE_STYLE = "style"
 _NAMED_PROFILE_STORE_ACTIVE = "active_profile"
 _NAMED_PROFILE_STORE_PROFILES = "profiles"
 DEFAULT_PLOT_PROFILE_NAME = "Default"
@@ -97,7 +103,7 @@ def _open_settings_group(handle: Any, *, create: bool) -> Any | None:
 def _normalize_profile_name(name: str | None) -> str:
     normalized = str(name or "").strip()
     if not normalized:
-        raise ValueError("Plot profile name cannot be empty.")
+        raise ValueError("Plot profile name cannot be empty. Enter a name to continue.")
     return normalized
 
 
@@ -114,6 +120,42 @@ def _coerce_settings_dict(value: Any) -> dict[str, Any] | None:
     return {str(key): _json_ready(item) for key, item in value.items()}
 
 
+def unsupported_saved_plot_profile_message(profile_key: str | None = None) -> str:
+    """Return the user-facing message for unsupported pre-contract saved profiles."""
+
+    target = (
+        "A saved plot profile"
+        if profile_key is None
+        else f"Saved plot profile '{str(profile_key)}'"
+    )
+    return (
+        f"{target} uses an older LiNaK persistence format and is no longer supported. "
+        "Recreate the profile with the current version."
+    )
+
+
+def _coerce_saved_plot_profile(value: Any, *, profile_key: str | None = None) -> dict[str, Any] | None:
+    settings = _coerce_settings_dict(value)
+    if settings is None:
+        return None
+    if settings.get(_PLOT_PROFILE_SENTINEL) != _PLOT_PROFILE_VERSION:
+        raise ValueError(unsupported_saved_plot_profile_message(profile_key))
+    source_selection = _coerce_settings_dict(settings.get(_PLOT_PROFILE_SOURCE_SELECTION))
+    view_mapping = _coerce_settings_dict(settings.get(_PLOT_PROFILE_VIEW_MAPPING))
+    style = _coerce_settings_dict(settings.get(_PLOT_PROFILE_STYLE))
+    if source_selection is None or view_mapping is None or style is None:
+        raise ValueError(
+            f"Saved plot profile '{profile_key or '<unknown>'}' is missing one of the required "
+            "'source_selection', 'view_mapping', or 'style' sections."
+        )
+    return {
+        _PLOT_PROFILE_SENTINEL: _PLOT_PROFILE_VERSION,
+        _PLOT_PROFILE_SOURCE_SELECTION: source_selection,
+        _PLOT_PROFILE_VIEW_MAPPING: view_mapping,
+        _PLOT_PROFILE_STYLE: style,
+    }
+
+
 def _first_profile_name(profiles: dict[str, dict[str, Any]]) -> str | None:
     if not profiles:
         return None
@@ -122,12 +164,25 @@ def _first_profile_name(profiles: dict[str, dict[str, Any]]) -> str | None:
     return next(iter(profiles))
 
 
-def _coerce_profile_store(value: Any) -> PlotProfileStore | None:
+def _coerce_profile_store(value: Any, *, profile_key: str | None = None) -> PlotProfileStore | None:
     settings = _coerce_settings_dict(value)
     if settings is None:
         return None
 
     if not _is_named_profile_store(settings):
+        if any(
+            key in settings
+            for key in (
+                "title",
+                "component",
+                "x_mode",
+                "series_overrides",
+                _PLOT_PROFILE_SOURCE_SELECTION,
+                _PLOT_PROFILE_VIEW_MAPPING,
+                _PLOT_PROFILE_STYLE,
+            )
+        ):
+            raise ValueError(unsupported_saved_plot_profile_message(profile_key))
         return None
 
     raw_profiles = settings.get(_NAMED_PROFILE_STORE_PROFILES)
@@ -137,7 +192,10 @@ def _coerce_profile_store(value: Any) -> PlotProfileStore | None:
     profiles: dict[str, dict[str, Any]] = {}
     for raw_name, raw_settings in raw_profiles.items():
         name = _normalize_profile_name(str(raw_name))
-        settings_dict = _coerce_settings_dict(raw_settings)
+        settings_dict = _coerce_saved_plot_profile(
+            raw_settings,
+            profile_key=f"{profile_key or '<unknown>'}/{name}",
+        )
         if settings_dict is None:
             continue
         profiles[name] = settings_dict
@@ -170,7 +228,7 @@ def _read_profiles_map_with_store(
     raw_profiles = read_plot_profiles_raw(path)
     stores: dict[str, PlotProfileStore] = {}
     for key, value in raw_profiles.items():
-        store = _coerce_profile_store(value)
+        store = _coerce_profile_store(value, profile_key=str(key))
         if store is not None:
             stores[str(key)] = store
     return raw_profiles, stores
@@ -179,6 +237,12 @@ def _read_profiles_map_with_store(
 def default_plot_profile_name() -> str:
     """Return the conventional default saved-profile name."""
     return DEFAULT_PLOT_PROFILE_NAME
+
+
+def profile_name_conflict_message(profile_name: str) -> str:
+    """Return a consistent user-facing message for duplicate profile names."""
+
+    return f"Profile '{_normalize_profile_name(profile_name)}' already exists. Choose a different name."
 
 
 def is_combined_plot_settings_source(path: str | Path) -> bool:
@@ -321,7 +385,7 @@ def write_plot_profile(
     source_path = Path(path).expanduser().resolve()
     if not source_path.exists():
         raise FileNotFoundError(f"HDF5 file not found: {source_path}")
-    settings_dict = _coerce_settings_dict(settings)
+    settings_dict = _coerce_saved_plot_profile(settings, profile_key=str(profile_key))
     if settings_dict is None:
         raise ValueError("Plot settings payload must be a JSON-like object.")
     with h5py.File(source_path, "r+") as handle:
@@ -330,7 +394,7 @@ def write_plot_profile(
         profiles = _read_profiles_map(group)
         key = str(profile_key)
         existing_raw = profiles.get(key)
-        existing_store = _coerce_profile_store(existing_raw)
+        existing_store = _coerce_profile_store(existing_raw, profile_key=key)
 
         target_name = (
             _normalize_profile_name(profile_name)
@@ -400,7 +464,7 @@ def delete_named_plot_profile(
             return False, None
         profiles = _read_profiles_map(group)
         key = str(profile_key)
-        store = _coerce_profile_store(profiles.get(key))
+        store = _coerce_profile_store(profiles.get(key), profile_key=key)
         if store is None or target_name not in store.profiles:
             return False, store.active_profile if store is not None else None
 
@@ -421,6 +485,53 @@ def delete_named_plot_profile(
         return True, active_profile
 
 
+def rename_named_plot_profile(
+    path: str | Path,
+    profile_key: str,
+    current_name: str,
+    new_name: str,
+) -> str:
+    """Rename one named plot profile and return the active profile afterwards."""
+    require_h5py()
+    import h5py
+
+    source_path = Path(path).expanduser().resolve()
+    if not source_path.exists():
+        raise FileNotFoundError(f"HDF5 file not found: {source_path}")
+    current = _normalize_profile_name(current_name)
+    renamed = _normalize_profile_name(new_name)
+
+    with h5py.File(source_path, "r+") as handle:
+        group = _open_settings_group(handle, create=False)
+        if group is None:
+            raise ValueError(
+                f"No plot-setting profile store '{profile_key}' found in '{source_path}'."
+            )
+        profiles = _read_profiles_map(group)
+        key = str(profile_key)
+        store = _coerce_profile_store(profiles.get(key), profile_key=key)
+        if store is None or current not in store.profiles:
+            raise ValueError(
+                f"No named plot profile '{current}' found for '{key}' in '{source_path}'."
+            )
+        if current.casefold() != renamed.casefold() and any(
+            existing.casefold() == renamed.casefold() for existing in store.profiles
+        ):
+            raise ValueError(profile_name_conflict_message(renamed))
+        if current == renamed:
+            return store.active_profile or renamed
+
+        updated_profiles = dict(store.profiles)
+        profile_payload = updated_profiles.pop(current)
+        updated_profiles[renamed] = profile_payload
+        active_profile = renamed if store.active_profile == current else (store.active_profile or renamed)
+        profiles[key] = _serialize_profile_store(
+            PlotProfileStore(active_profile=active_profile, profiles=updated_profiles)
+        )
+        _write_profiles_map(group, profiles)
+        return active_profile
+
+
 def set_active_plot_profile(path: str | Path, profile_key: str, profile_name: str) -> None:
     """Set the active named plot profile for one analysis key."""
     require_h5py()
@@ -439,7 +550,7 @@ def set_active_plot_profile(path: str | Path, profile_key: str, profile_name: st
             )
         profiles = _read_profiles_map(group)
         key = str(profile_key)
-        store = _coerce_profile_store(profiles.get(key))
+        store = _coerce_profile_store(profiles.get(key), profile_key=key)
         if store is None or target_name not in store.profiles:
             raise ValueError(
                 f"No named plot profile '{target_name}' found for '{key}' in '{source_path}'."
@@ -450,6 +561,47 @@ def set_active_plot_profile(path: str | Path, profile_key: str, profile_name: st
         )
         profiles[key] = _serialize_profile_store(updated_store)
         _write_profiles_map(group, profiles)
+
+
+def duplicate_named_plot_profile(
+    path: str | Path,
+    profile_key: str,
+    source_name: str,
+    target_name: str,
+) -> str:
+    """Duplicate one named plot profile exactly and return the active profile name."""
+    require_h5py()
+    import h5py
+
+    source_path = Path(path).expanduser().resolve()
+    if not source_path.exists():
+        raise FileNotFoundError(f"HDF5 file not found: {source_path}")
+    source_profile = _normalize_profile_name(source_name)
+    target_profile = _normalize_profile_name(target_name)
+
+    with h5py.File(source_path, "r+") as handle:
+        group = _open_settings_group(handle, create=False)
+        if group is None:
+            raise ValueError(
+                f"No plot-setting profile store '{profile_key}' found in '{source_path}'."
+            )
+        profiles = _read_profiles_map(group)
+        key = str(profile_key)
+        store = _coerce_profile_store(profiles.get(key), profile_key=key)
+        if store is None or source_profile not in store.profiles:
+            raise ValueError(
+                f"No named plot profile '{source_profile}' found for '{key}' in '{source_path}'."
+            )
+        if any(existing.casefold() == target_profile.casefold() for existing in store.profiles):
+            raise ValueError(profile_name_conflict_message(target_profile))
+
+        updated_profiles = dict(store.profiles)
+        updated_profiles[target_profile] = deepcopy(store.profiles[source_profile])
+        profiles[key] = _serialize_profile_store(
+            PlotProfileStore(active_profile=target_profile, profiles=updated_profiles)
+        )
+        _write_profiles_map(group, profiles)
+        return target_profile
 
 
 def copy_plot_profile(

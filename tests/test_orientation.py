@@ -19,6 +19,7 @@ from linak.analysis.orientation import (
     load_orientation_profiles,
     save_orientation_profile,
 )
+from linak.plot.mappings.orientation_mapping import orientation_plot_options_to_view_mapping
 
 
 def _water_frame(
@@ -562,6 +563,54 @@ def test_plot_orientation_profile_heatmap(tmp_path):
     )
     assert result is not None
     assert out.exists()
+
+
+def test_plot_orientation_profile_accepts_generic_line_view_mapping(tmp_path):
+    from linak.analysis.orientation import plot_orientation_profile
+
+    profile = compute_orientation_profile(
+        frames=_multi_frame_trajectory(2), axis="z", bin_width=2.0
+    )
+    capture_state: dict[str, object] = {}
+
+    result = plot_orientation_profile(
+        profile,
+        output=str(tmp_path / "orient_line_mapping.png"),
+        show=False,
+        view_mapping=orientation_plot_options_to_view_mapping(
+            component="density-weighted",
+            angle="azimuthal",
+        ),
+        capture_state=capture_state,
+    )
+
+    assert result is not None
+    assert capture_state["title"] == "H2O orientation (azimuthal)"
+    assert capture_state["y_label"] == "H2O density-weighted âŸ¨cos(Ï†)âŸ©"
+
+
+def test_plot_orientation_profile_accepts_generic_heatmap_view_mapping(tmp_path):
+    from linak.analysis.orientation import plot_orientation_profile
+
+    profile = compute_orientation_profile(
+        frames=_multi_frame_trajectory(2), axis="z", bin_width=2.0
+    )
+    capture_state: dict[str, object] = {}
+
+    result = plot_orientation_profile(
+        profile,
+        output=str(tmp_path / "orient_heatmap_mapping.png"),
+        show=False,
+        view_mapping=orientation_plot_options_to_view_mapping(
+            component="heatmap",
+            angle="azimuthal",
+        ),
+        capture_state=capture_state,
+    )
+
+    assert result is not None
+    assert capture_state["title"] == "H2O orientation heatmap (azimuthal)"
+    assert capture_state["y_label"] == "cos(Ï†)"
 
 
 def test_plot_orientation_profile_heatmap_normalize_uses_global_probability(tmp_path):

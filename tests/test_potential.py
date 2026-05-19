@@ -17,6 +17,8 @@ from linak.analysis.potential import (
     plot_potential_profiles,
     _resolve_worker_count,
 )
+from linak.storage.hdf5_utils import read_linak_hdf5_profiles
+from linak.plot.mappings.potential_mapping import potential_plot_options_to_view_mapping
 
 
 def _write_cube(
@@ -263,6 +265,81 @@ def test_plot_potential_profiles_rescales_record_id_axis(tmp_path):
     assert capture_state["x_axis_offset"] == pytest.approx(1.0)
 
 
+def test_plot_potential_profiles_accepts_generic_single_series_mapping(monkeypatch, tmp_path):
+    captured: dict[str, object] = {}
+
+    def _fake_plot_multi_line_series(x_series, y_series, labels, **kwargs):
+        captured["x_series"] = x_series
+        captured["y_series"] = y_series
+        captured["labels"] = labels
+        captured["series_ids"] = kwargs["series_ids"]
+        return tmp_path / "noop.png"
+
+    monkeypatch.setattr(
+        "linak.analysis.potential.plot_multi_line_series",
+        _fake_plot_multi_line_series,
+    )
+
+    source = tmp_path / "potential_single_series.h5"
+    _write_potential_summary_hdf5(
+        source,
+        ids=[1, 2],
+        efermi=[1.0, 1.1],
+        water_bulk=[2.0, 2.1],
+        cshe=[0.2, 0.3],
+        status=["ok", "ok"],
+    )
+    profiles, _summary = load_potential_plot_profiles(source)
+
+    plot_potential_profiles(
+        profiles,
+        show=False,
+        view_mapping=potential_plot_options_to_view_mapping(y_quantity="efermi"),
+    )
+
+    assert captured["labels"] == ["Fermi"]
+    assert captured["series_ids"] == ["efermi_ev"]
+    np.testing.assert_allclose(captured["x_series"][0], np.array([1.0, 2.0]))
+    np.testing.assert_allclose(captured["y_series"][0], np.array([1.0, 1.1]))
+
+
+def test_plot_potential_profiles_table_view_populates_capture_state(tmp_path):
+    source = tmp_path / "potential_table_view.h5"
+    _write_potential_summary_hdf5(
+        source,
+        ids=[1, 2],
+        efermi=[1.0, 1.1],
+        water_bulk=[2.0, 2.1],
+        cshe=[0.2, 0.3],
+        status=["ok", "ok"],
+    )
+    profiles, _summary = load_potential_plot_profiles(source)
+    capture_state: dict[str, object] = {}
+
+    result = plot_potential_profiles(
+        profiles,
+        show=False,
+        view_mapping=potential_plot_options_to_view_mapping(table_view=True),
+        capture_state=capture_state,
+    )
+
+    assert result is None
+    assert capture_state["table_rows"] == [
+        {
+            "record_id": 1.0,
+            "water_bulk_potential": 2.0,
+            "efermi": 1.0,
+            "electrode_cshe": 0.2,
+        },
+        {
+            "record_id": 2.0,
+            "water_bulk_potential": 2.1,
+            "efermi": 1.1,
+            "electrode_cshe": 0.3,
+        },
+    ]
+
+
 def test_plot_potential_hdf5_non_gui_renders_png(tmp_path):
     run_dir = tmp_path / "run"
     cube = _write_potential_case(run_dir, fermi_au=0.0367493036)
@@ -299,6 +376,191 @@ def test_plot_potential_hdf5_non_gui_renders_png(tmp_path):
 
     assert plot_rc == 0
     assert output.exists()
+
+
+def test_apply_convert_cube_to_cube_hdf5_and_back(tmp_path):
+    run_dir = tmp_path / "run"
+    cube = _write_potential_case(run_dir, fermi_au=0.0367493036)
+    cube_h5 = tmp_path / "field.cube.h5"
+    roundtrip_cube = tmp_path / "field_roundtrip.cube"
+
+    assert (
+        main(
+            [
+                "--log-level",
+                "ERROR",
+                "apply",
+                "convert",
+                str(cube),
+                "--output",
+                str(cube_h5),
+            ]
+        )
+        == 0
+    )
+    assert cube_h5.exists()
+    payloads = read_linak_hdf5_profiles(cube_h5, expected_analysis="cube")
+    assert len(payloads) == 1
+    assert payloads[0][1]["source_path"] == str(cube.resolve())
+
+    assert (
+        main(
+            [
+                "--log-level",
+                "ERROR",
+                "apply",
+                "convert",
+                str(cube_h5),
+                "--target-file-type",
+                "cube",
+                "--output",
+                str(roundtrip_cube),
+            ]
+        )
+        == 0
+    )
+    assert roundtrip_cube.exists()
+
+
+def test_apply_combine_cubes_writes_cube_hdf5_and_preserves_metadata(tmp_path):
+    run_a = tmp_path / "run_a"
+    run_b = tmp_path / "run_b"
+    cube_a = _write_potential_case(run_a, fermi_au=0.0367493036)
+    cube_b = _write_potential_case(run_b, fermi_au=0.0734986072)
+    combined = tmp_path / "combined.cube.h5"
+
+    rc = main(
+        [
+            "--log-level",
+            "ERROR",
+            "apply",
+            "combine",
+            "-f",
+            str(cube_a),
+            str(cube_b),
+            "--output",
+            str(combined),
+        ]
+    )
+
+    assert rc == 0
+    payloads = read_linak_hdf5_profiles(combined, expected_analysis="cube")
+    assert len(payloads) == 2
+    assert payloads[0][1]["source_path"] == str(cube_a.resolve())
+    assert payloads[1][1]["source_path"] == str(cube_b.resolve())
+    assert payloads[0][1]["combine_source_paths"] == [str(cube_a.resolve()), str(cube_b.resolve())]
+    assert payloads[0][1]["combine_source_file_types"] == ["cube_file", "cube_file"]
+    assert payloads[0][1]["combine_conversion_applied"] is True
+    assert payloads[0][1]["combine_total_fields"] == 2
+    assert payloads[0][1]["combine_timestamp_utc"]
+    assert payloads[0][1]["combine_linak_version"]
+
+
+def test_apply_combine_cubes_no_convert_fails_clearly(tmp_path, capsys):
+    run_a = tmp_path / "run_a"
+    run_b = tmp_path / "run_b"
+    cube_a = _write_potential_case(run_a, fermi_au=0.0367493036)
+    cube_b = _write_potential_case(run_b, fermi_au=0.0734986072)
+
+    rc = main(
+        [
+            "--log-level",
+            "ERROR",
+            "apply",
+            "combine",
+            "-f",
+            str(cube_a),
+            str(cube_b),
+            "--no-convert",
+        ]
+    )
+
+    assert rc == 1
+    err = capsys.readouterr().err.lower()
+    assert "no-convert" in err or ".cube.h5" in err
+
+
+def test_compute_potential_accepts_cube_hdf5_input(tmp_path):
+    run_dir = tmp_path / "run"
+    cube = _write_potential_case(run_dir, fermi_au=0.0367493036)
+    cube_h5 = tmp_path / "field.cube.h5"
+    output = tmp_path / "potential_summary.h5"
+
+    assert (
+        main(
+            [
+                "--log-level",
+                "ERROR",
+                "apply",
+                "convert",
+                str(cube),
+                "--output",
+                str(cube_h5),
+            ]
+        )
+        == 0
+    )
+    rc = main(
+        [
+            "--log-level",
+            "ERROR",
+            "compute",
+            "potential",
+            str(cube_h5),
+            "--output",
+            str(output),
+            "--water-padding-ang",
+            "0.2",
+        ]
+    )
+
+    assert rc == 0
+    rows = _read_hdf5_rows(output)
+    assert len(rows) == 1
+    assert rows[0]["status"] in {"ok", "incomplete"}
+
+
+def test_compute_potential_accepts_combined_cube_hdf5_input(tmp_path):
+    run_a = tmp_path / "run_a"
+    run_b = tmp_path / "run_b"
+    cube_a = _write_potential_case(run_a, fermi_au=0.0367493036)
+    cube_b = _write_potential_case(run_b, fermi_au=0.0734986072)
+    combined = tmp_path / "combined.cube.h5"
+    output = tmp_path / "potential_summary.h5"
+
+    assert (
+        main(
+            [
+                "--log-level",
+                "ERROR",
+                "apply",
+                "combine",
+                "-f",
+                str(cube_a),
+                str(cube_b),
+                "--output",
+                str(combined),
+            ]
+        )
+        == 0
+    )
+    rc = main(
+        [
+            "--log-level",
+            "ERROR",
+            "compute",
+            "potential",
+            str(combined),
+            "--output",
+            str(output),
+            "--water-padding-ang",
+            "0.2",
+        ]
+    )
+
+    assert rc == 0
+    rows = _read_hdf5_rows(output)
+    assert len(rows) == 2
 
 
 def test_plot_potential_profiles_preserve_explicit_blank_axis_labels(monkeypatch, tmp_path):

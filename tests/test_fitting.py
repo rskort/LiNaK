@@ -46,6 +46,25 @@ def test_execute_series_fit_polynomial_uses_degree_and_manual_range():
     assert summary["parameters"]["a0"] == pytest.approx(4.0)
 
 
+def test_execute_series_fit_polynomial_reports_vertex_from_rendered_predictor():
+    x = np.linspace(-2.0, 2.0, 80)
+    y = 3.0 * x**2 - 2.0 * x + 4.0
+
+    summary = execute_series_fit(
+        x,
+        y,
+        fit_config={"fit_enabled": True, "fit_type": "polynomial", "fit_degree": 2},
+    )
+
+    assert summary["status"] == "ok"
+    assert "3*x^2" in summary["equation"]
+    vertex = summary["characteristic_point"]
+    assert isinstance(vertex, dict)
+    assert vertex["label"] == "Vertex"
+    assert vertex["x"] == pytest.approx(1.0 / 3.0)
+    assert vertex["y"] == pytest.approx(11.0 / 3.0)
+
+
 def test_execute_series_fit_gaussian_converges_on_synthetic_data():
     x = np.linspace(-5.0, 5.0, 100)
     y = 4.0 * np.exp(-0.5 * ((x - 1.5) / 0.8) ** 2) + 0.2

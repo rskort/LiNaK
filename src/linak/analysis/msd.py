@@ -12,6 +12,8 @@ import numpy as np
 from ase import Atoms
 from ase.geometry import find_mic
 
+from ..plot.data_contract import PlotDataContract, PlotViewMapping
+from ..plot.mappings.msd_mapping import resolve_msd_plot_mapping
 from ..storage.hdf5_utils import write_linak_hdf5
 from .common import (
     frame_has_usable_cell as _common_frame_has_usable_cell,
@@ -291,6 +293,9 @@ def plot_msd_profile(
     preferred_backend: str | None = None,
     series_id: str | None = None,
     style: PlotStyle = DEFAULT_PLOT_STYLE,
+    data_contract: PlotDataContract | None = None,
+    view_mapping: PlotViewMapping | None = None,
+    time_axis: str = "ps",
     title: str | None = None,
     x_label: str | None = None,
     y_label: str | None = None,
@@ -345,8 +350,23 @@ def plot_msd_profile(
     savefig_kwargs: dict[str, Any] | None = None,
 ) -> Path | None:
     """Plot MSD profile using shared LiNaK plotting style."""
+    resolved_mapping = resolve_msd_plot_mapping(
+        contract=data_contract,
+        profile=profile,
+        mapping=view_mapping,
+        time_axis=time_axis,
+    )
+    runtime_time_axis = str(resolved_mapping.renderer_options.get("time_axis") or "ps")
+    x_values = profile.time_fs if runtime_time_axis == "fs" else profile.time_ps
     schema_labels = default_plot_labels("msd")
-    default_x = "Time (ps)" if schema_labels is None else schema_labels[0]
+    if schema_labels is None:
+        default_x = "Time (fs)" if runtime_time_axis == "fs" else "Time (ps)"
+    else:
+        default_x = (
+            schema_labels[0].replace("(ps)", "(fs)")
+            if runtime_time_axis == "fs"
+            else schema_labels[0]
+        )
     default_y = "MSD (Angstrom^2)" if schema_labels is None else schema_labels[1]
     resolved_label = line_label
     if resolved_label is None and legend:
@@ -361,7 +381,7 @@ def plot_msd_profile(
         series_normalization_x_refs=series_normalization_x_refs,
     )
     return plot_line_series(
-        profile.time_ps,
+        x_values,
         profile.msd,
         title=title or f"{profile.species} mean squared displacement",
         x_label=resolve_explicit_plot_text(x_label, default_x),
@@ -435,6 +455,9 @@ def plot_msd_profiles(
     show_blocking: bool = True,
     preferred_backend: str | None = None,
     style: PlotStyle = DEFAULT_PLOT_STYLE,
+    data_contract: PlotDataContract | None = None,
+    view_mapping: PlotViewMapping | None = None,
+    time_axis: str = "ps",
     title: str | None = None,
     x_label: str | None = None,
     y_label: str | None = None,
@@ -493,11 +516,26 @@ def plot_msd_profiles(
     savefig_kwargs: dict[str, Any] | None = None,
 ) -> Path | None:
     """Plot one or more MSD profiles."""
-    schema_labels = default_plot_labels("msd")
-    default_x = "Time (ps)" if schema_labels is None else schema_labels[0]
-    default_y = "MSD (Angstrom^2)" if schema_labels is None else schema_labels[1]
     if not profiles:
         raise ValueError("At least one MSD profile is required.")
+    first_profile = profiles[0]
+    resolved_mapping = resolve_msd_plot_mapping(
+        contract=data_contract,
+        profile=first_profile,
+        mapping=view_mapping,
+        time_axis=time_axis,
+    )
+    runtime_time_axis = str(resolved_mapping.renderer_options.get("time_axis") or "ps")
+    schema_labels = default_plot_labels("msd")
+    if schema_labels is None:
+        default_x = "Time (fs)" if runtime_time_axis == "fs" else "Time (ps)"
+    else:
+        default_x = (
+            schema_labels[0].replace("(ps)", "(fs)")
+            if runtime_time_axis == "fs"
+            else schema_labels[0]
+        )
+    default_y = "MSD (Angstrom^2)" if schema_labels is None else schema_labels[1]
     default_labels = [profile.species for profile in profiles]
     labels = resolve_series_labels(
         default_labels,
@@ -517,6 +555,9 @@ def plot_msd_profiles(
             show_blocking=show_blocking,
             preferred_backend=preferred_backend,
             style=style,
+            data_contract=resolved_mapping.contract,
+            view_mapping=resolved_mapping.mapping,
+            time_axis=runtime_time_axis,
             title=title,
             x_label=x_label,
             y_label=y_label,
@@ -573,7 +614,10 @@ def plot_msd_profiles(
         )
 
     return plot_multi_line_series(
-        [profile.time_ps for profile in profiles],
+        [
+            profile.time_fs if runtime_time_axis == "fs" else profile.time_ps
+            for profile in profiles
+        ],
         [profile.msd for profile in profiles],
         labels,
         title=title or "Mean squared displacement",

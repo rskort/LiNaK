@@ -23,6 +23,8 @@ from linak.analysis.coordination import (
     save_coordination_profile,
 )
 from linak.analysis.rdf import RDFProfile, save_rdf_profile
+from linak.plot.contracts.coordination_contract import coordination_profile_to_plot_data_contract
+from linak.plot.mappings.coordination_mapping import coordination_mapping_preset
 
 
 def _coordination_test_frames() -> list[Atoms]:
@@ -625,6 +627,20 @@ def test_fit_local_quadratic_minimum_falls_back_for_ill_conditioned_fit(monkeypa
     assert result == pytest.approx(1.0)
 
 
+def test_fit_local_raw_minimum_refines_against_raw_rdf_values():
+    x = np.array([1.0, 1.2, 1.4, 1.6, 1.8], dtype=float)
+    y = np.array([1.2, 0.8, 0.35, 0.5, 0.9], dtype=float)
+
+    minimum_x, minimum_y = coordination_module._fit_local_raw_minimum(
+        x,
+        y,
+        center_index=2,
+    )
+
+    assert minimum_x == pytest.approx(1.4, abs=5.0e-2)
+    assert minimum_y == pytest.approx(0.35, abs=5.0e-2)
+
+
 def test_coordination_reference_rdf_rmax_uses_shared_safe_periodic_rule():
     frames = [
         Atoms(
@@ -889,6 +905,48 @@ def test_plot_coordination_profile_time_uses_atom_series(monkeypatch):
     assert captured["x_label"] == "Time (ps)"
     assert captured["labels"] == ["O[2]", "O[3]"]
     assert len(captured["y_series"]) == 2
+
+
+def test_plot_coordination_profiles_accepts_contract_driven_trajectory_mapping(monkeypatch):
+    captured: dict[str, object] = {}
+
+    def _fake_projection(profiles, **kwargs):
+        captured["profiles"] = profiles
+        captured["time_axis"] = kwargs["time_axis"]
+        return None
+
+    monkeypatch.setattr(
+        "linak.analysis.coordination._plot_coordination_time_distance_projection",
+        _fake_projection,
+    )
+
+    profile = CoordinationProfile(
+        species_a="O",
+        species_b="H",
+        axis="z",
+        atom_indices=np.array([2, 3]),
+        frame_index=np.array([0, 1, 2]),
+        step=np.array([0.0, 1.0, 2.0]),
+        time_fs=np.array([0.0, 2.0, 4.0]),
+        time_ps=np.array([0.0, 0.002, 0.004]),
+        distance_to_surface=np.array([[0.8, 1.2], [0.9, 1.3], [1.0, 1.4]], dtype=float),
+        coordination_number=np.array([[1.0, 0.5], [0.8, 0.4], [0.7, 0.3]], dtype=float),
+        n_frames=3,
+        n_atoms=2,
+        coordinate_mode="distance",
+        cutoff_A=1.0,
+        cutoff_smoothing_width_A=0.4,
+    )
+
+    plot_coordination_profiles(
+        [profile],
+        show=False,
+        data_contract=coordination_profile_to_plot_data_contract(profile),
+        view_mapping=coordination_mapping_preset("distance_vs_time", time_axis="fs"),
+    )
+
+    assert captured["time_axis"] == "fs"
+    assert len(captured["profiles"]) == 1
 
 
 def test_plot_coordination_time_distance_applies_axis_label_padding(monkeypatch):

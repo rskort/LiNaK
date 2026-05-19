@@ -1,4 +1,5 @@
 import json
+import inspect
 import logging
 import numpy as np
 import pytest
@@ -10,6 +11,8 @@ from linak import __version__ as LINAK_VERSION
 import linak.analysis.density as density_module
 import linak.analysis.water as water_module
 from linak.analysis.density import (
+    DensityHeatmapProfile,
+    DensityProfile,
     SurfaceEstimatorOptions,
     available_element_species,
     compute_all_density_profiles,
@@ -18,11 +21,13 @@ from linak.analysis.density import (
     estimate_surface_reference,
     estimate_surface_position,
     load_density_profile,
+    load_density_heatmap_profiles,
     load_density_profiles,
     normalize_backend_name,
     save_density_profile,
     save_density_profiles,
 )
+from linak.plot.mappings.density_mapping import density_plot_options_to_view_mapping
 
 
 def test_density_profile_linear_density_without_cell():
@@ -47,6 +52,184 @@ def test_density_profile_linear_density_without_cell():
     assert profile.surface_estimate.summary.valid_fraction == pytest.approx(1.0)
     assert profile.units == "g/Angstrom"
     assert profile.axis == "z"
+
+
+def test_compute_all_density_profiles_default_is_line_only():
+    frame = Atoms(
+        "OO",
+        positions=[[0.0, 1.0, 2.0], [2.0, 3.0, 4.0]],
+        cell=[10.0, 11.0, 12.0],
+        pbc=True,
+    )
+
+    profiles = compute_all_density_profiles([frame], species="O", bin_width=1.0, surface_mode="none")
+
+    line_profiles = [profile for profile in profiles if isinstance(profile, DensityProfile)]
+    heatmap_profiles = [profile for profile in profiles if isinstance(profile, DensityHeatmapProfile)]
+    assert len(line_profiles) == 4
+    assert heatmap_profiles == []
+
+
+def test_compute_all_density_profiles_all_includes_planar_heatmaps():
+    frame = Atoms(
+        "OO",
+        positions=[[0.0, 1.0, 2.0], [2.0, 3.0, 4.0]],
+        cell=[10.0, 11.0, 12.0],
+        pbc=True,
+    )
+
+    profiles = compute_all_density_profiles(
+        [frame],
+        species="O",
+        bin_width=1.0,
+        surface_mode="none",
+        outputs="all",
+    )
+
+    line_profiles = [profile for profile in profiles if isinstance(profile, DensityProfile)]
+    heatmap_profiles = [profile for profile in profiles if isinstance(profile, DensityHeatmapProfile)]
+    assert len(line_profiles) == 4
+    assert {profile.plane for profile in heatmap_profiles} == {"xy", "xz", "yz"}
+    assert all(profile.density.ndim == 2 for profile in heatmap_profiles)
+
+
+def test_compute_all_density_profiles_heatmap_scope_selects_planes():
+    frame = Atoms(
+        "OO",
+        positions=[[0.0, 1.0, 2.0], [2.0, 3.0, 4.0]],
+        cell=[10.0, 11.0, 12.0],
+        pbc=True,
+    )
+
+    profiles = compute_all_density_profiles(
+        [frame],
+        species="O",
+        bin_width=1.0,
+        surface_mode="none",
+        outputs="heatmap",
+        heatmap_planes=["xy"],
+    )
+
+    assert not any(isinstance(profile, DensityProfile) for profile in profiles)
+    assert [profile.plane for profile in profiles if isinstance(profile, DensityHeatmapProfile)] == ["xy"]
+
+
+def test_compute_all_density_profiles_matches_single_profile_results_for_one_species():
+    frame1 = Atoms(
+        "OO",
+        positions=[[0.0, 1.0, 2.0], [2.0, 3.0, 4.0]],
+        cell=[10.0, 11.0, 12.0],
+        pbc=True,
+    )
+    frame2 = Atoms(
+        "OO",
+        positions=[[0.5, 1.5, 2.5], [2.5, 3.5, 4.5]],
+        cell=[12.0, 11.0, 12.0],
+        pbc=True,
+    )
+    frames = [frame1, frame2]
+
+    profiles = compute_all_density_profiles(
+        frames,
+        species="O",
+        bin_width=1.0,
+        surface_mode="none",
+        outputs="all",
+    )
+    line_profiles = {
+        (profile.axis, profile.coordinate_mode): profile
+        for profile in profiles
+        if isinstance(profile, DensityProfile)
+    }
+    heatmap_profiles = {
+        profile.plane: profile
+        for profile in profiles
+        if isinstance(profile, DensityHeatmapProfile)
+    }
+
+    for axis in ("x", "y", "z"):
+        expected = compute_density_profile(
+            frames,
+            species="O",
+            axis=axis,
+            bin_width=1.0,
+            surface_mode="none",
+            binning="cell",
+        )
+        actual = line_profiles[(axis, "axis")]
+        np.testing.assert_allclose(actual.bin_edges, expected.bin_edges)
+        np.testing.assert_allclose(actual.density, expected.density)
+        np.testing.assert_allclose(actual.number_density, expected.number_density)
+        np.testing.assert_allclose(actual.series_statistics["density"].sample_sem, expected.series_statistics["density"].sample_sem, equal_nan=True)
+
+    z_distance = line_profiles[("z", "axis")]
+    np.testing.assert_allclose(z_distance.density, line_profiles[("z", "axis")].density)
+
+    for plane in ("xy", "xz", "yz"):
+        expected = density_module._compute_density_heatmap_profile_from_selected(
+            frames=frames,
+            selected_xy_per_frame=[
+                np.column_stack(
+                    (
+                        np.asarray(frame.positions[:, "xyz".index(plane[0])], dtype=float),
+                        np.asarray(frame.positions[:, "xyz".index(plane[1])], dtype=float),
+                    )
+                )
+                for frame in frames
+            ],
+            selected_masses_per_frame=[
+                np.asarray(frame.get_masses(), dtype=float) * 1.66053906660e-24
+                for frame in frames
+            ],
+            plane_axes=(plane[0], plane[1]),
+            orthogonal_axis=next(axis for axis in ("x", "y", "z") if axis not in plane),
+            species_label="O",
+            bin_width=1.0,
+            histogram_bounds=None,
+        )
+        actual = heatmap_profiles[plane]
+        np.testing.assert_allclose(actual.density, expected.density)
+        np.testing.assert_allclose(actual.number_density, expected.number_density)
+
+
+def test_compute_all_density_profiles_supports_h2o_selection():
+    frame = Atoms(
+        "OHH",
+        positions=[[0.0, 0.0, 0.0], [0.96, 0.0, 0.0], [-0.24, 0.93, 0.0]],
+        cell=[10.0, 10.0, 10.0],
+        pbc=True,
+    )
+
+    profiles = compute_all_density_profiles([frame], species="H2O", surface_mode="none", bin_width=1.0)
+
+    assert len(profiles) == 4
+    assert all(profile.species == "H2O" for profile in profiles)
+
+
+def test_save_and_load_density_heatmap_profiles_round_trip(tmp_path):
+    frame = Atoms(
+        "OO",
+        positions=[[0.0, 1.0, 2.0], [2.0, 3.0, 4.0]],
+        cell=[10.0, 11.0, 12.0],
+        pbc=True,
+    )
+    output = tmp_path / "density.h5"
+
+    save_density_profiles(
+        compute_all_density_profiles(
+            [frame],
+            species="O",
+            bin_width=1.0,
+            surface_mode="none",
+            outputs="all",
+        ),
+        output,
+    )
+
+    loaded = load_density_heatmap_profiles(output, species="O")
+
+    assert len(loaded) == 3
+    assert {profile.plane for profile in loaded} == {"xy", "xz", "yz"}
 
 
 def test_plot_density_profiles_keeps_descriptor_render_path_with_single_loaded_profile(
@@ -90,6 +273,44 @@ def test_plot_density_profiles_keeps_descriptor_render_path_with_single_loaded_p
 
     assert result == tmp_path / "multi.png"
     assert calls == ["multi"]
+
+
+def test_plot_density_profile_accepts_generic_view_mapping(monkeypatch):
+    captured: dict[str, object] = {}
+
+    def _fake_plot_line_series(x_values, y_values, **kwargs):
+        captured["x_values"] = np.asarray(x_values, dtype=float)
+        captured["y_values"] = np.asarray(y_values, dtype=float)
+        captured["x_label"] = kwargs["x_label"]
+        captured["y_label"] = kwargs["y_label"]
+        return None
+
+    monkeypatch.setattr(density_module, "plot_line_series", _fake_plot_line_series)
+
+    profile = DensityProfile(
+        axis="z",
+        species="O",
+        bin_edges=np.array([0.0, 1.0, 2.0]),
+        bin_centers=np.array([0.5, 1.5]),
+        counts_per_frame=np.array([1.0, 1.0]),
+        density=np.array([2.0, 3.0]),
+        units="g/cm^3",
+        n_frames=2,
+        number_density=np.array([4.0, 5.0]),
+        number_density_units="atom/nm^3",
+        coordinate_mode="axis",
+    )
+
+    density_module.plot_density_profile(
+        profile,
+        show=False,
+        view_mapping=density_plot_options_to_view_mapping(x_mode="z", quantity="number"),
+    )
+
+    np.testing.assert_allclose(captured["x_values"], np.array([0.5, 1.5]))
+    np.testing.assert_allclose(captured["y_values"], np.array([4.0, 5.0]))
+    assert captured["x_label"] == "Z (A)"
+    assert "Entity density" in str(captured["y_label"])
 
 
 def test_density_profile_volumetric_density_with_cell():
@@ -1918,6 +2139,83 @@ def test_plot_density_profiles_autoscale_to_visible_normalized_data(tmp_path):
     assert top <= 1.2
 
 
+# ---------------------------------------------------------------------------
+# Fixed-slab fallback tests
+# ---------------------------------------------------------------------------
+
+
+def _make_fixed_slab_frames():
+    """Build a 2-frame trajectory where ALL Pt atoms are constrained via FixAtoms."""
+    # 3 Pt atoms in a slab layer, 1 H above.
+    positions_1 = [
+        [0.0, 0.0, 0.0],
+        [1.5, 0.0, 0.0],
+        [0.75, 1.3, 0.0],
+        [0.75, 0.65, 3.0],  # H above slab
+    ]
+    positions_2 = [
+        [0.0, 0.0, 0.0],
+        [1.5, 0.0, 0.0],
+        [0.75, 1.3, 0.0],
+        [0.75, 0.65, 3.1],  # H slightly moved
+    ]
+    frames = []
+    for pos in (positions_1, positions_2):
+        frame = Atoms(
+            symbols=["Pt", "Pt", "Pt", "H"],
+            positions=pos,
+            cell=[5, 5, 20],
+            pbc=[True, True, True],
+        )
+        frame.set_constraint(FixAtoms(indices=[0, 1, 2]))
+        frames.append(frame)
+    return frames
+
+
+def test_fixed_slab_fallback_succeeds_with_default_options():
+    """Default include_fixed_surface_atoms=False fails, fallback retries with True."""
+    frames = _make_fixed_slab_frames()
+    estimate = estimate_surface_reference(frames, "z")
+    assert estimate is not None
+    assert estimate.position is not None
+    assert estimate.diagnostics.effective_options["include_fixed_surface_atoms"] is True
+    assert estimate.diagnostics.effective_options.get("fixed_atom_fallback") is True
+
+
+def test_fixed_slab_no_fallback_with_explicit_surface_options():
+    """When surface_options explicitly sets include_fixed_surface_atoms=False, no retry."""
+    frames = _make_fixed_slab_frames()
+    explicit_opts = SurfaceEstimatorOptions(
+        mode="auto",
+        include_fixed_surface_atoms=False,
+    )
+    estimate = estimate_surface_reference(
+        frames, "z", surface_options=explicit_opts
+    )
+    assert estimate is None
+
+
+def test_fixed_slab_direct_include_fixed_no_fallback_tag():
+    """When user directly sets include_fixed_surface_atoms=True, it works without fallback tag."""
+    frames = _make_fixed_slab_frames()
+    estimate = estimate_surface_reference(
+        frames, "z", include_fixed_surface_atoms=True
+    )
+    assert estimate is not None
+    assert estimate.position is not None
+    assert estimate.diagnostics.effective_options["include_fixed_surface_atoms"] is True
+    assert estimate.diagnostics.effective_options.get("fixed_atom_fallback") is None
+
+
+def test_fixed_slab_fallback_logs_info_message(caplog):
+    """The fallback retry emits an INFO log message."""
+    frames = _make_fixed_slab_frames()
+    with caplog.at_level(logging.INFO, logger="linak.analysis.surface"):
+        estimate = estimate_surface_reference(frames, "z")
+    assert estimate is not None
+    assert any("retrying with include_fixed_surface_atoms=True" in msg for msg in caplog.messages)
+
+
 def test_plot_multi_line_series_rejects_invalid_series_line_kwargs_length():
     from linak.plot.plotting import plot_multi_line_series
 
@@ -2092,7 +2390,245 @@ def test_compute_all_density_profiles_logs_single_pass_and_aggregate_binning(cap
         record.getMessage() for record in caplog.records if record.levelno == logging.INFO
     ]
     assert any("Single-pass selection complete:" in message for message in info_messages)
-    assert any("Binning 12 density profiles." in message for message in info_messages)
+    assert any(
+        "Binning 12 density outputs (4 line profiles + 0 heatmaps per species selection)."
+        in message
+        for message in info_messages
+    )
+
+
+def test_compute_all_density_profiles_skips_bounds_progress_for_cell_line_outputs(monkeypatch):
+    frame = Atoms(
+        "OO",
+        positions=[[0.0, 0.0, 0.50], [0.0, 0.0, 1.50]],
+        cell=[10.0, 10.0, 10.0],
+        pbc=True,
+    )
+    progress_records: list[dict[str, object]] = []
+
+    class RecordingProgressBar:
+        def __init__(
+            self,
+            *,
+            desc: str,
+            total: int | None = None,
+            unit: str = "it",
+            **_kwargs: object,
+        ) -> None:
+            self.record = {"desc": desc, "total": total, "unit": unit, "count": 0}
+            progress_records.append(self.record)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc: object) -> None:
+            return None
+
+        def update(self, n: int = 1) -> None:
+            self.record["count"] = int(self.record["count"]) + n
+
+    monkeypatch.setattr(density_module, "ProgressBar", RecordingProgressBar)
+
+    compute_all_density_profiles(
+        frames=[frame],
+        species="O",
+        surface_axis="z",
+        surface_mode="none",
+        bin_width=1.0,
+        binning="cell",
+    )
+
+    assert [record["desc"] for record in progress_records] == ["Binning density frames"]
+    assert progress_records[0]["total"] == 1
+    assert progress_records[0]["unit"] == "frame"
+    assert progress_records[0]["count"] == 1
+
+
+def test_compute_all_density_profiles_heatmaps_prepare_bounds_before_binning(monkeypatch):
+    frame = Atoms(
+        "OO",
+        positions=[[0.0, 0.0, 0.50], [1.0, 1.0, 1.50]],
+        cell=[10.0, 10.0, 10.0],
+        pbc=True,
+    )
+    progress_records: list[dict[str, object]] = []
+
+    class RecordingProgressBar:
+        def __init__(
+            self,
+            *,
+            desc: str,
+            total: int | None = None,
+            unit: str = "it",
+            **_kwargs: object,
+        ) -> None:
+            self.record = {"desc": desc, "total": total, "unit": unit, "count": 0}
+            progress_records.append(self.record)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc: object) -> None:
+            return None
+
+        def update(self, n: int = 1) -> None:
+            self.record["count"] = int(self.record["count"]) + n
+
+    monkeypatch.setattr(density_module, "ProgressBar", RecordingProgressBar)
+
+    compute_all_density_profiles(
+        frames=[frame],
+        species="O",
+        surface_axis="z",
+        surface_mode="none",
+        bin_width=1.0,
+        binning="cell",
+        outputs="heatmap",
+        heatmap_planes=["xy"],
+    )
+
+    assert [record["desc"] for record in progress_records] == [
+        "Preparing density bins",
+        "Binning density frames",
+    ]
+    assert [record["count"] for record in progress_records] == [1, 1]
+
+
+def test_compute_all_density_profiles_binning_progress_is_frame_based():
+    source = inspect.getsource(density_module._compute_all_density_profiles_streaming)
+
+    assert 'ProgressBar(desc="Binning density frames", total=len(frames), unit="frame")' in source
+    assert 'desc="Binning density profiles", total=total_binning_jobs' not in source
+
+
+def test_density_heatmap_compute_does_not_retain_per_frame_2d_history():
+    source = inspect.getsource(density_module._compute_density_heatmap_profile_from_selected)
+
+    assert "per_frame_density_values" not in source
+    assert "per_frame_number_density_values" not in source
+
+
+def test_density_profile_fast_path_does_not_use_numpy_histogram_in_frame_loop():
+    source = inspect.getsource(density_module._compute_density_profile_from_selected)
+
+    assert "np.histogram(" not in source
+
+
+def test_density_heatmap_fast_path_does_not_use_numpy_histogram2d_in_frame_loop():
+    source = inspect.getsource(density_module._compute_density_heatmap_profile_from_selected)
+
+    assert "np.histogram2d(" not in source
+
+
+def test_density_heatmap_geometry_guard_rejects_oversized_grid():
+    frame = Atoms(
+        "OO",
+        positions=[[0.0, 0.0, 0.0], [2000.0, 2000.0, 1.0]],
+        cell=[2001.0, 2001.0, 10.0],
+        pbc=True,
+    )
+
+    with pytest.raises(ValueError, match="Density heatmap grid is too large for a safe compute path"):
+        compute_all_density_profiles(
+            [frame],
+            species="O",
+            bin_width=1.0,
+            surface_mode="none",
+            outputs="heatmap",
+        )
+
+
+def test_density_profile_fast_statistics_match_reference_moments():
+    frame1 = Atoms("OO", positions=[[0.0, 0.0, 0.10], [0.0, 0.0, 1.10]], cell=[10.0, 10.0, 10.0], pbc=True)
+    frame2 = Atoms("OO", positions=[[0.0, 0.0, 0.20], [0.0, 0.0, 1.20]], cell=[20.0, 10.0, 10.0], pbc=True)
+    frames = [frame1, frame2]
+    oxygen_mass_g = float(frame1.get_masses()[0]) * 1.66053906660e-24
+    selected_per_frame = [
+        np.array([0.10, 1.10], dtype=float),
+        np.array([0.20, 1.20], dtype=float),
+    ]
+    selected_masses_per_frame = [
+        np.array([oxygen_mass_g, oxygen_mass_g], dtype=float),
+        np.array([oxygen_mass_g, oxygen_mass_g], dtype=float),
+    ]
+
+    profile = density_module._compute_density_profile_from_selected(
+        frames=frames,
+        selected_per_frame=selected_per_frame,
+        selected_masses_per_frame=selected_masses_per_frame,
+        axis="z",
+        axis_index=2,
+        species_label="O",
+        count_label="atoms",
+        bin_width=1.0,
+    )
+
+    bin_edges = np.asarray(profile.bin_edges, dtype=float)
+    sample_rows = []
+    number_rows = []
+    for frame, axis_values, masses in zip(frames, selected_per_frame, selected_masses_per_frame):
+        mass_hist, _ = np.histogram(axis_values, bins=bin_edges, weights=masses)
+        entity_hist, _ = np.histogram(axis_values, bins=bin_edges)
+        volume = abs(float(np.linalg.det(np.asarray(frame.cell.array, dtype=float))))
+        axis_length = np.linalg.norm(np.asarray(frame.cell.array, dtype=float)[2])
+        frame_volume = (volume / axis_length) * 1.0
+        sample_rows.append((mass_hist / frame_volume) / 1.0e-24)
+        number_rows.append((entity_hist / frame_volume) / 1.0e-3)
+    sample_matrix = np.vstack(sample_rows)
+    number_matrix = np.vstack(number_rows)
+
+    np.testing.assert_allclose(profile.series_statistics["density"].sample_n, np.array([2, 2]))
+    np.testing.assert_allclose(
+        profile.series_statistics["density"].sample_sem,
+        np.nanstd(sample_matrix, axis=0, ddof=1) / np.sqrt(2.0),
+        equal_nan=True,
+    )
+    np.testing.assert_allclose(
+        profile.series_statistics["number_density"].sample_sem,
+        np.nanstd(number_matrix, axis=0, ddof=1) / np.sqrt(2.0),
+        equal_nan=True,
+    )
+
+
+def test_density_heatmap_fast_accumulation_matches_reference_histogram2d():
+    frame1 = Atoms("OO", positions=[[0.1, 0.2, 0.0], [1.1, 1.2, 0.0]], cell=[5.0, 5.0, 5.0], pbc=True)
+    frame2 = Atoms("OO", positions=[[0.2, 0.1, 0.0], [1.2, 1.1, 0.0]], cell=[5.0, 5.0, 5.0], pbc=True)
+    frames = [frame1, frame2]
+    oxygen_mass_g = float(frame1.get_masses()[0]) * 1.66053906660e-24
+    selected_xy_per_frame = [
+        np.array([[0.1, 0.2], [1.1, 1.2]], dtype=float),
+        np.array([[0.2, 0.1], [1.2, 1.1]], dtype=float),
+    ]
+    selected_masses_per_frame = [
+        np.array([oxygen_mass_g, oxygen_mass_g], dtype=float),
+        np.array([oxygen_mass_g, oxygen_mass_g], dtype=float),
+    ]
+
+    profile = density_module._compute_density_heatmap_profile_from_selected(
+        frames=frames,
+        selected_xy_per_frame=selected_xy_per_frame,
+        selected_masses_per_frame=selected_masses_per_frame,
+        plane_axes=("x", "y"),
+        orthogonal_axis="z",
+        species_label="O",
+        bin_width=1.0,
+    )
+
+    x_edges = np.asarray(profile.x_bin_edges, dtype=float)
+    y_edges = np.asarray(profile.y_bin_edges, dtype=float)
+    mass_sum = np.zeros_like(profile.density)
+    entity_sum = np.zeros_like(profile.number_density)
+    for points, masses in zip(selected_xy_per_frame, selected_masses_per_frame):
+        mass_hist, _, _ = np.histogram2d(points[:, 0], points[:, 1], bins=(x_edges, y_edges), weights=masses)
+        entity_hist, _, _ = np.histogram2d(points[:, 0], points[:, 1], bins=(x_edges, y_edges))
+        mass_sum += mass_hist
+        entity_sum += entity_hist
+    slice_volume = (125.0 / 5.0) * (1.0 * 1.0)
+    reference_density = ((mass_sum / slice_volume) / len(frames)) / 1.0e-24
+    reference_number_density = ((entity_sum / slice_volume) / len(frames)) / 1.0e-3
+
+    np.testing.assert_allclose(profile.density, reference_density)
+    np.testing.assert_allclose(profile.number_density, reference_number_density)
 
 
 def test_unify_number_density_units_merges_atom_and_molecule():

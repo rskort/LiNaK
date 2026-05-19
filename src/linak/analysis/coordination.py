@@ -11,7 +11,10 @@ from typing import Any
 from ase import Atoms
 from ase.neighborlist import neighbor_list
 import numpy as np
+from scipy.interpolate import PchipInterpolator
 
+from ..plot.data_contract import PlotDataContract, PlotViewMapping
+from ..plot.mappings.coordination_mapping import resolve_coordination_plot_mapping
 from ..plot.plotting import (
     DEFAULT_PLOT_STYLE,
     PlotStyle,
@@ -355,6 +358,49 @@ def _fit_local_quadratic_minimum(
     return float(np.clip(vertex, lower, upper))
 
 
+def _fit_local_raw_minimum(
+    x: np.ndarray,
+    y: np.ndarray,
+    *,
+    center_index: int,
+) -> tuple[float, float]:
+    start = max(0, center_index - _FIT_HALF_WINDOW_POINTS)
+    stop = min(x.size, center_index + _FIT_HALF_WINDOW_POINTS + 1)
+    x_window = np.asarray(x[start:stop], dtype=float)
+    y_window = np.asarray(y[start:stop], dtype=float)
+    finite_mask = np.isfinite(x_window) & np.isfinite(y_window)
+    x_window = x_window[finite_mask]
+    y_window = y_window[finite_mask]
+    if x_window.size < 3:
+        x_value = float(x[center_index])
+        y_value = float(y[center_index])
+        return x_value, y_value
+
+    try:
+        interpolator = PchipInterpolator(x_window, y_window, extrapolate=False)
+        sample_count = max(256, int((x_window.size - 1) * 128))
+        center_x = float(x[center_index])
+        lower_bound = float(x[max(center_index - 1, 0)])
+        upper_bound = float(x[min(center_index + 1, x.size - 1)])
+        lower_bound = max(lower_bound, float(x_window[0]))
+        upper_bound = min(upper_bound, float(x_window[-1]))
+        if not np.isfinite(lower_bound) or not np.isfinite(upper_bound) or lower_bound >= upper_bound:
+            lower_bound = max(center_x, float(x_window[0]))
+            upper_bound = float(x_window[-1])
+        x_dense = np.linspace(lower_bound, upper_bound, sample_count, dtype=float)
+        y_dense = np.asarray(interpolator(x_dense), dtype=float)
+        finite_dense = np.isfinite(y_dense)
+        if not np.any(finite_dense):
+            raise ValueError("No finite interpolated RDF samples were produced.")
+        x_dense = x_dense[finite_dense]
+        y_dense = y_dense[finite_dense]
+        minimum_index = int(np.argmin(y_dense))
+        return float(x_dense[minimum_index]), float(y_dense[minimum_index])
+    except Exception:
+        local_index = int(np.argmin(y_window))
+        return float(x_window[local_index]), float(y_window[local_index])
+
+
 def _compute_reference_rdf_pairs(
     frames: list[Atoms],
     *,
@@ -537,7 +583,7 @@ def _resolve_cutoff_from_rdf_curve(
     bin_centers_A: np.ndarray,
     g_r: np.ndarray,
     smoothing_sigma_A: float,
-) -> tuple[np.ndarray, float, float]:
+) -> tuple[np.ndarray, float, float, float]:
     if bin_centers_A.size != g_r.size:
         raise ValueError("RDF bin centers and g(r) arrays must have matching sizes.")
     finite_mask = np.isfinite(bin_centers_A) & np.isfinite(g_r)
@@ -558,9 +604,9 @@ def _resolve_cutoff_from_rdf_curve(
     minimum_index = _find_first_minimum_index(smoothed, start_index=peak_index)
     if minimum_index is None:
         raise ValueError("Unable to resolve a valid first RDF minimum after the first peak.")
-    cutoff_A = _fit_local_quadratic_minimum(
+    cutoff_A, cutoff_g_r = _fit_local_raw_minimum(
         finite_bin_centers,
-        np.asarray(smoothed, dtype=float),
+        finite_g_r,
         center_index=minimum_index,
     )
     _validate_resolved_cutoff(
@@ -572,7 +618,7 @@ def _resolve_cutoff_from_rdf_curve(
     )
     full_smoothed = np.full(g_r.shape, np.nan, dtype=float)
     full_smoothed[finite_mask] = smoothed
-    return full_smoothed, float(finite_bin_centers[peak_index]), cutoff_A
+    return full_smoothed, float(finite_bin_centers[peak_index]), cutoff_A, float(cutoff_g_r)
 
 
 def _save_cutoff_diagnostic_plot(
@@ -583,6 +629,7 @@ def _save_cutoff_diagnostic_plot(
     g_r_smoothed: np.ndarray,
     peak_A: float,
     minimum_A: float,
+    minimum_g_r: float | None,
     species_a: str,
     species_b: str,
 ) -> Path:
@@ -608,7 +655,11 @@ def _save_cutoff_diagnostic_plot(
     )
     ax.scatter(
         [minimum_A],
-        [float(np.interp(minimum_A, bin_centers_A, g_r_smoothed))],
+        [
+            float(minimum_g_r)
+            if minimum_g_r is not None and np.isfinite(minimum_g_r)
+            else float(np.interp(minimum_A, bin_centers_A, g_r))
+        ],
         color="#b22222",
         zorder=3,
     )
@@ -709,7 +760,7 @@ def resolve_coordination_cutoffs(
                 species_a=physical_pair[0],
                 species_b=physical_pair[1],
             )
-            smoothed, peak_A, minimum_A = _resolve_cutoff_from_rdf_curve(
+            smoothed, peak_A, minimum_A, minimum_g_r = _resolve_cutoff_from_rdf_curve(
                 bin_centers_A=np.asarray(rdf_profile.bin_centers, dtype=float),
                 g_r=np.asarray(rdf_profile.g_r, dtype=float),
                 smoothing_sigma_A=float(_DEFAULT_RDF_SMOOTHING_SIGMA_A),
@@ -744,6 +795,13 @@ def resolve_coordination_cutoffs(
                     g_r_smoothed=np.asarray(base.rdf_g_r_smoothed, dtype=float),
                     peak_A=float(base.rdf_peak_A),
                     minimum_A=float(base.rdf_minimum_A),
+                    minimum_g_r=float(
+                        np.interp(
+                            float(base.rdf_minimum_A),
+                            np.asarray(base.rdf_bin_centers_A, dtype=float),
+                            np.asarray(base.rdf_g_r, dtype=float),
+                        )
+                    ),
                     species_a=pair[0],
                     species_b=pair[1],
                 )
@@ -775,7 +833,7 @@ def resolve_coordination_cutoffs(
     for pair in normalized_pairs:
         physical_pair = _canonical_rdf_pair(*pair)
         bin_centers_A, g_r = resolved_curves[physical_pair]
-        smoothed, peak_A, minimum_A = _resolve_cutoff_from_rdf_curve(
+        smoothed, peak_A, minimum_A, minimum_g_r = _resolve_cutoff_from_rdf_curve(
             bin_centers_A=np.asarray(bin_centers_A, dtype=float),
             g_r=np.asarray(g_r, dtype=float),
             smoothing_sigma_A=float(_DEFAULT_RDF_SMOOTHING_SIGMA_A),
@@ -790,6 +848,7 @@ def resolve_coordination_cutoffs(
                 g_r_smoothed=smoothed,
                 peak_A=peak_A,
                 minimum_A=minimum_A,
+                minimum_g_r=minimum_g_r,
                 species_a=pair[0],
                 species_b=pair[1],
             )
@@ -1890,45 +1949,6 @@ def _default_coordination_series_labels(profile: CoordinationProfile) -> list[st
     return [f"{prefix}[{int(atom_index)}]" for atom_index in profile.atom_indices.tolist()]
 
 
-def _coordination_distance_series(
-    profile: CoordinationProfile,
-    *,
-    bin_width_A: float,
-    reducer: str,
-) -> tuple[np.ndarray, np.ndarray]:
-    ensure_positive("x_bin_width", bin_width_A)
-    token = str(reducer).strip().lower()
-    if token not in {"mean", "median", "sum", "min", "max"}:
-        raise ValueError("x_bin_reducer must be one of: mean, median, sum, min, max.")
-
-    distances = np.asarray(profile.distance_to_surface, dtype=float).ravel()
-    cn_values = np.asarray(profile.coordination_number, dtype=float).ravel()
-    mask = np.isfinite(distances) & np.isfinite(cn_values)
-    if not np.any(mask):
-        return np.empty(0, dtype=float), np.empty(0, dtype=float)
-    distances = distances[mask]
-    cn_values = cn_values[mask]
-    start = float(np.floor(np.min(distances) / float(bin_width_A)) * float(bin_width_A))
-    bin_index = np.floor((distances - start) / float(bin_width_A)).astype(np.int64)
-    unique_bins = np.unique(bin_index)
-    x_out = np.empty(unique_bins.size, dtype=float)
-    y_out = np.empty(unique_bins.size, dtype=float)
-    for out_index, group_id in enumerate(unique_bins):
-        group = cn_values[bin_index == group_id]
-        x_out[out_index] = start + (float(group_id) + 0.5) * float(bin_width_A)
-        if token == "mean":
-            y_out[out_index] = float(np.mean(group))
-        elif token == "median":
-            y_out[out_index] = float(np.median(group))
-        elif token == "sum":
-            y_out[out_index] = float(np.sum(group))
-        elif token == "min":
-            y_out[out_index] = float(np.min(group))
-        else:
-            y_out[out_index] = float(np.max(group))
-    return x_out, y_out
-
-
 def _plot_coordination_time_distance_projection(
     profiles: list[CoordinationProfile],
     *,
@@ -2290,6 +2310,8 @@ def plot_coordination_profile(
     preferred_backend: str | None = None,
     series_id: str | None = None,
     style: PlotStyle = DEFAULT_PLOT_STYLE,
+    data_contract: PlotDataContract | None = None,
+    view_mapping: PlotViewMapping | None = None,
     component: str = "distance",
     time_axis: str = "ps",
     title: str | None = None,
@@ -2348,11 +2370,20 @@ def plot_coordination_profile(
     tight_layout_kwargs: dict[str, Any] | None = None,
     savefig_kwargs: dict[str, Any] | None = None,
 ) -> Path | None:
-    normalized_component = _normalize_component_token(component)
+    resolved_mapping = resolve_coordination_plot_mapping(
+        contract=data_contract,
+        profile=profile,
+        mapping=view_mapping,
+        component=component,
+        time_axis=time_axis,
+    )
+    runtime_component = resolved_mapping.component
+    runtime_time_axis = resolved_mapping.time_axis
+    normalized_component = _normalize_component_token(runtime_component)
     if normalized_component == "time-distance":
         return _plot_coordination_time_distance_projection(
             [profile],
-            time_axis=time_axis,
+            time_axis=runtime_time_axis,
             output=output,
             show=show,
             show_blocking=show_blocking,
@@ -2401,7 +2432,7 @@ def plot_coordination_profile(
         )
 
     if normalized_component == "time":
-        x_values, default_x = _coordination_time_data(profile, time_axis=time_axis)
+        x_values, default_x = _coordination_time_data(profile, time_axis=runtime_time_axis)
         labels = _default_coordination_series_labels(profile)
         effective_legend = (profile.n_atoms <= 12) if legend is None else legend
         return plot_multi_line_series(
@@ -2553,6 +2584,8 @@ def plot_coordination_profiles(
     show_blocking: bool = True,
     preferred_backend: str | None = None,
     style: PlotStyle = DEFAULT_PLOT_STYLE,
+    data_contract: PlotDataContract | None = None,
+    view_mapping: PlotViewMapping | None = None,
     component: str = "distance",
     time_axis: str = "ps",
     title: str | None = None,
@@ -2614,12 +2647,22 @@ def plot_coordination_profiles(
 ) -> Path | None:
     if not profiles:
         raise ValueError("At least one coordination profile is required.")
-    normalized_component = _normalize_component_token(component)
+    first_profile = profiles[0]
+    resolved_mapping = resolve_coordination_plot_mapping(
+        contract=data_contract,
+        profile=first_profile,
+        mapping=view_mapping,
+        component=component,
+        time_axis=time_axis,
+    )
+    runtime_component = resolved_mapping.component
+    runtime_time_axis = resolved_mapping.time_axis
+    normalized_component = _normalize_component_token(runtime_component)
 
     if normalized_component == "time-distance":
         return _plot_coordination_time_distance_projection(
             profiles,
-            time_axis=time_axis,
+            time_axis=runtime_time_axis,
             output=output,
             show=show,
             show_blocking=show_blocking,
@@ -2686,8 +2729,10 @@ def plot_coordination_profiles(
             show_blocking=show_blocking,
             preferred_backend=preferred_backend,
             style=style,
-            component=normalized_component,
-            time_axis=time_axis,
+            data_contract=resolved_mapping.contract,
+            view_mapping=resolved_mapping.mapping,
+            component=runtime_component,
+            time_axis=runtime_time_axis,
             title=title,
             x_label=x_label,
             y_label=y_label,
@@ -2754,7 +2799,10 @@ def plot_coordination_profiles(
         y_series: list[np.ndarray] = []
         default_x_label = "Time (ps)"
         for profile in profiles:
-            x_values, default_x_label = _coordination_time_data(profile, time_axis=time_axis)
+            x_values, default_x_label = _coordination_time_data(
+                profile,
+                time_axis=runtime_time_axis,
+            )
             for column, atom_index in enumerate(profile.atom_indices.tolist()):
                 x_series.append(np.asarray(x_values, dtype=float))
                 y_series.append(np.asarray(profile.coordination_number[:, column], dtype=float))

@@ -4,6 +4,7 @@ import h5py
 from ase import Atoms
 
 from linak.analysis.msd import compute_msd, load_msd_profile, save_msd_profile
+from linak.plot.mappings.msd_mapping import msd_plot_options_to_view_mapping
 
 
 def test_compute_msd_returns_expected_profile():
@@ -97,3 +98,35 @@ def test_plot_msd_profiles_uses_multi_line_plot_for_multiple_profiles(monkeypatc
 
     plot_msd_profiles([profile_a, profile_b], show=False)
     assert captured["labels"] == ["A", "B"]
+
+
+def test_plot_msd_profile_accepts_generic_view_mapping(monkeypatch):
+    from linak.analysis.msd import MSDProfile, plot_msd_profile
+
+    captured: dict[str, object] = {}
+
+    def _fake_plot_line_series(x_values, y_values, **kwargs):
+        captured["x_values"] = np.asarray(x_values, dtype=float)
+        captured["y_values"] = np.asarray(y_values, dtype=float)
+        captured["x_label"] = kwargs["x_label"]
+        return None
+
+    monkeypatch.setattr("linak.analysis.msd.plot_line_series", _fake_plot_line_series)
+
+    profile = MSDProfile(
+        species="O",
+        time_fs=np.array([0.0, 2.0]),
+        time_ps=np.array([0.0, 0.002]),
+        msd=np.array([0.0, 1.0]),
+        n_frames=2,
+    )
+
+    plot_msd_profile(
+        profile,
+        show=False,
+        view_mapping=msd_plot_options_to_view_mapping(time_axis="fs"),
+    )
+
+    np.testing.assert_allclose(captured["x_values"], np.array([0.0, 2.0]))
+    np.testing.assert_allclose(captured["y_values"], np.array([0.0, 1.0]))
+    assert captured["x_label"] == "Time (fs)"

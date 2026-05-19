@@ -28,6 +28,8 @@ from typing import Any
 import numpy as np
 from ase import Atoms
 
+from ..plot.data_contract import PlotDataContract, PlotViewMapping
+from ..plot.mappings.orientation_mapping import resolve_orientation_plot_mapping
 from ..storage.hdf5_utils import write_linak_hdf5
 from .common import (
     frame_has_usable_cell as _frame_has_usable_cell,
@@ -140,20 +142,6 @@ class _OrientationFrameData:
     polar_valid: np.ndarray
     cos_azimuthal: np.ndarray
     azimuthal_valid: np.ndarray
-
-
-def _extract_cell_lengths(
-    frame: Atoms,
-    axis_index: int,
-) -> tuple[float, float, float] | None:
-    """Extract cell lengths from a frame; return None if not periodic."""
-    if not bool(np.all(frame.get_pbc())):
-        return None
-    cell = np.asarray(frame.cell.array, dtype=float)
-    lengths = tuple(float(np.linalg.norm(cell[i])) for i in range(3))
-    if any(length <= 0.0 for length in lengths):
-        return None
-    return (lengths[0], lengths[1], lengths[2])
 
 
 # HDF5 save/load
@@ -943,6 +931,8 @@ def plot_orientation_profile(
     show_blocking: bool = True,
     preferred_backend: str | None = None,
     style: PlotStyle = DEFAULT_PLOT_STYLE,
+    data_contract: PlotDataContract | None = None,
+    view_mapping: PlotViewMapping | None = None,
     component: str = "average",
     angle: str = "polar",
     title: str | None = None,
@@ -1015,10 +1005,17 @@ def plot_orientation_profile(
     savefig_kwargs: dict[str, Any] | None = None,
 ) -> Path | None:
     """Plot a single orientation profile."""
-    norm_component = _normalize_component_token(component)
-    norm_angle = _normalize_angle_token(angle)
+    resolved_mapping = resolve_orientation_plot_mapping(
+        contract=data_contract,
+        profile=profile,
+        mapping=view_mapping,
+        component=component,
+        angle=angle,
+    )
+    norm_component = _normalize_component_token(resolved_mapping.component)
+    norm_angle = _normalize_angle_token(resolved_mapping.angle)
 
-    if norm_component == "heatmap":
+    if resolved_mapping.is_heatmap:
         return _plot_orientation_heatmap(
             [profile],
             angle=norm_angle,
@@ -1158,6 +1155,8 @@ def plot_orientation_profiles(
     show_blocking: bool = True,
     preferred_backend: str | None = None,
     style: PlotStyle = DEFAULT_PLOT_STYLE,
+    data_contract: PlotDataContract | None = None,
+    view_mapping: PlotViewMapping | None = None,
     component: str = "average",
     angle: str = "polar",
     title: str | None = None,
@@ -1236,11 +1235,18 @@ def plot_orientation_profiles(
     """Plot one or more orientation profiles overlaid."""
     if not profiles:
         raise ValueError("At least one orientation profile is required.")
+    first_profile = profiles[0]
+    resolved_mapping = resolve_orientation_plot_mapping(
+        contract=data_contract,
+        profile=first_profile,
+        mapping=view_mapping,
+        component=component,
+        angle=angle,
+    )
+    norm_component = _normalize_component_token(resolved_mapping.component)
+    norm_angle = _normalize_angle_token(resolved_mapping.angle)
 
-    norm_component = _normalize_component_token(component)
-    norm_angle = _normalize_angle_token(angle)
-
-    if norm_component == "heatmap":
+    if resolved_mapping.is_heatmap:
         return _plot_orientation_heatmap(
             profiles,
             angle=norm_angle,

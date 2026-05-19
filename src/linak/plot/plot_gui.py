@@ -15,7 +15,54 @@ from uuid import uuid4
 
 import numpy as np
 
+from .data_contract import (
+    PlotDataContract,
+    PlotDimension,
+    PlotQuantity,
+    PlotViewMapping,
+    PlotViewType,
+)
+from .contracts.position_contract import default_position_plot_data_contract
+from .contracts.density_contract import (
+    default_density_heatmap_plot_data_contract,
+    default_density_plot_data_contract,
+)
+from .contracts.coordination_contract import default_coordination_plot_data_contract
+from .contracts.orientation_contract import (
+    default_orientation_heatmap_plot_data_contract,
+    default_orientation_line_plot_data_contract,
+)
+from .contracts.potential_contract import default_potential_plot_data_contract
+from .data_validation import generic_view_type_compatibility, visual_role_compatibility
 from .fitting import coerce_fit_config, default_fit_config, supported_fit_types
+from .mappings.position_mapping import (
+    _position_quantity_id_from_token,
+    position_mapping_preset,
+    position_plot_options_to_view_mapping,
+    position_view_mapping_to_plot_options,
+)
+from .mappings.density_mapping import (
+    density_plot_options_to_view_mapping,
+    resolve_density_plot_mapping,
+    density_view_mapping_to_plot_options,
+)
+from .mappings.coordination_mapping import (
+    coordination_plot_options_to_view_mapping,
+    resolve_coordination_plot_mapping,
+    coordination_view_mapping_to_plot_options,
+)
+from .mappings.orientation_mapping import (
+    orientation_plot_options_to_view_mapping,
+    resolve_orientation_plot_mapping,
+    orientation_view_mapping_to_plot_options,
+)
+from .mappings.potential_mapping import (
+    potential_plot_options_to_view_mapping,
+    resolve_potential_plot_mapping,
+    potential_view_mapping_to_plot_options,
+)
+from .profile_persistence import deserialize_plot_view_mapping, serialize_plot_view_mapping
+from .plot_settings import profile_name_conflict_message
 from .plotting import (
     _describe_error_provenance,
     _coerce_plot_annotations,
@@ -104,7 +151,7 @@ _INTEGRATION_SOURCE_LABEL_BY_MODE = {
 }
 _INTEGRATION_COLOR_MODES = ("Auto", "Custom")
 _ANNOTATION_TYPES = ("text", "line", "arrow")
-_ANNOTATION_COORD_SYSTEMS = ("data", "axes")
+_ANNOTATION_COORD_SYSTEMS = ("axes", "data")
 _ANNOTATION_LINE_STYLES = ("-", "--", "-.", ":")
 _ANNOTATION_ARROW_STYLES = ("->", "-|>", "<->", "simple", "fancy")
 _ANNOTATION_HORIZONTAL_ALIGN = ("left", "center", "right")
@@ -112,7 +159,53 @@ _ANNOTATION_VERTICAL_ALIGN = ("top", "center", "bottom", "baseline")
 _POSITION_COMPONENT_LABELS = ("distance", "x", "y", "z", "2D projection")
 _POSITION_PROJECTION_QUANTITIES = ("x", "y", "z", "distance", "ps", "fs", "step", "frame")
 _POSITION_PROJECTION_RENDER_MODES = ("color-scale", "line-colors")
+_POSITION_GUI_VIEW_TYPE_LABEL_BY_ID = {
+    "line_1d": "Line 1D",
+    "trajectory_2d": "Trajectory 2D",
+}
+_POSITION_GUI_VIEW_TYPE_ID_BY_LABEL = {
+    label: view_type_id for view_type_id, label in _POSITION_GUI_VIEW_TYPE_LABEL_BY_ID.items()
+}
+_POSITION_GUI_PRESET_LABEL_BY_ID = {
+    "distance_vs_time": "Distance vs time",
+    "x_y_trajectory": "X vs Y trajectory",
+    "x_z_trajectory": "X vs Z trajectory",
+    "y_z_trajectory": "Y vs Z trajectory",
+}
+_POSITION_GUI_PRESET_ID_BY_LABEL = {
+    label: preset_id for preset_id, label in _POSITION_GUI_PRESET_LABEL_BY_ID.items()
+}
+_POSITION_GUI_TOKEN_BY_QUANTITY_ID = {
+    "distance_to_surface": "distance",
+    "x": "x",
+    "y": "y",
+    "z": "z",
+    "time_ps": "ps",
+    "time_fs": "fs",
+    "step": "step",
+    "frame_index": "frame",
+}
+_POTENTIAL_VIEW_TYPE_LABEL_BY_ID = {
+    "line_1d": "Line 1D",
+    "table_records": "Table records",
+}
+_POTENTIAL_VIEW_TYPE_ID_BY_LABEL = {
+    label: view_type_id for view_type_id, label in _POTENTIAL_VIEW_TYPE_LABEL_BY_ID.items()
+}
+_POTENTIAL_SERIES_LABEL_BY_ID = {
+    "summary": "Summary (all series)",
+}
+_POTENTIAL_SERIES_ID_BY_LABEL = {
+    label: quantity_id for quantity_id, label in _POTENTIAL_SERIES_LABEL_BY_ID.items()
+}
 _DENSITY_X_MODE_LABELS = ("Distance", "X", "Y", "Z")
+_DENSITY_VIEW_TYPE_LABEL_BY_ID = {
+    "line_1d": "Line 1D",
+    "heatmap_2d": "Heatmap 2D",
+}
+_DENSITY_VIEW_TYPE_ID_BY_LABEL = {
+    label: view_type_id for view_type_id, label in _DENSITY_VIEW_TYPE_LABEL_BY_ID.items()
+}
 _DENSITY_X_MODE_BY_LABEL = {
     "distance": "distance",
     "x": "x",
@@ -120,8 +213,6 @@ _DENSITY_X_MODE_BY_LABEL = {
     "z": "z",
     "axis": "axis",
 }
-_PROFILE_FILTER_METADATA_LABEL = "Use stored metadata"
-_PROFILE_FILTER_SPECIES_B_AUTO_LABEL = "Same as Species A / stored metadata"
 _AUTO_PREVIEW_DEBOUNCE_MS = 1000
 _WORKSPACE_PANEL_WIDTH = 760
 _WORKSPACE_PANEL_MIN_WIDTH = 520
@@ -202,16 +293,32 @@ _TOOLTIPS: dict[str, str] = {
     "profiles.export_json": "Saves this profile to a JSON file.",
     "export.transparent": "Saves the figure with a transparent background.",
     "export.figure": "Saves the current figure to an image file.",
-    "data.density.x_values": "Chooses what is shown on the x-axis.",
-    "data.density.quantity": "Chooses whether density is mass or number based.",
+    "data.density.x_values": "Chooses which source quantity is assigned to the x role.",
+    "data.density.quantity": "Chooses which density quantity is assigned to the y role.",
     "data.profile.species": "Filters the stored profile by species.",
     "data.profile.axis": "Filters the stored profile by axis.",
-    "data.rdf.species_a": "Chooses the first species in the stored RDF profile.",
-    "data.rdf.species_b": "Chooses the second species in the stored RDF profile.",
+    "data.rdf.layer_count": "Shows how many RDF profiles were loaded as plot layers from the current source.",
+    "data.rdf.pairs": "Lists the RDF profile labels currently available as layers.",
     "data.coordination.species_a": "Chooses the center species in the stored profile.",
     "data.coordination.species_b": "Chooses the neighbor species in the stored profile.",
     "data.coordination.axis": "Chooses which stored axis profile to load.",
+    "data.density.source.contract": "Shows the shared plot-data contract detected for the current density source.",
+    "data.density.source.dimensions": "Shows the logical dimensions available for density plotting.",
+    "data.density.source.quantities": "Shows the quantities exposed by the current density plot-data contract.",
+    "data.density.target": "Chooses which loaded density species or molecule target is visible in the preview.",
+    "data.density.summary.status": "Shows whether the current density mapping is preferred, supported, or invalid for the active contract.",
+    "data.density.summary.mapping": "Shows the current density mapping in generic view-role form.",
+    "data.density.summary.backend": "Shows how the current density mapping is translated into backend plotting options.",
     "data.position.component": "Chooses which position component to plot.",
+    "data.position.source.contract": "Shows the shared plot-data contract detected for the current position source.",
+    "data.position.source.dimensions": "Shows the logical dimensions available for position plotting.",
+    "data.position.source.quantities": "Shows the quantities exposed by the current position plot-data contract.",
+    "data.position.mapping.preset": "Applies one thin default mapping for common position views.",
+    "data.position.mapping.view_type": "Chooses which generic plot view to map onto the current position data.",
+    "data.position.mapping.x": "Chooses which quantity is assigned to the x visual role.",
+    "data.position.mapping.y": "Chooses which quantity is assigned to the y visual role.",
+    "data.position.mapping.value": "Chooses which quantity supplies color values and optional range filtering for trajectory views.",
+    "data.position.mapping.split_by": "Shows which dimension the current position mapping splits into separate plotted series.",
     "data.position.color_by": "Chooses which quantity is used for projection coloring or range filtering.",
     "data.position.xy_z_distance_max": "Legacy distance cutoff for the projection view. Use the range controls for the general case.",
     "data.position.projection_x": "Chooses which quantity is shown on the horizontal axis in 2-D projection mode.",
@@ -220,18 +327,41 @@ _TOOLTIPS: dict[str, str] = {
     "data.position.projection_range_min": "Optional lower bound for the selected projection value quantity.",
     "data.position.projection_range_max": "Optional upper bound for the selected projection value quantity.",
     "data.position.time_axis": "Chooses the time unit on the x-axis.",
-    "data.coordination.component": "Chooses which coordination view to plot.",
-    "data.coordination.time_axis": "Chooses the time unit on the x-axis.",
-    "data.orientation.component": "Chooses the averaging mode: mean cos(angle), density-weighted, or 2-D heatmap.",
-    "data.orientation.angle": "Chooses which angle to display: polar (bisector vs surface normal) or azimuthal (molecular-plane normal).",
+    "data.position.summary.status": "Shows whether the current generic mapping is preferred, merely supported, or invalid for the current contract.",
+    "data.position.summary.mapping": "Shows the current position mapping in a compact generic form.",
+    "data.position.summary.backend": "Shows how the current generic mapping is translated back into the existing position plotting backend.",
+    "data.coordination.component": "Chooses the generic coordination mapping preset.",
+    "data.coordination.time_axis": "Chooses which time quantity is assigned to the x role when time is used.",
+    "data.coordination.source.contract": "Shows the shared plot-data contract detected for the current coordination source.",
+    "data.coordination.source.dimensions": "Shows the logical dimensions available for coordination plotting.",
+    "data.coordination.source.quantities": "Shows the quantities exposed by the current coordination plot-data contract.",
+    "data.coordination.summary.status": "Shows whether the current coordination mapping is preferred, supported, or invalid for the active contract.",
+    "data.coordination.summary.mapping": "Shows the current coordination mapping in generic view-role form.",
+    "data.coordination.summary.backend": "Shows how the current coordination mapping is translated into backend plotting options.",
+    "data.orientation.component": "Chooses the orientation view preset: line-style quantity or 2-D heatmap.",
+    "data.orientation.angle": "Chooses which angle quantity is assigned to the active mapping.",
+    "data.orientation.source.contract": "Shows the shared plot-data contract detected for the current orientation source.",
+    "data.orientation.source.dimensions": "Shows the logical dimensions available for the active orientation view type.",
+    "data.orientation.source.quantities": "Shows the quantities exposed by the active orientation plot-data contract.",
+    "data.orientation.summary.status": "Shows whether the current orientation mapping is preferred, supported, or invalid for the active contract.",
+    "data.orientation.summary.mapping": "Shows the current orientation mapping in generic view-role form.",
+    "data.orientation.summary.backend": "Shows how the current orientation mapping is translated into backend plotting options.",
     "data.potential.x_axis": "Shows which value is used on the x-axis.",
     "data.potential.total_rows": "Shows how many records were loaded.",
     "data.potential.complete_rows": "Shows how many records have complete values.",
     "data.potential.incomplete_rows": "Shows how many records have missing values.",
-    "data.section.width": "Groups nearby x-values into wider sections.",
+    "data.potential.source.contract": "Shows the shared plot-data contract detected for the current potential source.",
+    "data.potential.source.dimensions": "Shows the logical dimensions available for potential plotting.",
+    "data.potential.source.quantities": "Shows the quantities exposed by the current potential plot-data contract.",
+    "data.potential.mapping.view_type": "Chooses between line plotting and table-style record inspection.",
+    "data.potential.mapping.series": "Chooses which potential quantity is assigned to the y role in line mode.",
+    "data.potential.summary.status": "Shows whether the current potential mapping is preferred, supported, or invalid for the active contract.",
+    "data.potential.summary.mapping": "Shows the current potential mapping in generic view-role form.",
+    "data.potential.summary.backend": "Shows how the current potential mapping is translated into backend plotting options.",
+    "data.section.width": "Groups nearby x-values into wider display bins. The helper note below shows the source bin size and requested display bin size.",
     "data.section.reducer": "Chooses how each section is summarized.",
-    "data.section.min_points": "Requires at least this many contributing raw points in a plotted bin before LiNaK shows the value, uncertainty, or fit input for that bin.",
-    "data.section.y_width": "Groups nearby y-values (angle bins) into wider sections. Only used for heatmaps.",
+    "data.section.min_points": "Requires at least this many contributing raw points in a plotted bin before LiNaK shows the value, uncertainty, or fit input for that bin. The helper note below summarizes the current points-per-bin distribution.",
+    "data.section.y_width": "Groups nearby y-values into wider display bins for 2D views.",
     "data.section.y_reducer": "Chooses how each y-section is summarized.",
     "series.all_on": "Turns every series on.",
     "series.all_off": "Turns every series off.",
@@ -464,16 +594,6 @@ def _optional_int(value: str, *, field_name: str) -> int | None:
         return int(stripped)
     except ValueError as exc:
         raise ValueError(f"{field_name} must be an integer.") from exc
-
-
-def _display_positive_int(value: Any, *, fallback: int) -> str:
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        parsed = fallback
-    if parsed <= 0:
-        parsed = fallback
-    return str(parsed)
 
 
 def _display_optional_positive_int(value: Any) -> str:
@@ -1103,20 +1223,137 @@ def _is_position_projection_component(value: Any) -> bool:
     }
 
 
-def _position_component_setting_value(value: Any) -> str:
-    return (
-        "2d-projection"
-        if _is_position_projection_component(value)
-        else (str(value or "distance").strip().lower() or "distance")
+def _plot_data_contract_from_payload(value: Any) -> PlotDataContract | None:
+    if not isinstance(value, dict):
+        return None
+    dimensions = tuple(
+        PlotDimension(
+            id=str(item.get("id") or ""),
+            label=str(item.get("label") or ""),
+            kind=str(item.get("kind") or ""),
+            length=(
+                None if item.get("length") is None else int(item.get("length"))
+            ),
+            unit=None if item.get("unit") is None else str(item.get("unit")),
+        )
+        for item in value.get("dimensions", [])
+        if isinstance(item, dict) and str(item.get("id") or "").strip()
+    )
+    quantities = tuple(
+        PlotQuantity(
+            id=str(item.get("id") or ""),
+            label=str(item.get("label") or ""),
+            kind=str(item.get("kind") or ""),
+            dimensions=tuple(str(token) for token in item.get("dimensions", []) if str(token).strip()),
+            unit=None if item.get("unit") is None else str(item.get("unit")),
+            source_name=(
+                None if item.get("source_name") is None else str(item.get("source_name"))
+            ),
+        )
+        for item in value.get("quantities", [])
+        if isinstance(item, dict) and str(item.get("id") or "").strip()
+    )
+    view_types = tuple(
+        PlotViewType(
+            id=str(item.get("id") or ""),
+            label=str(item.get("label") or ""),
+            kind=str(item.get("kind") or ""),
+            supported_roles=tuple(
+                str(token) for token in item.get("supported_roles", []) if str(token).strip()
+            ),
+        )
+        for item in value.get("view_types", [])
+        if isinstance(item, dict) and str(item.get("id") or "").strip()
+    )
+    if not quantities:
+        return None
+    return PlotDataContract.from_items(
+        source_id=str(value.get("source_id") or "position"),
+        label=str(value.get("label") or "Position data"),
+        dimensions=dimensions,
+        quantities=quantities,
+        view_types=view_types,
+        default_view_type_id=(
+            None
+            if value.get("default_view_type_id") is None
+            else str(value.get("default_view_type_id"))
+        ),
     )
 
 
-def _position_component_display_value(value: Any) -> str:
-    return (
-        "2D projection"
-        if _is_position_projection_component(value)
-        else (str(value or "distance").strip().lower() or "distance")
-    )
+def _fallback_position_plot_data_contract() -> PlotDataContract:
+    return default_position_plot_data_contract()
+
+
+def _fallback_density_plot_data_contract() -> PlotDataContract:
+    return default_density_plot_data_contract()
+
+
+def _fallback_density_heatmap_plot_data_contract() -> PlotDataContract:
+    return default_density_heatmap_plot_data_contract()
+
+
+def _fallback_coordination_plot_data_contract() -> PlotDataContract:
+    return default_coordination_plot_data_contract()
+
+
+def _fallback_orientation_line_plot_data_contract() -> PlotDataContract:
+    return default_orientation_line_plot_data_contract()
+
+
+def _fallback_orientation_heatmap_plot_data_contract() -> PlotDataContract:
+    return default_orientation_heatmap_plot_data_contract()
+
+
+def _fallback_potential_plot_data_contract() -> PlotDataContract:
+    return default_potential_plot_data_contract()
+
+
+def _position_quantity_token(quantity_id: str | None) -> str:
+    token = _POSITION_GUI_TOKEN_BY_QUANTITY_ID.get(str(quantity_id or "").strip())
+    if token is None:
+        raise ValueError(f"Unsupported position quantity id '{quantity_id}'.")
+    return token
+
+
+def _mapping_status_label(status: str) -> str:
+    if status == "valid_preferred":
+        return "Preferred"
+    if status == "valid_nonpreferred":
+        return "Supported"
+    return "Invalid"
+
+
+def _contract_dimensions_text(contract: PlotDataContract) -> str:
+    parts: list[str] = []
+    for dimension in contract.dimensions:
+        token = str(dimension.id)
+        if dimension.length is not None:
+            token = f"{token}={dimension.length}"
+        parts.append(token)
+    return ", ".join(parts) if parts else "n/a"
+
+
+def _contract_quantities_text(contract: PlotDataContract) -> str:
+    quantities = [str(quantity.id) for quantity in contract.quantities if str(quantity.id).strip()]
+    return ", ".join(quantities) if quantities else "n/a"
+
+
+def _mapping_summary_text(mapping: PlotViewMapping) -> str:
+    roles = mapping.resolved_role_assignments()
+    ordered_roles = ("x", "y", "z", "color", "split_by", "filter_by")
+    parts: list[str] = []
+    for role in ordered_roles:
+        value = roles.get(role)
+        if value is None:
+            continue
+        token = f"{role}={value}"
+        if role == "filter_by" and (mapping.filter_min is not None or mapping.filter_max is not None):
+            token += f" [{'' if mapping.filter_min is None else mapping.filter_min}, {'' if mapping.filter_max is None else mapping.filter_max}]"
+        parts.append(token)
+    if not parts:
+        return mapping.view_type_id
+    return f"{mapping.view_type_id}: " + ", ".join(parts)
 
 
 @dataclass(frozen=True)
@@ -1218,7 +1455,7 @@ def _derive_warning_messages(
     if not isinstance(settings, dict):
         return messages
 
-    if str(settings.get("component") or "").strip().lower() != "heatmap":
+    if not _settings_use_heatmap_rendering(settings):
         visible_modes: list[str] = []
         series_overrides = settings.get("series_overrides")
         series_descriptors = settings.get("series_descriptors")
@@ -1253,6 +1490,77 @@ def _derive_warning_messages(
             )
 
     return messages
+
+
+def _settings_use_heatmap_rendering(settings: dict[str, Any]) -> bool:
+    mapping = settings.get("view_mapping")
+    if isinstance(mapping, PlotViewMapping):
+        return str(mapping.view_type_id).strip().lower() == "heatmap_2d"
+    if isinstance(mapping, dict):
+        try:
+            resolved_mapping = deserialize_plot_view_mapping(mapping)
+        except ValueError:
+            resolved_mapping = None
+        if resolved_mapping is not None:
+            return str(resolved_mapping.view_type_id).strip().lower() == "heatmap_2d"
+    if str(settings.get("component") or "").strip().lower() == "heatmap":
+        return True
+    return False
+
+
+def _coordination_mapping_preset_label(component: str) -> str:
+    normalized = str(component or "").strip().lower() or "distance"
+    if normalized == "distance":
+        return "coordination_vs_distance"
+    if normalized == "time":
+        return "coordination_vs_time"
+    if normalized == "time-distance":
+        return "distance_vs_time"
+    return normalized
+
+
+def _density_backend_summary_text(*, view_type_id: str, x_mode: str, quantity: str) -> str:
+    normalized_view_type = str(view_type_id or "").strip().lower() or "line_1d"
+    normalized_quantity = str(quantity or "").strip().lower() or "mass"
+    if normalized_view_type == "heatmap_2d":
+        return f"view type=heatmap_2d, source field={normalized_quantity}_density_2d"
+    return f"view type=line_1d, x role={str(x_mode or '').strip().lower() or 'distance'}, y role={normalized_quantity}_density"
+
+
+def _coordination_backend_summary_text(*, component: str, time_axis: str) -> str:
+    normalized_component = str(component or "").strip().lower() or "distance"
+    preset = _coordination_mapping_preset_label(normalized_component)
+    if normalized_component == "distance":
+        return f"view preset={preset}, x role=distance_to_surface, y role=coordination_number"
+    view_type = "trajectory_2d" if normalized_component == "time-distance" else "line_1d"
+    return (
+        f"view type={view_type}, view preset={preset}, "
+        f"x role=time ({str(time_axis or '').strip().lower() or 'ps'}), y role=coordination_number"
+    )
+
+
+def _orientation_backend_summary_text(*, component: str, angle: str, is_heatmap: bool) -> str:
+    normalized_component = str(component or "").strip().lower() or "average"
+    normalized_angle = str(angle or "").strip().lower() or "polar"
+    view_type = "heatmap_2d" if is_heatmap else "line_1d"
+    return (
+        f"view type={view_type}, view preset={normalized_component}, angle role={normalized_angle}"
+    )
+
+
+def _potential_backend_summary_text(
+    *,
+    view_type: str,
+    y_quantity: str,
+    standard_plot: str,
+) -> str:
+    normalized_view_type = str(view_type or "").strip().lower() or "line_1d"
+    if normalized_view_type == "table_records":
+        return "view type=table_records, record inspection mode"
+    normalized_standard_plot = str(standard_plot or "").strip().lower()
+    if normalized_standard_plot == "summary":
+        return "view type=line_1d, y role=summary"
+    return f"view type=line_1d, y role={str(y_quantity or '').strip().lower() or 'water_bulk_potential'}"
 
 
 def _extract_dict_value(settings: dict[str, Any], *, key: str, nested_key: str) -> Any:
@@ -1383,6 +1691,8 @@ def launch_plot_settings_panel(
     available_profile_names: list[str] | None = None,
     default_profile_settings: dict[str, Any] | None = None,
     on_load_profile: Callable[[str], dict[str, Any]] | None = None,
+    on_rename_profile: Callable[[str, str], str] | None = None,
+    on_duplicate_profile: Callable[[str, str], str] | None = None,
     on_delete_profile: Callable[[str], tuple[str | None, str]] | None = None,
     on_set_active_profile: Callable[[str], str] | None = None,
     allow_named_profiles: bool = True,
@@ -1391,6 +1701,7 @@ def launch_plot_settings_panel(
     try:
         from PySide6.QtCore import QEasingCurve, QEvent, QPropertyAnimation, QTimer, Qt
         from PySide6.QtGui import (
+            QBrush,
             QColor,
             QDoubleValidator,
             QIcon,
@@ -1939,7 +2250,7 @@ def launch_plot_settings_panel(
             title: str,
             section_id: str,
             state_store: dict[str, bool],
-            default_expanded: bool = True,
+            default_expanded: bool = False,
             subsection: bool = False,
             parent: QWidget | None = None,
         ) -> None:
@@ -2175,6 +2486,82 @@ def launch_plot_settings_panel(
             self._profile_filter_options = _coerce_profile_filter_options(
                 initial_settings.get("_profile_filter_options")
             )
+            self._position_data_contract = (
+                _plot_data_contract_from_payload(
+                    self._profile_filter_options.get("position_plot_contract")
+                )
+                if self._analysis_name == "position"
+                else None
+            )
+            if self._analysis_name == "position" and self._position_data_contract is None:
+                self._position_data_contract = _fallback_position_plot_data_contract()
+            self._density_data_contract = (
+                _plot_data_contract_from_payload(
+                    self._profile_filter_options.get("density_plot_contract")
+                )
+                if self._analysis_name == "density"
+                else None
+            )
+            self._density_heatmap_data_contract = (
+                _plot_data_contract_from_payload(
+                    self._profile_filter_options.get("density_heatmap_plot_contract")
+                )
+                if self._analysis_name == "density"
+                else None
+            )
+            if self._analysis_name == "density" and self._density_data_contract is None:
+                self._density_data_contract = _fallback_density_plot_data_contract()
+            if self._analysis_name == "density" and self._density_heatmap_data_contract is None:
+                self._density_heatmap_data_contract = _fallback_density_heatmap_plot_data_contract()
+            self._coordination_data_contract = (
+                _plot_data_contract_from_payload(
+                    self._profile_filter_options.get("coordination_plot_contract")
+                )
+                if self._analysis_name == "coordination"
+                else None
+            )
+            if (
+                self._analysis_name == "coordination"
+                and self._coordination_data_contract is None
+            ):
+                self._coordination_data_contract = _fallback_coordination_plot_data_contract()
+            self._orientation_line_data_contract = (
+                _plot_data_contract_from_payload(
+                    self._profile_filter_options.get("orientation_line_plot_contract")
+                )
+                if self._analysis_name == "orientation"
+                else None
+            )
+            self._orientation_heatmap_data_contract = (
+                _plot_data_contract_from_payload(
+                    self._profile_filter_options.get("orientation_heatmap_plot_contract")
+                )
+                if self._analysis_name == "orientation"
+                else None
+            )
+            if (
+                self._analysis_name == "orientation"
+                and self._orientation_line_data_contract is None
+            ):
+                self._orientation_line_data_contract = (
+                    _fallback_orientation_line_plot_data_contract()
+                )
+            if (
+                self._analysis_name == "orientation"
+                and self._orientation_heatmap_data_contract is None
+            ):
+                self._orientation_heatmap_data_contract = (
+                    _fallback_orientation_heatmap_plot_data_contract()
+                )
+            self._potential_data_contract = (
+                _plot_data_contract_from_payload(
+                    self._profile_filter_options.get("potential_plot_contract")
+                )
+                if self._analysis_name == "potential"
+                else None
+            )
+            if self._analysis_name == "potential" and self._potential_data_contract is None:
+                self._potential_data_contract = _fallback_potential_plot_data_contract()
             normalized_profile_names: list[str] = []
             for raw_name in available_profile_names or []:
                 candidate = str(raw_name).strip()
@@ -2210,14 +2597,13 @@ def launch_plot_settings_panel(
             self._x_bin_reducer_row: tuple[QFormLayout, QWidget] | None = None
             self._norm_value_row: tuple[QFormLayout, QWidget] | None = None
             self._norm_x_ref_row: tuple[QFormLayout, QWidget] | None = None
-            self._position_projection_x_row: tuple[QFormLayout, QWidget] | None = None
-            self._position_projection_y_row: tuple[QFormLayout, QWidget] | None = None
-            self._position_projection_render_mode_row: tuple[QFormLayout, QWidget] | None = None
-            self._position_map_color_row: tuple[QFormLayout, QWidget] | None = None
-            self._position_projection_filter_min_row: tuple[QFormLayout, QWidget] | None = None
-            self._position_projection_filter_max_row: tuple[QFormLayout, QWidget] | None = None
-            self._position_xy_z_distance_max_row: tuple[QFormLayout, QWidget] | None = None
-            self._position_time_axis_row: tuple[QFormLayout, QWidget] | None = None
+            self._position_mapping_x_row: tuple[QFormLayout, QWidget] | None = None
+            self._position_mapping_y_row: tuple[QFormLayout, QWidget] | None = None
+            self._position_mapping_render_mode_row: tuple[QFormLayout, QWidget] | None = None
+            self._position_mapping_value_row: tuple[QFormLayout, QWidget] | None = None
+            self._position_mapping_filter_min_row: tuple[QFormLayout, QWidget] | None = None
+            self._position_mapping_filter_max_row: tuple[QFormLayout, QWidget] | None = None
+            self._position_mapping_split_by_row: tuple[QFormLayout, QWidget] | None = None
             self._coordination_time_axis_row: tuple[QFormLayout, QWidget] | None = None
             self._axes_ticks_group: QGroupBox | None = None
             self._tick_appearance_group: QGroupBox | None = None
@@ -2370,6 +2756,8 @@ def launch_plot_settings_panel(
             self._y_bin_width_row: tuple[QFormLayout, QWidget] | None = None
             self._y_bin_reducer_row: tuple[QFormLayout, QWidget] | None = None
             self._min_bin_points_row: tuple[QFormLayout, QWidget] | None = None
+            self._binning_helper_label: QLabel | None = None
+            self._density_target_filter: QComboBox | None = None
             self._tooltip_disabled_reasons: dict[int, str | None] = {}
             self._gui_artwork_path = _default_gui_artwork_path()
             self._figure_save_filters, self._figure_default_name = _figure_filetype_filters()
@@ -2684,7 +3072,7 @@ def launch_plot_settings_panel(
             title: str,
             section_id: str,
             body_widget: QWidget,
-            default_expanded: bool = True,
+            default_expanded: bool = False,
             subsection: bool = False,
         ) -> _CollapsibleSection:
             section = _CollapsibleSection(
@@ -2838,12 +3226,48 @@ def launch_plot_settings_panel(
         def _normalize_profile_name(name: str) -> str:
             normalized = str(name).strip()
             if not normalized:
-                raise ValueError("Profile name cannot be empty.")
+                raise ValueError("Profile name cannot be empty. Enter a name to continue.")
             return normalized
 
         def _profile_name_exists(self, name: str) -> bool:
             lowered = name.casefold()
             return any(existing.casefold() == lowered for existing in self._profile_names)
+
+        @staticmethod
+        def _profile_unavailable_message(action: str) -> str:
+            return f"Cannot {action} profiles in this session."
+
+        @staticmethod
+        def _profile_name_unchanged_message(name: str) -> str:
+            return f"Profile name is still '{name}'. Enter a different name to rename it."
+
+        def _set_profile_names(self, names: Sequence[str], *, active_name: str | None = None) -> None:
+            normalized_names: list[str] = []
+            seen_names: set[str] = set()
+            for raw_name in names:
+                candidate = str(raw_name).strip()
+                if not candidate:
+                    continue
+                lowered = candidate.casefold()
+                if lowered in seen_names:
+                    continue
+                seen_names.add(lowered)
+                normalized_names.append(candidate)
+            if not normalized_names:
+                normalized_names = ["Default"]
+            self._profile_names = normalized_names
+            if active_name is not None and any(
+                existing.casefold() == str(active_name).strip().casefold()
+                for existing in normalized_names
+            ):
+                self._current_profile_name = next(
+                    existing
+                    for existing in normalized_names
+                    if existing.casefold() == str(active_name).strip().casefold()
+                )
+            elif self._current_profile_name not in normalized_names:
+                self._current_profile_name = normalized_names[0]
+            self._sync_profile_selector()
 
         def _sync_profile_selector(self) -> None:
             self._profile_selector_syncing = True
@@ -3164,7 +3588,7 @@ def launch_plot_settings_panel(
                 return None
             name = self._normalize_profile_name(raw_value)
             if self._profile_name_exists(name):
-                raise ValueError(f"A profile named '{name}' already exists.")
+                raise ValueError(profile_name_conflict_message(name))
             return name
 
         def _next_duplicate_profile_name(self) -> str:
@@ -3208,7 +3632,7 @@ def launch_plot_settings_panel(
 
         def _handle_new_profile(self) -> None:
             if not self._allow_named_profiles:
-                self._status_label.setText("Combined plot files use one saved settings document.")
+                self._status_label.setText(self._profile_unavailable_message("create"))
                 self._refresh_shell_state()
                 return
             if not self._confirm_context_change(action_label="creating a new profile"):
@@ -3224,7 +3648,7 @@ def launch_plot_settings_panel(
                 message = on_save(name, settings)
                 if on_set_active_profile is not None:
                     message = on_set_active_profile(name)
-                self._profile_names.append(name)
+                self._set_profile_names([*self._profile_names, name], active_name=name)
                 self._load_settings_into_editor(
                     settings,
                     profile_name=name,
@@ -3237,42 +3661,41 @@ def launch_plot_settings_panel(
 
         def _handle_duplicate_profile(self) -> None:
             if not self._allow_named_profiles:
-                self._status_label.setText("Combined plot files use one saved settings document.")
+                self._status_label.setText(self._profile_unavailable_message("duplicate"))
+                self._refresh_shell_state()
+                return
+            if on_duplicate_profile is None:
+                self._status_label.setText(self._profile_unavailable_message("duplicate"))
                 self._refresh_shell_state()
                 return
             try:
-                settings = self._collect_settings()
                 name = self._prompt_profile_name(
                     title_text="Duplicate profile",
                     default_value=self._next_duplicate_profile_name(),
                 )
                 if name is None:
                     return
-                message = on_save(name, settings)
-                if on_set_active_profile is not None:
-                    message = on_set_active_profile(name)
-                self._profile_names.append(name)
-                self._load_settings_into_editor(
-                    settings,
-                    profile_name=name,
-                    status_message=message,
-                    mark_saved=True,
-                )
-                self._schedule_preview_update()
+                current_name = self._current_profile_name
+                settings = self._collect_settings()
+                on_save(current_name, settings)
+                message = on_duplicate_profile(current_name, name)
+                self._set_profile_names([*self._profile_names, name], active_name=name)
+                self._saved_signature = self._signature(settings)
+                self._status_label.setText(message)
+                self._refresh_shell_state()
             except Exception as exc:
                 self._report_error("Duplicate profile failed", exc)
 
         def _handle_rename_profile(self) -> None:
             if not self._allow_named_profiles:
-                self._status_label.setText("Combined plot files use one saved settings document.")
+                self._status_label.setText(self._profile_unavailable_message("rename"))
                 self._refresh_shell_state()
                 return
-            if on_delete_profile is None:
-                self._status_label.setText("Rename profile is unavailable.")
+            if on_rename_profile is None:
+                self._status_label.setText(self._profile_unavailable_message("rename"))
                 return
             try:
                 current_name = self._current_profile_name
-                settings = self._collect_settings()
                 raw_value, accepted = QInputDialog.getText(
                     self,
                     "Rename profile",
@@ -3284,35 +3707,30 @@ def launch_plot_settings_panel(
                     return
                 name = self._normalize_profile_name(raw_value)
                 if name == current_name:
-                    self._status_label.setText("Profile name unchanged.")
+                    self._status_label.setText(self._profile_name_unchanged_message(current_name))
                     return
                 if self._profile_name_exists(name):
-                    raise ValueError(f"A profile named '{name}' already exists.")
-                message = on_save(name, settings)
-                if on_set_active_profile is not None:
-                    on_set_active_profile(name)
-                on_delete_profile(current_name)
-                self._profile_names = [
-                    name if entry == current_name else entry for entry in self._profile_names
-                ]
-                message = f"Renamed profile '{current_name}' to '{name}'."
-                self._load_settings_into_editor(
-                    settings,
-                    profile_name=name,
-                    status_message=message,
-                    mark_saved=True,
+                    raise ValueError(profile_name_conflict_message(name))
+                message = on_rename_profile(current_name, name)
+                self._set_profile_names(
+                    [name if entry.casefold() == current_name.casefold() else entry for entry in self._profile_names],
+                    active_name=name,
                 )
+                if on_load_profile is None:
+                    raise ValueError("Profile loading is unavailable after renaming.")
+                loaded = on_load_profile(name)
+                self._load_settings_into_editor(loaded, profile_name=name, status_message=message, mark_saved=True)
                 self._schedule_preview_update()
             except Exception as exc:
                 self._report_error("Rename profile failed", exc)
 
         def _handle_delete_profile(self) -> None:
             if not self._allow_named_profiles:
-                self._status_label.setText("Combined plot files use one saved settings document.")
+                self._status_label.setText(self._profile_unavailable_message("delete"))
                 self._refresh_shell_state()
                 return
             if on_delete_profile is None:
-                self._status_label.setText("Delete profile is unavailable.")
+                self._status_label.setText(self._profile_unavailable_message("delete"))
                 return
             if len(self._profile_names) <= 1:
                 self._status_label.setText("At least one profile must remain available.")
@@ -3332,13 +3750,13 @@ def launch_plot_settings_panel(
             try:
                 deleted_name = self._current_profile_name
                 next_profile_name, message = on_delete_profile(deleted_name)
-                self._profile_names = [name for name in self._profile_names if name != deleted_name]
-                if next_profile_name is None:
-                    self._current_profile_name = self._profile_names[0]
-                else:
-                    self._current_profile_name = next_profile_name
-                    if next_profile_name not in self._profile_names:
-                        self._profile_names.append(next_profile_name)
+                remaining_names = [
+                    name for name in self._profile_names if name.casefold() != deleted_name.casefold()
+                ]
+                self._set_profile_names(
+                    remaining_names,
+                    active_name=next_profile_name,
+                )
                 if on_load_profile is None:
                     raise ValueError("Profile loading is unavailable after deletion.")
                 loaded = on_load_profile(self._current_profile_name)
@@ -7290,7 +7708,8 @@ def launch_plot_settings_panel(
                 return
 
             if analysis in {"msd", "position"}:
-                selection = QGroupBox("Profile Selection")
+                selection_title = "Source" if analysis == "position" else "Profile Selection"
+                selection = QGroupBox(selection_title)
                 selection_form = QFormLayout(selection)
                 self.analysis_species = self._line("Leave blank to use file metadata")
                 self.analysis_species.textChanged.connect(self._handle_series_identity_change)
@@ -7311,75 +7730,87 @@ def launch_plot_settings_panel(
                         self.analysis_axis,
                         tooltip_id="data.profile.axis",
                     )
+                if analysis == "position":
+                    self._position_source_contract_label = QLabel("")
+                    self._position_source_contract_label.setWordWrap(True)
+                    self._position_source_dimensions_label = QLabel("")
+                    self._position_source_dimensions_label.setWordWrap(True)
+                    self._position_source_quantities_label = QLabel("")
+                    self._position_source_quantities_label.setWordWrap(True)
+                    self._add_form_row(
+                        selection_form,
+                        "Contract",
+                        self._position_source_contract_label,
+                        tooltip_id="data.position.source.contract",
+                    )
+                    self._add_form_row(
+                        selection_form,
+                        "Dimensions",
+                        self._position_source_dimensions_label,
+                        tooltip_id="data.position.source.dimensions",
+                    )
+                    self._add_form_row(
+                        selection_form,
+                        "Quantities",
+                        self._position_source_quantities_label,
+                        tooltip_id="data.position.source.quantities",
+                    )
                 selection_note = QLabel(
                     "Chooses which stored profile is loaded from the current source."
+                    if analysis != "position"
+                    else "Source filters choose which stored position profile is active. The contract summary describes what that source can expose to the mapping layer."
                 )
                 selection_note.setObjectName("sectionNote")
                 selection_note.setWordWrap(True)
                 selection_form.addRow(selection_note)
                 layout.addWidget(
                     self._make_collapsible_section(
-                        title="Profile Selection",
+                        title=selection_title,
                         section_id=f"data.{analysis}.selection",
                         body_widget=selection,
                     )
                 )
 
             if analysis == "rdf":
-                selection = QGroupBox("Profile Selection")
+                selection = QGroupBox("Source")
                 selection_form = QFormLayout(selection)
-                rdf_species_a_options = [
-                    _PROFILE_FILTER_METADATA_LABEL,
-                    *[
-                        str(value)
-                        for value in self._profile_filter_options.get("species_a", [])
-                        if str(value).strip()
-                    ],
-                ]
-                self.rdf_species_a = self._combo(tuple(rdf_species_a_options))
-                self.rdf_species_a.currentTextChanged.connect(
-                    self._handle_rdf_profile_selection_change
-                )
-                self.rdf_species_b = self._combo(
-                    tuple(self._rdf_species_b_choices(None)),
-                )
-                self.rdf_species_b.currentTextChanged.connect(self._handle_series_identity_change)
+                self._rdf_source_pair_count_label = QLabel("")
+                self._rdf_source_pair_count_label.setWordWrap(True)
+                self._rdf_source_pair_list_label = QLabel("")
+                self._rdf_source_pair_list_label.setWordWrap(True)
                 self._add_form_row(
                     selection_form,
-                    "Species A",
-                    self.rdf_species_a,
-                    tooltip_id="data.rdf.species_a",
+                    "Available layers",
+                    self._rdf_source_pair_count_label,
+                    tooltip_id="data.rdf.layer_count",
                 )
                 self._add_form_row(
                     selection_form,
-                    "Species B",
-                    self.rdf_species_b,
-                    tooltip_id="data.rdf.species_b",
+                    "Pairs",
+                    self._rdf_source_pair_list_label,
+                    tooltip_id="data.rdf.pairs",
                 )
                 selection_note = QLabel(
-                    "Chooses which stored RDF profile is loaded from the current source."
+                    "All stored RDF profiles are loaded as layers. Use the Layers panel to toggle visibility, styling, and ordering."
                 )
                 selection_note.setObjectName("sectionNote")
                 selection_note.setWordWrap(True)
                 selection_form.addRow(selection_note)
                 layout.addWidget(
                     self._make_collapsible_section(
-                        title="Profile Selection",
+                        title="Source",
                         section_id="data.rdf.selection",
                         body_widget=selection,
                     )
                 )
 
             if analysis == "coordination":
-                selection = QGroupBox("Profile Selection")
+                selection = QGroupBox("Source")
                 selection_form = QFormLayout(selection)
                 coord_species_a_options = [
-                    _PROFILE_FILTER_METADATA_LABEL,
-                    *[
-                        str(value)
-                        for value in self._profile_filter_options.get("species_a", [])
-                        if str(value).strip()
-                    ],
+                    str(value)
+                    for value in self._profile_filter_options.get("species_a", [])
+                    if str(value).strip()
                 ]
                 self.coord_species_a = self._combo(tuple(coord_species_a_options))
                 self.coord_species_a.currentTextChanged.connect(
@@ -7411,6 +7842,30 @@ def launch_plot_settings_panel(
                     self.analysis_axis,
                     tooltip_id="data.coordination.axis",
                 )
+                self._coordination_source_contract_label = QLabel("")
+                self._coordination_source_contract_label.setWordWrap(True)
+                self._coordination_source_dimensions_label = QLabel("")
+                self._coordination_source_dimensions_label.setWordWrap(True)
+                self._coordination_source_quantities_label = QLabel("")
+                self._coordination_source_quantities_label.setWordWrap(True)
+                self._add_form_row(
+                    selection_form,
+                    "Contract",
+                    self._coordination_source_contract_label,
+                    tooltip_id="data.coordination.source.contract",
+                )
+                self._add_form_row(
+                    selection_form,
+                    "Dimensions",
+                    self._coordination_source_dimensions_label,
+                    tooltip_id="data.coordination.source.dimensions",
+                )
+                self._add_form_row(
+                    selection_form,
+                    "Quantities",
+                    self._coordination_source_quantities_label,
+                    tooltip_id="data.coordination.source.quantities",
+                )
                 note = QLabel(
                     "Chooses which stored coordination profile(s) are loaded from the current source."
                 )
@@ -7419,15 +7874,75 @@ def launch_plot_settings_panel(
                 selection_form.addRow(note)
                 layout.addWidget(
                     self._make_collapsible_section(
-                        title="Profile Selection",
+                        title="Source",
                         section_id="data.coordination.selection",
                         body_widget=selection,
                     )
                 )
 
             if analysis == "density":
-                view = QGroupBox("Density View")
-                view_form = QFormLayout(view)
+                source = QGroupBox("Source")
+                source_form = QFormLayout(source)
+                self._density_source_contract_label = QLabel("")
+                self._density_source_contract_label.setWordWrap(True)
+                self._density_source_dimensions_label = QLabel("")
+                self._density_source_dimensions_label.setWordWrap(True)
+                self._density_source_quantities_label = QLabel("")
+                self._density_source_quantities_label.setWordWrap(True)
+                self._add_form_row(
+                    source_form,
+                    "Contract",
+                    self._density_source_contract_label,
+                    tooltip_id="data.density.source.contract",
+                )
+                self._add_form_row(
+                    source_form,
+                    "Dimensions",
+                    self._density_source_dimensions_label,
+                    tooltip_id="data.density.source.dimensions",
+                )
+                self._add_form_row(
+                    source_form,
+                    "Quantities",
+                    self._density_source_quantities_label,
+                    tooltip_id="data.density.source.quantities",
+                )
+                self._density_target_filter = self._combo(self._density_target_filter_labels())
+                self._density_target_filter.currentTextChanged.connect(
+                    self._handle_density_target_filter_changed
+                )
+                self._add_form_row(
+                    source_form,
+                    "Density target",
+                    self._density_target_filter,
+                    tooltip_id="data.density.target",
+                )
+                source_note = QLabel(
+                    "Density uses the currently loaded source profiles. Mapping controls choose how those source quantities are assigned to x/y roles."
+                )
+                source_note.setWordWrap(True)
+                source_note.setObjectName("sectionNote")
+                source_form.addRow(source_note)
+                layout.addWidget(
+                    self._make_collapsible_section(
+                        title="Source",
+                        section_id="data.density.source",
+                        body_widget=source,
+                    )
+                )
+
+                mapping = QGroupBox("Mapping")
+                mapping_form = QFormLayout(mapping)
+                available_density_view_types = self._profile_filter_options.get("density_view_types")
+                if isinstance(available_density_view_types, list) and available_density_view_types:
+                    density_view_type_labels = tuple(
+                        _DENSITY_VIEW_TYPE_LABEL_BY_ID.get(str(view_type).strip().lower(), "Line 1D")
+                        for view_type in available_density_view_types
+                    )
+                else:
+                    density_view_type_labels = (_DENSITY_VIEW_TYPE_LABEL_BY_ID["line_1d"],)
+                self.density_view_type = self._combo(density_view_type_labels)
+                self.density_view_type.currentTextChanged.connect(self._handle_density_mapping_change)
                 available_modes = self._profile_filter_options.get("available_modes")
                 if isinstance(available_modes, list) and available_modes:
                     mode_labels: list[str] = []
@@ -7440,31 +7955,170 @@ def launch_plot_settings_panel(
                 else:
                     density_x_mode_labels = _DENSITY_X_MODE_LABELS
                 self.density_x_mode = self._combo(density_x_mode_labels)
-                self.density_x_mode.currentTextChanged.connect(self._schedule_preview_update)
+                self.density_x_mode.currentTextChanged.connect(self._handle_density_mapping_change)
+                heatmap_source_entries = self._profile_filter_options.get("density_heatmap_sources")
+                heatmap_source_labels = (
+                    tuple(str(entry.get("label") or "") for entry in heatmap_source_entries)
+                    if isinstance(heatmap_source_entries, list) and heatmap_source_entries
+                    else ("No heatmap source available",)
+                )
+                self.density_heatmap_source = self._combo(heatmap_source_labels)
+                self.density_heatmap_source.currentTextChanged.connect(self._handle_density_mapping_change)
                 self.density_quantity = self._combo(("mass", "number"))
-                self.density_quantity.currentTextChanged.connect(self._schedule_preview_update)
+                self.density_quantity.currentTextChanged.connect(self._handle_density_mapping_change)
                 self._add_form_row(
-                    view_form,
-                    "X values",
+                    mapping_form,
+                    "View type",
+                    self.density_view_type,
+                    tooltip_id="data.density.summary.mapping",
+                )
+                self._add_form_row(
+                    mapping_form,
+                    "X quantity",
                     self.density_x_mode,
                     tooltip_id="data.density.x_values",
                 )
                 self._add_form_row(
-                    view_form,
-                    "Quantity",
+                    mapping_form,
+                    "Plane / source",
+                    self.density_heatmap_source,
+                    tooltip_id="data.density.source.quantities",
+                )
+                self._add_form_row(
+                    mapping_form,
+                    "Y / Z quantity",
                     self.density_quantity,
                     tooltip_id="data.density.quantity",
                 )
+                density_note = QLabel(
+                    "These controls build one generic density mapping. Line mode uses distance or axis coordinates on x, while heatmap mode uses the selected planar density field as a shared heatmap_2d source."
+                )
+                density_note.setWordWrap(True)
+                density_note.setObjectName("sectionNote")
+                mapping_form.addRow(density_note)
                 layout.addWidget(
                     self._make_collapsible_section(
-                        title="Density View",
+                        title="Mapping",
                         section_id="data.density.view",
-                        body_widget=view,
+                        body_widget=mapping,
+                    )
+                )
+
+                summary = QGroupBox("Summary")
+                summary_form = QFormLayout(summary)
+                self._density_mapping_status_label = QLabel("")
+                self._density_mapping_summary_label = QLabel("")
+                self._density_mapping_summary_label.setWordWrap(True)
+                self._density_backend_summary_label = QLabel("")
+                self._density_backend_summary_label.setWordWrap(True)
+                self._add_form_row(
+                    summary_form,
+                    "Status",
+                    self._density_mapping_status_label,
+                    tooltip_id="data.density.summary.status",
+                )
+                self._add_form_row(
+                    summary_form,
+                    "Mapping",
+                    self._density_mapping_summary_label,
+                    tooltip_id="data.density.summary.mapping",
+                )
+                self._add_form_row(
+                    summary_form,
+                    "Backend",
+                    self._density_backend_summary_label,
+                    tooltip_id="data.density.summary.backend",
+                )
+                layout.addWidget(
+                    self._make_collapsible_section(
+                        title="Summary",
+                        section_id="data.density.summary",
+                        body_widget=summary,
                     )
                 )
 
             if analysis == "potential":
-                summary = QGroupBox("Potential Summary")
+                source = QGroupBox("Source")
+                source_form = QFormLayout(source)
+                self._potential_source_contract_label = QLabel("")
+                self._potential_source_contract_label.setWordWrap(True)
+                self._potential_source_dimensions_label = QLabel("")
+                self._potential_source_dimensions_label.setWordWrap(True)
+                self._potential_source_quantities_label = QLabel("")
+                self._potential_source_quantities_label.setWordWrap(True)
+                self._add_form_row(
+                    source_form,
+                    "Contract",
+                    self._potential_source_contract_label,
+                    tooltip_id="data.potential.source.contract",
+                )
+                self._add_form_row(
+                    source_form,
+                    "Dimensions",
+                    self._potential_source_dimensions_label,
+                    tooltip_id="data.potential.source.dimensions",
+                )
+                self._add_form_row(
+                    source_form,
+                    "Quantities",
+                    self._potential_source_quantities_label,
+                    tooltip_id="data.potential.source.quantities",
+                )
+                source_note = QLabel(
+                    "Potential plotting uses record-based source data. Mapping controls choose line or table inspection and, for line mode, the plotted quantity."
+                )
+                source_note.setWordWrap(True)
+                source_note.setObjectName("sectionNote")
+                source_form.addRow(source_note)
+                layout.addWidget(
+                    self._make_collapsible_section(
+                        title="Source",
+                        section_id="data.potential.source",
+                        body_widget=source,
+                    )
+                )
+
+                mapping = QGroupBox("Mapping")
+                mapping_form = QFormLayout(mapping)
+                self.potential_view_type = self._combo(
+                    list(_POTENTIAL_VIEW_TYPE_LABEL_BY_ID.values())
+                )
+                self.potential_view_type.currentTextChanged.connect(
+                    self._handle_potential_mapping_change
+                )
+                self.potential_series_mode = self._combo(
+                    list(_POTENTIAL_SERIES_LABEL_BY_ID.values())
+                )
+                self.potential_series_mode.currentTextChanged.connect(
+                    self._handle_potential_mapping_change
+                )
+                self._add_form_row(
+                    mapping_form,
+                    "View type",
+                    self.potential_view_type,
+                    tooltip_id="data.potential.mapping.view_type",
+                )
+                self._add_form_row(
+                    mapping_form,
+                    "Y role",
+                    self.potential_series_mode,
+                    tooltip_id="data.potential.mapping.series",
+                )
+                mapping_note = QLabel(
+                    "Line mode keeps record_id on x and lets you choose the plotted potential quantity on y. Table mode switches to record-wise inspection."
+                )
+                mapping_note.setWordWrap(True)
+                mapping_note.setObjectName("sectionNote")
+                mapping_form.addRow(mapping_note)
+                layout.addWidget(
+                    self._make_collapsible_section(
+                        title="Mapping",
+                        section_id="data.potential.mapping",
+                        body_widget=mapping,
+                    )
+                )
+
+                summary = QGroupBox("Summary")
                 summary_form = QFormLayout(summary)
                 summary_note = QLabel(
                     "Potential HDF5 plots use record id on the x-axis and plot Water bulk, Fermi, and cSHE as fixed series. Missing values remain as gaps."
@@ -7498,191 +8152,213 @@ def launch_plot_settings_panel(
                     self._potential_summary_incomplete_rows_label,
                     tooltip_id="data.potential.incomplete_rows",
                 )
+                self._potential_mapping_status_label = QLabel("")
+                self._potential_mapping_summary_label = QLabel("")
+                self._potential_mapping_summary_label.setWordWrap(True)
+                self._potential_backend_summary_label = QLabel("")
+                self._potential_backend_summary_label.setWordWrap(True)
+                self._add_form_row(
+                    summary_form,
+                    "Status",
+                    self._potential_mapping_status_label,
+                    tooltip_id="data.potential.summary.status",
+                )
+                self._add_form_row(
+                    summary_form,
+                    "Mapping",
+                    self._potential_mapping_summary_label,
+                    tooltip_id="data.potential.summary.mapping",
+                )
+                self._add_form_row(
+                    summary_form,
+                    "Backend",
+                    self._potential_backend_summary_label,
+                    tooltip_id="data.potential.summary.backend",
+                )
                 summary_form.addRow("", summary_note)
                 layout.addWidget(
                     self._make_collapsible_section(
-                        title="Potential Summary",
+                        title="Summary",
                         section_id="data.potential.summary",
                         body_widget=summary,
                     )
                 )
 
             if analysis == "position":
-                view = QGroupBox("Position View")
-                view_form = QFormLayout(view)
-                self.position_component = self._combo(_POSITION_COMPONENT_LABELS)
-                self.position_component.currentTextChanged.connect(
-                    self._handle_series_identity_change
-                )
-                self.position_projection_x = self._combo(_POSITION_PROJECTION_QUANTITIES)
-                self.position_projection_x.currentTextChanged.connect(self._schedule_preview_update)
-                self.position_projection_y = self._combo(_POSITION_PROJECTION_QUANTITIES)
-                self.position_projection_y.currentTextChanged.connect(self._schedule_preview_update)
-                self.position_projection_render_mode = self._combo(
-                    _POSITION_PROJECTION_RENDER_MODES
-                )
-                self.position_projection_render_mode.currentTextChanged.connect(
-                    self._handle_series_identity_change
-                )
-                self.position_projection_render_mode.currentTextChanged.connect(
-                    self._refresh_widget_states
-                )
-                self.position_map_color = self._combo(_POSITION_PROJECTION_QUANTITIES)
-                self.position_map_color.currentTextChanged.connect(self._schedule_preview_update)
-                self.position_projection_filter_min = self._line("")
-                self.position_projection_filter_min.textChanged.connect(
-                    self._schedule_preview_update
-                )
-                self.position_projection_filter_max = self._line("")
-                self.position_projection_filter_max.textChanged.connect(
-                    self._schedule_preview_update
-                )
-                self.position_time_axis = self._combo(("ps", "fs", "step", "frame"))
-                self.position_time_axis.currentTextChanged.connect(self._schedule_preview_update)
-                self._add_form_row(
-                    view_form,
-                    "Component",
-                    self.position_component,
-                    tooltip_id="data.position.component",
-                )
-                self._add_form_row(
-                    view_form,
-                    "X axis",
-                    self.position_projection_x,
-                    tooltip_id="data.position.projection_x",
-                )
-                self._add_form_row(
-                    view_form,
-                    "Y axis",
-                    self.position_projection_y,
-                    tooltip_id="data.position.projection_y",
-                )
-                self._add_form_row(
-                    view_form,
-                    "Render mode",
-                    self.position_projection_render_mode,
-                    tooltip_id="data.position.projection_render_mode",
-                )
-                self._add_form_row(
-                    view_form,
-                    "Color / filter by",
-                    self.position_map_color,
-                    tooltip_id="data.position.color_by",
-                )
-                self._add_form_row(
-                    view_form,
-                    "Range min",
-                    self.position_projection_filter_min,
-                    tooltip_id="data.position.projection_range_min",
-                )
-                self._add_form_row(
-                    view_form,
-                    "Range max",
-                    self.position_projection_filter_max,
-                    tooltip_id="data.position.projection_range_max",
-                )
-                self.position_xy_z_distance_max = self._line("")
-                self.position_xy_z_distance_max.textChanged.connect(self._schedule_preview_update)
-                self._add_form_row(
-                    view_form,
-                    "Max distance to surface (A)",
-                    self.position_xy_z_distance_max,
-                    tooltip_id="data.position.xy_z_distance_max",
-                )
-                self._add_form_row(
-                    view_form,
-                    "Time axis",
-                    self.position_time_axis,
-                    tooltip_id="data.position.time_axis",
-                )
-                self._position_projection_x_row = (view_form, self.position_projection_x)
-                self._position_projection_y_row = (view_form, self.position_projection_y)
-                self._position_projection_render_mode_row = (
-                    view_form,
-                    self.position_projection_render_mode,
-                )
-                self._position_map_color_row = (view_form, self.position_map_color)
-                self._position_projection_filter_min_row = (
-                    view_form,
-                    self.position_projection_filter_min,
-                )
-                self._position_projection_filter_max_row = (
-                    view_form,
-                    self.position_projection_filter_max,
-                )
-                self._position_xy_z_distance_max_row = (
-                    view_form,
-                    self.position_xy_z_distance_max,
-                )
-                self._position_time_axis_row = (view_form, self.position_time_axis)
-                layout.addWidget(
-                    self._make_collapsible_section(
-                        title="Position View",
-                        section_id="data.position.view",
-                        body_widget=view,
-                    )
-                )
+                self._build_position_mapping_sections(layout)
 
             if analysis == "coordination":
-                view = QGroupBox("Coordination View")
+                view = QGroupBox("Mapping")
                 view_form = QFormLayout(view)
                 self.coordination_component = self._combo(("distance", "time", "time-distance"))
-                self.coordination_component.currentTextChanged.connect(
-                    self._handle_series_identity_change
-                )
+                self.coordination_component.currentTextChanged.connect(self._handle_coordination_mapping_change)
                 self.coordination_time_axis = self._combo(("ps", "fs", "step", "frame"))
-                self.coordination_time_axis.currentTextChanged.connect(
-                    self._schedule_preview_update
-                )
+                self.coordination_time_axis.currentTextChanged.connect(self._handle_coordination_mapping_change)
                 self._add_form_row(
                     view_form,
-                    "Component",
+                    "View preset",
                     self.coordination_component,
                     tooltip_id="data.coordination.component",
                 )
                 self._add_form_row(
                     view_form,
-                    "Time axis",
+                    "Time x-role",
                     self.coordination_time_axis,
                     tooltip_id="data.coordination.time_axis",
                 )
                 self._coordination_time_axis_row = (view_form, self.coordination_time_axis)
+                note = QLabel(
+                    "These controls generate one generic coordination mapping: distance profile, coordination-vs-time lines, or a distance-vs-time trajectory."
+                )
+                note.setWordWrap(True)
+                note.setObjectName("sectionNote")
+                view_form.addRow(note)
                 layout.addWidget(
                     self._make_collapsible_section(
-                        title="Coordination View",
+                        title="Mapping",
                         section_id="data.coordination.view",
                         body_widget=view,
                     )
                 )
 
+                summary = QGroupBox("Summary")
+                summary_form = QFormLayout(summary)
+                self._coordination_mapping_status_label = QLabel("")
+                self._coordination_mapping_summary_label = QLabel("")
+                self._coordination_mapping_summary_label.setWordWrap(True)
+                self._coordination_backend_summary_label = QLabel("")
+                self._coordination_backend_summary_label.setWordWrap(True)
+                self._add_form_row(
+                    summary_form,
+                    "Status",
+                    self._coordination_mapping_status_label,
+                    tooltip_id="data.coordination.summary.status",
+                )
+                self._add_form_row(
+                    summary_form,
+                    "Mapping",
+                    self._coordination_mapping_summary_label,
+                    tooltip_id="data.coordination.summary.mapping",
+                )
+                self._add_form_row(
+                    summary_form,
+                    "Backend",
+                    self._coordination_backend_summary_label,
+                    tooltip_id="data.coordination.summary.backend",
+                )
+                layout.addWidget(
+                    self._make_collapsible_section(
+                        title="Summary",
+                        section_id="data.coordination.summary",
+                        body_widget=summary,
+                    )
+                )
+
             if analysis == "orientation":
-                view = QGroupBox("Orientation View")
+                source = QGroupBox("Source")
+                source_form = QFormLayout(source)
+                self._orientation_source_contract_label = QLabel("")
+                self._orientation_source_contract_label.setWordWrap(True)
+                self._orientation_source_dimensions_label = QLabel("")
+                self._orientation_source_dimensions_label.setWordWrap(True)
+                self._orientation_source_quantities_label = QLabel("")
+                self._orientation_source_quantities_label.setWordWrap(True)
+                self._add_form_row(
+                    source_form,
+                    "Contract",
+                    self._orientation_source_contract_label,
+                    tooltip_id="data.orientation.source.contract",
+                )
+                self._add_form_row(
+                    source_form,
+                    "Dimensions",
+                    self._orientation_source_dimensions_label,
+                    tooltip_id="data.orientation.source.dimensions",
+                )
+                self._add_form_row(
+                    source_form,
+                    "Quantities",
+                    self._orientation_source_quantities_label,
+                    tooltip_id="data.orientation.source.quantities",
+                )
+                source_note = QLabel(
+                    "Orientation switches between a line-style contract and a heatmap contract based on the selected mapping mode."
+                )
+                source_note.setWordWrap(True)
+                source_note.setObjectName("sectionNote")
+                source_form.addRow(source_note)
+                layout.addWidget(
+                    self._make_collapsible_section(
+                        title="Source",
+                        section_id="data.orientation.source",
+                        body_widget=source,
+                    )
+                )
+
+                view = QGroupBox("Mapping")
                 view_form = QFormLayout(view)
                 self.orientation_component = self._combo(
                     ("average", "density", "density-weighted", "heatmap")
                 )
-                self.orientation_component.currentTextChanged.connect(
-                    self._handle_series_identity_change
-                )
+                self.orientation_component.currentTextChanged.connect(self._handle_orientation_mapping_change)
                 self.orientation_angle = self._combo(("polar", "azimuthal"))
-                self.orientation_angle.currentTextChanged.connect(self._schedule_preview_update)
+                self.orientation_angle.currentTextChanged.connect(self._handle_orientation_mapping_change)
                 self._add_form_row(
                     view_form,
-                    "Component",
+                    "View preset",
                     self.orientation_component,
                     tooltip_id="data.orientation.component",
                 )
                 self._add_form_row(
                     view_form,
-                    "Angle",
+                    "Angle role",
                     self.orientation_angle,
                     tooltip_id="data.orientation.angle",
                 )
+                note = QLabel(
+                    "These controls generate one generic orientation mapping: line_1d for average and density-style modes, or heatmap_2d for heatmap mode."
+                )
+                note.setWordWrap(True)
+                note.setObjectName("sectionNote")
+                view_form.addRow(note)
                 layout.addWidget(
                     self._make_collapsible_section(
-                        title="Orientation View",
+                        title="Mapping",
                         section_id="data.orientation.view",
                         body_widget=view,
+                    )
+                )
+
+                summary = QGroupBox("Summary")
+                summary_form = QFormLayout(summary)
+                self._orientation_mapping_status_label = QLabel("")
+                self._orientation_mapping_summary_label = QLabel("")
+                self._orientation_mapping_summary_label.setWordWrap(True)
+                self._orientation_backend_summary_label = QLabel("")
+                self._orientation_backend_summary_label.setWordWrap(True)
+                self._add_form_row(
+                    summary_form,
+                    "Status",
+                    self._orientation_mapping_status_label,
+                    tooltip_id="data.orientation.summary.status",
+                )
+                self._add_form_row(
+                    summary_form,
+                    "Mapping",
+                    self._orientation_mapping_summary_label,
+                    tooltip_id="data.orientation.summary.mapping",
+                )
+                self._add_form_row(
+                    summary_form,
+                    "Backend",
+                    self._orientation_backend_summary_label,
+                    tooltip_id="data.orientation.summary.backend",
+                )
+                layout.addWidget(
+                    self._make_collapsible_section(
+                        title="Summary",
+                        section_id="data.orientation.summary",
+                        body_widget=summary,
                     )
                 )
 
@@ -8074,6 +8750,7 @@ def launch_plot_settings_panel(
                 self._series_syncing = False
 
             self._update_normalization_warning()
+            self._update_rdf_source_summary()
 
         def _series_display_text(self, index: int) -> str:
             return _format_series_display_text(
@@ -8382,56 +9059,820 @@ def launch_plot_settings_panel(
                     else "Original data series cannot be deleted here; turn them off instead."
                 )
 
+        def _coerce_settings_view_mapping(self, settings: dict[str, Any]) -> PlotViewMapping | None:
+            raw = settings.get("view_mapping")
+            if isinstance(raw, PlotViewMapping):
+                return raw
+            if isinstance(raw, dict):
+                try:
+                    return deserialize_plot_view_mapping(raw)
+                except ValueError:
+                    return None
+            return None
+
+        def _density_contract(self) -> PlotDataContract:
+            if self._is_density_heatmap_mode():
+                contract = getattr(self, "_density_heatmap_data_contract", None)
+                if isinstance(contract, PlotDataContract):
+                    return contract
+                return _fallback_density_heatmap_plot_data_contract()
+            contract = self._density_data_contract
+            if isinstance(contract, PlotDataContract):
+                return contract
+            return _fallback_density_plot_data_contract()
+
+        def _density_target_filter_labels(self) -> tuple[str, ...]:
+            labels = ["All targets"]
+            seen = {"All targets"}
+            for descriptor in self._series_descriptors_data:
+                target = str(
+                    descriptor.get("density_species")
+                    or descriptor.get("default_label")
+                    or ""
+                ).strip()
+                if not target or target in seen:
+                    continue
+                labels.append(target)
+                seen.add(target)
+            return tuple(labels)
+
+        def _density_target_for_descriptor(self, descriptor: dict[str, Any]) -> str:
+            return str(
+                descriptor.get("density_species")
+                or descriptor.get("default_label")
+                or ""
+            ).strip()
+
+        def _coordination_contract(self) -> PlotDataContract:
+            contract = self._coordination_data_contract
+            if isinstance(contract, PlotDataContract):
+                return contract
+            return _fallback_coordination_plot_data_contract()
+
+        def _orientation_line_contract(self) -> PlotDataContract:
+            contract = self._orientation_line_data_contract
+            if isinstance(contract, PlotDataContract):
+                return contract
+            return _fallback_orientation_line_plot_data_contract()
+
+        def _orientation_heatmap_contract(self) -> PlotDataContract:
+            contract = self._orientation_heatmap_data_contract
+            if isinstance(contract, PlotDataContract):
+                return contract
+            return _fallback_orientation_heatmap_plot_data_contract()
+
+        def _potential_contract(self) -> PlotDataContract:
+            contract = self._potential_data_contract
+            if isinstance(contract, PlotDataContract):
+                return contract
+            return _fallback_potential_plot_data_contract()
+
+        def _current_density_mapping(self) -> PlotViewMapping:
+            view_type = (
+                _DENSITY_VIEW_TYPE_ID_BY_LABEL.get(
+                    self.density_view_type.currentText().strip(),
+                    "line_1d",
+                )
+                if hasattr(self, "density_view_type")
+                else "line_1d"
+            )
+            x_mode = self._selected_density_x_mode() if hasattr(self, "density_x_mode") else "distance"
+            quantity = (
+                self.density_quantity.currentText().strip() or "mass"
+                if hasattr(self, "density_quantity")
+                else "mass"
+            )
+            return density_plot_options_to_view_mapping(
+                view_type=view_type,
+                x_mode=x_mode,
+                quantity=quantity,
+            )
+
+        def _current_coordination_mapping(self) -> PlotViewMapping:
+            view_preset = (
+                self.coordination_component.currentText().strip() or "distance"
+                if hasattr(self, "coordination_component")
+                else "distance"
+            )
+            time_x_role = (
+                self.coordination_time_axis.currentText().strip() or "ps"
+                if hasattr(self, "coordination_time_axis")
+                else "ps"
+            )
+            return coordination_plot_options_to_view_mapping(
+                component=view_preset,
+                time_axis=time_x_role,
+            )
+
+        def _current_orientation_mapping(self) -> PlotViewMapping:
+            view_preset = (
+                self.orientation_component.currentText().strip() or "average"
+                if hasattr(self, "orientation_component")
+                else "average"
+            )
+            angle_role = (
+                self.orientation_angle.currentText().strip() or "polar"
+                if hasattr(self, "orientation_angle")
+                else "polar"
+            )
+            return orientation_plot_options_to_view_mapping(
+                component=view_preset,
+                angle=angle_role,
+            )
+
+        def _current_potential_mapping(self) -> PlotViewMapping:
+            if hasattr(self, "potential_view_type"):
+                view_type_id = _POTENTIAL_VIEW_TYPE_ID_BY_LABEL.get(
+                    self.potential_view_type.currentText().strip(),
+                    "line_1d",
+                )
+                if view_type_id == "table_records":
+                    return potential_plot_options_to_view_mapping(table_view=True)
+                series_token = _POTENTIAL_SERIES_ID_BY_LABEL.get(
+                    self.potential_series_mode.currentText().strip(),
+                    "summary",
+                ) if hasattr(self, "potential_series_mode") else "summary"
+                y_quantity = None if series_token == "summary" else series_token
+                return potential_plot_options_to_view_mapping(y_quantity=y_quantity)
+            return potential_plot_options_to_view_mapping()
+
+        def _is_potential_table_mode(self) -> bool:
+            return str(self._current_potential_mapping().view_type_id).strip().lower() == "table_records"
+
+        def _update_density_contract_summary(self) -> None:
+            if self._analysis_name != "density":
+                return
+            contract = self._density_contract()
+            if hasattr(self, "_density_source_contract_label"):
+                self._density_source_contract_label.setText(
+                    str(contract.label or contract.source_id or "Density data")
+                )
+            if hasattr(self, "_density_source_dimensions_label"):
+                self._density_source_dimensions_label.setText(_contract_dimensions_text(contract))
+            if hasattr(self, "_density_source_quantities_label"):
+                self._density_source_quantities_label.setText(_contract_quantities_text(contract))
+            if not hasattr(self, "_density_mapping_status_label"):
+                return
+            mapping = self._current_density_mapping()
+            compatibility = generic_view_type_compatibility(contract, mapping)
+            self._density_mapping_status_label.setText(_mapping_status_label(compatibility))
+            self._density_mapping_summary_label.setText(_mapping_summary_text(mapping))
+            try:
+                resolved = resolve_density_plot_mapping(
+                    contract=contract,
+                    mapping=mapping,
+                )
+                self._density_backend_summary_label.setText(
+                    _density_backend_summary_text(
+                        view_type_id=resolved.view_type_id,
+                        x_mode=resolved.x_mode,
+                        quantity=resolved.quantity,
+                    )
+                )
+            except ValueError as exc:
+                self._density_backend_summary_label.setText(str(exc))
+
+        def _update_coordination_contract_summary(self) -> None:
+            if self._analysis_name != "coordination":
+                return
+            contract = self._coordination_contract()
+            if hasattr(self, "_coordination_source_contract_label"):
+                self._coordination_source_contract_label.setText(
+                    str(contract.label or contract.source_id or "Coordination data")
+                )
+            if hasattr(self, "_coordination_source_dimensions_label"):
+                self._coordination_source_dimensions_label.setText(_contract_dimensions_text(contract))
+            if hasattr(self, "_coordination_source_quantities_label"):
+                self._coordination_source_quantities_label.setText(_contract_quantities_text(contract))
+            if not hasattr(self, "_coordination_mapping_status_label"):
+                return
+            mapping = self._current_coordination_mapping()
+            compatibility = generic_view_type_compatibility(contract, mapping)
+            self._coordination_mapping_status_label.setText(_mapping_status_label(compatibility))
+            self._coordination_mapping_summary_label.setText(_mapping_summary_text(mapping))
+            try:
+                resolved = resolve_coordination_plot_mapping(
+                    contract=contract,
+                    mapping=mapping,
+                )
+                self._coordination_backend_summary_label.setText(
+                    _coordination_backend_summary_text(
+                        component=resolved.component,
+                        time_axis=resolved.time_axis,
+                    )
+                )
+            except ValueError as exc:
+                self._coordination_backend_summary_label.setText(str(exc))
+
+        def _active_orientation_contract(self) -> PlotDataContract:
+            mapping = self._current_orientation_mapping()
+            if str(mapping.view_type_id).strip().lower() == "heatmap_2d":
+                return self._orientation_heatmap_contract()
+            return self._orientation_line_contract()
+
+        def _update_orientation_contract_summary(self) -> None:
+            if self._analysis_name != "orientation":
+                return
+            contract = self._active_orientation_contract()
+            if hasattr(self, "_orientation_source_contract_label"):
+                self._orientation_source_contract_label.setText(
+                    str(contract.label or contract.source_id or "Orientation data")
+                )
+            if hasattr(self, "_orientation_source_dimensions_label"):
+                self._orientation_source_dimensions_label.setText(_contract_dimensions_text(contract))
+            if hasattr(self, "_orientation_source_quantities_label"):
+                self._orientation_source_quantities_label.setText(_contract_quantities_text(contract))
+            if not hasattr(self, "_orientation_mapping_status_label"):
+                return
+            mapping = self._current_orientation_mapping()
+            compatibility = generic_view_type_compatibility(contract, mapping)
+            self._orientation_mapping_status_label.setText(_mapping_status_label(compatibility))
+            self._orientation_mapping_summary_label.setText(_mapping_summary_text(mapping))
+            try:
+                resolved = resolve_orientation_plot_mapping(
+                    contract=contract,
+                    mapping=mapping,
+                )
+                self._orientation_backend_summary_label.setText(
+                    _orientation_backend_summary_text(
+                        component=resolved.component,
+                        angle=resolved.angle,
+                        is_heatmap=resolved.is_heatmap,
+                    )
+                )
+            except ValueError as exc:
+                self._orientation_backend_summary_label.setText(str(exc))
+
+        def _update_potential_contract_summary(self) -> None:
+            if self._analysis_name != "potential":
+                return
+            contract = self._potential_contract()
+            if hasattr(self, "_potential_source_contract_label"):
+                self._potential_source_contract_label.setText(
+                    str(contract.label or contract.source_id or "Potential data")
+                )
+            if hasattr(self, "_potential_source_dimensions_label"):
+                self._potential_source_dimensions_label.setText(_contract_dimensions_text(contract))
+            if hasattr(self, "_potential_source_quantities_label"):
+                self._potential_source_quantities_label.setText(_contract_quantities_text(contract))
+            if not hasattr(self, "_potential_mapping_status_label"):
+                return
+            mapping = self._current_potential_mapping()
+            compatibility = generic_view_type_compatibility(contract, mapping)
+            self._potential_mapping_status_label.setText(_mapping_status_label(compatibility))
+            self._potential_mapping_summary_label.setText(_mapping_summary_text(mapping))
+            try:
+                resolved = resolve_potential_plot_mapping(
+                    contract=contract,
+                    mapping=mapping,
+                )
+                self._potential_backend_summary_label.setText(
+                    _potential_backend_summary_text(
+                        view_type=resolved.view_type,
+                        y_quantity=resolved.y_quantity,
+                        standard_plot=resolved.standard_plot,
+                    )
+                )
+            except ValueError as exc:
+                self._potential_backend_summary_label.setText(str(exc))
+
+        def _handle_density_mapping_change(self, *_unused: object) -> None:
+            self._update_density_contract_summary()
+            self._refresh_widget_states()
+            self._schedule_preview_update()
+
+        def _handle_density_target_filter_changed(self, *_unused: object) -> None:
+            if self._analysis_name != "density" or self._density_target_filter is None:
+                return
+            selected = self._density_target_filter.currentText().strip()
+            show_all = not selected or selected == "All targets"
+            for index, descriptor in enumerate(self._series_descriptors_data):
+                if index >= len(self._series_enabled_data):
+                    continue
+                if str(descriptor.get("source_kind") or "source").strip().lower() == "group":
+                    continue
+                target = self._density_target_for_descriptor(descriptor)
+                self._series_enabled_data[index] = show_all or target == selected
+            self._refresh_series_list_widgets()
+            self._refresh_widget_states()
+            self._record_history_after_non_text_change()
+            self._schedule_preview_update()
+
+        def _handle_coordination_mapping_change(self, *_unused: object) -> None:
+            self._update_coordination_contract_summary()
+            self._handle_series_identity_change()
+
+        def _handle_orientation_mapping_change(self, *_unused: object) -> None:
+            self._update_orientation_contract_summary()
+            self._handle_series_identity_change()
+
+        def _handle_potential_mapping_change(self, *_unused: object) -> None:
+            self._update_potential_contract_summary()
+            self._refresh_widget_states()
+            self._schedule_preview_update()
+
+        def _position_contract(self) -> PlotDataContract:
+            contract = self._position_data_contract
+            if isinstance(contract, PlotDataContract):
+                return contract
+            return _fallback_position_plot_data_contract()
+
+        def _position_supported_view_type_ids(self) -> list[str]:
+            available = {
+                str(view_type.id).strip()
+                for view_type in self._position_contract().view_types
+                if str(view_type.id).strip()
+            }
+            ordered = [
+                view_type_id
+                for view_type_id in ("line_1d", "trajectory_2d")
+                if not available or view_type_id in available
+            ]
+            return ordered or ["line_1d"]
+
+        def _position_mapping_candidate_quantity_ids(
+            self,
+            *,
+            view_type_id: str,
+            role: str,
+        ) -> list[str]:
+            if view_type_id == "line_1d":
+                backend_supported = (
+                    {"time_ps", "time_fs", "step", "frame_index"}
+                    if role == "x"
+                    else {"distance_to_surface", "x", "y", "z"}
+                    if role == "y"
+                    else set()
+                )
+            elif view_type_id == "trajectory_2d":
+                backend_supported = set(_POSITION_GUI_TOKEN_BY_QUANTITY_ID)
+            else:
+                backend_supported = set()
+            candidates: list[str] = []
+            contract = self._position_contract()
+            for quantity in contract.quantities:
+                quantity_id = str(quantity.id).strip()
+                if quantity_id not in backend_supported:
+                    continue
+                status = visual_role_compatibility(
+                    contract,
+                    view_type_id=view_type_id,
+                    role=role,
+                    quantity_id=quantity_id,
+                )
+                if status == "invalid":
+                    continue
+                candidates.append(quantity_id)
+            return candidates
+
+        def _position_view_type_id(self) -> str:
+            if hasattr(self, "position_view_type"):
+                return _POSITION_GUI_VIEW_TYPE_ID_BY_LABEL.get(
+                    self.position_view_type.currentText().strip(),
+                    "line_1d",
+                )
+            return "line_1d"
+
+        def _current_position_mapping(
+            self,
+            *,
+            strict: bool = False,
+        ) -> PlotViewMapping:
+            def _parse_optional_bound(text: str, *, field_name: str) -> float | None:
+                if strict:
+                    return _optional_float(text, field_name=field_name)
+                stripped = str(text).strip()
+                if not stripped:
+                    return None
+                try:
+                    return float(stripped)
+                except ValueError:
+                    return None
+
+            if hasattr(self, "position_view_type"):
+                view_type_id = self._position_view_type_id()
+                if view_type_id == "line_1d":
+                    x_token = self.position_mapping_x.currentText().strip() or "ps"
+                    y_token = self.position_mapping_y.currentText().strip() or "distance"
+                    return PlotViewMapping(
+                        view_type_id="line_1d",
+                        x=_position_quantity_id_from_token(x_token),
+                        y=_position_quantity_id_from_token(y_token),
+                        split_by="atom",
+                    )
+                value_token = self.position_mapping_value.currentText().strip() or "distance"
+                filter_min = _parse_optional_bound(
+                    self.position_mapping_filter_min.text(),
+                    field_name="projection range minimum",
+                )
+                filter_max = _parse_optional_bound(
+                    self.position_mapping_filter_max.text(),
+                    field_name="projection range maximum",
+                )
+                render_mode = (
+                    self.position_mapping_render_mode.currentText().strip() or "color-scale"
+                )
+                value_id = _position_quantity_id_from_token(value_token)
+                return PlotViewMapping(
+                    view_type_id="trajectory_2d",
+                    x=_position_quantity_id_from_token(
+                        self.position_mapping_x.currentText().strip() or "x"
+                    ),
+                    y=_position_quantity_id_from_token(
+                        self.position_mapping_y.currentText().strip() or "y"
+                    ),
+                    color=value_id if render_mode == "color-scale" else None,
+                    split_by="atom",
+                    filter_by=value_id if filter_min is not None or filter_max is not None else None,
+                    filter_min=filter_min,
+                    filter_max=filter_max,
+                    fixed_values={"projection_render_mode": render_mode},
+                )
+            return position_plot_options_to_view_mapping(component="distance", time_axis="ps")
+
+        def _current_position_is_projection_view(self) -> bool:
+            return self._position_view_type_id() == "trajectory_2d"
+
+        def _set_position_mapping_combo_items(
+            self,
+            mapping: PlotViewMapping | None = None,
+        ) -> None:
+            if not hasattr(self, "position_mapping_x"):
+                return
+            active_mapping = mapping or self._current_position_mapping()
+            view_type_id = str(active_mapping.view_type_id).strip() or "line_1d"
+            self._set_combo_items(
+                self.position_mapping_x,
+                [
+                    _position_quantity_token(quantity_id)
+                    for quantity_id in self._position_mapping_candidate_quantity_ids(
+                        view_type_id=view_type_id,
+                        role="x",
+                    )
+                ],
+                preferred_value=_position_quantity_token(active_mapping.x or "time_ps"),
+            )
+            self._set_combo_items(
+                self.position_mapping_y,
+                [
+                    _position_quantity_token(quantity_id)
+                    for quantity_id in self._position_mapping_candidate_quantity_ids(
+                        view_type_id=view_type_id,
+                        role="y",
+                    )
+                ],
+                preferred_value=_position_quantity_token(active_mapping.y or "distance_to_surface"),
+            )
+            if hasattr(self, "position_mapping_value"):
+                value_quantity = active_mapping.color or active_mapping.filter_by or "distance_to_surface"
+                self._set_combo_items(
+                    self.position_mapping_value,
+                    [
+                        _position_quantity_token(quantity_id)
+                        for quantity_id in self._position_mapping_candidate_quantity_ids(
+                            view_type_id=view_type_id,
+                            role="color",
+                        )
+                    ],
+                    preferred_value=_position_quantity_token(value_quantity),
+                )
+
+        def _set_position_preset_label(self, label: str) -> None:
+            if not hasattr(self, "position_mapping_preset"):
+                return
+            self.position_mapping_preset.blockSignals(True)
+            try:
+                self._set_combo_value(self.position_mapping_preset, label)
+            finally:
+                self.position_mapping_preset.blockSignals(False)
+
+        def _apply_position_mapping_controls(self, mapping: PlotViewMapping) -> None:
+            if not hasattr(self, "position_view_type"):
+                return
+            self._set_combo_value(
+                self.position_view_type,
+                _POSITION_GUI_VIEW_TYPE_LABEL_BY_ID.get(mapping.view_type_id, "Line 1D"),
+            )
+            self._set_position_mapping_combo_items(mapping)
+            if hasattr(self, "position_mapping_render_mode"):
+                self._set_combo_value(
+                    self.position_mapping_render_mode,
+                    str(mapping.fixed_values.get("projection_render_mode") or "color-scale"),
+                )
+            if hasattr(self, "position_mapping_filter_min"):
+                self.position_mapping_filter_min.setText(
+                    "" if mapping.filter_min is None else str(mapping.filter_min)
+                )
+            if hasattr(self, "position_mapping_filter_max"):
+                self.position_mapping_filter_max.setText(
+                    "" if mapping.filter_max is None else str(mapping.filter_max)
+                )
+            self._update_position_contract_summary()
+
+        def _handle_position_mapping_preset(self, *_unused: object) -> None:
+            preset_id = _POSITION_GUI_PRESET_ID_BY_LABEL.get(
+                self.position_mapping_preset.currentText().strip()
+            )
+            if preset_id is None:
+                return
+            self._apply_position_mapping_controls(position_mapping_preset(preset_id))
+            self._handle_series_identity_change()
+
+        def _handle_position_mapping_view_change(self, *_unused: object) -> None:
+            self._set_position_preset_label("Custom")
+            self._set_position_mapping_combo_items()
+            self._update_position_contract_summary()
+            self._handle_series_identity_change()
+
+        def _handle_position_mapping_preview_change(self, *_unused: object) -> None:
+            self._set_position_preset_label("Custom")
+            self._update_position_contract_summary()
+            self._schedule_preview_update()
+
+        def _build_position_mapping_sections(self, layout: QVBoxLayout) -> None:
+            mapping_group = QGroupBox("Mapping")
+            mapping_form = QFormLayout(mapping_group)
+            self.position_mapping_preset = self._combo(
+                ["Custom", *list(_POSITION_GUI_PRESET_LABEL_BY_ID.values())]
+            )
+            self.position_mapping_preset.currentTextChanged.connect(
+                self._handle_position_mapping_preset
+            )
+            self.position_view_type = self._combo(
+                [
+                    _POSITION_GUI_VIEW_TYPE_LABEL_BY_ID[view_type_id]
+                    for view_type_id in self._position_supported_view_type_ids()
+                ]
+            )
+            self.position_view_type.currentTextChanged.connect(
+                self._handle_position_mapping_view_change
+            )
+            self.position_mapping_x = self._combo(["ps", "fs", "step", "frame"])
+            self.position_mapping_x.currentTextChanged.connect(
+                self._handle_position_mapping_preview_change
+            )
+            self.position_mapping_y = self._combo(["distance", "x", "y", "z"])
+            self.position_mapping_y.currentTextChanged.connect(
+                self._handle_position_mapping_preview_change
+            )
+            self.position_mapping_render_mode = self._combo(_POSITION_PROJECTION_RENDER_MODES)
+            self.position_mapping_render_mode.currentTextChanged.connect(
+                lambda *_unused: self._set_position_preset_label("Custom")
+            )
+            self.position_mapping_render_mode.currentTextChanged.connect(
+                lambda *_unused: self._update_position_contract_summary()
+            )
+            self.position_mapping_render_mode.currentTextChanged.connect(
+                self._handle_series_identity_change
+            )
+            self.position_mapping_value = self._combo(list(_POSITION_PROJECTION_QUANTITIES))
+            self.position_mapping_value.currentTextChanged.connect(
+                self._handle_position_mapping_preview_change
+            )
+            self.position_mapping_filter_min = self._line("")
+            self.position_mapping_filter_min.textChanged.connect(
+                self._handle_position_mapping_preview_change
+            )
+            self.position_mapping_filter_max = self._line("")
+            self.position_mapping_filter_max.textChanged.connect(
+                self._handle_position_mapping_preview_change
+            )
+            self.position_mapping_split_by = QLabel("atom")
+            self._add_form_row(
+                mapping_form,
+                "Preset",
+                self.position_mapping_preset,
+                tooltip_id="data.position.mapping.preset",
+            )
+            self._add_form_row(
+                mapping_form,
+                "View type",
+                self.position_view_type,
+                tooltip_id="data.position.mapping.view_type",
+            )
+            self._add_form_row(
+                mapping_form,
+                "X",
+                self.position_mapping_x,
+                tooltip_id="data.position.mapping.x",
+            )
+            self._add_form_row(
+                mapping_form,
+                "Y",
+                self.position_mapping_y,
+                tooltip_id="data.position.mapping.y",
+            )
+            self._add_form_row(
+                mapping_form,
+                "Render mode",
+                self.position_mapping_render_mode,
+                tooltip_id="data.position.projection_render_mode",
+            )
+            self._add_form_row(
+                mapping_form,
+                "Value / color / filter by",
+                self.position_mapping_value,
+                tooltip_id="data.position.mapping.value",
+            )
+            self._add_form_row(
+                mapping_form,
+                "Split by",
+                self.position_mapping_split_by,
+                tooltip_id="data.position.mapping.split_by",
+            )
+            self._add_form_row(
+                mapping_form,
+                "Range min",
+                self.position_mapping_filter_min,
+                tooltip_id="data.position.projection_range_min",
+            )
+            self._add_form_row(
+                mapping_form,
+                "Range max",
+                self.position_mapping_filter_max,
+                tooltip_id="data.position.projection_range_max",
+            )
+            self._position_mapping_x_row = (mapping_form, self.position_mapping_x)
+            self._position_mapping_y_row = (mapping_form, self.position_mapping_y)
+            self._position_mapping_render_mode_row = (
+                mapping_form,
+                self.position_mapping_render_mode,
+            )
+            self._position_mapping_value_row = (mapping_form, self.position_mapping_value)
+            self._position_mapping_split_by_row = (mapping_form, self.position_mapping_split_by)
+            self._position_mapping_filter_min_row = (
+                mapping_form,
+                self.position_mapping_filter_min,
+            )
+            self._position_mapping_filter_max_row = (
+                mapping_form,
+                self.position_mapping_filter_max,
+            )
+            layout.addWidget(
+                self._make_collapsible_section(
+                    title="Mapping",
+                    section_id="data.position.mapping",
+                    body_widget=mapping_group,
+                )
+            )
+
+            summary_group = QGroupBox("Summary")
+            summary_form = QFormLayout(summary_group)
+            self._position_mapping_status_label = QLabel("")
+            self._position_mapping_status_label.setWordWrap(True)
+            self._position_mapping_summary_label = QLabel("")
+            self._position_mapping_summary_label.setWordWrap(True)
+            self._position_backend_summary_label = QLabel("")
+            self._position_backend_summary_label.setWordWrap(True)
+            self._add_form_row(
+                summary_form,
+                "Status",
+                self._position_mapping_status_label,
+                tooltip_id="data.position.summary.status",
+            )
+            self._add_form_row(
+                summary_form,
+                "Mapping",
+                self._position_mapping_summary_label,
+                tooltip_id="data.position.summary.mapping",
+            )
+            self._add_form_row(
+                summary_form,
+                "Backend",
+                self._position_backend_summary_label,
+                tooltip_id="data.position.summary.backend",
+            )
+            layout.addWidget(
+                self._make_collapsible_section(
+                    title="Summary",
+                    section_id="data.position.summary",
+                    body_widget=summary_group,
+                )
+            )
+
+            previous_suspend = self._suspend_preview_events
+            self._suspend_preview_events = True
+            try:
+                self._apply_position_mapping_controls(position_mapping_preset("distance_vs_time"))
+                self._set_position_preset_label("Custom")
+            finally:
+                self._suspend_preview_events = previous_suspend
+
+        def _update_position_contract_summary(self) -> None:
+            if self._analysis_name != "position":
+                return
+            contract = self._position_contract()
+            if hasattr(self, "_position_source_contract_label"):
+                self._position_source_contract_label.setText(
+                    str(contract.label or contract.source_id or "Position data")
+                )
+            if hasattr(self, "_position_source_dimensions_label"):
+                dimension_tokens: list[str] = []
+                for dimension in contract.dimensions:
+                    token = str(dimension.id)
+                    if dimension.length is not None:
+                        token = f"{token}={dimension.length}"
+                    dimension_tokens.append(token)
+                self._position_source_dimensions_label.setText(", ".join(dimension_tokens))
+            if hasattr(self, "_position_source_quantities_label"):
+                self._position_source_quantities_label.setText(
+                    ", ".join(
+                        _position_quantity_token(quantity.id)
+                        if quantity.id in _POSITION_GUI_TOKEN_BY_QUANTITY_ID
+                        else str(quantity.id)
+                        for quantity in contract.quantities
+                    )
+                )
+            if not hasattr(self, "_position_mapping_status_label"):
+                return
+            mapping = self._current_position_mapping()
+            compatibility = generic_view_type_compatibility(contract, mapping)
+            self._position_mapping_status_label.setText(
+                _mapping_status_label(compatibility)
+            )
+            role_parts = [
+                f"x={_position_quantity_token(mapping.x)}",
+                f"y={_position_quantity_token(mapping.y)}",
+            ]
+            if mapping.color is not None:
+                role_parts.append(f"color={_position_quantity_token(mapping.color)}")
+            if mapping.filter_by is not None:
+                filter_text = f"filter={_position_quantity_token(mapping.filter_by)}"
+                if mapping.filter_min is not None or mapping.filter_max is not None:
+                    filter_text += (
+                        f" [{'' if mapping.filter_min is None else mapping.filter_min}, "
+                        f"{'' if mapping.filter_max is None else mapping.filter_max}]"
+                    )
+                role_parts.append(filter_text)
+            role_parts.append(f"split_by={mapping.split_by or 'atom'}")
+            self._position_mapping_summary_label.setText(
+                f"{mapping.view_type_id}: " + ", ".join(role_parts)
+            )
+            try:
+                legacy = position_view_mapping_to_plot_options(mapping)
+                backend_parts = [f"component={legacy.get('component')}"]
+                if legacy.get("component") == "2d-projection":
+                    backend_parts.extend(
+                        [
+                            f"projection_x={legacy.get('projection_x')}",
+                            f"projection_y={legacy.get('projection_y')}",
+                            f"projection_value={legacy.get('projection_value')}",
+                            f"render_mode={legacy.get('projection_render_mode')}",
+                        ]
+                    )
+                else:
+                    backend_parts.append(f"time_axis={legacy.get('time_axis')}")
+                self._position_backend_summary_label.setText(", ".join(backend_parts))
+            except ValueError as exc:
+                self._position_backend_summary_label.setText(str(exc))
+
         def _fit_supported_for_current_view(self) -> bool:
             analysis = self._analysis_name
-            if analysis in {"density", "msd", "rdf", "potential"}:
+            if analysis in {"density", "msd", "rdf"}:
                 return True
+            if analysis == "potential":
+                return not self._is_potential_table_mode()
             if analysis == "position":
-                component = (
-                    self.position_component.currentText().strip().lower()
-                    if hasattr(self, "position_component")
-                    else "distance"
-                )
-                return not _is_position_projection_component(component)
+                return not self._current_position_is_projection_view()
             if analysis == "coordination":
-                component = (
-                    self.coordination_component.currentText().strip().lower()
-                    if hasattr(self, "coordination_component")
-                    else "distance"
-                )
-                return component != "time-distance"
+                return str(self._current_coordination_mapping().view_type_id).strip().lower() == "line_1d"
+            if analysis == "orientation":
+                return not self._is_orientation_heatmap_mode()
             return False
 
         def _error_supported_for_current_view(self) -> bool:
+            analysis = str(self._analysis_name or "")
+            if analysis == "potential":
+                return not self._is_potential_table_mode()
+            if analysis == "coordination":
+                return (
+                    str(self._current_coordination_mapping().view_type_id).strip().lower()
+                    == "line_1d"
+                )
+            if analysis == "orientation":
+                return not self._is_orientation_heatmap_mode()
+            if analysis == "position":
+                return not self._current_position_is_projection_view()
             return _error_supported_for_view(
-                str(self._analysis_name or ""),
+                analysis,
                 orientation_heatmap=self._is_orientation_heatmap_mode(),
-                position_component=(
-                    self.position_component.currentText().strip().lower()
-                    if hasattr(self, "position_component")
-                    else "distance"
-                ),
-                coordination_component=(
-                    self.coordination_component.currentText().strip().lower()
-                    if hasattr(self, "coordination_component")
-                    else "distance"
-                ),
             )
 
         def _current_plot_family(self) -> str:
+            analysis = str(self._analysis_name or "")
+            if analysis == "potential" and self._is_potential_table_mode():
+                return "table"
+            if analysis == "coordination":
+                mapping = self._current_coordination_mapping()
+                if str(mapping.view_type_id).strip().lower() == "trajectory_2d":
+                    return "time-distance"
+            if analysis == "orientation" and self._is_orientation_heatmap_mode():
+                return "heatmap"
+            if analysis == "position" and self._current_position_is_projection_view():
+                return "projection2d"
             return _plot_family_for_view(
-                str(self._analysis_name or ""),
+                analysis,
                 orientation_heatmap=self._is_orientation_heatmap_mode(),
-                position_component=(
-                    self.position_component.currentText().strip().lower()
-                    if hasattr(self, "position_component")
-                    else "distance"
-                ),
-                coordination_component=(
-                    self.coordination_component.currentText().strip().lower()
-                    if hasattr(self, "coordination_component")
-                    else "distance"
-                ),
             )
 
         def _current_layer_kind(self) -> str:
@@ -9306,6 +10747,94 @@ def launch_plot_settings_panel(
                             ]
                         )
                     )
+            self._update_binning_helper_summary(index)
+
+        def _update_binning_helper_summary(self, index: int) -> None:
+            if self._binning_helper_label is None:
+                return
+            if not hasattr(self, "x_bin_width") or not hasattr(self, "min_bin_points"):
+                self._binning_helper_label.hide()
+                self._binning_helper_label.setText("")
+                return
+
+            if index < 0 or index >= len(self._series_labels_data):
+                self._binning_helper_label.setText(
+                    "Refresh preview to inspect source bin size, requested display bin size, "
+                    "and bin occupancy for the current layer."
+                )
+                self._binning_helper_label.show()
+                return
+
+            descriptor = self._series_descriptor(index)
+            series_id = str(descriptor.get("series_id") or "")
+            point_counts_map = self._last_preview_state.get("series_point_counts")
+            source_widths_map = self._last_preview_state.get("series_source_bin_widths")
+            masked_map = self._last_preview_state.get("series_masked_bin_counts")
+
+            point_counts_raw = (
+                point_counts_map.get(series_id) if isinstance(point_counts_map, dict) else None
+            )
+            point_counts = (
+                np.asarray(point_counts_raw, dtype=float)
+                if isinstance(point_counts_raw, list) and point_counts_raw
+                else np.empty(0, dtype=float)
+            )
+            source_width_raw = (
+                source_widths_map.get(series_id) if isinstance(source_widths_map, dict) else None
+            )
+            source_width = (
+                float(source_width_raw)
+                if source_width_raw is not None and np.isfinite(source_width_raw)
+                else None
+            )
+            masked_count = masked_map.get(series_id) if isinstance(masked_map, dict) else None
+            min_points_text = self.min_bin_points.text().strip()
+            requested_width_text = self.x_bin_width.text().strip()
+            requested_width: float | None = None
+            if requested_width_text:
+                try:
+                    requested_width = float(requested_width_text)
+                except ValueError:
+                    requested_width = None
+
+            lines: list[str] = []
+            if source_width is not None:
+                lines.append(f"Source bin size: {_format_float_value(source_width)}")
+
+            if requested_width_text:
+                lines.append(f"Requested display bin size: {requested_width_text}")
+                if source_width is not None and requested_width is not None:
+                    status = (
+                        "valid"
+                        if requested_width >= source_width
+                        else "smaller than source bin size"
+                    )
+                    lines.append(f"Requested bin size status: {status}")
+            elif source_width is not None:
+                lines.append("Requested display bin size: source bin size")
+
+            if point_counts.size > 0:
+                lines.append(f"Visible bins: {int(point_counts.size)}")
+                lines.append(
+                    "Points per visible bin: "
+                    f"avg {_format_float_value(float(np.mean(point_counts)))}, "
+                    f"median {_format_float_value(float(np.median(point_counts)))}"
+                )
+            if masked_count is not None:
+                if min_points_text:
+                    lines.append(
+                        f"Masked bins at threshold {min_points_text}: {int(masked_count)}"
+                    )
+                else:
+                    lines.append(f"Masked bins: {int(masked_count)}")
+
+            if not lines:
+                lines.append(
+                    "Refresh preview to inspect source bin size, requested display bin size, "
+                    "and bin occupancy for the current layer."
+                )
+            self._binning_helper_label.setText("\n".join(lines))
+            self._binning_helper_label.show()
 
         def _refresh_series_list_widgets(self) -> None:
             if not hasattr(self, "series_list") or self.series_list is None:
@@ -9562,27 +11091,16 @@ def launch_plot_settings_panel(
             self._schedule_preview_update()
 
         def _build_binning_section(self, layout: QVBoxLayout) -> None:
-            binning_title = (
-                "Time Sectioning (plot-only)"
-                if self._analysis_name == "position"
-                else (
-                    "Distance / Time Binning (plot-only)"
-                    if self._analysis_name == "coordination"
-                    else "X Rebinning / Sectioning (plot-only)"
-                )
-            )
+            binning_title = "Display Binning / Sectioning"
             binning = QGroupBox(binning_title)
             self._data_transform_group = binning
             binning_form = QFormLayout(binning)
             self.x_bin_width = self._line("Leave blank to use the data width")
             self.x_bin_width.textChanged.connect(self._refresh_widget_states)
             self.x_bin_reducer = self._combo(_BIN_REDUCERS)
-            width_label = (
-                "Time section width" if self._analysis_name == "position" else "Section width"
-            )
             self._add_form_row(
                 binning_form,
-                width_label,
+                "X bin size",
                 self.x_bin_width,
                 tooltip_id="data.section.width",
             )
@@ -9602,14 +11120,18 @@ def launch_plot_settings_panel(
                 tooltip_id="data.section.min_points",
             )
             self._min_bin_points_row = (binning_form, self.min_bin_points)
+            self._binning_helper_label = QLabel("")
+            self._binning_helper_label.setObjectName("sectionNote")
+            self._binning_helper_label.setWordWrap(True)
+            binning_form.addRow(self._binning_helper_label)
 
-            if self._analysis_name == "orientation":
+            if self._analysis_name in {"density", "orientation"}:
                 self.y_bin_width = self._line("Leave blank to use the data width")
                 self.y_bin_width.textChanged.connect(self._refresh_widget_states)
                 self.y_bin_reducer = self._combo(_BIN_REDUCERS)
                 self._add_form_row(
                     binning_form,
-                    "Y section width",
+                    "Y bin size",
                     self.y_bin_width,
                     tooltip_id="data.section.y_width",
                 )
@@ -11299,6 +12821,9 @@ def launch_plot_settings_panel(
             mode = self._series_normalization_modes_data[self._series_active_index]
             value = self._series_normalization_values_data[self._series_active_index]
             x_ref = self._series_normalization_x_refs_data[self._series_active_index]
+            if mode == "none":
+                value = ""
+                x_ref = ""
             for index in range(len(self._series_normalization_modes_data)):
                 self._series_normalization_modes_data[index] = mode
                 self._series_normalization_values_data[index] = value
@@ -11786,6 +13311,7 @@ def launch_plot_settings_panel(
                 rmse = summary.get("rmse")
                 fit_point_count = summary.get("fit_point_count")
                 display_point_count = summary.get("display_point_count")
+                characteristic_point = summary.get("characteristic_point")
                 lines = [f"Type: {fit_type}"]
                 if equation:
                     lines.append(f"Equation: {equation}")
@@ -11795,7 +13321,15 @@ def launch_plot_settings_panel(
                             lines.append(f"{key}: {_format_float_value(parameters[key])}")
                 elif isinstance(parameters, dict):
                     for key, value in parameters.items():
-                        lines.append(f"{key}: {_format_float_value(value)}")
+                            lines.append(f"{key}: {_format_float_value(value)}")
+                if isinstance(characteristic_point, dict):
+                    label = str(characteristic_point.get("label") or "Characteristic point").strip()
+                    point_x = characteristic_point.get("x")
+                    point_y = characteristic_point.get("y")
+                    if point_x is not None and point_y is not None:
+                        lines.append(
+                            f"{label}: x={_format_float_value(point_x)}, y={_format_float_value(point_y)}"
+                        )
                 if r_squared is not None:
                     lines.append(f"R^2: {_format_float_value(r_squared)}")
                 if rmse is not None:
@@ -12045,6 +13579,33 @@ def launch_plot_settings_panel(
             self._preview_label.setPixmap(scaled)
             self._preview_label.resize(scaled.size())
 
+        def _preview_transparency_matte_colors(self) -> tuple[QColor, QColor]:
+            if self._theme_mode == "dark":
+                return QColor("#8793a3"), QColor("#aeb7c3")
+            return QColor("#f4f7fb"), QColor("#dce4ee")
+
+        def _preview_display_pixmap(self, pixmap: QPixmap) -> QPixmap:
+            if pixmap.isNull():
+                return pixmap
+            matte_a, matte_b = self._preview_transparency_matte_colors()
+            composed = QPixmap(pixmap.size())
+            painter = QPainter(composed)
+            try:
+                tile_size = 18
+                painter.fillRect(composed.rect(), matte_a)
+                painter.setBrush(QBrush(matte_b))
+                painter.setPen(Qt.PenStyle.NoPen)
+                width = max(1, composed.width())
+                height = max(1, composed.height())
+                for y in range(0, height, tile_size):
+                    for x in range(0, width, tile_size):
+                        if ((x // tile_size) + (y // tile_size)) % 2 == 0:
+                            painter.drawRect(x, y, tile_size, tile_size)
+                painter.drawPixmap(0, 0, pixmap)
+            finally:
+                painter.end()
+            return composed
+
         def _update_embedded_preview(self, *, interactive: bool) -> bool:
             if self._preview_loading:
                 return False
@@ -12089,7 +13650,7 @@ def launch_plot_settings_panel(
                     raise RuntimeError("Could not load rendered preview image.")
                 if pixmap.isNull():
                     raise RuntimeError("Could not load rendered preview image.")
-                self._preview_pixmap = pixmap
+                self._preview_pixmap = self._preview_display_pixmap(pixmap)
                 self._refresh_preview_pixmap()
                 self._preview_error = None
                 if self._preview_status is not None:
@@ -12146,7 +13707,12 @@ def launch_plot_settings_panel(
             finally:
                 widget.blockSignals(False)
 
-        def _profile_filter_display_value(self, value: str | None, *, default_label: str) -> str:
+        def _profile_filter_display_value(
+            self,
+            value: str | None,
+            *,
+            default_label: str = "",
+        ) -> str:
             token = str(value or "").strip()
             return token or default_label
 
@@ -12154,7 +13720,7 @@ def launch_plot_settings_panel(
             self,
             widget: QComboBox,
             *,
-            default_label: str,
+            default_label: str = "",
         ) -> str | None:
             token = widget.currentText().strip()
             return None if token == default_label or token == "" else token
@@ -12177,16 +13743,43 @@ def launch_plot_settings_panel(
             label = self.density_x_mode.currentText().strip().lower()
             return _DENSITY_X_MODE_BY_LABEL.get(label, "distance")
 
+        def _is_density_heatmap_mode(self) -> bool:
+            if self._analysis_name != "density":
+                return False
+            return str(self._current_density_mapping().view_type_id).strip().lower() == "heatmap_2d"
+
+        def _selected_density_heatmap_source(self) -> dict[str, str] | None:
+            entries = self._profile_filter_options.get("density_heatmap_sources")
+            if not isinstance(entries, list) or not entries:
+                return None
+            selected_label = (
+                self.density_heatmap_source.currentText().strip()
+                if hasattr(self, "density_heatmap_source")
+                else ""
+            )
+            for entry in entries:
+                if str(entry.get("label") or "").strip() == selected_label:
+                    return {
+                        "label": str(entry.get("label") or ""),
+                        "species": str(entry.get("species") or ""),
+                        "plane": str(entry.get("plane") or ""),
+                    }
+            first = entries[0]
+            return {
+                "label": str(first.get("label") or ""),
+                "species": str(first.get("species") or ""),
+                "plane": str(first.get("plane") or ""),
+            }
+
         def _rdf_species_b_choices(self, species_a: str | None) -> list[str]:
             mapping = self._profile_filter_options.get("species_b_by_species_a", {})
             if not isinstance(mapping, dict):
-                return [_PROFILE_FILTER_SPECIES_B_AUTO_LABEL]
+                return []
             key = "" if species_a is None else str(species_a)
             values = mapping.get(key)
             if not isinstance(values, list):
                 values = mapping.get("", [])
-            resolved = [str(value).strip() for value in values if str(value).strip()]
-            return [_PROFILE_FILTER_SPECIES_B_AUTO_LABEL, *resolved]
+            return [str(value).strip() for value in values if str(value).strip()]
 
         def _coordination_species_b_choices(self, species_a: str | None) -> list[str]:
             return self._rdf_species_b_choices(species_a)
@@ -12198,7 +13791,7 @@ def launch_plot_settings_panel(
         ) -> list[str]:
             axes_by_pair = self._profile_filter_options.get("axes_by_species_pair", {})
             if not isinstance(axes_by_pair, dict):
-                return ["", "x", "y", "z"]
+                return ["x", "y", "z"]
             species_a_key = "" if species_a is None else str(species_a)
             species_b_key = "" if species_b is None else str(species_b)
             axis_values: list[str] | None = None
@@ -12217,30 +13810,33 @@ def launch_plot_settings_panel(
                 str(value).strip().lower() for value in (axis_values or []) if str(value).strip()
             ]
             resolved = [value for value in resolved if value in {"x", "y", "z"}]
-            return ["", *resolved] if resolved else ["", "x", "y", "z"]
+            return resolved if resolved else ["x", "y", "z"]
 
-        def _handle_rdf_profile_selection_change(self, *_unused: object) -> None:
-            if not hasattr(self, "rdf_species_a") or not hasattr(self, "rdf_species_b"):
+        def _update_rdf_source_summary(self) -> None:
+            count_label = getattr(self, "_rdf_source_pair_count_label", None)
+            pair_list_label = getattr(self, "_rdf_source_pair_list_label", None)
+            if count_label is None or pair_list_label is None:
                 return
-            species_a = self._selected_profile_filter_value(
-                self.rdf_species_a,
-                default_label=_PROFILE_FILTER_METADATA_LABEL,
-            )
-            current_species_b = self.rdf_species_b.currentText()
-            self._set_combo_items(
-                self.rdf_species_b,
-                self._rdf_species_b_choices(species_a),
-                preferred_value=current_species_b,
-            )
-            self._handle_series_identity_change()
+            pair_labels = [
+                self._effective_series_label(index)
+                for index, descriptor in enumerate(self._series_descriptors_data)
+                if str(descriptor.get("source_kind") or "source").strip().lower() != "group"
+            ]
+            if not pair_labels:
+                count_label.setText("No RDF layers are available.")
+                pair_list_label.setText("No RDF profiles were loaded from the selected source.")
+                return
+            count_label.setText(f"{len(pair_labels)} RDF layer(s)")
+            preview_pairs = pair_labels[:8]
+            rendered = ", ".join(preview_pairs)
+            if len(pair_labels) > len(preview_pairs):
+                rendered = f"{rendered}, +{len(pair_labels) - len(preview_pairs)} more"
+            pair_list_label.setText(rendered)
 
         def _handle_coordination_profile_selection_change(self, *_unused: object) -> None:
             if not hasattr(self, "coord_species_a") or not hasattr(self, "coord_species_b"):
                 return
-            species_a = self._selected_profile_filter_value(
-                self.coord_species_a,
-                default_label=_PROFILE_FILTER_METADATA_LABEL,
-            )
+            species_a = self._selected_profile_filter_value(self.coord_species_a)
             current_species_b = self.coord_species_b.currentText()
             self._set_combo_items(
                 self.coord_species_b,
@@ -12248,10 +13844,7 @@ def launch_plot_settings_panel(
                 preferred_value=current_species_b,
             )
             if hasattr(self, "analysis_axis"):
-                species_b = self._selected_profile_filter_value(
-                    self.coord_species_b,
-                    default_label=_PROFILE_FILTER_SPECIES_B_AUTO_LABEL,
-                )
+                species_b = self._selected_profile_filter_value(self.coord_species_b)
                 current_axis = self.analysis_axis.currentText()
                 self._set_combo_items(
                     self.analysis_axis,
@@ -12551,46 +14144,77 @@ def launch_plot_settings_panel(
                 self.analysis_species.setText(str(settings.get("species") or ""))
             if hasattr(self, "analysis_axis"):
                 self._set_combo_value(self.analysis_axis, str(settings.get("axis") or ""))
+            settings_mapping = self._coerce_settings_view_mapping(settings)
+            if hasattr(self, "density_view_type"):
+                density_view_type_id = (
+                    str(getattr(settings_mapping, "view_type_id", "")).strip().lower()
+                    if settings_mapping is not None
+                    else "line_1d"
+                ) or "line_1d"
+                self._set_combo_value(
+                    self.density_view_type,
+                    _DENSITY_VIEW_TYPE_LABEL_BY_ID.get(
+                        density_view_type_id,
+                        _DENSITY_VIEW_TYPE_LABEL_BY_ID["line_1d"],
+                    ),
+                )
             if hasattr(self, "density_x_mode"):
+                density_options: dict[str, object]
+                if settings_mapping is not None:
+                    try:
+                        density_options = density_view_mapping_to_plot_options(settings_mapping)
+                    except ValueError:
+                        # Compatibility fallback is only used when no
+                        # usable mapping-native state can be restored.
+                        density_options = {
+                            "x_mode": str(settings.get("x_mode") or "distance"),
+                            "quantity": str(settings.get("quantity") or "mass"),
+                        }
+                else:
+                    density_options = {
+                        "x_mode": str(settings.get("x_mode") or "distance"),
+                        "quantity": str(settings.get("quantity") or "mass"),
+                    }
                 self._set_combo_value(
                     self.density_x_mode,
                     self._density_x_mode_display_label(
-                        str(settings.get("x_mode") or "distance"),
+                        str(density_options.get("x_mode") or "distance"),
                         axis=str(settings.get("axis") or ""),
                     ),
+                )
+            if hasattr(self, "density_heatmap_source"):
+                selected_species = str(settings.get("species") or "").strip()
+                selected_plane = str(settings.get("plane") or "").strip().lower()
+                preferred_source_label = ""
+                entries = self._profile_filter_options.get("density_heatmap_sources")
+                if isinstance(entries, list):
+                    for entry in entries:
+                        if (
+                            str(entry.get("species") or "").strip() == selected_species
+                            and str(entry.get("plane") or "").strip().lower() == selected_plane
+                        ):
+                            preferred_source_label = str(entry.get("label") or "")
+                            break
+                self._set_combo_value(
+                    self.density_heatmap_source,
+                    preferred_source_label,
                 )
             if hasattr(self, "density_quantity"):
                 self._set_combo_value(
                     self.density_quantity,
-                    str(settings.get("quantity") or "mass"),
-                )
-            if hasattr(self, "rdf_species_a"):
-                self._set_combo_value(
-                    self.rdf_species_a,
-                    self._profile_filter_display_value(
-                        settings.get("species_a"),
-                        default_label=_PROFILE_FILTER_METADATA_LABEL,
-                    ),
-                )
-            if hasattr(self, "rdf_species_b"):
-                species_a_value = settings.get("species_a")
-                self._set_combo_items(
-                    self.rdf_species_b,
-                    self._rdf_species_b_choices(
-                        None if species_a_value in {None, ""} else str(species_a_value)
-                    ),
-                    preferred_value=self._profile_filter_display_value(
-                        settings.get("species_b"),
-                        default_label=_PROFILE_FILTER_SPECIES_B_AUTO_LABEL,
+                    str(
+                        (
+                            density_options.get("quantity")
+                            if "density_options" in locals()
+                            else settings.get("quantity")
+                        )
+                        or "mass"
                     ),
                 )
             if hasattr(self, "coord_species_a"):
                 self._set_combo_value(
                     self.coord_species_a,
-                    self._profile_filter_display_value(
-                        settings.get("species_a"),
-                        default_label=_PROFILE_FILTER_METADATA_LABEL,
-                    ),
+                    self._profile_filter_display_value(settings.get("species_a")),
                 )
             if hasattr(self, "coord_species_b"):
                 species_a_value = settings.get("species_a")
@@ -12600,10 +14224,7 @@ def launch_plot_settings_panel(
                     self._coordination_species_b_choices(
                         None if species_a_value in {None, ""} else str(species_a_value)
                     ),
-                    preferred_value=self._profile_filter_display_value(
-                        species_b_value,
-                        default_label=_PROFILE_FILTER_SPECIES_B_AUTO_LABEL,
-                    ),
+                    preferred_value=self._profile_filter_display_value(species_b_value),
                 )
                 if hasattr(self, "analysis_axis") and self._analysis_name == "coordination":
                     self._set_combo_items(
@@ -12614,78 +14235,154 @@ def launch_plot_settings_panel(
                         ),
                         preferred_value=str(settings.get("axis") or ""),
                     )
-            if hasattr(self, "position_component"):
-                self._set_combo_value(
-                    self.position_component,
-                    _position_component_display_value(settings.get("component") or "distance"),
-                )
-            projection_value = settings.get("projection_value")
-            if projection_value is None:
-                projection_value = settings.get("map_color") or "distance"
-            projection_filter_max = settings.get("projection_filter_max")
-            if (
-                projection_filter_max is None
-                and str(projection_value).strip().lower() == "distance"
-            ):
-                projection_filter_max = settings.get("xy_z_distance_max")
-            if hasattr(self, "position_projection_x"):
-                self._set_combo_value(
-                    self.position_projection_x,
-                    str(settings.get("projection_x") or "x"),
-                )
-            if hasattr(self, "position_projection_y"):
-                self._set_combo_value(
-                    self.position_projection_y,
-                    str(settings.get("projection_y") or "y"),
-                )
-            if hasattr(self, "position_projection_render_mode"):
-                self._set_combo_value(
-                    self.position_projection_render_mode,
-                    str(settings.get("projection_render_mode") or "color-scale"),
-                )
-            if hasattr(self, "position_map_color"):
-                self._set_combo_value(
-                    self.position_map_color,
-                    str(projection_value or "distance"),
-                )
-            if hasattr(self, "position_projection_filter_min"):
-                raw = settings.get("projection_filter_min")
-                self.position_projection_filter_min.setText(str(raw) if raw is not None else "")
-            if hasattr(self, "position_projection_filter_max"):
-                self.position_projection_filter_max.setText(
-                    str(projection_filter_max) if projection_filter_max is not None else ""
-                )
-            if hasattr(self, "position_xy_z_distance_max"):
-                raw = settings.get("xy_z_distance_max")
-                self.position_xy_z_distance_max.setText(str(raw) if raw is not None else "")
-            if hasattr(self, "position_time_axis"):
-                self._set_combo_value(
-                    self.position_time_axis,
-                    str(settings.get("time_axis") or "ps"),
+            if hasattr(self, "position_view_type"):
+                position_mapping = settings_mapping
+                if position_mapping is None:
+                    # Position still has a broader compatibility restore surface than
+                    # the other migrated analyses, so keep one explicit fallback.
+                    position_mapping = position_plot_options_to_view_mapping(
+                        component=str(settings.get("component") or "distance"),
+                        time_axis=str(settings.get("time_axis") or "ps"),
+                        map_color=str(settings.get("map_color") or "distance"),
+                        projection_x=(
+                            None
+                            if settings.get("projection_x") is None
+                            else str(settings.get("projection_x"))
+                        ),
+                        projection_y=(
+                            None
+                            if settings.get("projection_y") is None
+                            else str(settings.get("projection_y"))
+                        ),
+                        projection_value=(
+                            None
+                            if settings.get("projection_value") is None
+                            else str(settings.get("projection_value"))
+                        ),
+                        projection_render_mode=(
+                            None
+                            if settings.get("projection_render_mode") is None
+                            else str(settings.get("projection_render_mode"))
+                        ),
+                        projection_filter_min=settings.get("projection_filter_min"),
+                        projection_filter_max=settings.get("projection_filter_max"),
+                        xy_z_distance_max=settings.get("xy_z_distance_max"),
+                    )
+                self._apply_position_mapping_controls(
+                    position_mapping
                 )
             if hasattr(self, "coordination_component"):
+                coordination_options: dict[str, object]
+                if settings_mapping is not None:
+                    try:
+                        coordination_options = coordination_view_mapping_to_plot_options(settings_mapping)
+                    except ValueError:
+                        # Compatibility fallback is only used when no
+                        # usable mapping-native state can be restored.
+                        coordination_options = {
+                            "component": str(settings.get("component") or "distance"),
+                            "time_axis": str(settings.get("time_axis") or "ps"),
+                        }
+                else:
+                    coordination_options = {
+                        "component": str(settings.get("component") or "distance"),
+                        "time_axis": str(settings.get("time_axis") or "ps"),
+                    }
                 self._set_combo_value(
                     self.coordination_component,
-                    str(settings.get("component") or "distance"),
+                    str(coordination_options.get("component") or "distance"),
                 )
             if hasattr(self, "coordination_time_axis"):
                 self._set_combo_value(
                     self.coordination_time_axis,
-                    str(settings.get("time_axis") or "ps"),
+                    str(
+                        (
+                            coordination_options.get("time_axis")
+                            if "coordination_options" in locals()
+                            else settings.get("time_axis")
+                        )
+                        or "ps"
+                    ),
                 )
             if hasattr(self, "orientation_component"):
+                orientation_options: dict[str, object]
+                if settings_mapping is not None:
+                    try:
+                        orientation_options = orientation_view_mapping_to_plot_options(settings_mapping)
+                    except ValueError:
+                        # Compatibility fallback is only used when no
+                        # usable mapping-native state can be restored.
+                        orientation_options = {
+                            "component": str(settings.get("component") or "average"),
+                            "angle": str(settings.get("angle") or "polar"),
+                        }
+                else:
+                    orientation_options = {
+                        "component": str(settings.get("component") or "average"),
+                        "angle": str(settings.get("angle") or "polar"),
+                    }
                 self.orientation_component.blockSignals(True)
                 try:
                     self._set_combo_value(
                         self.orientation_component,
-                        str(settings.get("component") or "average"),
+                        str(orientation_options.get("component") or "average"),
                     )
                 finally:
                     self.orientation_component.blockSignals(False)
             if hasattr(self, "orientation_angle"):
                 self._set_combo_value(
                     self.orientation_angle,
-                    str(settings.get("angle") or "polar"),
+                    str(
+                        (
+                            orientation_options.get("angle")
+                            if "orientation_options" in locals()
+                            else settings.get("angle")
+                        )
+                        or "polar"
+                    ),
+                )
+            if hasattr(self, "potential_view_type"):
+                potential_options: dict[str, object]
+                if settings_mapping is not None:
+                    try:
+                        potential_options = potential_view_mapping_to_plot_options(settings_mapping)
+                    except ValueError:
+                        # Compatibility fallback is only used when no
+                        # usable mapping-native state can be restored.
+                        potential_options = {
+                            "view_type": (
+                                "table_records"
+                                if bool(settings.get("table_view"))
+                                else "line_1d"
+                            ),
+                            "y_quantity": settings.get("y_quantity"),
+                        }
+                else:
+                    potential_options = {
+                        "view_type": (
+                            "table_records"
+                            if bool(settings.get("table_view"))
+                            else "line_1d"
+                        ),
+                        "y_quantity": settings.get("y_quantity"),
+                    }
+                self._set_combo_value(
+                    self.potential_view_type,
+                    _POTENTIAL_VIEW_TYPE_LABEL_BY_ID.get(
+                        str(potential_options.get("view_type") or "line_1d"),
+                        _POTENTIAL_VIEW_TYPE_LABEL_BY_ID["line_1d"],
+                    ),
+                )
+                series_token = str(
+                    potential_options.get("y_quantity")
+                    or ("summary" if str(potential_options.get("standard_plot") or "").strip().lower() == "summary" else "summary")
+                )
+                self._set_combo_value(
+                    self.potential_series_mode,
+                    _POTENTIAL_SERIES_LABEL_BY_ID.get(
+                        series_token,
+                        _POTENTIAL_SERIES_LABEL_BY_ID["summary"],
+                    ),
                 )
             if hasattr(self, "heatmap_vmin"):
                 vmin_raw = settings.get("heatmap_vmin")
@@ -12760,6 +14457,10 @@ def launch_plot_settings_panel(
             self._initialize_series_data(settings)
             self._initialize_normalization_data(settings)
             self._update_potential_summary_panel(settings)
+            self._update_density_contract_summary()
+            self._update_coordination_contract_summary()
+            self._update_orientation_contract_summary()
+            self._update_potential_contract_summary()
             self.matplotlib_rc_json.setPlainText(_format_json_block(settings.get("matplotlib_rc")))
             self.figure_kwargs_json.setPlainText(_format_json_block(settings.get("figure_kwargs")))
             self.axes_kwargs_json.setPlainText(_format_json_block(settings.get("axes_kwargs")))
@@ -12780,11 +14481,9 @@ def launch_plot_settings_panel(
             self._apply_preview_state_to_synced_fields(settings)
 
         def _is_orientation_heatmap_mode(self) -> bool:
-            return (
-                self._analysis_name == "orientation"
-                and hasattr(self, "orientation_component")
-                and self.orientation_component.currentText().strip().lower() == "heatmap"
-            )
+            if self._analysis_name != "orientation":
+                return False
+            return str(self._current_orientation_mapping().view_type_id).strip().lower() == "heatmap_2d"
 
         def _refresh_widget_states(self, *_unused: object) -> None:
             if all(
@@ -12835,12 +14534,7 @@ def launch_plot_settings_panel(
             )
             norm_enabled = norm_mode != "none"
             norm_x_ref_enabled = norm_mode == "value_at_x"
-            position_component = (
-                self.position_component.currentText().strip().lower()
-                if hasattr(self, "position_component")
-                else ""
-            )
-            position_xy_projection = _is_position_projection_component(position_component)
+            position_xy_projection = self._current_position_is_projection_view()
             coordination_component = (
                 self.coordination_component.currentText().strip().lower()
                 if hasattr(self, "coordination_component")
@@ -12961,57 +14655,47 @@ def launch_plot_settings_panel(
             if self._figure_heatmap_section is not None:
                 self._figure_heatmap_section.setVisible(figure_caps.show_heatmap)
 
-            if self._position_projection_x_row is not None:
+            if self._position_mapping_x_row is not None:
                 self._set_form_row_visible(
-                    self._position_projection_x_row[0],
-                    self._position_projection_x_row[1],
+                    self._position_mapping_x_row[0],
+                    self._position_mapping_x_row[1],
+                    True,
+                )
+            if self._position_mapping_y_row is not None:
+                self._set_form_row_visible(
+                    self._position_mapping_y_row[0],
+                    self._position_mapping_y_row[1],
+                    True,
+                )
+            if self._position_mapping_render_mode_row is not None:
+                self._set_form_row_visible(
+                    self._position_mapping_render_mode_row[0],
+                    self._position_mapping_render_mode_row[1],
                     position_xy_projection,
                 )
-            if self._position_projection_y_row is not None:
+            if self._position_mapping_value_row is not None:
                 self._set_form_row_visible(
-                    self._position_projection_y_row[0],
-                    self._position_projection_y_row[1],
+                    self._position_mapping_value_row[0],
+                    self._position_mapping_value_row[1],
                     position_xy_projection,
                 )
-            if self._position_projection_render_mode_row is not None:
+            if self._position_mapping_filter_min_row is not None:
                 self._set_form_row_visible(
-                    self._position_projection_render_mode_row[0],
-                    self._position_projection_render_mode_row[1],
+                    self._position_mapping_filter_min_row[0],
+                    self._position_mapping_filter_min_row[1],
                     position_xy_projection,
                 )
-            if self._position_map_color_row is not None:
+            if self._position_mapping_filter_max_row is not None:
                 self._set_form_row_visible(
-                    self._position_map_color_row[0],
-                    self._position_map_color_row[1],
+                    self._position_mapping_filter_max_row[0],
+                    self._position_mapping_filter_max_row[1],
                     position_xy_projection,
                 )
-            if self._position_projection_filter_min_row is not None:
+            if self._position_mapping_split_by_row is not None:
                 self._set_form_row_visible(
-                    self._position_projection_filter_min_row[0],
-                    self._position_projection_filter_min_row[1],
-                    position_xy_projection,
-                )
-            if self._position_projection_filter_max_row is not None:
-                self._set_form_row_visible(
-                    self._position_projection_filter_max_row[0],
-                    self._position_projection_filter_max_row[1],
-                    position_xy_projection,
-                )
-            if getattr(self, "_position_xy_z_distance_max_row", None) is not None:
-                position_xy_z_distance_max_row = self._position_xy_z_distance_max_row
-                assert position_xy_z_distance_max_row is not None
-                self._set_form_row_visible(
-                    position_xy_z_distance_max_row[0],
-                    position_xy_z_distance_max_row[1],
-                    False,
-                )
-            if self._position_time_axis_row is not None:
-                position_time_axis_row = self._position_time_axis_row
-                assert position_time_axis_row is not None
-                self._set_form_row_visible(
-                    position_time_axis_row[0],
-                    position_time_axis_row[1],
-                    not position_xy_projection,
+                    self._position_mapping_split_by_row[0],
+                    self._position_mapping_split_by_row[1],
+                    True,
                 )
             if self._coordination_time_axis_row is not None:
                 coordination_time_axis_row = self._coordination_time_axis_row
@@ -13021,12 +14705,54 @@ def launch_plot_settings_panel(
                     coordination_time_axis_row[1],
                     not coordination_distance,
                 )
+            if hasattr(self, "density_x_mode"):
+                self.density_x_mode.setEnabled(not self._is_density_heatmap_mode())
+                self._apply_widget_tooltip(
+                    self.density_x_mode,
+                    disabled_reason=(
+                        "x-role selection is controlled by the heatmap plane in heatmap mode."
+                        if self._is_density_heatmap_mode()
+                        else None
+                    ),
+                )
+            if hasattr(self, "density_heatmap_source"):
+                self.density_heatmap_source.setEnabled(self._is_density_heatmap_mode())
+                self._apply_widget_tooltip(
+                    self.density_heatmap_source,
+                    disabled_reason=(
+                        None
+                        if self._is_density_heatmap_mode()
+                        else "source field selection is only used in heatmap mode."
+                    ),
+                )
             if self._data_transform_group is not None and self._analysis_name == "position":
                 self._data_transform_group.setVisible(not position_xy_projection)
+            self._update_position_contract_summary()
+            self._update_density_contract_summary()
+            self._update_coordination_contract_summary()
+            self._update_orientation_contract_summary()
+            self._update_potential_contract_summary()
             if self._data_transform_group is not None and self._analysis_name == "coordination":
                 self._data_transform_group.setVisible(not coordination_time_distance)
+            if self._data_transform_group is not None and self._analysis_name == "potential":
+                self._data_transform_group.setVisible(not self._is_potential_table_mode())
+            if hasattr(self, "potential_series_mode"):
+                potential_table_mode = self._is_potential_table_mode()
+                self.potential_series_mode.setEnabled(not potential_table_mode)
+                self._apply_widget_tooltip(
+                    self.potential_series_mode,
+                    disabled_reason=(
+                        "line-series selection is unavailable for table view."
+                        if potential_table_mode
+                        else None
+                    ),
+                )
             # ── orientation heatmap mode ──────────────────────────────
             is_heatmap = self._is_orientation_heatmap_mode()
+            density_heatmap_mode = (
+                self._analysis_name == "density" and self._is_density_heatmap_mode()
+            )
+            two_dimensional_binning = is_heatmap or density_heatmap_mode
             if self._data_transform_group is not None and self._analysis_name == "orientation":
                 self._data_transform_group.setEnabled(True)
                 self._data_transform_group.setToolTip("")
@@ -13034,11 +14760,11 @@ def launch_plot_settings_panel(
                 self._set_form_row_visible(
                     self._y_bin_width_row[0],
                     self._y_bin_width_row[1],
-                    is_heatmap,
+                    two_dimensional_binning,
                 )
             if self._y_bin_reducer_row is not None:
                 y_rebin_enabled = (
-                    is_heatmap
+                    two_dimensional_binning
                     and bool(getattr(self, "y_bin_width", None))
                     and bool(self.y_bin_width.text().strip())
                 )
@@ -13047,12 +14773,12 @@ def launch_plot_settings_panel(
                     self._y_bin_reducer_row[1],
                     y_rebin_enabled,
                 )
-                if is_heatmap:
+                if two_dimensional_binning:
                     self._set_form_row_enabled(
                         self._y_bin_reducer_row[0],
                         self._y_bin_reducer_row[1],
                         y_rebin_enabled,
-                        disabled_reason="set a Y section width first.",
+                        disabled_reason="set a Y bin size first.",
                     )
             if self._normalization_group is not None and self._analysis_name == "orientation":
                 self._normalization_group.setEnabled(not is_heatmap)
@@ -13093,7 +14819,7 @@ def launch_plot_settings_panel(
                     self._x_bin_reducer_row[0],
                     self._x_bin_reducer_row[1],
                     rebin_enabled,
-                    disabled_reason="set a section width first.",
+                    disabled_reason="set an X bin size first.",
                 )
             if self._norm_value_row is not None:
                 self._set_form_row_visible(
@@ -13119,32 +14845,40 @@ def launch_plot_settings_panel(
                     norm_x_ref_enabled,
                     disabled_reason="reference x is only used for value_at_x normalization.",
                 )
+            normalization_actions_visible = layer_caps.show_normalization and not is_heatmap
             for widget in (
                 self._normalization_actions_widget,
                 self._normalization_hint_label,
             ):
                 if widget is not None:
-                    widget.setVisible(norm_enabled)
+                    if normalization_actions_visible == norm_enabled:
+                        widget.setVisible(norm_enabled)
+                    else:
+                        widget.setVisible(normalization_actions_visible)
             if self._normalization_copy_button is not None:
                 normalization_copy_enabled = (
                     layer_caps.show_normalization
                     and not is_heatmap
                     and not self._series_active_is_fit_child
                     and not self._series_active_is_cumulative_child
-                    and norm_enabled
                 )
+                normalization_copy_disabled_reason = None
+                if not layer_caps.show_normalization or is_heatmap:
+                    normalization_copy_disabled_reason = (
+                        "Normalization is unavailable for the current layer."
+                    )
+                elif self._series_active_is_fit_child:
+                    normalization_copy_disabled_reason = (
+                        "Normalization is edited on the base series only."
+                    )
+                elif self._series_active_is_cumulative_child:
+                    normalization_copy_disabled_reason = (
+                        "Normalization is edited on the base series only."
+                    )
                 self._normalization_copy_button.setEnabled(normalization_copy_enabled)
                 self._apply_widget_tooltip(
                     self._normalization_copy_button,
-                    disabled_reason=(
-                        None
-                        if normalization_copy_enabled
-                        else (
-                            "Normalization is unavailable for the current layer."
-                            if not layer_caps.show_normalization or is_heatmap
-                            else "Turn normalization on first."
-                        )
-                    ),
+                    disabled_reason=normalization_copy_disabled_reason,
                 )
             if self._normalization_group is not None and not (
                 self._analysis_name == "orientation" and is_heatmap
@@ -13522,6 +15256,7 @@ def launch_plot_settings_panel(
             # Plot Studio currently serializes one settings payload for
             # preview/save that includes data selection, view mapping,
             # per-series state, and pure style fields together.
+            resolved_view_mapping: PlotViewMapping | None = None
 
             def _synced_text(key: str, widget: QLineEdit) -> str | None:
                 mode = self._synced_field_mode(key)
@@ -14393,100 +16128,91 @@ def launch_plot_settings_panel(
             if hasattr(self, "analysis_axis"):
                 axis_value = self.analysis_axis.currentText().strip().lower()
                 settings["axis"] = None if axis_value == "" else axis_value
-            if hasattr(self, "density_x_mode"):
-                density_x_mode = self._selected_density_x_mode()
-                settings["x_mode"] = density_x_mode
-                if density_x_mode in {"x", "y", "z"}:
-                    settings["axis"] = density_x_mode
-            if hasattr(self, "density_quantity"):
-                settings["quantity"] = self.density_quantity.currentText().strip() or "mass"
-            if hasattr(self, "rdf_species_a"):
-                settings["species_a"] = self._selected_profile_filter_value(
-                    self.rdf_species_a,
-                    default_label=_PROFILE_FILTER_METADATA_LABEL,
-                )
-            if hasattr(self, "rdf_species_b"):
-                settings["species_b"] = self._selected_profile_filter_value(
-                    self.rdf_species_b,
-                    default_label=_PROFILE_FILTER_SPECIES_B_AUTO_LABEL,
-                )
-            if hasattr(self, "coord_species_a"):
-                settings["species_a"] = self._selected_profile_filter_value(
-                    self.coord_species_a,
-                    default_label=_PROFILE_FILTER_METADATA_LABEL,
-                )
-            if hasattr(self, "coord_species_b"):
-                settings["species_b"] = self._selected_profile_filter_value(
-                    self.coord_species_b,
-                    default_label=_PROFILE_FILTER_SPECIES_B_AUTO_LABEL,
-                )
-            if hasattr(self, "position_component"):
-                settings["component"] = _position_component_setting_value(
-                    self.position_component.currentText()
-                )
-            if hasattr(self, "position_projection_x"):
-                settings["projection_x"] = self.position_projection_x.currentText().strip() or "x"
-            if hasattr(self, "position_projection_y"):
-                settings["projection_y"] = self.position_projection_y.currentText().strip() or "y"
-            if hasattr(self, "position_projection_render_mode"):
-                settings["projection_render_mode"] = (
-                    self.position_projection_render_mode.currentText().strip() or "color-scale"
-                )
-            if hasattr(self, "position_map_color"):
-                projection_value = self.position_map_color.currentText().strip() or "distance"
-                settings["projection_value"] = projection_value
-                settings["map_color"] = (
-                    projection_value if projection_value in {"distance", "z"} else "distance"
-                )
-            if hasattr(self, "position_projection_filter_min"):
-                settings["projection_filter_min"] = _optional_float(
-                    self.position_projection_filter_min.text(),
-                    field_name="projection range minimum",
-                )
-            if hasattr(self, "position_projection_filter_max"):
-                settings["projection_filter_max"] = _optional_float(
-                    self.position_projection_filter_max.text(),
-                    field_name="projection range maximum",
-                )
+            if hasattr(self, "density_x_mode") or hasattr(self, "density_quantity"):
+                resolved_view_mapping = self._current_density_mapping()
                 if (
-                    settings["projection_filter_min"] is not None
-                    and settings["projection_filter_max"] is not None
-                    and settings["projection_filter_min"] > settings["projection_filter_max"]
+                    generic_view_type_compatibility(
+                        self._density_contract(),
+                        resolved_view_mapping,
+                    )
+                    == "invalid"
+                ):
+                    raise ValueError(
+                        "The selected density mapping is incompatible with the current plot-data contract."
+                    )
+                if self._is_density_heatmap_mode():
+                    selected_source = self._selected_density_heatmap_source()
+                    settings["species"] = (
+                        None if selected_source is None else (selected_source.get("species") or None)
+                    )
+                    settings["plane"] = (
+                        None if selected_source is None else (selected_source.get("plane") or None)
+                    )
+                    settings["axis"] = None
+                else:
+                    settings["plane"] = None
+            if hasattr(self, "coord_species_a"):
+                settings["species_a"] = self._selected_profile_filter_value(self.coord_species_a)
+            if hasattr(self, "coord_species_b"):
+                settings["species_b"] = self._selected_profile_filter_value(self.coord_species_b)
+            if hasattr(self, "position_view_type"):
+                mapping = self._current_position_mapping(strict=True)
+                if (
+                    mapping.filter_min is not None
+                    and mapping.filter_max is not None
+                    and mapping.filter_min > mapping.filter_max
                 ):
                     raise ValueError(
                         "Projection range minimum must not exceed the projection range maximum."
                     )
-            if hasattr(self, "position_xy_z_distance_max"):
-                settings["xy_z_distance_max"] = _optional_float(
-                    self.position_xy_z_distance_max.text(),
-                    field_name="xy-z distance max",
+                compatibility = generic_view_type_compatibility(
+                    self._position_contract(),
+                    mapping,
                 )
                 if (
-                    settings["xy_z_distance_max"] is not None
-                    and settings["xy_z_distance_max"] <= 0.0
+                    compatibility == "invalid"
                 ):
-                    raise ValueError("xy-z distance max must be positive.")
+                    raise ValueError(
+                        "The selected position mapping is incompatible with the current plot-data contract."
+                    )
+                resolved_view_mapping = mapping
+            if hasattr(self, "coordination_component") or hasattr(self, "coordination_time_axis"):
+                resolved_view_mapping = self._current_coordination_mapping()
                 if (
-                    settings.get("projection_value") == "distance"
-                    and settings.get("projection_filter_min") is None
-                    and settings.get("projection_filter_max") is None
-                    and settings["xy_z_distance_max"] is not None
+                    generic_view_type_compatibility(
+                        self._coordination_contract(),
+                        resolved_view_mapping,
+                    )
+                    == "invalid"
                 ):
-                    settings["projection_filter_max"] = settings["xy_z_distance_max"]
-            if hasattr(self, "position_time_axis"):
-                settings["time_axis"] = self.position_time_axis.currentText().strip() or "ps"
-            if hasattr(self, "coordination_component"):
-                settings["component"] = (
-                    self.coordination_component.currentText().strip() or "distance"
-                )
-            if hasattr(self, "coordination_time_axis"):
-                settings["time_axis"] = self.coordination_time_axis.currentText().strip() or "ps"
-            if hasattr(self, "orientation_component"):
-                settings["component"] = (
-                    self.orientation_component.currentText().strip() or "average"
-                )
-            if hasattr(self, "orientation_angle"):
-                settings["angle"] = self.orientation_angle.currentText().strip() or "polar"
+                    raise ValueError(
+                        "The selected coordination mapping is incompatible with the current plot-data contract."
+                    )
+            if hasattr(self, "orientation_component") or hasattr(self, "orientation_angle"):
+                resolved_view_mapping = self._current_orientation_mapping()
+                if (
+                    generic_view_type_compatibility(
+                        self._active_orientation_contract(),
+                        resolved_view_mapping,
+                    )
+                    == "invalid"
+                ):
+                    raise ValueError(
+                        "The selected orientation mapping is incompatible with the current plot-data contract."
+                    )
+            if hasattr(self, "potential_view_type"):
+                potential_mapping = self._current_potential_mapping()
+                if (
+                    generic_view_type_compatibility(
+                        self._potential_contract(),
+                        potential_mapping,
+                    )
+                    == "invalid"
+                ):
+                    raise ValueError(
+                        "The selected potential mapping is incompatible with the current plot-data contract."
+                    )
+                resolved_view_mapping = potential_mapping
             if hasattr(self, "heatmap_vmin"):
                 settings["heatmap_vmin"] = _optional_float(
                     self.heatmap_vmin.text(), field_name="heatmap vmin"
@@ -14542,6 +16268,8 @@ def launch_plot_settings_panel(
                 settings["heatmap_colorbar_aspect"] = _optional_float(
                     self.heatmap_colorbar_aspect.text(), field_name="colorbar aspect"
                 )
+            if resolved_view_mapping is not None:
+                settings["view_mapping"] = serialize_plot_view_mapping(resolved_view_mapping)
             return settings
 
         def _report_error(self, title_text: str, exc: Exception) -> None:

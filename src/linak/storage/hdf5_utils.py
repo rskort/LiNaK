@@ -154,9 +154,9 @@ def _read_required_linak_header(
         if warning_key not in _WARNED_LINAK_VERSION_MISMATCHES:
             _WARNED_LINAK_VERSION_MISMATCHES.add(warning_key)
             LOGGER.warning(
-                "LiNaK version mismatch (%s → %s) for '%s' [Consider file regeneration]",
-                file_linak_version,
+                "LiNaK version (%s) does not match file version (%s) for '%s' [Consider file regeneration]",
                 __version__,
+                file_linak_version,
                 Path(path_label).name,
             )
 

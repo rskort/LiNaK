@@ -1,6 +1,8 @@
+import colorsys
 import json
 
 import h5py
+import matplotlib.colors as mcolors
 import numpy as np
 import pytest
 from ase import Atoms
@@ -15,6 +17,8 @@ from linak.analysis.position import (
     plot_position_profiles,
     save_position_profile,
 )
+from linak.plot.contracts.position_contract import position_profile_to_plot_data_contract
+from linak.plot.mappings.position_mapping import position_mapping_preset
 
 
 def _surface_test_frames() -> list[Atoms]:
@@ -538,7 +542,7 @@ def test_plot_position_profile_xy_z_distance_cutoff_raises_when_all_filtered():
         )
 
 
-def test_plot_position_profile_2d_projection_line_colors_uses_per_series_colors():
+def test_plot_position_profile_2d_projection_line_colors_uses_same_hue_dark_to_light_ramp():
     profile = compute_position_profile(
         _surface_test_frames(),
         species="O",
@@ -564,7 +568,15 @@ def test_plot_position_profile_2d_projection_line_colors_uses_per_series_colors(
     assert result is None
     ax = captured["axes"]
     assert ax.get_legend() is not None
-    assert [line.get_color() for line in ax.lines] == ["#ff0000", "#00ff00"]
+    assert len(ax.lines) == 2
+    assert len(ax.collections) == 0
+    rendered_colors = [line.get_color() for line in ax.lines]
+    assert rendered_colors[0] != rendered_colors[1]
+    rendered_hls = [colorsys.rgb_to_hls(*mcolors.to_rgb(line.get_color())) for line in ax.lines]
+    assert rendered_hls[0][0] == pytest.approx(rendered_hls[1][0], abs=1.0e-3)
+    assert rendered_hls[0][2] == pytest.approx(rendered_hls[1][2], abs=1.0e-3)
+    assert rendered_hls[0][1] < rendered_hls[1][1]
+    assert all(line.get_marker() in {"", "None", "none", " ", "NoneType"} for line in ax.lines)
 
 
 def test_plot_position_profile_2d_projection_filter_uses_selected_value_quantity():
@@ -601,11 +613,7 @@ def test_plot_position_profile_2d_projection_filter_uses_selected_value_quantity
 
     ax = captured["axes"]
     assert len(ax.lines) == 0
-    assert len(ax.collections) == 1
-    offsets = ax.collections[0].get_offsets()
-    assert offsets.shape[0] == 1
-    assert offsets[0, 0] == pytest.approx(1.0)
-    assert offsets[0, 1] == pytest.approx(1.5)
+    assert len(ax.collections) == 0
 
 
 def test_plot_position_profiles_2d_projection_line_colors_honors_descriptor_overrides():
@@ -650,7 +658,10 @@ def test_plot_position_profiles_2d_projection_line_colors_honors_descriptor_over
 
     ax = captured["axes"]
     assert len(ax.lines) == 1
-    assert ax.lines[0].get_color() == "#ff0000"
+    rendered_hls = colorsys.rgb_to_hls(*mcolors.to_rgb(ax.lines[0].get_color()))
+    expected_hls = colorsys.rgb_to_hls(1.0, 0.0, 0.0)
+    assert rendered_hls[0] == pytest.approx(expected_hls[0], abs=1.0e-3)
+    assert rendered_hls[2] == pytest.approx(expected_hls[2], abs=1.0e-3)
     legend = ax.get_legend()
     assert legend is not None
     assert [text.get_text() for text in legend.get_texts()] == ["Visible atom"]
@@ -683,3 +694,29 @@ def test_plot_position_profile_2d_projection_color_scale_ignores_mismatched_line
         "ignores per-series fixed line colors in color-scale mode" in message
         for message in caplog.messages
     )
+
+
+def test_plot_position_profiles_accepts_contract_driven_trajectory_mapping():
+    profile = compute_position_profile(
+        _surface_test_frames(),
+        species="O",
+        axis="z",
+        timestep_fs=2.0,
+        surface_mode="rough",
+        surface_elements=["Pt"],
+    )
+    captured: dict[str, object] = {}
+
+    result = plot_position_profiles(
+        [profile],
+        show=False,
+        capture_state=captured,
+        data_contract=position_profile_to_plot_data_contract(profile),
+        view_mapping=position_mapping_preset("x_z_trajectory"),
+    )
+
+    assert result is None
+    ax = captured["axes"]
+    assert len(ax.collections) >= 1
+    assert ax.get_xlabel()
+    assert ax.get_ylabel()

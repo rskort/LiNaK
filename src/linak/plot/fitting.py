@@ -321,6 +321,69 @@ def _polynomial_equation(degree: int) -> str:
     return "y = " + " + ".join(terms)
 
 
+def _format_fit_number(value: float) -> str:
+    numeric = float(value)
+    if math.isclose(numeric, 0.0, abs_tol=1.0e-15):
+        numeric = 0.0
+    return f"{numeric:.6g}"
+
+
+def _linear_equation_from_parameters(*, slope: float, intercept: float) -> str:
+    return f"y = {_format_fit_number(slope)}*x + {_format_fit_number(intercept)}"
+
+
+def _polynomial_equation_from_coefficients(coefficients: np.ndarray) -> str:
+    resolved = np.asarray(coefficients, dtype=float)
+    degree = int(resolved.size - 1)
+    terms: list[str] = []
+    for index, coefficient in enumerate(resolved):
+        power = degree - index
+        numeric = _format_fit_number(float(coefficient))
+        if power == 0:
+            terms.append(numeric)
+        elif power == 1:
+            terms.append(f"{numeric}*x")
+        else:
+            terms.append(f"{numeric}*x^{power}")
+    return "y = " + " + ".join(terms)
+
+
+def _build_fit_summary(
+    *,
+    status: str,
+    fit_type: str,
+    equation: str,
+    parameters: dict[str, float],
+    parameter_order: list[str],
+    fit_point_count: int,
+    display_point_count: int,
+    x_fit: np.ndarray | None = None,
+    y_fit: np.ndarray | None = None,
+    r_squared: float | None = None,
+    rmse: float | None = None,
+    reason: str = "",
+    characteristic_point: dict[str, float | str] | None = None,
+) -> FitSummaryDict:
+    return {
+        "status": str(status),
+        "fit_type": str(fit_type),
+        "equation": str(equation),
+        "parameters": dict(parameters),
+        "parameter_order": list(parameter_order),
+        "r_squared": None if r_squared is None else float(r_squared),
+        "rmse": None if rmse is None else float(rmse),
+        "fit_point_count": int(fit_point_count),
+        "point_count": int(fit_point_count),
+        "display_point_count": int(display_point_count),
+        "x_fit": [] if x_fit is None else np.asarray(x_fit, dtype=float).tolist(),
+        "y_fit": [] if y_fit is None else np.asarray(y_fit, dtype=float).tolist(),
+        "reason": str(reason),
+        "characteristic_point": (
+            None if characteristic_point is None else dict(characteristic_point)
+        ),
+    }
+
+
 def _build_fit_x_grid(fit_x: np.ndarray, *, requires_positive_x: bool) -> np.ndarray:
     min_x = float(np.min(fit_x))
     max_x = float(np.max(fit_x))
@@ -341,21 +404,15 @@ def execute_series_fit(
     """Fit displayed series data using the requested fit family."""
     config = coerce_fit_config(fit_config)
     if not config["fit_enabled"]:
-        return {
-            "status": "off",
-            "fit_type": str(config["fit_type"]),
-            "equation": "",
-            "parameters": {},
-            "parameter_order": [],
-            "r_squared": None,
-            "rmse": None,
-            "fit_point_count": 0,
-            "point_count": 0,
-            "display_point_count": 0,
-            "x_fit": [],
-            "y_fit": [],
-            "reason": "",
-        }
+        return _build_fit_summary(
+            status="off",
+            fit_type=str(config["fit_type"]),
+            equation="",
+            parameters={},
+            parameter_order=[],
+            fit_point_count=0,
+            display_point_count=0,
+        )
 
     x = np.asarray(x_values, dtype=float)
     y = np.asarray(y_values, dtype=float)
@@ -377,21 +434,16 @@ def execute_series_fit(
 
     display_point_count = int(x.size)
     if display_point_count < 2:
-        return {
-            "status": "invalid",
-            "fit_type": str(config["fit_type"]),
-            "equation": "",
-            "parameters": {},
-            "parameter_order": [],
-            "r_squared": None,
-            "rmse": None,
-            "fit_point_count": int(x.size),
-            "point_count": int(x.size),
-            "display_point_count": display_point_count,
-            "x_fit": [],
-            "y_fit": [],
-            "reason": "Fit requires at least two finite displayed points.",
-        }
+        return _build_fit_summary(
+            status="invalid",
+            fit_type=str(config["fit_type"]),
+            equation="",
+            parameters={},
+            parameter_order=[],
+            fit_point_count=int(x.size),
+            display_point_count=display_point_count,
+            reason="Fit requires at least two finite displayed points.",
+        )
 
     fit_x = x
     fit_y = y
@@ -416,23 +468,19 @@ def execute_series_fit(
 
     fit_point_count = int(fit_x.size)
     if fit_point_count < 2 or np.unique(fit_x).size < 2:
-        return {
-            "status": "invalid",
-            "fit_type": fit_type,
-            "equation": model.equation_template,
-            "parameters": {},
-            "parameter_order": list(model.parameter_order),
-            "r_squared": None,
-            "rmse": None,
-            "fit_point_count": fit_point_count,
-            "point_count": fit_point_count,
-            "display_point_count": display_point_count,
-            "x_fit": [],
-            "y_fit": [],
-            "reason": "Fit requires at least two valid points and two distinct x values.",
-        }
+        return _build_fit_summary(
+            status="invalid",
+            fit_type=fit_type,
+            equation=model.equation_template,
+            parameters={},
+            parameter_order=list(model.parameter_order),
+            fit_point_count=fit_point_count,
+            display_point_count=display_point_count,
+            reason="Fit requires at least two valid points and two distinct x values.",
+        )
 
     try:
+        characteristic_point: dict[str, float | str] | None = None
         if fit_type == "linear":
             coefficients = np.polyfit(fit_x, fit_y, deg=1)
             parameter_order = list(model.parameter_order)
@@ -445,7 +493,10 @@ def execute_series_fit(
                 parameters["slope"],
                 parameters["intercept"],
             )
-            equation = model.equation_template
+            equation = _linear_equation_from_parameters(
+                slope=parameters["slope"],
+                intercept=parameters["intercept"],
+            )
         elif fit_type == "polynomial":
             degree = max(1, int(config.get("fit_degree") or 2))
             coefficients = np.polyfit(fit_x, fit_y, deg=degree)
@@ -458,7 +509,20 @@ def execute_series_fit(
                 np.asarray(coefficients, dtype=float),
                 np.asarray(values, dtype=float),
             )
-            equation = _polynomial_equation(degree)
+            equation = _polynomial_equation_from_coefficients(
+                np.asarray(coefficients, dtype=float)
+            )
+            if degree == 2:
+                a, b, _c = np.asarray(coefficients, dtype=float)
+                if np.isfinite(a) and abs(a) > 1.0e-15:
+                    vertex_x = float(-b / (2.0 * a))
+                    characteristic_point = {
+                        "label": "Vertex",
+                        "x": vertex_x,
+                        "y": float(
+                            np.polyval(np.asarray(coefficients, dtype=float), np.asarray([vertex_x]))[0]
+                        ),
+                    }
         else:
             assert model.model is not None
             nonlinear_model = model.model
@@ -507,34 +571,35 @@ def execute_series_fit(
         rmse = float(np.sqrt(ss_res / max(fit_point_count, 1)))
         x_fit = _build_fit_x_grid(fit_x, requires_positive_x=model.requires_positive_x)
         y_fit = np.asarray(predictor(x_fit), dtype=float)
-        return {
-            "status": "ok",
-            "fit_type": fit_type,
-            "equation": equation,
-            "parameters": parameters,
-            "parameter_order": parameter_order,
-            "r_squared": float(r_squared),
-            "rmse": float(rmse),
-            "fit_point_count": fit_point_count,
-            "point_count": fit_point_count,
-            "display_point_count": display_point_count,
-            "x_fit": x_fit.tolist(),
-            "y_fit": y_fit.tolist(),
-            "reason": "",
-        }
+        if characteristic_point is not None:
+            point_x = float(characteristic_point["x"])
+            characteristic_point = {
+                "label": str(characteristic_point["label"]),
+                "x": point_x,
+                "y": float(np.asarray(predictor(np.asarray([point_x], dtype=float)), dtype=float)[0]),
+            }
+        return _build_fit_summary(
+            status="ok",
+            fit_type=fit_type,
+            equation=equation,
+            parameters=parameters,
+            parameter_order=parameter_order,
+            fit_point_count=fit_point_count,
+            display_point_count=display_point_count,
+            x_fit=x_fit,
+            y_fit=y_fit,
+            r_squared=float(r_squared),
+            rmse=float(rmse),
+            characteristic_point=characteristic_point,
+        )
     except Exception as exc:
-        return {
-            "status": "error",
-            "fit_type": fit_type,
-            "equation": model.equation_template,
-            "parameters": {},
-            "parameter_order": list(model.parameter_order),
-            "r_squared": None,
-            "rmse": None,
-            "fit_point_count": fit_point_count,
-            "point_count": fit_point_count,
-            "display_point_count": display_point_count,
-            "x_fit": [],
-            "y_fit": [],
-            "reason": str(exc),
-        }
+        return _build_fit_summary(
+            status="error",
+            fit_type=fit_type,
+            equation=model.equation_template,
+            parameters={},
+            parameter_order=list(model.parameter_order),
+            fit_point_count=fit_point_count,
+            display_point_count=display_point_count,
+            reason=str(exc),
+        )

@@ -15,7 +15,8 @@ dist/
 .coverage
 htmlcov/
 LiNaK_outputs/
-.smoke_plot_complexity/
+LiNaK_project*
+.smoke_*
 
 # Type checking / lint caches
 .mypy_cache/

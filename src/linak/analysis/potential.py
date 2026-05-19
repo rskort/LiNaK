@@ -17,6 +17,12 @@ from typing import Any, Callable
 import numpy as np
 
 from .. import __version__
+from ..cube_io import CubeDataset, read_cube_sources, validate_cube_source
+from ..plot.data_contract import PlotDataContract, PlotViewMapping
+from ..plot.mappings.potential_mapping import (
+    potential_table_rows,
+    resolve_potential_plot_mapping,
+)
 from ..plot.plotting import (
     DEFAULT_PLOT_STYLE,
     PlotStyle,
@@ -387,14 +393,7 @@ def validate_potential_config(config: PotentialConfig) -> None:
 
 def validate_hartree_cube_source(path: str | Path) -> Path:
     """Validate and resolve one Hartree cube input path."""
-    source_path = Path(path).expanduser().resolve()
-    if not source_path.exists():
-        raise FileNotFoundError(f"Hartree cube file not found: {source_path}")
-    if source_path.is_dir():
-        raise ValueError(f"Hartree cube source is a directory, not a file: {source_path}")
-    if source_path.suffix.lower() != ".cube":
-        raise ValueError(f"Hartree cube source must be a .cube file: {source_path}")
-    return source_path
+    return validate_cube_source(path)
 
 
 def _parse_fermi_in_text(text: str) -> tuple[float, str] | None:
@@ -553,6 +552,27 @@ def _read_cube_header(path: Path) -> tuple[CubeHeader, int]:
     return header, data_start_line
 
 
+def _cube_header_from_dataset(dataset: CubeDataset) -> CubeHeader:
+    grid_counts = np.asarray(dataset.grid_counts_signed, dtype=int)
+    if grid_counts.shape != (3,):
+        raise ValueError("Cube dataset has invalid grid_counts_signed shape.")
+    atom_positions_bohr = np.asarray(dataset.atom_positions_bohr, dtype=float)
+    if atom_positions_bohr.ndim != 2 or atom_positions_bohr.shape[1] != 3:
+        raise ValueError("Cube dataset has invalid atom_positions_bohr shape.")
+    return CubeHeader(
+        natoms=abs(int(dataset.natoms_signed)),
+        origin_bohr=np.asarray(dataset.origin_bohr, dtype=float),
+        nx=int(abs(grid_counts[0])),
+        ny=int(abs(grid_counts[1])),
+        nz=int(abs(grid_counts[2])),
+        vx_bohr=np.asarray(dataset.grid_vectors_bohr[0], dtype=float),
+        vy_bohr=np.asarray(dataset.grid_vectors_bohr[1], dtype=float),
+        vz_bohr=np.asarray(dataset.grid_vectors_bohr[2], dtype=float),
+        atom_numbers=np.asarray(dataset.atom_numbers, dtype=int),
+        atom_z_bohr=np.asarray(atom_positions_bohr[:, 2], dtype=float),
+    )
+
+
 def _cube_xyavg_stream_both(
     path: Path,
     *,
@@ -577,6 +597,16 @@ def _cube_xyavg_stream_both(
             f"Cube data length mismatch in '{path}'. Expected {n_expected}, got {values.size}."
         )
 
+    v_xfast = values.reshape((nz, ny, nx), order="C").mean(axis=(1, 2))
+    v_zfast = values.reshape((nx, ny, nz), order="C").mean(axis=(0, 1))
+    return v_xfast, v_zfast
+
+
+def _cube_xyavg_from_dataset(dataset: CubeDataset) -> tuple[np.ndarray, np.ndarray]:
+    values = np.asarray(dataset.values, dtype=float)
+    if values.ndim != 3:
+        raise ValueError("Cube dataset values must be a 3D scalar field.")
+    nz, ny, nx = values.shape[2], values.shape[1], values.shape[0]
     v_xfast = values.reshape((nz, ny, nx), order="C").mean(axis=(1, 2))
     v_zfast = values.reshape((nx, ny, nz), order="C").mean(axis=(0, 1))
     return v_xfast, v_zfast
@@ -616,6 +646,29 @@ def cube_xyavg_vs_z(path: str | Path) -> tuple[np.ndarray, np.ndarray, CubeHeade
         LOGGER.warning(
             "Detected near-zero z component in cube grid vector for '%s'; using |vz|=%.6g bohr.",
             cube_path,
+            z_step_bohr,
+        )
+    z_bohr = header.origin_bohr[2] + np.arange(header.nz, dtype=float) * z_step_bohr
+    z_ang = z_bohr * BOHR_TO_ANG
+    return z_ang, profile, header
+
+
+def cube_xyavg_vs_dataset(dataset: CubeDataset) -> tuple[np.ndarray, np.ndarray, CubeHeader]:
+    """Return z-grid and xy-averaged values from one logical cube dataset."""
+
+    header = _cube_header_from_dataset(dataset)
+    v_xfast, v_zfast = _cube_xyavg_from_dataset(dataset)
+
+    profile = v_xfast
+    if _profile_roughness(v_zfast) < _profile_roughness(v_xfast):
+        profile = v_zfast
+
+    z_step_bohr = float(header.vz_bohr[2])
+    if np.isclose(z_step_bohr, 0.0):
+        z_step_bohr = float(np.linalg.norm(header.vz_bohr))
+        LOGGER.warning(
+            "Detected near-zero z component in cube grid vector for '%s'; using |vz|=%.6g bohr.",
+            dataset.source_path or dataset.source_name or "cube dataset",
             z_step_bohr,
         )
     z_bohr = header.origin_bohr[2] + np.arange(header.nz, dtype=float) * z_step_bohr
@@ -676,14 +729,39 @@ def _water_bulk_potential_ev(
     return float(v_xyavg_ev[nearest_idx]), z_value, z_value
 
 
-def compute_potential_record(source: str | Path, *, config: PotentialConfig) -> PotentialRecord:
+def _resolve_cube_dataset_provenance(dataset: CubeDataset) -> Path:
+    if dataset.source_path:
+        return Path(dataset.source_path).expanduser().resolve()
+    fallback_name = dataset.source_name or "cube_dataset.cube"
+    return Path(fallback_name).expanduser().resolve()
+
+
+def expand_hartree_cube_sources(source: str | Path) -> list[CubeDataset]:
+    """Expand one raw cube or `.cube.h5` container into logical cube datasets."""
+
+    return read_cube_sources(source)
+
+
+def compute_potential_record(
+    source: str | Path | CubeDataset,
+    *,
+    config: PotentialConfig,
+) -> PotentialRecord:
     """Compute cSHE-related quantities for one Hartree cube file."""
     validate_potential_config(config)
-
-    source_path = validate_hartree_cube_source(source)
+    dataset: CubeDataset | None = source if isinstance(source, CubeDataset) else None
+    if dataset is None:
+        source_path = validate_hartree_cube_source(source)
+        expanded = read_cube_sources(source_path)
+        if len(expanded) != 1:
+            raise ValueError(
+                "Potential compute expected one cube field but the source expands to multiple entries."
+            )
+        dataset = expanded[0]
+    source_path = _resolve_cube_dataset_provenance(dataset)
 
     source_dir = source_path.parent
-    z_ang, v_xyavg_hartree, header = cube_xyavg_vs_z(source_path)
+    z_ang, v_xyavg_hartree, header = cube_xyavg_vs_dataset(dataset)
     if z_ang.size == 0:
         raise ValueError("Potential profile is empty.")
 
@@ -778,7 +856,7 @@ def _resolve_worker_count(threads: int | None, n_sources: int) -> int:
 
 
 def compute_potential_records(
-    sources: Sequence[str | Path],
+    sources: Sequence[str | Path | CubeDataset],
     *,
     config: PotentialConfig,
     threads: int | None = None,
@@ -814,13 +892,18 @@ def compute_potential_records(
 
     def _compute_one(
         index: int,
-        source_item: str | Path,
+        source_item: str | Path | CubeDataset,
     ) -> tuple[int, PotentialRecord | None, PotentialComputationFailure | None]:
         try:
             record = compute_potential_record(source_item, config=config)
             return index, record, None
         except Exception as exc:
-            failure = PotentialComputationFailure(source=str(source_item), error=str(exc))
+            failure_source = (
+                str(_resolve_cube_dataset_provenance(source_item))
+                if isinstance(source_item, CubeDataset)
+                else str(source_item)
+            )
+            failure = PotentialComputationFailure(source=failure_source, error=str(exc))
             return index, None, failure
 
     if worker_count > 1:
@@ -1044,6 +1127,8 @@ def load_potential_plot_profiles(
 def plot_potential_profiles(
     profiles: list[PotentialPlotSeries],
     *,
+    data_contract: PlotDataContract | None = None,
+    view_mapping: PlotViewMapping | None = None,
     series_ids: list[str] | None = None,
     title: str = "Hartree potential summary",
     x_label: str | None = None,
@@ -1109,14 +1194,47 @@ def plot_potential_profiles(
     """Plot potential summary series with optional fitted child overlays."""
     if not profiles:
         raise ValueError("At least one potential series is required for plotting.")
+    resolved_mapping = resolve_potential_plot_mapping(
+        contract=data_contract,
+        profiles=profiles,
+        mapping=view_mapping,
+    )
+    if resolved_mapping.is_table_view:
+        if capture_state is not None:
+            capture_state["table_rows"] = potential_table_rows(profiles)
+            capture_state["potential_summary"] = {
+                "x_axis_label": "Record ID",
+                "total_rows": int(profiles[0].total_rows),
+                "complete_rows": int(profiles[0].complete_rows),
+                "incomplete_rows": int(profiles[0].incomplete_rows),
+            }
+        return None
+
+    runtime_y_quantity = resolved_mapping.y_quantity
+    runtime_standard_plot = resolved_mapping.standard_plot
+    selected_profiles = profiles
+    if runtime_standard_plot != "summary":
+        series_id_by_quantity = {
+            "water_bulk_potential": "water_bulk_potential_ev",
+            "efermi": "efermi_ev",
+            "electrode_cshe": "electrode_cshe_ev",
+        }
+        target_series_id = series_id_by_quantity[runtime_y_quantity]
+        selected_profiles = [
+            profile for profile in profiles if str(profile.series_id).strip() == target_series_id
+        ]
+        if not selected_profiles:
+            raise ValueError(
+                f"Potential series '{target_series_id}' is unavailable for the requested mapping."
+            )
 
     labels = resolve_series_labels(
-        [profile.default_label for profile in profiles],
+        [profile.default_label for profile in selected_profiles],
         series_labels,
         series_kind="potential",
     )
-    x_series = [np.asarray(profile.x_values, dtype=float) for profile in profiles]
-    y_series = [np.asarray(profile.y_values, dtype=float) for profile in profiles]
+    x_series = [np.asarray(profile.x_values, dtype=float) for profile in selected_profiles]
+    y_series = [np.asarray(profile.y_values, dtype=float) for profile in selected_profiles]
     output_path = plot_multi_line_series(
         x_series,
         y_series,
@@ -1128,7 +1246,7 @@ def plot_potential_profiles(
         show=show,
         show_blocking=show_blocking,
         preferred_backend=preferred_backend,
-        series_ids=series_ids or [profile.series_id for profile in profiles],
+        series_ids=series_ids or [profile.series_id for profile in selected_profiles],
         style=style,
         line_colors=line_colors,
         series_enabled=series_enabled,
@@ -1138,7 +1256,7 @@ def plot_potential_profiles(
         series_fit_configs=series_fit_configs,
         series_cumulative_configs=series_cumulative_configs,
         series_error_configs=series_error_configs,
-        series_raw_statistics=[True] * len(profiles),
+        series_raw_statistics=[True] * len(selected_profiles),
         series_normalization_modes=series_normalization_modes,
         series_normalization_values=series_normalization_values,
         series_normalization_x_refs=series_normalization_x_refs,
@@ -1187,9 +1305,9 @@ def plot_potential_profiles(
     if capture_state is not None:
         capture_state["potential_summary"] = {
             "x_axis_label": "Record ID",
-            "total_rows": int(profiles[0].total_rows),
-            "complete_rows": int(profiles[0].complete_rows),
-            "incomplete_rows": int(profiles[0].incomplete_rows),
+            "total_rows": int(selected_profiles[0].total_rows),
+            "complete_rows": int(selected_profiles[0].complete_rows),
+            "incomplete_rows": int(selected_profiles[0].incomplete_rows),
         }
     return output_path
 

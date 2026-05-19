@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import json
 import logging
 import os
 from pathlib import Path
@@ -73,6 +74,23 @@ class TrajectoryStoredMetadata:
     surface_cache_source: str | None = None
     surface_cache_unavailable_reason: str | None = None
     surface_cache_estimate: SurfaceEstimate | None = None
+    combine_source_paths: tuple[str, ...] = ()
+    combine_source_file_types: tuple[str, ...] = ()
+    combine_timestamp_utc: str | None = None
+    combine_total_frames: int | None = None
+    combine_conversion_applied: bool | None = None
+    combine_linak_version: str | None = None
+    selection_user: str | None = None
+    selection_kind: str | None = None
+    selection_unit: str | None = None
+    selection_start_frame: int | None = None
+    selection_stop_frame_exclusive: int | None = None
+    selection_selected_frame_count: int | None = None
+    selection_resolved_start_time_fs: float | None = None
+    selection_resolved_end_time_fs: float | None = None
+    selection_resolved_start_step: int | None = None
+    selection_resolved_end_step: int | None = None
+    spatial_filter_metadata: dict[str, Any] | None = None
 
 
 def default_trajectory_hdf5_output_path(source: str | Path) -> Path:
@@ -181,6 +199,69 @@ def _normalize_stored_metadata(
         if metadata.surface_cache_rough_surface_envelope_A is not None
         else None
     )
+    combine_source_paths = tuple(str(value).strip() for value in metadata.combine_source_paths if str(value).strip())
+    combine_source_file_types = tuple(
+        str(value).strip() for value in metadata.combine_source_file_types if str(value).strip()
+    )
+    combine_timestamp_utc = (
+        str(metadata.combine_timestamp_utc).strip() or None
+        if metadata.combine_timestamp_utc
+        else None
+    )
+    combine_total_frames = (
+        int(metadata.combine_total_frames) if metadata.combine_total_frames is not None else None
+    )
+    combine_conversion_applied = (
+        None
+        if metadata.combine_conversion_applied is None
+        else bool(metadata.combine_conversion_applied)
+    )
+    combine_linak_version = (
+        str(metadata.combine_linak_version).strip() or None
+        if metadata.combine_linak_version
+        else None
+    )
+    selection_user = str(metadata.selection_user).strip() or None if metadata.selection_user else None
+    selection_kind = str(metadata.selection_kind).strip() or None if metadata.selection_kind else None
+    selection_unit = str(metadata.selection_unit).strip() or None if metadata.selection_unit else None
+    selection_start_frame = (
+        int(metadata.selection_start_frame) if metadata.selection_start_frame is not None else None
+    )
+    selection_stop_frame_exclusive = (
+        int(metadata.selection_stop_frame_exclusive)
+        if metadata.selection_stop_frame_exclusive is not None
+        else None
+    )
+    selection_selected_frame_count = (
+        int(metadata.selection_selected_frame_count)
+        if metadata.selection_selected_frame_count is not None
+        else None
+    )
+    selection_resolved_start_time_fs = (
+        float(metadata.selection_resolved_start_time_fs)
+        if metadata.selection_resolved_start_time_fs is not None
+        else None
+    )
+    selection_resolved_end_time_fs = (
+        float(metadata.selection_resolved_end_time_fs)
+        if metadata.selection_resolved_end_time_fs is not None
+        else None
+    )
+    selection_resolved_start_step = (
+        int(metadata.selection_resolved_start_step)
+        if metadata.selection_resolved_start_step is not None
+        else None
+    )
+    selection_resolved_end_step = (
+        int(metadata.selection_resolved_end_step)
+        if metadata.selection_resolved_end_step is not None
+        else None
+    )
+    spatial_filter_metadata = (
+        None
+        if metadata.spatial_filter_metadata is None
+        else dict(metadata.spatial_filter_metadata)
+    )
     return TrajectoryStoredMetadata(
         input_path=input_path,
         input_format=input_format,
@@ -207,6 +288,23 @@ def _normalize_stored_metadata(
         surface_cache_source=surface_cache_source,
         surface_cache_unavailable_reason=surface_cache_unavailable_reason,
         surface_cache_estimate=metadata.surface_cache_estimate,
+        combine_source_paths=combine_source_paths,
+        combine_source_file_types=combine_source_file_types,
+        combine_timestamp_utc=combine_timestamp_utc,
+        combine_total_frames=combine_total_frames,
+        combine_conversion_applied=combine_conversion_applied,
+        combine_linak_version=combine_linak_version,
+        selection_user=selection_user,
+        selection_kind=selection_kind,
+        selection_unit=selection_unit,
+        selection_start_frame=selection_start_frame,
+        selection_stop_frame_exclusive=selection_stop_frame_exclusive,
+        selection_selected_frame_count=selection_selected_frame_count,
+        selection_resolved_start_time_fs=selection_resolved_start_time_fs,
+        selection_resolved_end_time_fs=selection_resolved_end_time_fs,
+        selection_resolved_start_step=selection_resolved_start_step,
+        selection_resolved_end_step=selection_resolved_end_step,
+        spatial_filter_metadata=spatial_filter_metadata,
     )
 
 
@@ -275,6 +373,23 @@ def _resolve_write_metadata(
         surface_cache_source=resolved.surface_cache_source,
         surface_cache_unavailable_reason=resolved.surface_cache_unavailable_reason,
         surface_cache_estimate=resolved.surface_cache_estimate,
+        combine_source_paths=resolved.combine_source_paths,
+        combine_source_file_types=resolved.combine_source_file_types,
+        combine_timestamp_utc=resolved.combine_timestamp_utc,
+        combine_total_frames=resolved.combine_total_frames,
+        combine_conversion_applied=resolved.combine_conversion_applied,
+        combine_linak_version=resolved.combine_linak_version,
+        selection_user=resolved.selection_user,
+        selection_kind=resolved.selection_kind,
+        selection_unit=resolved.selection_unit,
+        selection_start_frame=resolved.selection_start_frame,
+        selection_stop_frame_exclusive=resolved.selection_stop_frame_exclusive,
+        selection_selected_frame_count=resolved.selection_selected_frame_count,
+        selection_resolved_start_time_fs=resolved.selection_resolved_start_time_fs,
+        selection_resolved_end_time_fs=resolved.selection_resolved_end_time_fs,
+        selection_resolved_start_step=resolved.selection_resolved_start_step,
+        selection_resolved_end_step=resolved.selection_resolved_end_step,
+        spatial_filter_metadata=resolved.spatial_filter_metadata,
     )
 
 
@@ -374,6 +489,23 @@ def read_trajectory_hdf5_metadata(path: str | Path) -> TrajectoryStoredMetadata 
         surface_cache_rough_surface_envelope_A: float | None = None
         surface_cache_source: str | None = None
         surface_cache_unavailable_reason: str | None = None
+        combine_source_paths: tuple[str, ...] = ()
+        combine_source_file_types: tuple[str, ...] = ()
+        combine_timestamp_utc: str | None = None
+        combine_total_frames: int | None = None
+        combine_conversion_applied: bool | None = None
+        combine_linak_version: str | None = None
+        selection_user: str | None = None
+        selection_kind: str | None = None
+        selection_unit: str | None = None
+        selection_start_frame: int | None = None
+        selection_stop_frame_exclusive: int | None = None
+        selection_selected_frame_count: int | None = None
+        selection_resolved_start_time_fs: float | None = None
+        selection_resolved_end_time_fs: float | None = None
+        selection_resolved_start_step: int | None = None
+        selection_resolved_end_step: int | None = None
+        spatial_filter_metadata: dict[str, Any] | None = None
         if isinstance(surface_group, h5py.Group):
             surface_cache_status = _optional_attr_str(surface_group.attrs.get("status"))
             surface_cache_axis = _optional_attr_str(surface_group.attrs.get("axis"))
@@ -396,6 +528,55 @@ def read_trajectory_hdf5_metadata(path: str | Path) -> TrajectoryStoredMetadata 
             surface_cache_unavailable_reason = _optional_attr_str(
                 surface_group.attrs.get("unavailable_reason")
             )
+        combine_source_paths_dataset = metadata_group.get("combine_source_paths")
+        if isinstance(combine_source_paths_dataset, h5py.Dataset):
+            combine_source_paths = tuple(
+                str(value)
+                for value in _decode_hdf5_string_array(np.asarray(combine_source_paths_dataset))
+                if str(value)
+            )
+        combine_source_file_types_dataset = metadata_group.get("combine_source_file_types")
+        if isinstance(combine_source_file_types_dataset, h5py.Dataset):
+            combine_source_file_types = tuple(
+                str(value)
+                for value in _decode_hdf5_string_array(
+                    np.asarray(combine_source_file_types_dataset)
+                )
+                if str(value)
+            )
+        combine_timestamp_utc = _optional_attr_str(metadata_group.attrs.get("combine_timestamp_utc"))
+        combine_total_frames_raw = metadata_group.attrs.get("combine_total_frames")
+        combine_conversion_applied_raw = metadata_group.attrs.get("combine_conversion_applied")
+        combine_linak_version = _optional_attr_str(metadata_group.attrs.get("combine_linak_version"))
+        selection_user = _optional_attr_str(metadata_group.attrs.get("selection_user"))
+        selection_kind = _optional_attr_str(metadata_group.attrs.get("selection_kind"))
+        selection_unit = _optional_attr_str(metadata_group.attrs.get("selection_unit"))
+        selection_start_frame_raw = metadata_group.attrs.get("selection_start_frame")
+        selection_stop_frame_exclusive_raw = metadata_group.attrs.get(
+            "selection_stop_frame_exclusive"
+        )
+        selection_selected_frame_count_raw = metadata_group.attrs.get(
+            "selection_selected_frame_count"
+        )
+        selection_resolved_start_time_fs_raw = metadata_group.attrs.get(
+            "selection_resolved_start_time_fs"
+        )
+        selection_resolved_end_time_fs_raw = metadata_group.attrs.get(
+            "selection_resolved_end_time_fs"
+        )
+        selection_resolved_start_step_raw = metadata_group.attrs.get(
+            "selection_resolved_start_step"
+        )
+        selection_resolved_end_step_raw = metadata_group.attrs.get("selection_resolved_end_step")
+        spatial_filter_json = _optional_attr_str(metadata_group.attrs.get("spatial_filter_json"))
+        spatial_filter_metadata = None
+        if spatial_filter_json is not None:
+            try:
+                loaded_spatial_filter = json.loads(spatial_filter_json)
+            except json.JSONDecodeError:
+                loaded_spatial_filter = None
+            if isinstance(loaded_spatial_filter, dict):
+                spatial_filter_metadata = loaded_spatial_filter
 
         return _normalize_stored_metadata(
             TrajectoryStoredMetadata(
@@ -427,6 +608,57 @@ def read_trajectory_hdf5_metadata(path: str | Path) -> TrajectoryStoredMetadata 
                 surface_cache_rough_surface_envelope_A=surface_cache_rough_surface_envelope_A,
                 surface_cache_source=surface_cache_source,
                 surface_cache_unavailable_reason=surface_cache_unavailable_reason,
+                combine_source_paths=combine_source_paths,
+                combine_source_file_types=combine_source_file_types,
+                combine_timestamp_utc=combine_timestamp_utc,
+                combine_total_frames=(
+                    int(combine_total_frames_raw) if combine_total_frames_raw is not None else None
+                ),
+                combine_conversion_applied=(
+                    None
+                    if combine_conversion_applied_raw is None
+                    else bool(combine_conversion_applied_raw)
+                ),
+                combine_linak_version=combine_linak_version,
+                selection_user=selection_user,
+                selection_kind=selection_kind,
+                selection_unit=selection_unit,
+                selection_start_frame=(
+                    int(selection_start_frame_raw)
+                    if selection_start_frame_raw is not None
+                    else None
+                ),
+                selection_stop_frame_exclusive=(
+                    int(selection_stop_frame_exclusive_raw)
+                    if selection_stop_frame_exclusive_raw is not None
+                    else None
+                ),
+                selection_selected_frame_count=(
+                    int(selection_selected_frame_count_raw)
+                    if selection_selected_frame_count_raw is not None
+                    else None
+                ),
+                selection_resolved_start_time_fs=(
+                    float(selection_resolved_start_time_fs_raw)
+                    if selection_resolved_start_time_fs_raw is not None
+                    else None
+                ),
+                selection_resolved_end_time_fs=(
+                    float(selection_resolved_end_time_fs_raw)
+                    if selection_resolved_end_time_fs_raw is not None
+                    else None
+                ),
+                selection_resolved_start_step=(
+                    int(selection_resolved_start_step_raw)
+                    if selection_resolved_start_step_raw is not None
+                    else None
+                ),
+                selection_resolved_end_step=(
+                    int(selection_resolved_end_step_raw)
+                    if selection_resolved_end_step_raw is not None
+                    else None
+                ),
+                spatial_filter_metadata=spatial_filter_metadata,
             )
         )
 
@@ -611,24 +843,13 @@ def _collect_frame_info_values(
     return np.asarray(values, dtype=dtype)
 
 
-def _validate_fixed_topology_frames(frames: list[Atoms]) -> np.ndarray:
-    reference = frames[0].get_atomic_numbers()
-    if len(reference) == 0:
-        raise ValueError("Converted trajectory HDF5 requires at least one atom per frame.")
-
-    for index, frame in enumerate(frames[1:], start=1):
-        current = frame.get_atomic_numbers()
-        if len(current) != len(reference):
-            raise ValueError(
-                "LiNaK trajectory HDF5 conversion currently supports fixed topology only: "
-                f"frame 0 has {len(reference)} atoms but frame {index} has {len(current)}."
-            )
-        if not np.array_equal(current, reference):
-            raise ValueError(
-                "LiNaK trajectory HDF5 conversion currently supports fixed topology only: "
-                f"atomic numbers/order differ in frame {index}."
-            )
-    return reference
+def _topology_is_fixed(frames: list[Atoms]) -> bool:
+    reference = np.asarray(frames[0].get_atomic_numbers(), dtype=np.int64)
+    for frame in frames[1:]:
+        current = np.asarray(frame.get_atomic_numbers(), dtype=np.int64)
+        if len(current) != len(reference) or not np.array_equal(current, reference):
+            return False
+    return True
 
 
 def _write_string_dataset(group: h5py.Group, name: str, values: tuple[str, ...]) -> None:
@@ -718,16 +939,30 @@ def _write_trajectory_hdf5(
     source_format: str | None = None,
     metadata: TrajectoryStoredMetadata | None = None,
 ) -> Path:
-    atomic_numbers = _validate_fixed_topology_frames(frames)
     frame_count = len(frames)
-    atom_count = len(atomic_numbers)
+    atom_counts = np.asarray([len(frame) for frame in frames], dtype=np.int64)
+    if atom_counts.size == 0 or int(np.max(atom_counts)) <= 0:
+        raise ValueError("Converted trajectory HDF5 requires at least one atom in the trajectory.")
+    topology_is_fixed = _topology_is_fixed(frames)
+    max_atom_count = int(np.max(atom_counts))
     chunk_frames = max(1, min(frame_count, 64))
 
-    positions = np.empty((frame_count, atom_count, 3), dtype=np.float64)
+    positions = np.zeros((frame_count, max_atom_count, 3), dtype=np.float64)
     cells = np.empty((frame_count, 3, 3), dtype=np.float64)
     pbc = np.empty((frame_count, 3), dtype=bool)
+    if topology_is_fixed:
+        atomic_numbers: np.ndarray = np.asarray(frames[0].get_atomic_numbers(), dtype=np.int64)
+    else:
+        atomic_numbers = np.zeros((frame_count, max_atom_count), dtype=np.int64)
     for index, frame in enumerate(frames):
-        positions[index] = np.asarray(frame.get_positions(), dtype=np.float64)
+        atom_count = len(frame)
+        if atom_count > 0:
+            positions[index, :atom_count] = np.asarray(frame.get_positions(), dtype=np.float64)
+        if not topology_is_fixed and atom_count > 0:
+            atomic_numbers[index, :atom_count] = np.asarray(
+                frame.get_atomic_numbers(),
+                dtype=np.int64,
+            )
         cells[index] = np.asarray(frame.cell.array, dtype=np.float64)
         pbc[index] = np.asarray(frame.get_pbc(), dtype=bool)
 
@@ -748,7 +983,8 @@ def _write_trajectory_hdf5(
             handle.attrs["linak_trajectory_version"] = LINAK_TRAJECTORY_HDF5_VERSION
             handle.attrs["kind"] = "trajectory"
             handle.attrs["frame_count"] = frame_count
-            handle.attrs["atom_count"] = atom_count
+            handle.attrs["atom_count"] = max_atom_count
+            handle.attrs["topology_mode"] = "fixed" if topology_is_fixed else "variable"
             handle.attrs["created_utc"] = datetime.now(timezone.utc).isoformat()
             if source_path is not None:
                 handle.attrs["source_path"] = str(Path(source_path).expanduser().resolve())
@@ -758,7 +994,7 @@ def _write_trajectory_hdf5(
             handle.create_dataset(
                 "positions",
                 data=positions,
-                chunks=(chunk_frames, atom_count, 3),
+                chunks=(chunk_frames, max_atom_count, 3),
                 compression="lzf",
                 shuffle=True,
             )
@@ -775,7 +1011,20 @@ def _write_trajectory_hdf5(
                 chunks=(chunk_frames, 3),
                 compression="lzf",
             )
-            handle.create_dataset("atomic_numbers", data=atomic_numbers.astype(np.int64))
+            handle.create_dataset(
+                "atomic_numbers",
+                data=atomic_numbers.astype(np.int64),
+                compression="lzf" if not topology_is_fixed else None,
+                shuffle=not topology_is_fixed,
+            )
+            if not topology_is_fixed:
+                handle.create_dataset(
+                    "atom_counts",
+                    data=atom_counts,
+                    chunks=(chunk_frames,),
+                    compression="lzf",
+                    shuffle=True,
+                )
             if info_arrays:
                 info_group = handle.create_group("frame_info")
                 for key, values in info_arrays.items():
@@ -827,6 +1076,65 @@ def _write_trajectory_hdf5(
                         "fixed_atom_indices",
                         data=np.asarray(stored_metadata.fixed_atom_indices, dtype=np.int64),
                     )
+                if stored_metadata.combine_source_paths:
+                    _write_string_dataset(
+                        metadata_group,
+                        "combine_source_paths",
+                        stored_metadata.combine_source_paths,
+                    )
+                if stored_metadata.combine_source_file_types:
+                    _write_string_dataset(
+                        metadata_group,
+                        "combine_source_file_types",
+                        stored_metadata.combine_source_file_types,
+                    )
+                if stored_metadata.combine_timestamp_utc:
+                    metadata_group.attrs["combine_timestamp_utc"] = stored_metadata.combine_timestamp_utc
+                if stored_metadata.combine_total_frames is not None:
+                    metadata_group.attrs["combine_total_frames"] = stored_metadata.combine_total_frames
+                if stored_metadata.combine_conversion_applied is not None:
+                    metadata_group.attrs["combine_conversion_applied"] = bool(
+                        stored_metadata.combine_conversion_applied
+                    )
+                if stored_metadata.combine_linak_version:
+                    metadata_group.attrs["combine_linak_version"] = stored_metadata.combine_linak_version
+                if stored_metadata.selection_user:
+                    metadata_group.attrs["selection_user"] = stored_metadata.selection_user
+                if stored_metadata.selection_kind:
+                    metadata_group.attrs["selection_kind"] = stored_metadata.selection_kind
+                if stored_metadata.selection_unit:
+                    metadata_group.attrs["selection_unit"] = stored_metadata.selection_unit
+                if stored_metadata.selection_start_frame is not None:
+                    metadata_group.attrs["selection_start_frame"] = stored_metadata.selection_start_frame
+                if stored_metadata.selection_stop_frame_exclusive is not None:
+                    metadata_group.attrs["selection_stop_frame_exclusive"] = (
+                        stored_metadata.selection_stop_frame_exclusive
+                    )
+                if stored_metadata.selection_selected_frame_count is not None:
+                    metadata_group.attrs["selection_selected_frame_count"] = (
+                        stored_metadata.selection_selected_frame_count
+                    )
+                if stored_metadata.selection_resolved_start_time_fs is not None:
+                    metadata_group.attrs["selection_resolved_start_time_fs"] = (
+                        stored_metadata.selection_resolved_start_time_fs
+                    )
+                if stored_metadata.selection_resolved_end_time_fs is not None:
+                    metadata_group.attrs["selection_resolved_end_time_fs"] = (
+                        stored_metadata.selection_resolved_end_time_fs
+                    )
+                if stored_metadata.selection_resolved_start_step is not None:
+                    metadata_group.attrs["selection_resolved_start_step"] = (
+                        stored_metadata.selection_resolved_start_step
+                    )
+                if stored_metadata.selection_resolved_end_step is not None:
+                    metadata_group.attrs["selection_resolved_end_step"] = (
+                        stored_metadata.selection_resolved_end_step
+                    )
+                if stored_metadata.spatial_filter_metadata is not None:
+                    metadata_group.attrs["spatial_filter_json"] = json.dumps(
+                        stored_metadata.spatial_filter_metadata,
+                        sort_keys=True,
+                    )
                 _write_trajectory_surface_cache(metadata_group, stored_metadata)
             progress.update(frame_count)
 
@@ -841,12 +1149,20 @@ def _build_atoms_from_hdf5_chunk(
     pbc_chunk: np.ndarray,
     frame_info_chunks: dict[str, np.ndarray],
     fixed_atom_indices: tuple[int, ...],
+    atom_counts_chunk: np.ndarray | None = None,
 ) -> list[Atoms]:
     chunk: list[Atoms] = []
     for offset in range(len(positions_chunk)):
+        if atom_counts_chunk is None:
+            frame_atomic_numbers = np.asarray(atomic_numbers, dtype=np.int64)
+            frame_positions = np.asarray(positions_chunk[offset], dtype=np.float64)
+        else:
+            atom_count = int(atom_counts_chunk[offset])
+            frame_atomic_numbers = np.asarray(atomic_numbers[offset, :atom_count], dtype=np.int64)
+            frame_positions = np.asarray(positions_chunk[offset, :atom_count], dtype=np.float64)
         frame = Atoms(
-            numbers=atomic_numbers,
-            positions=positions_chunk[offset],
+            numbers=frame_atomic_numbers,
+            positions=frame_positions,
             cell=cell_chunk[offset],
             pbc=tuple(bool(value) for value in pbc_chunk[offset]),
         )
@@ -876,6 +1192,7 @@ def _read_trajectory_hdf5_chunks(path: Path, *, chunk_size: int) -> Iterator[lis
         cells = handle["cell"]
         pbc = handle["pbc"]
         atomic_numbers = np.asarray(handle["atomic_numbers"], dtype=np.int64)
+        atom_counts_dataset = handle.get("atom_counts")
         frame_count = int(handle.attrs.get("frame_count", positions.shape[0]))
         info_group = handle.get("frame_info")
         info_names = list(info_group.keys()) if isinstance(info_group, h5py.Group) else []
@@ -883,6 +1200,8 @@ def _read_trajectory_hdf5_chunks(path: Path, *, chunk_size: int) -> Iterator[lis
         fixed_atom_indices = (
             stored_metadata.fixed_atom_indices if stored_metadata is not None else ()
         )
+        if isinstance(atom_counts_dataset, h5py.Dataset):
+            fixed_atom_indices = ()
 
         with ProgressBar(desc="Reading trajectory", total=frame_count, unit="frame") as progress:
             for start in range(0, frame_count, chunk_size):
@@ -890,18 +1209,28 @@ def _read_trajectory_hdf5_chunks(path: Path, *, chunk_size: int) -> Iterator[lis
                 positions_chunk = np.asarray(positions[start:stop], dtype=np.float64)
                 cell_chunk = np.asarray(cells[start:stop], dtype=np.float64)
                 pbc_chunk = np.asarray(pbc[start:stop], dtype=bool)
+                atom_counts_chunk = (
+                    None
+                    if not isinstance(atom_counts_dataset, h5py.Dataset)
+                    else np.asarray(atom_counts_dataset[start:stop], dtype=np.int64)
+                )
                 frame_info_chunks = (
                     {key: np.asarray(info_group[key][start:stop]) for key in info_names}
                     if isinstance(info_group, h5py.Group)
                     else {}
                 )
                 chunk = _build_atoms_from_hdf5_chunk(
-                    atomic_numbers=atomic_numbers,
+                    atomic_numbers=(
+                        atomic_numbers
+                        if atom_counts_chunk is None
+                        else np.asarray(atomic_numbers[start:stop], dtype=np.int64)
+                    ),
                     positions_chunk=positions_chunk,
                     cell_chunk=cell_chunk,
                     pbc_chunk=pbc_chunk,
                     frame_info_chunks=frame_info_chunks,
                     fixed_atom_indices=fixed_atom_indices,
+                    atom_counts_chunk=atom_counts_chunk,
                 )
                 progress.update(len(chunk))
                 yield chunk
@@ -1207,6 +1536,12 @@ def read_trajectory_chunks(path: str | Path, *, chunk_size: int) -> Iterator[lis
     if not trajectory_path.exists():
         raise FileNotFoundError(f"Trajectory file not found: {trajectory_path}")
 
+    from ..out_h5 import is_linak_out_hdf5, read_out_h5_trajectory_chunks
+
+    if is_linak_out_hdf5(trajectory_path):
+        yield from read_out_h5_trajectory_chunks(trajectory_path, chunk_size=chunk_size)
+        return
+
     if is_linak_trajectory_hdf5(trajectory_path):
         yield from _read_trajectory_hdf5_chunks(trajectory_path, chunk_size=chunk_size)
         return
@@ -1334,7 +1669,11 @@ def read_trajectory(path: str | Path) -> list[Atoms]:
     if not trajectory_path.exists():
         raise FileNotFoundError(f"Trajectory file not found: {trajectory_path}")
 
-    if is_linak_trajectory_hdf5(trajectory_path):
+    from ..out_h5 import is_linak_out_hdf5, read_out_h5_trajectory
+
+    if is_linak_out_hdf5(trajectory_path):
+        frames = read_out_h5_trajectory(trajectory_path)
+    elif is_linak_trajectory_hdf5(trajectory_path):
         frames = _read_trajectory_hdf5(trajectory_path)
     else:
         suffix = trajectory_path.suffix.lower()

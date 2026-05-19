@@ -1,6 +1,7 @@
 import re
 from pathlib import Path
 
+from linak.plot.data_contract import PlotViewMapping
 from linak.plot.plot_gui import (
     _AUTO_PREVIEW_DEBOUNCE_MS,
     _TOOLTIPS,
@@ -11,11 +12,14 @@ from linak.plot.plot_gui import (
     _border_spines_from_setting,
     _current_error_statistics_mode,
     _capture_series_list_view_anchor,
+    _coordination_backend_summary_text,
+    _coordination_mapping_preset_label,
     _coerce_series_error_config,
     _coerce_series_order,
     _coerce_series_descriptors,
     _coerce_series_overrides,
     _default_error_series_label,
+    _density_backend_summary_text,
     _error_supported_for_view,
     _font_size_placeholder_text,
     _inferred_available_error_stats,
@@ -25,12 +29,15 @@ from linak.plot.plot_gui import (
     _extract_limit,
     _extract_dict_mode,
     _format_series_display_text,
+    _orientation_backend_summary_text,
+    _potential_backend_summary_text,
     _partition_series_ids_for_display_order,
     _resolve_error_stat_for_available,
     _resolve_asset_path,
     _resolve_series_id_order,
     _resolve_series_line_colors,
     _restore_series_list_anchor_scroll_value,
+    _settings_use_heatmap_rendering,
     _toggle_to_mode,
     _without_new_profile_series_overrides,
     _without_series_specific_settings,
@@ -110,6 +117,13 @@ def test_plot_settings_panel_imports_qshortcut_from_qtgui():
 
     assert "QShortcut" in source[qtgui_block_start:qtwidgets_block_start]
     assert "QShortcut" not in source[qtwidgets_block_start:qtwidgets_block_end]
+
+
+def test_density_view_type_fallback_is_line_only_without_heatmap_sources():
+    source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+
+    assert 'density_view_type_labels = (_DENSITY_VIEW_TYPE_LABEL_BY_ID["line_1d"],)' in source
+    assert "tuple(_DENSITY_VIEW_TYPE_LABEL_BY_ID.values())" not in source
 
 
 def test_plot_settings_panel_event_filter_uses_qt_modifier_flags_directly():
@@ -291,6 +305,26 @@ def test_plot_settings_panel_includes_cumulative_controls_and_group_actions():
     assert '"member_series_ids"' in source
 
 
+def test_plot_settings_panel_duplicates_profiles_without_reload_or_preview():
+    source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+    assert "on_duplicate_profile: Callable[[str, str], str] | None = None" in source
+    handler_match = re.search(
+        r"def _handle_duplicate_profile\(self\) -> None:(.*?)"
+        r"\n        def _handle_rename_profile",
+        source,
+        re.DOTALL,
+    )
+    assert handler_match is not None
+    handler = handler_match.group(1)
+
+    assert "on_save(current_name, settings)" in handler
+    assert "on_duplicate_profile(current_name, name)" in handler
+    assert "self._set_profile_names([*self._profile_names, name], active_name=name)" in handler
+    assert "self._saved_signature = self._signature(settings)" in handler
+    assert "_load_settings_into_editor" not in handler
+    assert "_schedule_preview_update" not in handler
+
+
 def test_plot_settings_panel_hides_inactive_optional_layer_details():
     source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
 
@@ -385,6 +419,27 @@ def test_plot_settings_panel_keeps_group_normalization_live_and_editable():
     assert "non-group base series only" not in source
     assert "show_normalization=is_line_family," in source
     assert "self._normalization_group.setEnabled(layer_caps.show_normalization)" in source
+
+
+def test_plot_settings_panel_can_copy_none_normalization_to_all_layers():
+    source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+
+    assert 'if mode == "none":\n                value = ""\n                x_ref = ""' in source
+    assert "widget.setVisible(normalization_actions_visible)" in source
+    assert "Turn normalization on first." not in source
+
+    copy_enabled_match = re.search(
+        r"normalization_copy_enabled = \((.*?)\)\n\s+self\._normalization_copy_button\.setEnabled",
+        source,
+        re.DOTALL,
+    )
+    assert copy_enabled_match is not None
+    copy_enabled_expression = copy_enabled_match.group(1)
+    assert "norm_enabled" not in copy_enabled_expression
+    assert "layer_caps.show_normalization" in copy_enabled_expression
+    assert "not is_heatmap" in copy_enabled_expression
+    assert "not self._series_active_is_fit_child" in copy_enabled_expression
+    assert "not self._series_active_is_cumulative_child" in copy_enabled_expression
 
 
 def test_plot_settings_panel_hides_inactive_figure_data_and_annotation_details():
@@ -552,6 +607,22 @@ def test_plot_settings_panel_busts_preview_pixmap_cache_before_reload():
     assert "if not pixmap.load(str(self._preview_image_path)):" in source
 
 
+def test_plot_settings_panel_composites_preview_transparency_on_theme_matte():
+    source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+
+    assert "def _preview_transparency_matte_colors(self) -> tuple[QColor, QColor]:" in source
+    assert 'if self._theme_mode == "dark":' in source
+    assert 'return QColor("#8793a3"), QColor("#aeb7c3")' in source
+    assert 'return QColor("#f4f7fb"), QColor("#dce4ee")' in source
+    assert "def _preview_display_pixmap(self, pixmap: QPixmap) -> QPixmap:" in source
+    assert "painter.fillRect(composed.rect(), matte_a)" in source
+    assert "painter.setBrush(QBrush(matte_b))" in source
+    assert "painter.drawPixmap(0, 0, pixmap)" in source
+    assert "self._preview_pixmap = self._preview_display_pixmap(pixmap)" in source
+    assert "save_result = on_save_figure(settings, str(self._preview_image_path))" in source
+    assert "settings[\"figure_alpha\"]" not in source
+
+
 def test_plot_settings_panel_uses_task_first_workspace_pages():
     source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
 
@@ -703,26 +774,42 @@ def test_plot_settings_panel_allows_resizable_workspace_and_preview_split():
     assert "splitter.setStretchFactor(0, 1)" in source
 
 
-def test_plot_settings_panel_exposes_position_projection_controls():
+def test_plot_settings_panel_exposes_contract_driven_position_mapping_controls():
     source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
 
-    assert "_POSITION_COMPONENT_LABELS = (" in source
-    assert "self.position_component = self._combo(_POSITION_COMPONENT_LABELS)" in source
-    assert "self.position_projection_x = self._combo(_POSITION_PROJECTION_QUANTITIES)" in source
-    assert "self.position_projection_y = self._combo(_POSITION_PROJECTION_QUANTITIES)" in source
-    assert "self.position_projection_render_mode = self._combo(" in source
-    assert '"2D projection"' in source
-    assert '"Color / filter by"' in source
-    assert '"Range min"' in source
-    assert '"Range max"' in source
-    assert 'settings["projection_x"]' in source
-    assert 'settings["projection_y"]' in source
-    assert 'settings["projection_value"]' in source
-    assert 'settings["projection_render_mode"]' in source
-    assert 'settings["projection_filter_min"]' in source
-    assert 'settings["projection_filter_max"]' in source
-    assert "_position_component_display_value" in source
-    assert "_position_component_setting_value" in source
+    assert "def _build_position_mapping_sections(self, layout: QVBoxLayout) -> None:" in source
+    assert 'selection_title = "Source" if analysis == "position" else "Profile Selection"' in source
+    assert 'title="Mapping"' in source
+    assert 'title="Summary"' in source
+    assert 'self.position_view_type = self._combo(' in source
+    assert 'self.position_mapping_x = self._combo(["ps", "fs", "step", "frame"])' in source
+    assert 'self.position_mapping_y = self._combo(["distance", "x", "y", "z"])' in source
+    assert 'self.position_mapping_value = self._combo(list(_POSITION_PROJECTION_QUANTITIES))' in source
+    assert '"Value / color / filter by"' in source
+    assert '"Split by"' in source
+    assert "position_plot_options_to_view_mapping(" in source
+    assert "position_view_mapping_to_plot_options(mapping)" in source
+    assert "generic_view_type_compatibility(" in source
+    assert "self.position_component = self._combo(_POSITION_COMPONENT_LABELS)" not in source
+
+
+def test_plot_settings_panel_uses_rdf_layer_summary_and_coordination_selector_choices():
+    source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+
+    assert "Use stored metadata" not in source
+    assert "Same as Species A / stored metadata" not in source
+    assert 'self._rdf_source_pair_count_label = QLabel("")' in source
+    assert 'self._rdf_source_pair_list_label = QLabel("")' in source
+    assert "All stored RDF profiles are loaded as layers." in source
+    assert '"Available layers"' in source
+    assert '"Pairs"' in source
+    assert "self.rdf_species_a" not in source
+    assert "self.rdf_species_b" not in source
+    assert 'self._binning_helper_label = QLabel("")' in source
+    assert '"series_source_bin_widths"' in source
+    assert "Source bin size:" in source
+    assert "Requested display bin size:" in source
+    assert "Points per visible bin:" in source
 
 
 def test_plot_settings_panel_has_manual_light_dark_theme_switch():
@@ -1269,11 +1356,147 @@ def test_derive_warning_messages_uses_series_overrides_and_skips_heatmap_mode():
     assert all("normalized" not in message.lower() for message in warnings)
 
 
+def test_derive_warning_messages_skips_heatmap_mode_when_only_view_mapping_is_present():
+    warnings = _derive_warning_messages(
+        {
+            "series_descriptors": [
+                {"series_id": "series:0", "source_kind": "source"},
+                {"series_id": "series:1", "source_kind": "source"},
+            ],
+            "series_overrides": {
+                "series:0": {"normalization_mode": "max"},
+                "series:1": {"normalization_mode": "none"},
+            },
+            "view_mapping": PlotViewMapping(
+                view_type_id="heatmap_2d",
+                x="bin_centers_A",
+                y="heatmap_angle_bin_centers",
+                role_assignments={"z": "heatmap_polar"},
+            ),
+        }
+    )
+
+    assert all("normalized" not in message.lower() for message in warnings)
+
+
+def test_backend_summary_helpers_use_view_and_role_wording():
+    assert _density_backend_summary_text(
+        view_type_id="line_1d",
+        x_mode="distance",
+        quantity="mass",
+    ) == "view type=line_1d, x role=distance, y role=mass_density"
+    assert _density_backend_summary_text(
+        view_type_id="heatmap_2d",
+        x_mode="distance",
+        quantity="number",
+    ) == "view type=heatmap_2d, source field=number_density_2d"
+    assert _coordination_mapping_preset_label("time-distance") == "distance_vs_time"
+    assert _coordination_backend_summary_text(
+        component="time-distance",
+        time_axis="ps",
+    ) == "view type=trajectory_2d, view preset=distance_vs_time, x role=time (ps), y role=coordination_number"
+    assert _orientation_backend_summary_text(
+        component="heatmap",
+        angle="azimuthal",
+        is_heatmap=True,
+    ) == "view type=heatmap_2d, view preset=heatmap, angle role=azimuthal"
+    assert _potential_backend_summary_text(
+        view_type="table_records",
+        y_quantity="water_bulk_potential",
+        standard_plot="",
+    ) == "view type=table_records, record inspection mode"
+    assert _potential_backend_summary_text(
+        view_type="line_1d",
+        y_quantity="efermi",
+        standard_plot="",
+    ) == "view type=line_1d, y role=efermi"
+
+
+def test_settings_use_heatmap_rendering_prefers_view_mapping_over_legacy_component():
+    assert (
+        _settings_use_heatmap_rendering(
+            {
+                "component": "heatmap",
+                "view_mapping": PlotViewMapping(
+                    view_type_id="line_1d",
+                    x="distance_A",
+                    y="density",
+                ),
+            }
+        )
+        is False
+    )
+
+
+def test_settings_use_heatmap_rendering_uses_legacy_component_only_as_fallback():
+    assert _settings_use_heatmap_rendering({"component": "heatmap"}) is True
+
+
 def test_derive_warning_messages_ignores_advanced_json_overlap():
     warnings = _derive_warning_messages({"legend": True})
 
     assert all(
         "Advanced JSON overlaps with standard controls" not in message for message in warnings
+    )
+
+
+def test_non_position_mapping_sections_use_role_based_labels_and_notes():
+    source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+
+    assert '"X quantity"' in source
+    assert '"Y / Z quantity"' in source
+    assert '"Plane / source"' in source
+    assert '"Density target"' in source
+    assert '"Y role"' in source
+    assert '"View preset"' in source
+    assert '"View type"' in source
+    assert '"Time x-role"' in source
+    assert '"Angle role"' in source
+
+
+def test_density_target_filter_and_binning_controls_are_source_level():
+    source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+
+    assert "self._density_target_filter = self._combo(self._density_target_filter_labels())" in source
+    assert "def _handle_density_target_filter_changed" in source
+    assert "self._series_enabled_data[index] = show_all or target == selected" in source
+    assert '"Display Binning / Sectioning"' in source
+    assert '"X bin size"' in source
+    assert '"Y bin size"' in source
+    assert "two_dimensional_binning = is_heatmap or density_heatmap_mode" in source
+
+
+def test_non_position_collect_settings_no_longer_emits_active_legacy_mapping_keys():
+    source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+
+    assert 'settings["x_mode"] = density_x_mode' not in source
+    assert 'settings["quantity"] = self.density_quantity.currentText().strip() or "mass"' not in source
+    assert 'settings["component"] = (' not in source
+    assert 'settings["time_axis"] = self.coordination_time_axis.currentText().strip() or "ps"' not in source
+    assert 'settings["angle"] = self.orientation_angle.currentText().strip() or "polar"' not in source
+    assert 'settings["table_view"] = ' not in source
+
+
+def test_position_collect_settings_no_longer_reemits_legacy_mapping_options():
+    source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+
+    assert "settings.update(position_view_mapping_to_plot_options(mapping))" not in source
+
+
+def test_current_view_capability_checks_no_longer_depend_on_position_component_tokens():
+    source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+
+    assert "def _current_position_component_token(self) -> str:" not in source
+    assert "position_component=self._current_position_component_token()" not in source
+
+
+def test_settings_use_heatmap_rendering_checks_mapping_before_legacy_component():
+    source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+    helper_start = source.index("def _settings_use_heatmap_rendering(settings: dict[str, Any]) -> bool:")
+    helper_block = source[helper_start : helper_start + 800]
+
+    assert helper_block.index('mapping = settings.get("view_mapping")') < helper_block.index(
+        'if str(settings.get("component") or "").strip().lower() == "heatmap":'
     )
 
 

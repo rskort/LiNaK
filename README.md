@@ -6,10 +6,11 @@ LiNaK is a lightweight Python toolkit for molecular dynamics trajectory analysis
 
 <img src="assets/linak_gui_banner.svg" alt="LiNaK GUI banner" width="200">
 
-LiNaK provides four top-level commands:
+LiNaK provides five top-level commands:
+- `linak project`: open a project workspace for input management, analyses, outputs, and logs
 - `linak compute`: generate LiNaK HDF5 analysis files
 - `linak plot`: plot LiNaK density, MSD, RDF, position, coordination, potential, and orientation HDF5 files by auto-detecting the analysis from the HDF5 metadata
-- `linak apply`: convert trajectories, apply PBC, or compress CP2K output files
+- `linak apply`: convert trajectories, pack simulation directories, apply PBC, or compress CP2K output files
 - `linak hdf5` (`linak hd`, `linak h5`): inspect, combine, transform, and plot generic tabular HDF5 data
 
 Supported inputs include:

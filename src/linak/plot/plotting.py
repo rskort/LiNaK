@@ -300,6 +300,8 @@ def _density_visible_auto_limits(
     *,
     x_scale: str,
     y_scale: str,
+    x_window: tuple[float | None, float | None] | list[float | None] | None = None,
+    y_window: tuple[float | None, float | None] | list[float | None] | None = None,
 ) -> tuple[list[float] | None, list[float] | None]:
     all_x: list[np.ndarray] = []
     all_y: list[np.ndarray] = []
@@ -310,6 +312,16 @@ def _density_visible_auto_limits(
         x_data = np.asarray(x_values, dtype=float)
         y_data = np.asarray(y_values, dtype=float)
         finite_mask = np.isfinite(x_data) & np.isfinite(y_data)
+        if x_window is not None:
+            if x_window[0] is not None:
+                finite_mask &= x_data >= float(x_window[0])
+            if x_window[1] is not None:
+                finite_mask &= x_data <= float(x_window[1])
+        if y_window is not None:
+            if y_window[0] is not None:
+                finite_mask &= y_data >= float(y_window[0])
+            if y_window[1] is not None:
+                finite_mask &= y_data <= float(y_window[1])
         if not np.any(finite_mask):
             continue
         x_finite = x_data[finite_mask]
@@ -336,6 +348,54 @@ def _density_visible_auto_limits(
         y_focus,
         scale=y_scale,
         clamp_nonnegative_to_zero=True,
+    )
+    return auto_x, auto_y
+
+
+def _visible_series_auto_limits(
+    x_series: list[np.ndarray],
+    y_series: list[np.ndarray],
+    *,
+    x_scale: str,
+    y_scale: str,
+    x_window: tuple[float | None, float | None] | list[float | None] | None = None,
+    y_window: tuple[float | None, float | None] | list[float | None] | None = None,
+    clamp_y_nonnegative_to_zero: bool = False,
+) -> tuple[list[float] | None, list[float] | None]:
+    visible_x: list[np.ndarray] = []
+    visible_y: list[np.ndarray] = []
+
+    for x_values, y_values in zip(x_series, y_series):
+        x_data = np.asarray(x_values, dtype=float)
+        y_data = np.asarray(y_values, dtype=float)
+        finite_mask = np.isfinite(x_data) & np.isfinite(y_data)
+        if x_window is not None:
+            if x_window[0] is not None:
+                finite_mask &= x_data >= float(x_window[0])
+            if x_window[1] is not None:
+                finite_mask &= x_data <= float(x_window[1])
+        if y_window is not None:
+            if y_window[0] is not None:
+                finite_mask &= y_data >= float(y_window[0])
+            if y_window[1] is not None:
+                finite_mask &= y_data <= float(y_window[1])
+        if not np.any(finite_mask):
+            continue
+        visible_x.append(x_data[finite_mask])
+        visible_y.append(y_data[finite_mask])
+
+    if not visible_x:
+        return None, None
+
+    auto_x = _auto_axis_limits_from_values(
+        np.concatenate(visible_x),
+        scale=x_scale,
+        clamp_nonnegative_to_zero=False,
+    )
+    auto_y = _auto_axis_limits_from_values(
+        np.concatenate(visible_y),
+        scale=y_scale,
+        clamp_nonnegative_to_zero=clamp_y_nonnegative_to_zero,
     )
     return auto_x, auto_y
 
@@ -1032,20 +1092,6 @@ def _coerce_integration_config(value: Any) -> IntegrationConfig:
     )
 
 
-def _integration_target_ids(
-    render_items: list[dict[str, Any]],
-    config: IntegrationConfig,
-) -> set[str]:
-    visible_ids = [
-        str(item.get("series_id") or "").strip()
-        for item in render_items
-        if str(item.get("series_id") or "").strip() and bool(item.get("series_enabled", True))
-    ]
-    if config.target_series_id:
-        return {config.target_series_id}
-    return {visible_ids[0]} if visible_ids else set()
-
-
 def _integration_region(
     x_values: np.ndarray,
     y_values: np.ndarray,
@@ -1659,15 +1705,24 @@ def _visible_axes_data_bounds(ax: Any) -> tuple[float, float, float, float] | No
     return min(x_mins), max(x_maxs), min(y_mins), max(y_maxs)
 
 
-def _apply_figure_kwargs(fig: Any, figure_kwargs: dict[str, Any] | None) -> None:
+def _apply_figure_kwargs(fig: Any, figure_kwargs: dict[str, Any] | None) -> float | None:
     if figure_kwargs is None:
-        return
+        return None
     resolved = dict(figure_kwargs)
     alpha = resolved.pop("alpha", None)
     if resolved:
         fig.set(**resolved)
     if alpha is not None:
-        fig.patch.set_alpha(float(alpha))
+        resolved_alpha = float(alpha)
+        fig.patch.set_alpha(resolved_alpha)
+        return resolved_alpha
+    return None
+
+
+def _apply_axes_face_alpha(ax: Any, alpha: float | None) -> None:
+    if alpha is None:
+        return
+    ax.patch.set_alpha(float(alpha))
 
 
 def _axis_tick_params(
@@ -2704,7 +2759,7 @@ def plot_heatmap_series(
         rc_context_args.update(dict(matplotlib_rc))
     with plt.rc_context(rc_context_args):
         fig, ax = plt.subplots(figsize=style.figure_size)
-        _apply_figure_kwargs(fig, figure_kwargs)
+        figure_alpha = _apply_figure_kwargs(fig, figure_kwargs)
 
         heatmap_array = np.asarray(z_values, dtype=float)
         mesh_kwargs: dict[str, Any] = {
@@ -2878,6 +2933,7 @@ def plot_heatmap_series(
         _apply_axes_border(ax, visible=style.axes_border)
         if axes_kwargs is not None:
             ax.set(**dict(axes_kwargs))
+        _apply_axes_face_alpha(ax, figure_alpha)
 
         if tight_layout_kwargs is not None:
             fig.tight_layout(**dict(tight_layout_kwargs))
@@ -3428,7 +3484,7 @@ def plot_multi_line_series(
         rc_context_args.update(dict(matplotlib_rc))
     with plt.rc_context(rc_context_args):
         fig, ax = plt.subplots(figsize=style.figure_size)
-        _apply_figure_kwargs(fig, figure_kwargs)
+        figure_alpha = _apply_figure_kwargs(fig, figure_kwargs)
         rendered_colors: list[str] = []
         rendered_markers: list[str] = []
         rendered_labels: list[str] = []
@@ -3438,8 +3494,11 @@ def plot_multi_line_series(
         error_summaries: dict[str, dict[str, Any]] = {}
         available_error_stats_map: dict[str, list[str]] = {}
         point_counts_map: dict[str, list[int]] = {}
+        source_bin_widths: dict[str, float | None] = {}
         masked_bin_counts: dict[str, int] = {}
         grouped_summaries: dict[str, dict[str, Any]] = {}
+        visible_x_series: list[np.ndarray] = []
+        visible_y_series: list[np.ndarray] = []
         density_visible_x_series: list[np.ndarray] = []
         density_visible_y_series: list[np.ndarray] = []
         has_visible_overlay_bounds = False
@@ -3454,6 +3513,12 @@ def plot_multi_line_series(
             y_values = prepared_item.y
             fit_key = str(item["series_id"])
             available_error_stats_map[fit_key] = list(prepared_item.available_error_stats)
+            x_source = item.get("x")
+            if x_source is None:
+                x_source = prepared_item.x
+            source_bin_widths[fit_key] = _resolve_meaningful_source_bin_width(
+                np.asarray(x_source, dtype=float)
+            )
             if prepared_item.statistics is not None:
                 point_counts_map[fit_key] = np.asarray(
                     prepared_item.statistics.point_count, dtype=int
@@ -3497,6 +3562,8 @@ def plot_multi_line_series(
                 rendered_colors.append(str(artist.get_color()))
                 rendered_markers.append(str(artist.get_marker()))
                 rendered_labels.append(str(artist.get_label()))
+                visible_x_series.append(np.asarray(x_values, dtype=float))
+                visible_y_series.append(np.asarray(y_values, dtype=float))
                 if str(analysis_name or "").strip().lower() == "density":
                     density_visible_x_series.append(np.asarray(x_values, dtype=float))
                     density_visible_y_series.append(np.asarray(y_values, dtype=float))
@@ -3770,6 +3837,8 @@ def plot_multi_line_series(
                         np.asarray(fit_summary.get("y_fit", []), dtype=float),
                         **fit_kwargs,
                     )
+                    visible_x_series.append(np.asarray(fit_summary.get("x_fit", []), dtype=float))
+                    visible_y_series.append(np.asarray(fit_summary.get("y_fit", []), dtype=float))
                     has_visible_overlay_bounds = True
 
             cumulative_config = item.get("cumulative_config")
@@ -3814,6 +3883,8 @@ def plot_multi_line_series(
                     elif artist is not None and artist.get_alpha() is not None:
                         cumulative_kwargs["alpha"] = float(artist.get_alpha())
                     ax.plot(cumulative_x, cumulative_y, **cumulative_kwargs)
+                    visible_x_series.append(np.asarray(cumulative_x, dtype=float))
+                    visible_y_series.append(np.asarray(cumulative_y, dtype=float))
                     has_visible_overlay_bounds = True
             else:
                 cumulative_summaries[fit_key] = {
@@ -3843,21 +3914,66 @@ def plot_multi_line_series(
                 text.set_color(style.font_color)
             legend_obj.get_title().set_color(style.font_color)
         auto_x_lim, auto_y_lim = _axes_artist_auto_limits(ax)
+        requested_x_window = (
+            x_lim
+            if x_lim is not None and any(bound is not None for bound in x_lim[:2])
+            else None
+        )
+        requested_y_window = (
+            y_lim
+            if y_lim is not None and any(bound is not None for bound in y_lim[:2])
+            else None
+        )
+        constrain_auto_x = requested_y_window is not None and (
+            x_lim is None or any(bound is None for bound in x_lim[:2])
+        )
+        constrain_auto_y = requested_x_window is not None and (
+            y_lim is None or any(bound is None for bound in y_lim[:2])
+        )
         if str(analysis_name or "").strip().lower() == "density":
             density_auto_x_lim, density_auto_y_lim = _density_visible_auto_limits(
                 density_visible_x_series,
                 density_visible_y_series,
                 x_scale=x_scale,
                 y_scale=y_scale,
+                x_window=requested_x_window if constrain_auto_y else None,
+                y_window=requested_y_window if constrain_auto_x else None,
+            )
+            overlay_auto_x_lim, overlay_auto_y_lim = _visible_series_auto_limits(
+                visible_x_series,
+                visible_y_series,
+                x_scale=x_scale,
+                y_scale=y_scale,
+                x_window=requested_x_window if constrain_auto_y else None,
+                y_window=requested_y_window if constrain_auto_x else None,
+                clamp_y_nonnegative_to_zero=True,
             )
             auto_x_lim = density_auto_x_lim if density_auto_x_lim is not None else auto_x_lim
+            if constrain_auto_x and overlay_auto_x_lim is not None:
+                auto_x_lim = overlay_auto_x_lim
             auto_y_lim = (
-                _union_axis_limits(density_auto_y_lim, auto_y_lim)
+                _union_axis_limits(density_auto_y_lim, overlay_auto_y_lim or auto_y_lim)
                 if has_visible_overlay_bounds
                 else density_auto_y_lim
                 if density_auto_y_lim is not None
+                else overlay_auto_y_lim
+                if overlay_auto_y_lim is not None
                 else auto_y_lim
             )
+        elif constrain_auto_x or constrain_auto_y:
+            constrained_auto_x_lim, constrained_auto_y_lim = _visible_series_auto_limits(
+                visible_x_series,
+                visible_y_series,
+                x_scale=x_scale,
+                y_scale=y_scale,
+                x_window=requested_x_window if constrain_auto_y else None,
+                y_window=requested_y_window if constrain_auto_x else None,
+                clamp_y_nonnegative_to_zero=False,
+            )
+            if constrain_auto_x and constrained_auto_x_lim is not None:
+                auto_x_lim = constrained_auto_x_lim
+            if constrain_auto_y and constrained_auto_y_lim is not None:
+                auto_y_lim = constrained_auto_y_lim
         x_lim = _merge_axis_limits(x_lim, auto_x_lim)
         y_lim = _merge_axis_limits(y_lim, auto_y_lim)
         xlabel_kwargs: dict[str, Any] = {
@@ -3964,6 +4080,7 @@ def plot_multi_line_series(
         _apply_axes_border(ax, visible=style.axes_border)
         if axes_kwargs is not None:
             ax.set(**dict(axes_kwargs))
+        _apply_axes_face_alpha(ax, figure_alpha)
 
         if tight_layout_kwargs is not None:
             fig.tight_layout(**dict(tight_layout_kwargs))
@@ -3988,6 +4105,7 @@ def plot_multi_line_series(
             capture_state["series_error_summaries"] = error_summaries
             capture_state["series_available_error_stats"] = available_error_stats_map
             capture_state["series_point_counts"] = point_counts_map
+            capture_state["series_source_bin_widths"] = source_bin_widths
             capture_state["series_masked_bin_counts"] = masked_bin_counts
             capture_state["series_group_summaries"] = grouped_summaries
             capture_state["integration_summaries"] = list(integration_summaries)

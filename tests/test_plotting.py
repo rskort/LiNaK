@@ -552,6 +552,7 @@ def test_plot_heatmap_series_applies_figure_alpha_and_font_color_settings(tmp_pa
     ax = capture_state["axes"]
     colorbar = capture_state["heatmap_colorbar"]
     assert fig.patch.get_alpha() == pytest.approx(0.35)
+    assert ax.patch.get_alpha() == pytest.approx(0.35)
     assert ax.title.get_color() == "#654321"
     assert ax.xaxis.label.get_color() == "#654321"
     assert ax.yaxis.label.get_color() == "#654321"
@@ -560,6 +561,29 @@ def test_plot_heatmap_series_applies_figure_alpha_and_font_color_settings(tmp_pa
     assert ax.yaxis.label.get_size() == pytest.approx(14)
     assert ax.xaxis.get_major_ticks()[0].label1.get_size() == pytest.approx(8)
     assert ax.yaxis.get_major_ticks()[0].label1.get_size() == pytest.approx(10)
+
+
+def test_plot_multi_line_series_applies_figure_alpha_to_axes_face(tmp_path):
+    capture_state: dict[str, object] = {}
+
+    result = plotting_module.plot_multi_line_series(
+        [np.array([0.0, 1.0], dtype=float)],
+        [np.array([1.0, 2.0], dtype=float)],
+        ["line"],
+        title="Line",
+        x_label="x",
+        y_label="y",
+        output=tmp_path / "styled_line.png",
+        show=False,
+        figure_kwargs={"alpha": 0.35},
+        capture_state=capture_state,
+    )
+
+    assert result is not None
+    fig = capture_state["figure"]
+    ax = capture_state["axes"]
+    assert fig.patch.get_alpha() == pytest.approx(0.35)
+    assert ax.patch.get_alpha() == pytest.approx(0.35)
 
 
 def test_with_style_overrides_updates_axes_border():
@@ -1331,6 +1355,58 @@ def test_plot_multi_line_series_density_autolimits_ignore_zero_tails_with_explic
     assert isinstance(x_lim, list)
     assert x_lim[0] > 0.0
     assert x_lim[1] < 39.0
+
+
+def test_plot_multi_line_series_manual_x_limits_recompute_auto_y_from_visible_data(tmp_path):
+    capture_state: dict[str, object] = {}
+
+    x_values = np.array([0.0, 1.0, 2.0, 10.0, 11.0], dtype=float)
+    y_values = np.array([1.0, 2.0, 3.0, 100.0, 120.0], dtype=float)
+
+    result = plotting_module.plot_multi_line_series(
+        [x_values],
+        [y_values],
+        ["run-a"],
+        title="Visible subset y autoscale",
+        x_label="x",
+        y_label="y",
+        output=tmp_path / "visible_subset_y_autoscale.png",
+        show=False,
+        x_lim=[0.0, 2.0],
+        y_lim=[None, None],
+        capture_state=capture_state,
+    )
+
+    assert result is not None
+    y_lim = capture_state["y_lim"]
+    assert isinstance(y_lim, list)
+    assert y_lim[1] < 10.0
+
+
+def test_plot_multi_line_series_manual_y_limits_recompute_auto_x_from_visible_data(tmp_path):
+    capture_state: dict[str, object] = {}
+
+    x_values = np.array([0.0, 1.0, 2.0, 10.0, 11.0], dtype=float)
+    y_values = np.array([1.0, 2.0, 3.0, 100.0, 120.0], dtype=float)
+
+    result = plotting_module.plot_multi_line_series(
+        [x_values],
+        [y_values],
+        ["run-a"],
+        title="Visible subset x autoscale",
+        x_label="x",
+        y_label="y",
+        output=tmp_path / "visible_subset_x_autoscale.png",
+        show=False,
+        x_lim=[None, None],
+        y_lim=[0.0, 3.0],
+        capture_state=capture_state,
+    )
+
+    assert result is not None
+    x_lim = capture_state["x_lim"]
+    assert isinstance(x_lim, list)
+    assert x_lim[1] < 3.0
 
 
 def test_plot_multi_line_series_autoscales_to_visible_errorbars(tmp_path):

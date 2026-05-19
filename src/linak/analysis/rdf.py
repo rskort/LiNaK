@@ -19,7 +19,10 @@ from ase.geometry import get_distances
 from ase.neighborlist import neighbor_list
 from scipy.spatial import cKDTree
 
+from ..plot.data_contract import PlotDataContract, PlotViewMapping
+from ..plot.mappings.rdf_mapping import resolve_rdf_plot_mapping
 from ..storage.hdf5_utils import (
+    resolve_hdf5_output_path,
     write_linak_hdf5,
 )
 from .binning import (
@@ -71,6 +74,8 @@ _RDF_FAST_TARGET_CHUNKS_PER_WORKER = 4
 _RDF_BACKEND_DENSE = "chunked_dense_matrix"
 _RDF_BACKEND_SPARSE = "chunked_sparse_cutoff"
 _RDF_BACKEND_GENERIC = "framewise_generic_fallback"
+_RDF_SAME_PAIR_RTOL = 1.0e-6
+_RDF_SAME_PAIR_ATOL = 1.0e-8
 
 
 @dataclass(frozen=True)
@@ -239,19 +244,6 @@ def _empty_rdf_statistics_moments(
     )
 
 
-def _rdf_g_values_from_counts_expected(
-    counts: np.ndarray,
-    expected: np.ndarray,
-) -> np.ndarray:
-    """Return exact per-frame RDF values with NaN where expected counts are unavailable."""
-    counts_array = np.asarray(counts, dtype=float)
-    expected_array = np.asarray(expected, dtype=float)
-    g_values = np.full(counts_array.shape, np.nan, dtype=float)
-    finite = expected_array > 0.0
-    g_values[finite] = counts_array[finite] / expected_array[finite]
-    return g_values
-
-
 def _update_rdf_statistics_moments(
     moments: _RDFStatisticsMoments | None,
     *,
@@ -409,13 +401,6 @@ def _ordered_unique_unordered_rdf_pairs(
         seen.add(pair)
         ordered.append(pair)
     return ordered
-
-
-def _canonicalize_rdf_pair(species_a: str, species_b: str) -> tuple[str, str]:
-    """Return deterministic unordered RDF pair order for physical pair identity."""
-    left = _normalize_species(species_a)
-    right = _normalize_species(species_b)
-    return (left, right) if left <= right else (right, left)
 
 
 def _pair_request_is_cross_species(
@@ -2345,6 +2330,231 @@ def _rdf_profile_hdf5_payload(profile: RDFProfile) -> dict[str, Any]:
         ),
     }
 
+def _rdf_pair_storage_key(species_a: str, species_b: str) -> tuple[str, str]:
+    normalized_a = _normalize_species(species_a)
+    normalized_b = _normalize_species(species_b)
+    return tuple(sorted((normalized_a, normalized_b)))
+
+
+def _rdf_payload_pair_key(payload: Mapping[str, Any]) -> tuple[str, str]:
+    metadata = payload.get("metadata", {})
+    species_a = str(metadata.get("species_a", "")).strip() or "UNKNOWN"
+    species_b = str(metadata.get("species_b", "")).strip() or species_a
+    return _rdf_pair_storage_key(species_a, species_b)
+
+
+def _resolve_non_overwriting_rdf_output_path(path: str | Path) -> Path:
+    resolved = resolve_hdf5_output_path(path)
+    if not resolved.exists():
+        return resolved
+    stem = resolved.stem
+    suffix = resolved.suffix
+    parent = resolved.parent
+    counter = 1
+    while True:
+        candidate = parent / f"{stem}_{counter}{suffix}"
+        if not candidate.exists():
+            return candidate
+        counter += 1
+
+
+def _rdf_collection_compatibility_error(
+    existing_payloads: Sequence[tuple[dict[str, np.ndarray], dict[str, Any]]],
+    incoming_payloads: Sequence[Mapping[str, Any]],
+    *,
+    expected_source_path: str | None,
+) -> str | None:
+    if not existing_payloads:
+        return None
+    if not incoming_payloads:
+        return "no incoming RDF payloads were provided"
+
+    incoming_source = str(expected_source_path or "").strip()
+    incoming_reference = incoming_payloads[0]
+    incoming_reference_datasets = incoming_reference.get("datasets", {})
+    incoming_reference_metadata = incoming_reference.get("metadata", {})
+    incoming_centers = np.asarray(incoming_reference_datasets.get("bin_centers_A", []), dtype=float)
+    incoming_n_frames = int(incoming_reference_metadata.get("n_frames", 0) or 0)
+
+    seen_pair_keys: set[tuple[str, str]] = set()
+    for index, (datasets, metadata) in enumerate(existing_payloads):
+        pair_key = _rdf_pair_storage_key(
+            str(metadata.get("species_a", "")).strip() or "UNKNOWN",
+            str(metadata.get("species_b", "")).strip() or str(metadata.get("species_a", "")).strip() or "UNKNOWN",
+        )
+        if pair_key in seen_pair_keys:
+            return f"stored RDF collection already contains duplicate pair '{pair_key[0]}-{pair_key[1]}'"
+        seen_pair_keys.add(pair_key)
+
+        if incoming_source:
+            stored_source = str(metadata.get("source_path", "")).strip()
+            if stored_source and Path(stored_source).expanduser().resolve() != Path(
+                incoming_source
+            ).expanduser().resolve():
+                return "stored source_path does not match the requested trajectory source"
+
+        stored_centers = np.asarray(datasets.get("bin_centers_A", []), dtype=float)
+        if stored_centers.shape != incoming_centers.shape or not np.allclose(
+            stored_centers,
+            incoming_centers,
+            rtol=1.0e-9,
+            atol=1.0e-12,
+        ):
+            return f"stored RDF bin geometry is incompatible at profile index {index}"
+
+        stored_n_frames = int(metadata.get("n_frames", 0) or 0)
+        if stored_n_frames != incoming_n_frames:
+            return f"stored n_frames={stored_n_frames} is incompatible with incoming n_frames={incoming_n_frames}"
+
+    return None
+
+
+def _rdf_payloads_match_within_tolerance(
+    existing_payload: Mapping[str, Any],
+    incoming_payload: Mapping[str, Any],
+) -> bool:
+    existing_datasets = existing_payload.get("datasets", {})
+    incoming_datasets = incoming_payload.get("datasets", {})
+    existing_centers = np.asarray(existing_datasets.get("bin_centers_A", []), dtype=float)
+    incoming_centers = np.asarray(incoming_datasets.get("bin_centers_A", []), dtype=float)
+    existing_g_r = np.asarray(existing_datasets.get("g_r", []), dtype=float)
+    incoming_g_r = np.asarray(incoming_datasets.get("g_r", []), dtype=float)
+    return (
+        existing_centers.shape == incoming_centers.shape
+        and existing_g_r.shape == incoming_g_r.shape
+        and np.allclose(existing_centers, incoming_centers, rtol=1.0e-9, atol=1.0e-12)
+        and np.allclose(
+            existing_g_r,
+            incoming_g_r,
+            rtol=_RDF_SAME_PAIR_RTOL,
+            atol=_RDF_SAME_PAIR_ATOL,
+            equal_nan=True,
+        )
+    )
+
+
+def _save_rdf_profile_collection(
+    profiles: Sequence[RDFProfile],
+    output: str | Path,
+    *,
+    additional_metadata: Mapping[str, Any] | None = None,
+    merge_existing: bool,
+) -> Path:
+    payloads = [_rdf_profile_hdf5_payload(profile) for profile in profiles]
+    root_metadata = dict(additional_metadata or {})
+    output_path = resolve_hdf5_output_path(output)
+    if not merge_existing or not output_path.exists():
+        written_path = write_profile_collection(
+            output_path,
+            analysis="rdf",
+            profiles=payloads,
+            metadata=root_metadata,
+        )
+        LOGGER.info("Saved %d RDF profile(s) to '%s'.", len(payloads), written_path)
+        return written_path
+
+    try:
+        _source_path, existing_payloads = read_profile_payloads(
+            output_path,
+            analysis="rdf",
+            label="RDF",
+        )
+    except Exception as exc:
+        fallback_path = _resolve_non_overwriting_rdf_output_path(output_path)
+        LOGGER.warning(
+            "Existing RDF output '%s' could not be merged (%s). Writing fallback file '%s'.",
+            output_path,
+            exc,
+            fallback_path,
+        )
+        written_path = write_profile_collection(
+            fallback_path,
+            analysis="rdf",
+            profiles=payloads,
+            metadata=root_metadata,
+        )
+        LOGGER.info("Saved %d RDF profile(s) to fallback '%s'.", len(payloads), written_path)
+        return written_path
+
+    compatibility_error = _rdf_collection_compatibility_error(
+        existing_payloads,
+        payloads,
+        expected_source_path=str(root_metadata.get("source_path", "")).strip() or None,
+    )
+    if compatibility_error is not None:
+        fallback_path = _resolve_non_overwriting_rdf_output_path(output_path)
+        LOGGER.warning(
+            "Existing RDF output '%s' is incompatible (%s). Writing fallback file '%s'.",
+            output_path,
+            compatibility_error,
+            fallback_path,
+        )
+        written_path = write_profile_collection(
+            fallback_path,
+            analysis="rdf",
+            profiles=payloads,
+            metadata=root_metadata,
+        )
+        LOGGER.info("Saved %d RDF profile(s) to fallback '%s'.", len(payloads), written_path)
+        return written_path
+
+    merged_payloads = [
+        {"datasets": dict(datasets), "metadata": dict(metadata)}
+        for datasets, metadata in existing_payloads
+    ]
+    existing_index_by_pair = {
+        _rdf_payload_pair_key(payload): index for index, payload in enumerate(merged_payloads)
+    }
+    appended_labels: list[str] = []
+    identical_labels: list[str] = []
+    replaced_labels: list[str] = []
+
+    for payload in payloads:
+        metadata = payload.get("metadata", {})
+        species_a = str(metadata.get("species_a", "")).strip() or "UNKNOWN"
+        species_b = str(metadata.get("species_b", "")).strip() or species_a
+        label = f"{species_a}-{species_b}"
+        pair_key = _rdf_pair_storage_key(species_a, species_b)
+        existing_index = existing_index_by_pair.get(pair_key)
+        if existing_index is None:
+            existing_index_by_pair[pair_key] = len(merged_payloads)
+            merged_payloads.append(payload)
+            appended_labels.append(label)
+            continue
+        if _rdf_payloads_match_within_tolerance(merged_payloads[existing_index], payload):
+            identical_labels.append(label)
+        else:
+            replaced_labels.append(label)
+        merged_payloads[existing_index] = payload
+
+    written_path = write_profile_collection(
+        output_path,
+        analysis="rdf",
+        profiles=merged_payloads,
+        metadata=root_metadata,
+    )
+    if appended_labels:
+        LOGGER.info(
+            "Appended RDF profile(s) %s to '%s'.",
+            ", ".join(appended_labels),
+            written_path,
+        )
+    if identical_labels:
+        LOGGER.info(
+            "RDF profile(s) already up to date in '%s': %s.",
+            written_path,
+            ", ".join(identical_labels),
+        )
+    if replaced_labels:
+        LOGGER.warning(
+            "Replaced existing RDF profile(s) in '%s' with newly computed data: %s.",
+            written_path,
+            ", ".join(replaced_labels),
+        )
+    if not appended_labels and not identical_labels and not replaced_labels:
+        LOGGER.info("Saved RDF profile collection to '%s'.", written_path)
+    return written_path
+
 
 def save_rdf_profile(
     profile: RDFProfile,
@@ -2373,25 +2583,24 @@ def save_rdf_profiles(
     output: str | Path,
     *,
     additional_metadata: Mapping[str, Any] | None = None,
+    force_collection: bool = False,
+    merge_existing: bool = False,
 ) -> Path:
     """Save one or more RDF profiles to LiNaK HDF5 and return the written path."""
     if not profiles:
         raise ValueError("At least one RDF profile is required.")
-    if len(profiles) == 1:
+    if len(profiles) == 1 and not force_collection and not merge_existing:
         return save_rdf_profile(
             profiles[0],
             output,
             additional_metadata=additional_metadata,
         )
-
-    output_path = write_profile_collection(
+    return _save_rdf_profile_collection(
+        profiles,
         output,
-        analysis="rdf",
-        profiles=[_rdf_profile_hdf5_payload(profile) for profile in profiles],
-        metadata=dict(additional_metadata or {}),
+        additional_metadata=additional_metadata,
+        merge_existing=merge_existing,
     )
-    LOGGER.info("Saved %d RDF profiles to '%s'.", len(profiles), output_path)
-    return output_path
 
 
 def load_rdf_profile(
@@ -2574,6 +2783,8 @@ def plot_rdf_profile(
     preferred_backend: str | None = None,
     series_id: str | None = None,
     style: PlotStyle = DEFAULT_PLOT_STYLE,
+    data_contract: PlotDataContract | None = None,
+    view_mapping: PlotViewMapping | None = None,
     title: str | None = None,
     x_label: str | None = None,
     y_label: str | None = None,
@@ -2628,6 +2839,11 @@ def plot_rdf_profile(
     savefig_kwargs: dict[str, Any] | None = None,
 ) -> Path | None:
     """Plot RDF profile using shared LiNaK plotting style."""
+    resolve_rdf_plot_mapping(
+        contract=data_contract,
+        profile=profile,
+        mapping=view_mapping,
+    )
     schema_labels = default_plot_labels("rdf")
     default_x = "r (Angstrom)" if schema_labels is None else schema_labels[0]
     default_y = "g(r)" if schema_labels is None else schema_labels[1]
@@ -2718,6 +2934,8 @@ def plot_rdf_profiles(
     show_blocking: bool = True,
     preferred_backend: str | None = None,
     style: PlotStyle = DEFAULT_PLOT_STYLE,
+    data_contract: PlotDataContract | None = None,
+    view_mapping: PlotViewMapping | None = None,
     title: str | None = None,
     x_label: str | None = None,
     y_label: str | None = None,
@@ -2781,6 +2999,12 @@ def plot_rdf_profiles(
     default_y = "g(r)" if schema_labels is None else schema_labels[1]
     if not profiles:
         raise ValueError("At least one RDF profile is required.")
+    first_profile = profiles[0]
+    resolved_mapping = resolve_rdf_plot_mapping(
+        contract=data_contract,
+        profile=first_profile,
+        mapping=view_mapping,
+    )
     default_labels = [f"{profile.species_a}-{profile.species_b}" for profile in profiles]
     labels = resolve_series_labels(
         default_labels,
@@ -2800,6 +3024,8 @@ def plot_rdf_profiles(
             show_blocking=show_blocking,
             preferred_backend=preferred_backend,
             style=style,
+            data_contract=resolved_mapping.contract,
+            view_mapping=resolved_mapping.mapping,
             title=title,
             x_label=x_label,
             y_label=y_label,
