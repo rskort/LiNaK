@@ -81,7 +81,7 @@ def density_plot_options_to_view_mapping(
             f"Unsupported density x_mode '{x_mode}'. Choose 'distance', 'x', 'y', 'z', or 'axis'."
         )
     y_quantity = "mass_density" if normalized_quantity == "mass" else "number_density"
-    fixed_values = {"quantity": normalized_quantity}
+    fixed_values: dict[str, str] = {}
     if x_quantity == "axis_coordinate":
         fixed_values["x_mode"] = normalized_x_mode
     return PlotViewMapping(
@@ -112,7 +112,9 @@ def density_view_mapping_to_plot_options(mapping: PlotViewMapping) -> dict[str, 
             )
         return {"view_type": "heatmap_2d", "quantity": quantity}
     if view_type_id != "line_1d":
-        raise ValueError("Current density plotting only supports 'line_1d' and 'heatmap_2d' mappings.")
+        raise ValueError(
+            "Current density plotting only supports 'line_1d' and 'heatmap_2d' mappings."
+        )
     x_quantity = str(mapping.x or "").strip()
     y_quantity = str(mapping.y or "").strip()
     if x_quantity == "distance_to_surface":

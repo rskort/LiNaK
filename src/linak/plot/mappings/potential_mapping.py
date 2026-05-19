@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any
-
 import numpy as np
 
 from ..contracts.potential_contract import (
@@ -73,11 +71,7 @@ def potential_plot_options_to_view_mapping(
         view_type_id="line_1d",
         x="record_id",
         y=normalized_y,
-        fixed_values=(
-            {"standard_plot": "summary"}
-            if y_quantity is None
-            else {}
-        ),
+        fixed_values=({"standard_plot": "summary"} if y_quantity is None else {}),
     )
 
 
@@ -149,7 +143,9 @@ def potential_table_rows(profiles: Sequence[object]) -> list[dict[str, float | N
     for index, record_id in enumerate(x_values.tolist()):
         row = {
             "record_id": float(record_id),
-            "water_bulk_potential": _potential_series_value(series_by_id, "water_bulk_potential_ev", index),
+            "water_bulk_potential": _potential_series_value(
+                series_by_id, "water_bulk_potential_ev", index
+            ),
             "efermi": _potential_series_value(series_by_id, "efermi_ev", index),
             "electrode_cshe": _potential_series_value(series_by_id, "electrode_cshe_ev", index),
         }

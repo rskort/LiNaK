@@ -8,6 +8,8 @@ import pytest
 
 from linak.cli import main
 from linak.analysis.potential import (
+    BOHR_TO_ANG,
+    CubeHeader,
     HARTREE_TO_EV,
     PotentialComputationFailure,
     PotentialConfig,
@@ -15,7 +17,9 @@ from linak.analysis.potential import (
     compute_potential_records,
     load_potential_plot_profiles,
     plot_potential_profiles,
+    _non_water_contaminated_z_slices,
     _resolve_worker_count,
+    _water_bulk_potential_ev,
 )
 from linak.storage.hdf5_utils import read_linak_hdf5_profiles
 from linak.plot.mappings.potential_mapping import potential_plot_options_to_view_mapping
@@ -148,6 +152,83 @@ def _write_potential_summary_hdf5(
             "electrode_cshe_ev",
             data=np.asarray([np.nan if value is None else value for value in cshe], dtype=float),
         )
+
+
+def _test_cube_header(atom_specs_ang: list[tuple[int, float]], *, nz: int) -> CubeHeader:
+    return CubeHeader(
+        natoms=len(atom_specs_ang),
+        origin_bohr=np.zeros(3, dtype=float),
+        nx=1,
+        ny=1,
+        nz=nz,
+        vx_bohr=np.asarray([1.0, 0.0, 0.0], dtype=float),
+        vy_bohr=np.asarray([0.0, 1.0, 0.0], dtype=float),
+        vz_bohr=np.asarray([0.0, 0.0, 1.0 / BOHR_TO_ANG], dtype=float),
+        atom_numbers=np.asarray([atomic_number for atomic_number, _ in atom_specs_ang], dtype=int),
+        atom_z_bohr=np.asarray(
+            [z_ang / BOHR_TO_ANG for _, z_ang in atom_specs_ang],
+            dtype=float,
+        ),
+    )
+
+
+def test_water_bulk_potential_excludes_non_water_z_slice_from_widest_span():
+    z_ang = np.arange(9, dtype=float)
+    v_xyavg_ev = np.asarray([4.0, 4.0, 99.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0])
+    header = _test_cube_header([(8, 0.0), (1, 8.0), (11, 2.1)], nz=z_ang.size)
+
+    contaminated = _non_water_contaminated_z_slices(z_ang, header)
+    value, z_min, z_max = _water_bulk_potential_ev(
+        z_ang=z_ang,
+        v_xyavg_ev=v_xyavg_ev,
+        water_z_min_ang=0.0,
+        water_z_max_ang=8.0,
+        padding_ang=0.0,
+        contaminated_z_mask=contaminated,
+    )
+
+    assert contaminated.tolist() == [False, False, True, False, False, False, False, False, False]
+    assert value == pytest.approx(2.0)
+    assert z_min == pytest.approx(3.0)
+    assert z_max == pytest.approx(8.0)
+
+
+def test_water_bulk_potential_padding_fallback_keeps_contaminated_slice_out():
+    z_ang = np.arange(7, dtype=float)
+    v_xyavg_ev = np.asarray([1.0, 1.0, 7.0, 99.0, 7.0, 1.0, 1.0])
+    header = _test_cube_header([(8, 0.0), (1, 6.0), (11, 3.0)], nz=z_ang.size)
+
+    value, _z_min, _z_max = _water_bulk_potential_ev(
+        z_ang=z_ang,
+        v_xyavg_ev=v_xyavg_ev,
+        water_z_min_ang=0.0,
+        water_z_max_ang=6.0,
+        padding_ang=2.9,
+        contaminated_z_mask=_non_water_contaminated_z_slices(z_ang, header),
+    )
+
+    assert value == pytest.approx(7.0)
+
+
+def test_water_bulk_potential_returns_none_when_all_candidate_slices_are_contaminated():
+    z_ang = np.arange(3, dtype=float)
+    header = _test_cube_header(
+        [(8, 0.0), (1, 2.0), (11, 0.0), (19, 1.0), (3, 2.0)],
+        nz=z_ang.size,
+    )
+
+    value, z_min, z_max = _water_bulk_potential_ev(
+        z_ang=z_ang,
+        v_xyavg_ev=np.asarray([10.0, 20.0, 30.0]),
+        water_z_min_ang=0.0,
+        water_z_max_ang=2.0,
+        padding_ang=0.0,
+        contaminated_z_mask=_non_water_contaminated_z_slices(z_ang, header),
+    )
+
+    assert value is None
+    assert z_min is None
+    assert z_max is None
 
 
 def test_load_potential_plot_profiles_sorts_rows_and_summarizes(tmp_path):
@@ -376,6 +457,47 @@ def test_plot_potential_hdf5_non_gui_renders_png(tmp_path):
 
     assert plot_rc == 0
     assert output.exists()
+
+
+def test_compute_potential_water_bulk_uses_clean_span_when_ion_is_in_water_region(tmp_path):
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    cube = run_dir / "ion-in-water-v_hartree-1_0.cube"
+    output = tmp_path / "potential_summary.h5"
+    potential_ev = np.asarray([4.0, 4.0, 99.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0])
+    _write_cube(
+        cube,
+        values_by_z=potential_ev / HARTREE_TO_EV,
+        atom_specs=[
+            (8, 0.0),
+            (1, 8.0),
+            (11, 2.0),
+        ],
+    )
+    (run_dir / "output.out").write_text(
+        "Some CP2K output\nFermi energy: 0.0367493036\n",
+        encoding="utf-8",
+    )
+
+    rc = main(
+        [
+            "--log-level",
+            "ERROR",
+            "compute",
+            "potential",
+            str(cube),
+            "--output",
+            str(output),
+            "--water-padding-ang",
+            "0.0",
+        ]
+    )
+
+    assert rc == 0
+    rows = _read_hdf5_rows(output)
+    assert len(rows) == 1
+    assert float(rows[0]["water_bulk_potential_ev"]) == pytest.approx(2.0, abs=1e-6)
+    assert float(rows[0]["electrode_cshe_ev"]) == pytest.approx(0.19, abs=1e-3)
 
 
 def test_apply_convert_cube_to_cube_hdf5_and_back(tmp_path):

@@ -63,7 +63,9 @@ potential cannot be resolved and remains unavailable.
 ## Step 3: Resolve The Water-Bulk Potential
 
 LiNaK takes the water-region interval and shrinks it inward by the configured
-padding. It then averages the `xy`-averaged potential within that bulk window.
+padding. It then removes any `z` slices whose slice bin contains a non-water
+atom, using H/O as the water definition, and averages the `xy`-averaged
+potential within the widest remaining contiguous clean window.
 
 This is intended to avoid using interfacial edge regions directly.
 
@@ -72,9 +74,14 @@ For padding `p`, the candidate averaging window is:
 - `z_min = z_water_min + p`
 - `z_max = z_water_max - p`
 
-LiNaK then averages over grid points satisfying:
+LiNaK first considers grid points satisfying:
 
 `z_min <= z_k <= z_max`
+
+Within that candidate interval, any slice containing a non-H/O atom is excluded.
+If contaminants split the candidate interval, LiNaK uses the widest contiguous
+clean span. If spans tie, it chooses the one closest to the water-region
+midpoint.
 
 ### Padding Fallback Logic
 
@@ -86,17 +93,9 @@ relaxes the padding:
 - quarter padding
 - zero padding
 
-If even that fails, LiNaK falls back to the nearest available `z` point around
-the water-region midpoint and emits a warning.
-
-The midpoint fallback uses:
-
-`z_mid = 0.5 * (z_water_min + z_water_max)`
-
-and selects the grid point `z_k` minimizing `|z_k - z_mid|`.
-
-This makes the workflow robust to narrow or awkward water regions without
-silently discarding the source.
+If even zero padding leaves no clean water slice, the water-bulk potential is
+left unavailable and the source row remains incomplete. LiNaK does not fall back
+to a contaminated slice.
 
 ## Step 4: Resolve The Fermi Energy
 

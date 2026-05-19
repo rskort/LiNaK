@@ -133,9 +133,7 @@ def build_plot_profile_payload(profile_key: str, settings: dict[str, Any]) -> di
         raise ValueError("Plot profile settings must be an object.")
     source_fields = _SOURCE_SELECTION_FIELDS_BY_PROFILE_KEY.get(str(profile_key), ())
     mapping_fields = _LEGACY_MAPPING_FIELDS_BY_PROFILE_KEY.get(str(profile_key), ())
-    source_selection = {
-        key: deepcopy(settings[key]) for key in source_fields if key in settings
-    }
+    source_selection = {key: deepcopy(settings[key]) for key in source_fields if key in settings}
     mapping = _resolve_explicit_view_mapping(settings)
     if mapping is None:
         mapping = _build_view_mapping(str(profile_key), settings)
@@ -168,7 +166,6 @@ def flatten_plot_profile_payload(profile_key: str, payload: dict[str, Any]) -> d
         raise ValueError("Saved plot profile style must be an object.")
     mapping = deserialize_plot_view_mapping(view_mapping_payload)
     flattened = {str(key): deepcopy(value) for key, value in source_selection.items()}
-    flattened["view_mapping"] = serialize_plot_view_mapping(mapping)
     mapping_settings = _flatten_view_mapping(str(profile_key), mapping)
     default_mapping_settings = _default_mapping_settings(str(profile_key))
     for key, value in mapping_settings.items():
@@ -214,9 +211,7 @@ def select_plot_profile_settings(
         raise ValueError("Saved plot profile style must be an object.")
 
     selected: dict[str, Any] = {
-        str(key): deepcopy(value)
-        for key, value in source_selection.items()
-        if str(key) in keys
+        str(key): deepcopy(value) for key, value in source_selection.items() if str(key) in keys
     }
     if isinstance(view_mapping_payload, dict) and "view_mapping" in keys:
         selected["view_mapping"] = deepcopy(view_mapping_payload)
@@ -337,11 +332,16 @@ def _flatten_view_mapping(profile_key: str, mapping: PlotViewMapping) -> dict[st
 
         return orientation_view_mapping_to_plot_options(mapping)
     if profile_key == _PLOT_PROFILE_TABLE:
-        kind = str(
-            mapping.fixed_values.get("kind")
-            or str(mapping.view_type_id).removeprefix("table_")
+        kind = (
+            str(
+                mapping.fixed_values.get("kind")
+                or str(mapping.view_type_id).removeprefix("table_")
+                or "line"
+            )
+            .strip()
+            .lower()
             or "line"
-        ).strip().lower() or "line"
+        )
         flattened = {"kind": kind}
         if mapping.x is not None:
             flattened["x"] = str(mapping.x)
@@ -375,9 +375,7 @@ def _string_dict(value: Any) -> dict[str, str]:
     if not isinstance(value, dict):
         return {}
     return {
-        str(key): str(item)
-        for key, item in value.items()
-        if str(key).strip() and item is not None
+        str(key): str(item) for key, item in value.items() if str(key).strip() and item is not None
     }
 
 

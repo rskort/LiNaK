@@ -137,7 +137,9 @@ def test_compute_orientation_reports_frame_and_aggregation_progress(monkeypatch,
     monkeypatch.setattr(orientation_mod, "ProgressBar", _DummyProgressBar)
     caplog.set_level(logging.INFO, logger=orientation_mod.LOGGER.name)
 
-    profile = compute_orientation_profile(frames=_multi_frame_trajectory(3), axis="z", bin_width=1.0)
+    profile = compute_orientation_profile(
+        frames=_multi_frame_trajectory(3), axis="z", bin_width=1.0
+    )
 
     assert profile.n_frames == 3
     entered = [event[1] for event in events if event[0] == "enter"]
@@ -586,7 +588,7 @@ def test_plot_orientation_profile_accepts_generic_line_view_mapping(tmp_path):
 
     assert result is not None
     assert capture_state["title"] == "H2O orientation (azimuthal)"
-    assert capture_state["y_label"] == "H2O density-weighted âŸ¨cos(Ï†)âŸ©"
+    assert capture_state["y_label"] == "H2O density-weighted ⟨cos(φ)⟩"
 
 
 def test_plot_orientation_profile_accepts_generic_heatmap_view_mapping(tmp_path):
@@ -610,7 +612,7 @@ def test_plot_orientation_profile_accepts_generic_heatmap_view_mapping(tmp_path)
 
     assert result is not None
     assert capture_state["title"] == "H2O orientation heatmap (azimuthal)"
-    assert capture_state["y_label"] == "cos(Ï†)"
+    assert capture_state["y_label"] == "cos(φ)"
 
 
 def test_plot_orientation_profile_heatmap_normalize_uses_global_probability(tmp_path):

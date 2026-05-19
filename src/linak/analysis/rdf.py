@@ -62,6 +62,14 @@ from .common import (
 )
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _warning_logger() -> logging.Logger:
+    """Return a logger that will emit warnings even after CLI log-level tests."""
+
+    return LOGGER if LOGGER.isEnabledFor(logging.WARNING) else logging.getLogger()
+
+
 _NEIGHBORLIST_DENSITY_THRESHOLD = 0.25
 _SELECTED_MATRIX_FRACTION_THRESHOLD = 0.40
 _DEFAULT_RDF_THREAD_CAP = 4
@@ -2330,6 +2338,7 @@ def _rdf_profile_hdf5_payload(profile: RDFProfile) -> dict[str, Any]:
         ),
     }
 
+
 def _rdf_pair_storage_key(species_a: str, species_b: str) -> tuple[str, str]:
     normalized_a = _normalize_species(species_a)
     normalized_b = _normalize_species(species_b)
@@ -2380,7 +2389,9 @@ def _rdf_collection_compatibility_error(
     for index, (datasets, metadata) in enumerate(existing_payloads):
         pair_key = _rdf_pair_storage_key(
             str(metadata.get("species_a", "")).strip() or "UNKNOWN",
-            str(metadata.get("species_b", "")).strip() or str(metadata.get("species_a", "")).strip() or "UNKNOWN",
+            str(metadata.get("species_b", "")).strip()
+            or str(metadata.get("species_a", "")).strip()
+            or "UNKNOWN",
         )
         if pair_key in seen_pair_keys:
             return f"stored RDF collection already contains duplicate pair '{pair_key[0]}-{pair_key[1]}'"
@@ -2388,9 +2399,11 @@ def _rdf_collection_compatibility_error(
 
         if incoming_source:
             stored_source = str(metadata.get("source_path", "")).strip()
-            if stored_source and Path(stored_source).expanduser().resolve() != Path(
-                incoming_source
-            ).expanduser().resolve():
+            if (
+                stored_source
+                and Path(stored_source).expanduser().resolve()
+                != Path(incoming_source).expanduser().resolve()
+            ):
                 return "stored source_path does not match the requested trajectory source"
 
         stored_centers = np.asarray(datasets.get("bin_centers_A", []), dtype=float)
@@ -2461,7 +2474,7 @@ def _save_rdf_profile_collection(
         )
     except Exception as exc:
         fallback_path = _resolve_non_overwriting_rdf_output_path(output_path)
-        LOGGER.warning(
+        _warning_logger().warning(
             "Existing RDF output '%s' could not be merged (%s). Writing fallback file '%s'.",
             output_path,
             exc,
@@ -2483,7 +2496,7 @@ def _save_rdf_profile_collection(
     )
     if compatibility_error is not None:
         fallback_path = _resolve_non_overwriting_rdf_output_path(output_path)
-        LOGGER.warning(
+        _warning_logger().warning(
             "Existing RDF output '%s' is incompatible (%s). Writing fallback file '%s'.",
             output_path,
             compatibility_error,
@@ -2546,7 +2559,7 @@ def _save_rdf_profile_collection(
             ", ".join(identical_labels),
         )
     if replaced_labels:
-        LOGGER.warning(
+        _warning_logger().warning(
             "Replaced existing RDF profile(s) in '%s' with newly computed data: %s.",
             written_path,
             ", ".join(replaced_labels),

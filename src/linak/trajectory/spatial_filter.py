@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-import math
 from pathlib import Path
 from typing import Any
 
@@ -107,7 +106,7 @@ def append_output_name_suffix(path: Path, suffix: str) -> Path:
     for token in (".traj.hdf5", ".traj.h5", ".cube.hdf5", ".cube.h5", ".hdf5", ".h5"):
         if lower.endswith(token):
             base = path_text[: -len(token)]
-            return Path(base + suffix + path_text[-len(token):])
+            return Path(base + suffix + path_text[-len(token) :])
     stem = path.stem or path.name
     return path.with_name(f"{stem}{suffix}{path.suffix}")
 
@@ -204,9 +203,7 @@ def _resolve_range(spec: SpatialRangeSpec, values: list[np.ndarray]) -> Resolved
     lower = _resolve_bound(spec.lower_token, full_lower=full_lower, full_upper=full_upper)
     upper = _resolve_bound(spec.upper_token, full_lower=full_lower, full_upper=full_upper)
     if not np.isfinite(lower) or not np.isfinite(upper) or upper < lower:
-        raise ValueError(
-            f"Resolved {spec.axis_id}-range is invalid: lower={lower}, upper={upper}."
-        )
+        raise ValueError(f"Resolved {spec.axis_id}-range is invalid: lower={lower}, upper={upper}.")
     return ResolvedSpatialRange(
         axis_id=spec.axis_id,
         requested=f"{spec.lower_token}:{spec.upper_token}",
@@ -254,7 +251,9 @@ def _surface_distance_values_for_atoms(
             frames,
             axis=axis,
             mode=options.surface_mode,
-            surface_elements=None if options.surface_elements is None else list(options.surface_elements),
+            surface_elements=None
+            if options.surface_elements is None
+            else list(options.surface_elements),
             include_fixed_surface_atoms=bool(options.include_fixed_surface_atoms),
             surface_options=None,
         )
@@ -268,7 +267,8 @@ def _surface_distance_values_for_atoms(
             "Distance-based spatial filtering failed because the cached surface reference does not match the trajectory."
         )
     values = [
-        np.asarray(frame.positions[:, axis_index], dtype=float) - float(estimate.per_frame[frame_index])
+        np.asarray(frame.positions[:, axis_index], dtype=float)
+        - float(estimate.per_frame[frame_index])
         for frame_index, frame in enumerate(frames)
     ]
     return values, estimate, provenance
@@ -295,9 +295,7 @@ def _group_centers_and_indices(
             continue
         group_indices.append(np.asarray([atom_index], dtype=int))
         group_centers.append(np.asarray(wrapped_positions[atom_index], dtype=float))
-    centers = (
-        np.vstack(group_centers) if group_centers else np.empty((0, 3), dtype=float)
-    )
+    centers = np.vstack(group_centers) if group_centers else np.empty((0, 3), dtype=float)
     return group_indices, centers, "water_com_plus_singletons"
 
 
@@ -364,7 +362,9 @@ def apply_spatial_filter(
     retained_group_counts: list[int] = []
 
     if options.keep_molecules_intact:
-        axis_values_by_groups: dict[str, list[np.ndarray]] = {axis_id: [] for axis_id in active_specs}
+        axis_values_by_groups: dict[str, list[np.ndarray]] = {
+            axis_id: [] for axis_id in active_specs
+        }
         group_indices_by_frame: list[list[np.ndarray]] = []
         group_centers_by_frame: list[np.ndarray] = []
         distance_values_by_groups: list[np.ndarray] = []
@@ -416,12 +416,18 @@ def apply_spatial_filter(
                 else np.empty((0,), dtype=int)
             )
             retained_indices = np.asarray(np.unique(retained_indices), dtype=int)
-            filtered_frames.append(frame[retained_indices.tolist()] if retained_indices.size > 0 else _empty_frame_like(frame))
+            filtered_frames.append(
+                frame[retained_indices.tolist()]
+                if retained_indices.size > 0
+                else _empty_frame_like(frame)
+            )
             retained_atom_counts.append(int(retained_indices.size))
             retained_group_counts.append(int(np.sum(keep_mask)))
         molecule_selection_mode = group_mode
     else:
-        axis_values_by_atoms: dict[str, list[np.ndarray]] = {axis_id: [] for axis_id in active_specs}
+        axis_values_by_atoms: dict[str, list[np.ndarray]] = {
+            axis_id: [] for axis_id in active_specs
+        }
         for frame_index, frame in enumerate(frames):
             wrapped_positions = wrapped_positions_by_frame[frame_index]
             original_atom_counts.append(len(frame))
@@ -452,7 +458,11 @@ def apply_spatial_filter(
                 keep_mask &= values >= (resolved.resolved_lower - _FILTER_TOL)
                 keep_mask &= values <= (resolved.resolved_upper + _FILTER_TOL)
             retained_indices = np.where(keep_mask)[0].astype(int)
-            filtered_frames.append(frame[retained_indices.tolist()] if retained_indices.size > 0 else _empty_frame_like(frame))
+            filtered_frames.append(
+                frame[retained_indices.tolist()]
+                if retained_indices.size > 0
+                else _empty_frame_like(frame)
+            )
             retained_atom_counts.append(int(retained_indices.size))
         molecule_selection_mode = "atoms"
 

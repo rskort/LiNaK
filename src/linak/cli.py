@@ -292,9 +292,7 @@ def _serialize_plot_data_contract(contract: Any) -> dict[str, Any]:
                 "label": str(getattr(dimension, "label", "") or ""),
                 "kind": str(getattr(dimension, "kind", "") or ""),
                 "length": getattr(dimension, "length", None),
-                "unit": (
-                    None if getattr(dimension, "unit", None) is None else str(dimension.unit)
-                ),
+                "unit": (None if getattr(dimension, "unit", None) is None else str(dimension.unit)),
             }
             for dimension in getattr(contract, "dimensions", ())
         ],
@@ -1103,7 +1101,7 @@ def _preflight_existing_file_path(path: str | Path, *, label: str) -> Path:
 def _analysis_source_stem(source: str | Path, *, default: str) -> str:
     name = Path(source).name
     lower = name.lower()
-    for suffix in (".out.hdf5", ".out.h5", ".traj.hdf5", ".traj.h5", ".cube.hdf5", ".cube.h5", ".hdf5", ".h5"):
+    for suffix in (".out.hdf5", ".out.h5", ".cube.hdf5", ".cube.h5", ".hdf5", ".h5"):
         if lower.endswith(suffix):
             return name[: -len(suffix)] or default
     return Path(source).stem or default
@@ -1582,7 +1580,12 @@ def _resolve_density_plotter_kwargs(
         x_mode=getattr(args, "x_mode", "distance"),
         quantity=getattr(args, "quantity", "mass"),
     )
-    payload: dict[str, Any] = {"view_mapping": resolved.mapping}
+    resolved_mapping = resolved.mapping
+    if mapping is None:
+        fixed_values = dict(resolved_mapping.fixed_values)
+        fixed_values["quantity"] = str(getattr(args, "quantity", "mass") or "mass").strip().lower()
+        resolved_mapping = replace(resolved_mapping, fixed_values=fixed_values)
+    payload: dict[str, Any] = {"view_mapping": resolved_mapping}
     if data_contract is not None:
         payload["data_contract"] = resolved.contract
     return payload
@@ -1692,10 +1695,13 @@ def _resolve_position_projection_estimation_settings(
     )
     mapping = resolved_mapping.mapping
     value_quantity = mapping.color or mapping.filter_by or "distance_to_surface"
-    render_mode = str(
-        mapping.fixed_values.get("projection_render_mode")
-        or ("color-scale" if mapping.color is not None else "line-colors")
-    ).strip() or "color-scale"
+    render_mode = (
+        str(
+            mapping.fixed_values.get("projection_render_mode")
+            or ("color-scale" if mapping.color is not None else "line-colors")
+        ).strip()
+        or "color-scale"
+    )
     return _ResolvedPositionProjectionEstimate(
         mapping=mapping,
         projection_x=_position_projection_token_from_quantity_id(mapping.x),
@@ -1713,10 +1719,13 @@ def _position_mapping_summary_for_dry_run(args: argparse.Namespace) -> str:
         return "view_mapping=<unresolved>"
     view_type_id = str(getattr(mapping, "view_type_id", "")).strip().lower() or "line_1d"
     if view_type_id == "trajectory_2d":
-        render_mode = str(
-            mapping.fixed_values.get("projection_render_mode")
-            or ("color-scale" if mapping.color is not None else "line-colors")
-        ).strip() or "color-scale"
+        render_mode = (
+            str(
+                mapping.fixed_values.get("projection_render_mode")
+                or ("color-scale" if mapping.color is not None else "line-colors")
+            ).strip()
+            or "color-scale"
+        )
         value_role = str(mapping.color or mapping.filter_by or "distance_to_surface")
         filter_text = ""
         if mapping.filter_min is not None or mapping.filter_max is not None:
@@ -2146,7 +2155,9 @@ def _load_density_heatmap_plot_profiles(
                 rendered_species = f"{source_label}:{profile.species}"
                 source_labels.append(f"{rendered_species} {profile.plane.upper()}")
                 source_ids.append(
-                    _profile_uid_from_payload(payload, fallback_prefix="density_heatmap", index=profile_index)
+                    _profile_uid_from_payload(
+                        payload, fallback_prefix="density_heatmap", index=profile_index
+                    )
                 )
                 source_origins.append(str(metadata.get("origin_hdf5_path") or source))
                 plot_profiles.append(replace(profile, species=rendered_species))
@@ -2156,18 +2167,25 @@ def _load_density_heatmap_plot_profiles(
     else:
         flattened = _flatten_profiles_by_source(profiles_by_source)
         plot_profiles.extend(flattened)
-        fallback_labels_by_source.append([f"{profile.species} {profile.plane.upper()}" for profile in flattened])
+        fallback_labels_by_source.append(
+            [f"{profile.species} {profile.plane.upper()}" for profile in flattened]
+        )
         raw_payloads = filtered_payloads_by_source[0][1]
         if len(raw_payloads) != len(flattened):
             raise ValueError("Density heatmap metadata does not match loaded profiles.")
         series_id_segments_by_source.append(
             [
-                _profile_uid_from_payload(payload, fallback_prefix="density_heatmap", index=profile_index)
+                _profile_uid_from_payload(
+                    payload, fallback_prefix="density_heatmap", index=profile_index
+                )
                 for profile_index, payload in enumerate(raw_payloads)
             ]
         )
         origin_path_segments_by_source.append(
-            [str(payload.get("metadata", {}).get("origin_hdf5_path") or sources[0]) for payload in raw_payloads]
+            [
+                str(payload.get("metadata", {}).get("origin_hdf5_path") or sources[0])
+                for payload in raw_payloads
+            ]
         )
 
     return (
@@ -2306,11 +2324,7 @@ def _density_logical_series_id(*, source_path: str, species: str) -> str:
 def _flatten_descriptor_segments(
     descriptor_segments_by_source: list[list[dict[str, Any]]],
 ) -> list[dict[str, Any]]:
-    return [
-        dict(descriptor)
-        for segment in descriptor_segments_by_source
-        for descriptor in segment
-    ]
+    return [dict(descriptor) for segment in descriptor_segments_by_source for descriptor in segment]
 
 
 def _build_density_logical_descriptor_segments(
@@ -3737,10 +3751,14 @@ def _resolve_compute_coordination_pairs(
 
     available_pairs = _ordered_coordination_pairs_from_frames(list(frames))
     normalized_species_a = (
-        None if species_a is None or not str(species_a).strip() else _normalize_rdf_species(species_a)
+        None
+        if species_a is None or not str(species_a).strip()
+        else _normalize_rdf_species(species_a)
     )
     normalized_species_b = (
-        None if species_b is None or not str(species_b).strip() else _normalize_rdf_species(species_b)
+        None
+        if species_b is None or not str(species_b).strip()
+        else _normalize_rdf_species(species_b)
     )
 
     if normalized_species_a is None and normalized_species_b is None:
@@ -6091,9 +6109,13 @@ def _build_density_gui_context(
                     "heatmap_log_scale": getattr(args, "heatmap_log_scale", False),
                     "heatmap_colorbar_enabled": getattr(args, "heatmap_colorbar_enabled", True),
                     "heatmap_colorbar_label": getattr(args, "heatmap_colorbar_label", None),
-                    "heatmap_colorbar_label_size": getattr(args, "heatmap_colorbar_label_size", None),
+                    "heatmap_colorbar_label_size": getattr(
+                        args, "heatmap_colorbar_label_size", None
+                    ),
                     "heatmap_colorbar_tick_size": getattr(args, "heatmap_colorbar_tick_size", None),
-                    "heatmap_colorbar_position": getattr(args, "heatmap_colorbar_position", "right"),
+                    "heatmap_colorbar_position": getattr(
+                        args, "heatmap_colorbar_position", "right"
+                    ),
                     "heatmap_colorbar_pad": getattr(args, "heatmap_colorbar_pad", None),
                     "heatmap_colorbar_shrink": getattr(args, "heatmap_colorbar_shrink", None),
                     "heatmap_colorbar_aspect": getattr(args, "heatmap_colorbar_aspect", None),
@@ -6281,7 +6303,9 @@ def _build_density_gui_logical_context(
             series_descriptors=[],
             profile_filter_options={
                 **filter_options,
-                "density_plot_contract": _serialize_plot_data_contract(default_density_plot_data_contract()),
+                "density_plot_contract": _serialize_plot_data_contract(
+                    default_density_plot_data_contract()
+                ),
                 "density_heatmap_plot_contract": _serialize_plot_data_contract(heatmap_contract),
             },
             estimated_total_points=None,
@@ -6651,10 +6675,14 @@ def _build_coordination_gui_context(
     return _GuiPlotRenderContext(
         profile=plot_profiles,
         plot_source_label=sources[0] if len(sources) == 1 else "multi_source_coordination",
-        plotter_kwargs=_resolve_coordination_plotter_kwargs(
-            args,
-            data_contract=reference_contract,
-        ),
+        plotter_kwargs={
+            **_resolve_coordination_plotter_kwargs(
+                args,
+                data_contract=reference_contract,
+            ),
+            "component": getattr(args, "component", "distance"),
+            "time_axis": getattr(args, "time_axis", "ps"),
+        },
         fallback_labels_by_source=fallback_labels_by_source,
         default_series_labels=_resolve_gui_default_series_labels(
             args=args,
@@ -6674,9 +6702,7 @@ def _build_coordination_gui_context(
                 {}
                 if reference_contract is None
                 else {
-                    "coordination_plot_contract": _serialize_plot_data_contract(
-                        reference_contract
-                    )
+                    "coordination_plot_contract": _serialize_plot_data_contract(reference_contract)
                 }
             ),
         },
@@ -6782,9 +6808,14 @@ def _build_density_gui_lazy_catalog(
                         "is_generated": False,
                         "source_index": 0,
                         "series_index": 0,
-                        "source_name": Path(str(header.get("origin_hdf5_path") or source)).name or str(source),
-                        "source_directory": str(Path(str(header.get("origin_hdf5_path") or source)).expanduser().parent),
-                        "source_path": str(Path(str(header.get("origin_hdf5_path") or source)).expanduser()),
+                        "source_name": Path(str(header.get("origin_hdf5_path") or source)).name
+                        or str(source),
+                        "source_directory": str(
+                            Path(str(header.get("origin_hdf5_path") or source)).expanduser().parent
+                        ),
+                        "source_path": str(
+                            Path(str(header.get("origin_hdf5_path") or source)).expanduser()
+                        ),
                         "load_source_path": str(Path(source).expanduser()),
                         "default_label": f"{str(header.get('species') or 'UNKNOWN')} {str(header.get('plane') or 'xy').upper()}",
                         "profile_index": int(header.get("profile_index", 0)),
@@ -6800,7 +6831,9 @@ def _build_density_gui_lazy_catalog(
 
         def _load_heatmap_profiles(descriptors: list[dict[str, Any]]) -> list[Any]:
             loaded: list[Any] = []
-            for load_source_path, source_descriptors in _group_descriptors_by_load_source(descriptors):
+            for load_source_path, source_descriptors in _group_descriptors_by_load_source(
+                descriptors
+            ):
                 indices = [int(descriptor["profile_index"]) for descriptor in source_descriptors]
                 loaded.extend(
                     load_density_heatmap_profiles_by_index(
@@ -6836,7 +6869,9 @@ def _build_density_gui_lazy_catalog(
             descriptor_segments_by_source=selected_descriptors,
             profile_filter_options={
                 **filter_options,
-                "density_plot_contract": _serialize_plot_data_contract(default_density_plot_data_contract()),
+                "density_plot_contract": _serialize_plot_data_contract(
+                    default_density_plot_data_contract()
+                ),
                 "density_heatmap_plot_contract": _serialize_plot_data_contract(
                     default_density_heatmap_plot_data_contract()
                 ),
@@ -7010,6 +7045,7 @@ def _build_rdf_gui_lazy_catalog(
 ) -> _LazyGuiSeriesCatalog:
     from .plot.contracts.rdf_contract import default_rdf_plot_data_contract
     from .analysis.rdf import load_rdf_profiles_by_index
+
     headers_by_source = _read_analysis_profile_headers_by_source(
         sources=sources,
         analysis="rdf",
@@ -7109,7 +7145,6 @@ def _build_position_gui_lazy_catalog(
     sources: list[str],
     active_profiles_by_series_id: dict[str, Any] | None = None,
 ) -> _LazyGuiSeriesCatalog:
-    from .plot.contracts.position_contract import position_profile_to_plot_data_contract
     from .analysis.position import _normalize_species as _normalize_position_species
     from .analysis.position import load_position_profiles_by_index
     from .storage.hdf5_utils import read_linak_hdf5_profiles_by_index
@@ -7139,8 +7174,6 @@ def _build_position_gui_lazy_catalog(
     load_source_path_segments_by_source: list[list[str]] = []
     extra_segments_by_source: list[list[dict[str, Any]]] = []
     raw_estimated_total_points = 0
-    reference_profile_source_path: Path | None = None
-    reference_profile_index: int | None = None
     resolved_projection = _resolve_position_projection_estimation_settings(args)
     profile_level_projection = _position_projection_uses_profile_descriptors(
         args,
@@ -7172,9 +7205,6 @@ def _build_position_gui_lazy_catalog(
                 f"{source_label}:{resolved_species}" if prefix_source_labels else resolved_species
             )
             profile_index = int(header.get("profile_index", 0))
-            if reference_profile_source_path is None:
-                reference_profile_source_path = source_path
-                reference_profile_index = profile_index
             profile_uid = _profile_uid_from_payload(
                 {"metadata": header},
                 fallback_prefix="position",
@@ -7329,30 +7359,15 @@ def _build_position_gui_lazy_catalog(
         )
         return final_points
 
-    reference_profile = None
-    if reference_profile_source_path is not None and reference_profile_index is not None:
-        reference_profiles = load_position_profiles_by_index(
-            reference_profile_source_path,
-            [reference_profile_index],
-            species=args.species,
-            axis=args.axis,
-        )
-        if reference_profiles:
-            reference_profile = reference_profiles[0]
-
     return _LazyGuiSeriesCatalog(
         sources=list(sources),
         plot_source_label=sources[0] if len(sources) == 1 else "multi_source_position",
         plotter_kwargs=_resolve_position_plotter_kwargs(
             args,
-            data_contract=(
-                None
-                if reference_profile is None
-                else position_profile_to_plot_data_contract(reference_profile)
-            ),
+            data_contract=None,
         ),
         descriptor_segments_by_source=descriptor_segments,
-        profile_filter_options=_build_position_plot_gui_filter_options(reference_profile),
+        profile_filter_options=_build_position_plot_gui_filter_options(None),
         load_profiles=_load_profiles,
         estimated_total_points=estimated_total_points,
         estimate_render_points=_estimate_render_points,
@@ -7597,10 +7612,14 @@ def _build_coordination_gui_lazy_catalog(
     return _LazyGuiSeriesCatalog(
         sources=list(sources),
         plot_source_label=sources[0] if len(sources) == 1 else "multi_source_coordination",
-        plotter_kwargs=_resolve_coordination_plotter_kwargs(
-            args,
-            data_contract=reference_contract,
-        ),
+        plotter_kwargs={
+            **_resolve_coordination_plotter_kwargs(
+                args,
+                data_contract=reference_contract,
+            ),
+            "component": getattr(args, "component", "distance"),
+            "time_axis": getattr(args, "time_axis", "ps"),
+        },
         descriptor_segments_by_source=descriptor_segments,
         profile_filter_options={
             **_build_coordination_profile_filter_options(
@@ -7610,9 +7629,7 @@ def _build_coordination_gui_lazy_catalog(
                 {}
                 if reference_contract is None
                 else {
-                    "coordination_plot_contract": _serialize_plot_data_contract(
-                        reference_contract
-                    )
+                    "coordination_plot_contract": _serialize_plot_data_contract(reference_contract)
                 }
             ),
         },
@@ -7693,7 +7710,7 @@ def _build_potential_gui_context(
                 "total_rows": total_rows,
                 "complete_rows": complete_rows,
                 "incomplete_rows": incomplete_rows,
-            }
+            },
         },
         estimated_total_points=_estimate_total_points_from_loaded_profiles(flattened_profiles),
     )
@@ -8137,7 +8154,10 @@ def _resolve_plot_settings_view_mapping(
     if keys is _PLOT_SETTINGS_ORIENTATION_KEYS:
         return _resolve_orientation_plotter_kwargs(args).get("view_mapping")
     if keys is _PLOT_SETTINGS_TABLE_KEYS:
-        from .plot.profile_persistence import build_plot_profile_payload, deserialize_plot_view_mapping
+        from .plot.profile_persistence import (
+            build_plot_profile_payload,
+            deserialize_plot_view_mapping,
+        )
 
         settings = _collect_plot_settings_from_args(args, keys=keys)
         payload = build_plot_profile_payload("plot:table", settings)
@@ -13011,9 +13031,7 @@ def _spatial_filter_surface_config_from_args(args: argparse.Namespace) -> dict[s
         "surface_axis": surface_axis,
         "surface_mode": str(getattr(args, "surface_mode", "auto")).strip().lower() or "auto",
         "surface_elements": getattr(args, "surface_elements", None),
-        "include_fixed_surface_atoms": bool(
-            getattr(args, "include_fixed_surface_atoms", False)
-        ),
+        "include_fixed_surface_atoms": bool(getattr(args, "include_fixed_surface_atoms", False)),
         "rough_surface_envelope_A": getattr(args, "rough_surface_envelope", None),
     }
 
@@ -13129,9 +13147,7 @@ def _handle_compute_density(args: argparse.Namespace) -> int:
                 )
             )
         else:
-            output_preview = str(
-                _default_density_hdf5_output_path(args.trajectory, args.species)
-            )
+            output_preview = str(_default_density_hdf5_output_path(args.trajectory, args.species))
 
         plan = [
             f"trajectory source: {source_path}",
@@ -13636,7 +13652,9 @@ def _handle_compute_rdf(args: argparse.Namespace) -> int:
                 f"bin_width={args.bin_width}, threads={args.threads if args.threads is not None else 'auto'}"
             )
         elif selector_mode == "species_collection":
-            selected_species = selector_species_a if selector_species_a is not None else selector_species_b
+            selected_species = (
+                selector_species_a if selector_species_a is not None else selector_species_b
+            )
             selector_label = "species_a" if selector_species_a is not None else "species_b"
             mode_preview = (
                 "mode=filtered pair collection, "
@@ -13778,6 +13796,12 @@ def _handle_compute_coordination(args: argparse.Namespace) -> int:
         source_label="trajectory input file",
     )
     if args.species_a is None and args.species_b is None:
+        if args.cutoff is not None:
+            print(
+                "Error: Provide at least one coordination selector via --species-a or --species-b.",
+                file=sys.stderr,
+            )
+            return 2
         raise ValueError(
             "Provide at least one coordination selector via --species-a or --species-b."
         )
@@ -13813,13 +13837,9 @@ def _handle_compute_coordination(args: argparse.Namespace) -> int:
         if single_pair_mode:
             selection_preview = f"species_a={args.species_a}, species_b={args.species_b}"
         elif args.species_a is not None:
-            selection_preview = (
-                f"species_a={args.species_a}, species_b=all matching stored species"
-            )
+            selection_preview = f"species_a={args.species_a}, species_b=all matching stored species"
         else:
-            selection_preview = (
-                f"species_a=all matching stored species, species_b={args.species_b}"
-            )
+            selection_preview = f"species_a=all matching stored species, species_b={args.species_b}"
         if args.cutoff is not None:
             cutoff_preview = f"direct cutoff={args.cutoff:.6g} A"
         elif args.cutoff_rdf:
@@ -13828,10 +13848,7 @@ def _handle_compute_coordination(args: argparse.Namespace) -> int:
             cutoff_preview = "full-trajectory RDF cutoff"
         plan = [
             f"trajectory source: {source_path}",
-            (
-                f"{selection_preview}, axis={args.axis}, "
-                f"{_describe_surface_cli_options(args)}"
-            ),
+            (f"{selection_preview}, axis={args.axis}, {_describe_surface_cli_options(args)}"),
             (
                 f"coordination cutoff: {cutoff_preview}, smoothing_width="
                 f"{args.cutoff_smoothing_width:.6g} A"
@@ -13851,6 +13868,7 @@ def _handle_compute_coordination(args: argparse.Namespace) -> int:
 
     from .analysis.coordination import (
         compute_coordination_profiles,
+        resolve_coordination_cutoff,
         resolve_coordination_cutoffs,
         save_coordination_profiles,
     )
@@ -13990,19 +14008,40 @@ def _handle_compute_coordination(args: argparse.Namespace) -> int:
                 diagnostic_candidate = output_path.with_name(
                     f"{output_path.stem}_{_sanitize_token(pair_species_a)}_{_sanitize_token(pair_species_b)}_cutoff_rdf.png"
                 )
-                diagnostic_plot_outputs[(pair_species_a, pair_species_b)] = _preflight_prepare_output_path(
-                    diagnostic_candidate,
-                    label="coordination cutoff diagnostic PNG",
+                diagnostic_plot_outputs[(pair_species_a, pair_species_b)] = (
+                    _preflight_prepare_output_path(
+                        diagnostic_candidate,
+                        label="coordination cutoff diagnostic PNG",
+                    )
                 )
-    cutoff_resolutions = resolve_coordination_cutoffs(
-        frames=analysis_frames,
-        ordered_pairs=ordered_pairs,
-        cutoff_A=args.cutoff,
-        cutoff_rdf_path=args.cutoff_rdf,
-        cutoff_from_rdf=use_cutoff_from_rdf,
-        cutoff_smoothing_width_A=args.cutoff_smoothing_width,
-        diagnostic_plot_outputs=diagnostic_plot_outputs,
-    )
+    if len(ordered_pairs) == 1:
+        pair_species_a, pair_species_b = ordered_pairs[0]
+        cutoff_resolutions = {
+            ordered_pairs[0]: resolve_coordination_cutoff(
+                frames=analysis_frames,
+                species_a=pair_species_a,
+                species_b=pair_species_b,
+                cutoff_A=args.cutoff,
+                cutoff_rdf_path=args.cutoff_rdf,
+                cutoff_from_rdf=use_cutoff_from_rdf,
+                cutoff_smoothing_width_A=args.cutoff_smoothing_width,
+                diagnostic_plot_output=(
+                    None
+                    if diagnostic_plot_outputs is None
+                    else diagnostic_plot_outputs.get(ordered_pairs[0])
+                ),
+            )
+        }
+    else:
+        cutoff_resolutions = resolve_coordination_cutoffs(
+            frames=analysis_frames,
+            ordered_pairs=ordered_pairs,
+            cutoff_A=args.cutoff,
+            cutoff_rdf_path=args.cutoff_rdf,
+            cutoff_from_rdf=use_cutoff_from_rdf,
+            cutoff_smoothing_width_A=args.cutoff_smoothing_width,
+            diagnostic_plot_outputs=diagnostic_plot_outputs,
+        )
     profiles = compute_coordination_profiles(
         frames=analysis_frames,
         ordered_pairs=ordered_pairs,
@@ -14108,9 +14147,7 @@ def _handle_compute_potential(args: argparse.Namespace) -> int:
         hdf5_plan_preview.existing_source_keys if (args.append and not args.overwrite) else set()
     )
     skip_existing = [
-        source_label
-        for source_label in expanded_source_labels
-        if source_label in existing_sources
+        source_label for source_label in expanded_source_labels if source_label in existing_sources
     ]
     sources_to_compute = [
         source
@@ -14335,7 +14372,9 @@ def _handle_compute_orientation(args: argparse.Namespace) -> int:
             cached_surface_estimate = spatial_filter_result.surface_estimate
         if output_path is None:
             output_path = _preflight_prepare_output_path(
-                append_output_name_suffix(default_output_path, spatial_filter_result.filename_suffix),
+                append_output_name_suffix(
+                    default_output_path, spatial_filter_result.filename_suffix
+                ),
                 label="orientation HDF5 output",
             )
     elif output_path is None:

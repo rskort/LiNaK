@@ -199,7 +199,9 @@ def _normalize_stored_metadata(
         if metadata.surface_cache_rough_surface_envelope_A is not None
         else None
     )
-    combine_source_paths = tuple(str(value).strip() for value in metadata.combine_source_paths if str(value).strip())
+    combine_source_paths = tuple(
+        str(value).strip() for value in metadata.combine_source_paths if str(value).strip()
+    )
     combine_source_file_types = tuple(
         str(value).strip() for value in metadata.combine_source_file_types if str(value).strip()
     )
@@ -221,9 +223,15 @@ def _normalize_stored_metadata(
         if metadata.combine_linak_version
         else None
     )
-    selection_user = str(metadata.selection_user).strip() or None if metadata.selection_user else None
-    selection_kind = str(metadata.selection_kind).strip() or None if metadata.selection_kind else None
-    selection_unit = str(metadata.selection_unit).strip() or None if metadata.selection_unit else None
+    selection_user = (
+        str(metadata.selection_user).strip() or None if metadata.selection_user else None
+    )
+    selection_kind = (
+        str(metadata.selection_kind).strip() or None if metadata.selection_kind else None
+    )
+    selection_unit = (
+        str(metadata.selection_unit).strip() or None if metadata.selection_unit else None
+    )
     selection_start_frame = (
         int(metadata.selection_start_frame) if metadata.selection_start_frame is not None else None
     )
@@ -258,9 +266,7 @@ def _normalize_stored_metadata(
         else None
     )
     spatial_filter_metadata = (
-        None
-        if metadata.spatial_filter_metadata is None
-        else dict(metadata.spatial_filter_metadata)
+        None if metadata.spatial_filter_metadata is None else dict(metadata.spatial_filter_metadata)
     )
     return TrajectoryStoredMetadata(
         input_path=input_path,
@@ -492,19 +498,10 @@ def read_trajectory_hdf5_metadata(path: str | Path) -> TrajectoryStoredMetadata 
         combine_source_paths: tuple[str, ...] = ()
         combine_source_file_types: tuple[str, ...] = ()
         combine_timestamp_utc: str | None = None
-        combine_total_frames: int | None = None
-        combine_conversion_applied: bool | None = None
         combine_linak_version: str | None = None
         selection_user: str | None = None
         selection_kind: str | None = None
         selection_unit: str | None = None
-        selection_start_frame: int | None = None
-        selection_stop_frame_exclusive: int | None = None
-        selection_selected_frame_count: int | None = None
-        selection_resolved_start_time_fs: float | None = None
-        selection_resolved_end_time_fs: float | None = None
-        selection_resolved_start_step: int | None = None
-        selection_resolved_end_step: int | None = None
         spatial_filter_metadata: dict[str, Any] | None = None
         if isinstance(surface_group, h5py.Group):
             surface_cache_status = _optional_attr_str(surface_group.attrs.get("status"))
@@ -544,10 +541,14 @@ def read_trajectory_hdf5_metadata(path: str | Path) -> TrajectoryStoredMetadata 
                 )
                 if str(value)
             )
-        combine_timestamp_utc = _optional_attr_str(metadata_group.attrs.get("combine_timestamp_utc"))
+        combine_timestamp_utc = _optional_attr_str(
+            metadata_group.attrs.get("combine_timestamp_utc")
+        )
         combine_total_frames_raw = metadata_group.attrs.get("combine_total_frames")
         combine_conversion_applied_raw = metadata_group.attrs.get("combine_conversion_applied")
-        combine_linak_version = _optional_attr_str(metadata_group.attrs.get("combine_linak_version"))
+        combine_linak_version = _optional_attr_str(
+            metadata_group.attrs.get("combine_linak_version")
+        )
         selection_user = _optional_attr_str(metadata_group.attrs.get("selection_user"))
         selection_kind = _optional_attr_str(metadata_group.attrs.get("selection_kind"))
         selection_unit = _optional_attr_str(metadata_group.attrs.get("selection_unit"))
@@ -944,6 +945,14 @@ def _write_trajectory_hdf5(
     if atom_counts.size == 0 or int(np.max(atom_counts)) <= 0:
         raise ValueError("Converted trajectory HDF5 requires at least one atom in the trajectory.")
     topology_is_fixed = _topology_is_fixed(frames)
+    stored_metadata = _resolve_write_metadata(frames, metadata)
+    if not topology_is_fixed and (
+        stored_metadata is None or stored_metadata.spatial_filter_metadata is None
+    ):
+        raise ValueError(
+            "Converted trajectory HDF5 supports fixed topology only unless a spatial filter "
+            "produced variable per-frame atom counts."
+        )
     max_atom_count = int(np.max(atom_counts))
     chunk_frames = max(1, min(frame_count, 64))
 
@@ -975,8 +984,6 @@ def _write_trajectory_hdf5(
         values = _collect_frame_info_values(frames, key=key, dtype=np.float64)
         if values is not None:
             info_arrays[key] = values
-    stored_metadata = _resolve_write_metadata(frames, metadata)
-
     with ProgressBar(desc="Writing trajectory", total=frame_count, unit="frame") as progress:
         with h5py.File(output_path, "w") as handle:
             handle.attrs["linak_format"] = LINAK_TRAJECTORY_HDF5_FORMAT
@@ -1089,15 +1096,21 @@ def _write_trajectory_hdf5(
                         stored_metadata.combine_source_file_types,
                     )
                 if stored_metadata.combine_timestamp_utc:
-                    metadata_group.attrs["combine_timestamp_utc"] = stored_metadata.combine_timestamp_utc
+                    metadata_group.attrs["combine_timestamp_utc"] = (
+                        stored_metadata.combine_timestamp_utc
+                    )
                 if stored_metadata.combine_total_frames is not None:
-                    metadata_group.attrs["combine_total_frames"] = stored_metadata.combine_total_frames
+                    metadata_group.attrs["combine_total_frames"] = (
+                        stored_metadata.combine_total_frames
+                    )
                 if stored_metadata.combine_conversion_applied is not None:
                     metadata_group.attrs["combine_conversion_applied"] = bool(
                         stored_metadata.combine_conversion_applied
                     )
                 if stored_metadata.combine_linak_version:
-                    metadata_group.attrs["combine_linak_version"] = stored_metadata.combine_linak_version
+                    metadata_group.attrs["combine_linak_version"] = (
+                        stored_metadata.combine_linak_version
+                    )
                 if stored_metadata.selection_user:
                     metadata_group.attrs["selection_user"] = stored_metadata.selection_user
                 if stored_metadata.selection_kind:
@@ -1105,7 +1118,9 @@ def _write_trajectory_hdf5(
                 if stored_metadata.selection_unit:
                     metadata_group.attrs["selection_unit"] = stored_metadata.selection_unit
                 if stored_metadata.selection_start_frame is not None:
-                    metadata_group.attrs["selection_start_frame"] = stored_metadata.selection_start_frame
+                    metadata_group.attrs["selection_start_frame"] = (
+                        stored_metadata.selection_start_frame
+                    )
                 if stored_metadata.selection_stop_frame_exclusive is not None:
                     metadata_group.attrs["selection_stop_frame_exclusive"] = (
                         stored_metadata.selection_stop_frame_exclusive

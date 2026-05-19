@@ -380,7 +380,8 @@ Position plotting components:
 `linak compute potential` is CP2K-focused. For each Hartree cube file, LiNaK:
 - searches the same directory for a suitable CP2K output file (`output.out` preferred)
 - parses the Fermi level from the output file
-- computes a water-bulk potential from O/H z-bounds read from the cube header
+- computes a water-bulk potential from O/H z-bounds read from the cube header,
+  excluding z slices whose slice bin contains any non-water atom
 - reports `electrode_cshe_ev = water_bulk_potential_ev - efermi_ev - 0.81` by default
 
 

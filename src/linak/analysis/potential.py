@@ -12,7 +12,8 @@ import os
 from pathlib import Path
 import re
 from types import TracebackType
-from typing import Any, Callable
+from typing import Any
+from collections.abc import Callable
 
 import numpy as np
 
@@ -686,6 +687,87 @@ def water_z_bounds_ang(header: CubeHeader) -> tuple[float, float] | None:
     return float(np.min(z_oh)), float(np.max(z_oh))
 
 
+def _z_slice_edges_ang(z_ang: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    z_values = np.asarray(z_ang, dtype=float)
+    order = np.argsort(z_values)
+    z_sorted = z_values[order]
+    if z_sorted.size == 0:
+        return order, np.asarray([], dtype=float)
+    if z_sorted.size == 1:
+        return order, np.asarray([-np.inf, np.inf], dtype=float)
+
+    midpoints = 0.5 * (z_sorted[:-1] + z_sorted[1:])
+    first_half_step = 0.5 * (z_sorted[1] - z_sorted[0])
+    last_half_step = 0.5 * (z_sorted[-1] - z_sorted[-2])
+    edges = np.empty(z_sorted.size + 1, dtype=float)
+    edges[0] = z_sorted[0] - first_half_step
+    edges[1:-1] = midpoints
+    edges[-1] = z_sorted[-1] + last_half_step
+    return order, edges
+
+
+def _non_water_contaminated_z_slices(z_ang: np.ndarray, header: CubeHeader) -> np.ndarray:
+    """Return z-slice mask for slices whose bin contains at least one non-water atom."""
+    z_values = np.asarray(z_ang, dtype=float)
+    contaminated = np.zeros(z_values.shape, dtype=bool)
+    if z_values.size == 0:
+        return contaminated
+
+    non_water_mask = ~np.isin(header.atom_numbers, tuple(_WATER_ATOMIC_NUMBERS))
+    if not np.any(non_water_mask):
+        return contaminated
+
+    order, edges = _z_slice_edges_ang(z_values)
+    if edges.size == 0:
+        return contaminated
+
+    for atom_z_ang in np.asarray(header.atom_z_bohr[non_water_mask], dtype=float) * BOHR_TO_ANG:
+        if atom_z_ang < edges[0] or atom_z_ang > edges[-1]:
+            continue
+        sorted_index = int(np.searchsorted(edges, atom_z_ang, side="right") - 1)
+        sorted_index = min(max(sorted_index, 0), order.size - 1)
+        contaminated[int(order[sorted_index])] = True
+    return contaminated
+
+
+def _widest_clean_run_mask(
+    *,
+    z_ang: np.ndarray,
+    candidate_mask: np.ndarray,
+    midpoint_ang: float,
+) -> np.ndarray | None:
+    order = np.argsort(np.asarray(z_ang, dtype=float))
+    sorted_clean = np.asarray(candidate_mask, dtype=bool)[order]
+    best: tuple[float, float, int, int] | None = None
+
+    run_start: int | None = None
+    for index, is_clean in enumerate(sorted_clean.tolist() + [False]):
+        if is_clean and run_start is None:
+            run_start = index
+            continue
+        if is_clean or run_start is None:
+            continue
+
+        run_stop = index
+        run_indices = order[run_start:run_stop]
+        run_z = np.asarray(z_ang, dtype=float)[run_indices]
+        span = float(np.max(run_z) - np.min(run_z)) if run_z.size > 1 else 0.0
+        center_distance = abs(float(np.mean([np.min(run_z), np.max(run_z)])) - midpoint_ang)
+        candidate = (span, -center_distance, -run_start, run_stop)
+        if best is None or candidate > best:
+            best = candidate
+        run_start = None
+
+    if best is None:
+        return None
+
+    _span, _negative_distance, negative_start, stop = best
+    start = -negative_start
+    selected = np.zeros(np.asarray(candidate_mask, dtype=bool).shape, dtype=bool)
+    selected[order[start:stop]] = True
+    return selected
+
+
 def _water_bulk_potential_ev(
     *,
     z_ang: np.ndarray,
@@ -693,10 +775,21 @@ def _water_bulk_potential_ev(
     water_z_min_ang: float,
     water_z_max_ang: float,
     padding_ang: float,
+    contaminated_z_mask: np.ndarray | None = None,
 ) -> tuple[float | None, float | None, float | None]:
     if water_z_min_ang > water_z_max_ang:
         water_z_min_ang, water_z_max_ang = water_z_max_ang, water_z_min_ang
 
+    z_values = np.asarray(z_ang, dtype=float)
+    v_values = np.asarray(v_xyavg_ev, dtype=float)
+    if contaminated_z_mask is None:
+        contaminated = np.zeros(z_values.shape, dtype=bool)
+    else:
+        contaminated = np.asarray(contaminated_z_mask, dtype=bool)
+        if contaminated.shape != z_values.shape:
+            raise ValueError("contaminated_z_mask must have the same shape as z_ang.")
+
+    midpoint = 0.5 * (water_z_min_ang + water_z_max_ang)
     paddings = [float(padding_ang)]
     if padding_ang > 0.0:
         paddings.extend([float(padding_ang * 0.5), float(padding_ang * 0.25), 0.0])
@@ -713,20 +806,22 @@ def _water_bulk_potential_ev(
         if z_min >= z_max:
             continue
 
-        mask = (z_ang >= z_min) & (z_ang <= z_max)
-        if np.any(mask):
-            return float(np.mean(v_xyavg_ev[mask])), float(z_min), float(z_max)
+        candidate_mask = (z_values >= z_min) & (z_values <= z_max) & ~contaminated
+        selected_mask = _widest_clean_run_mask(
+            z_ang=z_values,
+            candidate_mask=candidate_mask,
+            midpoint_ang=midpoint,
+        )
+        if selected_mask is not None and np.any(selected_mask):
+            selected_z = z_values[selected_mask]
+            return (
+                float(np.mean(v_values[selected_mask])),
+                float(np.min(selected_z)),
+                float(np.max(selected_z)),
+            )
 
-    if z_ang.size == 0:
-        return None, None, None
-
-    midpoint = 0.5 * (water_z_min_ang + water_z_max_ang)
-    nearest_idx = int(np.argmin(np.abs(z_ang - midpoint)))
-    LOGGER.warning(
-        "Could not resolve a finite water-bulk averaging window; using nearest z-point fallback."
-    )
-    z_value = float(z_ang[nearest_idx])
-    return float(v_xyavg_ev[nearest_idx]), z_value, z_value
+    LOGGER.warning("Could not resolve a clean water-bulk averaging window without non-water atoms.")
+    return None, None, None
 
 
 def _resolve_cube_dataset_provenance(dataset: CubeDataset) -> Path:
@@ -788,6 +883,7 @@ def compute_potential_record(
             water_z_min_ang=water_z_min_ang,
             water_z_max_ang=water_z_max_ang,
             padding_ang=float(config.water_padding_ang),
+            contaminated_z_mask=_non_water_contaminated_z_slices(z_ang, header),
         )
 
     output_out = find_cp2k_output_file(source_dir)

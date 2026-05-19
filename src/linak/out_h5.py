@@ -11,7 +11,7 @@ import json
 import logging
 from pathlib import Path
 import tempfile
-from typing import Any, Literal
+from typing import Any, Literal, Optional
 
 import numpy as np
 from ase import Atoms
@@ -36,13 +36,15 @@ LINAK_OUT_HDF5_FORMAT = "linak-out-hdf5"
 LINAK_OUT_HDF5_SCHEMA_VERSION = 1
 
 OutH5Component = Literal["trajectory", "cube"]
-ProgressCallback = Callable[[str, int, int | None], None]
+ProgressCallback = Callable[[str, int, Optional[int]], None]
 LogCallback = Callable[[str, str], None]
 CancelCallback = Callable[[], bool]
 
 _RAW_TRAJECTORY_SUFFIXES = (".xyz", ".extxyz", ".dump", ".lmp")
 _CUBE_SUFFIXES = (".cube", ".cube.h5", ".cube.hdf5")
 _CP2K_OUTPUT_SUFFIXES = (".out",)
+
+
 @dataclass(frozen=True)
 class OutH5PackOptions:
     """Options for directory-to-`.out.h5` packing."""
@@ -164,7 +166,9 @@ def _path_matches(path: Path, root: Path, patterns: Sequence[str]) -> bool:
     if not patterns:
         return False
     rel = path.relative_to(root).as_posix()
-    return any(fnmatch.fnmatch(rel, pattern) or fnmatch.fnmatch(path.name, pattern) for pattern in patterns)
+    return any(
+        fnmatch.fnmatch(rel, pattern) or fnmatch.fnmatch(path.name, pattern) for pattern in patterns
+    )
 
 
 def _has_suffix(path: Path, suffixes: Sequence[str]) -> bool:
@@ -253,7 +257,9 @@ def _write_string_dataset(group: Any, name: str, values: Iterable[Any]) -> None:
     group.create_dataset(name, data=data, dtype=_string_dtype())
 
 
-def _write_table(group: Any, name: str, rows: Sequence[Mapping[str, Any]], fields: Sequence[str]) -> None:
+def _write_table(
+    group: Any, name: str, rows: Sequence[Mapping[str, Any]], fields: Sequence[str]
+) -> None:
     if not rows:
         return
     table = group.create_group(name)
@@ -277,11 +283,17 @@ def _write_table(group: Any, name: str, rows: Sequence[Mapping[str, Any]], field
                 integer = False
         if numeric:
             if integer and all(np.isfinite(v) for v in numeric_values):
-                table.create_dataset(field, data=np.asarray(numeric_values, dtype=np.int64), compression="lzf")
+                table.create_dataset(
+                    field, data=np.asarray(numeric_values, dtype=np.int64), compression="lzf"
+                )
             else:
-                table.create_dataset(field, data=np.asarray(numeric_values, dtype=np.float64), compression="lzf")
+                table.create_dataset(
+                    field, data=np.asarray(numeric_values, dtype=np.float64), compression="lzf"
+                )
         else:
-            _write_string_dataset(table, field, ["" if value is None else value for value in values])
+            _write_string_dataset(
+                table, field, ["" if value is None else value for value in values]
+            )
     table.attrs["row_count"] = len(rows)
     table.attrs["columns_json"] = _json_attr(list(fields))
 
@@ -350,7 +362,13 @@ def _write_frames_trajectory(source: Path, group: Any) -> None:
         else np.zeros((frame_count, max_atoms), dtype=np.int64)
     )
     frame_info: dict[str, list[float | int]] = {}
-    info_keys = ("timestep", "frame_timestep_fs", "md_timestep_fs", "trajectory_stride_md", "time_fs")
+    info_keys = (
+        "timestep",
+        "frame_timestep_fs",
+        "md_timestep_fs",
+        "trajectory_stride_md",
+        "time_fs",
+    )
     for index, frame in enumerate(frames):
         count = len(frame)
         positions[index, :count] = np.asarray(frame.get_positions(), dtype=np.float64)
@@ -365,16 +383,33 @@ def _write_frames_trajectory(source: Path, group: Any) -> None:
                 frame_info[key][index] = float(value)
 
     chunk_frames = max(1, min(frame_count, 64))
-    group.create_dataset("positions", data=positions, chunks=(chunk_frames, max_atoms, 3), compression="lzf", shuffle=True)
-    group.create_dataset("cell", data=cells, chunks=(chunk_frames, 3, 3), compression="lzf", shuffle=True)
+    group.create_dataset(
+        "positions",
+        data=positions,
+        chunks=(chunk_frames, max_atoms, 3),
+        compression="lzf",
+        shuffle=True,
+    )
+    group.create_dataset(
+        "cell", data=cells, chunks=(chunk_frames, 3, 3), compression="lzf", shuffle=True
+    )
     group.create_dataset("pbc", data=pbc, chunks=(chunk_frames, 3), compression="lzf")
-    group.create_dataset("atomic_numbers", data=atomic_numbers, compression="lzf" if not fixed else None, shuffle=not fixed)
+    group.create_dataset(
+        "atomic_numbers",
+        data=atomic_numbers,
+        compression="lzf" if not fixed else None,
+        shuffle=not fixed,
+    )
     if not fixed:
-        group.create_dataset("atom_counts", data=atom_counts, chunks=(chunk_frames,), compression="lzf", shuffle=True)
+        group.create_dataset(
+            "atom_counts", data=atom_counts, chunks=(chunk_frames,), compression="lzf", shuffle=True
+        )
     if frame_info:
         info_group = group.create_group("frame_info")
         for key, values in frame_info.items():
-            info_group.create_dataset(key, data=np.asarray(values, dtype=np.float64), compression="lzf", shuffle=True)
+            info_group.create_dataset(
+                key, data=np.asarray(values, dtype=np.float64), compression="lzf", shuffle=True
+            )
     group.attrs["present"] = True
     group.attrs["source_path"] = str(source)
     group.attrs["source_format"] = source.suffix.lower().lstrip(".") or "trajectory"
@@ -403,19 +438,31 @@ def _write_trajectory(source: Path | None, group: Any, messages: list[str]) -> N
 def _write_cube_dataset(group: Any, dataset: CubeDataset, source: Path, index: int) -> None:
     cube_group = group.create_group(_safe_id(source, index))
     cube_group.create_dataset("origin_bohr", data=np.asarray(dataset.origin_bohr, dtype=float))
-    cube_group.create_dataset("grid_counts_signed", data=np.asarray(dataset.grid_counts_signed, dtype=int))
-    cube_group.create_dataset("grid_vectors_bohr", data=np.asarray(dataset.grid_vectors_bohr, dtype=float))
+    cube_group.create_dataset(
+        "grid_counts_signed", data=np.asarray(dataset.grid_counts_signed, dtype=int)
+    )
+    cube_group.create_dataset(
+        "grid_vectors_bohr", data=np.asarray(dataset.grid_vectors_bohr, dtype=float)
+    )
     cube_group.create_dataset("atom_numbers", data=np.asarray(dataset.atom_numbers, dtype=int))
     cube_group.create_dataset("atom_charges", data=np.asarray(dataset.atom_charges, dtype=float))
-    cube_group.create_dataset("atom_positions_bohr", data=np.asarray(dataset.atom_positions_bohr, dtype=float))
-    cube_group.create_dataset("values", data=np.asarray(dataset.values, dtype=float), compression="lzf", shuffle=True)
+    cube_group.create_dataset(
+        "atom_positions_bohr", data=np.asarray(dataset.atom_positions_bohr, dtype=float)
+    )
+    cube_group.create_dataset(
+        "values", data=np.asarray(dataset.values, dtype=float), compression="lzf", shuffle=True
+    )
     cube_group.attrs["comment_1"] = dataset.comment_1
     cube_group.attrs["comment_2"] = dataset.comment_2
     cube_group.attrs["natoms_signed"] = int(dataset.natoms_signed)
     cube_group.attrs["source_path"] = dataset.source_path or str(source)
     cube_group.attrs["source_name"] = dataset.source_name or source.name
-    cube_group.attrs["source_file_type"] = dataset.source_file_type or ("cube_hdf5" if is_linak_cube_hdf5(source) else "cube_file")
-    cube_group.attrs["source_profile_index"] = -1 if dataset.source_profile_index is None else int(dataset.source_profile_index)
+    cube_group.attrs["source_file_type"] = dataset.source_file_type or (
+        "cube_hdf5" if is_linak_cube_hdf5(source) else "cube_file"
+    )
+    cube_group.attrs["source_profile_index"] = (
+        -1 if dataset.source_profile_index is None else int(dataset.source_profile_index)
+    )
     cube_group.attrs["parse_status"] = "ok"
 
 
@@ -456,7 +503,12 @@ def _write_cp2k_output_tables(
         parser = CP2KOutputParser(source, None, tmp_path, options)
         result = parser.parse()
         tables = (
-            ("scf_iterations", tmp_path / "scf_iterations.csv", result.scf_iterations, SCF_ITERATION_FIELDS),
+            (
+                "scf_iterations",
+                tmp_path / "scf_iterations.csv",
+                result.scf_iterations,
+                SCF_ITERATION_FIELDS,
+            ),
             ("mulliken", tmp_path / "mulliken.csv", result.mulliken_rows, MULLIKEN_FIELDS),
             ("hirshfeld", tmp_path / "hirshfeld.csv", result.hirshfeld_rows, HIRSHFELD_FIELDS),
             ("forces", tmp_path / "forces.csv", result.forces_rows, FORCES_FIELDS),
@@ -467,13 +519,39 @@ def _write_cp2k_output_tables(
             if rows:
                 _write_table(output_group, name, rows, fields)
                 sections.append(name)
-        _write_table(output_group, "cell", result.cell_rows, ("prefix", "a_x", "a_y", "a_z", "a_len", "b_x", "b_y", "b_z", "b_len", "c_x", "c_y", "c_z", "c_len"))
+        _write_table(
+            output_group,
+            "cell",
+            result.cell_rows,
+            (
+                "prefix",
+                "a_x",
+                "a_y",
+                "a_z",
+                "a_len",
+                "b_x",
+                "b_y",
+                "b_z",
+                "b_len",
+                "c_x",
+                "c_y",
+                "c_z",
+                "c_len",
+            ),
+        )
         if result.atomic_kinds:
-            _write_table(output_group, "atomic_kinds", result.atomic_kinds, ("kind_index", "kind", "atom_count"))
+            _write_table(
+                output_group,
+                "atomic_kinds",
+                result.atomic_kinds,
+                ("kind_index", "kind", "atom_count"),
+            )
         if result.warnings_counter:
             warning_group = output_group.create_group("warnings")
             _write_string_dataset(warning_group, "message", result.warnings_counter.keys())
-            warning_group.create_dataset("count", data=np.asarray(list(result.warnings_counter.values()), dtype=np.int64))
+            warning_group.create_dataset(
+                "count", data=np.asarray(list(result.warnings_counter.values()), dtype=np.int64)
+            )
         output_group.attrs["sections_json"] = _json_attr(sections)
         output_group.attrs["parse_status"] = "ok"
         return len(sections), tuple(sections)
@@ -492,7 +570,9 @@ def _write_cp2k_outputs(
     parsed = 0
     for index, source in enumerate(sources):
         try:
-            section_count, sections = _write_cp2k_output_tables(source, cp2k_group, options=parser_options, index=index)
+            section_count, sections = _write_cp2k_output_tables(
+                source, cp2k_group, options=parser_options, index=index
+            )
             parsed += 1
             all_sections.update(sections)
             messages.append(f"Packed CP2K output: {source} ({section_count} section(s))")
@@ -510,7 +590,9 @@ def _species_from_atomic_numbers(numbers: np.ndarray) -> tuple[str, ...]:
         from ase.data import chemical_symbols
 
         unique = sorted({int(value) for value in np.asarray(numbers).reshape(-1) if int(value) > 0})
-        return tuple(chemical_symbols[number] for number in unique if number < len(chemical_symbols))
+        return tuple(
+            chemical_symbols[number] for number in unique if number < len(chemical_symbols)
+        )
     except Exception:
         return ()
 
@@ -690,7 +772,10 @@ def is_linak_out_hdf5(path: str | Path) -> bool:
     try:
         h5py = _h5py()
         with h5py.File(candidate, "r") as handle:
-            return str(_decode_attr(handle.attrs.get("linak_format", ""))).strip() == LINAK_OUT_HDF5_FORMAT
+            return (
+                str(_decode_attr(handle.attrs.get("linak_format", ""))).strip()
+                == LINAK_OUT_HDF5_FORMAT
+            )
     except Exception:
         return False
 
@@ -713,8 +798,18 @@ def inspect_out_h5(path: str | Path) -> OutH5Summary:
         frame_range = None
         pbc: tuple[bool, bool, bool] | None = None
         if trajectory_present and trajectory is not None:
-            frame_count = int(trajectory.attrs.get("frame_count", trajectory["positions"].shape[0] if "positions" in trajectory else 0))
-            atom_count = int(trajectory.attrs.get("atom_count", trajectory["positions"].shape[1] if "positions" in trajectory else 0))
+            frame_count = int(
+                trajectory.attrs.get(
+                    "frame_count",
+                    trajectory["positions"].shape[0] if "positions" in trajectory else 0,
+                )
+            )
+            atom_count = int(
+                trajectory.attrs.get(
+                    "atom_count",
+                    trajectory["positions"].shape[1] if "positions" in trajectory else 0,
+                )
+            )
             trajectory_source_path = str(_decode_attr(trajectory.attrs.get("source_path", "")))
             trajectory_source_format = str(_decode_attr(trajectory.attrs.get("source_format", "")))
             if "pbc" in trajectory and getattr(trajectory["pbc"], "shape", ()):
@@ -749,7 +844,9 @@ def inspect_out_h5(path: str | Path) -> OutH5Summary:
                         continue
                     first_dataset = next(iter(table_group.values()), None)
                     if first_dataset is not None and hasattr(first_dataset, "shape"):
-                        cp2k_table_counts[str(table_name)] = cp2k_table_counts.get(str(table_name), 0) + int(first_dataset.shape[0])
+                        cp2k_table_counts[str(table_name)] = cp2k_table_counts.get(
+                            str(table_name), 0
+                        ) + int(first_dataset.shape[0])
         species: tuple[str, ...] = ()
         if "system/species" in handle:
             species = tuple(str(_decode_attr(value)) for value in handle["system/species"][...])
@@ -948,8 +1045,12 @@ def read_out_h5_cube_datasets(
             datasets.append(
                 CubeDataset(
                     comment_1=str(_decode_attr(group.attrs.get("comment_1", "LiNaK out.h5 cube"))),
-                    comment_2=str(_decode_attr(group.attrs.get("comment_2", "Generated by LiNaK pack"))),
-                    natoms_signed=int(group.attrs.get("natoms_signed", np.asarray(group["atom_numbers"]).shape[0])),
+                    comment_2=str(
+                        _decode_attr(group.attrs.get("comment_2", "Generated by LiNaK pack"))
+                    ),
+                    natoms_signed=int(
+                        group.attrs.get("natoms_signed", np.asarray(group["atom_numbers"]).shape[0])
+                    ),
                     origin_bohr=np.asarray(group["origin_bohr"], dtype=float),
                     grid_counts_signed=np.asarray(group["grid_counts_signed"], dtype=int),
                     grid_vectors_bohr=np.asarray(group["grid_vectors_bohr"], dtype=float),
@@ -986,7 +1087,9 @@ def export_out_h5_component(
     if component == "cube":
         datasets = read_out_h5_cube_datasets(path)
         if not datasets:
-            raise ValueError(f"Output container has no cube data: {Path(path).expanduser().resolve()}")
+            raise ValueError(
+                f"Output container has no cube data: {Path(path).expanduser().resolve()}"
+            )
         return save_cube_datasets(
             datasets,
             output_path,
