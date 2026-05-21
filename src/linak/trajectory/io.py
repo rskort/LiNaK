@@ -95,9 +95,12 @@ class TrajectoryStoredMetadata:
 
 def default_trajectory_hdf5_output_path(source: str | Path) -> Path:
     """Return the default output path for a converted LiNaK trajectory HDF5."""
+    from ..analysis.output_naming import analysis_source_base
+
     source_path = Path(source).expanduser().resolve()
-    stem = source_path.stem or source_path.name or "trajectory"
-    return source_path.with_name(f"{stem}.traj.h5")
+    output_dir = source_path.parent / "LiNaK_outputs"
+    stem = analysis_source_base(source_path, default="trajectory")
+    return output_dir / f"{stem}.traj.h5"
 
 
 def is_linak_trajectory_hdf5(path: str | Path) -> bool:

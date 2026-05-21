@@ -21,5 +21,5 @@ def test_package_version_matches_pyproject() -> None:
 
 
 def test_registered_analysis_schemas_are_development_v1() -> None:
-    for analysis in ("density", "msd", "rdf", "position", "coordination", "orientation"):
+    for analysis in ("density", "msd", "rdf", "position", "coordination", "orientation", "temperature"):
         assert get_analysis_schema(analysis).version == 1

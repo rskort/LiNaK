@@ -414,4 +414,12 @@ def test_default_trajectory_hdf5_output_path_uses_traj_suffix(tmp_path):
 
     resolved = default_trajectory_hdf5_output_path(path)
 
-    assert resolved == tmp_path.resolve() / "traj.traj.h5"
+    assert resolved == tmp_path.resolve() / "LiNaK_outputs" / "traj.traj.h5"
+
+
+def test_default_trajectory_hdf5_output_path_strips_cp2k_position_suffix(tmp_path):
+    path = tmp_path / "Au111_K6-pos-1.xyz"
+
+    resolved = default_trajectory_hdf5_output_path(path)
+
+    assert resolved == tmp_path.resolve() / "LiNaK_outputs" / "Au111_K6.traj.h5"

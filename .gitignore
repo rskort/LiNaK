@@ -40,3 +40,8 @@ data/
 # Temporary files
 *tmp*
 *temp*
+!src/linak/analysis/temperature.py
+!src/linak/plot/contracts/temperature_contract.py
+!src/linak/plot/mappings/temperature_mapping.py
+!docs/temperature.md
+!tests/test_temperature.py

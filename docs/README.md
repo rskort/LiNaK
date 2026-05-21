@@ -30,6 +30,7 @@ The pages in this folder describe:
 - [Coordination](coordination.md)
 - [Potential](potential.md)
 - [Orientation](orientation.md)
+- [Temperature](temperature.md)
 
 ## Shared Method Guides
 
@@ -66,7 +67,7 @@ The supported analysis workflow is compute first, plot second:
 
 ```bash
 linak compute density /path/to/traj.h5 --species O --axis z
-linak plot /path/to/traj_density_o_z.h5
+linak plot /path/to/traj.density.h5
 ```
 
 For repeated analysis, first convert raw text trajectories into LiNaK trajectory
@@ -74,7 +75,7 @@ HDF5:
 
 ```bash
 linak apply convert /path/to/traj.xyz --input /path/to/input.inp
-linak compute density /path/to/traj.traj.h5 --species O --axis z
+linak compute density /path/to/LiNaK_outputs/traj.traj.h5 --species O --axis z
 ```
 
 Converted `*.traj.h5` files are preprocessed trajectory containers. They keep
@@ -137,6 +138,7 @@ The current implementations described in this folder are primarily defined in:
 - `src/linak/analysis/coordination.py`
 - `src/linak/analysis/potential.py`
 - `src/linak/analysis/orientation.py`
+- `src/linak/analysis/temperature.py`
 - `src/linak/analysis/surface.py`
 - `src/linak/analysis/water.py`
 - `src/linak/analysis/schema.py`

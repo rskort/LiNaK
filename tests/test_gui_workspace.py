@@ -97,7 +97,7 @@ def test_gui_command_is_explicit_subcommand():
 
 def test_project_item_detection_distinguishes_external_and_generated_hdf5(tmp_path):
     source = tmp_path / "traj.xyz"
-    output = tmp_path / "project" / "traj_density.h5"
+    output = tmp_path / "project" / "traj.density.h5"
     _write_xyz(source)
     write_linak_hdf5(
         output,
@@ -226,7 +226,7 @@ def test_expected_output_naming_versions_collisions(tmp_path):
     _write_xyz(trajectory)
     item = detect_project_item(trajectory, origin="external")
     action = ActionRegistry().by_id("density")
-    existing = project / "traj_density.h5"
+    existing = project / "traj.density.h5"
     existing.write_text("occupied", encoding="utf-8")
 
     outputs = action.expected_outputs(
@@ -235,7 +235,7 @@ def test_expected_output_naming_versions_collisions(tmp_path):
         settings={"species": "O", "axis": "z", "bin_width": 0.1, "outputs": "line"},
     )
 
-    assert outputs == (project / "traj_density_1.h5",)
+    assert outputs == (project / "traj.density_1.h5",)
 
 
 def test_viewmodels_build_guided_display_rows(tmp_path):
@@ -404,14 +404,14 @@ def test_gui_action_settings_snapshot_and_hash_are_stable(tmp_path):
     assert gui_settings.to_backend_dict() == settings
     assert gui_settings.settings_hash == settings_hash("density", settings)
     assert gui_settings.collision_policy == "auto-version"
-    assert gui_settings.output_paths == (project / "traj_density.h5",)
+    assert gui_settings.output_paths == (project / "traj.density.h5",)
 
 
 def test_component_viewmodels_group_items_and_flag_outputs(tmp_path):
     project = tmp_path / "project"
     project.mkdir()
     container = project / "run.out.h5"
-    output = project / "run_density.h5"
+    output = project / "run.density.h5"
     _write_minimal_out_h5(container, trajectory=True, cubes=0)
     write_linak_hdf5(
         output,
@@ -436,7 +436,7 @@ def test_component_viewmodels_group_items_and_flag_outputs(tmp_path):
     )
 
     assert rows[0].group_label == "2. Output containers"
-    assert display.output_preview == ("run_density_1.h5",)
+    assert display.output_preview == ("run.density_1.h5",)
     assert display.can_run_defaults
     assert display.cancel_capability == "limited"
 

@@ -190,6 +190,15 @@ def _msd_settings(_item: ProjectItem) -> list[SettingField]:
     ]
 
 
+def _temperature_settings(_item: ProjectItem) -> list[SettingField]:
+    return [
+        SettingField("group_by", "Group by", "choice", "auto", ("auto", "elements", "regions", "both"), True, "Selection", widget="choice"),
+        SettingField("input", "CP2K input", "path", group="Metadata", widget="path"),
+        SettingField("velocity_unit", "Velocity unit", "choice", "auto", ("auto", "atomic", "angstrom/fs"), True, "Velocity", widget="choice"),
+        SettingField("remove_com", "Remove COM velocity", "bool", False, group="Velocity"),
+    ]
+
+
 def _rdf_settings(_item: ProjectItem) -> list[SettingField]:
     return [
         SettingField("species_a", "Species A", "text", "all", True, group="Selection", widget="species"),
@@ -290,6 +299,16 @@ def _project_output(ctx: ActionContext, suffix: str) -> Path:
 
 def _planned_output(project_dir: Path, item: ProjectItem, suffix: str) -> Path:
     return _unique_path(Path(project_dir).expanduser().resolve() / f"{_stem(item.path)}{suffix}")
+
+
+def _analysis_output(project_dir: Path, source: Path, analysis: str) -> Path:
+    from ..analysis.output_naming import analysis_hdf5_filename
+
+    return _unique_path(Path(project_dir).expanduser().resolve() / analysis_hdf5_filename(source, analysis))
+
+
+def _project_analysis_output(ctx: ActionContext, analysis: str) -> Path:
+    return _analysis_output(ctx.project_dir, ctx.item.path, analysis)
 
 
 def _split_words(value: Any) -> list[str]:
@@ -423,8 +442,7 @@ def _convert_backend(ctx: ActionContext) -> ActionExecutionResult:
         ctx.item.path,
         target_file_type=target_type.id,
     )
-    suffix_name = default_path.name[len(_stem(ctx.item.path)) :] if default_path.name.startswith(_stem(ctx.item.path)) else default_path.name
-    target_path = _unique_path(ctx.project_dir / f"{_stem(ctx.item.path)}{suffix_name}")
+    target_path = _unique_path(ctx.project_dir / default_path.name)
     request = CONVERSION_REGISTRY.build_request(
         ctx.item.path,
         output_path=target_path,
@@ -483,7 +501,7 @@ def _pack_backend(ctx: ActionContext) -> ActionExecutionResult:
 
 
 def _compute_density_backend(ctx: ActionContext) -> ActionExecutionResult:
-    output = _project_output(ctx, "_density.h5")
+    output = _project_analysis_output(ctx, "density")
     argv = ["compute", "density", str(ctx.item.path), "--output", str(output)]
     _add_optional(argv, "--species", ctx.settings.get("species"))
     _add_optional(argv, "--axis", ctx.settings.get("axis"))
@@ -499,7 +517,7 @@ def _compute_density_backend(ctx: ActionContext) -> ActionExecutionResult:
 
 
 def _compute_msd_backend(ctx: ActionContext) -> ActionExecutionResult:
-    output = _project_output(ctx, "_msd.h5")
+    output = _project_analysis_output(ctx, "msd")
     argv = ["compute", "msd", str(ctx.item.path), "--output", str(output)]
     _add_optional(argv, "--species", ctx.settings.get("species"))
     _add_optional(argv, "--timestep-fs", ctx.settings.get("timestep_fs"))
@@ -508,8 +526,19 @@ def _compute_msd_backend(ctx: ActionContext) -> ActionExecutionResult:
     return _run_cli_with_expected_outputs(ctx, argv, (output,))
 
 
+def _compute_temperature_backend(ctx: ActionContext) -> ActionExecutionResult:
+    output = _project_analysis_output(ctx, "temperature")
+    argv = ["compute", "temperature", str(ctx.item.path), "--output", str(output)]
+    _add_optional(argv, "--group-by", ctx.settings.get("group_by"))
+    _add_optional(argv, "--input", ctx.settings.get("input"))
+    _add_optional(argv, "--velocity-unit", ctx.settings.get("velocity_unit"))
+    if bool(ctx.settings.get("remove_com", False)):
+        argv.append("--remove-com")
+    return _run_cli_with_expected_outputs(ctx, argv, (output,))
+
+
 def _compute_rdf_backend(ctx: ActionContext) -> ActionExecutionResult:
-    output = _project_output(ctx, "_rdf.h5")
+    output = _project_analysis_output(ctx, "rdf")
     argv = ["compute", "rdf", str(ctx.item.path), "--output", str(output)]
     _add_optional(argv, "--species-a", ctx.settings.get("species_a"))
     _add_optional(argv, "--species-b", ctx.settings.get("species_b"))
@@ -523,7 +552,7 @@ def _compute_rdf_backend(ctx: ActionContext) -> ActionExecutionResult:
 
 
 def _compute_position_backend(ctx: ActionContext) -> ActionExecutionResult:
-    output = _project_output(ctx, "_position.h5")
+    output = _project_analysis_output(ctx, "position")
     argv = ["compute", "position", str(ctx.item.path), "--output", str(output)]
     _add_optional(argv, "--species", ctx.settings.get("species"))
     _add_optional(argv, "--axis", ctx.settings.get("axis"))
@@ -535,7 +564,7 @@ def _compute_position_backend(ctx: ActionContext) -> ActionExecutionResult:
 
 
 def _compute_coordination_backend(ctx: ActionContext) -> ActionExecutionResult:
-    output = _project_output(ctx, "_coordination.h5")
+    output = _project_analysis_output(ctx, "coordination")
     argv = ["compute", "coordination", str(ctx.item.path), "--output", str(output)]
     _add_optional(argv, "--species-a", ctx.settings.get("species_a"))
     _add_optional(argv, "--species-b", ctx.settings.get("species_b"))
@@ -551,7 +580,7 @@ def _compute_coordination_backend(ctx: ActionContext) -> ActionExecutionResult:
 
 
 def _compute_orientation_backend(ctx: ActionContext) -> ActionExecutionResult:
-    output = _project_output(ctx, "_orientation.h5")
+    output = _project_analysis_output(ctx, "orientation")
     argv = ["compute", "orientation", str(ctx.item.path), "--output", str(output)]
     _add_optional(argv, "--axis", ctx.settings.get("axis"))
     _add_optional(argv, "--reference-axis", ctx.settings.get("reference_axis"))
@@ -573,7 +602,7 @@ def _apply_pbc_backend(ctx: ActionContext) -> ActionExecutionResult:
 
 
 def _compute_potential_backend(ctx: ActionContext) -> ActionExecutionResult:
-    output = _project_output(ctx, "_potential.h5")
+    output = _project_analysis_output(ctx, "potential")
     argv = ["compute", "potential", str(ctx.item.path), "--output", str(output)]
     _add_optional(argv, "--water-padding-ang", ctx.settings.get("water_padding_ang"))
     _add_optional(argv, "--cshe-offset-ev", ctx.settings.get("cshe_offset_ev"))
@@ -641,18 +670,19 @@ def _expected_convert_outputs(
         item.path,
         target_file_type=target_type.id,
     )
-    stem = _stem(item.path)
-    suffix_name = (
-        default_path.name[len(stem) :]
-        if default_path.name.startswith(stem)
-        else default_path.name
-    )
-    return (_unique_path(Path(project_dir).expanduser().resolve() / f"{stem}{suffix_name}"),)
+    return (_unique_path(Path(project_dir).expanduser().resolve() / default_path.name),)
 
 
 def _expected_suffix(suffix: str) -> ExpectedOutputsFactory:
     def _factory(project_dir: Path, item: ProjectItem, _settings: dict[str, Any]) -> tuple[Path, ...]:
         return (_planned_output(project_dir, item, suffix),)
+
+    return _factory
+
+
+def _expected_analysis(analysis: str) -> ExpectedOutputsFactory:
+    def _factory(project_dir: Path, item: ProjectItem, _settings: dict[str, Any]) -> tuple[Path, ...]:
+        return (_analysis_output(project_dir, item.path, analysis),)
 
     return _factory
 
@@ -681,6 +711,7 @@ def _summary(label: str, expected: ExpectedOutputsFactory) -> SummaryFactory:
 
 def build_action_registry() -> list[Action]:
     trajectory_inputs = frozenset({"raw_trajectory", "trajectory_hdf5", "out_hdf5"})
+    temperature_inputs = frozenset({"temperature_file", "raw_trajectory"})
     convertible_inputs = frozenset({"raw_trajectory", "trajectory_hdf5", "cube_file", "cube_hdf5"})
     analysis_outputs = frozenset({"analysis_hdf5", "cube_hdf5"})
     return [
@@ -688,14 +719,15 @@ def build_action_registry() -> list[Action]:
         Action("convert", "Convert", "Convert file", "Convert to another LiNaK-compatible working format.", convertible_inputs, None, _convert_settings, _convert_backend, _expected_convert_outputs, _summary("Conversion", _expected_convert_outputs)),
         Action("export_out_trajectory", "Convert", "Export trajectory", "Export trajectory data from this output container as .traj.h5.", frozenset({"out_hdf5"}), "trajectory_hdf5", _no_settings, _export_out_trajectory_backend, _expected_suffix(".traj.h5"), _summary("Trajectory export", _expected_suffix(".traj.h5"))),
         Action("export_out_cube", "Convert", "Export cubes", "Export cube data from this output container as .cube.h5.", frozenset({"out_hdf5"}), "cube_hdf5", _no_settings, _export_out_cube_backend, _expected_suffix(".cube.h5"), _summary("Cube export", _expected_suffix(".cube.h5"))),
-        Action("density", "Compute", "Density", "Compute density profiles and heatmaps from a trajectory.", trajectory_inputs, "analysis_hdf5", _density_settings, _compute_density_backend, _expected_suffix("_density.h5"), _summary("Density", _expected_suffix("_density.h5"))),
-        Action("msd", "Compute", "MSD", "Compute mean-squared displacement from a trajectory.", trajectory_inputs, "analysis_hdf5", _msd_settings, _compute_msd_backend, _expected_suffix("_msd.h5"), _summary("MSD", _expected_suffix("_msd.h5"))),
-        Action("rdf", "Compute", "RDF", "Compute radial distribution functions from a trajectory.", trajectory_inputs, "analysis_hdf5", _rdf_settings, _compute_rdf_backend, _expected_suffix("_rdf.h5"), _summary("RDF", _expected_suffix("_rdf.h5"))),
-        Action("position", "Compute", "Position", "Compute atom-resolved positions and distance-to-surface profiles.", trajectory_inputs, "analysis_hdf5", _position_settings, _compute_position_backend, _expected_suffix("_position.h5"), _summary("Position", _expected_suffix("_position.h5"))),
-        Action("coordination", "Compute", "Coordination", "Compute continuous coordination numbers.", trajectory_inputs, "analysis_hdf5", _coordination_settings, _compute_coordination_backend, _expected_suffix("_coordination.h5"), _summary("Coordination", _expected_suffix("_coordination.h5"))),
-        Action("orientation", "Compute", "Orientation", "Compute water orientation versus distance to surface.", trajectory_inputs, "analysis_hdf5", _orientation_settings, _compute_orientation_backend, _expected_suffix("_orientation.h5"), _summary("Orientation", _expected_suffix("_orientation.h5"))),
+        Action("density", "Compute", "Density", "Compute density profiles and heatmaps from a trajectory.", trajectory_inputs, "analysis_hdf5", _density_settings, _compute_density_backend, _expected_analysis("density"), _summary("Density", _expected_analysis("density"))),
+        Action("msd", "Compute", "MSD", "Compute mean-squared displacement from a trajectory.", trajectory_inputs, "analysis_hdf5", _msd_settings, _compute_msd_backend, _expected_analysis("msd"), _summary("MSD", _expected_analysis("msd"))),
+        Action("temperature", "Compute", "Temperature", "Compute temperature profiles from .temp, .tregion, or velocity XYZ.", temperature_inputs, "analysis_hdf5", _temperature_settings, _compute_temperature_backend, _expected_analysis("temperature"), _summary("Temperature", _expected_analysis("temperature"))),
+        Action("rdf", "Compute", "RDF", "Compute radial distribution functions from a trajectory.", trajectory_inputs, "analysis_hdf5", _rdf_settings, _compute_rdf_backend, _expected_analysis("rdf"), _summary("RDF", _expected_analysis("rdf"))),
+        Action("position", "Compute", "Position", "Compute atom-resolved positions and distance-to-surface profiles.", trajectory_inputs, "analysis_hdf5", _position_settings, _compute_position_backend, _expected_analysis("position"), _summary("Position", _expected_analysis("position"))),
+        Action("coordination", "Compute", "Coordination", "Compute continuous coordination numbers.", trajectory_inputs, "analysis_hdf5", _coordination_settings, _compute_coordination_backend, _expected_analysis("coordination"), _summary("Coordination", _expected_analysis("coordination"))),
+        Action("orientation", "Compute", "Orientation", "Compute water orientation versus distance to surface.", trajectory_inputs, "analysis_hdf5", _orientation_settings, _compute_orientation_backend, _expected_analysis("orientation"), _summary("Orientation", _expected_analysis("orientation"))),
         Action("pbc", "Apply", "Apply PBC", "Wrap trajectory atoms into the resolved periodic cell.", trajectory_inputs, "raw_trajectory", _pbc_settings, _apply_pbc_backend, _expected_suffix("_pbc.xyz"), _summary("PBC", _expected_suffix("_pbc.xyz"))),
-        Action("potential", "Compute", "Potential", "Compute CP2K electrode cSHE potential from cube data.", frozenset({"cube_file", "cube_hdf5", "out_hdf5"}), "analysis_hdf5", _potential_settings, _compute_potential_backend, _expected_suffix("_potential.h5"), _summary("Potential", _expected_suffix("_potential.h5"))),
+        Action("potential", "Compute", "Potential", "Compute CP2K electrode cSHE potential from cube data.", frozenset({"cube_file", "cube_hdf5", "out_hdf5"}), "analysis_hdf5", _potential_settings, _compute_potential_backend, _expected_analysis("potential"), _summary("Potential", _expected_analysis("potential"))),
         Action("open_plot", "Open", "Open plot viewer", "Open this output in the LiNaK plotting GUI.", analysis_outputs, None, _no_settings, None),
     ]
 

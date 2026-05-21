@@ -1497,10 +1497,10 @@ def _read_max_existing_id(path: Path) -> int:
 def _fallback_csv_path(path: Path) -> Path:
     suffix = path.suffix if path.suffix.lower() in {".h5", ".hdf5"} else ".h5"
     stem = path.stem if path.suffix else path.name
-    candidate = path.with_name(f"{stem}_linak_potential{suffix}")
+    candidate = path.with_name(f"{stem}.linak.potential{suffix}")
     counter = 2
     while candidate.exists():
-        candidate = path.with_name(f"{stem}_linak_potential_{counter}{suffix}")
+        candidate = path.with_name(f"{stem}.linak.potential_{counter}{suffix}")
         counter += 1
     return candidate
 

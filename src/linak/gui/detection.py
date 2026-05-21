@@ -219,8 +219,21 @@ def detect_project_item(path: str | Path, *, origin: ProjectItemOrigin) -> Proje
             validation=ValidationResult("valid", "Cube file"),
         )
 
+    if lower_name.endswith((".temp", ".tregion")):
+        metadata["stem"] = _strip_known_suffix(resolved.name)
+        metadata["temperature_source_type"] = "tregion" if lower_name.endswith(".tregion") else "temp"
+        return ProjectItem(
+            path=resolved,
+            item_type="temperature_file",
+            origin=origin,
+            metadata=metadata,
+            validation=ValidationResult("valid", "Temperature source"),
+        )
+
     if lower_name.endswith((".xyz", ".extxyz", ".dump", ".lmp")):
         metadata["stem"] = _strip_known_suffix(resolved.name)
+        if lower_name.endswith((".xyz", ".extxyz")) and "-vel-" in lower_name:
+            metadata["trajectory_role"] = "velocity"
         return ProjectItem(
             path=resolved,
             item_type="raw_trajectory",
@@ -249,7 +262,7 @@ def discover_generated_items(project_dir: str | Path) -> list[ProjectItem]:
         if path.name == ".linak_project.json" or not path.is_file():
             continue
         lower_name = path.name.lower()
-        if not lower_name.endswith((".h5", ".hdf5", ".out.h5", ".out.hdf5", ".traj.h5", ".traj.hdf5", ".cube.h5", ".cube.hdf5", ".xyz", ".cube")):
+        if not lower_name.endswith((".h5", ".hdf5", ".out.h5", ".out.hdf5", ".traj.h5", ".traj.hdf5", ".cube.h5", ".cube.hdf5", ".xyz", ".cube", ".temp", ".tregion")):
             continue
         item = detect_project_item(path, origin="generated")
         if (

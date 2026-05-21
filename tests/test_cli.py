@@ -66,6 +66,7 @@ from linak.storage.hdf5_utils import (
     write_linak_hdf5_profile_collection,
 )
 from linak.analysis.msd import compute_msd, load_msd_profile, save_msd_profile
+from linak.analysis.output_naming import analysis_source_base
 from linak.plot.plot_settings import (
     read_active_plot_profile_name,
     read_plot_profile,
@@ -242,6 +243,22 @@ def _write_simple_hdf5(path: Path) -> None:
 
 def _linak_output_dir(path: Path) -> Path:
     return path / "LiNaK_outputs"
+
+
+def test_analysis_source_base_strips_known_source_suffixes(tmp_path):
+    cases = {
+        "Au111_K6-pos-1.traj.xyz": "Au111_K6",
+        "Pt110_1x2_Na4_H-vel-1.xyz": "Pt110_1x2_Na4_H",
+        "Au111_K6-1.temp": "Au111_K6",
+        "Au111_K6-1.tregion": "Au111_K6",
+        "Au111_K6.traj.h5": "Au111_K6",
+        "Au111_K6.out.h5": "Au111_K6",
+        "Au111_K6.cube.h5": "Au111_K6",
+        "sample-v_hartree-1_0.cube": "sample",
+    }
+
+    for filename, expected in cases.items():
+        assert analysis_source_base(tmp_path / filename) == expected
 
 
 def test_read_project_author_falls_back_to_installed_package_metadata(tmp_path, monkeypatch):
@@ -524,7 +541,7 @@ def test_plot_command_without_subcommand_shows_overview(capsys):
     assert rc == 0
     out = capsys.readouterr().out
     assert "LiNaK Plot Usage (HDF5-only)" in out
-    assert "linak plot /path/to/traj_density.h5" in out
+    assert "linak plot /path/to/traj.density.h5" in out
 
 
 def test_compute_command_without_subcommand_shows_overview(capsys):
@@ -572,7 +589,9 @@ def test_apply_convert_dry_run_reports_default_output(tmp_path, capsys):
     )
 
     assert rc == 0
-    assert "traj.traj.h5" in capsys.readouterr().err
+    captured = capsys.readouterr()
+    assert "LiNaK_outputs" in captured.err
+    assert "traj.traj.h5" in captured.err
 
 
 def test_apply_convert_dry_run_reports_explicit_target_file_type(tmp_path, capsys):
@@ -611,7 +630,25 @@ def test_apply_convert_writes_traj_hdf5(tmp_path):
     )
 
     assert rc == 0
-    assert (tmp_path / "traj.traj.h5").exists()
+    assert (tmp_path / "LiNaK_outputs" / "traj.traj.h5").exists()
+
+
+def test_apply_convert_cp2k_position_xyz_uses_clean_linak_output_name(tmp_path):
+    trajectory = tmp_path / "Au111_K6-pos-1.xyz"
+    _write_xyz(trajectory)
+
+    rc = main(
+        [
+            "--log-level",
+            "ERROR",
+            "apply",
+            "convert",
+            str(trajectory),
+        ]
+    )
+
+    assert rc == 0
+    assert (tmp_path / "LiNaK_outputs" / "Au111_K6.traj.h5").exists()
 
 
 def test_apply_convert_traj_hdf5_to_xyz_roundtrip(tmp_path):
@@ -630,7 +667,7 @@ def test_apply_convert_traj_hdf5_to_xyz_roundtrip(tmp_path):
         == 0
     )
 
-    converted_h5 = tmp_path / "traj.traj.h5"
+    converted_h5 = tmp_path / "LiNaK_outputs" / "traj.traj.h5"
     out_xyz = tmp_path / "traj_roundtrip.xyz"
     rc = main(
         [
@@ -668,7 +705,7 @@ def test_apply_convert_preferred_hdf5_input_without_target_is_noop(tmp_path, cap
         == 0
     )
 
-    converted_h5 = tmp_path / "traj.traj.h5"
+    converted_h5 = tmp_path / "LiNaK_outputs" / "traj.traj.h5"
     rc = main(
         [
             "--log-level",
@@ -721,7 +758,7 @@ def test_apply_convert_select_first_frames_adds_suffix_and_metadata(tmp_path):
     )
 
     assert rc == 0
-    converted = tmp_path / "traj_first3f.traj.h5"
+    converted = tmp_path / "LiNaK_outputs" / "traj_first3f.traj.h5"
     assert converted.exists()
     loaded = read_trajectory(converted)
     assert [frame.positions[0, 2] for frame in loaded] == pytest.approx([0.1, 0.2, 0.3])
@@ -752,7 +789,7 @@ def test_apply_convert_select_last_percent_resolves_to_actual_frame_range(tmp_pa
     )
 
     assert rc == 0
-    converted = tmp_path / "traj_last50pct.traj.h5"
+    converted = tmp_path / "LiNaK_outputs" / "traj_last50pct.traj.h5"
     loaded = read_trajectory(converted)
     assert [frame.positions[0, 2] for frame in loaded] == pytest.approx([0.3, 0.4])
     metadata = read_trajectory_hdf5_metadata(converted)
@@ -911,7 +948,7 @@ def test_apply_convert_select_range_frames_uses_deterministic_suffix(tmp_path):
     )
 
     assert rc == 0
-    converted = tmp_path / "traj_range1f_4f.traj.h5"
+    converted = tmp_path / "LiNaK_outputs" / "traj_range1f_4f.traj.h5"
     loaded = read_trajectory(converted)
     assert [frame.positions[0, 2] for frame in loaded] == pytest.approx([0.2, 0.3, 0.4])
 
@@ -989,7 +1026,7 @@ def test_apply_convert_spatial_filter_x_range_writes_variable_topology_hdf5(tmp_
     )
 
     assert rc == 0
-    converted = tmp_path / "traj_x_0.0_5.0.traj.h5"
+    converted = tmp_path / "LiNaK_outputs" / "traj_x_0.0_5.0.traj.h5"
     loaded = read_trajectory(converted)
     assert [len(frame) for frame in loaded] == [2, 1]
     metadata = read_trajectory_hdf5_metadata(converted)
@@ -1028,7 +1065,7 @@ def test_apply_convert_spatial_filter_keep_molecules_intact_keeps_full_water(tmp
     )
 
     assert rc == 0
-    converted = tmp_path / "traj_z_1.0_1.2.traj.h5"
+    converted = tmp_path / "LiNaK_outputs" / "traj_z_1.0_1.2.traj.h5"
     loaded = read_trajectory(converted)
     assert len(loaded) == 1
     assert len(loaded[0]) == 3
@@ -1040,7 +1077,7 @@ def test_apply_convert_spatial_filter_keep_molecules_intact_keeps_full_water(tmp
     assert metadata.spatial_filter_metadata["retained_molecule_count_total"] == 1
 
 
-def test_compute_density_spatial_filter_z_range_sets_suffix_and_metadata(tmp_path):
+def test_compute_density_spatial_filter_z_range_records_metadata(tmp_path):
     trajectory = tmp_path / "traj.xyz"
     _write_xyz_custom_frames(
         trajectory,
@@ -1081,7 +1118,7 @@ def test_compute_density_spatial_filter_z_range_sets_suffix_and_metadata(tmp_pat
     )
 
     assert rc == 0
-    output = _linak_output_dir(tmp_path) / "traj_density_o_z_0.5_1.5.h5"
+    output = _linak_output_dir(tmp_path) / "traj.density.h5"
     assert output.exists()
     with h5py.File(output, "r") as handle:
         metadata = json.loads(str(handle.attrs["metadata_json"]))
@@ -1144,7 +1181,7 @@ def test_compute_density_spatial_filter_distance_range_uses_surface_metadata(tmp
     )
 
     assert rc == 0
-    output = _linak_output_dir(tmp_path) / "traj_density_o_dist_0.5_1.5.h5"
+    output = _linak_output_dir(tmp_path) / "traj.density.h5"
     assert output.exists()
     with h5py.File(output, "r") as handle:
         metadata = json.loads(str(handle.attrs["metadata_json"]))
@@ -1488,7 +1525,7 @@ def test_apply_convert_embeds_input_metadata_into_traj_hdf5(tmp_path):
     )
 
     assert rc == 0
-    metadata = read_trajectory_hdf5_metadata(tmp_path / "traj.traj.h5")
+    metadata = read_trajectory_hdf5_metadata(tmp_path / "LiNaK_outputs" / "traj.traj.h5")
     assert metadata is not None
     assert metadata.input_path == input_path.resolve()
     assert metadata.cell_angstrom == pytest.approx((17.887, 15.491, 59.671))
@@ -1520,7 +1557,7 @@ def test_apply_convert_wraps_pbc_and_caches_default_surface(tmp_path):
     )
 
     assert rc == 0
-    converted = tmp_path / "surface.traj.h5"
+    converted = tmp_path / "LiNaK_outputs" / "surface.traj.h5"
     metadata = read_trajectory_hdf5_metadata(converted)
     assert metadata is not None
     assert metadata.pbc_applied is True
@@ -1575,7 +1612,7 @@ def test_compute_position_reuses_conversion_cached_pbc_and_surface(tmp_path, mon
         "&END MOTION\n",
         encoding="utf-8",
     )
-    converted = tmp_path / "surface.traj.h5"
+    converted = tmp_path / "LiNaK_outputs" / "surface.traj.h5"
     rc_convert = main(
         [
             "--log-level",
@@ -1631,7 +1668,7 @@ def test_conversion_surface_cache_mismatch_is_not_used(tmp_path):
         "&SUBSYS\n  &CELL\n    ABC 2.0 2.0 4.0\n  &END CELL\n&END SUBSYS\n",
         encoding="utf-8",
     )
-    converted = tmp_path / "surface.traj.h5"
+    converted = tmp_path / "LiNaK_outputs" / "surface.traj.h5"
     rc = main(
         [
             "--log-level",
@@ -1668,7 +1705,7 @@ def test_compute_msd_uses_converted_trajectory_hdf5_timestep_metadata_without_in
     input_path = source_dir / "input.inp"
     _write_xyz(trajectory)
     _write_cp2k_input(input_path, timestep_fs=0.5, stride_md=5)
-    converted_path = converted_dir / "traj.traj.h5"
+    converted_path = converted_dir / "LiNaK_outputs" / "traj.traj.h5"
 
     rc_convert = main(
         [
@@ -1685,7 +1722,7 @@ def test_compute_msd_uses_converted_trajectory_hdf5_timestep_metadata_without_in
     )
     assert rc_convert == 0
 
-    output = converted_dir / "traj_msd_o.h5"
+    output = converted_dir / "traj.msd.h5"
     rc = main(
         [
             "--log-level",
@@ -1714,7 +1751,7 @@ def test_compute_rdf_uses_converted_trajectory_hdf5_cell_metadata_without_input(
     input_path = source_dir / "input.inp"
     _write_xyz(trajectory)
     _write_cp2k_input(input_path)
-    converted_path = converted_dir / "traj.traj.h5"
+    converted_path = converted_dir / "LiNaK_outputs" / "traj.traj.h5"
 
     rc_convert = main(
         [
@@ -2979,7 +3016,7 @@ def test_compute_density_default_axis_produces_all_three_axes(tmp_path, monkeypa
         "Density bin preparation uses cell bounds; skipped observed coordinate scan."
         in capsys.readouterr().err
     )
-    output = _linak_output_dir(tmp_path) / "traj_density_o.h5"
+    output = _linak_output_dir(tmp_path) / "traj.density.h5"
     assert output.exists()
     profiles = load_density_profiles(output)
     raw_profiles = [p for p in profiles if p.coordinate_mode != "distance"]
@@ -3012,7 +3049,7 @@ def test_compute_density_outputs_all_writes_line_profiles_and_heatmaps(tmp_path,
     )
 
     assert rc == 0
-    output = _linak_output_dir(tmp_path) / "traj_density_o.h5"
+    output = _linak_output_dir(tmp_path) / "traj.density.h5"
     line_profiles = load_density_profiles(output)
     heatmap_profiles = load_density_heatmap_profiles(output)
     assert {profile.axis for profile in line_profiles if profile.coordinate_mode != "distance"} == {
@@ -3047,7 +3084,7 @@ def test_compute_density_outputs_heatmap_respects_selected_planes(tmp_path, monk
     )
 
     assert rc == 0
-    output = _linak_output_dir(tmp_path) / "traj_density_o.h5"
+    output = _linak_output_dir(tmp_path) / "traj.density.h5"
     assert load_density_profiles(output) == []
     assert [profile.plane for profile in load_density_heatmap_profiles(output)] == ["xy"]
 
@@ -3074,7 +3111,7 @@ def test_compute_density_heatmap_planes_imply_heatmap_output(tmp_path, monkeypat
     )
 
     assert rc == 0
-    output = _linak_output_dir(tmp_path) / "traj_density_o.h5"
+    output = _linak_output_dir(tmp_path) / "traj.density.h5"
     assert load_density_profiles(output) == []
     assert [profile.plane for profile in load_density_heatmap_profiles(output)] == ["xy"]
 
@@ -3166,7 +3203,7 @@ def test_compute_density_axis_y_stores_all_axes_with_y_as_surface(tmp_path, monk
     )
 
     assert rc == 0
-    output = _linak_output_dir(tmp_path) / "traj_density_o.h5"
+    output = _linak_output_dir(tmp_path) / "traj.density.h5"
     assert output.exists()
     profiles = load_density_profiles(output)
     raw_profiles = [p for p in profiles if p.coordinate_mode != "distance"]
@@ -3219,7 +3256,7 @@ def test_plot_density_dry_run_skips_rendering(tmp_path):
 
 def test_compute_density_dry_run_skips_trajectory_read_and_csv_write(tmp_path):
     missing_trajectory = tmp_path / "missing_traj.xyz"
-    expected_default_output = _linak_output_dir(tmp_path) / "missing_traj_density_o.h5"
+    expected_default_output = _linak_output_dir(tmp_path) / "missing_traj.density.h5"
 
     rc = main(
         [
@@ -3473,7 +3510,7 @@ def test_compute_density_uses_trajectory_hdf5_cell_without_adjacent_input_lookup
 
     assert rc == 0
     _datasets, metadata = read_linak_hdf5(
-        _linak_output_dir(tmp_path) / "traj.traj_density_o.h5",
+        _linak_output_dir(tmp_path) / "traj.density.h5",
         expected_analysis="density",
     )
     assert metadata["cell_source"] == "trajectory HDF5 metadata"
@@ -5166,7 +5203,7 @@ def test_plot_density_gui_explicit_cartesian_x_mode_sets_matching_axis(tmp_path,
 
 
 def test_plot_density_gui_accepts_combined_all_axis_density_hdf5(tmp_path, monkeypatch):
-    source_h5 = tmp_path / "traj_density.h5"
+    source_h5 = tmp_path / "traj.density.h5"
     _write_density_collection_hdf5(source_h5)
 
     captured: dict[str, object] = {}
@@ -5195,7 +5232,7 @@ def test_plot_density_gui_accepts_combined_all_axis_density_hdf5(tmp_path, monke
 
 
 def test_density_gui_combined_all_axis_uses_species_based_logical_descriptors(tmp_path):
-    source_h5 = tmp_path / "traj_density.h5"
+    source_h5 = tmp_path / "traj.density.h5"
     _write_density_collection_hdf5(source_h5)
 
     args = cli_mod.argparse.Namespace(
@@ -5219,7 +5256,7 @@ def test_density_gui_combined_all_axis_uses_species_based_logical_descriptors(tm
 
 
 def test_density_gui_mode_switch_keeps_series_ids_and_labels_stable(tmp_path):
-    source_h5 = tmp_path / "traj_density.h5"
+    source_h5 = tmp_path / "traj.density.h5"
     _write_density_collection_hdf5(source_h5)
 
     base_kwargs = {
@@ -5252,7 +5289,7 @@ def test_density_gui_mode_switch_keeps_series_ids_and_labels_stable(tmp_path):
 
 
 def test_density_gui_render_context_switches_active_backing_mode_without_changing_layers(tmp_path):
-    source_h5 = tmp_path / "traj_density.h5"
+    source_h5 = tmp_path / "traj.density.h5"
     _write_density_collection_hdf5(source_h5)
 
     base_kwargs = {
@@ -5289,7 +5326,7 @@ def test_density_gui_render_context_switches_active_backing_mode_without_changin
 
 
 def test_density_gui_ignores_axis_prefilter_when_switching_x_mode(tmp_path):
-    source_h5 = tmp_path / "traj_density.h5"
+    source_h5 = tmp_path / "traj.density.h5"
     _write_density_collection_hdf5(source_h5)
 
     args = cli_mod.argparse.Namespace(
@@ -5313,7 +5350,7 @@ def test_density_gui_ignores_axis_prefilter_when_switching_x_mode(tmp_path):
 
 
 def test_plot_density_gui_preview_switch_to_x_mode_does_not_drop_all_profiles(tmp_path, monkeypatch):
-    source_h5 = tmp_path / "traj_density.h5"
+    source_h5 = tmp_path / "traj.density.h5"
     _write_density_collection_hdf5(source_h5)
 
     preview_calls: list[dict[str, object]] = []
@@ -5353,7 +5390,7 @@ def test_plot_density_gui_preview_switch_to_x_mode_does_not_drop_all_profiles(tm
 
 
 def test_plot_density_combined_all_axis_hdf5_supports_number_quantity(tmp_path):
-    source_h5 = tmp_path / "traj_density.h5"
+    source_h5 = tmp_path / "traj.density.h5"
     _write_density_collection_hdf5(source_h5)
 
     rc = main(
@@ -8238,7 +8275,7 @@ def test_compute_rdf_with_species_b_only_writes_filtered_collection_hdf5(tmp_pat
     )
 
     assert rc == 0
-    output = _linak_output_dir(tmp_path) / "traj_rdf.h5"
+    output = _linak_output_dir(tmp_path) / "traj.rdf.h5"
     assert output.exists()
     profiles = load_rdf_profiles(output)
     assert {(profile.species_a, profile.species_b) for profile in profiles} == {
@@ -8351,8 +8388,8 @@ def test_compute_coordination_with_cutoff_rdf_writes_hdf5_and_diagnostic_png(tmp
     )
 
     assert rc == 0
-    assert (_linak_output_dir(tmp_path) / "traj_coordination_o_h.h5").exists()
-    assert (_linak_output_dir(tmp_path) / "traj_coordination_o_h_cutoff_rdf.png").exists()
+    assert (_linak_output_dir(tmp_path) / "traj.coordination.h5").exists()
+    assert (_linak_output_dir(tmp_path) / "traj.coordination_cutoff_rdf.png").exists()
 
 
 def test_compute_coordination_defaults_to_cutoff_from_rdf_when_unspecified(tmp_path, monkeypatch):
@@ -8438,8 +8475,8 @@ def test_compute_coordination_defaults_to_cutoff_from_rdf_when_unspecified(tmp_p
         "cutoff_rdf_path": None,
         "cutoff_from_rdf": True,
     }
-    assert (_linak_output_dir(tmp_path) / "traj_coordination_o_h.h5").exists()
-    assert (_linak_output_dir(tmp_path) / "traj_coordination_o_h_cutoff_rdf.png").exists()
+    assert (_linak_output_dir(tmp_path) / "traj.coordination.h5").exists()
+    assert (_linak_output_dir(tmp_path) / "traj.coordination_cutoff_rdf.png").exists()
 
 
 def test_compute_coordination_without_explicit_species_writes_collection_hdf5(
@@ -8590,7 +8627,7 @@ def test_compute_coordination_with_species_a_only_writes_collection_hdf5(tmp_pat
     )
 
     assert rc == 0
-    output = _linak_output_dir(tmp_path) / "traj_coordination.h5"
+    output = _linak_output_dir(tmp_path) / "traj.coordination.h5"
     assert output.exists()
     assert captured_pairs["ordered_pairs"] == [("O", "H"), ("O", "O"), ("O", "Pt")]
     profiles = load_coordination_profiles(output)
@@ -8653,7 +8690,7 @@ def test_compute_density_writes_default_csv(tmp_path, monkeypatch):
     )
 
     assert rc == 0
-    assert (_linak_output_dir(tmp_path) / "traj_density_o.h5").exists()
+    assert (_linak_output_dir(tmp_path) / "traj.density.h5").exists()
 
 
 def test_compute_density_accepts_single_source_via_files_option(tmp_path, monkeypatch):
@@ -8679,7 +8716,7 @@ def test_compute_density_accepts_single_source_via_files_option(tmp_path, monkey
     )
 
     assert rc == 0
-    assert (_linak_output_dir(tmp_path) / "traj_density_o.h5").exists()
+    assert (_linak_output_dir(tmp_path) / "traj.density.h5").exists()
 
 
 def test_compute_density_default_hdf5_uses_linak_output_dir_in_source_folder(tmp_path, monkeypatch):
@@ -8709,8 +8746,8 @@ def test_compute_density_default_hdf5_uses_linak_output_dir_in_source_folder(tmp
     )
 
     assert rc == 0
-    assert (_linak_output_dir(trajectory_dir) / "traj_density_o.h5").exists()
-    assert not (work_dir / "traj_density_o.h5").exists()
+    assert (_linak_output_dir(trajectory_dir) / "traj.density.h5").exists()
+    assert not (work_dir / "traj.density.h5").exists()
 
 
 def test_compute_density_output_trailing_slash_uses_directory_with_default_filename(
@@ -8740,7 +8777,7 @@ def test_compute_density_output_trailing_slash_uses_directory_with_default_filen
     )
 
     assert rc == 0
-    assert (output_dir / "traj_density_o.h5").exists()
+    assert (output_dir / "traj.density.h5").exists()
     assert not (tmp_path / "custom_output.h5").exists()
 
 
@@ -8770,7 +8807,7 @@ def test_compute_density_output_without_suffix_stays_file_path(tmp_path, monkeyp
 
     assert rc == 0
     assert (tmp_path / "custom_output.h5").exists()
-    assert not (output_base / "traj_density_o.h5").exists()
+    assert not (output_base / "traj.density.h5").exists()
 
 
 def test_compute_msd_default_hdf5_uses_linak_output_dir_in_source_folder(tmp_path, monkeypatch):
@@ -8799,8 +8836,8 @@ def test_compute_msd_default_hdf5_uses_linak_output_dir_in_source_folder(tmp_pat
     )
 
     assert rc == 0
-    assert (_linak_output_dir(trajectory_dir) / "traj_msd_o.h5").exists()
-    assert not (work_dir / "traj_msd_o.h5").exists()
+    assert (_linak_output_dir(trajectory_dir) / "traj.msd.h5").exists()
+    assert not (work_dir / "traj.msd.h5").exists()
 
 
 def test_compute_position_default_hdf5_uses_linak_output_dir_in_source_folder(
@@ -8832,8 +8869,8 @@ def test_compute_position_default_hdf5_uses_linak_output_dir_in_source_folder(
     )
 
     assert rc == 0
-    assert (_linak_output_dir(trajectory_dir) / "traj_position_o_z.h5").exists()
-    assert not (work_dir / "traj_position_o_z.h5").exists()
+    assert (_linak_output_dir(trajectory_dir) / "traj.position.h5").exists()
+    assert not (work_dir / "traj.position.h5").exists()
 
 
 def test_compute_position_pbc_corrects_hdf5_positions_without_modifying_source_file(
@@ -8870,7 +8907,7 @@ def test_compute_position_pbc_corrects_hdf5_positions_without_modifying_source_f
     )
 
     assert rc == 0
-    output = _linak_output_dir(tmp_path) / "traj_pbc_position_o_z.h5"
+    output = _linak_output_dir(tmp_path) / "traj_pbc.position.h5"
     profile = load_position_profile(output, species="O", axis="z")
     np.testing.assert_allclose(profile.x[:, 0], np.array([0.2, 0.3]), atol=1e-12)
     np.testing.assert_allclose(profile.y[:, 0], np.array([0.9, 0.8]), atol=1e-12)
@@ -8888,7 +8925,7 @@ def test_compute_position_pbc_corrects_hdf5_positions_without_modifying_source_f
     assert original[1].positions[0, 1] == pytest.approx(-0.2)
 
 
-def test_compute_position_without_species_warns_and_writes_per_species_files(tmp_path, capsys):
+def test_compute_position_without_species_warns_and_writes_profile_collection(tmp_path, capsys):
     trajectory = tmp_path / "mixed.xyz"
     frame0 = Atoms(
         "HO",
@@ -8917,13 +8954,11 @@ def test_compute_position_without_species_warns_and_writes_per_species_files(tmp
     )
 
     assert rc == 0
-    expected_h = _linak_output_dir(tmp_path) / "mixed_position_h_z.h5"
-    expected_o = _linak_output_dir(tmp_path) / "mixed_position_o_z.h5"
-    assert expected_h.exists()
-    assert expected_o.exists()
-    for output_path in (expected_h, expected_o):
-        datasets, metadata = read_linak_hdf5(output_path, expected_analysis="position")
-        assert metadata["species"] in {"H", "O"}
+    output = _linak_output_dir(tmp_path) / "mixed.position.h5"
+    assert output.exists()
+    payloads = read_linak_hdf5_profiles(output, expected_analysis="position")
+    assert [metadata["species"] for _datasets, metadata in payloads] == ["H", "O"]
+    for datasets, _metadata in payloads:
         assert datasets["x_A"].shape == (2, 1)
         assert datasets["y_A"].shape == (2, 1)
         assert datasets["z_A"].shape == (2, 1)
@@ -8961,8 +8996,8 @@ def test_compute_rdf_default_hdf5_uses_linak_output_dir_in_source_folder(tmp_pat
     )
 
     assert rc == 0
-    assert (_linak_output_dir(trajectory_dir) / "traj_rdf.h5").exists()
-    assert not (work_dir / "traj_rdf.h5").exists()
+    assert (_linak_output_dir(trajectory_dir) / "traj.rdf.h5").exists()
+    assert not (work_dir / "traj.rdf.h5").exists()
 
 
 def test_compute_density_default_output_avoids_overwriting_existing_hdf5(tmp_path, monkeypatch):
@@ -9003,8 +9038,8 @@ def test_compute_density_default_output_avoids_overwriting_existing_hdf5(tmp_pat
 
     assert first_rc == 0
     assert second_rc == 0
-    assert (_linak_output_dir(tmp_path) / "traj_density_o.h5").exists()
-    assert (_linak_output_dir(tmp_path) / "traj_density_o_1.h5").exists()
+    assert (_linak_output_dir(tmp_path) / "traj.density.h5").exists()
+    assert (_linak_output_dir(tmp_path) / "traj.density_1.h5").exists()
 
 
 def test_default_combined_analysis_hdf5_path_uses_pwd_linak_output_dir_for_multi_source(
@@ -9021,7 +9056,7 @@ def test_default_combined_analysis_hdf5_path_uses_pwd_linak_output_dir_for_multi
         analysis="density",
     )
 
-    assert output == _linak_output_dir(working_dir) / "linak_density_combined.h5"
+    assert output == _linak_output_dir(working_dir) / "linak.density.combined.h5"
 
 
 def test_default_csv_output_path_uses_shared_linak_output_dir_without_nesting(tmp_path):
@@ -9055,7 +9090,7 @@ def test_compute_density_auto_detects_cell_for_volumetric_units(tmp_path, monkey
     )
 
     assert rc == 0
-    profile = load_density_profile(_linak_output_dir(tmp_path) / "traj_density_o.h5")
+    profile = load_density_profile(_linak_output_dir(tmp_path) / "traj.density.h5")
     assert profile.units == "g/cm^3"
 
 
@@ -9080,7 +9115,7 @@ def test_compute_density_writes_resolution_metadata_to_hdf5(tmp_path, monkeypatc
 
     assert rc == 0
     _datasets, metadata = read_linak_hdf5(
-        _linak_output_dir(tmp_path) / "traj_density_o.h5",
+        _linak_output_dir(tmp_path) / "traj.density.h5",
         expected_analysis="density",
     )
     assert metadata["source_path"] == str(trajectory.resolve())
@@ -9135,7 +9170,7 @@ def test_compute_density_accepts_cp2k_input_alias(tmp_path, monkeypatch):
     )
 
     assert rc == 0
-    profile = load_density_profile(_linak_output_dir(tmp_path) / "traj_density_o.h5")
+    profile = load_density_profile(_linak_output_dir(tmp_path) / "traj.density.h5")
     assert profile.units == "g/cm^3"
 
 
@@ -9169,7 +9204,7 @@ def test_compute_density_all_writes_one_hdf5_with_all_species_series(tmp_path, m
     )
 
     assert rc == 0
-    output = _linak_output_dir(tmp_path) / "traj_density.h5"
+    output = _linak_output_dir(tmp_path) / "traj.density.h5"
     assert output.exists()
     profiles = load_density_profiles(output)
     species_set = {profile.species for profile in profiles}
@@ -9213,9 +9248,8 @@ def test_compute_density_h2o_stays_single_dataset(tmp_path, monkeypatch):
     )
 
     assert rc == 0
-    assert (_linak_output_dir(tmp_path) / "water_density_h2o.h5").exists()
-    assert not (_linak_output_dir(tmp_path) / "water_density_h.h5").exists()
-    assert not (_linak_output_dir(tmp_path) / "water_density_o.h5").exists()
+    assert (_linak_output_dir(tmp_path) / "water.density.h5").exists()
+    assert not (_linak_output_dir(tmp_path) / "water.density_1.h5").exists()
 
 
 def test_apply_pbc_with_explicit_cell(tmp_path):
@@ -9359,11 +9393,11 @@ def test_compute_msd_writes_resolution_metadata_to_hdf5(tmp_path, monkeypatch):
         ]
     )
     assert rc == 0
-    profile = load_msd_profile(_linak_output_dir(tmp_path) / "traj_msd_o.h5")
+    profile = load_msd_profile(_linak_output_dir(tmp_path) / "traj.msd.h5")
     assert profile.time_fs[1] == pytest.approx(2.5)
 
     _datasets, metadata = read_linak_hdf5(
-        _linak_output_dir(tmp_path) / "traj_msd_o.h5",
+        _linak_output_dir(tmp_path) / "traj.msd.h5",
         expected_analysis="msd",
     )
     assert metadata["source_path"] == str(trajectory.resolve())

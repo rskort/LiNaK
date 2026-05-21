@@ -23,6 +23,7 @@ from .common import (
     read_profile_payloads_by_index,
     use_multi_series_plot,
     validate_stable_atom_layout as _validate_stable_atom_layout,
+    write_profile_collection,
 )
 from .surface import (
     _log_framewise_surface_alignment,
@@ -366,13 +367,7 @@ def compute_position_profiles(
     )
 
 
-def save_position_profile(
-    profile: PositionProfile,
-    output: str | Path,
-    *,
-    additional_metadata: Mapping[str, Any] | None = None,
-) -> Path:
-    """Save one position profile to LiNaK HDF5 and return the written path."""
+def _position_profile_hdf5_payload(profile: PositionProfile) -> dict[str, Any]:
     metadata = build_profile_metadata(
         analysis="position",
         metadata={
@@ -393,13 +388,8 @@ def save_position_profile(
             ),
         },
     )
-    if additional_metadata:
-        metadata.update(dict(additional_metadata))
-
-    output_path = write_linak_hdf5(
-        output,
-        analysis="position",
-        datasets={
+    return {
+        "datasets": {
             "frame_index": profile.frame_index,
             "step": profile.step,
             "time_fs": profile.time_fs,
@@ -412,9 +402,55 @@ def save_position_profile(
             "surface_position_per_frame_A": profile.surface_position_per_frame,
             **_surface_estimate_datasets(profile.surface_estimate),
         },
+        "metadata": metadata,
+    }
+
+
+def save_position_profile(
+    profile: PositionProfile,
+    output: str | Path,
+    *,
+    additional_metadata: Mapping[str, Any] | None = None,
+) -> Path:
+    """Save one position profile to LiNaK HDF5 and return the written path."""
+    payload = _position_profile_hdf5_payload(profile)
+    metadata = dict(payload["metadata"])
+    if additional_metadata:
+        metadata.update(dict(additional_metadata))
+
+    output_path = write_linak_hdf5(
+        output,
+        analysis="position",
+        datasets=payload["datasets"],
         metadata=metadata,
     )
     LOGGER.info("Saved position data to '%s'.", output_path)
+    return output_path
+
+
+def save_position_profiles(
+    profiles: list[PositionProfile],
+    output: str | Path,
+    *,
+    additional_metadata: Mapping[str, Any] | None = None,
+) -> Path:
+    """Save one or more position profiles to LiNaK HDF5 and return the written path."""
+
+    if not profiles:
+        raise ValueError("At least one position profile is required.")
+    if len(profiles) == 1:
+        return save_position_profile(
+            profiles[0],
+            output,
+            additional_metadata=additional_metadata,
+        )
+    output_path = write_profile_collection(
+        output,
+        analysis="position",
+        profiles=[_position_profile_hdf5_payload(profile) for profile in profiles],
+        metadata=dict(additional_metadata or {}),
+    )
+    LOGGER.info("Saved %d position profiles to '%s'.", len(profiles), output_path)
     return output_path
 
 

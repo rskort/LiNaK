@@ -44,6 +44,7 @@ def type_icon(item_type: str) -> str:
         "simulation_directory": "[DIR]",
         "out_hdf5": "[OUT]",
         "trajectory_hdf5": "[H5]",
+        "temperature_file": "[T]",
         "analysis_hdf5": "[A]",
         "cube_file": "[C]",
         "cube_hdf5": "[C5]",
@@ -57,6 +58,7 @@ def item_type_label(item_type: str) -> str:
         "simulation_directory": "Simulation directory",
         "out_hdf5": "Output container",
         "trajectory_hdf5": "Trajectory HDF5",
+        "temperature_file": "Temperature source",
         "analysis_hdf5": "Analysis HDF5",
         "cube_file": "Cube file",
         "cube_hdf5": "Cube HDF5",
@@ -216,6 +218,7 @@ def suggested_actions_for_item(
     actions = registry.available_for(item)
     priority_by_type = {
         "raw_trajectory": ("convert", "density", "msd"),
+        "temperature_file": ("temperature",),
         "simulation_directory": ("pack_out_h5",),
         "out_hdf5": ("density", "msd", "rdf"),
         "trajectory_hdf5": ("density", "msd", "rdf"),

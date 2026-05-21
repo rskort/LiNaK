@@ -79,7 +79,9 @@ def test_conversion_registry_exposes_allowed_targets_by_family(tmp_path):
 def test_conversion_registry_default_request_uses_traj_hdf5_and_uniquifies(tmp_path):
     xyz_path = tmp_path / "traj.xyz"
     _write_xyz(xyz_path)
-    existing_output = tmp_path / "traj.traj.h5"
+    output_dir = tmp_path / "LiNaK_outputs"
+    output_dir.mkdir()
+    existing_output = output_dir / "traj.traj.h5"
     existing_output.write_text("placeholder", encoding="utf-8")
 
     request = CONVERSION_REGISTRY.build_default_request(
@@ -91,7 +93,7 @@ def test_conversion_registry_default_request_uses_traj_hdf5_and_uniquifies(tmp_p
     assert request.family == "trajectory"
     assert request.source_file_type == "trajectory_xyz"
     assert request.target_file_type == "trajectory_hdf5"
-    assert request.target_path == tmp_path / "traj.traj_2.h5"
+    assert request.target_path == output_dir / "traj.traj_2.h5"
 
 
 def test_conversion_registry_default_request_uses_cube_hdf5(tmp_path):
@@ -125,7 +127,7 @@ def test_conversion_registry_executes_current_trajectory_conversion(tmp_path):
         options=TrajectoryConversionOptions(input_path=input_path),
     )
 
-    assert result.output_path == tmp_path / "traj.traj.h5"
+    assert result.output_path == tmp_path / "LiNaK_outputs" / "traj.traj.h5"
     assert is_linak_trajectory_hdf5(result.output_path)
 
 

@@ -129,6 +129,20 @@ _ANALYSIS_SCHEMAS: dict[str, AnalysisSchema] = {
         },
         default_plot_labels=("Distance to surface (Angstrom)", "cos(theta)"),
     ),
+    "temperature": AnalysisSchema(
+        analysis="temperature",
+        version=1,
+        default_units_map={
+            "frame_index": "index",
+            "step": "step",
+            "time_fs": "fs",
+            "time_ps": "ps",
+            "temperature_K": "K",
+            "atom_indices": "index",
+            "target_temperature_K": "K",
+        },
+        default_plot_labels=("Time (ps)", "Temperature (K)"),
+    ),
 }
 
 

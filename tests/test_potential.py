@@ -849,7 +849,7 @@ def test_compute_potential_incompatible_hdf5_schema_uses_fallback_file(tmp_path)
     with h5py.File(output_h5, "r") as handle:
         assert handle.attrs["analysis"] == "unexpected"
 
-    fallback_matches = sorted(tmp_path.glob("potentials_linak_potential*.h5"))
+    fallback_matches = sorted(tmp_path.glob("potentials.linak.potential*.h5"))
     assert fallback_matches
     fallback_rows = _read_hdf5_rows(fallback_matches[0])
     assert len(fallback_rows) == 1

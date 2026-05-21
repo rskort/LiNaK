@@ -50,6 +50,7 @@ _PLOT_PROFILE_POSITION = "plot:position"
 _PLOT_PROFILE_COORDINATION = "plot:coordination"
 _PLOT_PROFILE_POTENTIAL = "plot:potential"
 _PLOT_PROFILE_ORIENTATION = "plot:orientation"
+_PLOT_PROFILE_TEMPERATURE = "plot:temperature"
 _PLOT_PROFILE_TABLE = "plot:table"
 _ANALYSIS_TO_PROFILE_KEY = {
     "density": _PLOT_PROFILE_DENSITY,
@@ -59,6 +60,7 @@ _ANALYSIS_TO_PROFILE_KEY = {
     "coordination": _PLOT_PROFILE_COORDINATION,
     "potential": _PLOT_PROFILE_POTENTIAL,
     "orientation": _PLOT_PROFILE_ORIENTATION,
+    "temperature": _PLOT_PROFILE_TEMPERATURE,
     "table": _PLOT_PROFILE_TABLE,
 }
 _PROFILE_KEY_TO_ANALYSIS = {value: key for key, value in _ANALYSIS_TO_PROFILE_KEY.items()}
@@ -663,6 +665,9 @@ _PLOT_SETTINGS_MSD_KEYS = (
     "species",
     *_PLOT_SETTINGS_COMMON_KEYS,
 )
+_PLOT_SETTINGS_TEMPERATURE_KEYS = (
+    *_PLOT_SETTINGS_COMMON_KEYS,
+)
 _PLOT_SETTINGS_RDF_KEYS = (
     "species_a",
     "species_b",
@@ -1099,23 +1104,29 @@ def _preflight_existing_file_path(path: str | Path, *, label: str) -> Path:
 
 
 def _analysis_source_stem(source: str | Path, *, default: str) -> str:
-    name = Path(source).name
-    lower = name.lower()
-    for suffix in (".out.hdf5", ".out.h5", ".cube.hdf5", ".cube.h5", ".hdf5", ".h5"):
-        if lower.endswith(suffix):
-            return name[: -len(suffix)] or default
-    return Path(source).stem or default
+    from .analysis.output_naming import analysis_source_base
+
+    return analysis_source_base(source, default=default)
+
+
+def _default_analysis_hdf5_output_path(
+    source: str | Path,
+    analysis: str,
+    *,
+    default: str = "trajectory",
+) -> Path:
+    from .analysis.output_naming import analysis_hdf5_filename
+
+    source_path = Path(source).expanduser().resolve()
+    return _linak_output_dir_for_source(source_path) / analysis_hdf5_filename(
+        source_path,
+        analysis,
+        default=default,
+    )
 
 
 def _default_density_hdf5_output_path(source: str | Path, species: str) -> Path:
-    source_path = Path(source).expanduser().resolve()
-    stem = _analysis_source_stem(source_path, default="trajectory")
-    normalized_species = str(species).strip().lower()
-    if normalized_species in {"", "all", "*"}:
-        filename = f"{stem}_density.h5"
-    else:
-        filename = f"{stem}_density_{_sanitize_token(species)}.h5"
-    return _linak_output_dir_for_source(source_path) / filename
+    return _default_analysis_hdf5_output_path(source, "density")
 
 
 def _density_hdf5_output_path(
@@ -1131,10 +1142,7 @@ def _density_hdf5_output_path(
 
 
 def _default_orientation_hdf5_output_path(source: str | Path, axis: str) -> Path:
-    source_path = Path(source).expanduser().resolve()
-    stem = _analysis_source_stem(source_path, default="trajectory")
-    filename = f"{stem}_orientation_{axis.lower()}.h5"
-    return _linak_output_dir_for_source(source_path) / filename
+    return _default_analysis_hdf5_output_path(source, "orientation")
 
 
 def _orientation_hdf5_output_path(
@@ -1275,68 +1283,41 @@ def _resolve_csv_plot_sources(args: argparse.Namespace) -> list[str]:
 
 
 def _default_msd_hdf5_output_path(source: str | Path, species: str) -> Path:
-    source_path = Path(source).expanduser().resolve()
-    stem = _analysis_source_stem(source_path, default="trajectory")
-    return _linak_output_dir_for_source(source_path) / f"{stem}_msd_{_sanitize_token(species)}.h5"
+    return _default_analysis_hdf5_output_path(source, "msd")
+
+
+def _default_temperature_hdf5_output_path(source: str | Path) -> Path:
+    return _default_analysis_hdf5_output_path(source, "temperature", default="temperature")
 
 
 def _default_position_hdf5_output_path(source: str | Path, species: str, axis: str) -> Path:
-    source_path = Path(source).expanduser().resolve()
-    stem = _analysis_source_stem(source_path, default="trajectory")
-    return _linak_output_dir_for_source(source_path) / (
-        f"{stem}_position_{_sanitize_token(species)}_{axis.lower()}.h5"
-    )
+    return _default_analysis_hdf5_output_path(source, "position")
 
 
-def _position_hdf5_output_paths(
+def _position_hdf5_output_path(
     base_output: str | None,
     source: str | Path,
     profiles: list[Any],
     *,
     axis: str,
-) -> list[Path]:
+) -> Path | None:
     if not profiles:
-        return []
+        return None
 
+    default_path = _default_position_hdf5_output_path(source, "all", axis)
     if base_output is None:
-        paths = [
-            _default_position_hdf5_output_path(source, profile.species, axis)
-            for profile in profiles
-        ]
-        return [_resolve_non_overwriting_hdf5_path(path) for path in paths]
+        return _resolve_non_overwriting_hdf5_path(default_path)
 
     base_path = Path(base_output).expanduser()
-    if len(profiles) == 1:
-        default_path = _default_position_hdf5_output_path(source, profiles[0].species, axis)
-        if _output_request_looks_like_directory(base_output) or (
-            base_path.exists() and base_path.is_dir()
-        ):
-            paths = [base_path / default_path.name]
-        else:
-            paths = [base_path if base_path.suffix else base_path.with_suffix(".h5")]
-        return [_resolve_non_overwriting_hdf5_path(path) for path in paths]
-
-    if base_path.suffix.lower() in {".h5", ".hdf5"}:
-        paths = [
-            base_path.with_name(
-                f"{base_path.stem}_{_sanitize_token(profile.species)}{base_path.suffix}"
-            )
-            for profile in profiles
-        ]
-        return [_resolve_non_overwriting_hdf5_path(path) for path in paths]
-
-    base_path.mkdir(parents=True, exist_ok=True)
-    paths = [
-        base_path / f"position_{_sanitize_token(profile.species)}_{axis.lower()}.h5"
-        for profile in profiles
-    ]
-    return [_resolve_non_overwriting_hdf5_path(path) for path in paths]
+    if _output_request_looks_like_directory(base_output) or (base_path.exists() and base_path.is_dir()):
+        return _resolve_non_overwriting_hdf5_path(base_path / default_path.name)
+    if not base_path.suffix:
+        base_path = base_path.with_suffix(".h5")
+    return _resolve_non_overwriting_hdf5_path(base_path)
 
 
 def _default_rdf_collection_hdf5_output_path(source: str | Path) -> Path:
-    source_path = Path(source).expanduser().resolve()
-    stem = _analysis_source_stem(source_path, default="trajectory")
-    return _linak_output_dir_for_source(source_path) / f"{stem}_rdf.h5"
+    return _default_analysis_hdf5_output_path(source, "rdf")
 
 
 def _default_coordination_hdf5_output_path(
@@ -1344,37 +1325,25 @@ def _default_coordination_hdf5_output_path(
     species_a: str,
     species_b: str,
 ) -> Path:
-    source_path = Path(source).expanduser().resolve()
-    stem = _analysis_source_stem(source_path, default="trajectory")
-    return _linak_output_dir_for_source(source_path) / (
-        f"{stem}_coordination_{_sanitize_token(species_a)}_{_sanitize_token(species_b)}.h5"
-    )
+    return _default_analysis_hdf5_output_path(source, "coordination")
 
 
 def _default_coordination_collection_hdf5_output_path(source: str | Path) -> Path:
-    source_path = Path(source).expanduser().resolve()
-    stem = _analysis_source_stem(source_path, default="trajectory")
-    return _linak_output_dir_for_source(source_path) / f"{stem}_coordination.h5"
+    return _default_analysis_hdf5_output_path(source, "coordination")
 
 
 def _default_potential_hdf5_output_path(source: str | Path) -> Path:
-    source_path = Path(source).expanduser().resolve()
-    stem = _analysis_source_stem(source_path, default="source")
-    for suffix in "-v_hartree-1_0":
-        if stem.endswith(suffix):
-            stem = stem[: -len(suffix)] or "source"
-            break
-    return _linak_output_dir_for_source(source_path) / f"{stem}_potential.h5"
+    return _default_analysis_hdf5_output_path(source, "potential", default="source")
 
 
 def _default_potential_hdf5_output_for_sources(sources: list[str]) -> Path:
     if len(sources) == 1:
         return _default_potential_hdf5_output_path(sources[0])
-    return _linak_output_dir_for_sources(sources) / "linak_potential.h5"
+    return _linak_output_dir_for_sources(sources) / "linak.potential.h5"
 
 
 def _default_combined_analysis_hdf5_path(sources: list[str], *, analysis: str) -> Path:
-    return _linak_output_dir_for_sources(sources) / f"linak_{analysis}_combined.h5"
+    return _linak_output_dir_for_sources(sources) / f"linak.{analysis}.combined.h5"
 
 
 def _unique_path_with_numeric_suffix(path: Path) -> Path:
@@ -1600,6 +1569,25 @@ def _resolve_msd_plotter_kwargs(
 
     mapping = _coerce_runtime_view_mapping(getattr(args, "view_mapping", None))
     resolved = resolve_msd_plot_mapping(
+        contract=data_contract,
+        mapping=mapping,
+        time_axis=getattr(args, "time_axis", "ps"),
+    )
+    payload: dict[str, Any] = {"view_mapping": resolved.mapping}
+    if data_contract is not None:
+        payload["data_contract"] = resolved.contract
+    return payload
+
+
+def _resolve_temperature_plotter_kwargs(
+    args: argparse.Namespace,
+    *,
+    data_contract: Any | None = None,
+) -> dict[str, Any]:
+    from .plot.mappings.temperature_mapping import resolve_temperature_plot_mapping
+
+    mapping = _coerce_runtime_view_mapping(getattr(args, "view_mapping", None))
+    resolved = resolve_temperature_plot_mapping(
         contract=data_contract,
         mapping=mapping,
         time_axis=getattr(args, "time_axis", "ps"),
@@ -2678,6 +2666,90 @@ def _load_msd_plot_profiles(
     )
 
 
+def _load_temperature_plot_profiles(
+    *,
+    sources: list[str],
+) -> tuple[list[Any], list[list[str]], list[list[str]], list[list[str]]]:
+    from .analysis.temperature import load_temperature_profiles
+
+    raw_payloads_by_source = _read_analysis_profile_payloads_by_source(
+        sources=sources,
+        analysis="temperature",
+    )
+    prefix_source_labels = _should_prefix_combined_source_labels(
+        sources=sources,
+        metadata_items=[
+            dict(payload.get("metadata", {}))
+            for _source, source_payloads in raw_payloads_by_source
+            for payload in source_payloads
+        ],
+    )
+    profiles_by_source: list[tuple[str, list[Any]]] = []
+    for source in sources:
+        profiles_by_source.append((source, load_temperature_profiles(source)))
+
+    plot_profiles: list[Any] = []
+    fallback_labels_by_source: list[list[str]] = []
+    series_id_segments_by_source: list[list[str]] = []
+    origin_path_segments_by_source: list[list[str]] = []
+    if prefix_source_labels:
+        for source_index, (source, profiles) in enumerate(profiles_by_source):
+            raw_payloads = raw_payloads_by_source[source_index][1]
+            if len(raw_payloads) != len(profiles):
+                raise ValueError("Temperature profile metadata does not match loaded profiles.")
+            source_labels: list[str] = []
+            source_ids: list[str] = []
+            source_origins: list[str] = []
+            for profile_index, profile in enumerate(profiles):
+                payload = raw_payloads[profile_index]
+                metadata = dict(payload.get("metadata", {}))
+                source_label = _metadata_source_label(metadata, fallback_source=source)
+                rendered_label = f"{source_label}:{profile.default_label}"
+                source_labels.append(rendered_label)
+                source_ids.append(
+                    _profile_uid_from_payload(
+                        payload,
+                        fallback_prefix="temperature",
+                        index=profile_index,
+                    )
+                )
+                source_origins.append(str(metadata.get("origin_hdf5_path") or source))
+                plot_profiles.append(replace(profile, default_label=rendered_label))
+            fallback_labels_by_source.append(source_labels)
+            series_id_segments_by_source.append(source_ids)
+            origin_path_segments_by_source.append(source_origins)
+    else:
+        flattened = _flatten_profiles_by_source(profiles_by_source)
+        plot_profiles.extend(flattened)
+        fallback_labels_by_source.append([profile.default_label for profile in flattened])
+        raw_payloads = raw_payloads_by_source[0][1]
+        if len(raw_payloads) != len(flattened):
+            raise ValueError("Temperature profile metadata does not match loaded profiles.")
+        series_id_segments_by_source.append(
+            [
+                _profile_uid_from_payload(
+                    payload,
+                    fallback_prefix="temperature",
+                    index=profile_index,
+                )
+                for profile_index, payload in enumerate(raw_payloads)
+            ]
+        )
+        origin_path_segments_by_source.append(
+            [
+                str(payload.get("metadata", {}).get("origin_hdf5_path") or sources[0])
+                for payload in raw_payloads
+            ]
+        )
+
+    return (
+        plot_profiles,
+        fallback_labels_by_source,
+        series_id_segments_by_source,
+        origin_path_segments_by_source,
+    )
+
+
 def _load_rdf_plot_profiles(
     *,
     sources: list[str],
@@ -3568,6 +3640,7 @@ def _runtime_view_mapping_was_provided(
         "plot:coordination": ("component", "time_axis"),
         "plot:potential": ("y_quantity", "table_view", "view_type"),
         "plot:orientation": ("component", "angle"),
+        "plot:temperature": ("time_axis",),
         "plot:table": ("kind", "x", "y", "bins"),
     }
     return any(
@@ -3994,6 +4067,8 @@ def _profile_key_from_analysis(analysis: str | None) -> str:
         return _PLOT_PROFILE_POTENTIAL
     if normalized == "orientation":
         return _PLOT_PROFILE_ORIENTATION
+    if normalized == "temperature":
+        return _PLOT_PROFILE_TEMPERATURE
     return _PLOT_PROFILE_TABLE
 
 
@@ -4022,6 +4097,8 @@ def _resolve_plot_profile_key(
         return _PLOT_PROFILE_POTENTIAL
     if normalized == "orientation":
         return _PLOT_PROFILE_ORIENTATION
+    if normalized == "temperature":
+        return _PLOT_PROFILE_TEMPERATURE
     if normalized in {"table", "hdf5"}:
         return _PLOT_PROFILE_TABLE
     raise ValueError(f"Unsupported plot profile '{profile_token}'.")
@@ -4581,6 +4658,16 @@ def _add_rdf_plot_options(
     )
 
 
+def _add_temperature_plot_options(parser: argparse.ArgumentParser) -> None:
+    group = parser.add_argument_group("Temperature plot options")
+    group.add_argument(
+        "--time-axis",
+        choices=["ps", "fs"],
+        default="ps",
+        help="Time axis for temperature plots (default: ps).",
+    )
+
+
 def _add_position_plot_options(
     parser: argparse.ArgumentParser,
     *,
@@ -4762,6 +4849,9 @@ def _configure_plot_parser(parser: argparse.ArgumentParser, *, analysis: str | N
         return
     if normalized == "msd":
         _add_species_override_options(parser)
+        return
+    if normalized == "temperature":
+        _add_temperature_plot_options(parser)
         return
     if normalized == "rdf":
         _add_rdf_plot_options(parser)
@@ -6386,6 +6476,47 @@ def _build_msd_gui_context(
             args=args,
             sources=sources,
             profile_key=_PLOT_PROFILE_MSD,
+            fallback_labels_by_source=fallback_labels_by_source,
+        ),
+        series_descriptors=_build_gui_series_descriptors(
+            sources=sources,
+            fallback_labels_by_source=fallback_labels_by_source,
+            series_id_segments_by_source=series_id_segments_by_source,
+            origin_path_segments_by_source=origin_path_segments_by_source,
+        ),
+        estimated_total_points=_estimate_total_points_from_loaded_profiles(plot_profiles),
+    )
+
+
+def _build_temperature_gui_context(
+    args: argparse.Namespace,
+    *,
+    sources: list[str],
+) -> _GuiPlotRenderContext:
+    from .plot.contracts.temperature_contract import temperature_profile_to_plot_data_contract
+
+    (
+        plot_profiles,
+        fallback_labels_by_source,
+        series_id_segments_by_source,
+        origin_path_segments_by_source,
+    ) = _load_temperature_plot_profiles(sources=sources)
+    return _GuiPlotRenderContext(
+        profile=plot_profiles,
+        plot_source_label=sources[0] if len(sources) == 1 else "multi_source_temperature",
+        plotter_kwargs=_resolve_temperature_plotter_kwargs(
+            args,
+            data_contract=(
+                None
+                if not plot_profiles
+                else temperature_profile_to_plot_data_contract(plot_profiles[0])
+            ),
+        ),
+        fallback_labels_by_source=fallback_labels_by_source,
+        default_series_labels=_resolve_gui_default_series_labels(
+            args=args,
+            sources=sources,
+            profile_key=_PLOT_PROFILE_TEMPERATURE,
             fallback_labels_by_source=fallback_labels_by_source,
         ),
         series_descriptors=_build_gui_series_descriptors(
@@ -8915,14 +9046,12 @@ def _handle_root_overview(_args: argparse.Namespace) -> int:
                 f"Author       : {author}",
                 "",
                 "Core workflow",
-                "  0) Work in a project workspace",
-                "     linak project /path/to/project_dir",
                 "  1) Pack a simulation directory into one .out.h5 container",
                 "     linak apply pack /path/to/simulation_dir --output run.out.h5",
                 "  2) Compute analysis HDF5 from trajectory or .out.h5 data",
                 "     linak compute density /path/to/traj.xyz",
                 "  3) Plot from HDF5 only",
-                "     linak plot /path/to/traj_density.h5",
+                "     linak plot /path/to/traj.density.h5",
                 "",
                 "Fast HDF5 plotting shorthand",
                 (
@@ -8934,20 +9063,20 @@ def _handle_root_overview(_args: argparse.Namespace) -> int:
                 "Command groups",
                 "  compute   trajectory/.out.h5 -> HDF5",
                 "  plot      LiNaK analysis HDF5 -> figure",
-                "  project   workspace for imports, actions, tasks, and logs",
                 (
                     f"  {_TABULAR_COMMAND:<8} inspect/transform/plot tabular HDF5 "
                     f"(aliases: {', '.join(_TABULAR_COMMAND_ALIASES)})"
                 ),
                 "  apply     trajectory transformations and directory packing",
+                "  project   experimental workspace UI (WIP; not the recommended path)",
                 "",
                 "Need details?",
                 "  linak <command> --help",
-                "  linak project --help",
                 "  linak compute --help",
                 "  linak plot --help",
                 f"  linak {_TABULAR_COMMAND} --help",
                 "  linak apply --help",
+                "  linak project --help",
             ]
         )
     )
@@ -8973,17 +9102,18 @@ def _handle_plot_overview(_args: argparse.Namespace) -> int:
             [
                 "LiNaK Plot Usage (HDF5-only)",
                 "============================",
-                "Plot accepts LiNaK density/MSD/RDF/position/coordination/potential HDF5 inputs and auto-detects the analysis.",
+                "Plot accepts LiNaK density/MSD/RDF/position/coordination/potential/temperature HDF5 inputs and auto-detects the analysis.",
                 "",
                 "Examples",
                 "  linak compute density /path/to/traj.xyz",
-                "  linak plot /path/to/traj_density.h5",
-                "  linak plot -f run1_density.h5 run2_density.h5 --no-show --output density.png",
-                "  linak plot /path/to/traj_msd_o.h5 --no-show --output msd.png",
-                "  linak plot /path/to/traj_rdf_o_h.h5 --species-a O --species-b H",
-                "  linak plot /path/to/traj_position_o_z.h5 --component distance",
-                "  linak plot /path/to/traj_coordination_o_h.h5 --component distance",
+                "  linak plot /path/to/traj.density.h5",
+                "  linak plot -f run1.density.h5 run2.density.h5 --no-show --output density.png",
+                "  linak plot /path/to/traj.msd.h5 --no-show --output msd.png",
+                "  linak plot /path/to/traj.rdf.h5 --species-a O --species-b H",
+                "  linak plot /path/to/traj.position.h5 --component distance",
+                "  linak plot /path/to/traj.coordination.h5 --component distance",
                 "  linak plot /path/to/potentials.h5",
+                "  linak plot /path/to/run.temperature.h5",
                 "",
                 "Generic HDF5 table plotting",
                 "  linak plot /path/to/data.h5             # falls back to hdf5 plot when not LiNaK analysis",
@@ -9009,6 +9139,7 @@ def _handle_compute_overview(_args: argparse.Namespace) -> int:
                 "  linak compute rdf /path/to/traj.xyz --species-a O --species-b H",
                 "  linak compute rdf /path/to/traj.xyz --atoms-a 0 100 200..210 --atoms-b 5 6 7",
                 "  linak compute coordination /path/to/traj.xyz --species-a O --species-b H --cutoff-from-rdf",
+                "  linak compute temperature /path/to/run-vel-1.xyz --input /path/to/input.inp",
                 "  linak compute potential -f /path/to/*.cube",
                 "",
                 "Need command options?",
@@ -9017,6 +9148,7 @@ def _handle_compute_overview(_args: argparse.Namespace) -> int:
                 "  linak compute position --help",
                 "  linak compute rdf --help",
                 "  linak compute coordination --help",
+                "  linak compute temperature --help",
                 "  linak compute potential --help",
             ]
         )
@@ -9065,7 +9197,7 @@ def _handle_csv_overview(_args: argparse.Namespace) -> int:
                 f"  linak {_TABULAR_COMMAND} preview -f /path/to/data.h5",
                 f"  linak {_TABULAR_COMMAND} get /path/to/data.h5 --column value",
                 (
-                    f"  linak {_TABULAR_COMMAND} combine -f run1_density.h5 run2_density.h5 "
+                    f"  linak {_TABULAR_COMMAND} combine -f run1.density.h5 run2.density.h5 "
                     "-o combined_density.h5"
                 ),
                 (
@@ -9306,6 +9438,62 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_dry_run_option(compute_msd)
     compute_msd.set_defaults(handler=_handle_compute_msd, compute_command="msd")
+
+    compute_temperature = compute_commands.add_parser(
+        "temperature",
+        help="Compute temperature profiles from CP2K .temp/.tregion or velocity XYZ.",
+    )
+    compute_temperature.add_argument(
+        "source",
+        nargs="?",
+        help="Path to .temp, .tregion, or *-vel-*.xyz temperature source.",
+    )
+    compute_temperature.add_argument(
+        "-f",
+        "--files",
+        nargs="+",
+        metavar="PATH",
+        help=(
+            "Temperature source path(s). Use -f/--files even for one file; "
+            "this command accepts exactly one source."
+        ),
+    )
+    compute_temperature.add_argument(
+        "--input",
+        help="Optional CP2K input.inp path used to resolve elements and thermal regions.",
+    )
+    compute_temperature.add_argument(
+        "--group-by",
+        choices=["auto", "elements", "regions", "both"],
+        default="auto",
+        help=(
+            "Velocity grouping mode (default: auto; both when regions are known, "
+            "otherwise elements). Ignored for .temp/.tregion tables."
+        ),
+    )
+    compute_temperature.add_argument(
+        "--velocity-unit",
+        choices=["auto", "atomic", "angstrom/fs"],
+        default="auto",
+        help="Velocity XYZ unit (default: auto, interpreted as CP2K atomic velocity units).",
+    )
+    compute_temperature.add_argument(
+        "--remove-com",
+        action="store_true",
+        help="Remove center-of-mass velocity from each velocity-derived selection.",
+    )
+    compute_temperature.add_argument(
+        "-o",
+        "--output",
+        "--save-data",
+        dest="output",
+        help="HDF5 output path (default: auto-generated .h5)",
+    )
+    _add_dry_run_option(compute_temperature)
+    compute_temperature.set_defaults(
+        handler=_handle_compute_temperature,
+        compute_command="temperature",
+    )
 
     compute_position = compute_commands.add_parser(
         "position",
@@ -10269,7 +10457,7 @@ def build_parser() -> argparse.ArgumentParser:
         "combine",
         help="Combine multiple LiNaK analysis HDF5 files into one multi-profile HDF5.",
         description=(
-            "Combine multiple density/MSD/RDF/position/coordination LiNaK HDF5 files into one combined HDF5 file "
+            "Combine multiple density/MSD/RDF/position/coordination/temperature LiNaK HDF5 files into one combined HDF5 file "
             "that can be plotted directly with `linak plot /path/to/combined.h5`."
         ),
     )
@@ -10942,9 +11130,9 @@ def _handle_csv_combine(args: argparse.Namespace) -> int:
         )
 
     detected_analysis = _resolve_auto_plot_analysis_from_sources(sources)
-    if detected_analysis not in {"density", "msd", "rdf", "position", "coordination"}:
+    if detected_analysis not in {"density", "msd", "rdf", "position", "coordination", "temperature"}:
         raise ValueError(
-            "HDF5 combine currently supports LiNaK density/MSD/RDF/position/coordination analysis files only."
+            "HDF5 combine currently supports LiNaK density/MSD/RDF/position/coordination/temperature analysis files only."
         )
 
     settings_source_path = _resolve_plot_settings_source_path(
@@ -11724,6 +11912,7 @@ def _detect_plot_analysis_from_hdf5_source(source: str | Path) -> str | None:
         "coordination",
         "potential",
         "orientation",
+        "temperature",
         "table",
     }:
         return analysis
@@ -11740,6 +11929,7 @@ def _detect_plot_analysis_from_hdf5_source(source: str | Path) -> str | None:
         _PLOT_PROFILE_COORDINATION,
         _PLOT_PROFILE_POTENTIAL,
         _PLOT_PROFILE_ORIENTATION,
+        _PLOT_PROFILE_TEMPERATURE,
         _PLOT_PROFILE_TABLE,
     ):
         if profile_key in profiles:
@@ -11999,9 +12189,12 @@ def _handle_plot(args: argparse.Namespace) -> int:
     if detected_analysis == "orientation":
         args.plot_command = "orientation"
         return _handle_plot_orientation(args)
+    if detected_analysis == "temperature":
+        args.plot_command = "temperature"
+        return _handle_plot_temperature(args)
 
     raise ValueError(
-        "Could not detect a LiNaK density/MSD/RDF/position/coordination/potential/orientation analysis from the provided HDF5 input. "
+        "Could not detect a LiNaK density/MSD/RDF/position/coordination/potential/orientation/temperature analysis from the provided HDF5 input. "
         f"Use `linak {_TABULAR_COMMAND} plot ...` for generic HDF5 plotting."
     )
 
@@ -12295,6 +12488,128 @@ def _handle_plot_msd(args: argparse.Namespace) -> int:
     )
 
     LOGGER.info("MSD plotting finished in %.2f s.", perf_counter() - start)
+    return 0
+
+
+def _handle_plot_temperature(args: argparse.Namespace) -> int:
+    start = perf_counter()
+    LOGGER.info("Starting temperature plotting.")
+    sources = _resolve_plot_hdf5_sources(args, command_name="linak plot")
+    settings_source_path = (
+        _resolve_plot_settings_source_path(
+            sources,
+            setting_source_token=getattr(args, "settings_source", None),
+        )
+        if len(sources) == 1
+        else None
+    )
+    default_args = deepcopy(args)
+    if len(sources) == 1:
+        assert settings_source_path is not None
+        _apply_saved_plot_settings(
+            args=args,
+            source_path=settings_source_path,
+            profile_key=_PLOT_PROFILE_TEMPERATURE,
+            keys=_PLOT_SETTINGS_TEMPERATURE_KEYS,
+            profile_name=getattr(args, "settings_profile", None),
+        )
+    use_gui = _resolve_gui_mode(args)
+    if len(sources) > 1:
+        LOGGER.info("Processing %d temperature HDF5 input file(s).", len(sources))
+
+    if args.dry_run:
+        if use_gui:
+            render_target = "interactive GUI controls"
+        elif args.output:
+            render_target = f"save plot to {Path(args.output).expanduser()}"
+        elif args.show:
+            render_target = f"interactive display via backend {args.backend}"
+        else:
+            render_target = "no render target (--no-show without --output)"
+        plan = [
+            "input mode: HDF5 only",
+            f"sources ({len(sources)}): {_summarize_sources(sources)}",
+            f"time_axis={getattr(args, 'time_axis', 'ps')}",
+            f"render target: {render_target}",
+        ]
+        if settings_source_path is not None:
+            plan.insert(-1, f"plot-settings source: {settings_source_path}")
+        _log_dry_run_plan("plot temperature", plan)
+        LOGGER.info("Temperature plotting dry run finished in %.2f s.", perf_counter() - start)
+        return 0
+
+    if use_gui:
+        from .analysis.temperature import plot_temperature_profiles
+
+        gui_sources = list(sources)
+        gui_settings_path = settings_source_path
+        if len(sources) > 1:
+            gui_settings_path = _combine_analysis_hdf5_sources(
+                sources=sources,
+                analysis="temperature",
+                output=None,
+            )
+            gui_sources = [str(gui_settings_path)]
+            LOGGER.info(
+                "Created combined temperature HDF5 for GUI controls: '%s'.",
+                gui_settings_path,
+            )
+        assert gui_settings_path is not None
+        initial_context = _build_temperature_gui_context(args, sources=gui_sources)
+        _apply_effective_series_settings(
+            args=args,
+            sources=gui_sources,
+            profile_key=_PLOT_PROFILE_TEMPERATURE,
+            fallback_labels_by_source=initial_context.fallback_labels_by_source,
+            series_descriptors=initial_context.series_descriptors,
+            allow_saved_multi_source_merge=not (use_gui and len(sources) > 1),
+            materialize_default_colors=False,
+        )
+        _launch_profile_plot_gui(
+            args=args,
+            default_args=default_args,
+            source_path=gui_settings_path,
+            profile_key=_PLOT_PROFILE_TEMPERATURE,
+            setting_keys=_PLOT_SETTINGS_TEMPERATURE_KEYS,
+            gui_title="LiNaK Plot Controls: Temperature",
+            analysis_name="temperature",
+            plotter=plot_temperature_profiles,
+            initial_context=initial_context,
+            build_context=lambda current_args: _build_temperature_gui_context(
+                current_args,
+                sources=gui_sources,
+            ),
+            build_full_context=lambda current_args: _build_temperature_gui_context(
+                current_args,
+                sources=gui_sources,
+            ),
+        )
+        LOGGER.info("Temperature GUI plotting session finished in %.2f s.", perf_counter() - start)
+        return 0
+
+    from .analysis.temperature import plot_temperature_profiles
+
+    render_context = _build_temperature_gui_context(args, sources=sources)
+    _warn_for_non_gui_plot_complexity(analysis_name="temperature", render_context=render_context)
+    _apply_effective_series_settings(
+        args=args,
+        sources=sources,
+        profile_key=_PLOT_PROFILE_TEMPERATURE,
+        fallback_labels_by_source=render_context.fallback_labels_by_source,
+        series_descriptors=render_context.series_descriptors,
+        allow_saved_multi_source_merge=True,
+        materialize_default_colors=True,
+    )
+    _saved_path, _rendered_state = _render_profile_plot(
+        args=args,
+        source=render_context.plot_source_label,
+        analysis_name="temperature",
+        profile=render_context.profile,
+        plotter=plot_temperature_profiles,
+        plotter_kwargs=render_context.plotter_kwargs,
+        series_descriptors=render_context.series_descriptors,
+    )
+    LOGGER.info("Temperature plotting finished in %.2f s.", perf_counter() - start)
     return 0
 
 
@@ -13170,7 +13485,6 @@ def _handle_compute_density(args: argparse.Namespace) -> int:
         return 0
 
     from .analysis.density import compute_all_density_profiles, save_density_profiles
-    from .trajectory.spatial_filter import append_output_name_suffix
     from .trajectory.io import read_trajectory
 
     source_path = Path(args.trajectory).expanduser().resolve()
@@ -13223,10 +13537,7 @@ def _handle_compute_density(args: argparse.Namespace) -> int:
             cached_surface_estimate = spatial_filter_result.surface_estimate
         if output_path is None:
             output_path = _preflight_prepare_output_path(
-                append_output_name_suffix(
-                    default_output_path,
-                    spatial_filter_result.filename_suffix,
-                ),
+                default_output_path,
                 label="density HDF5 output",
             )
     elif output_path is None:
@@ -13393,6 +13704,61 @@ def _handle_compute_msd(args: argparse.Namespace) -> int:
     return 0
 
 
+def _handle_compute_temperature(args: argparse.Namespace) -> int:
+    start = perf_counter()
+    LOGGER.info("Starting temperature compute.")
+    _resolve_single_source_argument(
+        args,
+        positional_attr="source",
+        source_label="temperature input file",
+    )
+    source_path = Path(args.source).expanduser().resolve()
+    output = _resolve_single_analysis_hdf5_output_path(
+        args.output,
+        _default_temperature_hdf5_output_path(args.source),
+    )
+
+    if args.dry_run:
+        input_preview = (
+            str(Path(args.input).expanduser().resolve()) if args.input else "auto sibling input.inp"
+        )
+        plan = [
+            f"temperature source: {source_path}",
+            f"group_by={args.group_by}, velocity_unit={args.velocity_unit}, remove_com={bool(args.remove_com)}",
+            f"metadata input: {input_preview}",
+            f"output HDF5 target: {output}",
+        ]
+        _log_dry_run_plan("compute temperature", plan)
+        LOGGER.info("Temperature compute dry run finished in %.2f s.", perf_counter() - start)
+        return 0
+
+    from .analysis.temperature import compute_temperature_profiles, save_temperature_profiles
+
+    output_path = _preflight_prepare_output_path(output, label="temperature HDF5 output")
+    profiles = compute_temperature_profiles(
+        args.source,
+        input_path=args.input,
+        group_by=args.group_by,
+        velocity_unit=args.velocity_unit,
+        remove_com=bool(args.remove_com),
+    )
+    metadata: dict[str, Any] = {
+        "source_path": str(source_path),
+        "group_by": args.group_by,
+        "velocity_unit": args.velocity_unit,
+        "remove_com": bool(args.remove_com),
+    }
+    if args.input:
+        metadata["input_path"] = str(Path(args.input).expanduser().resolve())
+    save_temperature_profiles(
+        profiles,
+        output_path,
+        additional_metadata=metadata,
+    )
+    LOGGER.info("Temperature compute finished in %.2f s.", perf_counter() - start)
+    return 0
+
+
 def _handle_compute_position(args: argparse.Namespace) -> int:
     start = perf_counter()
     LOGGER.info("Starting position compute.")
@@ -13429,10 +13795,7 @@ def _handle_compute_position(args: argparse.Namespace) -> int:
                 )
             )
         elif species_token.lower() in {"all", "*"}:
-            output_preview = str(
-                _linak_output_dir_for_source(source_path)
-                / f"{source_path.stem or 'trajectory'}_position_<species>_{args.axis.lower()}.h5"
-            )
+            output_preview = str(_default_position_hdf5_output_path(args.trajectory, "all", args.axis))
         else:
             output_preview = str(
                 _default_position_hdf5_output_path(args.trajectory, species_token, args.axis)
@@ -13456,9 +13819,8 @@ def _handle_compute_position(args: argparse.Namespace) -> int:
         LOGGER.info("Position compute dry run finished in %.2f s.", perf_counter() - start)
         return 0
 
-    from .analysis.position import compute_position_profiles, save_position_profile
+    from .analysis.position import compute_position_profiles, save_position_profiles
     from .pbc import apply_pbc_to_frames
-    from .trajectory.spatial_filter import append_output_name_suffix
     from .trajectory.io import read_trajectory
 
     source_path = Path(args.trajectory).expanduser().resolve()
@@ -13551,40 +13913,36 @@ def _handle_compute_position(args: argparse.Namespace) -> int:
         surface_options=_surface_options_from_cli_args(args),
         precomputed_surface_estimate=cached_surface_estimate,
     )
-    outputs = _position_hdf5_output_paths(
+    output_path = _position_hdf5_output_path(
         args.output,
         args.trajectory,
         profiles,
         axis=args.axis,
     )
-    if spatial_filter_result is not None and args.output is None:
-        outputs = [
-            append_output_name_suffix(Path(output), spatial_filter_result.filename_suffix)
-            for output in outputs
-        ]
-    for profile, output in zip(profiles, outputs):
-        position_metadata: dict[str, Any] = {
-            "source_path": str(source_path),
-            "cell_source": cell_source,
-            "timestep_source": timestep_source,
-            "frame_timestep_fs": float(timestep_fs),
-            "positions_pbc_corrected": bool(pbc_corrected_positions),
-        }
-        if pbc_cell is not None:
-            position_metadata["pbc_cell_angstrom"] = list(pbc_cell)
-        if resolved_cell is not None:
-            position_metadata["resolved_cell_angstrom"] = list(resolved_cell)
-        if cell_input_path is not None:
-            position_metadata["cell_input_path"] = cell_input_path
-        if timestep_input_path is not None:
-            position_metadata["timestep_input_path"] = timestep_input_path
-        if md_timestep_fs is not None:
-            position_metadata["md_timestep_fs"] = float(md_timestep_fs)
-        if trajectory_stride_md is not None:
-            position_metadata["trajectory_stride_md"] = int(trajectory_stride_md)
-        if spatial_filter_result is not None:
-            position_metadata["spatial_filter"] = spatial_filter_result.metadata
-        save_position_profile(profile, output, additional_metadata=position_metadata)
+    if output_path is None:
+        raise ValueError("No position profiles were computed.")
+    position_metadata: dict[str, Any] = {
+        "source_path": str(source_path),
+        "cell_source": cell_source,
+        "timestep_source": timestep_source,
+        "frame_timestep_fs": float(timestep_fs),
+        "positions_pbc_corrected": bool(pbc_corrected_positions),
+    }
+    if pbc_cell is not None:
+        position_metadata["pbc_cell_angstrom"] = list(pbc_cell)
+    if resolved_cell is not None:
+        position_metadata["resolved_cell_angstrom"] = list(resolved_cell)
+    if cell_input_path is not None:
+        position_metadata["cell_input_path"] = cell_input_path
+    if timestep_input_path is not None:
+        position_metadata["timestep_input_path"] = timestep_input_path
+    if md_timestep_fs is not None:
+        position_metadata["md_timestep_fs"] = float(md_timestep_fs)
+    if trajectory_stride_md is not None:
+        position_metadata["trajectory_stride_md"] = int(trajectory_stride_md)
+    if spatial_filter_result is not None:
+        position_metadata["spatial_filter"] = spatial_filter_result.metadata
+    save_position_profiles(profiles, output_path, additional_metadata=position_metadata)
 
     LOGGER.info("Position compute finished in %.2f s.", perf_counter() - start)
     return 0
@@ -13688,7 +14046,6 @@ def _handle_compute_rdf(args: argparse.Namespace) -> int:
         compute_rdf_profiles,
         save_rdf_profiles,
     )
-    from .trajectory.spatial_filter import append_output_name_suffix
 
     source_path = Path(args.trajectory).expanduser().resolve()
     output_path = (
@@ -13728,7 +14085,7 @@ def _handle_compute_rdf(args: argparse.Namespace) -> int:
         rdf_metadata["spatial_filter"] = spatial_filter_result.metadata
         if output_path is None:
             output_path = _preflight_prepare_output_path(
-                append_output_name_suffix(default_output, spatial_filter_result.filename_suffix),
+                default_output,
                 label="RDF HDF5 output",
             )
     elif output_path is None:
@@ -13873,7 +14230,6 @@ def _handle_compute_coordination(args: argparse.Namespace) -> int:
         save_coordination_profiles,
     )
     from .pbc import apply_pbc_to_frames
-    from .trajectory.spatial_filter import append_output_name_suffix
     from .trajectory.io import read_trajectory
 
     source_path = Path(args.trajectory).expanduser().resolve()
@@ -13952,7 +14308,7 @@ def _handle_compute_coordination(args: argparse.Namespace) -> int:
             cached_surface_estimate = spatial_filter_result.surface_estimate
         if output_path is None:
             output_path = _preflight_prepare_output_path(
-                append_output_name_suffix(default_output, spatial_filter_result.filename_suffix),
+                default_output,
                 label="coordination HDF5 output",
             )
     elif output_path is None:
@@ -14102,7 +14458,9 @@ def _handle_compute_potential(args: argparse.Namespace) -> int:
                 continue
             seen_expanded_sources.add(expanded_key)
             expanded_sources.append(dataset)
-            expanded_source_labels.append(expanded_key)
+            expanded_source_labels.append(
+                dataset_source if dataset_profile_index == 0 else expanded_key
+            )
 
     if not expanded_sources:
         raise ValueError("No unique valid Hartree cube inputs were provided.")
@@ -14318,7 +14676,6 @@ def _handle_compute_orientation(args: argparse.Namespace) -> int:
         return 0
 
     from .analysis.orientation import compute_orientation_profile, save_orientation_profile
-    from .trajectory.spatial_filter import append_output_name_suffix
     from .trajectory.io import read_trajectory
 
     source_path = Path(args.trajectory).expanduser().resolve()
@@ -14372,9 +14729,7 @@ def _handle_compute_orientation(args: argparse.Namespace) -> int:
             cached_surface_estimate = spatial_filter_result.surface_estimate
         if output_path is None:
             output_path = _preflight_prepare_output_path(
-                append_output_name_suffix(
-                    default_output_path, spatial_filter_result.filename_suffix
-                ),
+                default_output_path,
                 label="orientation HDF5 output",
             )
     elif output_path is None:
@@ -14778,7 +15133,16 @@ def _rewrite_implicit_plot_csv(argv: list[str]) -> list[str]:
     if len(argv) <= command_index + 1:
         return argv
 
-    known_subcommands = {"density", "msd", "rdf", "position", "coordination", "potential"}
+    known_subcommands = {
+        "density",
+        "msd",
+        "rdf",
+        "position",
+        "coordination",
+        "potential",
+        "orientation",
+        "temperature",
+    }
     next_token = argv[command_index + 1]
     if next_token in known_subcommands or next_token in {"-h", "--help"}:
         return argv
@@ -14840,6 +15204,7 @@ def _rewrite_implicit_plot_csv(argv: list[str]) -> list[str]:
         "coordination",
         "potential",
         "orientation",
+        "temperature",
     }:
         return rewritten
 

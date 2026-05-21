@@ -6,12 +6,14 @@ LiNaK is a lightweight Python toolkit for molecular dynamics trajectory analysis
 
 <img src="assets/linak_gui_banner.svg" alt="LiNaK GUI banner" width="200">
 
-LiNaK provides five top-level commands:
-- `linak project`: open a project workspace for input management, analyses, outputs, and logs
+LiNaK's recommended path is the command-line `apply`/`compute`/`plot` workflow:
 - `linak compute`: generate LiNaK HDF5 analysis files
 - `linak plot`: plot LiNaK density, MSD, RDF, position, coordination, potential, and orientation HDF5 files by auto-detecting the analysis from the HDF5 metadata
 - `linak apply`: convert trajectories, pack simulation directories, apply PBC, or compress CP2K output files
 - `linak hdf5` (`linak hd`, `linak h5`): inspect, combine, transform, and plot generic tabular HDF5 data
+
+`linak project` exists as an experimental workspace UI, but it is still WIP and
+is not the recommended workflow.
 
 Supported inputs include:
 - ASE-supported trajectory files (e.g. CP2K's `.xyz`, LAMMPS's `.dump`, etc.)
@@ -54,35 +56,35 @@ machine for fast iteration with `linak compute` and `linak plot`.
 
 ```bash
 linak apply convert traj.xyz
-linak compute density traj.traj.h5
-linak compute msd traj.traj.h5 --species O
-linak compute rdf traj.traj.h5 --species-a O --species-b H
-linak compute coordination traj.traj.h5 --species-a O --species-b H --cutoff-from-rdf
-linak compute position traj.traj.h5 --species O
-linak compute orientation traj.traj.h5
-linak plot LiNaK_outputs/traj.traj_density_z.h5
-linak plot LiNaK_outputs/traj.traj_rdf_o_h.h5
+linak compute density LiNaK_outputs/traj.traj.h5
+linak compute msd LiNaK_outputs/traj.traj.h5 --species O
+linak compute rdf LiNaK_outputs/traj.traj.h5 --species-a O --species-b H
+linak compute coordination LiNaK_outputs/traj.traj.h5 --species-a O --species-b H --cutoff-from-rdf
+linak compute position LiNaK_outputs/traj.traj.h5 --species O
+linak compute orientation LiNaK_outputs/traj.traj.h5
+linak plot LiNaK_outputs/traj.density.h5
+linak plot LiNaK_outputs/traj.rdf.h5
 ```
 
 You can also run `linak compute` directly on a raw trajectory without converting first:
 
 ```bash
 linak compute density traj.xyz
-linak plot traj_density_z.h5
+linak plot traj.density.h5
 
 linak compute density traj.xyz --species H2O
-linak plot traj_density_h2o_z.h5
+linak plot traj.density.h5
 
 linak compute msd traj.xyz --species O
-linak plot traj_msd_o.h5
+linak plot traj.msd.h5
 linak compute position traj.xyz --species O
-linak plot traj_position_o_z.h5
+linak plot traj.position.h5
 linak compute rdf traj.xyz --species-a O --species-b H
-linak plot traj_rdf_o_h.h5
+linak plot traj.rdf.h5
 linak compute coordination traj.xyz --species-a O --species-b H --cutoff-from-rdf
-linak plot traj_coordination_o_h.h5
+linak plot traj.coordination.h5
 linak compute orientation traj.xyz
-linak plot traj_orientation_z.h5
+linak plot traj.orientation.h5
 ```
 
 Run `linak` for information or `linak --help` for the full CLI overview.
@@ -128,6 +130,7 @@ Available analyses:
 - `coordination`: continuous coordination number vs time and/or distance to surface
 - `potential`: CP2K cSHE-related quantities from Hartree cube files
 - `orientation`: H2O polar and azimuthal orientation profiles vs distance to surface
+- `temperature`: CP2K kind/thermal-region temperatures or kinetic temperatures from velocity XYZ
 
 Examples:
 
@@ -139,25 +142,28 @@ linak compute position traj.xyz --species O --axis z
 linak compute rdf traj.xyz --species-a O --species-b H --bin-width 0.05
 linak compute coordination traj.xyz --species-a O --species-b H --cutoff-from-rdf
 linak compute orientation traj.xyz
+linak compute temperature run-1.temp
+linak compute temperature run-vel-1.xyz --input input.inp
 linak compute potential -f run1/*-v_hartree-1_0.cube run2/*-v_hartree-1_0.cube --output potentials.h5
 ```
 
 ### `linak plot`
 
 The `plot` command reads LiNaK analysis HDF5 files and auto-detects whether the
-file contains density, MSD, RDF, position, coordination, potential, or orientation data.
+file contains density, MSD, RDF, position, coordination, potential, orientation, or temperature data.
 
 Examples:
 
 ```bash
-linak plot traj_density_z.h5
-linak plot -f run1_density_z.h5 run2_density_z.h5
-linak plot traj_msd_o.h5 
-linak plot traj_position_o_z.h5
-linak plot traj_rdf_o_h.h5 
-linak plot traj_coordination_o_h.h5
-linak plot traj_orientation_z.h5
+linak plot traj.density.h5
+linak plot -f run1.density.h5 run2.density.h5
+linak plot traj.msd.h5 
+linak plot traj.position.h5
+linak plot traj.rdf.h5 
+linak plot traj.coordination.h5
+linak plot traj.orientation.h5
 linak plot potentials.h5
+linak plot run.temperature.h5
 ```
 
 When `linak plot` cannot detect a supported LiNaK analysis in the HDF5 file, it
@@ -242,7 +248,7 @@ LiNaK rejects it and asks you to recompute the analysis with the current package
 The `hdf5` command group works with generic tabular HDF5 data. It supports:
 - `info`, `preview`, `get`
 - `sort`, `filter`, `dedupe`
-- `combine` for LiNaK density/MSD/RDF/position HDF5 files
+- `combine` for LiNaK density/MSD/RDF/position/coordination/temperature HDF5 files
 - `plot` for generic column-based plotting
 - `plot-settings` for persisted plot profiles stored inside HDF5 files
 
@@ -250,7 +256,7 @@ Examples:
 
 ```bash
 linak hdf5 info density.h5
-linak hdf5 combine -f run1_density_z.h5 run2_density_z.h5
+linak hdf5 combine -f run1.density.h5 run2.density.h5
 linak hdf5 plot table.h5 --kind line --x time_ps --y msd_A2
 ```
 
@@ -268,6 +274,7 @@ Detailed method notes:
 - [Coordination](docs/coordination.md)
 - [Potential](docs/potential.md)
 - [Orientation](docs/orientation.md)
+- [Temperature](docs/temperature.md)
 - [Surface Estimation](docs/surface-estimation.md)
 - [Water Detection And Water Geometry](docs/water-detection.md)
 - [HDF5 Data Model And Metadata Conventions](docs/hdf5-data-model.md)
@@ -415,9 +422,33 @@ Surface options shared with density (`--surface-mode`, `--surface-elements`,
 
 ```bash
 linak compute orientation traj.xyz
-linak compute orientation traj.traj.h5 --axis z --reference-axis z --bin-width 0.05
-linak plot traj_orientation_z.h5
-linak plot traj_orientation_z.h5 --component heatmap --angle polar
+linak compute orientation LiNaK_outputs/traj.traj.h5 --axis z --reference-axis z --bin-width 0.05
+linak plot traj.orientation.h5
+linak plot traj.orientation.h5 --component heatmap --angle polar
+```
+
+### Temperature
+
+`linak compute temperature` supports CP2K `.temp`, `.tregion`, and `*-vel-*.xyz`
+velocity files. `.temp` inputs become per-element/kind temperature series;
+`.tregion` inputs become thermal-region series. Velocity XYZ inputs recompute
+kinetic temperatures and default to per-element plus per-region output when
+region metadata can be resolved from `--input` or sibling `input.inp`.
+
+Velocity XYZ values are interpreted as CP2K atomic velocity units by default.
+Use `--velocity-unit angstrom/fs` for files stored in Angstrom/fs and
+`--remove-com` when the center-of-mass velocity should be removed for each
+selection. Outputs store `temperature_K` against `time_ps`/`time_fs` and keep
+the resolved element, region, region composition, atom indices, CP2K `LIST`,
+target temperature, velocity unit, and DOF mode in profile metadata. Region
+names remain raw CP2K/logical identifiers, while plotted labels include
+composition when known, for example `Region 2 [O215 H430]`.
+
+```bash
+linak compute temperature run-1.temp
+linak compute temperature run-1.tregion --input input.inp
+linak compute temperature run-vel-1.xyz --input input.inp
+linak plot run.temperature.h5
 ```
 
 ## Plotting and Plot Studio
@@ -511,7 +542,7 @@ All executable subcommands support:
 - `--log-file <path>`
 
 Additional shared behavior:
-- compute commands write HDF5 next to the input source by default
+- default generated HDF5 outputs are written under `LiNaK_outputs`
 - use `-o/--output` (alias `--save-data` on compute commands) to override output paths
 - use `-f/--files` when passing multiple input files; it also works for a single file
 - LiNaK records resolved cell and timestep provenance in HDF5 metadata where applicable

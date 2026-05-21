@@ -227,6 +227,7 @@ def readiness_for_action(action: Action, item: ProjectItem) -> ActionReadiness:
         trajectory_actions = {
             "density",
             "msd",
+            "temperature",
             "rdf",
             "position",
             "coordination",
@@ -238,6 +239,9 @@ def readiness_for_action(action: Action, item: ProjectItem) -> ActionReadiness:
             return ActionReadiness(False, "Missing trajectory data in .out.h5")
         if action.action_id in {"potential", "export_out_cube"} and not summary.has_cubes:
             return ActionReadiness(False, "Missing cube data in .out.h5")
+    if action.action_id == "temperature" and item.item_type == "raw_trajectory":
+        if item.metadata.get("trajectory_role") != "velocity":
+            return ActionReadiness(False, "Temperature requires a .temp, .tregion, or *-vel-*.xyz source")
     return ActionReadiness(True)
 
 
