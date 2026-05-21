@@ -666,6 +666,7 @@ _PLOT_SETTINGS_MSD_KEYS = (
     *_PLOT_SETTINGS_COMMON_KEYS,
 )
 _PLOT_SETTINGS_TEMPERATURE_KEYS = (
+    "time_axis",
     *_PLOT_SETTINGS_COMMON_KEYS,
 )
 _PLOT_SETTINGS_RDF_KEYS = (
@@ -8284,6 +8285,8 @@ def _resolve_plot_settings_view_mapping(
         return _resolve_potential_plotter_kwargs(args).get("view_mapping")
     if keys is _PLOT_SETTINGS_ORIENTATION_KEYS:
         return _resolve_orientation_plotter_kwargs(args).get("view_mapping")
+    if keys is _PLOT_SETTINGS_TEMPERATURE_KEYS:
+        return _resolve_temperature_plotter_kwargs(args).get("view_mapping")
     if keys is _PLOT_SETTINGS_TABLE_KEYS:
         from .plot.profile_persistence import (
             build_plot_profile_payload,

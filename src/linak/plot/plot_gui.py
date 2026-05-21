@@ -1195,7 +1195,7 @@ def _error_supported_for_view(
 ) -> bool:
     """Return whether one GUI view supports 1-D error overlays and min-bin masking."""
     normalized_analysis = str(analysis).strip().lower()
-    if normalized_analysis in {"density", "msd", "rdf", "potential"}:
+    if normalized_analysis in {"density", "msd", "rdf", "potential", "temperature"}:
         return True
     if normalized_analysis == "orientation":
         return not bool(orientation_heatmap)
@@ -6542,6 +6542,7 @@ def launch_plot_settings_panel(
                 "position",
                 "coordination",
                 "orientation",
+                "temperature",
             }:
                 error_group = QGroupBox("Uncertainty")
                 error_layout = QVBoxLayout(error_group)
@@ -6770,6 +6771,7 @@ def launch_plot_settings_panel(
                 "potential",
                 "position",
                 "coordination",
+                "temperature",
             }:
                 fit_group = QGroupBox("Fit")
                 fit_layout = QVBoxLayout(fit_group)
@@ -9828,7 +9830,7 @@ def launch_plot_settings_panel(
 
         def _fit_supported_for_current_view(self) -> bool:
             analysis = self._analysis_name
-            if analysis in {"density", "msd", "rdf"}:
+            if analysis in {"density", "msd", "rdf", "temperature"}:
                 return True
             if analysis == "potential":
                 return not self._is_potential_table_mode()

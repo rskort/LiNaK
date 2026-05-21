@@ -376,6 +376,25 @@ def test_select_plot_profile_settings_still_flattens_position_compatibility_keys
     assert selected["component"] == "2d-projection"
 
 
+def test_temperature_plot_profile_round_trips_time_axis_mapping():
+    payload = build_plot_profile_payload(
+        "plot:temperature",
+        {"time_axis": "fs", "title": "Temperature", "legend": True},
+    )
+
+    assert payload["source_selection"] == {}
+    assert payload["view_mapping"]["view_type_id"] == "line_1d"
+    assert payload["view_mapping"]["x"] == "time_fs"
+    assert payload["view_mapping"]["y"] == "temperature"
+    assert payload["style"] == {"title": "Temperature", "legend": True}
+
+    flattened = flatten_plot_profile_payload("plot:temperature", payload)
+
+    assert flattened["time_axis"] == "fs"
+    assert flattened["title"] == "Temperature"
+    assert flattened["legend"] is True
+
+
 def test_plot_profile_requires_legacy_mapping_flatten_only_for_compatibility_keys():
     assert (
         plot_profile_requires_legacy_mapping_flatten(

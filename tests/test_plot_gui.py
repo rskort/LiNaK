@@ -980,12 +980,20 @@ def test_default_error_series_label_uses_effective_stat_name():
 
 def test_error_supported_for_view_tracks_one_dimensional_modes_only():
     assert _error_supported_for_view("rdf") is True
+    assert _error_supported_for_view("temperature") is True
     assert _error_supported_for_view("orientation", orientation_heatmap=True) is False
     assert _error_supported_for_view("position", position_component="xy-z") is False
     assert _error_supported_for_view("position", position_component="2d-projection") is False
     assert (
         _error_supported_for_view("coordination", coordination_component="time-distance") is False
     )
+
+
+def test_temperature_is_registered_for_line_fit_controls():
+    source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+
+    assert '"density", "msd", "rdf", "temperature"' in source
+    assert '"coordination",\n                "temperature",' in source
 
 
 def test_without_new_profile_series_overrides_resets_series_customizations_only():

@@ -21,6 +21,7 @@ _PLOT_PROFILE_POSITION = "plot:position"
 _PLOT_PROFILE_COORDINATION = "plot:coordination"
 _PLOT_PROFILE_POTENTIAL = "plot:potential"
 _PLOT_PROFILE_ORIENTATION = "plot:orientation"
+_PLOT_PROFILE_TEMPERATURE = "plot:temperature"
 _PLOT_PROFILE_TABLE = "plot:table"
 _PLOT_PROFILE_SENTINEL = "__linak_plot_profile__"
 _PLOT_PROFILE_VERSION = 2
@@ -33,6 +34,7 @@ _SOURCE_SELECTION_FIELDS_BY_PROFILE_KEY: dict[str, tuple[str, ...]] = {
     _PLOT_PROFILE_COORDINATION: ("species_a", "species_b", "axis"),
     _PLOT_PROFILE_POTENTIAL: (),
     _PLOT_PROFILE_ORIENTATION: (),
+    _PLOT_PROFILE_TEMPERATURE: (),
     _PLOT_PROFILE_TABLE: ("group",),
 }
 
@@ -55,6 +57,7 @@ _LEGACY_MAPPING_FIELDS_BY_PROFILE_KEY: dict[str, tuple[str, ...]] = {
     _PLOT_PROFILE_COORDINATION: ("component", "time_axis"),
     _PLOT_PROFILE_POTENTIAL: ("y_quantity", "table_view", "view_type"),
     _PLOT_PROFILE_ORIENTATION: ("component", "angle"),
+    _PLOT_PROFILE_TEMPERATURE: ("time_axis",),
     _PLOT_PROFILE_TABLE: ("kind", "x", "y", "bins"),
 }
 
@@ -278,6 +281,12 @@ def _build_view_mapping(profile_key: str, settings: dict[str, Any]) -> PlotViewM
             component=str(settings.get("component") or "average"),
             angle=str(settings.get("angle") or "polar"),
         )
+    if profile_key == _PLOT_PROFILE_TEMPERATURE:
+        from .mappings.temperature_mapping import temperature_plot_options_to_view_mapping
+
+        return temperature_plot_options_to_view_mapping(
+            time_axis=str(settings.get("time_axis") or "ps"),
+        )
     if profile_key == _PLOT_PROFILE_TABLE:
         kind = str(settings.get("kind") or "line").strip().lower() or "line"
         fixed_values: dict[str, str] = {"kind": kind}
@@ -331,6 +340,10 @@ def _flatten_view_mapping(profile_key: str, mapping: PlotViewMapping) -> dict[st
         from .mappings.orientation_mapping import orientation_view_mapping_to_plot_options
 
         return orientation_view_mapping_to_plot_options(mapping)
+    if profile_key == _PLOT_PROFILE_TEMPERATURE:
+        from .mappings.temperature_mapping import temperature_view_mapping_to_plot_options
+
+        return temperature_view_mapping_to_plot_options(mapping)
     if profile_key == _PLOT_PROFILE_TABLE:
         kind = (
             str(
