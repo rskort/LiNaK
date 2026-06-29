@@ -54,8 +54,11 @@ from ..plot.plotting import (
 from ..progress import ProgressBar
 from ..utils import axis_to_index, ensure_positive
 from .common import (
+    MOLECULE_SPECIES_LABELS,
     available_element_species,
     frame_has_usable_cell as _common_frame_has_usable_cell,
+    is_molecule_species_label,
+    molecule_display_label,
     normalize_species_query as _normalize_species_query,
     read_profile_payloads,
     read_profile_payloads_by_index,
@@ -78,15 +81,17 @@ from .surface import (
     estimate_surface_reference as estimate_surface_reference,
 )
 from .water import (
+    OHTopologyCache,
+    molecule_positions_with_masses as _molecule_positions_with_masses,
     water_molecule_triplets as _water_molecule_triplets,
     water_triplet_axis_values_with_masses as _water_triplet_axis_values_with_masses,
-    water_triplet_geometry as _water_triplet_geometry,
     water_axis_values_per_frame as _water_axis_values_per_frame_impl,
 )
 
 LOGGER = logging.getLogger(__name__)
 H2O_VALIDATION_STRIDE = 100
 H2O_OH_CUTOFF_A = 1.25
+DEFAULT_MIN_MOLECULE_FRAMES = 3
 AMU_TO_G = 1.66053906660e-24
 ANGSTROM3_TO_CM3 = 1.0e-24
 ANGSTROM3_TO_NM3 = 1.0e-3
@@ -119,6 +124,10 @@ class DensityProfile:
     surface_position_std: float | None = None
     surface_estimate: SurfaceEstimate | None = None
     series_statistics: dict[str, SeriesStatistics] | None = None
+    visible_x_min_A: float | None = None
+    visible_x_max_A: float | None = None
+    oh_cutoff_A: float | None = None
+    min_molecule_frames: int | None = None
 
 
 @dataclass(frozen=True)
@@ -137,6 +146,12 @@ class DensityHeatmapProfile:
     n_frames: int
     number_density: np.ndarray | None = None
     number_density_units: str | None = None
+    visible_x_min_A: float | None = None
+    visible_x_max_A: float | None = None
+    visible_y_min_A: float | None = None
+    visible_y_max_A: float | None = None
+    oh_cutoff_A: float | None = None
+    min_molecule_frames: int | None = None
 
 
 @dataclass
@@ -184,6 +199,7 @@ class _DensityTargetSpec:
     species_label: str
     count_label: str
     selection_kind: str
+    apply_min_molecule_frames: bool = False
 
 
 @dataclass
@@ -193,6 +209,10 @@ class _DensityObservedBounds:
     axis_lower: dict[str, float]
     axis_upper: dict[str, float]
     selected_count: int = 0
+    active_frame_count: int = 0
+
+    def mark_frame_active(self) -> None:
+        self.active_frame_count += 1
 
     def update_axis(self, axis_id: str, values: np.ndarray) -> None:
         data = np.asarray(values, dtype=float)
@@ -213,6 +233,86 @@ class _DensityObservedBounds:
         return axis_id in self.axis_lower and axis_id in self.axis_upper
 
 
+def _density_species_display_label(species_label: str) -> str:
+    if is_molecule_species_label(species_label):
+        return molecule_display_label(species_label)
+    return str(species_label)
+
+
+def _density_selection_summary(targets: list[_DensityTargetSpec]) -> str:
+    elements = [
+        target.species_label for target in targets if target.selection_kind == "element"
+    ]
+    molecules = [
+        _density_species_display_label(target.species_label)
+        for target in targets
+        if target.selection_kind == "molecule"
+    ]
+    parts: list[str] = []
+    if elements:
+        parts.append("elements=" + ",".join(elements))
+    if molecules:
+        parts.append("molecules=" + ",".join(molecules))
+    return "; ".join(parts) if parts else "none"
+
+
+def _molecule_target_is_active(
+    *,
+    species_label: str,
+    active_frame_count: int,
+    apply_min_molecule_frames: bool,
+    min_molecule_frames: int,
+) -> bool:
+    if active_frame_count <= 0:
+        return False
+    if not apply_min_molecule_frames:
+        return True
+    if species_label == "mol:H2O":
+        return True
+    return int(active_frame_count) >= int(min_molecule_frames)
+
+
+def _line_visible_range_from_density(
+    *,
+    bin_edges: np.ndarray,
+    values: np.ndarray,
+) -> tuple[float | None, float | None]:
+    density = np.asarray(values, dtype=float)
+    edges = np.asarray(bin_edges, dtype=float)
+    if density.size == 0 or edges.size != density.size + 1:
+        return None, None
+    active = np.isfinite(density) & (density != 0.0)
+    if not np.any(active):
+        return None, None
+    indices = np.flatnonzero(active)
+    lower = float(edges[int(indices[0])])
+    upper = float(edges[int(indices[-1]) + 1])
+    return lower, upper
+
+
+def _heatmap_visible_ranges_from_density(
+    *,
+    x_bin_edges: np.ndarray,
+    y_bin_edges: np.ndarray,
+    values: np.ndarray,
+) -> tuple[float | None, float | None, float | None, float | None]:
+    density = np.asarray(values, dtype=float)
+    x_edges = np.asarray(x_bin_edges, dtype=float)
+    y_edges = np.asarray(y_bin_edges, dtype=float)
+    if density.ndim != 2 or x_edges.size != density.shape[0] + 1 or y_edges.size != density.shape[1] + 1:
+        return None, None, None, None
+    active = np.isfinite(density) & (density != 0.0)
+    if not np.any(active):
+        return None, None, None, None
+    x_indices, y_indices = np.nonzero(active)
+    return (
+        float(x_edges[int(np.min(x_indices))]),
+        float(x_edges[int(np.max(x_indices)) + 1]),
+        float(y_edges[int(np.min(y_indices))]),
+        float(y_edges[int(np.max(y_indices)) + 1]),
+    )
+
+
 @dataclass
 class _DensityLineAccumulator:
     """Incrementally accumulate one 1D density output over shared frame data."""
@@ -229,6 +329,8 @@ class _DensityLineAccumulator:
     surface_position: float | None = None
     surface_position_std: float | None = None
     surface_estimate: SurfaceEstimate | None = None
+    oh_cutoff_A: float | None = None
+    min_molecule_frames: int | None = None
     mass_histogram_sum: np.ndarray | None = None
     entity_histogram_sum: np.ndarray | None = None
     framewise_mass_density_sum: np.ndarray | None = None
@@ -336,6 +438,10 @@ class _DensityLineAccumulator:
             self.species_label,
             volumetric=self.normalization_cache.use_volumetric_density,
         )
+        visible_x_min_A, visible_x_max_A = _line_visible_range_from_density(
+            bin_edges=self.bin_edges,
+            values=density,
+        )
         return DensityProfile(
             axis=self.axis.lower(),
             species=self.species_label,
@@ -356,6 +462,10 @@ class _DensityLineAccumulator:
                 "density": _finalize_density_statistics_moments(self.density_moments),
                 "number_density": _finalize_density_statistics_moments(self.number_density_moments),
             },
+            visible_x_min_A=visible_x_min_A,
+            visible_x_max_A=visible_x_max_A,
+            oh_cutoff_A=self.oh_cutoff_A,
+            min_molecule_frames=self.min_molecule_frames,
         )
 
 
@@ -370,6 +480,8 @@ class _DensityHeatmapAccumulator:
     y_bin_edges: np.ndarray
     bin_width: float
     normalization_cache: _DensityHeatmapNormalizationCache
+    oh_cutoff_A: float | None = None
+    min_molecule_frames: int | None = None
     mass_histogram_sum: np.ndarray | None = None
     entity_histogram_sum: np.ndarray | None = None
     framewise_mass_density_sum: np.ndarray | None = None
@@ -461,6 +573,13 @@ class _DensityHeatmapAccumulator:
             number_density_units = _entity_areal_density_units_for_species(self.species_label)
         x_bin_centers = 0.5 * (self.x_bin_edges[:-1] + self.x_bin_edges[1:])
         y_bin_centers = 0.5 * (self.y_bin_edges[:-1] + self.y_bin_edges[1:])
+        visible_x_min_A, visible_x_max_A, visible_y_min_A, visible_y_max_A = (
+            _heatmap_visible_ranges_from_density(
+                x_bin_edges=self.x_bin_edges,
+                y_bin_edges=self.y_bin_edges,
+                values=density,
+            )
+        )
         return DensityHeatmapProfile(
             plane=f"{self.plane_axes[0]}{self.plane_axes[1]}",
             plane_axes=self.plane_axes,
@@ -474,6 +593,12 @@ class _DensityHeatmapAccumulator:
             n_frames=n_frames,
             number_density=np.asarray(number_density, dtype=float),
             number_density_units=number_density_units,
+            visible_x_min_A=visible_x_min_A,
+            visible_x_max_A=visible_x_max_A,
+            visible_y_min_A=visible_y_min_A,
+            visible_y_max_A=visible_y_max_A,
+            oh_cutoff_A=self.oh_cutoff_A,
+            min_molecule_frames=self.min_molecule_frames,
         )
 
 
@@ -495,6 +620,21 @@ def _select_axis_values_with_masses(
     return axis_values, masses
 
 
+def _wrap_positions_to_periodic_cell(frame: Atoms, positions: np.ndarray) -> np.ndarray:
+    data = np.asarray(positions, dtype=float)
+    if data.size == 0 or data.ndim != 2 or data.shape[1] != 3:
+        return data
+    pbc = np.asarray(frame.get_pbc(), dtype=bool)
+    if not np.any(pbc) or not _common_frame_has_usable_cell(frame):
+        return data
+    try:
+        scaled = np.asarray(frame.cell.scaled_positions(data), dtype=float)
+    except Exception:
+        return data
+    scaled[:, pbc] = np.mod(scaled[:, pbc], 1.0)
+    return np.asarray(scaled @ np.asarray(frame.cell.array, dtype=float), dtype=float)
+
+
 def _select_water_axis_values_with_masses(
     frame: Atoms, axis_index: int, oh_cutoff: float = H2O_OH_CUTOFF_A
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -506,14 +646,66 @@ def _select_water_axis_values_with_masses(
 
 
 def _select_water_axis_values_per_frame(
-    frames: list[Atoms], axis_index: int
+    frames: list[Atoms], axis_index: int, oh_cutoff: float = H2O_OH_CUTOFF_A
 ) -> tuple[list[np.ndarray], list[np.ndarray]]:
     """Select water-molecule COM axis values with periodic cached-topology validation."""
     return _water_axis_values_per_frame_impl(
         frames,
         axis_index,
+        oh_cutoff=oh_cutoff,
         progress_desc="Selecting H2O for density",
     )
+
+
+def _select_molecule_axis_values_per_frame(
+    frames: list[Atoms],
+    axis_index: int,
+    molecule_label: str,
+    oh_cutoff: float = H2O_OH_CUTOFF_A,
+) -> tuple[list[np.ndarray], list[np.ndarray]]:
+    """Select O/H molecule COM axis values with adaptive cached-topology validation."""
+
+    selections = _select_molecule_axis_values_for_labels_per_frame(
+        frames,
+        axis_index,
+        (molecule_label,),
+        oh_cutoff=oh_cutoff,
+        progress_desc=f"Selecting {molecule_label} for density",
+    )
+    return selections[molecule_label]
+
+
+def _select_molecule_axis_values_for_labels_per_frame(
+    frames: list[Atoms],
+    axis_index: int,
+    molecule_labels: tuple[str, ...] | list[str],
+    *,
+    oh_cutoff: float = H2O_OH_CUTOFF_A,
+    progress_desc: str,
+) -> dict[str, tuple[list[np.ndarray], list[np.ndarray]]]:
+    """Select O/H molecule COM axis values for multiple labels using one topology cache."""
+
+    labels = tuple(molecule_labels)
+    selections: dict[str, tuple[list[np.ndarray], list[np.ndarray]]] = {
+        label: ([], []) for label in labels
+    }
+    topology_cache = OHTopologyCache(
+        oh_cutoff=oh_cutoff,
+        context="density O/H molecule topology",
+    )
+    with ProgressBar(desc=progress_desc, total=len(frames), unit="frame") as progress:
+        for frame_index, frame in enumerate(frames):
+            topology = topology_cache.select(frame, frame_index=frame_index)
+            for label in labels:
+                positions, masses = _molecule_positions_with_masses(
+                    frame,
+                    topology.indices_for(label),
+                )
+                selected_per_frame, selected_masses_per_frame = selections[label]
+                selected_per_frame.append(np.asarray(positions[:, axis_index], dtype=float))
+                selected_masses_per_frame.append(np.asarray(masses, dtype=float))
+            progress.update()
+    return selections
 
 
 def _entity_density_units_for_species(
@@ -521,7 +713,7 @@ def _entity_density_units_for_species(
     *,
     volumetric: bool,
 ) -> str:
-    entity_label = "molecule" if str(species_label).strip().upper() == "H2O" else "atom"
+    entity_label = "molecule" if is_molecule_species_label(species_label) else "atom"
     if volumetric:
         return f"{entity_label}/nm^3"
     return f"{entity_label}/Angstrom"
@@ -530,7 +722,7 @@ def _entity_density_units_for_species(
 def _entity_areal_density_units_for_species(species_label: str) -> str:
     """Return fallback areal-density units for one species selection."""
 
-    entity_label = "molecule" if str(species_label).strip().upper() == "H2O" else "atom"
+    entity_label = "molecule" if is_molecule_species_label(species_label) else "atom"
     return f"{entity_label}/Angstrom^2"
 
 
@@ -814,32 +1006,53 @@ def _resolve_density_target_specs(
     *,
     species: str | None,
 ) -> list[_DensityTargetSpec]:
-    selection_mode, species_label = _normalize_species_query(species, allow_h2o=True)
-    if selection_mode == "all":
+    selection_mode, species_label = _normalize_species_query(
+        species,
+        allow_h2o=True,
+        allow_molecules=True,
+    )
+    if selection_mode in {"all", "elements"}:
         element_species = available_element_species(frames)
         if not element_species:
             raise ValueError("No elements found in trajectory.")
+        element_targets = [
+            _DensityTargetSpec(
+                species_label=element,
+                count_label="atoms",
+                selection_kind="element",
+            )
+            for element in element_species
+        ]
+        if selection_mode == "elements":
+            return element_targets
         return [
+            *element_targets,
             *(
                 _DensityTargetSpec(
-                    species_label=element,
-                    count_label="atoms",
-                    selection_kind="element",
+                    species_label=label,
+                    count_label="molecules",
+                    selection_kind="molecule",
+                    apply_min_molecule_frames=True,
                 )
-                for element in element_species
-            ),
-            _DensityTargetSpec(
-                species_label="H2O",
-                count_label="molecules",
-                selection_kind="h2o",
+                for label in MOLECULE_SPECIES_LABELS
             ),
         ]
-    if selection_mode == "h2o":
+    if selection_mode == "molecules":
         return [
             _DensityTargetSpec(
-                species_label="H2O",
+                species_label=label,
                 count_label="molecules",
-                selection_kind="h2o",
+                selection_kind="molecule",
+                apply_min_molecule_frames=True,
+            )
+            for label in MOLECULE_SPECIES_LABELS
+        ]
+    if selection_mode == "molecule":
+        return [
+            _DensityTargetSpec(
+                species_label=species_label,
+                count_label="molecules",
+                selection_kind="molecule",
             )
         ]
     return [
@@ -898,10 +1111,11 @@ def _density_needs_observed_bounds_prepass(
     cell_bounds_by_axis: Mapping[str, tuple[float, float] | None],
     distance_hist_bounds: tuple[float, float] | None,
 ) -> bool:
-    if selected_heatmap_planes:
+    heatmap_axes = {axis for plane in selected_heatmap_planes for axis in plane}
+    if any(cell_bounds_by_axis.get(axis) is None for axis in heatmap_axes):
         return True
     if not include_line_outputs:
-        return True
+        return False
     if normalized_binning != "cell":
         return True
     return not _density_cell_bounds_cover_line_outputs(
@@ -924,12 +1138,88 @@ def _resolve_density_active_targets_without_bounds_prepass(
             if target.species_label in element_species:
                 active_targets.append(target)
             continue
-        if target.selection_kind == "h2o":
-            # Water activity depends on topology detection, so keep the conservative
-            # selection scan for H2O and mixed "all" runs.
+        if target.selection_kind == "molecule":
+            # Molecule activity depends on topology detection, so keep the conservative
+            # selection scan for O/H molecule runs.
             return None
         return None
     return active_targets
+
+
+class _DensityElementSelector:
+    """Select element positions/masses with a stable-symbol fast path."""
+
+    def __init__(
+        self,
+        element_labels: list[str],
+        *,
+        validation_stride: int = H2O_VALIDATION_STRIDE,
+    ) -> None:
+        self.element_labels = tuple(element_labels)
+        self.validation_stride = max(1, int(validation_stride))
+        self._reference_symbols: np.ndarray | None = None
+        self._masks_by_label: dict[str, np.ndarray] = {}
+        self._stable = True
+
+    def select(self, frame: Atoms, *, frame_index: int) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+        positions = np.asarray(frame.positions, dtype=float)
+        masses = np.asarray(frame.get_masses(), dtype=float) * AMU_TO_G
+        symbols = np.asarray(frame.get_chemical_symbols())
+        if self._reference_symbols is None:
+            self._reference_symbols = np.asarray(symbols, dtype=object)
+            self._masks_by_label = {
+                label: np.asarray(symbols == label, dtype=bool)
+                for label in self.element_labels
+            }
+            return self._select_with_masks(positions, masses)
+
+        if self._stable:
+            reference = self._reference_symbols
+            needs_validation = int(frame_index) % self.validation_stride == 0
+            if symbols.shape != reference.shape:
+                self._stable = False
+                LOGGER.info(
+                    "Density element selection detected atom-count changes; using dynamic element grouping."
+                )
+            elif needs_validation and not np.array_equal(symbols, reference):
+                self._stable = False
+                LOGGER.info(
+                    "Density element selection detected atom-order changes; using dynamic element grouping."
+                )
+
+        if self._stable:
+            return self._select_with_masks(positions, masses)
+        return self._select_dynamic(positions, masses, symbols)
+
+    def _select_with_masks(
+        self,
+        positions: np.ndarray,
+        masses: np.ndarray,
+    ) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+        selections: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        for label, mask in self._masks_by_label.items():
+            if np.any(mask):
+                selections[label] = (
+                    np.asarray(positions[mask], dtype=float),
+                    np.asarray(masses[mask], dtype=float),
+                )
+        return selections
+
+    def _select_dynamic(
+        self,
+        positions: np.ndarray,
+        masses: np.ndarray,
+        symbols: np.ndarray,
+    ) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+        selections: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        for label in self.element_labels:
+            mask = symbols == label
+            if np.any(mask):
+                selections[label] = (
+                    np.asarray(positions[mask], dtype=float),
+                    np.asarray(masses[mask], dtype=float),
+                )
+        return selections
 
 
 def _density_observed_bounds_from_cell_bounds(
@@ -937,7 +1227,7 @@ def _density_observed_bounds_from_cell_bounds(
     active_targets: list[_DensityTargetSpec],
     raw_axes: tuple[str, ...],
     cell_bounds_by_axis: Mapping[str, tuple[float, float] | None],
-    distance_hist_bounds: tuple[float, float],
+    distance_hist_bounds: tuple[float, float] | None,
 ) -> dict[str, _DensityObservedBounds]:
     observed_bounds_by_target: dict[str, _DensityObservedBounds] = {}
     for target in active_targets:
@@ -949,8 +1239,9 @@ def _density_observed_bounds_from_cell_bounds(
                 raise ValueError(f"Missing cell bounds for density axis '{axis}'.")
             axis_lower[axis] = float(bounds[0])
             axis_upper[axis] = float(bounds[1])
-        axis_lower["distance"] = float(distance_hist_bounds[0])
-        axis_upper["distance"] = float(distance_hist_bounds[1])
+        if distance_hist_bounds is not None:
+            axis_lower["distance"] = float(distance_hist_bounds[0])
+            axis_upper["distance"] = float(distance_hist_bounds[1])
         observed_bounds_by_target[target.species_label] = _DensityObservedBounds(
             axis_lower=axis_lower,
             axis_upper=axis_upper,
@@ -963,8 +1254,10 @@ def _select_density_targets_in_frame(
     *,
     frame_index: int,
     target_specs: list[_DensityTargetSpec],
-    cached_water_triplets: np.ndarray | None,
-) -> tuple[dict[str, tuple[np.ndarray, np.ndarray]], np.ndarray | None]:
+    topology_cache: OHTopologyCache | None,
+    element_selector: _DensityElementSelector | None = None,
+    wrap_positions_to_cell: bool = False,
+) -> dict[str, tuple[np.ndarray, np.ndarray]]:
     """Return one frame's selected positions/masses for each active density target."""
 
     selections: dict[str, tuple[np.ndarray, np.ndarray]] = {}
@@ -972,18 +1265,12 @@ def _select_density_targets_in_frame(
         target.species_label for target in target_specs if target.selection_kind == "element"
     ]
     if element_labels:
-        positions = np.asarray(frame.positions, dtype=float)
-        masses = np.asarray(frame.get_masses(), dtype=float) * AMU_TO_G
-        symbols = np.asarray(frame.get_chemical_symbols())
-        if len(element_labels) == 1:
-            label = element_labels[0]
-            mask = symbols == label
-            if np.any(mask):
-                selections[label] = (
-                    np.asarray(positions[mask], dtype=float),
-                    np.asarray(masses[mask], dtype=float),
-                )
+        if element_selector is not None:
+            selections.update(element_selector.select(frame, frame_index=frame_index))
         else:
+            positions = np.asarray(frame.positions, dtype=float)
+            masses = np.asarray(frame.get_masses(), dtype=float) * AMU_TO_G
+            symbols = np.asarray(frame.get_chemical_symbols())
             for label in element_labels:
                 mask = symbols == label
                 if np.any(mask):
@@ -991,24 +1278,30 @@ def _select_density_targets_in_frame(
                         np.asarray(positions[mask], dtype=float),
                         np.asarray(masses[mask], dtype=float),
                     )
-    if any(target.selection_kind == "h2o" for target in target_specs):
-        if cached_water_triplets is None:
-            cached_water_triplets = _water_molecule_triplets(frame)
-        elif frame_index % H2O_VALIDATION_STRIDE == 0:
-            validated = _water_molecule_triplets(frame)
-            if not np.array_equal(validated, cached_water_triplets):
-                LOGGER.warning(
-                    "Detected H2O topology change at frame %d; refreshing cached water triplets.",
-                    frame_index,
-                )
-                cached_water_triplets = validated
-        geometry = _water_triplet_geometry(frame, cached_water_triplets)
-        if geometry.com_positions.size > 0:
-            selections["H2O"] = (
-                np.asarray(geometry.com_positions, dtype=float),
-                np.asarray(geometry.molecular_masses_amu * AMU_TO_G, dtype=float),
+        if wrap_positions_to_cell:
+            selections = {
+                label: (_wrap_positions_to_periodic_cell(frame, positions), masses)
+                for label, (positions, masses) in selections.items()
+            }
+    molecule_labels = [
+        target.species_label for target in target_specs if target.selection_kind == "molecule"
+    ]
+    if molecule_labels:
+        active_cache = topology_cache or OHTopologyCache(context="density O/H molecule topology")
+        topology = active_cache.select(frame, frame_index=frame_index)
+        for label in molecule_labels:
+            positions, masses = _molecule_positions_with_masses(
+                frame,
+                topology.indices_for(label),
             )
-    return selections, cached_water_triplets
+            if positions.size > 0:
+                selections[label] = (
+                    _wrap_positions_to_periodic_cell(frame, positions)
+                    if wrap_positions_to_cell
+                    else np.asarray(positions, dtype=float),
+                    np.asarray(masses, dtype=float),
+                )
+    return selections
 
 
 def _resolve_density_line_bin_edges_from_bounds(
@@ -1195,6 +1488,8 @@ def _compute_density_heatmap_profile_from_selected(
     bin_width: float,
     histogram_bounds: tuple[tuple[float, float] | None, tuple[float, float] | None] | None = None,
     aggregate_binning_progress: ProgressBar | None = None,
+    oh_cutoff_A: float | None = None,
+    min_molecule_frames: int | None = None,
 ) -> DensityHeatmapProfile:
     """Build a :class:`DensityHeatmapProfile` from already-selected planar coordinates."""
 
@@ -1329,6 +1624,13 @@ def _compute_density_heatmap_profile_from_selected(
 
     x_bin_centers = 0.5 * (x_bin_edges[:-1] + x_bin_edges[1:])
     y_bin_centers = 0.5 * (y_bin_edges[:-1] + y_bin_edges[1:])
+    visible_x_min_A, visible_x_max_A, visible_y_min_A, visible_y_max_A = (
+        _heatmap_visible_ranges_from_density(
+            x_bin_edges=x_bin_edges,
+            y_bin_edges=y_bin_edges,
+            values=density,
+        )
+    )
     return DensityHeatmapProfile(
         plane=f"{plane_axes[0]}{plane_axes[1]}",
         plane_axes=plane_axes,
@@ -1342,6 +1644,12 @@ def _compute_density_heatmap_profile_from_selected(
         n_frames=n_frames,
         number_density=np.asarray(number_density, dtype=float),
         number_density_units=number_density_units,
+        visible_x_min_A=visible_x_min_A,
+        visible_x_max_A=visible_x_max_A,
+        visible_y_min_A=visible_y_min_A,
+        visible_y_max_A=visible_y_max_A,
+        oh_cutoff_A=oh_cutoff_A,
+        min_molecule_frames=min_molecule_frames,
     )
 
 
@@ -1363,6 +1671,8 @@ def _compute_density_profile_from_selected(
     show_binning_progress: bool = True,
     aggregate_binning_progress: ProgressBar | None = None,
     block_index_by_frame: np.ndarray | None = None,
+    oh_cutoff_A: float | None = None,
+    min_molecule_frames: int | None = None,
 ) -> DensityProfile:
     """Build a :class:`DensityProfile` from already-selected axis values."""
     _validate_selected_density_inputs(
@@ -1560,6 +1870,10 @@ def _compute_density_profile_from_selected(
     density_statistics = _finalize_density_statistics_moments(density_moments)
     number_density_statistics = _finalize_density_statistics_moments(number_density_moments)
 
+    visible_x_min_A, visible_x_max_A = _line_visible_range_from_density(
+        bin_edges=bin_edges,
+        values=density,
+    )
     return DensityProfile(
         axis=axis.lower(),
         species=species_label,
@@ -1580,6 +1894,10 @@ def _compute_density_profile_from_selected(
             "density": density_statistics,
             "number_density": number_density_statistics,
         },
+        visible_x_min_A=visible_x_min_A,
+        visible_x_max_A=visible_x_max_A,
+        oh_cutoff_A=oh_cutoff_A,
+        min_molecule_frames=min_molecule_frames,
     )
 
 
@@ -1629,6 +1947,8 @@ def compute_density_profile(
     binning: str = "observed",
     surface_options: SurfaceEstimatorOptions | None = None,
     precomputed_surface_estimate: SurfaceEstimate | None = None,
+    oh_cutoff: float = H2O_OH_CUTOFF_A,
+    min_molecule_frames: int = DEFAULT_MIN_MOLECULE_FRAMES,
 ) -> DensityProfile:
     """Compute a 1D species mass-density profile along a Cartesian axis.
 
@@ -1659,6 +1979,9 @@ def compute_density_profile(
         raise ValueError("At least one trajectory frame is required.")
 
     ensure_positive("bin_width", bin_width)
+    ensure_positive("oh_cutoff", oh_cutoff)
+    if int(min_molecule_frames) < 1:
+        raise ValueError("min_molecule_frames must be >= 1.")
     normalized_binning = binning.strip().lower()
     if normalized_binning not in {"observed", "cell"}:
         raise ValueError("binning must be one of: observed, cell")
@@ -1699,15 +2022,27 @@ def compute_density_profile(
             surface_position=surface_position,
             surface_position_std=surface_position_std,
         )
-    selection_mode, species_label = _normalize_species_query(species, allow_h2o=True)
-    count_label = "molecules" if selection_mode == "h2o" else "atoms"
+    selection_mode, species_label = _normalize_species_query(
+        species,
+        allow_h2o=True,
+        allow_molecules=True,
+    )
+    if selection_mode in {"elements", "molecules"}:
+        raise ValueError(
+            f"Density selector '{species}' expands to multiple profiles; use compute_density_profiles "
+            "or compute_all_density_profiles."
+        )
+    count_label = "molecules" if selection_mode == "molecule" else "atoms"
     LOGGER.debug("Selection mode: %s (label=%s).", selection_mode, species_label)
 
     selected_per_frame: list[np.ndarray] = []
     selected_masses_per_frame: list[np.ndarray] = []
-    if selection_mode == "h2o":
-        selected_per_frame, selected_masses_per_frame = _select_water_axis_values_per_frame(
-            frames, axis_index
+    if selection_mode == "molecule":
+        selected_per_frame, selected_masses_per_frame = _select_molecule_axis_values_per_frame(
+            frames,
+            axis_index,
+            species_label,
+            oh_cutoff=oh_cutoff,
         )
     else:
         with ProgressBar(
@@ -1740,6 +2075,20 @@ def compute_density_profile(
         labels=[species_label],
     )
     LOGGER.info("Density compute summary: %s.", run_summary)
+    LOGGER.info(
+        "Density selections: %s.",
+        _density_selection_summary(
+            [
+                _DensityTargetSpec(
+                    species_label=species_label,
+                    count_label=count_label,
+                    selection_kind="molecule" if selection_mode == "molecule" else "element",
+                )
+            ]
+        ),
+    )
+    if selection_mode == "molecule":
+        LOGGER.info("O/H molecule cutoff: %.6g A.", float(oh_cutoff))
     histogram_bounds = None
     if normalized_binning == "cell":
         surface_per_frame = (
@@ -1782,6 +2131,8 @@ def compute_density_profile(
         surface_position_std=profile_surface_position_std,
         surface_estimate=surface_estimate,
         histogram_bounds=histogram_bounds,
+        oh_cutoff_A=oh_cutoff if selection_mode == "molecule" else None,
+        min_molecule_frames=min_molecule_frames if selection_mode == "molecule" else None,
     )
 
 
@@ -1796,14 +2147,23 @@ def compute_density_profiles(
     binning: str = "observed",
     surface_options: SurfaceEstimatorOptions | None = None,
     precomputed_surface_estimate: SurfaceEstimate | None = None,
+    oh_cutoff: float = H2O_OH_CUTOFF_A,
+    min_molecule_frames: int = DEFAULT_MIN_MOLECULE_FRAMES,
 ) -> list[DensityProfile]:
     """Compute one or more density profiles based on the species selection policy."""
     ensure_positive("bin_width", bin_width)
+    ensure_positive("oh_cutoff", oh_cutoff)
+    if int(min_molecule_frames) < 1:
+        raise ValueError("min_molecule_frames must be >= 1.")
     normalized_binning = binning.strip().lower()
     if normalized_binning not in {"observed", "cell"}:
         raise ValueError("binning must be one of: observed, cell")
-    selection_mode, _ = _normalize_species_query(species, allow_h2o=True)
-    if selection_mode != "all":
+    selection_mode, _ = _normalize_species_query(
+        species,
+        allow_h2o=True,
+        allow_molecules=True,
+    )
+    if selection_mode not in {"all", "elements", "molecules"}:
         return [
             compute_density_profile(
                 frames=frames,
@@ -1816,6 +2176,8 @@ def compute_density_profiles(
                 binning=normalized_binning,
                 surface_options=surface_options,
                 precomputed_surface_estimate=precomputed_surface_estimate,
+                oh_cutoff=oh_cutoff,
+                min_molecule_frames=min_molecule_frames,
             )
         ]
 
@@ -1857,9 +2219,10 @@ def compute_density_profiles(
             surface_position=surface_position,
             surface_position_std=surface_position_std,
         )
-    element_species = available_element_species(frames)
-    if not element_species:
+    available_elements = available_element_species(frames)
+    if selection_mode in {"all", "elements"} and not available_elements:
         raise ValueError("No elements found in trajectory.")
+    element_species = available_elements if selection_mode in {"all", "elements"} else []
 
     axis_index = axis_to_index(axis)
     selected_by_species: dict[str, list[np.ndarray]] = {element: [] for element in element_species}
@@ -1867,27 +2230,26 @@ def compute_density_profiles(
         element: [] for element in element_species
     }
     empty = np.array([], dtype=float)
-    with ProgressBar(
-        desc="Selecting element data for density", total=len(frames), unit="frame"
-    ) as progress:
-        for frame in frames:
-            symbols = np.asarray(frame.get_chemical_symbols())
-            axis_values = np.asarray(frame.positions[:, axis_index], dtype=float)
-            masses = np.asarray(frame.get_masses(), dtype=float) * AMU_TO_G
-
-            frame_selected: dict[str, np.ndarray] = {}
-            frame_selected_masses: dict[str, np.ndarray] = {}
-            for symbol in np.unique(symbols):
-                mask = symbols == symbol
-                frame_selected[str(symbol)] = axis_values[mask]
-                frame_selected_masses[str(symbol)] = masses[mask]
-
-            for element in element_species:
-                selected_by_species[element].append(frame_selected.get(element, empty))
-                selected_masses_by_species[element].append(
-                    frame_selected_masses.get(element, empty)
-                )
-            progress.update()
+    if element_species:
+        element_selector = _DensityElementSelector(element_species)
+        with ProgressBar(
+            desc="Selecting element data for density", total=len(frames), unit="frame"
+        ) as progress:
+            for frame_index, frame in enumerate(frames):
+                frame_selected = element_selector.select(frame, frame_index=frame_index)
+                for element in element_species:
+                    selected_values, selected_masses = frame_selected.get(
+                        element,
+                        (empty, empty),
+                    )
+                    axis_selected = (
+                        np.asarray(selected_values[:, axis_index], dtype=float)
+                        if np.asarray(selected_values).size > 0
+                        else empty
+                    )
+                    selected_by_species[element].append(axis_selected)
+                    selected_masses_by_species[element].append(selected_masses)
+                progress.update()
 
     profiles: list[DensityProfile] = []
     trusted_surface_estimate = (
@@ -1899,13 +2261,6 @@ def compute_density_profiles(
         None if trusted_surface_estimate is None else trusted_surface_estimate.per_frame
     )
     coordinate_mode_global = "distance" if trusted_surface_estimate is not None else "axis"
-    _density_mode, run_summary = _summarize_density_run(
-        frames=frames,
-        axis_index=axis_index,
-        coordinate_mode=coordinate_mode_global,
-        labels=[*element_species, "H2O"],
-    )
-    LOGGER.info("Density compute summary: %s.", run_summary)
     histogram_bounds = None
     if normalized_binning == "cell":
         histogram_bounds = _cell_histogram_bounds(
@@ -1920,14 +2275,70 @@ def compute_density_profiles(
                 "cell was unavailable. Falling back to observed-data binning.",
                 axis.lower(),
             )
-    water_selected_per_frame: list[np.ndarray] = []
-    water_masses_per_frame: list[np.ndarray] = []
-    water_selected_per_frame, water_masses_per_frame = _select_water_axis_values_per_frame(
-        frames, axis_index
-    )
+    molecule_selections: dict[str, tuple[list[np.ndarray], list[np.ndarray]]] = {}
+    if selection_mode in {"all", "molecules"}:
+        molecule_selection_candidates = _select_molecule_axis_values_for_labels_per_frame(
+            frames,
+            axis_index,
+            MOLECULE_SPECIES_LABELS,
+            oh_cutoff=oh_cutoff,
+            progress_desc="Selecting O/H molecules for density",
+        )
+        for molecule_label, (
+            selected_values,
+            selected_masses,
+        ) in molecule_selection_candidates.items():
+            active_frame_count = sum(1 for values in selected_values if values.size > 0)
+            if _molecule_target_is_active(
+                species_label=molecule_label,
+                active_frame_count=active_frame_count,
+                apply_min_molecule_frames=True,
+                min_molecule_frames=min_molecule_frames,
+            ):
+                molecule_selections[molecule_label] = (selected_values, selected_masses)
     total_binning_jobs = len(element_species)
-    if any(values.size > 0 for values in water_selected_per_frame):
-        total_binning_jobs += 1
+    total_binning_jobs += len(molecule_selections)
+    if total_binning_jobs == 0:
+        raise ValueError("No entities found for the requested density selection.")
+    active_targets_for_log = [
+        *(
+            _DensityTargetSpec(
+                species_label=element,
+                count_label="atoms",
+                selection_kind="element",
+            )
+            for element in element_species
+        ),
+        *(
+            _DensityTargetSpec(
+                species_label=molecule_label,
+                count_label="molecules",
+                selection_kind="molecule",
+                apply_min_molecule_frames=True,
+            )
+            for molecule_label in molecule_selections
+        ),
+    ]
+    LOGGER.info("Density selections: %s.", _density_selection_summary(active_targets_for_log))
+    if molecule_selections:
+        LOGGER.info("O/H molecule cutoff: %.6g A.", float(oh_cutoff))
+        non_water_molecules = [
+            _density_species_display_label(label)
+            for label in molecule_selections
+            if label != "mol:H2O"
+        ]
+        if non_water_molecules:
+            LOGGER.info(
+                "Detected O/H molecule species: %s.",
+                ",".join(non_water_molecules),
+            )
+    _density_mode, run_summary = _summarize_density_run(
+        frames=frames,
+        axis_index=axis_index,
+        coordinate_mode=coordinate_mode_global,
+        labels=[*element_species, *molecule_selections],
+    )
+    LOGGER.info("Density compute summary: %s.", run_summary)
     LOGGER.info("Binning %d density profiles.", total_binning_jobs)
     with ProgressBar(
         desc="Binning density profiles", total=total_binning_jobs, unit="profile"
@@ -1956,12 +2367,17 @@ def compute_density_profiles(
                     histogram_bounds=histogram_bounds,
                     show_binning_progress=False,
                     aggregate_binning_progress=progress,
+                    oh_cutoff_A=None,
+                    min_molecule_frames=None,
                 )
             )
 
-        if any(values.size > 0 for values in water_selected_per_frame):
+        for molecule_label, (
+            molecule_selected_per_frame,
+            molecule_masses_per_frame,
+        ) in molecule_selections.items():
             selected_for_binning, coordinate_mode = _shift_axis_values_by_surface_per_frame(
-                water_selected_per_frame,
+                molecule_selected_per_frame,
                 per_frame_surface,
             )
             profile_surface_position = surface_position
@@ -1970,10 +2386,10 @@ def compute_density_profiles(
                 _compute_density_profile_from_selected(
                     frames=frames,
                     selected_per_frame=selected_for_binning,
-                    selected_masses_per_frame=water_masses_per_frame,
+                    selected_masses_per_frame=molecule_masses_per_frame,
                     axis=axis,
                     axis_index=axis_index,
-                    species_label="H2O",
+                    species_label=molecule_label,
                     count_label="molecules",
                     bin_width=bin_width,
                     coordinate_mode=coordinate_mode,
@@ -1983,6 +2399,8 @@ def compute_density_profiles(
                     histogram_bounds=histogram_bounds,
                     show_binning_progress=False,
                     aggregate_binning_progress=progress,
+                    oh_cutoff_A=oh_cutoff,
+                    min_molecule_frames=min_molecule_frames,
                 )
             )
     return profiles
@@ -2002,10 +2420,15 @@ def _compute_all_density_profiles_streaming(
     precomputed_surface_estimate: SurfaceEstimate | None,
     outputs: str | None,
     heatmap_planes: list[str] | tuple[str, ...] | None,
+    oh_cutoff: float = H2O_OH_CUTOFF_A,
+    min_molecule_frames: int = DEFAULT_MIN_MOLECULE_FRAMES,
 ) -> list[DensityProfile | DensityHeatmapProfile]:
     """Shared streaming density engine for raw-axis, distance, and heatmap outputs."""
 
     ensure_positive("bin_width", bin_width)
+    ensure_positive("oh_cutoff", oh_cutoff)
+    if int(min_molecule_frames) < 1:
+        raise ValueError("min_molecule_frames must be >= 1.")
     normalized_binning = binning.strip().lower()
     if normalized_binning not in {"observed", "cell"}:
         raise ValueError("binning must be one of: observed, cell")
@@ -2071,13 +2494,6 @@ def _compute_all_density_profiles_streaming(
     distance_coordinate_mode = "distance" if per_frame_surface is not None else "axis"
 
     target_specs = _resolve_density_target_specs(frames, species=species)
-    _density_mode, run_summary = _summarize_density_run(
-        frames=frames,
-        axis_index=surface_axis_index,
-        coordinate_mode=distance_coordinate_mode,
-        labels=[target.species_label for target in target_specs],
-    )
-    LOGGER.info("Density compute summary: %s.", run_summary)
 
     line_jobs_per_species = 4 if include_line_outputs else 0
     heatmap_jobs_per_species = len(selected_heatmap_planes)
@@ -2087,7 +2503,7 @@ def _compute_all_density_profiles_streaming(
     n_blocks = None if block_index_by_frame is None else int(np.max(block_index_by_frame)) + 1
 
     cell_bounds_by_axis: dict[str, tuple[float, float] | None] = {}
-    if include_line_outputs and normalized_binning == "cell":
+    if normalized_binning == "cell" and (include_line_outputs or include_heatmap_outputs):
         for ax in raw_axes:
             cell_bounds_by_axis[ax] = _cell_histogram_bounds(
                 frames=frames,
@@ -2146,7 +2562,7 @@ def _compute_all_density_profiles_streaming(
         else _resolve_density_active_targets_without_bounds_prepass(frames, target_specs)
     )
     if active_targets_without_prepass is not None:
-        if distance_hist_bounds is None:
+        if include_line_outputs and distance_hist_bounds is None:
             raise ValueError("Missing distance cell bounds for density bin preparation.")
         active_targets = active_targets_without_prepass
         observed_bounds_by_target = _density_observed_bounds_from_cell_bounds(
@@ -2163,14 +2579,26 @@ def _compute_all_density_profiles_streaming(
             target.species_label: _DensityObservedBounds(axis_lower={}, axis_upper={})
             for target in target_specs
         }
-        prepass_water_triplets: np.ndarray | None = None
+        run_topology_cache = OHTopologyCache(
+            oh_cutoff=oh_cutoff,
+            context="density O/H molecule topology",
+        )
+        element_selector = _DensityElementSelector(
+            [
+                target.species_label
+                for target in target_specs
+                if target.selection_kind == "element"
+            ]
+        )
         with ProgressBar(desc="Preparing density bins", total=len(frames), unit="frame") as progress:
             for frame_index, frame in enumerate(frames):
-                frame_selections, prepass_water_triplets = _select_density_targets_in_frame(
+                frame_selections = _select_density_targets_in_frame(
                     frame,
                     frame_index=frame_index,
                     target_specs=target_specs,
-                    cached_water_triplets=prepass_water_triplets,
+                    topology_cache=run_topology_cache,
+                    element_selector=element_selector,
+                    wrap_positions_to_cell=normalized_binning == "cell",
                 )
                 for target in target_specs:
                     selection = frame_selections.get(target.species_label)
@@ -2178,6 +2606,7 @@ def _compute_all_density_profiles_streaming(
                         continue
                     positions, _masses = selection
                     bounds = observed_bounds_by_target[target.species_label]
+                    bounds.mark_frame_active()
                     for ax in raw_axes:
                         bounds.update_axis(ax, positions[:, axis_indices[ax]])
                     distance_values = (
@@ -2189,20 +2618,53 @@ def _compute_all_density_profiles_streaming(
                     bounds.update_axis("distance", distance_values)
                 progress.update()
 
-        active_targets = [
-            target
-            for target in target_specs
-            if observed_bounds_by_target[target.species_label].has_axis_data(surface_axis)
-        ]
+        active_targets = []
+        for target in target_specs:
+            bounds = observed_bounds_by_target[target.species_label]
+            if not bounds.has_axis_data(surface_axis):
+                continue
+            if target.selection_kind == "molecule" and not _molecule_target_is_active(
+                species_label=target.species_label,
+                active_frame_count=bounds.active_frame_count,
+                apply_min_molecule_frames=target.apply_min_molecule_frames,
+                min_molecule_frames=min_molecule_frames,
+            ):
+                continue
+            active_targets.append(target)
+    if "run_topology_cache" not in locals():
+        run_topology_cache = OHTopologyCache(
+            oh_cutoff=oh_cutoff,
+            context="density O/H molecule topology",
+        )
     if not active_targets:
         raise ValueError("No entities found for the requested density selection.")
 
     active_element_count = sum(1 for target in active_targets if target.selection_kind == "element")
-    water_active = any(target.selection_kind == "h2o" for target in active_targets)
+    molecule_active_count = sum(1 for target in active_targets if target.selection_kind == "molecule")
+    _density_mode, run_summary = _summarize_density_run(
+        frames=frames,
+        axis_index=surface_axis_index,
+        coordinate_mode=distance_coordinate_mode,
+        labels=[target.species_label for target in active_targets],
+    )
+    LOGGER.info("Density compute summary: %s.", run_summary)
+    LOGGER.info("Density selections: %s.", _density_selection_summary(active_targets))
+    if molecule_active_count:
+        LOGGER.info("O/H molecule cutoff: %.6g A.", float(oh_cutoff))
+        non_water_molecules = [
+            _density_species_display_label(target.species_label)
+            for target in active_targets
+            if target.selection_kind == "molecule" and target.species_label != "mol:H2O"
+        ]
+        if non_water_molecules:
+            LOGGER.info(
+                "Detected O/H molecule species: %s.",
+                ",".join(non_water_molecules),
+            )
     LOGGER.info(
-        "Single-pass selection complete: %d element species + %s water, %d frames.",
+        "Single-pass selection complete: %d element species + %d O/H molecule selections, %d frames.",
         active_element_count,
-        "with" if water_active else "no",
+        molecule_active_count,
         len(frames),
     )
     LOGGER.info(
@@ -2260,6 +2722,12 @@ def _compute_all_density_profiles_streaming(
                                 n_bins=bin_edges.size - 1,
                                 n_blocks=n_blocks,
                             ),
+                            oh_cutoff_A=oh_cutoff if target.selection_kind == "molecule" else None,
+                            min_molecule_frames=(
+                                min_molecule_frames
+                                if target.selection_kind == "molecule"
+                                else None
+                            ),
                         ),
                     )
                 )
@@ -2299,6 +2767,12 @@ def _compute_all_density_profiles_streaming(
                         surface_position=surface_position,
                         surface_position_std=surface_position_std,
                         surface_estimate=surface_estimate,
+                        oh_cutoff_A=oh_cutoff if target.selection_kind == "molecule" else None,
+                        min_molecule_frames=(
+                            min_molecule_frames
+                            if target.selection_kind == "molecule"
+                            else None
+                        ),
                     ),
                 )
             )
@@ -2311,7 +2785,14 @@ def _compute_all_density_profiles_streaming(
                 plane_axes=plane_axes,
                 species_label=species_lbl,
                 bin_width=bin_width,
-                histogram_bounds=None,
+                histogram_bounds=(
+                    (
+                        cell_bounds_by_axis.get(plane_axes[0]),
+                        cell_bounds_by_axis.get(plane_axes[1]),
+                    )
+                    if normalized_binning == "cell"
+                    else None
+                ),
             )
             orthogonal_axis = next(axis for axis in raw_axes if axis not in plane_axes)
             target_heatmap_accumulators.append(
@@ -2325,20 +2806,34 @@ def _compute_all_density_profiles_streaming(
                         y_bin_edges=y_bin_edges,
                         bin_width=bin_width,
                         normalization_cache=heatmap_normalization_by_plane[plane_axes],
+                        oh_cutoff_A=oh_cutoff if target.selection_kind == "molecule" else None,
+                        min_molecule_frames=(
+                            min_molecule_frames
+                            if target.selection_kind == "molecule"
+                            else None
+                        ),
                     ),
                 )
             )
         heatmap_accumulators_by_target[species_lbl] = target_heatmap_accumulators
 
     profiles: list[DensityProfile | DensityHeatmapProfile] = []
-    accumulation_water_triplets: np.ndarray | None = None
+    accumulation_element_selector = _DensityElementSelector(
+        [
+            target.species_label
+            for target in active_targets
+            if target.selection_kind == "element"
+        ]
+    )
     with ProgressBar(desc="Binning density frames", total=len(frames), unit="frame") as progress:
         for frame_index, frame in enumerate(frames):
-            frame_selections, accumulation_water_triplets = _select_density_targets_in_frame(
+            frame_selections = _select_density_targets_in_frame(
                 frame,
                 frame_index=frame_index,
                 target_specs=active_targets,
-                cached_water_triplets=accumulation_water_triplets,
+                topology_cache=run_topology_cache,
+                element_selector=accumulation_element_selector,
+                wrap_positions_to_cell=normalized_binning == "cell",
             )
             for target in active_targets:
                 selection = frame_selections.get(target.species_label)
@@ -2402,6 +2897,8 @@ def compute_all_density_profiles(
     precomputed_surface_estimate: SurfaceEstimate | None = None,
     outputs: str | None = "line",
     heatmap_planes: list[str] | tuple[str, ...] | None = None,
+    oh_cutoff: float = H2O_OH_CUTOFF_A,
+    min_molecule_frames: int = DEFAULT_MIN_MOLECULE_FRAMES,
 ) -> list[DensityProfile | DensityHeatmapProfile]:
     return _compute_all_density_profiles_streaming(
         frames=frames,
@@ -2416,11 +2913,18 @@ def compute_all_density_profiles(
         precomputed_surface_estimate=precomputed_surface_estimate,
         outputs=outputs,
         heatmap_planes=heatmap_planes,
+        oh_cutoff=oh_cutoff,
+        min_molecule_frames=min_molecule_frames,
     )
 
 
 def _density_profile_hdf5_payload(profile: DensityProfile) -> dict[str, Any]:
     """Return validated HDF5 datasets/metadata payload for one density profile."""
+    _profile_selection_mode, profile_species_label = _normalize_species_query(
+        profile.species,
+        allow_h2o=True,
+        allow_molecules=True,
+    )
     bin_edges = np.asarray(profile.bin_edges, dtype=float)
     bin_centers = np.asarray(profile.bin_centers, dtype=float)
     if bin_edges.size != bin_centers.size + 1:
@@ -2454,13 +2958,19 @@ def _density_profile_hdf5_payload(profile: DensityProfile) -> dict[str, Any]:
     metadata_payload = {
         "profile_kind": "line_1d",
         "axis": profile.axis,
-        "species": profile.species,
+        "species": profile_species_label,
+        "selection_kind": "molecule" if is_molecule_species_label(profile_species_label) else "element",
+        "entity_kind": "molecule" if is_molecule_species_label(profile_species_label) else "atom",
         "units": canonical_density_units,
         "n_frames": profile.n_frames,
         "number_density_units": canonical_number_units,
         "coordinate_mode": profile.coordinate_mode,
         "bin_width_A": bin_width,
         "counts_per_frame_available": False,
+        "visible_x_min_A": profile.visible_x_min_A,
+        "visible_x_max_A": profile.visible_x_max_A,
+        "oh_cutoff_A": profile.oh_cutoff_A,
+        "min_molecule_frames": profile.min_molecule_frames,
         **_surface_metadata_payload(
             surface_position=profile.surface_position,
             surface_position_std=profile.surface_position_std,
@@ -2494,6 +3004,11 @@ def _density_profile_hdf5_payload(profile: DensityProfile) -> dict[str, Any]:
 
 def _density_heatmap_profile_hdf5_payload(profile: DensityHeatmapProfile) -> dict[str, Any]:
     """Return validated HDF5 datasets/metadata payload for one density heatmap profile."""
+    _profile_selection_mode, profile_species_label = _normalize_species_query(
+        profile.species,
+        allow_h2o=True,
+        allow_molecules=True,
+    )
 
     canonical_density, canonical_density_units, canonical_number_density, canonical_number_units = (
         canonicalize_density_units(
@@ -2519,10 +3034,18 @@ def _density_heatmap_profile_hdf5_payload(profile: DensityHeatmapProfile) -> dic
             "profile_kind": "heatmap_2d",
             "plane": profile.plane,
             "plane_axes": list(profile.plane_axes),
-            "species": profile.species,
+            "species": profile_species_label,
+            "selection_kind": "molecule" if is_molecule_species_label(profile_species_label) else "element",
+            "entity_kind": "molecule" if is_molecule_species_label(profile_species_label) else "atom",
             "n_frames": profile.n_frames,
             "units": canonical_density_units,
             "number_density_units": canonical_number_units,
+            "visible_x_min_A": profile.visible_x_min_A,
+            "visible_x_max_A": profile.visible_x_max_A,
+            "visible_y_min_A": profile.visible_y_min_A,
+            "visible_y_max_A": profile.visible_y_max_A,
+            "oh_cutoff_A": profile.oh_cutoff_A,
+            "min_molecule_frames": profile.min_molecule_frames,
             "x_bin_width_A": uniform_bin_width_from_edges(
                 np.asarray(profile.x_bin_edges, dtype=float),
                 source_label=f"Density heatmap '{profile.species}' x-axis",
@@ -2659,6 +3182,7 @@ def _density_payload_matches_selection(
         selection_mode, requested_label = _normalize_species_query(
             requested_species,
             allow_h2o=True,
+            allow_molecules=True,
         )
         if selection_mode != "all":
             metadata_species = str(metadata.get("species", "")).strip()
@@ -2667,11 +3191,35 @@ def _density_payload_matches_selection(
             metadata_mode, metadata_label = _normalize_species_query(
                 metadata_species,
                 allow_h2o=True,
+                allow_molecules=True,
             )
+            if selection_mode == "elements":
+                if metadata_mode != "element":
+                    return False
+                return True
+            if selection_mode == "molecules":
+                if metadata_mode != "molecule":
+                    return False
+                return True
             if metadata_mode != selection_mode or metadata_label != requested_label:
                 return False
 
     return True
+
+
+def _optional_float_metadata(metadata: Mapping[str, Any], name: str) -> float | None:
+    raw_value = metadata.get(name)
+    if raw_value is None:
+        return None
+    value = float(raw_value)
+    return value if np.isfinite(value) else None
+
+
+def _optional_int_metadata(metadata: Mapping[str, Any], name: str) -> int | None:
+    raw_value = metadata.get(name)
+    if raw_value is None:
+        return None
+    return int(raw_value)
 
 
 def _load_density_profiles_from_payloads(
@@ -2707,9 +3255,17 @@ def _load_density_profiles_from_payloads(
 
         species_meta = str(metadata.get("species", "")).strip()
         if species is not None and species.strip():
-            _selection_mode, species_label = _normalize_species_query(species, allow_h2o=True)
+            _selection_mode, species_label = _normalize_species_query(
+                species,
+                allow_h2o=True,
+                allow_molecules=True,
+            )
         elif species_meta:
-            species_label = species_meta
+            _metadata_mode, species_label = _normalize_species_query(
+                species_meta,
+                allow_h2o=True,
+                allow_molecules=True,
+            )
         else:
             species_label = "UNKNOWN"
 
@@ -2805,6 +3361,10 @@ def _load_density_profiles_from_payloads(
                 surface_position_std=surface_position_std,
                 surface_estimate=surface_estimate,
                 series_statistics=series_statistics,
+                visible_x_min_A=_optional_float_metadata(metadata, "visible_x_min_A"),
+                visible_x_max_A=_optional_float_metadata(metadata, "visible_x_max_A"),
+                oh_cutoff_A=_optional_float_metadata(metadata, "oh_cutoff_A"),
+                min_molecule_frames=_optional_int_metadata(metadata, "min_molecule_frames"),
             )
         )
     return profiles
@@ -2874,11 +3434,21 @@ def _load_density_heatmap_profiles_from_payloads(
             raise ValueError(f"Density HDF5 '{source_path}' has incompatible heatmap bin geometry.")
         x_bin_edges = reconstruct_uniform_bin_edges_from_centers(x_bin_centers, bin_width=x_bin_width)
         y_bin_edges = reconstruct_uniform_bin_edges_from_centers(y_bin_centers, bin_width=y_bin_width)
+        species_meta = str(metadata.get("species", "")).strip() or "UNKNOWN"
+        if species_meta != "UNKNOWN":
+            _metadata_mode, species_label = _normalize_species_query(
+                species_meta,
+                allow_h2o=True,
+                allow_molecules=True,
+            )
+        else:
+            species_label = species_meta
+
         profiles.append(
             DensityHeatmapProfile(
                 plane=plane_token,
                 plane_axes=plane_axes,
-                species=str(metadata.get("species", "")).strip() or "UNKNOWN",
+                species=species_label,
                 x_bin_edges=x_bin_edges,
                 y_bin_edges=y_bin_edges,
                 x_bin_centers=x_bin_centers,
@@ -2888,6 +3458,12 @@ def _load_density_heatmap_profiles_from_payloads(
                 n_frames=int(metadata.get("n_frames", 0)),
                 number_density=number_density_values,
                 number_density_units=number_density_units,
+                visible_x_min_A=_optional_float_metadata(metadata, "visible_x_min_A"),
+                visible_x_max_A=_optional_float_metadata(metadata, "visible_x_max_A"),
+                visible_y_min_A=_optional_float_metadata(metadata, "visible_y_min_A"),
+                visible_y_max_A=_optional_float_metadata(metadata, "visible_y_max_A"),
+                oh_cutoff_A=_optional_float_metadata(metadata, "oh_cutoff_A"),
+                min_molecule_frames=_optional_int_metadata(metadata, "min_molecule_frames"),
             )
         )
     return profiles
@@ -3249,6 +3825,59 @@ def _density_auto_plot_limits(
     return auto_x, auto_y
 
 
+def _density_profile_visible_x_limits(
+    profile: DensityProfile,
+    *,
+    x_mode: str,
+) -> list[float] | None:
+    lower = profile.visible_x_min_A
+    upper = profile.visible_x_max_A
+    if lower is None or upper is None:
+        return None
+    if not (np.isfinite(float(lower)) and np.isfinite(float(upper))):
+        return None
+    normalized_x_mode = str(x_mode).strip().lower() or "distance"
+    lower_value = float(lower)
+    upper_value = float(upper)
+    if normalized_x_mode in {"axis", "x", "y", "z"}:
+        if (
+            profile.coordinate_mode == "distance"
+            and profile.surface_position is not None
+            and np.isfinite(float(profile.surface_position))
+        ):
+            lower_value += float(profile.surface_position)
+            upper_value += float(profile.surface_position)
+    elif normalized_x_mode == "distance":
+        if (
+            profile.coordinate_mode != "distance"
+            and profile.surface_position is not None
+            and np.isfinite(float(profile.surface_position))
+        ):
+            lower_value -= float(profile.surface_position)
+            upper_value -= float(profile.surface_position)
+    else:
+        return None
+    return _expand_linear_limits(lower_value, upper_value)
+
+
+def _density_profiles_visible_x_limits(
+    profiles: list[DensityProfile],
+    *,
+    x_mode: str,
+) -> list[float] | None:
+    ranges = [
+        value
+        for profile in profiles
+        if (value := _density_profile_visible_x_limits(profile, x_mode=x_mode)) is not None
+    ]
+    if not ranges:
+        return None
+    return _expand_linear_limits(
+        min(float(value[0]) for value in ranges),
+        max(float(value[1]) for value in ranges),
+    )
+
+
 def _prepared_density_auto_limit_series(
     *,
     x_series: list[np.ndarray],
@@ -3395,9 +4024,22 @@ def plot_density_profile(
             raise ValueError("Density heatmap rendering requires a 2D density heatmap profile.")
         z_values, units, z_label_prefix = _density_heatmap_z_data(profile, quantity=runtime_quantity)
         units = _format_plot_density_units(units)
-        default_title = f"{profile.species} density heatmap ({profile.plane.upper()})"
+        display_species = _density_species_display_label(profile.species)
+        default_title = f"{display_species} density heatmap ({profile.plane.upper()})"
         default_x_label = f"{profile.plane_axes[0].upper()} (A)"
         default_y_label = f"{profile.plane_axes[1].upper()} (A)"
+        resolved_heatmap_x_lim = x_lim
+        resolved_heatmap_y_lim = y_lim
+        if x_lim is None and profile.visible_x_min_A is not None and profile.visible_x_max_A is not None:
+            resolved_heatmap_x_lim = _expand_linear_limits(
+                float(profile.visible_x_min_A),
+                float(profile.visible_x_max_A),
+            )
+        if y_lim is None and profile.visible_y_min_A is not None and profile.visible_y_max_A is not None:
+            resolved_heatmap_y_lim = _expand_linear_limits(
+                float(profile.visible_y_min_A),
+                float(profile.visible_y_max_A),
+            )
         return plot_heatmap_series(
             np.asarray(profile.x_bin_edges, dtype=float),
             np.asarray(profile.y_bin_edges, dtype=float),
@@ -3410,8 +4052,8 @@ def plot_density_profile(
             show_blocking=show_blocking,
             preferred_backend=preferred_backend,
             style=style,
-            x_lim=x_lim,
-            y_lim=y_lim,
+            x_lim=resolved_heatmap_x_lim,
+            y_lim=resolved_heatmap_y_lim,
             x_ticks=x_ticks,
             y_ticks=y_ticks,
             x_tick_rotation=x_tick_rotation,
@@ -3462,8 +4104,9 @@ def plot_density_profile(
     density_values, units, y_label_prefix = _density_y_data(profile, quantity=runtime_quantity)
     units = _format_plot_density_units(units)
     resolved_line_label = line_label
+    display_species = _density_species_display_label(profile.species)
     if resolved_line_label is None and legend:
-        resolved_line_label = profile.species
+        resolved_line_label = display_species
     single_series = resolve_single_series_options(
         line_colors=line_colors,
         series_enabled=series_enabled,
@@ -3479,7 +4122,7 @@ def plot_density_profile(
         auto_x_series, auto_y_series = _prepared_density_auto_limit_series(
             x_series=[x_values],
             y_series=[density_values],
-            labels=[resolved_line_label or profile.species or "Series"],
+            labels=[resolved_line_label or display_species or "Series"],
             series_enabled=[single_series.line_visible],
             x_bin_width=x_bin_width,
             x_bin_reducer=x_bin_reducer,
@@ -3506,6 +4149,13 @@ def plot_density_profile(
             x_scale=x_scale,
             y_scale=y_scale,
         )
+        if x_lim is None:
+            stored_x_lim = _density_profile_visible_x_limits(
+                profile,
+                x_mode=runtime_x_mode,
+            )
+            if stored_x_lim is not None:
+                auto_x_lim = stored_x_lim
         resolved_x_lim = _merge_plot_limits(x_lim, auto_x_lim)
         resolved_y_lim = _merge_plot_limits(y_lim, auto_y_lim)
     stats_key = "number_density" if runtime_quantity.strip().lower() == "number" else "density"
@@ -3513,7 +4163,7 @@ def plot_density_profile(
     return plot_line_series(
         x_values,
         density_values,
-        title=title or f"{profile.species} density profile",
+        title=title or f"{display_species} density profile",
         x_label=resolve_explicit_plot_text(x_label, default_x_label),
         y_label=resolve_explicit_plot_text(y_label, f"{y_label_prefix} ({units})"),
         output=output,
@@ -3728,7 +4378,7 @@ def plot_density_profiles(
             heatmap_colorbar_shrink=heatmap_colorbar_shrink,
             heatmap_colorbar_aspect=heatmap_colorbar_aspect,
         )
-    default_labels = [profile.species for profile in profiles]
+    default_labels = [_density_species_display_label(profile.species) for profile in profiles]
     labels = resolve_series_labels(
         default_labels,
         series_labels,
@@ -3895,6 +4545,13 @@ def plot_density_profiles(
             x_scale=x_scale,
             y_scale=y_scale,
         )
+        if x_lim is None:
+            stored_x_lim = _density_profiles_visible_x_limits(
+                [profile for profile in profiles if isinstance(profile, DensityProfile)],
+                x_mode=runtime_x_mode,
+            )
+            if stored_x_lim is not None:
+                auto_x_lim = stored_x_lim
         resolved_x_lim = _merge_plot_limits(x_lim, auto_x_lim)
         resolved_y_lim = _merge_plot_limits(y_lim, auto_y_lim)
     stats_key = "number_density" if runtime_quantity.strip().lower() == "number" else "density"
@@ -3903,7 +4560,7 @@ def plot_density_profiles(
         x_series,
         y_series,
         labels,
-        title=title or "Element-resolved density profile",
+        title=title or "Density profile",
         x_label=resolve_explicit_plot_text(x_label, default_x_label),
         y_label=resolve_explicit_plot_text(y_label, f"{y_label_prefix} ({display_units})"),
         output=output,

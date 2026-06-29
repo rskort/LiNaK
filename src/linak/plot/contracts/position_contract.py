@@ -23,7 +23,10 @@ def _position_contract(
     coordinate_mode: str,
     frame_length: int | None,
     atom_length: int | None,
+    entity_kind: str = "atom",
 ) -> PlotDataContract:
+    normalized_entity_kind = str(entity_kind or "atom").strip().lower()
+    entity_label = "Molecule" if normalized_entity_kind == "molecule" else "Atom"
     dimensions = (
         PlotDimension(
             id="frame",
@@ -34,7 +37,7 @@ def _position_contract(
         ),
         PlotDimension(
             id="atom",
-            label="Atom",
+            label=entity_label,
             kind="entity_index",
             length=None if atom_length is None else int(atom_length),
             unit="index",
@@ -76,7 +79,7 @@ def _position_contract(
         ),
         PlotQuantity(
             id="atom_index",
-            label="Atom index",
+            label=f"{entity_label} index",
             kind="entity_index",
             dimensions=("atom",),
             unit="index",
@@ -161,6 +164,7 @@ def default_position_plot_data_contract() -> PlotDataContract:
         coordinate_mode="distance",
         frame_length=None,
         atom_length=None,
+        entity_kind="atom",
     )
 
 
@@ -175,4 +179,5 @@ def position_profile_to_plot_data_contract(profile: PositionProfile) -> PlotData
         coordinate_mode=str(profile.coordinate_mode),
         frame_length=int(profile.n_frames),
         atom_length=int(profile.n_atoms),
+        entity_kind=str(getattr(profile, "entity_kind", "atom")),
     )

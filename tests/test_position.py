@@ -13,9 +13,11 @@ from linak.analysis.position import (
     compute_position_profile,
     compute_position_profiles,
     load_position_profile,
+    load_position_profiles,
     plot_position_profile,
     plot_position_profiles,
     save_position_profile,
+    save_position_profiles,
 )
 from linak.plot.contracts.position_contract import position_profile_to_plot_data_contract
 from linak.plot.mappings.position_mapping import position_mapping_preset
@@ -135,10 +137,218 @@ def test_compute_position_profiles_all_is_element_resolved():
         axis="z",
         timestep_fs=1.0,
         surface_mode="auto",
+        min_molecule_frames=1,
     )
 
-    assert [profile.species for profile in profiles] == ["H", "O"]
-    assert [profile.n_atoms for profile in profiles] == [1, 1]
+    assert [profile.species for profile in profiles] == ["H", "O", "mol:OH"]
+    assert [profile.n_atoms for profile in profiles] == [1, 1, 1]
+    assert profiles[-1].entity_kind == "molecule"
+
+
+def test_compute_position_profiles_elements_and_molecules_group_selectors():
+    frames = [
+        Atoms(
+            ["O", "H", "O"],
+            positions=[[0.0, 0.0, 0.0], [0.9, 0.0, 0.0], [4.0, 0.0, 0.0]],
+            cell=[10.0, 10.0, 10.0],
+            pbc=True,
+        )
+        for _ in range(3)
+    ]
+
+    element_profiles = compute_position_profiles(frames, species="elements", surface_mode="none")
+    molecule_profiles = compute_position_profiles(
+        frames,
+        species="molecules",
+        surface_mode="none",
+    )
+    all_profiles = compute_position_profiles(frames, species="all", surface_mode="none")
+
+    assert [profile.species for profile in element_profiles] == ["H", "O"]
+    assert [profile.species for profile in molecule_profiles] == ["mol:O", "mol:OH"]
+    assert [profile.species for profile in all_profiles] == ["H", "O", "mol:O", "mol:OH"]
+
+
+@pytest.mark.parametrize("selector", ["OH", "HO", "mol:OH", "mol:HO"])
+def test_compute_position_profile_accepts_oh_aliases(selector):
+    frame = Atoms(
+        ["O", "H"],
+        positions=[[0.0, 0.0, 0.0], [0.9, 0.0, 0.0]],
+        cell=[10.0, 10.0, 10.0],
+        pbc=True,
+    )
+
+    profile = compute_position_profile([frame], species=selector, surface_mode="none")
+
+    assert profile.species == "mol:OH"
+    assert profile.entity_kind == "molecule"
+    np.testing.assert_array_equal(profile.entity_counts_per_frame, np.array([1]))
+
+
+def test_compute_position_profiles_molecule_threshold_omits_transient_group_events():
+    h2o = Atoms(
+        ["O", "H", "H"],
+        positions=[[0.0, 0.0, 0.0], [0.9, 0.0, 0.0], [-0.9, 0.0, 0.0]],
+        cell=[10.0, 10.0, 10.0],
+        pbc=True,
+    )
+    h3o = Atoms(
+        ["O", "H", "H", "H"],
+        positions=[[0.0, 0.0, 0.0], [0.9, 0.0, 0.0], [-0.9, 0.0, 0.0], [0.0, 0.9, 0.0]],
+        cell=[10.0, 10.0, 10.0],
+        pbc=True,
+    )
+    frames = [h2o, h2o, h2o, h3o]
+
+    grouped = compute_position_profiles(
+        frames,
+        species="molecules",
+        surface_mode="none",
+        min_molecule_frames=3,
+        oh_topology_stride=1,
+    )
+    threshold_one = compute_position_profiles(
+        frames,
+        species="molecules",
+        surface_mode="none",
+        min_molecule_frames=1,
+        oh_topology_stride=1,
+    )
+    explicit = compute_position_profiles(
+        frames,
+        species="H3O",
+        surface_mode="none",
+        min_molecule_frames=3,
+        oh_topology_stride=1,
+    )
+
+    assert [profile.species for profile in grouped] == ["mol:H2O"]
+    assert [profile.species for profile in threshold_one] == ["mol:H2O", "mol:H3O"]
+    assert [profile.species for profile in explicit] == ["mol:H3O"]
+
+
+def test_compute_position_profile_tracks_molecule_com_with_variable_counts():
+    frame0 = Atoms(
+        ["O", "H", "H"],
+        positions=[[0.0, 0.0, 0.0], [0.9, 0.0, 0.0], [-0.9, 0.0, 0.0]],
+        cell=[10.0, 10.0, 10.0],
+        pbc=True,
+    )
+    frame1 = Atoms(
+        ["O", "H", "H", "H"],
+        positions=[[0.0, 0.0, 0.0], [0.9, 0.0, 0.0], [-0.9, 0.0, 0.0], [0.0, 0.9, 0.0]],
+        cell=[10.0, 10.0, 10.0],
+        pbc=True,
+    )
+
+    frames = [frame0] * 100 + [frame1]
+    h2o_profile = compute_position_profile(
+        frames,
+        species="H2O",
+        axis="z",
+        surface_mode="none",
+    )
+    h3o_profile = compute_position_profile(
+        frames,
+        species="mol:H3O",
+        axis="z",
+        surface_mode="none",
+    )
+
+    assert h2o_profile.species == "mol:H2O"
+    assert h2o_profile.entity_kind == "molecule"
+    np.testing.assert_array_equal(
+        h2o_profile.entity_counts_per_frame,
+        np.array([*[1] * 100, 0]),
+    )
+    assert h2o_profile.x.shape == (101, 1)
+    assert np.isfinite(h2o_profile.x[0, 0])
+    assert np.isnan(h2o_profile.x[-1, 0])
+    np.testing.assert_array_equal(
+        h3o_profile.entity_counts_per_frame,
+        np.array([*[0] * 100, 1]),
+    )
+    assert np.isnan(h3o_profile.x[0, 0])
+    assert np.isfinite(h3o_profile.x[-1, 0])
+
+
+def test_save_and_load_position_molecule_profile_preserves_entity_counts(tmp_path):
+    frame = Atoms(
+        ["O", "H", "H", "H"],
+        positions=[[0.0, 0.0, 0.0], [0.9, 0.0, 0.0], [-0.9, 0.0, 0.0], [0.0, 0.9, 0.0]],
+        cell=[10.0, 10.0, 10.0],
+        pbc=True,
+    )
+    profile = compute_position_profile([frame], species="mol:H3O", surface_mode="none")
+    output = tmp_path / "position.h5"
+
+    save_position_profile(profile, output)
+    loaded = load_position_profile(output, species="H3O")
+
+    assert loaded.species == "mol:H3O"
+    assert loaded.selection_kind == "molecule"
+    assert loaded.entity_kind == "molecule"
+    np.testing.assert_array_equal(loaded.entity_counts_per_frame, np.array([1]))
+    assert loaded.oh_cutoff_A == pytest.approx(1.25)
+    assert loaded.oh_topology_stride == 100
+
+
+def test_save_and_load_position_profiles_filters_groups_and_legacy_ho(tmp_path):
+    frame = Atoms(
+        ["O", "H", "O"],
+        positions=[[0.0, 0.0, 0.0], [0.9, 0.0, 0.0], [4.0, 0.0, 0.0]],
+        cell=[10.0, 10.0, 10.0],
+        pbc=True,
+    )
+    profiles = compute_position_profiles(
+        [frame] * 3,
+        species="all",
+        surface_mode="none",
+        min_molecule_frames=3,
+    )
+    output = tmp_path / "position_collection.h5"
+
+    save_position_profiles(profiles, output)
+
+    loaded_molecules = load_position_profiles(output, species="molecules")
+    loaded_elements = load_position_profiles(output, species="elements")
+    loaded_oh = load_position_profiles(output, species="mol:HO")
+
+    assert [profile.species for profile in loaded_molecules] == ["mol:O", "mol:OH"]
+    assert [profile.species for profile in loaded_elements] == ["H", "O"]
+    assert [profile.species for profile in loaded_oh] == ["mol:OH"]
+
+
+def test_position_topology_cache_reuses_stable_topology_between_validation_frames(monkeypatch):
+    import linak.analysis.water as water_module
+
+    frames = [
+        Atoms(
+            ["O", "H", "H"],
+            positions=[[0.0, 0.0, 0.0], [0.9, 0.0, 0.0], [-0.9, 0.0, 0.0]],
+            cell=[10.0, 10.0, 10.0],
+            pbc=True,
+        )
+        for _ in range(5)
+    ]
+    calls = 0
+    original = water_module.oh_molecule_topology
+
+    def _counting_topology(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(water_module, "oh_molecule_topology", _counting_topology)
+
+    compute_position_profiles(
+        frames,
+        species="molecules",
+        surface_mode="none",
+        oh_topology_stride=3,
+    )
+
+    assert calls == 2
 
 
 def test_save_and_load_position_profile(tmp_path):

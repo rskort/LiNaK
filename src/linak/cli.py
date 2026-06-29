@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 from copy import deepcopy
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -11,6 +12,7 @@ import importlib
 import inspect
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import re
@@ -67,6 +69,9 @@ _PROFILE_KEY_TO_ANALYSIS = {value: key for key, value in _ANALYSIS_TO_PROFILE_KE
 _LINAK_OUTPUT_DIRNAME = "LiNaK_outputs"
 _GUI_COMPLEXITY_MAX_SERIES = 128
 _GUI_COMPLEXITY_MAX_POINTS = 1_000_000
+_POSITION_GUI_AUTO_DISPLAY_SERIES = 64
+_POSITION_GUI_AUTO_DISPLAY_TRIGGER_SERIES = _GUI_COMPLEXITY_MAX_SERIES
+_POSITION_GUI_AUTO_DISPLAY_TARGET_POINTS = 200_000
 
 
 @dataclass(frozen=True)
@@ -427,7 +432,7 @@ def _format_plot_complexity_message(
             "use --component 2d-projection with --projection-filter-min/--projection-filter-max when that lighter view is sufficient"
         )
     if interactive_gui:
-        return f"{message} {'; '.join(suggestions)}."
+        return f"{message} {'; '.join(suggestions)}. Or use --force-gui to proceed with rendering anyway, but be aware that the GUI may become unresponsive or crash."
     return f"{message} Proceeding anyway. {'; '.join(suggestions)}."
 
 
@@ -1340,20 +1345,24 @@ def _default_potential_hdf5_output_path(source: str | Path) -> Path:
 def _default_potential_hdf5_output_for_sources(sources: list[str]) -> Path:
     if len(sources) == 1:
         return _default_potential_hdf5_output_path(sources[0])
-    return _linak_output_dir_for_sources(sources) / "linak.potential.h5"
+    from .analysis.output_naming import combined_analysis_hdf5_filename
+
+    return _linak_output_dir_for_sources(sources) / combined_analysis_hdf5_filename("potential")
 
 
 def _default_combined_analysis_hdf5_path(sources: list[str], *, analysis: str) -> Path:
-    return _linak_output_dir_for_sources(sources) / f"linak.{analysis}.combined.h5"
+    from .analysis.output_naming import combined_analysis_hdf5_filename
+
+    return _linak_output_dir_for_sources(sources) / combined_analysis_hdf5_filename(analysis)
 
 
 def _unique_path_with_numeric_suffix(path: Path) -> Path:
+    from .analysis.output_naming import numbered_hdf5_path
+
     if not path.exists():
         return path
-    stem = path.stem
-    suffix = path.suffix
     for index in range(1, 10000):
-        candidate = path.with_name(f"{stem}_{index}{suffix}")
+        candidate = numbered_hdf5_path(path, index)
         if not candidate.exists():
             return candidate
     raise ValueError(f"Could not find available output filename for '{path}'.")
@@ -1540,6 +1549,7 @@ def _resolve_density_plotter_kwargs(
     args: argparse.Namespace,
     *,
     data_contract: Any | None = None,
+    view_type: str | None = None,
 ) -> dict[str, Any]:
     from .plot.mappings.density_mapping import resolve_density_plot_mapping
 
@@ -1547,6 +1557,7 @@ def _resolve_density_plotter_kwargs(
     resolved = resolve_density_plot_mapping(
         contract=data_contract,
         mapping=mapping,
+        view_type=view_type or "line_1d",
         x_mode=getattr(args, "x_mode", "distance"),
         quantity=getattr(args, "quantity", "mass"),
     )
@@ -1857,6 +1868,258 @@ def _estimate_position_gui_point_counts(
     return raw_total, final_total
 
 
+def _coerce_positive_float_or_none(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, str) and not value.strip():
+        return None
+    try:
+        resolved = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(resolved) or resolved <= 0:
+        return None
+    return resolved
+
+
+def _position_descriptor_n_frames(descriptor: Mapping[str, Any]) -> int:
+    try:
+        n_frames = int(descriptor.get("n_frames", 0) or 0)
+    except (TypeError, ValueError):
+        n_frames = 0
+    return max(0, n_frames)
+
+
+def _position_descriptor_time_span(
+    descriptor: Mapping[str, Any],
+    *,
+    time_axis: str,
+) -> float:
+    n_frames = _position_descriptor_n_frames(descriptor)
+    if n_frames <= 1:
+        return 0.0
+    axis = str(time_axis or "ps").strip().lower()
+    try:
+        timestep_fs = float(descriptor.get("frame_timestep_fs", 1000.0) or 1000.0)
+    except (TypeError, ValueError):
+        timestep_fs = 1000.0
+    if not np.isfinite(timestep_fs) or timestep_fs <= 0:
+        timestep_fs = 1000.0
+    if axis == "fs":
+        return float(n_frames - 1) * timestep_fs
+    if axis == "ps":
+        return float(n_frames - 1) * timestep_fs / 1000.0
+    return float(n_frames - 1)
+
+
+def _estimate_position_line_points_from_descriptors(
+    descriptors: Sequence[Mapping[str, Any]],
+    *,
+    x_bin_width: Any,
+    time_axis: str,
+) -> int:
+    width = _coerce_positive_float_or_none(x_bin_width)
+    total = 0
+    for descriptor in descriptors:
+        n_frames = _position_descriptor_n_frames(descriptor)
+        if n_frames <= 0:
+            continue
+        if width is None:
+            total += n_frames
+            continue
+        span = _position_descriptor_time_span(descriptor, time_axis=time_axis)
+        if span <= 0:
+            total += 1
+        else:
+            total += min(n_frames, max(1, int(math.ceil(span / width)) + 1))
+    return int(total)
+
+
+def _round_up_display_bin_width(value: float) -> float:
+    if not np.isfinite(value) or value <= 0:
+        return 1.0
+    exponent = math.floor(math.log10(value))
+    scale = 10.0**exponent
+    normalized = value / scale
+    for step in (1.0, 2.0, 5.0, 10.0):
+        if normalized <= step:
+            return step * scale
+    return 10.0 * scale
+
+
+def _position_descriptor_profile_key(descriptor: Mapping[str, Any]) -> str:
+    source = str(descriptor.get("load_source_path") or descriptor.get("origin_path") or "")
+    profile_uid = str(
+        descriptor.get("profile_uid")
+        or descriptor.get("source_series_id")
+        or descriptor.get("series_id")
+        or ""
+    )
+    rendered_species = str(descriptor.get("rendered_species") or descriptor.get("default_label") or "")
+    return f"{source}|{profile_uid}|{rendered_species}"
+
+
+def _select_round_robin_position_series_ids(
+    descriptors: Sequence[Mapping[str, Any]],
+    *,
+    limit: int,
+) -> set[str]:
+    if limit <= 0:
+        return set()
+    grouped: dict[str, list[str]] = {}
+    group_order: list[str] = []
+    for index, descriptor in enumerate(descriptors):
+        series_id = str(descriptor.get("series_id") or f"series:{index}")
+        group_key = _position_descriptor_profile_key(descriptor)
+        if group_key not in grouped:
+            grouped[group_key] = []
+            group_order.append(group_key)
+        grouped[group_key].append(series_id)
+
+    selected: set[str] = set()
+    round_index = 0
+    while len(selected) < limit:
+        added = False
+        for group_key in group_order:
+            group_ids = grouped[group_key]
+            if round_index >= len(group_ids):
+                continue
+            selected.add(group_ids[round_index])
+            added = True
+            if len(selected) >= limit:
+                break
+        if not added:
+            break
+        round_index += 1
+    return selected
+
+
+def _format_gui_count(value: int | None) -> str:
+    return "unknown" if value is None else f"{int(value):,}"
+
+
+def _apply_position_gui_auto_display_reduction(
+    settings: dict[str, Any],
+    *,
+    args: argparse.Namespace,
+    initial_context: _GuiPlotRenderContext,
+) -> dict[str, Any]:
+    descriptors = [
+        dict(item) for item in settings.get("series_descriptors", []) if isinstance(item, dict)
+    ]
+    if not descriptors:
+        return settings
+    resolved_projection = _resolve_position_projection_estimation_settings(args)
+    time_axis = str(settings.get("time_axis") or getattr(args, "time_axis", "ps") or "ps")
+    raw_series = len(descriptors)
+    raw_points = initial_context.estimated_total_points
+    if raw_points is None:
+        raw_points = _estimate_position_line_points_from_descriptors(
+            descriptors,
+            x_bin_width=None,
+            time_axis=time_axis,
+        )
+    if (
+        raw_series <= _POSITION_GUI_AUTO_DISPLAY_TRIGGER_SERIES
+        and raw_points <= _GUI_COMPLEXITY_MAX_POINTS
+    ):
+        return settings
+
+    reduced = dict(settings)
+    existing_overrides = _coerce_series_override_map(reduced.get("series_overrides"))
+    enabled_ids = {str(descriptor.get("series_id") or "") for descriptor in descriptors}
+    if raw_series > _POSITION_GUI_AUTO_DISPLAY_TRIGGER_SERIES:
+        enabled_ids = _select_round_robin_position_series_ids(
+            descriptors,
+            limit=_POSITION_GUI_AUTO_DISPLAY_SERIES,
+        )
+    enabled_ids.discard("")
+
+    overrides: dict[str, dict[str, Any]] = {}
+    for index, descriptor in enumerate(descriptors):
+        series_id = str(descriptor.get("series_id") or f"series:{index}")
+        entry = dict(existing_overrides.get(series_id, {}))
+        entry["enabled"] = series_id in enabled_ids
+        overrides[series_id] = entry
+    reduced["series_overrides"] = overrides
+    reduced.pop("series_enabled", None)
+
+    enabled_descriptors = [
+        descriptor
+        for index, descriptor in enumerate(descriptors)
+        if str(descriptor.get("series_id") or f"series:{index}") in enabled_ids
+    ]
+    initial_series = len(enabled_descriptors)
+    existing_width = _coerce_positive_float_or_none(
+        reduced.get("x_bin_width", getattr(args, "x_bin_width", None))
+    )
+    final_width = existing_width
+    width_was_raised = False
+    if not resolved_projection.is_projection and initial_series > 0:
+        target_bins_per_series = max(
+            1,
+            int(
+                math.floor(
+                    _POSITION_GUI_AUTO_DISPLAY_TARGET_POINTS / max(initial_series, 1)
+                )
+            ),
+        )
+        max_span = max(
+            (
+                _position_descriptor_time_span(descriptor, time_axis=time_axis)
+                for descriptor in enabled_descriptors
+            ),
+            default=0.0,
+        )
+        if max_span > 0:
+            required_width = _round_up_display_bin_width(max_span / target_bins_per_series)
+            candidate_points = _estimate_position_line_points_from_descriptors(
+                enabled_descriptors,
+                x_bin_width=existing_width,
+                time_axis=time_axis,
+            )
+            if existing_width is None or candidate_points > _POSITION_GUI_AUTO_DISPLAY_TARGET_POINTS:
+                final_width = max(existing_width or 0.0, required_width)
+                width_was_raised = existing_width is not None and final_width > existing_width
+                reduced["x_bin_width"] = float(final_width)
+                reduced["time_section_width"] = float(final_width)
+        if not reduced.get("x_bin_reducer"):
+            reduced["x_bin_reducer"] = "mean"
+
+    estimated_points = (
+        _estimate_position_line_points_from_descriptors(
+            enabled_descriptors,
+            x_bin_width=final_width,
+            time_axis=time_axis,
+        )
+        if not resolved_projection.is_projection
+        else min(raw_points, _POSITION_GUI_AUTO_DISPLAY_TARGET_POINTS)
+    )
+    if not enabled_descriptors and descriptors:
+        estimated_points = 0
+
+    width_label = "off"
+    if final_width is not None:
+        width_label = f"{float(final_width):.6g} {time_axis}"
+    note = (
+        "Position GUI auto-reduced display: "
+        f"raw={raw_series:,} series, ~{_format_gui_count(raw_points)} points; "
+        f"initial={initial_series:,} series, ~{_format_gui_count(estimated_points)} points, "
+        f"time_section_width={width_label}. "
+        "HDF5 data is unchanged; enable more series or clear X bin size in the GUI to render raw data."
+    )
+    reduced["_auto_display_note"] = note
+    LOGGER.warning(note)
+    if width_was_raised:
+        LOGGER.warning(
+            "Raised requested position GUI time_section_width from %.6g to %.6g %s for initial responsiveness.",
+            float(existing_width),
+            float(final_width),
+            time_axis,
+        )
+    return reduced
+
+
 def _log_position_projection_guard_debug(
     *,
     stage: str,
@@ -2094,6 +2357,7 @@ def _load_density_heatmap_plot_profiles(
     plane: str | None,
 ) -> tuple[list[Any], list[list[str]], list[list[str]], list[list[str]]]:
     from .analysis.density import load_density_heatmap_profiles, _density_payload_matches_selection
+    from .analysis.common import is_molecule_species_label, molecule_display_label
 
     raw_payloads_by_source = _read_analysis_profile_payloads_by_source(
         sources=sources,
@@ -2141,7 +2405,12 @@ def _load_density_heatmap_plot_profiles(
                 payload = raw_payloads[profile_index]
                 metadata = dict(payload.get("metadata", {}))
                 source_label = _metadata_source_label(metadata, fallback_source=source)
-                rendered_species = f"{source_label}:{profile.species}"
+                display_species = (
+                    molecule_display_label(profile.species)
+                    if is_molecule_species_label(profile.species)
+                    else profile.species
+                )
+                rendered_species = f"{source_label}:{display_species}"
                 source_labels.append(f"{rendered_species} {profile.plane.upper()}")
                 source_ids.append(
                     _profile_uid_from_payload(
@@ -2157,7 +2426,14 @@ def _load_density_heatmap_plot_profiles(
         flattened = _flatten_profiles_by_source(profiles_by_source)
         plot_profiles.extend(flattened)
         fallback_labels_by_source.append(
-            [f"{profile.species} {profile.plane.upper()}" for profile in flattened]
+            [
+                (
+                    f"{molecule_display_label(profile.species)} {profile.plane.upper()}"
+                    if is_molecule_species_label(profile.species)
+                    else f"{profile.species} {profile.plane.upper()}"
+                )
+                for profile in flattened
+            ]
         )
         raw_payloads = filtered_payloads_by_source[0][1]
         if len(raw_payloads) != len(flattened):
@@ -2206,10 +2482,18 @@ def _resolve_density_plot_axis_and_x_mode(
     return resolved_axis, resolved_x_mode
 
 
-def _density_selected_view_type(args: argparse.Namespace) -> str:
+def _density_selected_view_type(
+    args: argparse.Namespace,
+    filter_options: Mapping[str, Any] | None = None,
+) -> str:
     mapping = _coerce_runtime_view_mapping(getattr(args, "view_mapping", None))
     if mapping is not None:
         return str(getattr(mapping, "view_type_id", "") or "line_1d").strip().lower() or "line_1d"
+    view_types_raw = None if filter_options is None else filter_options.get("density_view_types")
+    if isinstance(view_types_raw, (list, tuple, set)):
+        view_types = {str(value).strip().lower() for value in view_types_raw}
+        if "heatmap_2d" in view_types and "line_1d" not in view_types:
+            return "heatmap_2d"
     return "line_1d"
 
 
@@ -2283,7 +2567,9 @@ def _resolve_density_outputs_from_args(args: argparse.Namespace) -> str:
     requested_outputs = getattr(args, "outputs", None)
     heatmap_planes = getattr(args, "heatmap_planes", None)
     if requested_outputs is None:
-        return "heatmap" if heatmap_planes else "line"
+        if heatmap_planes:
+            raise ValueError("--heatmap-planes requires --outputs heatmap or --outputs all.")
+        return "line"
     if requested_outputs == "line" and heatmap_planes:
         raise ValueError("--heatmap-planes requires --outputs heatmap or --outputs all.")
     return str(requested_outputs)
@@ -2324,6 +2610,7 @@ def _build_density_logical_descriptor_segments(
     species: str | None,
 ) -> tuple[list[list[dict[str, Any]]], dict[str, Any] | None]:
     from .analysis.density import _density_payload_matches_selection, _normalize_species_query
+    from .analysis.common import is_molecule_species_label, molecule_display_label
 
     prefix_source_labels = _should_prefix_combined_source_labels(
         sources=sources,
@@ -2335,7 +2622,13 @@ def _build_density_logical_descriptor_segments(
     )
     resolved_species_label: str | None = None
     if species is not None and str(species).strip():
-        _selection_mode, resolved_species_label = _normalize_species_query(species)
+        _selection_mode, candidate_species_label = _normalize_species_query(
+            species,
+            allow_h2o=True,
+            allow_molecules=True,
+        )
+        if _selection_mode not in {"all", "elements", "molecules"}:
+            resolved_species_label = candidate_species_label
 
     source_group_indices: dict[str, int] = {}
     seen_modes: set[str] = set()
@@ -2355,12 +2648,25 @@ def _build_density_logical_descriptor_segments(
                 available_modes.append(mode)
                 seen_modes.add(mode)
 
-            base_species = (
+            raw_base_species = (
                 resolved_species_label or str(metadata.get("species", "")).strip() or "UNKNOWN"
+            )
+            if raw_base_species != "UNKNOWN":
+                _metadata_mode, base_species = _normalize_species_query(
+                    raw_base_species,
+                    allow_h2o=True,
+                    allow_molecules=True,
+                )
+            else:
+                base_species = raw_base_species
+            display_species = (
+                molecule_display_label(base_species)
+                if is_molecule_species_label(base_species)
+                else base_species
             )
             source_label = _metadata_source_label(dict(metadata), fallback_source=source)
             rendered_species = (
-                f"{source_label}:{base_species}" if prefix_source_labels else base_species
+                f"{source_label}:{display_species}" if prefix_source_labels else display_species
             )
             resolved_source_path = Path(
                 str(metadata.get("origin_hdf5_path") or source)
@@ -6147,17 +6453,6 @@ def _build_density_gui_context(
     )
     from .plot.mappings.density_mapping import resolve_density_plot_mapping
 
-    resolved_density_mapping = resolve_density_plot_mapping(
-        mapping=_coerce_runtime_view_mapping(getattr(args, "view_mapping", None)),
-        view_type=_density_selected_view_type(args),
-        x_mode=getattr(args, "x_mode", None),
-        quantity=getattr(args, "quantity", "mass"),
-    )
-    selected_view_type = resolved_density_mapping.view_type_id
-    _load_axis, resolved_x_mode = _resolve_density_plot_axis_and_x_mode(
-        axis=getattr(args, "axis", None),
-        x_mode=resolved_density_mapping.x_mode,
-    )
     raw_payloads_by_source = _read_analysis_profile_payloads_by_source(
         sources=sources,
         analysis="density",
@@ -6169,6 +6464,18 @@ def _build_density_gui_context(
             species=args.species,
         )
         or {}
+    )
+    selected_view_type = _density_selected_view_type(args, filter_options)
+    resolved_density_mapping = resolve_density_plot_mapping(
+        mapping=_coerce_runtime_view_mapping(getattr(args, "view_mapping", None)),
+        view_type=selected_view_type,
+        x_mode=getattr(args, "x_mode", None),
+        quantity=getattr(args, "quantity", "mass"),
+    )
+    selected_view_type = resolved_density_mapping.view_type_id
+    _load_axis, resolved_x_mode = _resolve_density_plot_axis_and_x_mode(
+        axis=getattr(args, "axis", None),
+        x_mode=resolved_density_mapping.x_mode,
     )
     line_contract = default_density_plot_data_contract()
     heatmap_contract = default_density_heatmap_plot_data_contract()
@@ -6193,7 +6500,11 @@ def _build_density_gui_context(
                 profile=[],
                 plot_source_label=sources[0] if len(sources) == 1 else "multi_source_density",
                 plotter_kwargs={
-                    **_resolve_density_plotter_kwargs(args, data_contract=heatmap_contract),
+                    **_resolve_density_plotter_kwargs(
+                        args,
+                        data_contract=heatmap_contract,
+                        view_type=selected_view_type,
+                    ),
                     "heatmap_vmin": getattr(args, "heatmap_vmin", None),
                     "heatmap_vmax": getattr(args, "heatmap_vmax", None),
                     "heatmap_cmap": getattr(args, "heatmap_cmap", None),
@@ -6256,7 +6567,11 @@ def _build_density_gui_context(
             profile=active_profile,
             plot_source_label=sources[0] if len(sources) == 1 else "multi_source_density",
             plotter_kwargs={
-                **_resolve_density_plotter_kwargs(args, data_contract=heatmap_contract),
+                **_resolve_density_plotter_kwargs(
+                    args,
+                    data_contract=heatmap_contract,
+                    view_type=selected_view_type,
+                ),
                 "heatmap_vmin": getattr(args, "heatmap_vmin", None),
                 "heatmap_vmax": getattr(args, "heatmap_vmax", None),
                 "heatmap_cmap": getattr(args, "heatmap_cmap", None),
@@ -6321,6 +6636,7 @@ def _build_density_gui_context(
         plotter_kwargs=_resolve_density_plotter_kwargs(
             args,
             data_contract=density_contract,
+            view_type=selected_view_type,
         ),
         fallback_labels_by_source=fallback_labels_by_source,
         default_series_labels=_resolve_gui_default_series_labels(
@@ -6346,17 +6662,6 @@ def _build_density_gui_logical_context(
     )
     from .plot.mappings.density_mapping import resolve_density_plot_mapping
 
-    resolved_density_mapping = resolve_density_plot_mapping(
-        mapping=_coerce_runtime_view_mapping(getattr(args, "view_mapping", None)),
-        view_type=_density_selected_view_type(args),
-        x_mode=getattr(args, "x_mode", None),
-        quantity=getattr(args, "quantity", "mass"),
-    )
-    selected_view_type = resolved_density_mapping.view_type_id
-    _load_axis, resolved_x_mode = _resolve_density_plot_axis_and_x_mode(
-        axis=getattr(args, "axis", None),
-        x_mode=resolved_density_mapping.x_mode,
-    )
     raw_payloads_by_source = _read_analysis_profile_payloads_by_source(
         sources=sources,
         analysis="density",
@@ -6369,13 +6674,29 @@ def _build_density_gui_logical_context(
         )
         or {}
     )
+    selected_view_type = _density_selected_view_type(args, filter_options)
+    resolved_density_mapping = resolve_density_plot_mapping(
+        mapping=_coerce_runtime_view_mapping(getattr(args, "view_mapping", None)),
+        view_type=selected_view_type,
+        x_mode=getattr(args, "x_mode", None),
+        quantity=getattr(args, "quantity", "mass"),
+    )
+    selected_view_type = resolved_density_mapping.view_type_id
+    _load_axis, resolved_x_mode = _resolve_density_plot_axis_and_x_mode(
+        axis=getattr(args, "axis", None),
+        x_mode=resolved_density_mapping.x_mode,
+    )
     if selected_view_type == "heatmap_2d":
         heatmap_contract = default_density_heatmap_plot_data_contract()
         return _GuiPlotRenderContext(
             profile=[],
             plot_source_label=sources[0] if len(sources) == 1 else "multi_source_density",
             plotter_kwargs={
-                **_resolve_density_plotter_kwargs(args, data_contract=heatmap_contract),
+                **_resolve_density_plotter_kwargs(
+                    args,
+                    data_contract=heatmap_contract,
+                    view_type=selected_view_type,
+                ),
                 "heatmap_vmin": getattr(args, "heatmap_vmin", None),
                 "heatmap_vmax": getattr(args, "heatmap_vmax", None),
                 "heatmap_cmap": getattr(args, "heatmap_cmap", None),
@@ -6419,7 +6740,7 @@ def _build_density_gui_logical_context(
         for segment in logical_descriptor_segments
     ]
     density_contract = default_density_plot_data_contract()
-    profile_filter_options = dict(filter_options)
+    profile_filter_options = dict(filter_options or {})
     profile_filter_options = {
         **profile_filter_options,
         "density_plot_contract": _serialize_plot_data_contract(density_contract),
@@ -6433,6 +6754,7 @@ def _build_density_gui_logical_context(
         plotter_kwargs=_resolve_density_plotter_kwargs(
             args,
             data_contract=density_contract,
+            view_type=selected_view_type,
         ),
         fallback_labels_by_source=fallback_labels_by_source,
         default_series_labels=_resolve_gui_default_series_labels(
@@ -6883,18 +7205,6 @@ def _build_density_gui_lazy_catalog(
     )
     from .plot.mappings.density_mapping import resolve_density_plot_mapping
 
-    resolved_density_mapping = resolve_density_plot_mapping(
-        mapping=_coerce_runtime_view_mapping(getattr(args, "view_mapping", None)),
-        view_type=_density_selected_view_type(args),
-        x_mode=getattr(args, "x_mode", None),
-        quantity=getattr(args, "quantity", "mass"),
-    )
-    selected_view_type = resolved_density_mapping.view_type_id
-    _load_axis, resolved_x_mode = _resolve_density_plot_axis_and_x_mode(
-        axis=getattr(args, "axis", None),
-        x_mode=resolved_density_mapping.x_mode,
-    )
-
     headers_by_source = _read_analysis_profile_headers_by_source(
         sources=sources,
         analysis="density",
@@ -6906,6 +7216,18 @@ def _build_density_gui_lazy_catalog(
             species=args.species,
         )
         or {}
+    )
+    selected_view_type = _density_selected_view_type(args, filter_options)
+    resolved_density_mapping = resolve_density_plot_mapping(
+        mapping=_coerce_runtime_view_mapping(getattr(args, "view_mapping", None)),
+        view_type=selected_view_type,
+        x_mode=getattr(args, "x_mode", None),
+        quantity=getattr(args, "quantity", "mass"),
+    )
+    selected_view_type = resolved_density_mapping.view_type_id
+    _load_axis, resolved_x_mode = _resolve_density_plot_axis_and_x_mode(
+        axis=getattr(args, "axis", None),
+        x_mode=resolved_density_mapping.x_mode,
     )
     if selected_view_type == "heatmap_2d":
         selected_descriptors: list[list[dict[str, Any]]] = []
@@ -6984,6 +7306,7 @@ def _build_density_gui_lazy_catalog(
                 **_resolve_density_plotter_kwargs(
                     args,
                     data_contract=default_density_heatmap_plot_data_contract(),
+                    view_type=selected_view_type,
                 ),
                 "heatmap_vmin": getattr(args, "heatmap_vmin", None),
                 "heatmap_vmax": getattr(args, "heatmap_vmax", None),
@@ -7042,6 +7365,7 @@ def _build_density_gui_lazy_catalog(
         plotter_kwargs=_resolve_density_plotter_kwargs(
             args,
             data_contract=density_contract,
+            view_type=selected_view_type,
         ),
         descriptor_segments_by_source=descriptor_segments,
         profile_filter_options={
@@ -7342,10 +7666,12 @@ def _build_position_gui_lazy_catalog(
                 fallback_prefix="position",
                 index=profile_index,
             )
-            atom_indices = np.asarray(datasets.get("atom_indices", []), dtype=int)
-            raw_estimated_total_points += int(header.get("n_frames", 0) or 0) * int(
-                atom_indices.size
+            n_frames = int(header.get("n_frames", 0) or 0)
+            frame_timestep_fs = _coerce_positive_float_or_none(
+                header.get("frame_timestep_fs")
             )
+            atom_indices = np.asarray(datasets.get("atom_indices", []), dtype=int)
+            raw_estimated_total_points += n_frames * int(atom_indices.size)
             if profile_level_projection:
                 source_labels.append(rendered_species)
                 source_ids.append(str(profile_uid))
@@ -7356,6 +7682,8 @@ def _build_position_gui_lazy_catalog(
                         "profile_index": profile_index,
                         "profile_uid": profile_uid,
                         "rendered_species": rendered_species,
+                        "n_frames": n_frames,
+                        "frame_timestep_fs": frame_timestep_fs,
                     }
                 )
             else:
@@ -7371,6 +7699,8 @@ def _build_position_gui_lazy_catalog(
                             "profile_uid": profile_uid,
                             "atom_index": atom_token,
                             "rendered_species": rendered_species,
+                            "n_frames": n_frames,
+                            "frame_timestep_fs": frame_timestep_fs,
                         }
                     )
         fallback_labels_by_source.append(source_labels)
@@ -7476,9 +7806,17 @@ def _build_position_gui_lazy_catalog(
     def _estimate_render_points(
         active_profiles: list[Any],
         current_args: argparse.Namespace,
-        _active_descriptors: list[dict[str, Any]],
+        active_descriptors: list[dict[str, Any]],
     ) -> int | None:
         resolved_current_projection = _resolve_position_projection_estimation_settings(current_args)
+        if not resolved_current_projection.is_projection:
+            return _estimate_position_line_points_from_descriptors(
+                active_descriptors,
+                x_bin_width=getattr(current_args, "time_section_width", None)
+                if getattr(current_args, "time_section_width", None) is not None
+                else getattr(current_args, "x_bin_width", None),
+                time_axis=str(getattr(current_args, "time_axis", "ps") or "ps"),
+            )
         raw_points, final_points = _estimate_position_gui_point_counts(
             active_profiles,
             resolved_projection=resolved_current_projection,
@@ -7794,23 +8132,35 @@ def _build_potential_gui_context(
         total_rows += int(summary.get("total_rows") or 0)
         complete_rows += int(summary.get("complete_rows") or 0)
         incomplete_rows += int(summary.get("incomplete_rows") or 0)
-        label_prefix = source_path.stem or source_path.name or str(source_path)
-        fallback_labels_by_source.append(
-            [f"{label_prefix}: {profile.default_label}" for profile in plot_profiles]
-        )
-        series_id_segments_by_source.append(
-            [f"{source_path}::{profile.series_id}" for profile in plot_profiles]
-        )
-        origin_path_segments_by_source.append([str(source_path) for _profile in plot_profiles])
+        source_labels: list[str] = []
+        source_ids: list[str] = []
+        source_origins: list[str] = []
         for profile in plot_profiles:
+            profile_source_path = Path(profile.source_path or source_path).expanduser().resolve()
+            label_prefix = profile_source_path.stem or profile_source_path.name or str(
+                profile_source_path
+            )
+            source_token = f"{profile_source_path}::"
+            if str(profile.series_id).startswith(source_token):
+                rendered_series_id = str(profile.series_id)
+                rendered_label = profile.default_label
+            else:
+                rendered_series_id = f"{profile_source_path}::{profile.series_id}"
+                rendered_label = f"{label_prefix}: {profile.default_label}"
+            source_labels.append(rendered_label)
+            source_ids.append(rendered_series_id)
+            source_origins.append(str(profile_source_path))
             flattened_profiles.append(
                 replace(
                     profile,
-                    series_id=f"{source_path}::{profile.series_id}",
-                    default_label=f"{label_prefix}: {profile.default_label}",
-                    source_path=str(source_path),
+                    series_id=rendered_series_id,
+                    default_label=rendered_label,
+                    source_path=str(profile_source_path),
                 )
             )
+        fallback_labels_by_source.append(source_labels)
+        series_id_segments_by_source.append(source_ids)
+        origin_path_segments_by_source.append(source_origins)
     descriptors = _build_gui_series_descriptors(
         sources=[str(source_path) for source_path in resolved_sources],
         fallback_labels_by_source=fallback_labels_by_source,
@@ -8462,6 +8812,7 @@ def _open_plot_settings_gui(
     on_preview: Callable[[dict[str, Any]], dict[str, Any] | None],
     on_save: Callable[[str, dict[str, Any]], str],
     on_save_figure: Callable[[dict[str, Any], str], str | tuple[str, dict[str, Any]]] | None = None,
+    on_save_data: Callable[[dict[str, Any], str], str | tuple[str, dict[str, Any]]] | None = None,
     on_import_hdf5: Callable[[str, str | None], dict[str, Any]] | None = None,
     on_list_import_hdf5_profiles: Callable[[str], dict[str, Any]] | None = None,
     analysis_name: str | None = None,
@@ -8484,6 +8835,7 @@ def _open_plot_settings_gui(
         on_preview=on_preview,
         on_save=on_save,
         on_save_figure=on_save_figure,
+        on_save_data=on_save_data,
         on_import_hdf5=on_import_hdf5,
         on_list_import_hdf5_profiles=on_list_import_hdf5_profiles,
         analysis_name=analysis_name,
@@ -8507,6 +8859,87 @@ def _is_gui_preview_output_path(path: str | Path) -> bool:
         and resolved.name.startswith("linak_preview_")
         and resolved.suffix.lower() == ".png"
     )
+
+
+def _plot_data_export_delimiter(path: str | Path) -> str:
+    suffix = Path(path).suffix.lower()
+    if suffix == ".dat":
+        return " "
+    if suffix in {".tsv", ".txt"}:
+        return "\t"
+    return ","
+
+
+def _format_plot_data_export_value(value: Any) -> str:
+    if isinstance(value, (float, int, np.floating, np.integer)):
+        return format(float(value), ".15g")
+    return str(value)
+
+
+def _write_plotted_xy_data_export(
+    render_state: Mapping[str, Any],
+    output_path: str | Path,
+) -> Path:
+    series_payload = render_state.get("plotted_xy_series")
+    if not isinstance(series_payload, list) or not series_payload:
+        raise ValueError("No line xy data is available for this preview.")
+
+    normalized_series: list[dict[str, Any]] = []
+    for raw_series in series_payload:
+        if not isinstance(raw_series, Mapping):
+            continue
+        x_values = raw_series.get("x")
+        y_values = raw_series.get("y")
+        if not isinstance(x_values, Sequence) or isinstance(x_values, (str, bytes)):
+            continue
+        if not isinstance(y_values, Sequence) or isinstance(y_values, (str, bytes)):
+            continue
+        if len(x_values) != len(y_values) or len(x_values) == 0:
+            continue
+        normalized_series.append(
+            {
+                "series_id": str(raw_series.get("series_id") or ""),
+                "series_label": str(raw_series.get("series_label") or ""),
+                "series_kind": str(raw_series.get("series_kind") or "source"),
+                "x": list(x_values),
+                "y": list(y_values),
+            }
+        )
+
+    if not normalized_series:
+        raise ValueError("No line xy data is available for this preview.")
+
+    target_path = Path(output_path).expanduser().resolve()
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    delimiter = _plot_data_export_delimiter(target_path)
+    with target_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle, delimiter=delimiter, lineterminator="\n")
+        if len(normalized_series) == 1:
+            writer.writerow(["x", "y"])
+            series = normalized_series[0]
+            for x_value, y_value in zip(series["x"], series["y"]):
+                writer.writerow(
+                    [
+                        _format_plot_data_export_value(x_value),
+                        _format_plot_data_export_value(y_value),
+                    ]
+                )
+            return target_path
+
+        writer.writerow(["series_id", "series_label", "series_kind", "point_index", "x", "y"])
+        for series in normalized_series:
+            for point_index, (x_value, y_value) in enumerate(zip(series["x"], series["y"]), start=1):
+                writer.writerow(
+                    [
+                        series["series_id"],
+                        series["series_label"],
+                        series["series_kind"],
+                        str(point_index),
+                        _format_plot_data_export_value(x_value),
+                        _format_plot_data_export_value(y_value),
+                    ]
+                )
+    return target_path
 
 
 def _descriptor_is_generated_layer(descriptor: dict[str, Any]) -> bool:
@@ -8694,11 +9127,21 @@ def _launch_profile_plot_gui(
         else None,
     )
     initial_settings = _materialize_gui_series_overrides(initial_settings)
+    if analysis_name == "position":
+        initial_settings = _apply_position_gui_auto_display_reduction(
+            initial_settings,
+            args=args,
+            initial_context=initial_context,
+        )
     initial_settings = _strip_redundant_series_lists_for_gui(initial_settings)
 
     effective_guard_args = deepcopy(args)
     _apply_gui_settings_to_args(effective_guard_args, initial_settings)
-    effective_context = build_full_context(effective_guard_args)
+    effective_context = (
+        build_context(effective_guard_args)
+        if analysis_name == "position"
+        else build_full_context(effective_guard_args)
+    )
     effective_series_descriptors = _merge_gui_series_descriptors(
         effective_context.series_descriptors,
         initial_saved_profile.get("series_descriptors")
@@ -8721,7 +9164,7 @@ def _launch_profile_plot_gui(
                 profile=effective_context.profile,
                 estimated_total_points=effective_context.estimated_total_points,
             ),
-            interactive_gui=True,
+            interactive_gui=analysis_name != "position",
         )
     else:
         LOGGER.debug(
@@ -8776,7 +9219,7 @@ def _launch_profile_plot_gui(
                         profile=context.profile,
                         estimated_total_points=context.estimated_total_points,
                     ),
-                    interactive_gui=True,
+                    interactive_gui=analysis_name != "position",
                 )
             else:
                 LOGGER.debug(
@@ -8900,6 +9343,18 @@ def _launch_profile_plot_gui(
             raise ValueError("No output was generated for the requested figure path.")
         return f"Saved figure to '{saved_path}'.", render_state
 
+    def _save_data(gui_settings: dict[str, Any], output_path: str) -> tuple[str, dict[str, Any]]:
+        _saved_path, render_state = _render_gui_preview_settings(
+            gui_settings,
+            show=False,
+            output=None,
+            empty_error_message=(
+                "No series are enabled. Turn on at least one series before exporting data."
+            ),
+        )
+        saved_path = _write_plotted_xy_data_export(render_state, output_path)
+        return f"Saved data to '{saved_path}'.", render_state
+
     def _list_import_hdf5_profiles(source_hdf5_path: str) -> dict[str, Any]:
         imported_path = Path(source_hdf5_path).expanduser().resolve()
         available_names = read_plot_profile_names(imported_path, profile_key)
@@ -9022,6 +9477,7 @@ def _launch_profile_plot_gui(
         on_preview=_preview,
         on_save=_save,
         on_save_figure=_save_figure,
+        on_save_data=_save_data,
         on_import_hdf5=_import_hdf5,
         on_list_import_hdf5_profiles=_list_import_hdf5_profiles,
         analysis_name=analysis_name,
@@ -9310,8 +9766,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--species",
         default="all",
         help=(
-            "Chemical symbol (e.g. O), H2O, or all resolved density series together "
-            "(elements plus H2O when present; default: all)"
+            "Density selector: element symbol (e.g. O), group selector elements/molecules/all, "
+            "or O/H molecule selector mol:H, mol:O, mol:OH, mol:H2O, mol:H3O "
+            "(aliases OH, HO, H2O, H3O and legacy mol:HO accepted). H and O are elements; "
+            "use mol:H and mol:O for free molecular H/O. Default: all."
         ),
     )
     compute_density.add_argument(
@@ -9327,13 +9785,29 @@ def build_parser() -> argparse.ArgumentParser:
         help="Histogram bin width in Angstrom (default: 0.05)",
     )
     compute_density.add_argument(
+        "--oh-cutoff",
+        type=_positive_float,
+        default=1.25,
+        help="O-H cutoff in Angstrom for O/H molecule classification (default: 1.25).",
+    )
+    compute_density.add_argument(
+        "--min-molecule-frames",
+        type=int,
+        default=3,
+        help=(
+            "Minimum number of frames a non-water O/H molecule type must appear in before "
+            "group selectors create a density profile (default: 3). Explicit molecule selectors "
+            "are always honored."
+        ),
+    )
+    compute_density.add_argument(
         "--outputs",
         choices=["line", "heatmap", "all"],
         default=None,
         help=(
             "Density outputs to compute. 'line' writes 1D distance/X/Y/Z profiles, "
-            "'heatmap' writes only selected 2D planes, and 'all' restores exhaustive "
-            "line plus heatmap output (default: line, or heatmap when --heatmap-planes is set)."
+            "'heatmap' writes only selected 2D planes, and 'all' writes line plus heatmap "
+            "output (default: line)."
         ),
     )
     compute_density.add_argument(
@@ -9524,8 +9998,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--species",
         default=None,
         help=(
-            "Optional species to track (for example O). "
-            "If omitted, LiNaK warns and writes one output per species."
+            "Position selector: element symbol (e.g. O), group selector elements/molecules/all, "
+            "or O/H molecule selector mol:H, mol:O, mol:OH, mol:H2O, mol:H3O "
+            "(aliases OH, HO, H2O, H3O and legacy mol:HO accepted). H and O are elements; "
+            "use mol:H and mol:O for free molecular H/O. If omitted, LiNaK warns and writes "
+            "one output per element and active O/H molecule."
         ),
     )
     compute_position.add_argument(
@@ -9576,6 +10053,31 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Restrict rough-mode reference selection to atoms within this depth from the "
             "outer surface in Angstrom (default: adaptive)."
+        ),
+    )
+    compute_position.add_argument(
+        "--oh-cutoff",
+        type=_positive_float,
+        default=1.25,
+        help="O-H cutoff in Angstrom for O/H molecule classification (default: 1.25).",
+    )
+    compute_position.add_argument(
+        "--min-molecule-frames",
+        type=_positive_int,
+        default=3,
+        help=(
+            "Minimum number of frames a non-water O/H molecule type must appear in before "
+            "group selectors create a position profile (default: 3). Explicit molecule selectors "
+            "are always honored."
+        ),
+    )
+    compute_position.add_argument(
+        "--oh-topology-stride",
+        type=_positive_int,
+        default=100,
+        help=(
+            "Frame stride for validating cached O/H molecule topology before switching to "
+            "per-frame detection after a detected change (default: 100)."
         ),
     )
     _add_cell_resolution_options(compute_position)
@@ -13448,6 +13950,10 @@ def _handle_compute_density(args: argparse.Namespace) -> int:
 
     surface_axis: str = args.axis
     density_outputs = _resolve_density_outputs_from_args(args)
+    min_molecule_frames = int(getattr(args, "min_molecule_frames", 3))
+    if min_molecule_frames < 1:
+        raise ValueError("--min-molecule-frames must be >= 1.")
+    oh_cutoff = float(getattr(args, "oh_cutoff", 1.25))
 
     if args.dry_run:
         source_path = Path(args.trajectory).expanduser().resolve()
@@ -13473,6 +13979,8 @@ def _handle_compute_density(args: argparse.Namespace) -> int:
                 f"species={args.species}, raw axes=x/y/z, "
                 f"distance axis={surface_axis}, "
                 f"bin_width={args.bin_width}, "
+                f"oh_cutoff={oh_cutoff}, "
+                f"min_molecule_frames={min_molecule_frames}, "
                 f"outputs={density_outputs}, "
                 f"{_describe_surface_cli_options(args)}"
             ),
@@ -13561,11 +14069,15 @@ def _handle_compute_density(args: argparse.Namespace) -> int:
         precomputed_surface_estimate=cached_surface_estimate,
         outputs=density_outputs,
         heatmap_planes=args.heatmap_planes,
+        oh_cutoff=oh_cutoff,
+        min_molecule_frames=min_molecule_frames,
     )
     density_metadata: dict[str, Any] = {
         "source_path": str(source_path),
         "cell_source": cell_source,
         "surface_axis": surface_axis,
+        "oh_cutoff_A": oh_cutoff,
+        "min_molecule_frames": min_molecule_frames,
     }
     if cell_input_path is not None:
         density_metadata["input_path"] = cell_input_path
@@ -13773,7 +14285,8 @@ def _handle_compute_position(args: argparse.Namespace) -> int:
     species_token = args.species if args.species is not None else "all"
     if args.species is None:
         LOGGER.warning(
-            "No --species provided for position analysis; computing one output per species."
+            "No --species provided for position analysis; computing one output per element "
+            "and active O/H molecule selection."
         )
 
     if args.dry_run:
@@ -13808,7 +14321,8 @@ def _handle_compute_position(args: argparse.Namespace) -> int:
             f"trajectory source: {source_path}",
             (
                 f"species={species_token}, axis={args.axis}, timestep_fs={args.timestep_fs or 'auto'}, "
-                f"{_describe_surface_cli_options(args)}"
+                f"oh_cutoff={args.oh_cutoff}, min_molecule_frames={args.min_molecule_frames}, "
+                f"oh_topology_stride={args.oh_topology_stride}, {_describe_surface_cli_options(args)}"
             ),
             f"cell resolution: {cell_preview}",
             (
@@ -13848,6 +14362,7 @@ def _handle_compute_position(args: argparse.Namespace) -> int:
         input_path=args.input,
         pre_resolved=pre_resolved_cell,
         preflight_error=preflight_cell_error,
+        analysis_label="position analysis",
     )
     pbc_corrected_positions = False
     pbc_cell: tuple[float, float, float] | None = None
@@ -13915,6 +14430,9 @@ def _handle_compute_position(args: argparse.Namespace) -> int:
         include_fixed_surface_atoms=args.include_fixed_surface_atoms,
         surface_options=_surface_options_from_cli_args(args),
         precomputed_surface_estimate=cached_surface_estimate,
+        oh_cutoff=args.oh_cutoff,
+        min_molecule_frames=args.min_molecule_frames,
+        oh_topology_stride=args.oh_topology_stride,
     )
     output_path = _position_hdf5_output_path(
         args.output,
@@ -13930,6 +14448,9 @@ def _handle_compute_position(args: argparse.Namespace) -> int:
         "timestep_source": timestep_source,
         "frame_timestep_fs": float(timestep_fs),
         "positions_pbc_corrected": bool(pbc_corrected_positions),
+        "oh_cutoff_A": float(args.oh_cutoff),
+        "min_molecule_frames": int(args.min_molecule_frames),
+        "oh_topology_stride": int(args.oh_topology_stride),
     }
     if pbc_cell is not None:
         position_metadata["pbc_cell_angstrom"] = list(pbc_cell)
@@ -14433,6 +14954,7 @@ def _handle_compute_potential(args: argparse.Namespace) -> int:
         summarize_potential_statistics,
         validate_hartree_cube_source,
     )
+    from .progress import ProgressBar
 
     raw_sources = _resolve_plot_sources(args)
     if len(raw_sources) > 1:
@@ -14444,26 +14966,33 @@ def _handle_compute_potential(args: argparse.Namespace) -> int:
     expanded_sources: list[Any] = []
     expanded_source_labels: list[str] = []
     seen_expanded_sources: set[str] = set()
-    for source in raw_sources:
-        resolved = validate_hartree_cube_source(source)
-        key = str(resolved)
-        if key in seen_sources:
-            duplicate_sources.append(key)
-            continue
-        seen_sources.add(key)
-        validated_sources.append(key)
-        for dataset in expand_hartree_cube_sources(resolved):
-            dataset_source = str(Path(dataset.source_path or key).expanduser().resolve())
-            dataset_profile_index = int(dataset.source_profile_index or 0)
-            expanded_key = f"{dataset_source}::profile:{dataset_profile_index}"
-            if expanded_key in seen_expanded_sources:
-                duplicate_sources.append(expanded_key)
+    with ProgressBar(
+        desc="Loading potential inputs",
+        total=len(raw_sources),
+        unit="file",
+    ) as progress:
+        for source in raw_sources:
+            resolved = validate_hartree_cube_source(source)
+            key = str(resolved)
+            if key in seen_sources:
+                duplicate_sources.append(key)
+                progress.update()
                 continue
-            seen_expanded_sources.add(expanded_key)
-            expanded_sources.append(dataset)
-            expanded_source_labels.append(
-                dataset_source if dataset_profile_index == 0 else expanded_key
-            )
+            seen_sources.add(key)
+            validated_sources.append(key)
+            for dataset in expand_hartree_cube_sources(resolved):
+                dataset_source = str(Path(dataset.source_path or key).expanduser().resolve())
+                dataset_profile_index = int(dataset.source_profile_index or 0)
+                expanded_key = f"{dataset_source}::profile:{dataset_profile_index}"
+                if expanded_key in seen_expanded_sources:
+                    duplicate_sources.append(expanded_key)
+                    continue
+                seen_expanded_sources.add(expanded_key)
+                expanded_sources.append(dataset)
+                expanded_source_labels.append(
+                    dataset_source if dataset_profile_index == 0 else expanded_key
+                )
+            progress.update()
 
     if not expanded_sources:
         raise ValueError("No unique valid Hartree cube inputs were provided.")

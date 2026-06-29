@@ -744,7 +744,27 @@ def test_plot_settings_panel_keeps_export_in_preview_toolbar_without_transparent
     assert "self.transparent_mode" not in source
     assert 'self.figure_alpha = self._bounded_float_line("0.0 - 1.0"' in source
     assert 'self.save_figure_button = QPushButton("Export Figure")' in source
+    assert 'self.save_data_button = QPushButton("Export Data")' in source
+    assert "self.save_data_button.clicked.connect(on_save_data_callback)" in source
+    assert '"export.data": "Saves the current preview line data to a text data file."' in source
     assert "header_layout.addWidget(self._save_figure_button)" not in source
+
+
+def test_plot_settings_panel_wires_export_data_callback_and_dialog():
+    source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+
+    assert (
+        "on_save_data: Callable[[dict[str, Any], str], str | tuple[str, dict[str, Any]]] | None = None"
+        in source
+    )
+    assert "self._save_data_button.setEnabled(on_save_data is not None)" in source
+    assert "def _handle_save_data(self) -> None:" in source
+    assert '"Save Data"' in source
+    assert "self._data_save_filters, self._data_default_name = _data_filetype_filters()" in source
+    assert (
+        "CSV data (*.csv);;DAT data (*.dat);;TSV data (*.tsv);;Text data (*.txt);;All files (*)"
+        in source
+    )
 
 
 def test_plot_settings_panel_supports_detachable_preview_window():
@@ -756,6 +776,7 @@ def test_plot_settings_panel_supports_detachable_preview_window():
     assert 'self.dock_button = QPushButton("Dock Back")' in source
     assert 'self.setWindowTitle("LiNaK Figure Preview")' in source
     assert "self._embedded_preview_pane.setVisible(False)" in source
+    assert "on_save_data_callback=self._handle_save_data" in source
     assert "detached_window.close_from_dock()" in source
     assert "QTimer.singleShot(0, self._on_dock_requested)" in source
 
@@ -806,6 +827,7 @@ def test_plot_settings_panel_uses_rdf_layer_summary_and_coordination_selector_ch
     assert "self.rdf_species_a" not in source
     assert "self.rdf_species_b" not in source
     assert 'self._binning_helper_label = QLabel("")' in source
+    assert "_auto_display_note" in source
     assert '"series_source_bin_widths"' in source
     assert "Source bin size:" in source
     assert "Requested display bin size:" in source

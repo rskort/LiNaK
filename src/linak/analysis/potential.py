@@ -44,7 +44,9 @@ LOGGER = logging.getLogger(__name__)
 
 BOHR_TO_ANG = 0.529177210903
 HARTREE_TO_EV = 27.211386245988
-DEFAULT_CSHE_OFFSET_EV = 0.81
+
+# DOI: 10.1063/5.0322322
+DEFAULT_CSHE_OFFSET_EV = 15.51 - 0.35 - 15.81 # = -0.65
 _DEFAULT_POTENTIAL_THREAD_CAP = 1
 _WATER_ATOMIC_NUMBERS = {1, 8}
 
@@ -76,6 +78,12 @@ POTENTIAL_CSV_COLUMNS = [
     "status",
     "error",
 ]
+_COMBINED_POTENTIAL_SOURCES_GROUP = "combined_sources"
+_POTENTIAL_PLOT_SERIES_SPECS = (
+    ("water_bulk_potential_ev", "Water bulk"),
+    ("efermi_ev", "Fermi"),
+    ("electrode_cshe_ev", "cSHE"),
+)
 
 
 @dataclass(frozen=True)
@@ -891,7 +899,7 @@ def compute_potential_record(
 
     electrode_cshe_ev = None
     if efermi_ev is not None and water_bulk_potential_ev is not None:
-        electrode_cshe_ev = water_bulk_potential_ev - efermi_ev - float(config.cshe_offset_ev)
+        electrode_cshe_ev = water_bulk_potential_ev - efermi_ev + float(config.cshe_offset_ev)
 
     status = "ok" if electrode_cshe_ev is not None else "incomplete"
     if efermi_ev is None:
@@ -1128,12 +1136,102 @@ def combine_potential_hdf5_sources(
 ) -> Path:
     """Write a combined potential HDF5 that contains rows from every source file."""
     records: list[PotentialRecord] = []
+    source_segments: list[tuple[Path, int, int]] = []
     for source in sources:
-        records.extend(load_potential_records(source))
+        source_path = Path(source).expanduser().resolve()
+        source_records = load_potential_records(source_path)
+        row_start = len(records)
+        records.extend(source_records)
+        if source_records:
+            source_segments.append((source_path, row_start, len(source_records)))
     if not records:
         raise ValueError("No potential rows were available to combine.")
     result = write_potential_records_csv(records, output=output, append=False, overwrite=True)
+    _write_combined_potential_source_metadata(result.path, source_segments)
     return result.path
+
+
+def _write_combined_potential_source_metadata(
+    path: str | Path,
+    source_segments: Sequence[tuple[Path, int, int]],
+) -> None:
+    """Persist row spans for the original HDF5 files in a combined potential output."""
+    require_h5py()
+    import h5py
+
+    target_path = Path(path).expanduser().resolve()
+    with h5py.File(target_path, "a") as handle:
+        if _COMBINED_POTENTIAL_SOURCES_GROUP in handle:
+            del handle[_COMBINED_POTENTIAL_SOURCES_GROUP]
+        group = handle.create_group(_COMBINED_POTENTIAL_SOURCES_GROUP)
+        group.attrs["schema_version"] = 1
+        group.create_dataset(
+            "source_path",
+            data=np.asarray(
+                [str(source_path) for source_path, _start, _count in source_segments],
+                dtype=object,
+            ),
+            dtype=h5py.string_dtype(encoding="utf-8"),
+        )
+        group.create_dataset(
+            "row_start",
+            data=np.asarray([row_start for _path, row_start, _count in source_segments], dtype=np.int64),
+        )
+        group.create_dataset(
+            "row_count",
+            data=np.asarray([row_count for _path, _start, row_count in source_segments], dtype=np.int64),
+        )
+
+
+def _read_combined_potential_source_metadata(
+    handle: Any,
+    *,
+    total_rows: int,
+) -> list[tuple[Path, int, int]]:
+    """Return valid combined-source row spans, or an empty list for ordinary files."""
+    if _COMBINED_POTENTIAL_SOURCES_GROUP not in handle:
+        return []
+    group = handle[_COMBINED_POTENTIAL_SOURCES_GROUP]
+    required = ("source_path", "row_start", "row_count")
+    if any(name not in group for name in required):
+        return []
+    source_paths = np.asarray(group["source_path"].asstr()[...], dtype=object)
+    row_starts = np.asarray(group["row_start"], dtype=np.int64)
+    row_counts = np.asarray(group["row_count"], dtype=np.int64)
+    if not (len(source_paths) == len(row_starts) == len(row_counts)):
+        return []
+
+    segments: list[tuple[Path, int, int]] = []
+    for source_path_raw, row_start_raw, row_count_raw in zip(
+        source_paths,
+        row_starts,
+        row_counts,
+    ):
+        source_path = Path(str(source_path_raw).strip()).expanduser()
+        row_start = int(row_start_raw)
+        row_count = int(row_count_raw)
+        if not str(source_path).strip() or row_count <= 0:
+            continue
+        if row_start < 0 or row_start + row_count > total_rows:
+            continue
+        segments.append((source_path.resolve(), row_start, row_count))
+    return segments
+
+
+def _potential_plot_order_for_rows(
+    raw_ids: np.ndarray,
+    *,
+    row_start: int,
+    row_count: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    row_indices = np.arange(row_start, row_start + row_count, dtype=np.int64)
+    segment_ids = np.asarray(raw_ids[row_indices], dtype=np.int64)
+    finite_positive_ids = segment_ids.size > 0 and bool(np.all(segment_ids > 0))
+    unique_positive_ids = finite_positive_ids and len(np.unique(segment_ids)) == len(segment_ids)
+    if finite_positive_ids and unique_positive_ids:
+        local_order = np.argsort(segment_ids, kind="mergesort")
+        return row_indices[local_order], np.asarray(segment_ids[local_order], dtype=float)
+    return row_indices, np.arange(1, row_count + 1, dtype=float)
 
 
 def load_potential_plot_profiles(
@@ -1156,7 +1254,6 @@ def load_potential_plot_profiles(
         "source",
         "source_dir",
     )
-    ordered_series_values: dict[str, np.ndarray] = {}
     with h5py.File(source_path, "r") as handle:
         if str(handle.attrs.get("analysis", "")) != "potential":
             raise ValueError(f"HDF5 analysis mismatch for '{source_path}': expected 'potential'.")
@@ -1172,51 +1269,58 @@ def load_potential_plot_profiles(
 
         total_rows = int(records["id"].shape[0])
         raw_ids = np.asarray(records["id"], dtype=np.int64)
-        finite_positive_ids = raw_ids.size > 0 and bool(np.all(raw_ids > 0))
-        unique_positive_ids = finite_positive_ids and len(np.unique(raw_ids)) == len(raw_ids)
-        if finite_positive_ids and unique_positive_ids:
-            order = np.argsort(raw_ids, kind="mergesort")
-            x_values = np.asarray(raw_ids[order], dtype=float)
-        else:
-            order = np.arange(total_rows, dtype=np.int64)
-            x_values = np.arange(1, total_rows + 1, dtype=float)
-
-        for column in (
-            "water_bulk_potential_ev",
-            "efermi_ev",
-            "electrode_cshe_ev",
-        ):
-            values = np.asarray(records[column], dtype=float)
-            ordered_series_values[column] = np.asarray(values[order], dtype=float)
-
+        values_by_column = {
+            column: np.asarray(records[column], dtype=float)
+            for column, _label in _POTENTIAL_PLOT_SERIES_SPECS
+        }
         status_values = np.asarray(records["status"].asstr()[...], dtype=object)
+        combined_segments = _read_combined_potential_source_metadata(
+            handle,
+            total_rows=total_rows,
+        )
+
+    if not combined_segments:
+        combined_segments = [(source_path, 0, total_rows)]
+
+    profiles: list[PotentialPlotSeries] = []
+    total_complete_rows = 0
+    for segment_source_path, row_start, row_count in combined_segments:
+        order, x_values = _potential_plot_order_for_rows(
+            raw_ids,
+            row_start=row_start,
+            row_count=row_count,
+        )
         ordered_status = [str(status_values[index]).strip().lower() for index in order]
         complete_rows = sum(1 for value in ordered_status if value == "ok")
-        incomplete_rows = total_rows - complete_rows
+        incomplete_rows = row_count - complete_rows
+        total_complete_rows += complete_rows
+        is_combined_segment = segment_source_path != source_path
+        label_prefix = segment_source_path.stem or segment_source_path.name or str(segment_source_path)
+        for series_id, default_label in _POTENTIAL_PLOT_SERIES_SPECS:
+            rendered_series_id = (
+                f"{segment_source_path}::{series_id}" if is_combined_segment else series_id
+            )
+            rendered_label = (
+                f"{label_prefix}: {default_label}" if is_combined_segment else default_label
+            )
+            profiles.append(
+                PotentialPlotSeries(
+                    series_id=rendered_series_id,
+                    default_label=rendered_label,
+                    x_values=np.asarray(x_values, dtype=float),
+                    y_values=np.asarray(values_by_column[series_id][order], dtype=float),
+                    source_path=str(segment_source_path),
+                    total_rows=row_count,
+                    complete_rows=complete_rows,
+                    incomplete_rows=incomplete_rows,
+                )
+            )
 
-    series_specs = (
-        ("water_bulk_potential_ev", "Water bulk"),
-        ("efermi_ev", "Fermi"),
-        ("electrode_cshe_ev", "cSHE"),
-    )
-    profiles = [
-        PotentialPlotSeries(
-            series_id=series_id,
-            default_label=default_label,
-            x_values=np.asarray(x_values, dtype=float),
-            y_values=ordered_series_values[series_id],
-            source_path=str(source_path),
-            total_rows=total_rows,
-            complete_rows=complete_rows,
-            incomplete_rows=incomplete_rows,
-        )
-        for series_id, default_label in series_specs
-    ]
     return profiles, {
         "x_axis_label": "Record ID",
         "total_rows": total_rows,
-        "complete_rows": complete_rows,
-        "incomplete_rows": incomplete_rows,
+        "complete_rows": total_complete_rows,
+        "incomplete_rows": total_rows - total_complete_rows,
     }
 
 
@@ -1495,12 +1599,14 @@ def _read_max_existing_id(path: Path) -> int:
 
 
 def _fallback_csv_path(path: Path) -> Path:
+    from .output_naming import numbered_hdf5_path
+
     suffix = path.suffix if path.suffix.lower() in {".h5", ".hdf5"} else ".h5"
     stem = path.stem if path.suffix else path.name
     candidate = path.with_name(f"{stem}.linak.potential{suffix}")
-    counter = 2
+    counter = 1
     while candidate.exists():
-        candidate = path.with_name(f"{stem}.linak.potential_{counter}{suffix}")
+        candidate = numbered_hdf5_path(path.with_name(f"{stem}.linak.potential{suffix}"), counter)
         counter += 1
     return candidate
 

@@ -16,6 +16,59 @@ from ..storage.hdf5_utils import (
 )
 
 
+MOLECULE_SPECIES_LABELS: tuple[str, ...] = (
+    "mol:H",
+    "mol:O",
+    "mol:OH",
+    "mol:H2O",
+    "mol:H3O",
+)
+
+_MOLECULE_FORMULA_LABELS = {label[4:].upper(): label for label in MOLECULE_SPECIES_LABELS}
+_MOLECULE_FORMULA_LABELS["HO"] = "mol:OH"
+_MOLECULE_FORMULA_LABELS["OH"] = "mol:OH"
+
+_MOLECULE_DISPLAY_LABELS = {
+    "mol:H": "free H",
+    "mol:O": "free O",
+    "mol:OH": "OH",
+    "mol:H2O": "H2O",
+    "mol:H3O": "H3O",
+}
+
+
+def normalize_molecule_label(species: str | None) -> str | None:
+    """Return the canonical molecule label for supported O/H molecule selectors."""
+
+    if species is None:
+        return None
+    token = str(species).strip()
+    if not token:
+        return None
+    if token.lower().startswith("mol:"):
+        formula = token[4:].strip().upper()
+        return _MOLECULE_FORMULA_LABELS.get(formula)
+    formula = token.upper()
+    if formula in {"H", "O"}:
+        return None
+    return _MOLECULE_FORMULA_LABELS.get(formula)
+
+
+def is_molecule_species_label(species: str | None) -> bool:
+    """Return whether *species* is a canonical supported molecule label."""
+
+    return normalize_molecule_label(species) in MOLECULE_SPECIES_LABELS
+
+
+def molecule_display_label(species: str | None) -> str:
+    """Return a short user-facing label for a supported molecule selector."""
+
+    label = normalize_molecule_label(species)
+    if label is None:
+        return "" if species is None else str(species)
+    return _MOLECULE_DISPLAY_LABELS[label]
+
+
 def normalize_species_label(species: str | None) -> str:
     """Normalize user-facing species selectors used by atom-resolved analyses."""
     if species is None:
@@ -24,6 +77,11 @@ def normalize_species_label(species: str | None) -> str:
     token = str(species).strip()
     if not token or token.lower() == "all" or token == "*":
         return "ALL"
+    if token.lower() in {"elements", "molecules"}:
+        return token.upper()
+    molecule_label = normalize_molecule_label(token)
+    if token.lower().startswith("mol:") and molecule_label is not None:
+        return molecule_label
     if token.upper() == "H2O":
         return "H2O"
     return token[0].upper() + token[1:].lower()
@@ -33,6 +91,7 @@ def normalize_species_query(
     species: str | None,
     *,
     allow_h2o: bool = False,
+    allow_molecules: bool = False,
 ) -> tuple[str, str]:
     """Resolve density-style species selectors to a mode token plus canonical label."""
     if species is None:
@@ -41,8 +100,13 @@ def normalize_species_query(
     token = str(species).strip()
     if not token or token.lower() == "all" or token == "*":
         return "all", "ALL"
-    if allow_h2o and token.upper() == "H2O":
-        return "h2o", "H2O"
+    if token.lower() == "elements":
+        return "elements", "ELEMENTS"
+    if token.lower() == "molecules":
+        return "molecules", "MOLECULES"
+    molecule_label = normalize_molecule_label(token)
+    if molecule_label is not None and (allow_molecules or (allow_h2o and molecule_label == "mol:H2O")):
+        return "molecule", molecule_label
     return "element", normalize_species_label(token)
 
 

@@ -12,11 +12,16 @@ from typing import Any
 import numpy as np
 from ase import Atoms
 
+from ..progress import ProgressBar
 from ..storage.hdf5_utils import write_linak_hdf5
 from .common import (
+    MOLECULE_SPECIES_LABELS,
     available_element_species,
     frame_has_usable_cell as _common_frame_has_usable_cell,
+    is_molecule_species_label,
+    molecule_display_label,
     normalize_species_label as _normalize_species,
+    normalize_species_query as _normalize_species_query,
     optional_cell_lengths as _optional_cell_lengths,
     optional_finite_float as _optional_finite_float,
     read_profile_payloads,
@@ -24,6 +29,12 @@ from .common import (
     use_multi_series_plot,
     validate_stable_atom_layout as _validate_stable_atom_layout,
     write_profile_collection,
+)
+from .water import (
+    H2O_OH_CUTOFF_A,
+    H2O_VALIDATION_STRIDE,
+    OHTopologyCache,
+    molecule_positions_with_masses as _molecule_positions_with_masses,
 )
 from .surface import (
     _log_framewise_surface_alignment,
@@ -58,6 +69,7 @@ from ..plot.plotting import (
 from ..utils import axis_to_index, ensure_positive
 
 LOGGER = logging.getLogger(__name__)
+DEFAULT_MIN_MOLECULE_FRAMES = 3
 _POSITION_PROJECTION_COMPONENT = "2d-projection"
 _POSITION_PROJECTION_QUANTITIES = (
     "x",
@@ -95,6 +107,12 @@ class PositionProfile:
     surface_position_per_frame: np.ndarray | None = None
     surface_estimate: SurfaceEstimate | None = None
     cell_lengths_angstrom: tuple[float, float, float] | None = None
+    selection_kind: str = "element"
+    entity_kind: str = "atom"
+    entity_counts_per_frame: np.ndarray | None = None
+    oh_cutoff_A: float | None = None
+    min_molecule_frames: int | None = None
+    oh_topology_stride: int | None = None
 
 
 def _frame_has_usable_cell(frame: Atoms) -> bool:
@@ -152,6 +170,9 @@ def _resolve_surface_distance_values(
     surface_options: SurfaceEstimatorOptions | None,
     precomputed_surface_estimate: SurfaceEstimate | None,
 ) -> tuple[np.ndarray, str, float | None, float | None, np.ndarray | None, SurfaceEstimate | None]:
+    if str(surface_mode).strip().lower() == "none":
+        return np.array(axis_values_all, copy=True), "axis", None, None, None, None
+
     surface_estimate: SurfaceEstimate | None
     if precomputed_surface_estimate is not None:
         if precomputed_surface_estimate.frame_values.shape != (axis_values_all.shape[0],):
@@ -207,6 +228,126 @@ def _resolve_surface_distance_values(
     return np.array(axis_values_all, copy=True), "axis", None, None, None, surface_estimate
 
 
+def _position_species_display_label(species_label: str) -> str:
+    if is_molecule_species_label(species_label):
+        return molecule_display_label(species_label)
+    return str(species_label)
+
+
+def _position_selection_summary(
+    *,
+    element_labels: list[str],
+    molecule_labels: list[str],
+) -> str:
+    parts: list[str] = []
+    if element_labels:
+        parts.append("elements=" + ",".join(element_labels))
+    if molecule_labels:
+        parts.append(
+            "molecules="
+            + ",".join(_position_species_display_label(label) for label in molecule_labels)
+        )
+    return "; ".join(parts) if parts else "none"
+
+
+def _molecule_position_label_is_active(
+    *,
+    species_label: str,
+    active_frame_count: int,
+    apply_min_molecule_frames: bool,
+    min_molecule_frames: int,
+) -> bool:
+    if active_frame_count <= 0:
+        return False
+    if not apply_min_molecule_frames:
+        return True
+    if species_label == "mol:H2O":
+        return True
+    return int(active_frame_count) >= int(min_molecule_frames)
+
+
+def _position_surface_context(
+    *,
+    frames: list[Atoms],
+    axis: str,
+    surface_mode: str,
+    surface_elements: list[str] | tuple[str, ...] | None,
+    include_fixed_surface_atoms: bool,
+    surface_options: SurfaceEstimatorOptions | None,
+    precomputed_surface_estimate: SurfaceEstimate | None,
+) -> tuple[str, float | None, float | None, np.ndarray | None, SurfaceEstimate | None]:
+    if str(surface_mode).strip().lower() == "none":
+        return "axis", None, None, None, None
+
+    if precomputed_surface_estimate is not None:
+        surface_estimate = precomputed_surface_estimate
+    else:
+        surface_estimate, _surface_method = _select_surface_estimate(
+            frames,
+            axis,
+            mode=surface_mode,
+            surface_elements=surface_elements,
+            include_fixed_surface_atoms=include_fixed_surface_atoms,
+            surface_options=surface_options,
+            logger=LOGGER,
+        )
+    if surface_estimate is None:
+        LOGGER.warning(
+            "Could not estimate a surface position along %s; storing raw %s coordinates "
+            "for distance-to-surface values.",
+            axis.lower(),
+            axis.lower(),
+        )
+        return "axis", None, None, None, None
+
+    if _surface_estimate_supports_distance_mode(surface_estimate, frame_count=len(frames)):
+        assert surface_estimate.position is not None
+        _log_framewise_surface_alignment(
+            logger=LOGGER,
+            axis=axis,
+            surface_position=surface_estimate.position,
+            surface_position_std=surface_estimate.std,
+        )
+        return (
+            "distance",
+            float(surface_estimate.position),
+            None if surface_estimate.std is None else float(surface_estimate.std),
+            np.asarray(surface_estimate.per_frame, dtype=float),
+            surface_estimate,
+        )
+
+    LOGGER.warning(
+        "Surface position was estimated for %s, but frame-wise alignment was unavailable; "
+        "storing raw %s coordinates for distance-to-surface values.",
+        axis.lower(),
+        axis.lower(),
+    )
+    return "axis", None, None, None, surface_estimate
+
+
+def _distance_values_for_axis_matrix(
+    axis_values: np.ndarray,
+    *,
+    surface_position_per_frame: np.ndarray | None,
+) -> np.ndarray:
+    values = np.asarray(axis_values, dtype=float)
+    if surface_position_per_frame is None:
+        return np.array(values, copy=True)
+    return values - np.asarray(surface_position_per_frame, dtype=float)[:, np.newaxis]
+
+
+def _position_time_arrays(
+    *,
+    frames: list[Atoms],
+    timestep_fs: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    frame_index = np.arange(len(frames), dtype=int)
+    step = _resolve_step_values(frames)
+    time_fs = frame_index.astype(float) * float(timestep_fs)
+    time_ps = time_fs / 1000.0
+    return frame_index, step, time_fs, time_ps
+
+
 def _compute_position_profiles_for_labels(
     *,
     frames: list[Atoms],
@@ -220,65 +361,183 @@ def _compute_position_profiles_for_labels(
     precomputed_surface_estimate: SurfaceEstimate | None,
 ) -> list[PositionProfile]:
     ensure_positive("timestep_fs", timestep_fs)
-    symbols = _validate_stable_atom_layout(
-        frames,
-        description="Atom-resolved position tracking",
-    )
+    if not frames:
+        raise ValueError("At least one trajectory frame is required.")
+    stable_layout = True
+    try:
+        symbols = _validate_stable_atom_layout(
+            frames,
+            description="Atom-resolved position tracking",
+        )
+    except ValueError as exc:
+        stable_layout = False
+        LOGGER.warning(
+            "%s Falling back to frame-wise position selection with NaN padding.",
+            exc,
+        )
+        symbols = np.asarray(frames[0].get_chemical_symbols(), dtype=object)
+
     cell_lengths_angstrom = _resolve_cell_lengths_from_frames(frames)
-    positions = np.stack([np.asarray(frame.positions, dtype=float) for frame in frames], axis=0)
     axis_index = axis_to_index(axis)
-    axis_values_all = positions[:, :, axis_index]
     (
-        distance_to_surface_all,
         coordinate_mode,
         surface_position,
         surface_position_std,
         surface_position_per_frame,
         surface_estimate,
-    ) = _resolve_surface_distance_values(
+    ) = _position_surface_context(
         frames=frames,
         axis=axis,
-        axis_values_all=axis_values_all,
         surface_mode=surface_mode,
         surface_elements=surface_elements,
         include_fixed_surface_atoms=include_fixed_surface_atoms,
         surface_options=surface_options,
         precomputed_surface_estimate=precomputed_surface_estimate,
     )
-
-    frame_index = np.arange(len(frames), dtype=int)
-    step = _resolve_step_values(frames)
-    time_fs = frame_index.astype(float) * float(timestep_fs)
-    time_ps = time_fs / 1000.0
+    frame_index, step, time_fs, time_ps = _position_time_arrays(
+        frames=frames,
+        timestep_fs=timestep_fs,
+    )
 
     profiles: list[PositionProfile] = []
-    for species_label in species_labels:
-        if species_label == "ALL":
-            atom_indices = np.arange(symbols.size, dtype=int)
-        else:
-            atom_indices = np.where(symbols == species_label)[0].astype(int, copy=False)
-        if atom_indices.size == 0:
-            raise ValueError(f"No atoms found for species '{species_label}' in frame 0.")
+    if stable_layout:
+        selected_indices_by_label: dict[str, np.ndarray] = {}
+        for species_label in species_labels:
+            if species_label == "ALL":
+                atom_indices = np.arange(symbols.size, dtype=int)
+            else:
+                atom_indices = np.where(symbols == species_label)[0].astype(int, copy=False)
+            if atom_indices.size == 0:
+                raise ValueError(f"No atoms found for species '{species_label}' in frame 0.")
+            selected_indices_by_label[species_label] = np.asarray(atom_indices, dtype=int)
 
-        selected = positions[:, atom_indices, :]
+        matrices_by_label: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+        for species_label, atom_indices in selected_indices_by_label.items():
+            shape = (len(frames), int(atom_indices.size))
+            matrices_by_label[species_label] = (
+                np.empty(shape, dtype=float),
+                np.empty(shape, dtype=float),
+                np.empty(shape, dtype=float),
+            )
+
+        with ProgressBar(desc="Selecting atom positions", total=len(frames), unit="frame") as progress:
+            for frame_i, frame in enumerate(frames):
+                positions = np.asarray(frame.positions, dtype=float)
+                for species_label, atom_indices in selected_indices_by_label.items():
+                    x_values, y_values, z_values = matrices_by_label[species_label]
+                    selected = positions[atom_indices]
+                    x_values[frame_i, :] = selected[:, 0]
+                    y_values[frame_i, :] = selected[:, 1]
+                    z_values[frame_i, :] = selected[:, 2]
+                progress.update()
+
+        for species_label, atom_indices in selected_indices_by_label.items():
+            x_values, y_values, z_values = matrices_by_label[species_label]
+            axis_values_all = (x_values, y_values, z_values)[axis_index]
+            distance_to_surface_all = _distance_values_for_axis_matrix(
+                axis_values_all,
+                surface_position_per_frame=surface_position_per_frame,
+            )
+            profiles.append(
+                PositionProfile(
+                    species=species_label,
+                    axis=axis.lower(),
+                    atom_indices=np.asarray(atom_indices, dtype=int),
+                    frame_index=np.asarray(frame_index, dtype=int),
+                    step=np.asarray(step, dtype=float),
+                    time_fs=np.asarray(time_fs, dtype=float),
+                    time_ps=np.asarray(time_ps, dtype=float),
+                    x=np.asarray(x_values, dtype=float),
+                    y=np.asarray(y_values, dtype=float),
+                    z=np.asarray(z_values, dtype=float),
+                    distance_to_surface=np.asarray(distance_to_surface_all, dtype=float),
+                    n_frames=len(frames),
+                    n_atoms=int(atom_indices.size),
+                    coordinate_mode=coordinate_mode,
+                    surface_position=surface_position,
+                    surface_position_std=surface_position_std,
+                    surface_position_per_frame=(
+                        None
+                        if surface_position_per_frame is None
+                        else np.asarray(surface_position_per_frame, dtype=float)
+                    ),
+                    surface_estimate=surface_estimate,
+                    cell_lengths_angstrom=cell_lengths_angstrom,
+                )
+            )
+        return profiles
+
+    counts_by_label: dict[str, np.ndarray] = {
+        label: np.zeros(len(frames), dtype=int) for label in species_labels
+    }
+    max_counts_by_label: dict[str, int] = {label: 0 for label in species_labels}
+    for frame_i, frame in enumerate(frames):
+        frame_symbols = np.asarray(frame.get_chemical_symbols(), dtype=object)
+        for species_label in species_labels:
+            if species_label == "ALL":
+                count = int(frame_symbols.size)
+            else:
+                count = int(np.count_nonzero(frame_symbols == species_label))
+            counts_by_label[species_label][frame_i] = count
+            max_counts_by_label[species_label] = max(max_counts_by_label[species_label], count)
+
+    matrices_by_label = {}
+    for species_label in species_labels:
+        max_count = max_counts_by_label[species_label]
+        if max_count <= 0:
+            raise ValueError(f"No atoms found for species '{species_label}' in trajectory.")
+        shape = (len(frames), max_count)
+        matrices_by_label[species_label] = (
+            np.full(shape, np.nan, dtype=float),
+            np.full(shape, np.nan, dtype=float),
+            np.full(shape, np.nan, dtype=float),
+        )
+
+    with ProgressBar(desc="Selecting atom positions", total=len(frames), unit="frame") as progress:
+        for frame_i, frame in enumerate(frames):
+            frame_symbols = np.asarray(frame.get_chemical_symbols(), dtype=object)
+            positions = np.asarray(frame.positions, dtype=float)
+            for species_label in species_labels:
+                if species_label == "ALL":
+                    atom_indices = np.arange(frame_symbols.size, dtype=int)
+                else:
+                    atom_indices = np.where(frame_symbols == species_label)[0].astype(
+                        int,
+                        copy=False,
+                    )
+                if atom_indices.size == 0:
+                    continue
+                x_values, y_values, z_values = matrices_by_label[species_label]
+                selected = positions[atom_indices]
+                count = int(atom_indices.size)
+                x_values[frame_i, :count] = selected[:, 0]
+                y_values[frame_i, :count] = selected[:, 1]
+                z_values[frame_i, :count] = selected[:, 2]
+            progress.update()
+
+    for species_label in species_labels:
+        x_values, y_values, z_values = matrices_by_label[species_label]
+        max_count = int(max_counts_by_label[species_label])
+        axis_values_all = (x_values, y_values, z_values)[axis_index]
+        distance_to_surface_all = _distance_values_for_axis_matrix(
+            axis_values_all,
+            surface_position_per_frame=surface_position_per_frame,
+        )
         profiles.append(
             PositionProfile(
                 species=species_label,
                 axis=axis.lower(),
-                atom_indices=np.asarray(atom_indices, dtype=int),
+                atom_indices=np.arange(max_count, dtype=int),
                 frame_index=np.asarray(frame_index, dtype=int),
                 step=np.asarray(step, dtype=float),
                 time_fs=np.asarray(time_fs, dtype=float),
                 time_ps=np.asarray(time_ps, dtype=float),
-                x=np.asarray(selected[:, :, 0], dtype=float),
-                y=np.asarray(selected[:, :, 1], dtype=float),
-                z=np.asarray(selected[:, :, 2], dtype=float),
-                distance_to_surface=np.asarray(
-                    distance_to_surface_all[:, atom_indices],
-                    dtype=float,
-                ),
+                x=np.asarray(x_values, dtype=float),
+                y=np.asarray(y_values, dtype=float),
+                z=np.asarray(z_values, dtype=float),
+                distance_to_surface=np.asarray(distance_to_surface_all, dtype=float),
                 n_frames=len(frames),
-                n_atoms=int(atom_indices.size),
+                n_atoms=max_count,
                 coordinate_mode=coordinate_mode,
                 surface_position=surface_position,
                 surface_position_std=surface_position_std,
@@ -289,6 +548,187 @@ def _compute_position_profiles_for_labels(
                 ),
                 surface_estimate=surface_estimate,
                 cell_lengths_angstrom=cell_lengths_angstrom,
+                entity_counts_per_frame=np.asarray(counts_by_label[species_label], dtype=int),
+            )
+        )
+    return profiles
+
+
+def _pad_molecule_position_frames(
+    positions_per_frame: list[np.ndarray],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    counts = np.asarray([np.asarray(values).shape[0] for values in positions_per_frame], dtype=int)
+    max_count = int(np.max(counts)) if counts.size else 0
+    shape = (len(positions_per_frame), max_count)
+    x = np.full(shape, np.nan, dtype=float)
+    y = np.full(shape, np.nan, dtype=float)
+    z = np.full(shape, np.nan, dtype=float)
+    for frame_index, positions in enumerate(positions_per_frame):
+        values = np.asarray(positions, dtype=float)
+        if values.size == 0:
+            continue
+        count = values.shape[0]
+        x[frame_index, :count] = values[:, 0]
+        y[frame_index, :count] = values[:, 1]
+        z[frame_index, :count] = values[:, 2]
+    return x, y, z, counts
+
+
+def _compute_molecule_position_profiles_for_labels(
+    *,
+    frames: list[Atoms],
+    molecule_labels: list[str],
+    axis: str,
+    timestep_fs: float,
+    surface_mode: str,
+    surface_elements: list[str] | tuple[str, ...] | None,
+    include_fixed_surface_atoms: bool,
+    surface_options: SurfaceEstimatorOptions | None,
+    precomputed_surface_estimate: SurfaceEstimate | None,
+    oh_cutoff: float = H2O_OH_CUTOFF_A,
+    min_molecule_frames: int = DEFAULT_MIN_MOLECULE_FRAMES,
+    oh_topology_stride: int = H2O_VALIDATION_STRIDE,
+    apply_min_molecule_frames: bool = False,
+) -> list[PositionProfile]:
+    ensure_positive("timestep_fs", timestep_fs)
+    ensure_positive("oh_cutoff", oh_cutoff)
+    if int(min_molecule_frames) < 1:
+        raise ValueError("min_molecule_frames must be >= 1.")
+    if int(oh_topology_stride) < 1:
+        raise ValueError("oh_topology_stride must be >= 1.")
+    if not frames:
+        raise ValueError("At least one trajectory frame is required.")
+
+    axis_index = axis_to_index(axis)
+    cell_lengths_angstrom = _resolve_cell_lengths_from_frames(frames)
+    frame_index, step, time_fs, time_ps = _position_time_arrays(
+        frames=frames,
+        timestep_fs=timestep_fs,
+    )
+    (
+        coordinate_mode,
+        surface_position,
+        surface_position_std,
+        surface_position_per_frame,
+        surface_estimate,
+    ) = _position_surface_context(
+        frames=frames,
+        axis=axis,
+        surface_mode=surface_mode,
+        surface_elements=surface_elements,
+        include_fixed_surface_atoms=include_fixed_surface_atoms,
+        surface_options=surface_options,
+        precomputed_surface_estimate=precomputed_surface_estimate,
+    )
+
+    requested_labels = list(dict.fromkeys(molecule_labels))
+    topology_indices_by_frame: list[dict[str, np.ndarray]] = []
+    counts_by_label: dict[str, np.ndarray] = {
+        label: np.zeros(len(frames), dtype=int) for label in requested_labels
+    }
+    max_counts_by_label: dict[str, int] = {label: 0 for label in requested_labels}
+    topology_cache = OHTopologyCache(
+        oh_cutoff=oh_cutoff,
+        validation_stride=oh_topology_stride,
+        logger=LOGGER,
+        context="position O/H molecule topology",
+    )
+    LOGGER.info("O/H molecule cutoff: %.6g A.", float(oh_cutoff))
+    with ProgressBar(desc="Selecting O/H molecules for position", total=len(frames), unit="frame") as progress:
+        for frame_i, frame in enumerate(frames):
+            topology = topology_cache.select(frame, frame_index=frame_i)
+            frame_indices: dict[str, np.ndarray] = {}
+            for label in requested_labels:
+                indices = np.asarray(topology.indices_for(label), dtype=int)
+                frame_indices[label] = indices
+                count = int(indices.shape[0])
+                counts_by_label[label][frame_i] = count
+                max_counts_by_label[label] = max(max_counts_by_label[label], count)
+            topology_indices_by_frame.append(frame_indices)
+            progress.update()
+
+    active_labels = [
+        label
+        for label in requested_labels
+        if _molecule_position_label_is_active(
+            species_label=label,
+            active_frame_count=int(np.count_nonzero(counts_by_label[label] > 0)),
+            apply_min_molecule_frames=apply_min_molecule_frames,
+            min_molecule_frames=int(min_molecule_frames),
+        )
+    ]
+    detected_non_water = [
+        _position_species_display_label(label)
+        for label in active_labels
+        if label != "mol:H2O" and int(np.count_nonzero(counts_by_label[label] > 0)) > 0
+    ]
+    if detected_non_water:
+        LOGGER.info(
+            "Detected O/H molecule types: %s.",
+            ",".join(detected_non_water),
+        )
+
+    profiles: list[PositionProfile] = []
+    for label in active_labels:
+        max_entities = int(max_counts_by_label[label])
+        if max_entities == 0:
+            continue
+        shape = (len(frames), max_entities)
+        x_values = np.full(shape, np.nan, dtype=float)
+        y_values = np.full(shape, np.nan, dtype=float)
+        z_values = np.full(shape, np.nan, dtype=float)
+        for frame_i, frame in enumerate(frames):
+            molecule_indices = topology_indices_by_frame[frame_i][label]
+            if molecule_indices.size == 0:
+                continue
+            positions, _masses = _molecule_positions_with_masses(
+                frame,
+                molecule_indices,
+            )
+            positions = np.asarray(positions, dtype=float)
+            count = int(positions.shape[0])
+            x_values[frame_i, :count] = positions[:, 0]
+            y_values[frame_i, :count] = positions[:, 1]
+            z_values[frame_i, :count] = positions[:, 2]
+
+        axis_values_all = (x_values, y_values, z_values)[axis_index]
+        distance_to_surface_all = _distance_values_for_axis_matrix(
+            axis_values_all,
+            surface_position_per_frame=surface_position_per_frame,
+        )
+        profiles.append(
+            PositionProfile(
+                species=label,
+                axis=axis.lower(),
+                atom_indices=np.arange(max_entities, dtype=int),
+                frame_index=np.asarray(frame_index, dtype=int),
+                step=np.asarray(step, dtype=float),
+                time_fs=np.asarray(time_fs, dtype=float),
+                time_ps=np.asarray(time_ps, dtype=float),
+                x=np.asarray(x_values, dtype=float),
+                y=np.asarray(y_values, dtype=float),
+                z=np.asarray(z_values, dtype=float),
+                distance_to_surface=np.asarray(distance_to_surface_all, dtype=float),
+                n_frames=len(frames),
+                n_atoms=max_entities,
+                coordinate_mode=coordinate_mode,
+                surface_position=surface_position,
+                surface_position_std=surface_position_std,
+                surface_position_per_frame=(
+                    None
+                    if surface_position_per_frame is None
+                    else np.asarray(surface_position_per_frame, dtype=float)
+                ),
+                surface_estimate=surface_estimate,
+                cell_lengths_angstrom=cell_lengths_angstrom,
+                selection_kind="molecule",
+                entity_kind="molecule",
+                entity_counts_per_frame=np.asarray(counts_by_label[label], dtype=int),
+                oh_cutoff_A=float(oh_cutoff),
+                min_molecule_frames=(
+                    int(min_molecule_frames) if apply_min_molecule_frames else None
+                ),
+                oh_topology_stride=int(oh_topology_stride),
             )
         )
     return profiles
@@ -305,9 +745,40 @@ def compute_position_profile(
     include_fixed_surface_atoms: bool = False,
     surface_options: SurfaceEstimatorOptions | None = None,
     precomputed_surface_estimate: SurfaceEstimate | None = None,
+    oh_cutoff: float = H2O_OH_CUTOFF_A,
+    min_molecule_frames: int = DEFAULT_MIN_MOLECULE_FRAMES,
+    oh_topology_stride: int = H2O_VALIDATION_STRIDE,
 ) -> PositionProfile:
     """Compute one atom-resolved position profile."""
-    species_label = _normalize_species(species)
+    selection_mode, species_label = _normalize_species_query(
+        species,
+        allow_h2o=True,
+        allow_molecules=True,
+    )
+    if selection_mode == "molecule":
+        profiles = _compute_molecule_position_profiles_for_labels(
+            frames=frames,
+            molecule_labels=[species_label],
+            axis=axis,
+            timestep_fs=timestep_fs,
+            surface_mode=surface_mode,
+            surface_elements=surface_elements,
+            include_fixed_surface_atoms=include_fixed_surface_atoms,
+            surface_options=surface_options,
+            precomputed_surface_estimate=precomputed_surface_estimate,
+            oh_cutoff=oh_cutoff,
+            min_molecule_frames=min_molecule_frames,
+            oh_topology_stride=oh_topology_stride,
+            apply_min_molecule_frames=False,
+        )
+        if not profiles:
+            raise ValueError(f"No molecules found for species '{species_label}' in trajectory.")
+        return profiles[0]
+    if selection_mode in {"elements", "molecules"}:
+        raise ValueError(
+            "compute_position_profile accepts one element or molecule selector; "
+            "use compute_position_profiles for group selectors."
+        )
     profiles = _compute_position_profiles_for_labels(
         frames=frames,
         species_labels=[species_label],
@@ -333,10 +804,41 @@ def compute_position_profiles(
     include_fixed_surface_atoms: bool = False,
     surface_options: SurfaceEstimatorOptions | None = None,
     precomputed_surface_estimate: SurfaceEstimate | None = None,
+    oh_cutoff: float = H2O_OH_CUTOFF_A,
+    min_molecule_frames: int = DEFAULT_MIN_MOLECULE_FRAMES,
+    oh_topology_stride: int = H2O_VALIDATION_STRIDE,
 ) -> list[PositionProfile]:
     """Compute one or more atom-resolved position profiles."""
-    species_label = _normalize_species(species)
-    if species_label != "ALL":
+    ensure_positive("oh_cutoff", oh_cutoff)
+    if int(min_molecule_frames) < 1:
+        raise ValueError("min_molecule_frames must be >= 1.")
+    if int(oh_topology_stride) < 1:
+        raise ValueError("oh_topology_stride must be >= 1.")
+    selection_mode, species_label = _normalize_species_query(
+        species,
+        allow_h2o=True,
+        allow_molecules=True,
+    )
+    if selection_mode == "molecule":
+        profiles = _compute_molecule_position_profiles_for_labels(
+            frames=frames,
+            molecule_labels=[species_label],
+            axis=axis,
+            timestep_fs=timestep_fs,
+            surface_mode=surface_mode,
+            surface_elements=surface_elements,
+            include_fixed_surface_atoms=include_fixed_surface_atoms,
+            surface_options=surface_options,
+            precomputed_surface_estimate=precomputed_surface_estimate,
+            oh_cutoff=oh_cutoff,
+            min_molecule_frames=min_molecule_frames,
+            oh_topology_stride=oh_topology_stride,
+            apply_min_molecule_frames=False,
+        )
+        if not profiles:
+            raise ValueError(f"No molecules found for species '{species_label}' in trajectory.")
+        return profiles
+    if selection_mode == "element":
         return [
             compute_position_profile(
                 frames=frames,
@@ -348,23 +850,62 @@ def compute_position_profiles(
                 include_fixed_surface_atoms=include_fixed_surface_atoms,
                 surface_options=surface_options,
                 precomputed_surface_estimate=precomputed_surface_estimate,
+                oh_cutoff=oh_cutoff,
+                min_molecule_frames=min_molecule_frames,
+                oh_topology_stride=oh_topology_stride,
             )
         ]
 
-    element_species = available_element_species(frames)
-    if not element_species:
-        raise ValueError("No elements found in trajectory.")
-    return _compute_position_profiles_for_labels(
-        frames=frames,
-        species_labels=element_species,
-        axis=axis,
-        timestep_fs=timestep_fs,
-        surface_mode=surface_mode,
-        surface_elements=surface_elements,
-        include_fixed_surface_atoms=include_fixed_surface_atoms,
-        surface_options=surface_options,
-        precomputed_surface_estimate=precomputed_surface_estimate,
+    element_species = (
+        available_element_species(frames)
+        if selection_mode in {"all", "elements"}
+        else []
     )
+    if selection_mode in {"all", "elements"} and not element_species:
+        raise ValueError("No elements found in trajectory.")
+    molecule_labels = list(MOLECULE_SPECIES_LABELS) if selection_mode in {"all", "molecules"} else []
+    profiles: list[PositionProfile] = []
+    if element_species:
+        profiles.extend(
+            _compute_position_profiles_for_labels(
+                frames=frames,
+                species_labels=element_species,
+                axis=axis,
+                timestep_fs=timestep_fs,
+                surface_mode=surface_mode,
+                surface_elements=surface_elements,
+                include_fixed_surface_atoms=include_fixed_surface_atoms,
+                surface_options=surface_options,
+                precomputed_surface_estimate=precomputed_surface_estimate,
+            )
+        )
+    if molecule_labels:
+        molecule_profiles = _compute_molecule_position_profiles_for_labels(
+            frames=frames,
+            molecule_labels=molecule_labels,
+            axis=axis,
+            timestep_fs=timestep_fs,
+            surface_mode=surface_mode,
+            surface_elements=surface_elements,
+            include_fixed_surface_atoms=include_fixed_surface_atoms,
+            surface_options=surface_options,
+            precomputed_surface_estimate=precomputed_surface_estimate,
+            oh_cutoff=oh_cutoff,
+            min_molecule_frames=min_molecule_frames,
+            oh_topology_stride=oh_topology_stride,
+            apply_min_molecule_frames=True,
+        )
+        profiles.extend(molecule_profiles)
+    LOGGER.info(
+        "Position selections: %s.",
+        _position_selection_summary(
+            element_labels=element_species,
+            molecule_labels=[
+                profile.species for profile in profiles if profile.selection_kind == "molecule"
+            ],
+        ),
+    )
+    return profiles
 
 
 def _position_profile_hdf5_payload(profile: PositionProfile) -> dict[str, Any]:
@@ -375,7 +916,14 @@ def _position_profile_hdf5_payload(profile: PositionProfile) -> dict[str, Any]:
             "axis": profile.axis,
             "n_frames": int(profile.n_frames),
             "n_atoms": int(profile.n_atoms),
+            "n_entities": int(profile.n_atoms),
             "coordinate_mode": profile.coordinate_mode,
+            "selection_kind": profile.selection_kind,
+            "entity_kind": profile.entity_kind,
+            "entity_counts_available": profile.entity_counts_per_frame is not None,
+            "oh_cutoff_A": profile.oh_cutoff_A,
+            "min_molecule_frames": profile.min_molecule_frames,
+            "oh_topology_stride": profile.oh_topology_stride,
             "cell_lengths_angstrom": (
                 None
                 if profile.cell_lengths_angstrom is None
@@ -399,6 +947,7 @@ def _position_profile_hdf5_payload(profile: PositionProfile) -> dict[str, Any]:
             "y_A": profile.y,
             "z_A": profile.z,
             "distance_to_surface_A": profile.distance_to_surface,
+            "entity_counts": profile.entity_counts_per_frame,
             "surface_position_per_frame_A": profile.surface_position_per_frame,
             **_surface_estimate_datasets(profile.surface_estimate),
         },
@@ -490,6 +1039,52 @@ def load_position_profiles(
     )
 
 
+def _optional_int_metadata(metadata: Mapping[str, Any], name: str) -> int | None:
+    raw_value = metadata.get(name)
+    if raw_value is None:
+        return None
+    return int(raw_value)
+
+
+def _position_payload_matches_selection(
+    metadata: Mapping[str, Any],
+    *,
+    species: str | None = None,
+    axis: str | None = None,
+) -> bool:
+    wanted_axis = None if axis is None or not axis.strip() else axis.strip().lower()
+    if wanted_axis is not None:
+        metadata_axis = str(metadata.get("axis", "z")).strip().lower() or "z"
+        if metadata_axis != wanted_axis:
+            return False
+
+    requested_species = None if species is None or not str(species).strip() else str(species)
+    if requested_species is None:
+        return True
+
+    selection_mode, requested_label = _normalize_species_query(
+        requested_species,
+        allow_h2o=True,
+        allow_molecules=True,
+    )
+    if selection_mode == "all":
+        return True
+
+    metadata_species = str(metadata.get("species", "")).strip()
+    if not metadata_species:
+        return False
+    metadata_mode, metadata_label = _normalize_species_query(
+        metadata_species,
+        allow_h2o=True,
+        allow_molecules=True,
+    )
+    if selection_mode == "elements":
+        return metadata_mode == "element"
+    if selection_mode == "molecules":
+        return metadata_mode == "molecule"
+    return metadata_mode == selection_mode and metadata_label == requested_label
+
+
 def _load_position_profiles_from_payloads(
     source_path: Path,
     payloads: list[tuple[dict[str, np.ndarray], dict[str, Any]]],
@@ -497,8 +1092,6 @@ def _load_position_profiles_from_payloads(
     species: str | None = None,
     axis: str | None = None,
 ) -> list[PositionProfile]:
-    wanted_species = None if species is None or not species.strip() else _normalize_species(species)
-    wanted_axis = None if axis is None or not axis.strip() else axis.strip().lower()
     profiles: list[PositionProfile] = []
     for datasets, metadata in payloads:
         required = (
@@ -522,12 +1115,15 @@ def _load_position_profiles_from_payloads(
         resolved_axis = str(metadata.get("axis", "z")).strip().lower()
         if resolved_axis not in {"x", "y", "z"}:
             resolved_axis = "z"
-
-        if wanted_species is not None and wanted_species != "ALL":
-            if _normalize_species(resolved_species) != wanted_species:
-                continue
-        if wanted_axis is not None and resolved_axis != wanted_axis:
+        if not _position_payload_matches_selection(metadata, species=species, axis=axis):
             continue
+        resolved_mode, resolved_label = _normalize_species_query(
+            resolved_species,
+            allow_h2o=True,
+            allow_molecules=True,
+        )
+        if resolved_mode == "molecule":
+            resolved_species = resolved_label
 
         frame_index = np.asarray(datasets["frame_index"], dtype=int)
         step = np.asarray(datasets["step"], dtype=float)
@@ -572,6 +1168,11 @@ def _load_position_profiles_from_payloads(
             candidate = np.asarray(datasets["surface_position_per_frame_A"], dtype=float)
             if candidate.shape == (expected_shape[0],):
                 surface_per_frame = candidate
+        entity_counts_per_frame = None
+        if "entity_counts" in datasets:
+            candidate_counts = np.asarray(datasets["entity_counts"], dtype=int)
+            if candidate_counts.shape == (expected_shape[0],):
+                entity_counts_per_frame = candidate_counts
         surface_estimate = _surface_estimate_from_payload(
             datasets=datasets,
             metadata=metadata,
@@ -579,6 +1180,8 @@ def _load_position_profiles_from_payloads(
 
         n_frames = int(metadata.get("n_frames", expected_shape[0]))
         n_atoms = int(metadata.get("n_atoms", expected_shape[1]))
+        selection_kind = str(metadata.get("selection_kind", "element")).strip().lower() or "element"
+        entity_kind = str(metadata.get("entity_kind", "atom")).strip().lower() or "atom"
         cell_lengths_angstrom = (
             _optional_cell_lengths(metadata.get("cell_lengths_angstrom"))
             or _optional_cell_lengths(metadata.get("pbc_cell_angstrom"))
@@ -610,6 +1213,12 @@ def _load_position_profiles_from_payloads(
                 surface_position_per_frame=surface_per_frame,
                 surface_estimate=surface_estimate,
                 cell_lengths_angstrom=cell_lengths_angstrom,
+                selection_kind=selection_kind,
+                entity_kind=entity_kind,
+                entity_counts_per_frame=entity_counts_per_frame,
+                oh_cutoff_A=_optional_finite_float(metadata.get("oh_cutoff_A")),
+                min_molecule_frames=_optional_int_metadata(metadata, "min_molecule_frames"),
+                oh_topology_stride=_optional_int_metadata(metadata, "oh_topology_stride"),
             )
         )
     return profiles
@@ -942,7 +1551,8 @@ def _resolve_projection_settings(
 
 
 def _default_position_series_labels(profile: PositionProfile) -> list[str]:
-    return [f"{profile.species}[{int(atom_index)}]" for atom_index in profile.atom_indices.tolist()]
+    species_label = _position_species_display_label(profile.species)
+    return [f"{species_label}[{int(atom_index)}]" for atom_index in profile.atom_indices.tolist()]
 
 
 def _first_non_none(values: list[float | None] | None) -> float | None:
@@ -2271,10 +2881,13 @@ def plot_position_profile(
     default_labels = _default_position_series_labels(profile)
     effective_legend = (profile.n_atoms <= 12) if legend is None else legend
     schema_labels = default_plot_labels("position")
+    entity_descriptor = (
+        "molecule-resolved" if profile.entity_kind == "molecule" else "atom-resolved"
+    )
     default_title = (
-        f"{profile.species} atom-resolved positions"
+        f"{_position_species_display_label(profile.species)} {entity_descriptor} positions"
         if schema_labels is not None
-        else "Atom-resolved positions"
+        else f"{entity_descriptor.capitalize()} positions"
     )
     labels = resolve_series_labels(default_labels, series_labels, series_kind="position")
 
@@ -2710,12 +3323,14 @@ def plot_position_profiles(
         for column, atom_index in enumerate(profile.atom_indices.tolist()):
             x_series.append(np.asarray(x_values, dtype=float))
             y_series.append(np.asarray(matrix[:, column], dtype=float))
-            default_labels.append(f"{profile.species}[{int(atom_index)}]")
+            default_labels.append(
+                f"{_position_species_display_label(profile.species)}[{int(atom_index)}]"
+            )
 
     labels = resolve_series_labels(default_labels, series_labels, series_kind="position")
     effective_legend = (len(labels) <= 12) if legend is None else legend
     schema_labels = default_plot_labels("position")
-    default_title = "Atom-resolved positions" if schema_labels is not None else "Position profile"
+    default_title = "Position profiles" if schema_labels is not None else "Position profile"
 
     return plot_multi_line_series(
         x_series,

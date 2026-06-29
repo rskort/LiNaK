@@ -58,9 +58,8 @@ from .surface import (
 )
 from .water import (
     H2O_OH_CUTOFF_A,
-    H2O_VALIDATION_STRIDE,
+    OHTopologyCache,
     WaterGeometry,
-    water_molecule_triplets,
     water_triplet_geometry,
 )
 from ..plot.plotting import (
@@ -446,23 +445,20 @@ def compute_orientation_profile(
             surface_per_frame = None
 
     coordinate_mode = "distance" if surface_per_frame is not None else "axis"
-    cached_triplets: np.ndarray | None = None
+    topology_cache = OHTopologyCache(
+        oh_cutoff=oh_cutoff,
+        logger=LOGGER,
+        context="H2O topology",
+    )
     n_molecules_per_frame = 0
     frame_data: list[_OrientationFrameData] = []
 
     with ProgressBar(desc="Computing orientation", total=len(frames), unit="frame") as progress:
         for frame_idx, frame in enumerate(frames):
-            if cached_triplets is None:
-                cached_triplets = water_molecule_triplets(frame, oh_cutoff=oh_cutoff)
-            elif frame_idx % H2O_VALIDATION_STRIDE == 0:
-                validated = water_molecule_triplets(frame, oh_cutoff=oh_cutoff)
-                if not np.array_equal(validated, cached_triplets):
-                    LOGGER.warning(
-                        "H2O topology change at frame %d; refreshing water triplets.",
-                        frame_idx,
-                    )
-                    cached_triplets = validated
-
+            cached_triplets = topology_cache.select(
+                frame,
+                frame_index=frame_idx,
+            ).indices_for("mol:H2O")
             geom = water_triplet_geometry(frame, cached_triplets)
             n_mol = geom.com_positions.shape[0]
             if frame_idx == 0 or (n_molecules_per_frame == 0 and n_mol > 0):

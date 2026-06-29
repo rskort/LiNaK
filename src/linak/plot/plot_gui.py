@@ -293,6 +293,7 @@ _TOOLTIPS: dict[str, str] = {
     "profiles.export_json": "Saves this profile to a JSON file.",
     "export.transparent": "Saves the figure with a transparent background.",
     "export.figure": "Saves the current figure to an image file.",
+    "export.data": "Saves the current preview line data to a text data file.",
     "data.density.x_values": "Chooses which source quantity is assigned to the x role.",
     "data.density.quantity": "Chooses which density quantity is assigned to the y role.",
     "data.profile.species": "Filters the stored profile by species.",
@@ -1628,6 +1629,13 @@ def _figure_filetype_filters() -> tuple[str, str]:
     return ";;".join(filters), default_name
 
 
+def _data_filetype_filters() -> tuple[str, str]:
+    return (
+        "CSV data (*.csv);;DAT data (*.dat);;TSV data (*.tsv);;Text data (*.txt);;All files (*)",
+        "linak_plot_data.csv",
+    )
+
+
 def _resolve_asset_path(filename: str, *, module_path: Path | None = None) -> Path:
     """Resolve shared asset files from a source tree or an installed distribution."""
     resolved_module_path = (
@@ -1683,6 +1691,7 @@ def launch_plot_settings_panel(
     on_preview: Callable[[dict[str, Any]], dict[str, Any] | None],
     on_save: Callable[[str, dict[str, Any]], str],
     on_save_figure: Callable[[dict[str, Any], str], str | tuple[str, dict[str, Any]]] | None = None,
+    on_save_data: Callable[[dict[str, Any], str], str | tuple[str, dict[str, Any]]] | None = None,
     on_import_hdf5: Callable[[str, str | None], dict[str, Any]] | None = None,
     on_list_import_hdf5_profiles: Callable[[str], dict[str, Any]] | None = None,
     analysis_name: str | None = None,
@@ -2149,6 +2158,7 @@ def launch_plot_settings_panel(
             on_fit: Callable[[], None],
             on_actual_size: Callable[[], None],
             on_save_figure_callback: Callable[[], None],
+            on_save_data_callback: Callable[[], None],
             on_auto_update: Callable[[bool], None],
             on_detach: Callable[[], None] | None,
             on_dock: Callable[[], None] | None,
@@ -2195,6 +2205,13 @@ def launch_plot_settings_panel(
             register_tooltip(self.save_figure_button, "export.figure")
             apply_tooltip(self.save_figure_button)
             preview_controls.addWidget(self.save_figure_button)
+
+            self.save_data_button = QPushButton("Export Data")
+            self.save_data_button.setEnabled(auto_update_enabled)
+            self.save_data_button.clicked.connect(on_save_data_callback)
+            register_tooltip(self.save_data_button, "export.data")
+            apply_tooltip(self.save_data_button)
+            preview_controls.addWidget(self.save_data_button)
 
             self.auto_preview_checkbox = QCheckBox("Auto update")
             self.auto_preview_checkbox.setChecked(auto_update_enabled)
@@ -2691,6 +2708,7 @@ def launch_plot_settings_panel(
             self._undo_shortcut: QShortcut | None = None
             self._redo_shortcut: QShortcut | None = None
             self._save_figure_button: QPushButton | None = None
+            self._save_data_button: QPushButton | None = None
             self._auto_preview_checkbox: QCheckBox | None = None
             self._detach_preview_button: QPushButton | None = None
             self._dock_preview_button: QPushButton | None = None
@@ -2761,6 +2779,7 @@ def launch_plot_settings_panel(
             self._tooltip_disabled_reasons: dict[int, str | None] = {}
             self._gui_artwork_path = _default_gui_artwork_path()
             self._figure_save_filters, self._figure_default_name = _figure_filetype_filters()
+            self._data_save_filters, self._data_default_name = _data_filetype_filters()
             self._preview_image_path = (
                 Path(tempfile.gettempdir()) / f"linak_preview_{uuid4().hex}.png"
             )
@@ -3909,6 +3928,7 @@ def launch_plot_settings_panel(
                 on_fit=self._handle_fit_preview,
                 on_actual_size=self._handle_actual_size_preview,
                 on_save_figure_callback=self._handle_save_figure,
+                on_save_data_callback=self._handle_save_data,
                 on_auto_update=self._handle_auto_preview_toggle,
                 on_detach=self._handle_detach_preview,
                 on_dock=None,
@@ -5114,6 +5134,7 @@ def launch_plot_settings_panel(
             self._preview_status = pane.preview_status
             self._preview_button = pane.preview_button
             self._save_figure_button = pane.save_figure_button
+            self._save_data_button = pane.save_data_button
             self._auto_preview_checkbox = pane.auto_preview_checkbox
             self._detach_preview_button = pane.detach_button
             self._dock_preview_button = pane.dock_button
@@ -5125,6 +5146,7 @@ def launch_plot_settings_panel(
             finally:
                 self._auto_preview_checkbox.blockSignals(False)
             self._save_figure_button.setEnabled(on_save_figure is not None)
+            self._save_data_button.setEnabled(on_save_data is not None)
             self._set_preview_loading(self._preview_loading)
             self._refresh_preview_pixmap()
 
@@ -5155,6 +5177,7 @@ def launch_plot_settings_panel(
                 on_fit=self._handle_fit_preview,
                 on_actual_size=self._handle_actual_size_preview,
                 on_save_figure_callback=self._handle_save_figure,
+                on_save_data_callback=self._handle_save_data,
                 on_auto_update=self._handle_auto_preview_toggle,
                 on_detach=None,
                 on_dock=self._handle_dock_preview,
@@ -10754,16 +10777,21 @@ def launch_plot_settings_panel(
         def _update_binning_helper_summary(self, index: int) -> None:
             if self._binning_helper_label is None:
                 return
+            auto_note = str(getattr(self, "_auto_display_note", "") or "").strip()
             if not hasattr(self, "x_bin_width") or not hasattr(self, "min_bin_points"):
                 self._binning_helper_label.hide()
                 self._binning_helper_label.setText("")
                 return
 
             if index < 0 or index >= len(self._series_labels_data):
-                self._binning_helper_label.setText(
+                lines = []
+                if auto_note:
+                    lines.append(auto_note)
+                lines.append(
                     "Refresh preview to inspect source bin size, requested display bin size, "
                     "and bin occupancy for the current layer."
                 )
+                self._binning_helper_label.setText("\n".join(lines))
                 self._binning_helper_label.show()
                 return
 
@@ -10835,6 +10863,8 @@ def launch_plot_settings_panel(
                     "Refresh preview to inspect source bin size, requested display bin size, "
                     "and bin occupancy for the current layer."
                 )
+            if auto_note:
+                lines.insert(0, auto_note)
             self._binning_helper_label.setText("\n".join(lines))
             self._binning_helper_label.show()
 
@@ -14446,6 +14476,7 @@ def launch_plot_settings_panel(
             if hasattr(self, "heatmap_colorbar_aspect"):
                 raw = settings.get("heatmap_colorbar_aspect")
                 self.heatmap_colorbar_aspect.setText(str(raw) if raw is not None else "20")
+            self._auto_display_note = str(settings.get("_auto_display_note") or "").strip()
             self.x_bin_width.setText(str(settings.get("x_bin_width") or ""))
             self._set_combo_value(self.x_bin_reducer, str(settings.get("x_bin_reducer") or "mean"))
             self.min_bin_points.setText(str(settings.get("min_bin_points") or ""))
@@ -16319,6 +16350,31 @@ def launch_plot_settings_panel(
                 self._refresh_shell_state()
             except Exception as exc:
                 self._report_error("Save figure failed", exc)
+
+        def _handle_save_data(self) -> None:
+            if on_save_data is None:
+                self._status_label.setText("Save-data action is not available.")
+                return
+            try:
+                settings = self._collect_settings()
+                output_path, _selected = QFileDialog.getSaveFileName(
+                    self,
+                    "Save Data",
+                    self._data_default_name,
+                    self._data_save_filters,
+                )
+                if not output_path:
+                    self._status_label.setText("Save data canceled.")
+                    return
+                result = on_save_data(settings, output_path)
+                message = result[0] if isinstance(result, tuple) else result
+                render_state = result[1] if isinstance(result, tuple) and len(result) > 1 else None
+                if isinstance(render_state, dict) and render_state:
+                    self._apply_preview_state_to_synced_fields(render_state)
+                self._status_label.setText(message)
+                self._refresh_shell_state()
+            except Exception as exc:
+                self._report_error("Save data failed", exc)
 
         def _confirm_reset_defaults(self) -> bool:
             decision = QMessageBox.question(

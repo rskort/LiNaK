@@ -45,6 +45,7 @@ from .common import (
     read_profile_payloads_by_index,
     select_species_indices as _select_indices,
     use_multi_series_plot,
+    validate_stable_atom_layout as _validate_stable_atom_layout,
     write_profile_collection,
 )
 from ..utils import ensure_positive
@@ -1454,6 +1455,10 @@ def compute_coordination_profile(
     label_a = _normalize_species(species_a)
     label_b = _normalize_species(species_b if species_b is not None else species_a)
     ensure_positive("timestep_fs", timestep_fs)
+    _validate_stable_atom_layout(
+        frames,
+        description="Coordination atom-resolved tracking",
+    )
 
     LOGGER.info(
         "Resolving coordination center trajectories for %d frame(s) using species_a=%s.",
@@ -1498,6 +1503,10 @@ def compute_coordination_profiles(
 
     axis_label = _normalize_axis(axis)
     ensure_positive("timestep_fs", timestep_fs)
+    _validate_stable_atom_layout(
+        frames,
+        description="Coordination atom-resolved tracking",
+    )
     resolved_pairs = (
         [
             (_normalize_species(species_a), _normalize_species(species_b))

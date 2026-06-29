@@ -235,7 +235,7 @@ def test_expected_output_naming_versions_collisions(tmp_path):
         settings={"species": "O", "axis": "z", "bin_width": 0.1, "outputs": "line"},
     )
 
-    assert outputs == (project / "traj.density_1.h5",)
+    assert outputs == (project / "traj_1.density.h5",)
 
 
 def test_viewmodels_build_guided_display_rows(tmp_path):
@@ -407,6 +407,60 @@ def test_gui_action_settings_snapshot_and_hash_are_stable(tmp_path):
     assert gui_settings.output_paths == (project / "traj.density.h5",)
 
 
+def test_position_gui_backend_forwards_oh_molecule_options(tmp_path, monkeypatch):
+    import linak.gui.actions as actions_mod
+
+    project = tmp_path / "project"
+    project.mkdir()
+    trajectory = tmp_path / "traj.xyz"
+    _write_xyz(trajectory)
+    item = detect_project_item(trajectory, origin="external")
+    action = ActionRegistry().by_id("position")
+    captured: dict[str, object] = {}
+
+    def _fake_run(ctx, argv, expected_outputs):
+        captured["argv"] = tuple(argv)
+        captured["expected_outputs"] = tuple(expected_outputs)
+        return ActionExecutionResult(output_paths=tuple(expected_outputs))
+
+    monkeypatch.setattr(actions_mod, "_run_cli_with_expected_outputs", _fake_run)
+
+    result = action.backend(
+        ActionContext(
+            project_dir=project,
+            item=item,
+            settings={
+                "species": "molecules",
+                "axis": "z",
+                "oh_cutoff": 1.15,
+                "min_molecule_frames": 2,
+                "oh_topology_stride": 3,
+            },
+            log=lambda _level, _message: None,
+            progress=lambda _label, _current, _total: None,
+        )
+    )
+
+    assert result.output_paths == (project / "traj.position.h5",)
+    assert captured["argv"] == (
+        "compute",
+        "position",
+        str(trajectory.resolve()),
+        "--output",
+        str(project / "traj.position.h5"),
+        "--species",
+        "molecules",
+        "--axis",
+        "z",
+        "--oh-cutoff",
+        "1.15",
+        "--min-molecule-frames",
+        "2",
+        "--oh-topology-stride",
+        "3",
+    )
+
+
 def test_component_viewmodels_group_items_and_flag_outputs(tmp_path):
     project = tmp_path / "project"
     project.mkdir()
@@ -436,7 +490,7 @@ def test_component_viewmodels_group_items_and_flag_outputs(tmp_path):
     )
 
     assert rows[0].group_label == "2. Output containers"
-    assert display.output_preview == ("run.density_1.h5",)
+    assert display.output_preview == ("run_1.density.h5",)
     assert display.can_run_defaults
     assert display.cancel_capability == "limited"
 

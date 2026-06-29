@@ -172,9 +172,11 @@ def _pack_settings(item: ProjectItem) -> list[SettingField]:
 
 def _density_settings(_item: ProjectItem) -> list[SettingField]:
     return [
-        SettingField("species", "Species", "text", "all", True, group="Selection", widget="species", multi=True),
+        SettingField("species", "Species", "text", "all", True, group="Selection", widget="species", multi=True, help_text="Use elements, elements/molecules/all, or molecule selectors mol:H, mol:O, mol:OH, mol:H2O, mol:H3O."),
         SettingField("axis", "Axis", "choice", "z", ("x", "y", "z"), True, "Binning", widget="axis"),
         SettingField("bin_width", "Bin width", "float", 0.05, True, "Binning", minimum=0.0, widget="float", unit="A"),
+        SettingField("oh_cutoff", "O-H cutoff", "float", 1.25, required=False, group="Binning", minimum=0.0, widget="float", unit="A"),
+        SettingField("min_molecule_frames", "Min molecule frames", "int", 3, required=False, group="Binning", minimum=1, widget="int"),
         SettingField("outputs", "Outputs", "choice", "line", ("line", "heatmap", "all"), True, "Binning", widget="choice"),
         SettingField("heatmap_planes", "Heatmap planes", "text", group="Binning", help_text="Space-separated xy, xz, yz."),
         *_surface_settings(),
@@ -213,9 +215,12 @@ def _rdf_settings(_item: ProjectItem) -> list[SettingField]:
 
 def _position_settings(_item: ProjectItem) -> list[SettingField]:
     return [
-        SettingField("species", "Species", "text", "all", True, group="Selection", widget="species", multi=True),
+        SettingField("species", "Species", "text", "all", True, group="Selection", widget="species", multi=True, help_text="Use elements/molecules/all, elements like O/H, or molecule selectors mol:H, mol:O, mol:OH, mol:H2O, mol:H3O."),
         SettingField("axis", "Axis", "choice", "z", ("x", "y", "z"), True, "Geometry", widget="axis"),
         SettingField("timestep_fs", "Timestep fs", "float", None, group="Time", minimum=0.0, widget="float", unit="fs"),
+        SettingField("oh_cutoff", "O-H cutoff", "float", 1.25, required=False, group="O/H molecules", minimum=0.0, widget="float", unit="A"),
+        SettingField("min_molecule_frames", "Min molecule frames", "int", 3, required=False, group="O/H molecules", minimum=1, widget="int"),
+        SettingField("oh_topology_stride", "O/H topology stride", "int", 100, required=False, group="O/H molecules", minimum=1, widget="int"),
         *_surface_settings(),
         *_trajectory_settings(),
     ]
@@ -273,21 +278,13 @@ def _stem(path: Path) -> str:
 
 
 def _unique_path(path: Path) -> Path:
+    from ..analysis.output_naming import numbered_hdf5_path
+
     if not path.exists():
         return path
-    lower = str(path).lower()
-    for suffix in (".traj.hdf5", ".traj.h5", ".cube.hdf5", ".cube.h5", ".hdf5", ".h5"):
-        if lower.endswith(suffix):
-            base = str(path)[: -len(suffix)]
-            counter = 1
-            while True:
-                candidate = Path(f"{base}_{counter}{str(path)[-len(suffix):]}")
-                if not candidate.exists():
-                    return candidate
-                counter += 1
     counter = 1
     while True:
-        candidate = path.with_name(f"{path.stem}_{counter}{path.suffix}")
+        candidate = numbered_hdf5_path(path, counter)
         if not candidate.exists():
             return candidate
         counter += 1
@@ -506,6 +503,8 @@ def _compute_density_backend(ctx: ActionContext) -> ActionExecutionResult:
     _add_optional(argv, "--species", ctx.settings.get("species"))
     _add_optional(argv, "--axis", ctx.settings.get("axis"))
     _add_optional(argv, "--bin-width", ctx.settings.get("bin_width"))
+    _add_optional(argv, "--oh-cutoff", ctx.settings.get("oh_cutoff"))
+    _add_optional(argv, "--min-molecule-frames", ctx.settings.get("min_molecule_frames"))
     _add_optional(argv, "--outputs", ctx.settings.get("outputs"))
     planes = _split_words(ctx.settings.get("heatmap_planes"))
     if planes:
@@ -557,6 +556,9 @@ def _compute_position_backend(ctx: ActionContext) -> ActionExecutionResult:
     _add_optional(argv, "--species", ctx.settings.get("species"))
     _add_optional(argv, "--axis", ctx.settings.get("axis"))
     _add_optional(argv, "--timestep-fs", ctx.settings.get("timestep_fs"))
+    _add_optional(argv, "--oh-cutoff", ctx.settings.get("oh_cutoff"))
+    _add_optional(argv, "--min-molecule-frames", ctx.settings.get("min_molecule_frames"))
+    _add_optional(argv, "--oh-topology-stride", ctx.settings.get("oh_topology_stride"))
     _add_surface(argv, ctx.settings)
     _add_optional(argv, "--input", ctx.settings.get("input"))
     _add_cell(argv, ctx.settings.get("cell"))

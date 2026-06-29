@@ -1178,6 +1178,47 @@ def test_plot_multi_line_series_renders_fit_when_base_line_is_hidden(tmp_path):
     assert ax.lines[0].get_label() == "base fit"
 
 
+def test_plot_multi_line_series_captures_visible_xy_export_payload(tmp_path):
+    capture_state: dict[str, object] = {}
+
+    result = plotting_module.plot_multi_line_series(
+        [
+            np.array([0.0, 1.0, 2.0], dtype=float),
+            np.array([0.0, 1.0, 2.0], dtype=float),
+        ],
+        [
+            np.array([1.0, 3.0, 5.0], dtype=float),
+            np.array([10.0, 20.0, 30.0], dtype=float),
+        ],
+        ["base", "hidden"],
+        series_ids=["series:a", "series:hidden"],
+        title="Export payload",
+        x_label="x",
+        y_label="y",
+        output=tmp_path / "export_payload.png",
+        show=False,
+        series_enabled=[True, False],
+        x_axis_scale=10.0,
+        x_axis_offset=1.0,
+        series_fit_configs=[{"fit_enabled": True, "fit_type": "linear"}, None],
+        series_cumulative_configs=[{"enabled": True, "show_in_legend": True}, None],
+        capture_state=capture_state,
+    )
+
+    assert result is not None
+    payload = capture_state["plotted_xy_series"]
+    assert isinstance(payload, list)
+    assert [entry["series_kind"] for entry in payload] == ["source", "fit", "cumulative"]
+    assert [entry["series_id"] for entry in payload] == [
+        "series:a",
+        "series:a::fit",
+        "series:a::cumulative",
+    ]
+    np.testing.assert_allclose(payload[0]["x"], np.array([1.0, 11.0, 21.0], dtype=float))
+    np.testing.assert_allclose(payload[0]["y"], np.array([1.0, 3.0, 5.0], dtype=float))
+    assert all("hidden" not in entry["series_id"] for entry in payload)
+
+
 def test_plot_multi_line_series_hides_group_raw_line_when_show_raw_line_is_off(tmp_path):
     capture_state: dict[str, object] = {}
 

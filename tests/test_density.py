@@ -30,6 +30,87 @@ from linak.analysis.density import (
 from linak.plot.mappings.density_mapping import density_plot_options_to_view_mapping
 
 
+def _mixed_oh_frame() -> Atoms:
+    symbols = [
+        "O", "H", "H", "H",
+        "O", "H", "H",
+        "O", "H",
+        "O",
+        "H",
+    ]
+    positions = [
+        [0.0, 0.0, 0.0],
+        [0.9, 0.0, 0.0],
+        [-0.9, 0.0, 0.0],
+        [0.0, 0.9, 0.0],
+        [5.0, 0.0, 0.0],
+        [5.9, 0.0, 0.0],
+        [4.1, 0.0, 0.0],
+        [0.0, 5.0, 0.0],
+        [0.9, 5.0, 0.0],
+        [5.0, 5.0, 0.0],
+        [9.0, 9.0, 0.0],
+    ]
+    return Atoms(symbols, positions=positions, cell=[20.0, 20.0, 20.0], pbc=True)
+
+
+def test_oh_topology_classifies_supported_molecules_and_loose_atoms():
+    topology = water_module.oh_molecule_topology(_mixed_oh_frame())
+
+    assert topology.indices_for("mol:H3O").shape == (1, 4)
+    assert topology.indices_for("mol:H2O").shape == (1, 3)
+    assert topology.indices_for("mol:OH").shape == (1, 2)
+    assert topology.indices_for("mol:O").shape == (1, 1)
+    assert topology.indices_for("mol:H").shape == (1, 1)
+
+
+def test_oh_topology_excludes_ambiguous_shared_hydrogen():
+    frame = Atoms(
+        ["O", "O", "H"],
+        positions=[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.5, 0.0, 0.0]],
+        cell=[10.0, 10.0, 10.0],
+        pbc=True,
+    )
+
+    topology = water_module.oh_molecule_topology(frame)
+
+    assert topology.indices_for("mol:OH").size == 0
+    assert topology.indices_for("mol:O").size == 0
+    assert topology.indices_for("mol:H").size == 0
+    np.testing.assert_array_equal(topology.ambiguous_hydrogen_indices, np.array([2]))
+
+
+def test_oh_topology_cache_switches_to_per_frame_after_stride_change(caplog):
+    frame0 = Atoms(
+        ["O", "H", "H"],
+        positions=[[0.0, 0.0, 0.0], [0.9, 0.0, 0.0], [-0.9, 0.0, 0.0]],
+        cell=[10.0, 10.0, 10.0],
+        pbc=True,
+    )
+    frame_h3o = Atoms(
+        ["O", "H", "H", "H"],
+        positions=[[0.0, 0.0, 0.0], [0.9, 0.0, 0.0], [-0.9, 0.0, 0.0], [0.0, 0.9, 0.0]],
+        cell=[10.0, 10.0, 10.0],
+        pbc=True,
+    )
+    frame_ho = Atoms(
+        ["O", "H"],
+        positions=[[0.0, 0.0, 0.0], [0.9, 0.0, 0.0]],
+        cell=[10.0, 10.0, 10.0],
+        pbc=True,
+    )
+    cache = water_module.OHTopologyCache(validation_stride=2)
+
+    caplog.set_level("WARNING", logger="linak.analysis.water")
+    assert cache.select(frame0, frame_index=0).indices_for("mol:H2O").shape[0] == 1
+    assert cache.select(frame_h3o, frame_index=1).indices_for("mol:H2O").shape[0] == 1
+    assert cache.select(frame_h3o, frame_index=2).indices_for("mol:H3O").shape[0] == 1
+    assert cache.per_frame is True
+    assert "likely indicates H-jumping" in caplog.text
+    assert "slower per-frame O/H molecule detection" in caplog.text
+    assert cache.select(frame_ho, frame_index=3).indices_for("mol:OH").shape[0] == 1
+
+
 def test_density_profile_linear_density_without_cell():
     frame1 = Atoms("OO", positions=[[0.0, 0.0, 0.02], [0.0, 0.0, 0.08]])
     frame2 = Atoms("OO", positions=[[0.0, 0.0, 0.02], [0.0, 0.0, 0.18]])
@@ -185,7 +266,20 @@ def test_compute_all_density_profiles_matches_single_profile_results_for_one_spe
             orthogonal_axis=next(axis for axis in ("x", "y", "z") if axis not in plane),
             species_label="O",
             bin_width=1.0,
-            histogram_bounds=None,
+            histogram_bounds=(
+                density_module._cell_histogram_bounds(
+                    frames=frames,
+                    axis_index="xyz".index(plane[0]),
+                    coordinate_mode="axis",
+                    surface_per_frame=None,
+                ),
+                density_module._cell_histogram_bounds(
+                    frames=frames,
+                    axis_index="xyz".index(plane[1]),
+                    coordinate_mode="axis",
+                    surface_per_frame=None,
+                ),
+            ),
         )
         actual = heatmap_profiles[plane]
         np.testing.assert_allclose(actual.density, expected.density)
@@ -203,7 +297,136 @@ def test_compute_all_density_profiles_supports_h2o_selection():
     profiles = compute_all_density_profiles([frame], species="H2O", surface_mode="none", bin_width=1.0)
 
     assert len(profiles) == 4
-    assert all(profile.species == "H2O" for profile in profiles)
+    assert all(profile.species == "mol:H2O" for profile in profiles)
+
+
+def test_compute_density_profile_supports_oh_molecule_selectors():
+    frame = _mixed_oh_frame()
+
+    for selector in ("mol:H3O", "mol:H2O", "mol:OH", "mol:O", "mol:H"):
+        profile = compute_density_profile(
+            frames=[frame],
+            species=selector,
+            axis="z",
+            bin_width=1.0,
+            surface_mode="none",
+        )
+        assert profile.species == selector
+        assert profile.number_density_units == "molecule/nm^3"
+        assert profile.entities_per_frame is not None
+        assert np.sum(profile.entities_per_frame) == pytest.approx(1.0)
+
+
+def test_compute_all_density_profiles_all_includes_active_oh_molecules():
+    profiles = compute_all_density_profiles(
+        [_mixed_oh_frame()],
+        species="all",
+        bin_width=1.0,
+        surface_mode="none",
+        min_molecule_frames=1,
+    )
+
+    z_line_species = {
+        profile.species
+        for profile in profiles
+        if isinstance(profile, DensityProfile)
+        and profile.axis == "z"
+        and profile.coordinate_mode == "axis"
+    }
+
+    assert {"H", "O", "mol:H", "mol:O", "mol:OH", "mol:H2O", "mol:H3O"} <= z_line_species
+
+
+def test_compute_all_density_profiles_group_selectors_and_molecule_threshold():
+    frame = _mixed_oh_frame()
+
+    element_profiles = compute_all_density_profiles(
+        [frame],
+        species="elements",
+        bin_width=1.0,
+        surface_mode="none",
+    )
+    element_species = {
+        profile.species
+        for profile in element_profiles
+        if isinstance(profile, DensityProfile)
+        and profile.axis == "z"
+        and profile.coordinate_mode == "axis"
+    }
+    assert element_species == {"H", "O"}
+
+    default_molecule_profiles = compute_all_density_profiles(
+        [frame],
+        species="molecules",
+        bin_width=1.0,
+        surface_mode="none",
+    )
+    default_molecule_species = {
+        profile.species
+        for profile in default_molecule_profiles
+        if isinstance(profile, DensityProfile)
+        and profile.axis == "z"
+        and profile.coordinate_mode == "axis"
+    }
+    assert default_molecule_species == {"mol:H2O"}
+
+    all_molecule_profiles = compute_all_density_profiles(
+        [frame],
+        species="molecules",
+        bin_width=1.0,
+        surface_mode="none",
+        min_molecule_frames=1,
+    )
+    all_molecule_species = {
+        profile.species
+        for profile in all_molecule_profiles
+        if isinstance(profile, DensityProfile)
+        and profile.axis == "z"
+        and profile.coordinate_mode == "axis"
+    }
+    assert all_molecule_species == {"mol:H", "mol:O", "mol:OH", "mol:H2O", "mol:H3O"}
+
+
+def test_density_molecule_aliases_cutoff_and_visible_metadata_round_trip(tmp_path):
+    output = tmp_path / "density_oh.h5"
+    profile = compute_density_profile(
+        frames=[_mixed_oh_frame()],
+        species="mol:HO",
+        axis="z",
+        bin_width=1.0,
+        surface_mode="none",
+        oh_cutoff=1.4,
+    )
+
+    assert profile.species == "mol:OH"
+    assert profile.oh_cutoff_A == pytest.approx(1.4)
+    assert profile.visible_x_min_A is not None
+    assert profile.visible_x_max_A is not None
+
+    save_density_profile(profile, output)
+    loaded = load_density_profile(output, species="OH", axis="z")
+
+    assert loaded.species == "mol:OH"
+    assert loaded.oh_cutoff_A == pytest.approx(1.4)
+    assert loaded.visible_x_min_A == pytest.approx(profile.visible_x_min_A)
+    assert loaded.visible_x_max_A == pytest.approx(profile.visible_x_max_A)
+
+
+def test_density_hdf5_loads_molecule_profiles_by_alias(tmp_path):
+    output = tmp_path / "density.h5"
+    profile = compute_density_profile(
+        frames=[_mixed_oh_frame()],
+        species="mol:H3O",
+        axis="z",
+        bin_width=1.0,
+        surface_mode="none",
+    )
+    save_density_profile(profile, output)
+
+    loaded = load_density_profiles(output, species="H3O", axis="z")
+
+    assert [profile.species for profile in loaded] == ["mol:H3O"]
+    assert loaded[0].number_density_units == "molecule/nm^3"
 
 
 def test_save_and_load_density_heatmap_profiles_round_trip(tmp_path):
@@ -829,7 +1052,7 @@ def test_density_profile_h2o_counts_water_molecules():
     np.testing.assert_allclose(profile.counts_per_frame, np.array([h2o_mass_g, h2o_mass_g]))
     np.testing.assert_allclose(profile.density, np.array([h2o_mass_g / 0.5, h2o_mass_g / 0.5]))
     np.testing.assert_allclose(profile.number_density, np.array([2.0, 2.0]))
-    assert profile.species == "H2O"
+    assert profile.species == "mol:H2O"
     assert profile.units == "g/Angstrom"
     assert profile.number_density_units == "molecule/Angstrom"
 
@@ -889,7 +1112,7 @@ def test_compute_density_profiles_all_includes_elements_and_h2o():
         axis="z",
         bin_width=1.0,
     )
-    assert [profile.species for profile in profiles] == ["H", "O", "H2O"]
+    assert [profile.species for profile in profiles] == ["H", "O", "mol:H2O"]
 
 
 def test_compute_density_profiles_all_reuses_cached_h2o_topology(monkeypatch):
@@ -902,18 +1125,18 @@ def test_compute_density_profiles_all_reuses_cached_h2o_topology(monkeypatch):
         ],
     )
     frames = [frame.copy() for _ in range(density_module.H2O_VALIDATION_STRIDE + 1)]
-    original = water_module.water_molecule_triplets
+    original = water_module.oh_molecule_topology
     call_count = 0
 
-    def counting_water_molecule_triplets(*args, **kwargs):
+    def counting_oh_molecule_topology(*args, **kwargs):
         nonlocal call_count
         call_count += 1
         return original(*args, **kwargs)
 
     monkeypatch.setattr(
         water_module,
-        "water_molecule_triplets",
-        counting_water_molecule_triplets,
+        "oh_molecule_topology",
+        counting_oh_molecule_topology,
     )
 
     profiles = compute_density_profiles(
@@ -923,7 +1146,7 @@ def test_compute_density_profiles_all_reuses_cached_h2o_topology(monkeypatch):
         bin_width=1.0,
     )
 
-    assert [profile.species for profile in profiles] == ["H", "O", "H2O"]
+    assert [profile.species for profile in profiles] == ["H", "O", "mol:H2O"]
     assert call_count == 2
 
 
@@ -1154,7 +1377,7 @@ def test_save_density_profiles_writes_hdf5_collection(tmp_path):
 
     assert saved_path == out.resolve()
     loaded = load_density_profiles(out)
-    assert [profile.species for profile in loaded] == ["H", "O", "H2O"]
+    assert [profile.species for profile in loaded] == ["H", "O", "mol:H2O"]
 
 
 def test_load_density_profile_rejects_missing_v1_bin_width_metadata(tmp_path):
@@ -2350,7 +2573,7 @@ def test_compute_density_profiles_logs_one_compact_info_summary(caplog):
             bin_width=1.0,
         )
 
-    assert [profile.species for profile in profiles] == ["H", "O", "H2O"]
+    assert [profile.species for profile in profiles] == ["H", "O", "mol:H2O"]
     info_messages = [
         record.getMessage() for record in caplog.records if record.levelno == logging.INFO
     ]
@@ -2358,7 +2581,7 @@ def test_compute_density_profiles_logs_one_compact_info_summary(caplog):
         message for message in info_messages if "Density compute summary:" in message
     ]
     assert len(summary_messages) == 1
-    assert "3 profile(s): H, O, H2O;" in summary_messages[0]
+    assert "3 profile(s): H, O, mol:H2O;" in summary_messages[0]
     assert any("Binning 3 density profiles." in message for message in info_messages)
     assert not any("Selected " in message for message in info_messages)
     assert not any("Density mode:" in message for message in info_messages)
@@ -2488,10 +2711,9 @@ def test_compute_all_density_profiles_heatmaps_prepare_bounds_before_binning(mon
     )
 
     assert [record["desc"] for record in progress_records] == [
-        "Preparing density bins",
         "Binning density frames",
     ]
-    assert [record["count"] for record in progress_records] == [1, 1]
+    assert [record["count"] for record in progress_records] == [1]
 
 
 def test_compute_all_density_profiles_binning_progress_is_frame_based():

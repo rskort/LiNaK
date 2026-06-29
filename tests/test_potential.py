@@ -14,6 +14,7 @@ from linak.analysis.potential import (
     PotentialComputationFailure,
     PotentialConfig,
     PotentialRecord,
+    combine_potential_hdf5_sources,
     compute_potential_records,
     load_potential_plot_profiles,
     plot_potential_profiles,
@@ -133,8 +134,18 @@ def _write_potential_summary_hdf5(
             dtype=h5py.string_dtype(encoding="utf-8"),
         )
         records.create_dataset(
+            "output_out",
+            data=np.asarray(["output.out" for _index in range(len(ids))], dtype=object),
+            dtype=h5py.string_dtype(encoding="utf-8"),
+        )
+        records.create_dataset(
             "status",
             data=np.asarray(status, dtype=object),
+            dtype=h5py.string_dtype(encoding="utf-8"),
+        )
+        records.create_dataset(
+            "error",
+            data=np.asarray(["" for _index in range(len(ids))], dtype=object),
             dtype=h5py.string_dtype(encoding="utf-8"),
         )
         records.create_dataset(
@@ -276,6 +287,89 @@ def test_load_potential_plot_profiles_falls_back_to_row_order_for_invalid_ids(tm
 
     assert profiles[0].x_values.tolist() == [1.0, 2.0, 3.0]
     assert profiles[1].y_values.tolist() == [1.0, 2.0, 3.0]
+
+
+def test_combine_potential_hdf5_sources_records_original_row_spans(tmp_path):
+    source_a = tmp_path / "potential_a.h5"
+    source_b = tmp_path / "potential_b.h5"
+    combined = tmp_path / "combined.h5"
+    _write_potential_summary_hdf5(
+        source_a,
+        ids=[1, 2],
+        efermi=[1.1, 1.2],
+        water_bulk=[2.1, 2.2],
+        cshe=[0.1, 0.2],
+        status=["ok", "ok"],
+    )
+    _write_potential_summary_hdf5(
+        source_b,
+        ids=[1, 2, 3],
+        efermi=[3.1, 3.2, 3.3],
+        water_bulk=[4.1, 4.2, 4.3],
+        cshe=[0.3, 0.4, 0.5],
+        status=["ok", "missing_fermi", "ok"],
+    )
+
+    output = combine_potential_hdf5_sources([source_a, source_b], output=combined)
+
+    assert output == combined.resolve()
+    with h5py.File(output, "r") as handle:
+        group = handle["combined_sources"]
+        assert [str(value) for value in group["source_path"].asstr()[...]] == [
+            str(source_a.resolve()),
+            str(source_b.resolve()),
+        ]
+        assert group["row_start"][:].tolist() == [0, 2]
+        assert group["row_count"][:].tolist() == [2, 3]
+
+
+def test_load_potential_plot_profiles_reopens_combined_sources_as_separate_layers(tmp_path):
+    source_a = tmp_path / "potential_a.h5"
+    source_b = tmp_path / "potential_b.h5"
+    combined = tmp_path / "combined.h5"
+    _write_potential_summary_hdf5(
+        source_a,
+        ids=[2, 1],
+        efermi=[1.2, 1.1],
+        water_bulk=[2.2, 2.1],
+        cshe=[0.2, 0.1],
+        status=["ok", "ok"],
+    )
+    _write_potential_summary_hdf5(
+        source_b,
+        ids=[2, 1],
+        efermi=[3.2, 3.1],
+        water_bulk=[4.2, 4.1],
+        cshe=[0.4, 0.3],
+        status=["missing_fermi", "ok"],
+    )
+    combine_potential_hdf5_sources([source_a, source_b], output=combined)
+
+    profiles, summary = load_potential_plot_profiles(combined)
+
+    assert len(profiles) == 6
+    assert [profile.series_id for profile in profiles] == [
+        f"{source_a.resolve()}::water_bulk_potential_ev",
+        f"{source_a.resolve()}::efermi_ev",
+        f"{source_a.resolve()}::electrode_cshe_ev",
+        f"{source_b.resolve()}::water_bulk_potential_ev",
+        f"{source_b.resolve()}::efermi_ev",
+        f"{source_b.resolve()}::electrode_cshe_ev",
+    ]
+    assert [profile.default_label for profile in profiles] == [
+        "potential_a: Water bulk",
+        "potential_a: Fermi",
+        "potential_a: cSHE",
+        "potential_b: Water bulk",
+        "potential_b: Fermi",
+        "potential_b: cSHE",
+    ]
+    assert profiles[1].x_values.tolist() == [1.0, 2.0]
+    assert profiles[1].y_values.tolist() == [1.1, 1.2]
+    assert profiles[4].y_values.tolist() == [3.1, 3.2]
+    assert summary["total_rows"] == 4
+    assert summary["complete_rows"] == 3
+    assert summary["incomplete_rows"] == 1
 
 
 def test_plot_potential_profiles_capture_defaults_and_fit_summary(tmp_path):
@@ -821,6 +915,70 @@ def test_compute_potential_writes_and_appends_hdf5(tmp_path):
     assert len(rows_after) == 2
 
 
+def test_compute_potential_shows_loading_progress_for_raw_inputs(tmp_path, monkeypatch):
+    run1 = tmp_path / "run1"
+    run2 = tmp_path / "run2"
+    cube1 = _write_potential_case(run1, fermi_au=0.0367493036)
+    cube2 = _write_potential_case(run2, fermi_au=0.0734986072)
+    output_h5 = tmp_path / "potentials.h5"
+
+    class RecordingProgressBar:
+        instances: list["RecordingProgressBar"] = []
+
+        def __init__(self, *, desc, total=None, unit="it", **_kwargs):
+            self.desc = desc
+            self.total = total
+            self.unit = unit
+            self.updates = 0
+            self.entered = False
+            self.closed = False
+            RecordingProgressBar.instances.append(self)
+
+        def __enter__(self):
+            self.entered = True
+            return self
+
+        def __exit__(self, _exc_type, _exc, _tb):
+            self.closed = True
+
+        def update(self, n=1):
+            self.updates += n
+
+        @classmethod
+        def prepare_for_external_write(cls, _stream):
+            return None
+
+    monkeypatch.setattr("linak.progress.ProgressBar", RecordingProgressBar)
+
+    rc = main(
+        [
+            "--log-level",
+            "ERROR",
+            "compute",
+            "potential",
+            "-f",
+            str(cube1),
+            str(cube2),
+            "--output",
+            str(output_h5),
+            "--water-padding-ang",
+            "0.2",
+        ]
+    )
+
+    assert rc == 0
+    loading_bars = [
+        bar for bar in RecordingProgressBar.instances if bar.desc == "Loading potential inputs"
+    ]
+    assert len(loading_bars) == 1
+    loading_bar = loading_bars[0]
+    assert loading_bar.total == 2
+    assert loading_bar.unit == "file"
+    assert loading_bar.entered
+    assert loading_bar.closed
+    assert loading_bar.updates == 2
+
+
 def test_compute_potential_incompatible_hdf5_schema_uses_fallback_file(tmp_path):
     run_dir = tmp_path / "run"
     cube = _write_potential_case(run_dir, fermi_au=0.0367493036)
@@ -849,9 +1007,45 @@ def test_compute_potential_incompatible_hdf5_schema_uses_fallback_file(tmp_path)
     with h5py.File(output_h5, "r") as handle:
         assert handle.attrs["analysis"] == "unexpected"
 
-    fallback_matches = sorted(tmp_path.glob("potentials.linak.potential*.h5"))
-    assert fallback_matches
-    fallback_rows = _read_hdf5_rows(fallback_matches[0])
+    fallback_path = tmp_path / "potentials.linak.potential.h5"
+    assert fallback_path.exists()
+    assert not (tmp_path / "potentials.linak.potential_1.h5").exists()
+    fallback_rows = _read_hdf5_rows(fallback_path)
+    assert len(fallback_rows) == 1
+
+
+def test_compute_potential_incompatible_hdf5_schema_versions_fallback_before_analysis_suffix(
+    tmp_path,
+):
+    run_dir = tmp_path / "run"
+    cube = _write_potential_case(run_dir, fermi_au=0.0367493036)
+
+    output_h5 = tmp_path / "potentials.h5"
+    fallback_path = tmp_path / "potentials.linak.potential.h5"
+    with h5py.File(output_h5, "w") as handle:
+        handle.attrs["linak_format"] = "linak-hdf5"
+        handle.attrs["analysis"] = "unexpected"
+    fallback_path.write_text("occupied", encoding="utf-8")
+
+    rc = main(
+        [
+            "--log-level",
+            "ERROR",
+            "compute",
+            "potential",
+            str(cube),
+            "--output",
+            str(output_h5),
+            "--water-padding-ang",
+            "0.2",
+        ]
+    )
+
+    versioned_fallback = tmp_path / "potentials.linak_1.potential.h5"
+    assert rc == 0
+    assert versioned_fallback.exists()
+    assert not (tmp_path / "potentials.linak.potential_1.h5").exists()
+    fallback_rows = _read_hdf5_rows(versioned_fallback)
     assert len(fallback_rows) == 1
 
 

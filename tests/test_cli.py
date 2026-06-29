@@ -30,6 +30,7 @@ from linak.cli import (
     _resolve_orientation_plotter_kwargs,
     _resolve_potential_plotter_kwargs,
     _resolve_rdf_plotter_kwargs,
+    _write_plotted_xy_data_export,
     _without_preview_series_state,
     _rewrite_implicit_csv_interactive,
     _rewrite_implicit_plot_csv,
@@ -37,6 +38,7 @@ from linak.cli import (
     main,
 )
 from linak.analysis.density import (
+    DensityHeatmapProfile,
     compute_all_density_profiles,
     compute_density_profile,
     load_density_heatmap_profiles,
@@ -66,7 +68,7 @@ from linak.storage.hdf5_utils import (
     write_linak_hdf5_profile_collection,
 )
 from linak.analysis.msd import compute_msd, load_msd_profile, save_msd_profile
-from linak.analysis.output_naming import analysis_source_base
+from linak.analysis.output_naming import analysis_source_base, numbered_hdf5_path
 from linak.plot.plot_settings import (
     read_active_plot_profile_name,
     read_plot_profile,
@@ -86,6 +88,7 @@ from linak.analysis.rdf import (
     plot_rdf_profile,
     save_rdf_profile,
 )
+from linak.analysis.potential import combine_potential_hdf5_sources
 from linak.trajectory.io import (
     TrajectoryStoredMetadata,
     read_trajectory,
@@ -441,8 +444,18 @@ def _write_potential_hdf5(path: Path) -> None:
             dtype=h5py.string_dtype(encoding="utf-8"),
         )
         records.create_dataset(
+            "output_out",
+            data=np.asarray(["output.out", "output.out", "output.out"], dtype=object),
+            dtype=h5py.string_dtype(encoding="utf-8"),
+        )
+        records.create_dataset(
             "status",
             data=np.asarray(["ok", "ok", "missing_fermi"], dtype=object),
+            dtype=h5py.string_dtype(encoding="utf-8"),
+        )
+        records.create_dataset(
+            "error",
+            data=np.asarray(["", "", "missing Fermi"], dtype=object),
             dtype=h5py.string_dtype(encoding="utf-8"),
         )
         records.create_dataset(
@@ -2244,6 +2257,32 @@ def test_hdf5_combine_density_outputs_plot_ready_hdf5(tmp_path):
     assert output.exists()
 
 
+def test_hdf5_combine_default_output_uses_combined_base_and_analysis_suffix(tmp_path, monkeypatch):
+    frame = Atoms("OO", positions=[[0.0, 0.0, 0.02], [0.0, 0.0, 0.18]])
+    profile = compute_density_profile([frame], species="O", axis="z", bin_width=0.1)
+    source_a = tmp_path / "source_a_density.h5"
+    source_b = tmp_path / "source_b_density.h5"
+    save_density_profile(profile, source_a)
+    save_density_profile(profile, source_b)
+    monkeypatch.chdir(tmp_path)
+
+    rc = main(
+        [
+            "--log-level",
+            "ERROR",
+            "hdf5",
+            "combine",
+            "-f",
+            str(source_a),
+            str(source_b),
+        ]
+    )
+
+    assert rc == 0
+    assert (_linak_output_dir(tmp_path) / "linak_combined.density.h5").exists()
+    assert not (_linak_output_dir(tmp_path) / "linak.density.combined.h5").exists()
+
+
 def test_hdf5_combine_position_outputs_plot_ready_hdf5(tmp_path):
     source_a = tmp_path / "source_a_position.h5"
     source_b = tmp_path / "source_b_position.h5"
@@ -2565,6 +2604,73 @@ def test_plot_potential_multi_source_renders_successfully(tmp_path):
     )
 
     assert rc == 0
+
+
+def test_plot_potential_reopened_combined_hdf5_preserves_source_layers(tmp_path):
+    source_a = tmp_path / "potential_a.h5"
+    source_b = tmp_path / "potential_b.h5"
+    combined = tmp_path / "linak.potential.combined.h5"
+    _write_potential_hdf5(source_a)
+    _write_potential_hdf5(source_b)
+    args = argparse.Namespace(
+        y_quantity=None,
+        table_view=False,
+        view_mapping=None,
+        series_labels=None,
+        line_colors=None,
+        series_overrides=None,
+        _runtime_argv=(),
+    )
+
+    first_open_context = cli_mod._build_potential_gui_context(
+        args,
+        sources=[str(source_a), str(source_b)],
+    )
+    combine_potential_hdf5_sources([source_a, source_b], output=combined)
+    reopened_context = cli_mod._build_potential_gui_context(args, sources=[str(combined)])
+
+    assert [item["series_id"] for item in reopened_context.series_descriptors] == [
+        item["series_id"] for item in first_open_context.series_descriptors
+    ]
+    assert [item["default_label"] for item in reopened_context.series_descriptors] == [
+        item["default_label"] for item in first_open_context.series_descriptors
+    ]
+
+
+def test_plot_potential_gui_multi_source_default_output_uses_combined_base_and_analysis_suffix(
+    tmp_path,
+    monkeypatch,
+):
+    source_a = tmp_path / "potential_a.h5"
+    source_b = tmp_path / "potential_b.h5"
+    _write_potential_hdf5(source_a)
+    _write_potential_hdf5(source_b)
+    monkeypatch.chdir(tmp_path)
+    captured: dict[str, object] = {}
+
+    def _fake_launch_profile_plot_gui(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr("linak.cli._launch_profile_plot_gui", _fake_launch_profile_plot_gui)
+
+    rc = main(
+        [
+            "--log-level",
+            "ERROR",
+            "plot",
+            "-f",
+            str(source_a),
+            str(source_b),
+            "--gui",
+        ]
+    )
+
+    assert rc == 0
+    combined_source = captured["source_path"]
+    assert combined_source == _linak_output_dir(tmp_path) / "linak_combined.potential.h5"
+    assert isinstance(combined_source, Path)
+    assert combined_source.exists()
+    assert not (_linak_output_dir(tmp_path) / "linak.potential.combined.h5").exists()
 
 
 def test_rewrite_implicit_plot_csv_detects_density_with_files_option(tmp_path):
@@ -3089,7 +3195,7 @@ def test_compute_density_outputs_heatmap_respects_selected_planes(tmp_path, monk
     assert [profile.plane for profile in load_density_heatmap_profiles(output)] == ["xy"]
 
 
-def test_compute_density_heatmap_planes_imply_heatmap_output(tmp_path, monkeypatch):
+def test_compute_density_heatmap_planes_require_heatmap_output(tmp_path, monkeypatch, capsys):
     monkeypatch.chdir(tmp_path)
     trajectory = tmp_path / "traj.xyz"
     _write_xyz(trajectory)
@@ -3110,10 +3216,8 @@ def test_compute_density_heatmap_planes_imply_heatmap_output(tmp_path, monkeypat
         ]
     )
 
-    assert rc == 0
-    output = _linak_output_dir(tmp_path) / "traj.density.h5"
-    assert load_density_profiles(output) == []
-    assert [profile.plane for profile in load_density_heatmap_profiles(output)] == ["xy"]
+    assert rc == 1
+    assert "--heatmap-planes requires --outputs heatmap or --outputs all" in capsys.readouterr().err
 
 
 def test_compute_density_rejects_heatmap_planes_with_line_output(capsys):
@@ -3219,6 +3323,9 @@ def test_compute_position_defaults_surface_detection_options():
     args = build_parser().parse_args(["compute", "position", "traj.xyz"])
     assert args.species is None
     assert args.axis == "z"
+    assert args.oh_cutoff == pytest.approx(1.25)
+    assert args.min_molecule_frames == 3
+    assert args.oh_topology_stride == 100
     assert args.surface_mode == "auto"
     assert args.surface_elements is None
     assert args.include_fixed_surface_atoms is False
@@ -5071,6 +5178,103 @@ def test_build_density_gui_context_selects_heatmap_contract(tmp_path):
     assert context.profile_filter_options["density_heatmap_plot_contract"]["default_view_type_id"] == "heatmap_2d"
 
 
+def test_build_density_gui_logical_context_defaults_to_heatmap_for_heatmap_only_hdf5(tmp_path):
+    frame = Atoms(
+        "OO",
+        positions=[[0.0, 1.0, 2.0], [2.0, 3.0, 4.0]],
+        cell=[10.0, 11.0, 12.0],
+        pbc=True,
+    )
+    output = tmp_path / "density_heatmap_only.h5"
+    save_density_profiles(
+        compute_all_density_profiles(
+            [frame],
+            species="O",
+            bin_width=1.0,
+            surface_mode="none",
+            outputs="heatmap",
+            heatmap_planes=["xy"],
+        ),
+        output,
+    )
+    args = argparse.Namespace(
+        species=None,
+        axis=None,
+        plane=None,
+        x_mode="distance",
+        quantity="mass",
+        view_mapping=None,
+        heatmap_vmin=None,
+        heatmap_vmax=None,
+        heatmap_cmap=None,
+        heatmap_log_scale=False,
+        heatmap_colorbar_enabled=True,
+        heatmap_colorbar_label=None,
+        heatmap_colorbar_label_size=None,
+        heatmap_colorbar_tick_size=None,
+        heatmap_colorbar_position="right",
+        heatmap_colorbar_pad=None,
+        heatmap_colorbar_shrink=None,
+        heatmap_colorbar_aspect=None,
+    )
+
+    context = cli_mod._build_density_gui_logical_context(args, sources=[str(output)])
+
+    assert context.plotter_kwargs["view_mapping"].view_type_id == "heatmap_2d"
+    assert context.profile_filter_options["density_view_types"] == ["heatmap_2d"]
+
+
+def test_plot_density_non_gui_defaults_to_heatmap_for_heatmap_only_hdf5(
+    tmp_path,
+    monkeypatch,
+):
+    frame = Atoms(
+        "OO",
+        positions=[[0.0, 1.0, 2.0], [2.0, 3.0, 4.0]],
+        cell=[10.0, 11.0, 12.0],
+        pbc=True,
+    )
+    output = tmp_path / "density_heatmap_only.h5"
+    save_density_profiles(
+        compute_all_density_profiles(
+            [frame],
+            species="O",
+            bin_width=1.0,
+            surface_mode="none",
+            outputs="heatmap",
+            heatmap_planes=["xy"],
+        ),
+        output,
+    )
+    captured: dict[str, object] = {}
+
+    def _fake_plot_density_profiles(profile, **kwargs):
+        captured["profile"] = profile
+        captured["kwargs"] = kwargs
+        return tmp_path / "density.png"
+
+    monkeypatch.setattr("linak.analysis.density.plot_density_profiles", _fake_plot_density_profiles)
+
+    rc = main(
+        [
+            "--log-level",
+            "ERROR",
+            "plot",
+            str(output),
+            "--no-gui",
+            "--no-show",
+        ]
+    )
+
+    assert rc == 0
+    profile = captured["profile"]
+    kwargs = captured["kwargs"]
+    assert isinstance(profile, DensityHeatmapProfile)
+    assert isinstance(kwargs, dict)
+    assert profile.plane == "xy"
+    assert kwargs["view_mapping"].view_type_id == "heatmap_2d"
+
+
 def test_resolve_density_plot_axis_and_x_mode_prefers_explicit_cartesian_values():
     assert cli_mod._resolve_density_plot_axis_and_x_mode(axis=None, x_mode="x") == (None, "x")
     assert cli_mod._resolve_density_plot_axis_and_x_mode(axis="z", x_mode="y") == ("z", "y")
@@ -5228,7 +5432,11 @@ def test_plot_density_gui_accepts_combined_all_axis_density_hdf5(tmp_path, monke
     assert isinstance(initial, dict)
     assert initial["series_count"] == 3
     assert len(initial["series_descriptors"]) == initial["series_count"]
-    assert [item["default_label"] for item in initial["series_descriptors"]] == ["H", "O", "H2O"]
+    assert [item["default_label"] for item in initial["series_descriptors"]] == [
+        "H",
+        "O",
+        "H2O",
+    ]
 
 
 def test_density_gui_combined_all_axis_uses_species_based_logical_descriptors(tmp_path):
@@ -5248,7 +5456,11 @@ def test_density_gui_combined_all_axis_uses_species_based_logical_descriptors(tm
 
     context = cli_mod._build_density_gui_logical_context(args, sources=[str(source_h5)])
 
-    assert [item["default_label"] for item in context.series_descriptors] == ["H", "O", "H2O"]
+    assert [item["default_label"] for item in context.series_descriptors] == [
+        "H",
+        "O",
+        "H2O",
+    ]
     assert all(
         set(item["density_backing_profiles_by_mode"]) == {"distance", "x", "y", "z"}
         for item in context.series_descriptors
@@ -6231,6 +6443,92 @@ def test_plot_density_gui_combined_hdf5_does_not_pass_reordered_series_lists_to_
     assert "series_enabled" not in initial
     assert "series_labels" not in initial
     assert "line_colors" not in initial
+
+
+def test_write_plotted_xy_data_export_single_series_csv(tmp_path):
+    output_path = tmp_path / "preview.csv"
+
+    saved_path = _write_plotted_xy_data_export(
+        {
+            "plotted_xy_series": [
+                {
+                    "series_id": "series:a",
+                    "series_label": "Water bulk",
+                    "series_kind": "source",
+                    "x": [1.0, 2.5],
+                    "y": [3.0, 4.25],
+                }
+            ]
+        },
+        output_path,
+    )
+
+    assert saved_path == output_path.resolve()
+    assert output_path.read_text(encoding="utf-8").splitlines() == [
+        "x,y",
+        "1,3",
+        "2.5,4.25",
+    ]
+
+
+def test_write_plotted_xy_data_export_multi_series_dat(tmp_path):
+    output_path = tmp_path / "preview.dat"
+
+    _write_plotted_xy_data_export(
+        {
+            "plotted_xy_series": [
+                {
+                    "series_id": "series:a",
+                    "series_label": "A",
+                    "series_kind": "source",
+                    "x": [1.0, 2.0],
+                    "y": [3.0, 4.0],
+                },
+                {
+                    "series_id": "series:a::fit",
+                    "series_label": "A fit",
+                    "series_kind": "fit",
+                    "x": [1.0],
+                    "y": [3.0],
+                },
+            ]
+        },
+        output_path,
+    )
+
+    assert output_path.read_text(encoding="utf-8").splitlines() == [
+        "series_id series_label series_kind point_index x y",
+        "series:a A source 1 1 3",
+        "series:a A source 2 2 4",
+        'series:a::fit "A fit" fit 1 1 3',
+    ]
+
+
+def test_write_plotted_xy_data_export_rejects_missing_xy_payload(tmp_path):
+    with pytest.raises(ValueError, match="No line xy data"):
+        _write_plotted_xy_data_export({}, tmp_path / "preview.csv")
+
+
+def test_open_plot_settings_gui_forwards_save_data_callback(monkeypatch):
+    captured: dict[str, object] = {}
+
+    def _fake_launcher(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr("linak.plot.plot_gui.launch_plot_settings_panel", _fake_launcher)
+
+    def _save_data(_settings: dict[str, object], _output_path: str) -> str:
+        return "saved"
+
+    cli_mod._open_plot_settings_gui(
+        title="Plot",
+        initial_settings={},
+        on_preview=lambda _settings: {},
+        on_save=lambda _profile_name, _settings: "saved",
+        on_save_data=_save_data,
+    )
+
+    assert captured["on_save_data"] is _save_data
 
 
 def test_plot_density_gui_first_open_materializes_id_keyed_series_state(tmp_path, monkeypatch):
@@ -7344,9 +7642,52 @@ def test_plot_position_gui_uses_atom_level_series_in_initial_settings(tmp_path, 
     assert resolved["series_labels"] == ["O[2]", "O[3]"]
 
 
-def test_plot_position_gui_refuses_excessive_atom_series(tmp_path):
+def test_position_gui_line_point_estimate_respects_display_bin_width():
+    descriptors = [
+        {"series_id": "a", "n_frames": 1001, "frame_timestep_fs": 1000.0},
+        {"series_id": "b", "n_frames": 1001, "frame_timestep_fs": 1000.0},
+    ]
+
+    raw_points = cli_mod._estimate_position_line_points_from_descriptors(
+        descriptors,
+        x_bin_width=None,
+        time_axis="ps",
+    )
+    binned_points = cli_mod._estimate_position_line_points_from_descriptors(
+        descriptors,
+        x_bin_width=100.0,
+        time_axis="ps",
+    )
+
+    assert raw_points == 2002
+    assert binned_points == 22
+
+
+def test_position_gui_round_robin_initial_series_selection_spans_profiles():
+    descriptors = []
+    for profile in ("H", "O", "Pt"):
+        for atom_index in range(3):
+            descriptors.append(
+                {
+                    "series_id": f"{profile}:{atom_index}",
+                    "profile_uid": profile,
+                    "rendered_species": profile,
+                    "atom_index": atom_index,
+                }
+            )
+
+    selected = cli_mod._select_round_robin_position_series_ids(descriptors, limit=5)
+
+    assert selected == {"H:0", "O:0", "Pt:0", "H:1", "O:1"}
+
+
+def test_plot_position_gui_auto_reduces_excessive_atom_series(tmp_path, monkeypatch, caplog):
     source_h5 = tmp_path / "large_position.h5"
     _write_large_position_hdf5(source_h5, n_atoms=200, n_frames=3)
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr("linak.cli._render_profile_plot", lambda **_kwargs: (None, {}))
+    monkeypatch.setattr("linak.cli._open_plot_settings_gui", lambda **kwargs: captured.update(kwargs))
 
     argv = ["plot", str(source_h5), "--gui"]
     args = build_parser().parse_args(argv)
@@ -7361,27 +7702,55 @@ def test_plot_position_gui_refuses_excessive_atom_series(tmp_path):
     )
     initial_context = catalog.build_initial_context()
 
-    with pytest.raises(ValueError, match="too large for interactive GUI controls"):
-        cli_mod._launch_profile_plot_gui(
-            args=args,
-            default_args=default_args,
-            source_path=source_h5,
-            profile_key="plot:position",
-            setting_keys=cli_mod._PLOT_SETTINGS_POSITION_KEYS,
-            gui_title="LiNaK Plot Controls: Position",
-            analysis_name="position",
-            plotter=lambda *_args, **_kwargs: None,
-            initial_context=initial_context,
-            build_context=lambda current_args: catalog.build_render_context(current_args),
-            build_full_context=lambda current_args: catalog.build_initial_context(),
-        )
+    caplog.set_level(logging.WARNING, logger="linak.cli")
+    cli_mod._launch_profile_plot_gui(
+        args=args,
+        default_args=default_args,
+        source_path=source_h5,
+        profile_key="plot:position",
+        setting_keys=cli_mod._PLOT_SETTINGS_POSITION_KEYS,
+        gui_title="LiNaK Plot Controls: Position",
+        analysis_name="position",
+        plotter=lambda *_args, **_kwargs: None,
+        initial_context=initial_context,
+        build_context=lambda current_args: catalog.build_render_context(current_args),
+        build_full_context=lambda current_args: catalog.build_initial_context(),
+    )
+
+    initial = captured["initial_settings"]
+    assert isinstance(initial, dict)
+    assert len(initial["series_descriptors"]) == 200
+    overrides = initial["series_overrides"]
+    enabled = [
+        series_id
+        for series_id, entry in overrides.items()
+        if isinstance(entry, dict) and entry.get("enabled") is True
+    ]
+    disabled = [
+        series_id
+        for series_id, entry in overrides.items()
+        if isinstance(entry, dict) and entry.get("enabled") is False
+    ]
+    assert len(enabled) == 64
+    assert len(disabled) == 136
+    assert initial["x_bin_width"] > 0
+    assert initial["x_bin_reducer"] == "mean"
+    assert "HDF5 data is unchanged" in initial["_auto_display_note"]
+    assert "Position GUI auto-reduced display" in caplog.text
+    assert "HDF5 data is unchanged" in caplog.text
 
 
-def test_plot_position_gui_combined_sources_refuses_after_descriptor_expansion(tmp_path):
+def test_plot_position_gui_combined_sources_auto_reduces_after_descriptor_expansion(
+    tmp_path, monkeypatch
+):
     source_h5_a = tmp_path / "large_a_position.h5"
     source_h5_b = tmp_path / "large_b_position.h5"
     _write_large_position_hdf5(source_h5_a, n_atoms=100, n_frames=3)
     _write_large_position_hdf5(source_h5_b, n_atoms=100, n_frames=3)
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr("linak.cli._render_profile_plot", lambda **_kwargs: (None, {}))
+    monkeypatch.setattr("linak.cli._open_plot_settings_gui", lambda **kwargs: captured.update(kwargs))
 
     argv = ["plot", "-f", str(source_h5_a), str(source_h5_b), "--gui"]
     args = build_parser().parse_args(argv)
@@ -7401,20 +7770,30 @@ def test_plot_position_gui_combined_sources_refuses_after_descriptor_expansion(t
     )
     initial_context = catalog.build_initial_context()
 
-    with pytest.raises(ValueError, match="200 series"):
-        cli_mod._launch_profile_plot_gui(
-            args=args,
-            default_args=default_args,
-            source_path=combined_source,
-            profile_key="plot:position",
-            setting_keys=cli_mod._PLOT_SETTINGS_POSITION_KEYS,
-            gui_title="LiNaK Plot Controls: Position",
-            analysis_name="position",
-            plotter=lambda *_args, **_kwargs: None,
-            initial_context=initial_context,
-            build_context=lambda current_args: catalog.build_render_context(current_args),
-            build_full_context=lambda current_args: catalog.build_initial_context(),
-        )
+    cli_mod._launch_profile_plot_gui(
+        args=args,
+        default_args=default_args,
+        source_path=combined_source,
+        profile_key="plot:position",
+        setting_keys=cli_mod._PLOT_SETTINGS_POSITION_KEYS,
+        gui_title="LiNaK Plot Controls: Position",
+        analysis_name="position",
+        plotter=lambda *_args, **_kwargs: None,
+        initial_context=initial_context,
+        build_context=lambda current_args: catalog.build_render_context(current_args),
+        build_full_context=lambda current_args: catalog.build_initial_context(),
+    )
+
+    initial = captured["initial_settings"]
+    assert isinstance(initial, dict)
+    assert len(initial["series_descriptors"]) == 200
+    enabled = [
+        series_id
+        for series_id, entry in initial["series_overrides"].items()
+        if isinstance(entry, dict) and entry.get("enabled") is True
+    ]
+    assert len(enabled) == 64
+    assert "Position GUI auto-reduced display" in initial["_auto_display_note"]
 
 
 def test_plot_position_gui_uses_saved_projection_filter_before_initial_guard(tmp_path, monkeypatch):
@@ -9039,7 +9418,22 @@ def test_compute_density_default_output_avoids_overwriting_existing_hdf5(tmp_pat
     assert first_rc == 0
     assert second_rc == 0
     assert (_linak_output_dir(tmp_path) / "traj.density.h5").exists()
-    assert (_linak_output_dir(tmp_path) / "traj.density_1.h5").exists()
+    assert (_linak_output_dir(tmp_path) / "traj_1.density.h5").exists()
+
+
+def test_numbered_hdf5_path_inserts_counter_before_analysis_suffix(tmp_path):
+    assert numbered_hdf5_path(tmp_path / "linak.position.h5", 1).name == "linak_1.position.h5"
+    assert numbered_hdf5_path(tmp_path / "linak.potential.h5", 2).name == "linak_2.potential.h5"
+    assert numbered_hdf5_path(tmp_path / "run.density.hdf5", 1).name == "run_1.density.hdf5"
+
+
+def test_unique_hdf5_path_preserves_analysis_suffix_when_versioning(tmp_path):
+    first = tmp_path / "linak_combined.potential.h5"
+    second = tmp_path / "linak_combined_1.potential.h5"
+    first.write_text("occupied", encoding="utf-8")
+    second.write_text("occupied", encoding="utf-8")
+
+    assert cli_mod._unique_path_with_numeric_suffix(first).name == "linak_combined_2.potential.h5"
 
 
 def test_default_combined_analysis_hdf5_path_uses_pwd_linak_output_dir_for_multi_source(
@@ -9056,7 +9450,7 @@ def test_default_combined_analysis_hdf5_path_uses_pwd_linak_output_dir_for_multi
         analysis="density",
     )
 
-    assert output == _linak_output_dir(working_dir) / "linak.density.combined.h5"
+    assert output == _linak_output_dir(working_dir) / "linak_combined.density.h5"
 
 
 def test_default_csv_output_path_uses_shared_linak_output_dir_without_nesting(tmp_path):
@@ -9209,7 +9603,7 @@ def test_compute_density_all_writes_one_hdf5_with_all_species_series(tmp_path, m
     profiles = load_density_profiles(output)
     species_set = {profile.species for profile in profiles}
     raw_axes_set = {profile.axis for profile in profiles if profile.coordinate_mode != "distance"}
-    assert species_set == {"H", "O", "H2O"}
+    assert species_set == {"H", "O", "mol:H2O"}
     assert raw_axes_set == {"x", "y", "z"}
     distance_profiles = [p for p in profiles if p.coordinate_mode == "distance"]
     assert len(distance_profiles) >= 1

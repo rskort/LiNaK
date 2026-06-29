@@ -19,6 +19,8 @@ _ANALYSIS_SOURCE_SUFFIXES = (
     ".h5",
 )
 
+_HDF5_SUFFIXES = (".hdf5", ".h5")
+
 
 def analysis_source_base(source: str | Path, *, default: str = "source") -> str:
     """Return the source stem used for default analysis HDF5 filenames."""
@@ -46,3 +48,39 @@ def analysis_hdf5_filename(source: str | Path, analysis: str, *, default: str = 
     base = analysis_source_base(source, default=default)
     analysis_token = str(analysis).strip().lower() or "analysis"
     return f"{base}.{analysis_token}.h5"
+
+
+def combined_analysis_hdf5_filename(analysis: str, *, base: str = "linak_combined") -> str:
+    """Return the default HDF5 filename for combined profiles of one analysis."""
+
+    analysis_token = str(analysis).strip().lower() or "analysis"
+    base_token = str(base).strip() or "linak_combined"
+    return f"{base_token}.{analysis_token}.h5"
+
+
+def split_analysis_hdf5_name(name: str | Path) -> tuple[str, str, str] | None:
+    """Split '<base>.<analysis>.h5/.hdf5' into base, analysis, suffix."""
+
+    path_name = Path(name).name
+    lower_name = path_name.lower()
+    suffix = next((item for item in _HDF5_SUFFIXES if lower_name.endswith(item)), None)
+    if suffix is None:
+        return None
+    without_suffix = path_name[: -len(suffix)]
+    if "." not in without_suffix:
+        return None
+    base, analysis = without_suffix.rsplit(".", 1)
+    if not base or not analysis:
+        return None
+    return base, analysis, path_name[-len(suffix) :]
+
+
+def numbered_hdf5_path(path: str | Path, index: int) -> Path:
+    """Return an auto-versioned HDF5 path, keeping analysis suffixes at the end."""
+
+    path_obj = Path(path)
+    split = split_analysis_hdf5_name(path_obj.name)
+    if split is not None:
+        base, analysis, suffix = split
+        return path_obj.with_name(f"{base}_{index}.{analysis}{suffix}")
+    return path_obj.with_name(f"{path_obj.stem}_{index}{path_obj.suffix}")

@@ -1893,6 +1893,31 @@ def _capture_plot_state(
     )
 
 
+def _plotted_xy_series_payload(
+    *,
+    series_id: str,
+    series_label: str,
+    series_kind: str,
+    x_values: np.ndarray,
+    y_values: np.ndarray,
+) -> dict[str, Any]:
+    x_data = np.asarray(x_values, dtype=float)
+    y_data = np.asarray(y_values, dtype=float)
+    if x_data.shape != y_data.shape:
+        raise ValueError("Plotted x/y arrays must have the same shape for data export.")
+    finite_mask = np.isfinite(x_data) & np.isfinite(y_data)
+    x_export = np.asarray(x_data[finite_mask], dtype=float)
+    y_export = np.asarray(y_data[finite_mask], dtype=float)
+    return {
+        "series_id": str(series_id),
+        "series_label": normalize_plot_text(str(series_label)),
+        "series_kind": str(series_kind),
+        "x": x_export.tolist(),
+        "y": y_export.tolist(),
+        "point_count": int(x_export.size),
+    }
+
+
 def _apply_axes_border(ax: Any, *, visible: bool | dict[str, bool]) -> None:
     if isinstance(visible, dict):
         for name, spine in ax.spines.items():
@@ -3497,6 +3522,7 @@ def plot_multi_line_series(
         source_bin_widths: dict[str, float | None] = {}
         masked_bin_counts: dict[str, int] = {}
         grouped_summaries: dict[str, dict[str, Any]] = {}
+        plotted_xy_series: list[dict[str, Any]] = []
         visible_x_series: list[np.ndarray] = []
         visible_y_series: list[np.ndarray] = []
         density_visible_x_series: list[np.ndarray] = []
@@ -3564,6 +3590,15 @@ def plot_multi_line_series(
                 rendered_labels.append(str(artist.get_label()))
                 visible_x_series.append(np.asarray(x_values, dtype=float))
                 visible_y_series.append(np.asarray(y_values, dtype=float))
+                plotted_xy_series.append(
+                    _plotted_xy_series_payload(
+                        series_id=fit_key,
+                        series_label=label,
+                        series_kind=str(item.get("kind") or "source"),
+                        x_values=x_values,
+                        y_values=y_values,
+                    )
+                )
                 if str(analysis_name or "").strip().lower() == "density":
                     density_visible_x_series.append(np.asarray(x_values, dtype=float))
                     density_visible_y_series.append(np.asarray(y_values, dtype=float))
@@ -3837,8 +3872,19 @@ def plot_multi_line_series(
                         np.asarray(fit_summary.get("y_fit", []), dtype=float),
                         **fit_kwargs,
                     )
-                    visible_x_series.append(np.asarray(fit_summary.get("x_fit", []), dtype=float))
-                    visible_y_series.append(np.asarray(fit_summary.get("y_fit", []), dtype=float))
+                    fit_x = np.asarray(fit_summary.get("x_fit", []), dtype=float)
+                    fit_y = np.asarray(fit_summary.get("y_fit", []), dtype=float)
+                    visible_x_series.append(fit_x)
+                    visible_y_series.append(fit_y)
+                    plotted_xy_series.append(
+                        _plotted_xy_series_payload(
+                            series_id=f"{fit_key}::fit",
+                            series_label=fit_render_label,
+                            series_kind="fit",
+                            x_values=fit_x,
+                            y_values=fit_y,
+                        )
+                    )
                     has_visible_overlay_bounds = True
 
             cumulative_config = item.get("cumulative_config")
@@ -3885,6 +3931,15 @@ def plot_multi_line_series(
                     ax.plot(cumulative_x, cumulative_y, **cumulative_kwargs)
                     visible_x_series.append(np.asarray(cumulative_x, dtype=float))
                     visible_y_series.append(np.asarray(cumulative_y, dtype=float))
+                    plotted_xy_series.append(
+                        _plotted_xy_series_payload(
+                            series_id=f"{fit_key}::cumulative",
+                            series_label=cumulative_label,
+                            series_kind="cumulative",
+                            x_values=np.asarray(cumulative_x, dtype=float),
+                            y_values=np.asarray(cumulative_y, dtype=float),
+                        )
+                    )
                     has_visible_overlay_bounds = True
             else:
                 cumulative_summaries[fit_key] = {
@@ -4110,6 +4165,7 @@ def plot_multi_line_series(
             capture_state["series_group_summaries"] = grouped_summaries
             capture_state["integration_summaries"] = list(integration_summaries)
             capture_state["annotations_summary"] = list(annotation_summaries)
+            capture_state["plotted_xy_series"] = list(plotted_xy_series)
             capture_state["x_axis_scale"] = float(resolved_x_axis_scale)
             capture_state["x_axis_offset"] = float(resolved_x_axis_offset)
 
