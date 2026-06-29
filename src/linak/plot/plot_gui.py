@@ -9,6 +9,7 @@ import html
 from pathlib import Path
 import re
 import tempfile
+import threading
 from collections.abc import Sequence
 from typing import Any, Callable
 from uuid import uuid4
@@ -200,8 +201,8 @@ _POTENTIAL_SERIES_ID_BY_LABEL = {
 }
 _DENSITY_X_MODE_LABELS = ("Distance", "X", "Y", "Z")
 _DENSITY_VIEW_TYPE_LABEL_BY_ID = {
-    "line_1d": "Line 1D",
-    "heatmap_2d": "Heatmap 2D",
+    "line_1d": "1D",
+    "heatmap_2d": "2D",
 }
 _DENSITY_VIEW_TYPE_ID_BY_LABEL = {
     label: view_type_id for view_type_id, label in _DENSITY_VIEW_TYPE_LABEL_BY_ID.items()
@@ -1708,7 +1709,15 @@ def launch_plot_settings_panel(
 ) -> None:
     """Open a PySide6 panel that previews and persists plot settings."""
     try:
-        from PySide6.QtCore import QEasingCurve, QEvent, QPropertyAnimation, QTimer, Qt
+        from PySide6.QtCore import (
+            QEasingCurve,
+            QEvent,
+            QObject,
+            QPropertyAnimation,
+            QTimer,
+            Qt,
+            Signal,
+        )
         from PySide6.QtGui import (
             QBrush,
             QColor,
@@ -2260,6 +2269,10 @@ def launch_plot_settings_panel(
             preview_frame_layout.addWidget(self.preview_scroll, stretch=1)
             layout.addWidget(self.preview_frame, stretch=1)
 
+    class _PreviewWorkerBridge(QObject):
+        finished = Signal(int, object)
+        failed = Signal(int, object)
+
     class _CollapsibleSection(QFrame):
         def __init__(
             self,
@@ -2621,6 +2634,12 @@ def launch_plot_settings_panel(
             self._position_mapping_filter_min_row: tuple[QFormLayout, QWidget] | None = None
             self._position_mapping_filter_max_row: tuple[QFormLayout, QWidget] | None = None
             self._position_mapping_split_by_row: tuple[QFormLayout, QWidget] | None = None
+            self._density_mapping_1d_rows: list[tuple[QFormLayout, QWidget]] = []
+            self._density_mapping_2d_rows: list[tuple[QFormLayout, QWidget]] = []
+            self._density_filter_rows: dict[str, tuple[QFormLayout, QWidget]] = {}
+            self._density_species_checkbox_syncing = False
+            self._density_previous_view_type_id: str | None = None
+            self._density_1d_enabled_species_snapshot: set[str] | None = None
             self._coordination_time_axis_row: tuple[QFormLayout, QWidget] | None = None
             self._axes_ticks_group: QGroupBox | None = None
             self._tick_appearance_group: QGroupBox | None = None
@@ -2783,6 +2802,17 @@ def launch_plot_settings_panel(
             self._preview_image_path = (
                 Path(tempfile.gettempdir()) / f"linak_preview_{uuid4().hex}.png"
             )
+            self._preview_temp_paths: set[Path] = {self._preview_image_path}
+            self._preview_generation = 0
+            self._active_preview_generation: int | None = None
+            self._active_preview_image_path: Path | None = None
+            self._active_preview_interactive = False
+            self._pending_preview_request: tuple[dict[str, Any], bool] | None = None
+            self._preview_worker_thread: threading.Thread | None = None
+            self._preview_worker_bridge = _PreviewWorkerBridge(self)
+            self._preview_worker_bridge.finished.connect(self._handle_preview_worker_finished)
+            self._preview_worker_bridge.failed.connect(self._handle_preview_worker_failed)
+            self._closing = False
             self._preview_timer = QTimer(self)
             self._preview_timer.setSingleShot(True)
             self._preview_timer.timeout.connect(self._handle_debounced_preview)
@@ -3208,6 +3238,39 @@ def launch_plot_settings_panel(
                 self._apply_preview_state_to_synced_fields(self._last_preview_state)
             self._refresh_widget_states()
             self._schedule_preview_update()
+
+        def _apply_preview_series_state(self, render_state: dict[str, Any]) -> None:
+            raw_descriptors = render_state.get("series_descriptors")
+            if not isinstance(raw_descriptors, list):
+                return
+            descriptors = [
+                dict(descriptor)
+                for descriptor in raw_descriptors
+                if isinstance(descriptor, dict)
+            ]
+            if not descriptors:
+                return
+            labels = [
+                str(label)
+                for label in render_state.get("series_labels", [])
+                if str(label).strip()
+            ]
+            if not labels:
+                labels = [
+                    str(descriptor.get("default_label") or f"Series {index + 1}")
+                    for index, descriptor in enumerate(descriptors)
+                ]
+            current_ids = [
+                str(descriptor.get("series_id") or "").strip()
+                for descriptor in self._series_descriptors_data
+            ]
+            next_ids = [
+                str(descriptor.get("series_id") or "").strip()
+                for descriptor in descriptors
+            ]
+            if current_ids == next_ids:
+                return
+            self._apply_series_defaults(labels, descriptors=descriptors)
 
         def _build_rasterized_window_icon(self) -> QIcon | None:
             if not self._gui_artwork_path.exists():
@@ -5449,7 +5512,7 @@ def launch_plot_settings_panel(
                 allow_off=True,
             )
             y_label_row, self.y_label, y_label_lock = self._lockable_line(
-                placeholder="e.g. Density ($g/cm^3$)",
+                placeholder="e.g. Density (g/cm$^3$)",
                 allow_off=True,
             )
 
@@ -7906,58 +7969,60 @@ def launch_plot_settings_panel(
                 )
 
             if analysis == "density":
-                source = QGroupBox("Source")
-                source_form = QFormLayout(source)
-                self._density_source_contract_label = QLabel("")
-                self._density_source_contract_label.setWordWrap(True)
-                self._density_source_dimensions_label = QLabel("")
-                self._density_source_dimensions_label.setWordWrap(True)
-                self._density_source_quantities_label = QLabel("")
-                self._density_source_quantities_label.setWordWrap(True)
-                self._add_form_row(
-                    source_form,
-                    "Contract",
-                    self._density_source_contract_label,
-                    tooltip_id="data.density.source.contract",
-                )
-                self._add_form_row(
-                    source_form,
-                    "Dimensions",
-                    self._density_source_dimensions_label,
-                    tooltip_id="data.density.source.dimensions",
-                )
-                self._add_form_row(
-                    source_form,
-                    "Quantities",
-                    self._density_source_quantities_label,
-                    tooltip_id="data.density.source.quantities",
-                )
-                self._density_target_filter = self._combo(self._density_target_filter_labels())
-                self._density_target_filter.currentTextChanged.connect(
-                    self._handle_density_target_filter_changed
-                )
-                self._add_form_row(
-                    source_form,
-                    "Density target",
-                    self._density_target_filter,
-                    tooltip_id="data.density.target",
-                )
-                source_note = QLabel(
-                    "Density uses the currently loaded source profiles. Mapping controls choose how those source quantities are assigned to x/y roles."
-                )
-                source_note.setWordWrap(True)
-                source_note.setObjectName("sectionNote")
-                source_form.addRow(source_note)
-                layout.addWidget(
-                    self._make_collapsible_section(
-                        title="Source",
-                        section_id="data.density.source",
-                        body_widget=source,
-                    )
-                )
-
                 mapping = QGroupBox("Mapping")
                 mapping_form = QFormLayout(mapping)
+                self._density_species_checkboxes = {}
+                species_widget = QWidget(mapping)
+                species_layout = QGridLayout(species_widget)
+                species_layout.setContentsMargins(0, 0, 0, 0)
+                species_layout.setSpacing(4)
+                species_options = self._profile_filter_options.get("density_species_options")
+                if isinstance(species_options, list) and species_options:
+                    resolved_species_options = [
+                        (
+                            str(option.get("value") or option.get("label") or "").strip(),
+                            str(option.get("label") or option.get("value") or "").strip(),
+                        )
+                        for option in species_options
+                        if isinstance(option, dict)
+                    ]
+                else:
+                    resolved_species_options = [
+                        (label, label)
+                        for label in self._density_target_filter_labels()
+                        if label != "All targets"
+                    ]
+                option_count = max(1, len(resolved_species_options))
+                species_columns = 1
+                if option_count > 12:
+                    species_columns = 4
+                elif option_count > 6:
+                    species_columns = 3
+                elif option_count > 2:
+                    species_columns = 2
+                grid_index = 0
+                for value, label in resolved_species_options:
+                    if not value:
+                        continue
+                    checkbox = QCheckBox(label or value)
+                    checkbox.setChecked(True)
+                    checkbox.setProperty("density_species", value)
+                    checkbox.stateChanged.connect(self._handle_density_species_checkbox_changed)
+                    species_layout.addWidget(
+                        checkbox,
+                        grid_index // species_columns,
+                        grid_index % species_columns,
+                    )
+                    grid_index += 1
+                    self._density_species_checkboxes[value] = checkbox
+                if not self._density_species_checkboxes:
+                    species_layout.addWidget(QLabel("No species filters available"), 0, 0)
+                self._add_form_row(
+                    mapping_form,
+                    "Species",
+                    species_widget,
+                    tooltip_id="data.density.target",
+                )
                 available_density_view_types = self._profile_filter_options.get("density_view_types")
                 if isinstance(available_density_view_types, list) and available_density_view_types:
                     density_view_type_labels = tuple(
@@ -7981,14 +8046,10 @@ def launch_plot_settings_panel(
                     density_x_mode_labels = _DENSITY_X_MODE_LABELS
                 self.density_x_mode = self._combo(density_x_mode_labels)
                 self.density_x_mode.currentTextChanged.connect(self._handle_density_mapping_change)
-                heatmap_source_entries = self._profile_filter_options.get("density_heatmap_sources")
-                heatmap_source_labels = (
-                    tuple(str(entry.get("label") or "") for entry in heatmap_source_entries)
-                    if isinstance(heatmap_source_entries, list) and heatmap_source_entries
-                    else ("No heatmap source available",)
-                )
-                self.density_heatmap_source = self._combo(heatmap_source_labels)
-                self.density_heatmap_source.currentTextChanged.connect(self._handle_density_mapping_change)
+                self.density_2d_x_axis = self._combo(_DENSITY_X_MODE_LABELS)
+                self.density_2d_y_axis = self._combo(("Y", "X", "Z", "Distance"))
+                self.density_2d_x_axis.currentTextChanged.connect(self._handle_density_mapping_change)
+                self.density_2d_y_axis.currentTextChanged.connect(self._handle_density_mapping_change)
                 self.density_quantity = self._combo(("mass", "number"))
                 self.density_quantity.currentTextChanged.connect(self._handle_density_mapping_change)
                 self._add_form_row(
@@ -7999,66 +8060,64 @@ def launch_plot_settings_panel(
                 )
                 self._add_form_row(
                     mapping_form,
-                    "X quantity",
+                    "X-axis quantity",
                     self.density_x_mode,
                     tooltip_id="data.density.x_values",
                 )
+                self._density_mapping_1d_rows.append((mapping_form, self.density_x_mode))
                 self._add_form_row(
                     mapping_form,
-                    "Plane / source",
-                    self.density_heatmap_source,
+                    "2D X-axis quantity",
+                    self.density_2d_x_axis,
                     tooltip_id="data.density.source.quantities",
                 )
+                self._density_mapping_2d_rows.append((mapping_form, self.density_2d_x_axis))
                 self._add_form_row(
                     mapping_form,
-                    "Y / Z quantity",
+                    "2D Y-axis quantity",
+                    self.density_2d_y_axis,
+                    tooltip_id="data.density.source.quantities",
+                )
+                self._density_mapping_2d_rows.append((mapping_form, self.density_2d_y_axis))
+                self._add_form_row(
+                    mapping_form,
+                    "Z quantity",
                     self.density_quantity,
                     tooltip_id="data.density.quantity",
                 )
-                density_note = QLabel(
-                    "These controls build one generic density mapping. Line mode uses distance or axis coordinates on x, while heatmap mode uses the selected planar density field as a shared heatmap_2d source."
-                )
-                density_note.setWordWrap(True)
-                density_note.setObjectName("sectionNote")
-                mapping_form.addRow(density_note)
+                self._density_filter_widgets = {}
+                for axis_label, axis_id in (("X range", "x"), ("Y range", "y"), ("Z range", "z"), ("Distance range", "distance")):
+                    range_widget = QWidget(mapping)
+                    range_layout = QHBoxLayout(range_widget)
+                    range_layout.setContentsMargins(0, 0, 0, 0)
+                    default_range = self._density_axis_range_defaults(axis_id)
+                    lower = self._bounded_float_line(
+                        self._density_axis_range_text(axis_id, 0) or "min",
+                        bottom=default_range[0] if default_range is not None else None,
+                        top=default_range[1] if default_range is not None else None,
+                    )
+                    upper = self._bounded_float_line(
+                        self._density_axis_range_text(axis_id, 1) or "max",
+                        bottom=default_range[0] if default_range is not None else None,
+                        top=default_range[1] if default_range is not None else None,
+                    )
+                    lower.textChanged.connect(self._handle_density_range_change)
+                    upper.textChanged.connect(self._handle_density_range_change)
+                    range_layout.addWidget(lower)
+                    range_layout.addWidget(upper)
+                    self._density_filter_widgets[axis_id] = (lower, upper)
+                    self._add_form_row(
+                        mapping_form,
+                        axis_label,
+                        range_widget,
+                        tooltip_id="data.density.source.quantities",
+                    )
+                    self._density_filter_rows[axis_id] = (mapping_form, range_widget)
                 layout.addWidget(
                     self._make_collapsible_section(
                         title="Mapping",
                         section_id="data.density.view",
                         body_widget=mapping,
-                    )
-                )
-
-                summary = QGroupBox("Summary")
-                summary_form = QFormLayout(summary)
-                self._density_mapping_status_label = QLabel("")
-                self._density_mapping_summary_label = QLabel("")
-                self._density_mapping_summary_label.setWordWrap(True)
-                self._density_backend_summary_label = QLabel("")
-                self._density_backend_summary_label.setWordWrap(True)
-                self._add_form_row(
-                    summary_form,
-                    "Status",
-                    self._density_mapping_status_label,
-                    tooltip_id="data.density.summary.status",
-                )
-                self._add_form_row(
-                    summary_form,
-                    "Mapping",
-                    self._density_mapping_summary_label,
-                    tooltip_id="data.density.summary.mapping",
-                )
-                self._add_form_row(
-                    summary_form,
-                    "Backend",
-                    self._density_backend_summary_label,
-                    tooltip_id="data.density.summary.backend",
-                )
-                layout.addWidget(
-                    self._make_collapsible_section(
-                        title="Summary",
-                        section_id="data.density.summary",
-                        body_widget=summary,
                     )
                 )
 
@@ -9128,6 +9187,116 @@ def launch_plot_settings_panel(
                 or ""
             ).strip()
 
+        def _enabled_density_species(self) -> set[str] | None:
+            checkboxes = getattr(self, "_density_species_checkboxes", {})
+            if not isinstance(checkboxes, dict) or not checkboxes:
+                return None
+            return {
+                str(value)
+                for value, checkbox in checkboxes.items()
+                if getattr(checkbox, "isChecked", lambda: False)()
+            }
+
+        def _density_descriptor_passes_species_filter(self, descriptor: dict[str, Any]) -> bool:
+            enabled_species = self._enabled_density_species()
+            if enabled_species is None:
+                return True
+            target = self._density_target_for_descriptor(descriptor)
+            return not target or target in enabled_species
+
+        def _density_axis_range_defaults(self, axis_id: str) -> tuple[float, float] | None:
+            ranges = self._profile_filter_options.get("density_axis_ranges")
+            if not isinstance(ranges, dict):
+                return None
+            raw_range = ranges.get(str(axis_id).strip().lower())
+            if not isinstance(raw_range, (list, tuple)) or len(raw_range) != 2:
+                return None
+            try:
+                lower = float(raw_range[0])
+                upper = float(raw_range[1])
+            except (TypeError, ValueError):
+                return None
+            if not (np.isfinite(lower) and np.isfinite(upper)) or lower >= upper:
+                return None
+            return lower, upper
+
+        def _density_axis_range_text(self, axis_id: str, index: int) -> str:
+            defaults = self._density_axis_range_defaults(axis_id)
+            if defaults is None:
+                return ""
+            return f"{defaults[index]:.6g}"
+
+        def _density_effective_filter_values(
+            self,
+            axis_id: str,
+            lower: float | None,
+            upper: float | None,
+        ) -> tuple[float | None, float | None]:
+            defaults = self._density_axis_range_defaults(axis_id)
+            if defaults is None:
+                return lower, upper
+            if lower is not None and abs(float(lower) - defaults[0]) <= 1.0e-9:
+                lower = None
+            if upper is not None and abs(float(upper) - defaults[1]) <= 1.0e-9:
+                upper = None
+            return lower, upper
+
+        def _density_current_view_type_id(self) -> str:
+            if not hasattr(self, "density_view_type"):
+                return "line_1d"
+            return _DENSITY_VIEW_TYPE_ID_BY_LABEL.get(
+                self.density_view_type.currentText().strip(),
+                "line_1d",
+            )
+
+        def _sync_density_species_selection_for_view_type(
+            self,
+            *,
+            record_snapshot: bool = True,
+        ) -> None:
+            if self._analysis_name != "density":
+                return
+            checkboxes = getattr(self, "_density_species_checkboxes", {})
+            if not isinstance(checkboxes, dict) or not checkboxes:
+                return
+            view_type_id = self._density_current_view_type_id()
+            previous_view_type_id = self._density_previous_view_type_id
+            self._density_previous_view_type_id = view_type_id
+            if view_type_id == "heatmap_2d":
+                if previous_view_type_id != view_type_id and record_snapshot:
+                    self._density_1d_enabled_species_snapshot = self._enabled_density_species()
+                active_value = next(
+                    (
+                        str(value)
+                        for value, checkbox in checkboxes.items()
+                        if checkbox.isChecked()
+                    ),
+                    next(iter(checkboxes)),
+                )
+                self._density_species_checkbox_syncing = True
+                try:
+                    for value, checkbox in checkboxes.items():
+                        checkbox.blockSignals(True)
+                        try:
+                            checkbox.setChecked(str(value) == active_value)
+                        finally:
+                            checkbox.blockSignals(False)
+                finally:
+                    self._density_species_checkbox_syncing = False
+                return
+            if previous_view_type_id == "heatmap_2d" and self._density_1d_enabled_species_snapshot is not None:
+                enabled = set(self._density_1d_enabled_species_snapshot)
+                self._density_species_checkbox_syncing = True
+                try:
+                    for value, checkbox in checkboxes.items():
+                        checkbox.blockSignals(True)
+                        try:
+                            checkbox.setChecked(str(value) in enabled)
+                        finally:
+                            checkbox.blockSignals(False)
+                finally:
+                    self._density_species_checkbox_syncing = False
+
         def _coordination_contract(self) -> PlotDataContract:
             contract = self._coordination_data_contract
             if isinstance(contract, PlotDataContract):
@@ -9362,6 +9531,13 @@ def launch_plot_settings_panel(
                 self._potential_backend_summary_label.setText(str(exc))
 
         def _handle_density_mapping_change(self, *_unused: object) -> None:
+            self._sync_density_species_selection_for_view_type()
+            self._update_density_contract_summary()
+            self._handle_series_identity_change()
+
+        def _handle_density_range_change(self, *_unused: object) -> None:
+            if self._analysis_name != "density":
+                return
             self._update_density_contract_summary()
             self._refresh_widget_states()
             self._schedule_preview_update()
@@ -9382,6 +9558,45 @@ def launch_plot_settings_panel(
             self._refresh_widget_states()
             self._record_history_after_non_text_change()
             self._schedule_preview_update()
+
+        def _handle_density_species_checkbox_changed(self, *_unused: object) -> None:
+            if self._analysis_name != "density":
+                return
+            if self._density_species_checkbox_syncing:
+                return
+            if self._is_density_heatmap_mode():
+                checkboxes = getattr(self, "_density_species_checkboxes", {})
+                sender = self.sender()
+                if isinstance(checkboxes, dict) and checkboxes:
+                    active_value = next(
+                        (
+                            str(value)
+                            for value, checkbox in checkboxes.items()
+                            if checkbox is sender and checkbox.isChecked()
+                        ),
+                        None,
+                    )
+                    if active_value is None:
+                        active_value = next(
+                            (
+                                str(value)
+                                for value, checkbox in checkboxes.items()
+                                if checkbox.isChecked()
+                            ),
+                            next(iter(checkboxes)),
+                        )
+                    self._density_species_checkbox_syncing = True
+                    try:
+                        for value, checkbox in checkboxes.items():
+                            checkbox.blockSignals(True)
+                            try:
+                                checkbox.setChecked(str(value) == active_value)
+                            finally:
+                                checkbox.blockSignals(False)
+                    finally:
+                        self._density_species_checkbox_syncing = False
+            self._record_history_after_non_text_change()
+            self._handle_series_identity_change()
 
         def _handle_coordination_mapping_change(self, *_unused: object) -> None:
             self._update_coordination_contract_summary()
@@ -11123,7 +11338,11 @@ def launch_plot_settings_panel(
             self._schedule_preview_update()
 
         def _build_binning_section(self, layout: QVBoxLayout) -> None:
-            binning_title = "Display Binning / Sectioning"
+            binning_title = (
+                "Density Binning"
+                if self._analysis_name == "density"
+                else "Display Binning / Sectioning"
+            )
             binning = QGroupBox(binning_title)
             self._data_transform_group = binning
             binning_form = QFormLayout(binning)
@@ -11132,7 +11351,7 @@ def launch_plot_settings_panel(
             self.x_bin_reducer = self._combo(_BIN_REDUCERS)
             self._add_form_row(
                 binning_form,
-                "X bin size",
+                "X-axis bin size" if self._analysis_name == "density" else "X bin size",
                 self.x_bin_width,
                 tooltip_id="data.section.width",
             )
@@ -11145,13 +11364,14 @@ def launch_plot_settings_panel(
             self._x_bin_reducer_row = (binning_form, self.x_bin_reducer)
             self.min_bin_points = self._line("Leave blank to disable masking")
             self.min_bin_points.textChanged.connect(self._refresh_widget_states)
-            self._add_form_row(
-                binning_form,
-                "Min points per bin",
-                self.min_bin_points,
-                tooltip_id="data.section.min_points",
-            )
-            self._min_bin_points_row = (binning_form, self.min_bin_points)
+            if self._analysis_name != "density":
+                self._add_form_row(
+                    binning_form,
+                    "Min points per bin",
+                    self.min_bin_points,
+                    tooltip_id="data.section.min_points",
+                )
+                self._min_bin_points_row = (binning_form, self.min_bin_points)
             self._binning_helper_label = QLabel("")
             self._binning_helper_label.setObjectName("sectionNote")
             self._binning_helper_label.setWordWrap(True)
@@ -11163,7 +11383,7 @@ def launch_plot_settings_panel(
                 self.y_bin_reducer = self._combo(_BIN_REDUCERS)
                 self._add_form_row(
                     binning_form,
-                    "Y bin size",
+                    "Y-axis bin size" if self._analysis_name == "density" else "Y bin size",
                     self.y_bin_width,
                     tooltip_id="data.section.y_width",
                 )
@@ -13509,12 +13729,13 @@ def launch_plot_settings_panel(
             if not self._auto_preview_checkbox.isChecked():
                 return
             if self._preview_loading:
-                return
+                if self._preview_status is not None:
+                    self._preview_status.setText(
+                        "Preview updating... changes will render next."
+                    )
             self._preview_timer.start(_AUTO_PREVIEW_DEBOUNCE_MS)
 
         def _handle_debounced_preview(self) -> None:
-            if self._preview_loading:
-                return
             self._update_embedded_preview(interactive=False)
 
         def _set_preview_loading(self, active: bool) -> None:
@@ -13542,6 +13763,225 @@ def launch_plot_settings_panel(
                         preview_loading=self._preview_loading,
                     )
                 )
+            if self._save_figure_button is not None:
+                self._save_figure_button.setEnabled(
+                    (not self._preview_loading) and on_save_figure is not None
+                )
+            if self._save_data_button is not None:
+                self._save_data_button.setEnabled(
+                    (not self._preview_loading) and on_save_data is not None
+                )
+
+        def _new_preview_image_path(self) -> Path:
+            path = Path(tempfile.gettempdir()) / f"linak_preview_{uuid4().hex}.png"
+            self._preview_temp_paths.add(path)
+            return path
+
+        def _cleanup_preview_temp_path(self, path: str | Path | None) -> None:
+            if path is None:
+                return
+            resolved = Path(path)
+            QPixmapCache.remove(str(resolved))
+            try:
+                resolved.unlink(missing_ok=True)
+            except OSError:
+                pass
+            self._preview_temp_paths.discard(resolved)
+
+        def _parse_preview_worker_result(
+            self,
+            save_result: str | tuple[str, dict[str, Any]] | dict[str, Any] | None,
+        ) -> tuple[str, dict[str, Any]]:
+            if isinstance(save_result, tuple):
+                message = str(save_result[0] or "")
+                render_state = save_result[1] if len(save_result) > 1 else {}
+                return message, dict(render_state) if isinstance(render_state, dict) else {}
+            if isinstance(save_result, dict):
+                return "", dict(save_result)
+            return str(save_result or ""), {}
+
+        def _run_preview_worker(
+            self,
+            *,
+            generation: int,
+            settings: dict[str, Any],
+            image_path: Path | None,
+        ) -> None:
+            try:
+                try:
+                    from .plotting import configure_matplotlib_backend
+
+                    configure_matplotlib_backend(interactive=False)
+                except Exception:
+                    pass
+                if image_path is None or on_save_figure is None:
+                    render_state = on_preview(settings)
+                    payload = {
+                        "image_path": None,
+                        "message": "External preview opened.",
+                        "render_state": dict(render_state)
+                        if isinstance(render_state, dict)
+                        else {},
+                    }
+                else:
+                    save_result = on_save_figure(settings, str(image_path))
+                    message, render_state = self._parse_preview_worker_result(save_result)
+                    payload = {
+                        "image_path": str(image_path),
+                        "message": message,
+                        "render_state": render_state,
+                    }
+                try:
+                    self._preview_worker_bridge.finished.emit(generation, payload)
+                except RuntimeError:
+                    pass
+            except Exception as exc:
+                try:
+                    self._preview_worker_bridge.failed.emit(generation, exc)
+                except RuntimeError:
+                    pass
+
+        def _start_preview_worker(
+            self,
+            settings: dict[str, Any],
+            *,
+            interactive: bool,
+        ) -> bool:
+            if self._closing:
+                return False
+            self._preview_generation += 1
+            generation = self._preview_generation
+            image_path = self._new_preview_image_path() if on_save_figure is not None else None
+            self._active_preview_generation = generation
+            self._active_preview_image_path = image_path
+            self._active_preview_interactive = bool(interactive)
+            self._set_preview_loading(True)
+            if self._preview_status is not None:
+                self._preview_status.setText("Preview updating...")
+            worker = threading.Thread(
+                target=self._run_preview_worker,
+                kwargs={
+                    "generation": generation,
+                    "settings": deepcopy(settings),
+                    "image_path": image_path,
+                },
+                name=f"LiNaKPreview-{generation}",
+                daemon=True,
+            )
+            self._preview_worker_thread = worker
+            worker.start()
+            return True
+
+        def _queue_pending_preview(
+            self,
+            settings: dict[str, Any],
+            *,
+            interactive: bool,
+        ) -> None:
+            self._pending_preview_request = (deepcopy(settings), bool(interactive))
+            if self._preview_status is not None:
+                self._preview_status.setText(
+                    "Preview updating... changes will render next."
+                )
+
+        def _start_pending_preview_if_available(self) -> bool:
+            pending = self._pending_preview_request
+            if pending is None:
+                return False
+            self._pending_preview_request = None
+            settings, interactive = pending
+            return self._start_preview_worker(settings, interactive=interactive)
+
+        def _finish_active_preview_generation(self, generation: int) -> None:
+            if self._active_preview_generation == generation:
+                self._active_preview_generation = None
+                self._active_preview_image_path = None
+                self._active_preview_interactive = False
+                self._preview_worker_thread = None
+
+        def _preview_worker_result_is_stale(self, generation: int) -> bool:
+            return (
+                self._closing
+                or generation != self._active_preview_generation
+                or self._pending_preview_request is not None
+            )
+
+        def _handle_preview_worker_finished(self, generation: int, payload: object) -> None:
+            payload_dict = dict(payload) if isinstance(payload, dict) else {}
+            image_path = payload_dict.get("image_path")
+            if self._preview_worker_result_is_stale(generation):
+                self._cleanup_preview_temp_path(image_path)
+                self._finish_active_preview_generation(generation)
+                self._set_preview_loading(False)
+                self._start_pending_preview_if_available()
+                return
+
+            try:
+                render_state = payload_dict.get("render_state")
+                if isinstance(render_state, dict) and render_state:
+                    self._apply_preview_series_state(render_state)
+                    self._apply_preview_state_to_synced_fields(render_state)
+                if image_path is not None:
+                    image_path_obj = Path(str(image_path))
+                    previous_path = self._preview_image_path
+                    QPixmapCache.remove(str(image_path_obj))
+                    pixmap = QPixmap()
+                    if not pixmap.load(str(image_path_obj)):
+                        raise RuntimeError("Could not load rendered preview image.")
+                    if pixmap.isNull():
+                        raise RuntimeError("Could not load rendered preview image.")
+                    self._preview_image_path = image_path_obj
+                    if previous_path != image_path_obj:
+                        self._cleanup_preview_temp_path(previous_path)
+                    self._preview_pixmap = self._preview_display_pixmap(pixmap)
+                    self._refresh_preview_pixmap()
+                self._preview_error = None
+                if self._preview_status is not None:
+                    self._preview_status.setText(
+                        "Preview updated."
+                        if image_path is not None
+                        else str(payload_dict.get("message") or "External preview opened.")
+                    )
+                self._refresh_shell_state()
+            except Exception as exc:
+                if self._active_preview_interactive:
+                    self._report_error("Preview failed", exc)
+                else:
+                    self._preview_error = str(exc)
+                    if self._preview_status is not None:
+                        self._preview_status.setText("Preview paused.")
+                    self._refresh_shell_state()
+            finally:
+                self._finish_active_preview_generation(generation)
+                self._set_preview_loading(False)
+                self._start_pending_preview_if_available()
+
+        def _handle_preview_worker_failed(self, generation: int, exc: object) -> None:
+            image_path = (
+                self._active_preview_image_path
+                if generation == self._active_preview_generation
+                else None
+            )
+            if self._preview_worker_result_is_stale(generation):
+                self._cleanup_preview_temp_path(image_path)
+                self._finish_active_preview_generation(generation)
+                self._set_preview_loading(False)
+                self._start_pending_preview_if_available()
+                return
+            error = exc if isinstance(exc, Exception) else RuntimeError(str(exc))
+            try:
+                self._cleanup_preview_temp_path(image_path)
+                if self._active_preview_interactive:
+                    self._report_error("Preview failed", error)
+                else:
+                    self._preview_error = str(error)
+                    if self._preview_status is not None:
+                        self._preview_status.setText("Preview paused.")
+                    self._refresh_shell_state()
+            finally:
+                self._finish_active_preview_generation(generation)
+                self._set_preview_loading(False)
+                self._start_pending_preview_if_available()
 
         def _set_preview_zoom(self, value: float) -> None:
             self._preview_zoom_factor = max(0.2, min(20.0, float(value)))
@@ -13639,56 +14079,9 @@ def launch_plot_settings_panel(
             return composed
 
         def _update_embedded_preview(self, *, interactive: bool) -> bool:
-            if self._preview_loading:
-                return False
             self._preview_timer.stop()
-            self._set_preview_loading(True)
-            if on_save_figure is None:
-                try:
-                    settings = self._collect_settings()
-                    render_state = on_preview(settings)
-                    if isinstance(render_state, dict) and render_state:
-                        self._apply_preview_state_to_synced_fields(render_state)
-                    self._preview_error = None
-                    if self._preview_status is not None:
-                        self._preview_status.setText("External preview opened.")
-                    self._refresh_shell_state()
-                    return True
-                except Exception as exc:
-                    if interactive:
-                        self._report_error("Preview failed", exc)
-                    else:
-                        self._preview_error = str(exc)
-                        if self._preview_status is not None:
-                            self._preview_status.setText("Preview paused.")
-                        self._refresh_shell_state()
-                    return False
-                finally:
-                    self._set_preview_loading(False)
-
             try:
                 settings = self._collect_settings()
-                save_result = on_save_figure(settings, str(self._preview_image_path))
-                render_state = None
-                if isinstance(save_result, tuple):
-                    _message, render_state = save_result
-                elif isinstance(save_result, dict):
-                    render_state = save_result
-                if isinstance(render_state, dict) and render_state:
-                    self._apply_preview_state_to_synced_fields(render_state)
-                QPixmapCache.remove(str(self._preview_image_path))
-                pixmap = QPixmap()
-                if not pixmap.load(str(self._preview_image_path)):
-                    raise RuntimeError("Could not load rendered preview image.")
-                if pixmap.isNull():
-                    raise RuntimeError("Could not load rendered preview image.")
-                self._preview_pixmap = self._preview_display_pixmap(pixmap)
-                self._refresh_preview_pixmap()
-                self._preview_error = None
-                if self._preview_status is not None:
-                    self._preview_status.setText("Preview updated.")
-                self._refresh_shell_state()
-                return True
             except Exception as exc:
                 if interactive:
                     self._report_error("Preview failed", exc)
@@ -13698,8 +14091,10 @@ def launch_plot_settings_panel(
                         self._preview_status.setText("Preview paused.")
                     self._refresh_shell_state()
                 return False
-            finally:
-                self._set_preview_loading(False)
+            if self._preview_loading:
+                self._queue_pending_preview(settings, interactive=interactive)
+                return False
+            return self._start_preview_worker(settings, interactive=interactive)
 
         def _set_combo_value(self, widget: QComboBox, value: str) -> None:
             if not value:
@@ -14214,23 +14609,39 @@ def launch_plot_settings_panel(
                         axis=str(settings.get("axis") or ""),
                     ),
                 )
-            if hasattr(self, "density_heatmap_source"):
-                selected_species = str(settings.get("species") or "").strip()
-                selected_plane = str(settings.get("plane") or "").strip().lower()
-                preferred_source_label = ""
-                entries = self._profile_filter_options.get("density_heatmap_sources")
-                if isinstance(entries, list):
-                    for entry in entries:
-                        if (
-                            str(entry.get("species") or "").strip() == selected_species
-                            and str(entry.get("plane") or "").strip().lower() == selected_plane
-                        ):
-                            preferred_source_label = str(entry.get("label") or "")
-                            break
+            if hasattr(self, "density_2d_x_axis"):
                 self._set_combo_value(
-                    self.density_heatmap_source,
-                    preferred_source_label,
+                    self.density_2d_x_axis,
+                    self._density_x_mode_display_label(
+                        str(settings.get("density_2d_x_axis") or "x"),
+                        axis=None,
+                    ),
                 )
+            if hasattr(self, "density_2d_y_axis"):
+                self._set_combo_value(
+                    self.density_2d_y_axis,
+                    self._density_x_mode_display_label(
+                        str(settings.get("density_2d_y_axis") or "y"),
+                        axis=None,
+                    ),
+                )
+            if hasattr(self, "_density_filter_widgets"):
+                for axis_id, widgets in self._density_filter_widgets.items():
+                    lower_widget, upper_widget = widgets
+                    lower = settings.get(f"density_filter_{axis_id}_min")
+                    upper = settings.get(f"density_filter_{axis_id}_max")
+                    lower_text = (
+                        self._density_axis_range_text(axis_id, 0)
+                        if lower is None
+                        else str(lower)
+                    )
+                    upper_text = (
+                        self._density_axis_range_text(axis_id, 1)
+                        if upper is None
+                        else str(upper)
+                    )
+                    lower_widget.setText(lower_text)
+                    upper_widget.setText(upper_text)
             if hasattr(self, "density_quantity"):
                 self._set_combo_value(
                     self.density_quantity,
@@ -14738,26 +15149,21 @@ def launch_plot_settings_panel(
                     coordination_time_axis_row[1],
                     not coordination_distance,
                 )
+            density_heatmap_mode = (
+                self._analysis_name == "density" and self._is_density_heatmap_mode()
+            )
+            if self._analysis_name == "density":
+                self._sync_density_species_selection_for_view_type()
+                self._set_rows_visible(self._density_mapping_1d_rows, not density_heatmap_mode)
+                self._set_rows_visible(self._density_mapping_2d_rows, density_heatmap_mode)
+                for axis_id, row in self._density_filter_rows.items():
+                    self._set_form_row_visible(row[0], row[1], True)
             if hasattr(self, "density_x_mode"):
-                self.density_x_mode.setEnabled(not self._is_density_heatmap_mode())
-                self._apply_widget_tooltip(
-                    self.density_x_mode,
-                    disabled_reason=(
-                        "x-role selection is controlled by the heatmap plane in heatmap mode."
-                        if self._is_density_heatmap_mode()
-                        else None
-                    ),
-                )
-            if hasattr(self, "density_heatmap_source"):
-                self.density_heatmap_source.setEnabled(self._is_density_heatmap_mode())
-                self._apply_widget_tooltip(
-                    self.density_heatmap_source,
-                    disabled_reason=(
-                        None
-                        if self._is_density_heatmap_mode()
-                        else "source field selection is only used in heatmap mode."
-                    ),
-                )
+                self.density_x_mode.setEnabled(not density_heatmap_mode)
+            for widget_name in ("density_2d_x_axis", "density_2d_y_axis"):
+                widget = getattr(self, widget_name, None)
+                if widget is not None:
+                    widget.setEnabled(density_heatmap_mode)
             if self._data_transform_group is not None and self._analysis_name == "position":
                 self._data_transform_group.setVisible(not position_xy_projection)
             self._update_position_contract_summary()
@@ -14782,9 +15188,6 @@ def launch_plot_settings_panel(
                 )
             # ── orientation heatmap mode ──────────────────────────────
             is_heatmap = self._is_orientation_heatmap_mode()
-            density_heatmap_mode = (
-                self._analysis_name == "density" and self._is_density_heatmap_mode()
-            )
             two_dimensional_binning = is_heatmap or density_heatmap_mode
             if self._data_transform_group is not None and self._analysis_name == "orientation":
                 self._data_transform_group.setEnabled(True)
@@ -15365,6 +15768,11 @@ def launch_plot_settings_panel(
             series_enabled_value: list[bool] | None = None
             if any(value is False for value in series_enabled):
                 series_enabled_value = series_enabled
+            density_enabled_species = None
+            if self._analysis_name == "density":
+                enabled_species = self._enabled_density_species()
+                if enabled_species is not None:
+                    density_enabled_species = sorted(enabled_species)
 
             series_show_in_legend = [bool(value) for value in self._series_show_in_legend_data]
             series_show_in_legend_value: list[bool] | None = None
@@ -16105,6 +16513,7 @@ def launch_plot_settings_panel(
                     else None
                 ),
                 "series_descriptors": deepcopy(self._series_descriptors_data),
+                "density_enabled_species": density_enabled_species,
                 "series_overrides": series_overrides or None,
                 "series_enabled": None if series_overrides else series_enabled_value,
                 "series_show_in_legend": (
@@ -16174,16 +16583,72 @@ def launch_plot_settings_panel(
                         "The selected density mapping is incompatible with the current plot-data contract."
                     )
                 if self._is_density_heatmap_mode():
-                    selected_source = self._selected_density_heatmap_source()
-                    settings["species"] = (
-                        None if selected_source is None else (selected_source.get("species") or None)
-                    )
-                    settings["plane"] = (
-                        None if selected_source is None else (selected_source.get("plane") or None)
-                    )
+                    settings["density_2d_x_axis"] = _DENSITY_X_MODE_BY_LABEL.get(
+                        self.density_2d_x_axis.currentText().strip().lower(),
+                        "x",
+                    ) if hasattr(self, "density_2d_x_axis") else "x"
+                    settings["density_2d_y_axis"] = _DENSITY_X_MODE_BY_LABEL.get(
+                        self.density_2d_y_axis.currentText().strip().lower(),
+                        "y",
+                    ) if hasattr(self, "density_2d_y_axis") else "y"
+                    if settings["density_2d_x_axis"] == settings["density_2d_y_axis"]:
+                        raise ValueError("Density 2D axes must be different.")
+                    if {
+                        settings["density_2d_x_axis"],
+                        settings["density_2d_y_axis"],
+                    } == {"z", "distance"}:
+                        raise ValueError("Density 2D plotting does not support Z versus distance.")
                     settings["axis"] = None
+                    if hasattr(self, "_density_filter_widgets"):
+                        for axis_id, widgets in self._density_filter_widgets.items():
+                            lower_widget, upper_widget = widgets
+                            lower_value = _optional_float(
+                                lower_widget.text(),
+                                field_name=f"{axis_id}-filter-min",
+                            )
+                            upper_value = _optional_float(
+                                upper_widget.text(),
+                                field_name=f"{axis_id}-filter-max",
+                            )
+                            if (
+                                lower_value is not None
+                                and upper_value is not None
+                                and lower_value > upper_value
+                            ):
+                                raise ValueError(f"{axis_id.upper()} range minimum must not exceed maximum.")
+                            lower_value, upper_value = self._density_effective_filter_values(
+                                axis_id,
+                                lower_value,
+                                upper_value,
+                            )
+                            settings[f"density_filter_{axis_id}_min"] = lower_value
+                            settings[f"density_filter_{axis_id}_max"] = upper_value
                 else:
                     settings["plane"] = None
+                    if hasattr(self, "_density_filter_widgets"):
+                        for axis_id, widgets in self._density_filter_widgets.items():
+                            lower_widget, upper_widget = widgets
+                            lower_value = _optional_float(
+                                lower_widget.text(),
+                                field_name=f"{axis_id}-filter-min",
+                            )
+                            upper_value = _optional_float(
+                                upper_widget.text(),
+                                field_name=f"{axis_id}-filter-max",
+                            )
+                            if (
+                                lower_value is not None
+                                and upper_value is not None
+                                and lower_value > upper_value
+                            ):
+                                raise ValueError(f"{axis_id.upper()} range minimum must not exceed maximum.")
+                            lower_value, upper_value = self._density_effective_filter_values(
+                                axis_id,
+                                lower_value,
+                                upper_value,
+                            )
+                            settings[f"density_filter_{axis_id}_min"] = lower_value
+                            settings[f"density_filter_{axis_id}_max"] = upper_value
             if hasattr(self, "coord_species_a"):
                 settings["species_a"] = self._selected_profile_filter_value(self.coord_species_a)
             if hasattr(self, "coord_species_b"):
@@ -16312,8 +16777,6 @@ def launch_plot_settings_panel(
 
         def _handle_preview(self) -> None:
             self._preview_timer.stop()
-            if self._preview_loading:
-                return
             self._update_embedded_preview(interactive=True)
 
         def _handle_save(self) -> None:
@@ -16497,17 +16960,25 @@ def launch_plot_settings_panel(
                 self._report_error("Export failed", exc)
 
         def _cleanup_preview_artifacts(self) -> None:
+            self._closing = True
             self._preview_timer.stop()
+            self._preview_generation += 1
+            self._active_preview_generation = None
+            self._active_preview_image_path = None
+            self._pending_preview_request = None
             if self._detached_preview_window is not None:
                 detached_window = self._detached_preview_window
                 self._detached_preview_window = None
                 self._detached_preview_pane = None
                 detached_window.close_from_dock()
                 detached_window.deleteLater()
+            QPixmapCache.remove(str(self._preview_image_path))
             try:
                 self._preview_image_path.unlink(missing_ok=True)
             except OSError:
                 pass
+            for path in list(self._preview_temp_paths):
+                self._cleanup_preview_temp_path(path)
 
         def _refresh_preview_after_layout(self) -> None:
             self._refresh_preview_pixmap()

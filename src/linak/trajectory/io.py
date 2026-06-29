@@ -9,6 +9,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import shlex
 from typing import TYPE_CHECKING, Any, cast
 
 import h5py
@@ -16,6 +17,7 @@ import numpy as np
 from ase import Atoms
 from ase.calculators.singlepoint import SinglePointCalculator
 from ase.constraints import FixAtoms
+from ase.data import atomic_numbers
 from ase.io import iread, write
 from ase.io.formats import UnknownFileTypeError
 from ase.io import lammpsrun as ase_lammpsrun
@@ -27,6 +29,7 @@ from .lammps import (
 )
 
 from ..progress import ProgressBar
+from ..analysis.common import ATOM_ALIAS_INFO_KEY, RAW_SPECIES_ARRAY
 
 LOGGER = logging.getLogger(__name__)
 
@@ -45,6 +48,87 @@ _TRAJECTORY_INFO_FLOAT_KEYS = (
     "trajectory_stride_md",
     "time_fs",
 )
+
+
+def _normalize_element_symbol(value: str | None) -> str | None:
+    token = "" if value is None else str(value).strip()
+    if not token:
+        return None
+    candidate = token[0].upper() + token[1:].lower()
+    return candidate if candidate in atomic_numbers else None
+
+
+def parse_atom_aliases(atom_aliases: Any = None) -> dict[str, str]:
+    """Parse repeatable RAW=ELEMENT atom-label aliases."""
+
+    if atom_aliases is None:
+        return {}
+    if isinstance(atom_aliases, dict):
+        items = atom_aliases.items()
+    else:
+        items = []
+        for alias in atom_aliases:
+            if "=" not in str(alias):
+                raise ValueError(
+                    f"Invalid atom alias '{alias}'. Use RAW=ELEMENT, for example Ow=O."
+                )
+            raw, element = str(alias).split("=", 1)
+            items.append((raw, element))
+    parsed: dict[str, str] = {}
+    for raw, element in items:
+        raw_label = str(raw).strip()
+        element_label = _normalize_element_symbol(str(element).strip())
+        if not raw_label or element_label is None:
+            raise ValueError(
+                f"Invalid atom alias '{raw}={element}'. Use RAW=ELEMENT with a valid element."
+            )
+        parsed[raw_label] = element_label
+    return parsed
+
+
+def _resolve_raw_atom_label(raw_label: str, aliases: dict[str, str]) -> str:
+    label = str(raw_label).strip()
+    if not label:
+        raise ValueError("Unknown empty atom label. Add --atom-alias RAW=<element>.")
+    if label in aliases:
+        return aliases[label]
+    exact = _normalize_element_symbol(label)
+    if exact is not None:
+        return exact
+    first_two = _normalize_element_symbol(label[:2])
+    if first_two is not None:
+        return first_two
+    first_one = _normalize_element_symbol(label[:1])
+    if first_one is not None:
+        return first_one
+    raise ValueError(f"Unknown atom label '{label}'. Add --atom-alias {label}=<element>.")
+
+
+def _set_raw_species_labels(
+    frame: Atoms,
+    labels: list[str] | tuple[str, ...] | np.ndarray,
+    aliases: dict[str, str] | None = None,
+) -> None:
+    raw_labels = np.asarray([str(label) for label in labels], dtype=object)
+    if len(raw_labels) != len(frame):
+        raise ValueError("Raw species label count does not match atom count.")
+    frame.new_array(RAW_SPECIES_ARRAY, raw_labels.astype(str))
+    if aliases:
+        frame.info[ATOM_ALIAS_INFO_KEY] = dict(aliases)
+
+
+def _raw_species_labels_for_frame(frame: Atoms) -> np.ndarray:
+    labels = frame.arrays.get(RAW_SPECIES_ARRAY)
+    if labels is None:
+        return np.asarray(frame.get_chemical_symbols(), dtype=object).astype(str)
+    return np.asarray(labels, dtype=object).astype(str)
+
+
+def _decode_hdf5_string_array(values: np.ndarray) -> np.ndarray:
+    array = np.asarray(values)
+    if array.dtype.kind == "S":
+        return array.astype(str)
+    return array.astype(object).astype(str)
 
 
 @dataclass(frozen=True)
@@ -856,6 +940,15 @@ def _topology_is_fixed(frames: list[Atoms]) -> bool:
     return True
 
 
+def _raw_species_topology_is_fixed(frames: list[Atoms]) -> bool:
+    reference = _raw_species_labels_for_frame(frames[0])
+    for frame in frames[1:]:
+        current = _raw_species_labels_for_frame(frame)
+        if len(current) != len(reference) or not np.array_equal(current, reference):
+            return False
+    return True
+
+
 def _write_string_dataset(group: h5py.Group, name: str, values: tuple[str, ...]) -> None:
     maxlen = max(1, *(len(value.encode("utf-8")) for value in values))
     group.create_dataset(name, data=np.asarray(list(values), dtype=f"S{maxlen}"))
@@ -958,6 +1051,8 @@ def _write_trajectory_hdf5(
         )
     max_atom_count = int(np.max(atom_counts))
     chunk_frames = max(1, min(frame_count, 64))
+    raw_species_is_fixed = _raw_species_topology_is_fixed(frames)
+    raw_species_dtype = f"S{max(1, max(len(label.encode('utf-8')) for frame in frames for label in _raw_species_labels_for_frame(frame)))}"
 
     positions = np.zeros((frame_count, max_atom_count, 3), dtype=np.float64)
     cells = np.empty((frame_count, 3, 3), dtype=np.float64)
@@ -966,6 +1061,12 @@ def _write_trajectory_hdf5(
         atomic_numbers: np.ndarray = np.asarray(frames[0].get_atomic_numbers(), dtype=np.int64)
     else:
         atomic_numbers = np.zeros((frame_count, max_atom_count), dtype=np.int64)
+    if raw_species_is_fixed:
+        raw_species_labels: np.ndarray = _raw_species_labels_for_frame(frames[0]).astype(
+            raw_species_dtype
+        )
+    else:
+        raw_species_labels = np.full((frame_count, max_atom_count), b"", dtype=raw_species_dtype)
     for index, frame in enumerate(frames):
         atom_count = len(frame)
         if atom_count > 0:
@@ -975,6 +1076,9 @@ def _write_trajectory_hdf5(
                 frame.get_atomic_numbers(),
                 dtype=np.int64,
             )
+        raw_labels = _raw_species_labels_for_frame(frame)
+        if not raw_species_is_fixed and atom_count > 0:
+            raw_species_labels[index, :atom_count] = raw_labels.astype(raw_species_dtype)
         cells[index] = np.asarray(frame.cell.array, dtype=np.float64)
         pbc[index] = np.asarray(frame.get_pbc(), dtype=bool)
 
@@ -1026,6 +1130,15 @@ def _write_trajectory_hdf5(
                 data=atomic_numbers.astype(np.int64),
                 compression="lzf" if not topology_is_fixed else None,
                 shuffle=not topology_is_fixed,
+            )
+            handle.create_dataset(
+                "raw_species_labels",
+                data=raw_species_labels,
+                compression="lzf" if not raw_species_is_fixed else None,
+                shuffle=not raw_species_is_fixed,
+            )
+            handle.attrs["raw_species_labels_mode"] = (
+                "fixed" if raw_species_is_fixed else "variable"
             )
             if not topology_is_fixed:
                 handle.create_dataset(
@@ -1162,6 +1275,7 @@ def _write_trajectory_hdf5(
 def _build_atoms_from_hdf5_chunk(
     *,
     atomic_numbers: np.ndarray,
+    raw_species_labels: np.ndarray | None,
     positions_chunk: np.ndarray,
     cell_chunk: np.ndarray,
     pbc_chunk: np.ndarray,
@@ -1178,12 +1292,25 @@ def _build_atoms_from_hdf5_chunk(
             atom_count = int(atom_counts_chunk[offset])
             frame_atomic_numbers = np.asarray(atomic_numbers[offset, :atom_count], dtype=np.int64)
             frame_positions = np.asarray(positions_chunk[offset, :atom_count], dtype=np.float64)
+        frame_raw_species_labels: np.ndarray | None = None
+        if raw_species_labels is not None:
+            if atom_counts_chunk is None and raw_species_labels.ndim == 1:
+                frame_raw_species_labels = _decode_hdf5_string_array(raw_species_labels)
+            elif atom_counts_chunk is None:
+                frame_raw_species_labels = _decode_hdf5_string_array(raw_species_labels[offset])
+            else:
+                atom_count = int(atom_counts_chunk[offset])
+                frame_raw_species_labels = _decode_hdf5_string_array(
+                    raw_species_labels[offset, :atom_count]
+                )
         frame = Atoms(
             numbers=frame_atomic_numbers,
             positions=frame_positions,
             cell=cell_chunk[offset],
             pbc=tuple(bool(value) for value in pbc_chunk[offset]),
         )
+        if frame_raw_species_labels is not None:
+            _set_raw_species_labels(frame, frame_raw_species_labels)
         for key, values in frame_info_chunks.items():
             scalar = values[offset]
             if np.issubdtype(values.dtype, np.integer):
@@ -1210,6 +1337,7 @@ def _read_trajectory_hdf5_chunks(path: Path, *, chunk_size: int) -> Iterator[lis
         cells = handle["cell"]
         pbc = handle["pbc"]
         atomic_numbers = np.asarray(handle["atomic_numbers"], dtype=np.int64)
+        raw_species_dataset = handle.get("raw_species_labels")
         atom_counts_dataset = handle.get("atom_counts")
         frame_count = int(handle.attrs.get("frame_count", positions.shape[0]))
         info_group = handle.get("frame_info")
@@ -1242,6 +1370,15 @@ def _read_trajectory_hdf5_chunks(path: Path, *, chunk_size: int) -> Iterator[lis
                         atomic_numbers
                         if atom_counts_chunk is None
                         else np.asarray(atomic_numbers[start:stop], dtype=np.int64)
+                    ),
+                    raw_species_labels=(
+                        None
+                        if not isinstance(raw_species_dataset, h5py.Dataset)
+                        else (
+                            np.asarray(raw_species_dataset)
+                            if raw_species_dataset.ndim == 1
+                            else np.asarray(raw_species_dataset[start:stop])
+                        )
                     ),
                     positions_chunk=positions_chunk,
                     cell_chunk=cell_chunk,
@@ -1433,6 +1570,109 @@ def _read_frames(
     return frames
 
 
+def _parse_extxyz_comment(comment: str) -> tuple[np.ndarray | None, tuple[bool, bool, bool] | None]:
+    try:
+        fields = shlex.split(comment)
+    except ValueError:
+        return None, None
+    values: dict[str, str] = {}
+    for field in fields:
+        if "=" not in field:
+            continue
+        key, value = field.split("=", 1)
+        values[key] = value.strip('"')
+    cell: np.ndarray | None = None
+    pbc: tuple[bool, bool, bool] | None = None
+    lattice = values.get("Lattice")
+    if lattice:
+        try:
+            lattice_values = [float(item) for item in lattice.split()]
+        except ValueError:
+            lattice_values = []
+        if len(lattice_values) == 9:
+            cell = np.asarray(lattice_values, dtype=float).reshape(3, 3)
+    pbc_value = values.get("pbc") or values.get("PBC")
+    if pbc_value:
+        parts = pbc_value.replace(",", " ").split()
+        if len(parts) == 3:
+            pbc = cast(
+                tuple[bool, bool, bool],
+                tuple(part.lower() in {"t", "true", "1", "yes"} for part in parts),
+            )
+    return cell, pbc
+
+
+def _read_xyz_like_frames(
+    path: Path,
+    *,
+    atom_aliases: Any = None,
+) -> list[Atoms]:
+    aliases = parse_atom_aliases(atom_aliases)
+    frames: list[Atoms] = []
+    alias_summary: dict[str, str] = {}
+    total_frames = _count_xyz_like_frames(path)
+    with path.open("r", encoding="utf-8") as handle:
+        with ProgressBar(desc="Reading trajectory", total=total_frames, unit="frame") as progress:
+            while True:
+                natoms_line = handle.readline()
+                if not natoms_line:
+                    break
+                stripped = natoms_line.strip()
+                if not stripped:
+                    continue
+                try:
+                    atom_count = int(stripped)
+                except ValueError:
+                    raise ValueError(
+                        f"Could not parse XYZ trajectory '{path}': expected atom count line, "
+                        f"got {stripped!r}."
+                    ) from None
+                comment = handle.readline()
+                if comment == "":
+                    raise ValueError(f"Incomplete XYZ trajectory '{path}': missing comment line.")
+                raw_labels: list[str] = []
+                symbols: list[str] = []
+                positions = np.empty((atom_count, 3), dtype=float)
+                for atom_index in range(atom_count):
+                    line = handle.readline()
+                    if line == "":
+                        raise ValueError(
+                            f"Incomplete XYZ trajectory '{path}': truncated atom block."
+                        )
+                    parts = line.split()
+                    if len(parts) < 4:
+                        raise ValueError(
+                            f"Invalid XYZ atom line in '{path}': expected label and xyz columns."
+                        )
+                    raw_label = parts[0]
+                    element_label = _resolve_raw_atom_label(raw_label, aliases)
+                    try:
+                        positions[atom_index] = [float(parts[1]), float(parts[2]), float(parts[3])]
+                    except ValueError:
+                        raise ValueError(
+                            f"Invalid XYZ coordinates for atom label '{raw_label}' in '{path}'."
+                        ) from None
+                    raw_labels.append(raw_label)
+                    symbols.append(element_label)
+                    if raw_label != element_label or raw_label in aliases:
+                        alias_summary[raw_label] = element_label
+                cell, pbc = _parse_extxyz_comment(comment)
+                frame = Atoms(symbols=symbols, positions=positions)
+                if cell is not None:
+                    frame.set_cell(cell)
+                    frame.set_pbc(pbc if pbc is not None else (True, True, True))
+                elif pbc is not None:
+                    frame.set_pbc(pbc)
+                frame.info["comment"] = comment.strip()
+                _set_raw_species_labels(frame, raw_labels, aliases)
+                frames.append(frame)
+                progress.update()
+    if alias_summary:
+        summary = ", ".join(f"{raw}->{element}" for raw, element in sorted(alias_summary.items()))
+        LOGGER.info("Atom labels: %s.", summary)
+    return frames
+
+
 def _count_lammps_dump_frames(path: Path) -> int:
     """Count frames in a LAMMPS text dump by scanning timestep markers."""
     frame_count = 0
@@ -1542,7 +1782,12 @@ def _read_lammps_dump_frames(path: Path) -> list[Atoms]:
     return frames
 
 
-def read_trajectory_chunks(path: str | Path, *, chunk_size: int) -> Iterator[list[Atoms]]:
+def read_trajectory_chunks(
+    path: str | Path,
+    *,
+    chunk_size: int,
+    atom_aliases: Any = None,
+) -> Iterator[list[Atoms]]:
     """Yield trajectory frames in fixed-size chunks.
 
     This allows analyses to stream large trajectories without materializing all frames.
@@ -1565,6 +1810,12 @@ def read_trajectory_chunks(path: str | Path, *, chunk_size: int) -> Iterator[lis
         return
 
     suffix = trajectory_path.suffix.lower()
+    if suffix in _XYZ_LIKE_SUFFIXES:
+        frames = _read_xyz_like_frames(trajectory_path, atom_aliases=atom_aliases)
+        for start in range(0, len(frames), chunk_size):
+            yield frames[start : start + chunk_size]
+        return
+
     if suffix == ".lmp":
         frames = _read_lammps_input_trajectory(trajectory_path)
         for start in range(0, len(frames), chunk_size):
@@ -1655,7 +1906,7 @@ def _read_lammps_input_trajectory(input_path: Path) -> list[Atoms]:
     return frames
 
 
-def read_trajectory(path: str | Path) -> list[Atoms]:
+def read_trajectory(path: str | Path, *, atom_aliases: Any = None) -> list[Atoms]:
     """Read all frames from a trajectory file.
 
     Parameters
@@ -1699,6 +1950,8 @@ def read_trajectory(path: str | Path) -> list[Atoms]:
             frames = _read_lammps_input_trajectory(trajectory_path)
         elif suffix == ".dump":
             frames = _read_lammps_dump_frames(trajectory_path)
+        elif suffix in _XYZ_LIKE_SUFFIXES:
+            frames = _read_xyz_like_frames(trajectory_path, atom_aliases=atom_aliases)
         else:
             frames = _read_frames(trajectory_path)
 

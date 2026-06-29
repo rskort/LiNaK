@@ -16,6 +16,7 @@ from ..progress import ProgressBar
 from ..storage.hdf5_utils import write_linak_hdf5
 from .common import (
     MOLECULE_SPECIES_LABELS,
+    available_distinct_raw_species,
     available_element_species,
     frame_has_usable_cell as _common_frame_has_usable_cell,
     is_molecule_species_label,
@@ -24,8 +25,10 @@ from .common import (
     normalize_species_query as _normalize_species_query,
     optional_cell_lengths as _optional_cell_lengths,
     optional_finite_float as _optional_finite_float,
+    raw_species_labels,
     read_profile_payloads,
     read_profile_payloads_by_index,
+    species_selector_raw_label,
     use_multi_series_plot,
     validate_stable_atom_layout as _validate_stable_atom_layout,
     write_profile_collection,
@@ -69,7 +72,7 @@ from ..plot.plotting import (
 from ..utils import axis_to_index, ensure_positive
 
 LOGGER = logging.getLogger(__name__)
-DEFAULT_MIN_MOLECULE_FRAMES = 3
+DEFAULT_MIN_MOLECULE_FRAMES = 5
 _POSITION_PROJECTION_COMPONENT = "2d-projection"
 _POSITION_PROJECTION_QUANTITIES = (
     "x",
@@ -231,17 +234,55 @@ def _resolve_surface_distance_values(
 def _position_species_display_label(species_label: str) -> str:
     if is_molecule_species_label(species_label):
         return molecule_display_label(species_label)
+    if str(species_label).lower().startswith("species:"):
+        return f"{species_selector_raw_label(species_label)} (species)"
     return str(species_label)
+
+
+def _position_selection_kind_for_label(species_label: str) -> str:
+    if is_molecule_species_label(species_label):
+        return "molecule"
+    if str(species_label).lower().startswith("species:"):
+        return "species"
+    return "element"
+
+
+def _position_selector_mask(
+    frame: Atoms,
+    species_label: str,
+    *,
+    symbols: np.ndarray | None = None,
+) -> np.ndarray:
+    if species_label == "ALL":
+        return np.ones(len(frame), dtype=bool)
+    selection_mode, selection_label = _normalize_species_query(species_label)
+    if selection_mode == "species":
+        labels = raw_species_labels(frame)
+        return labels == species_selector_raw_label(selection_label)
+    frame_symbols = (
+        np.asarray(frame.get_chemical_symbols(), dtype=object)
+        if symbols is None
+        else np.asarray(symbols, dtype=object)
+    )
+    if selection_mode == "element":
+        return frame_symbols == selection_label
+    return frame_symbols == species_label
 
 
 def _position_selection_summary(
     *,
     element_labels: list[str],
+    raw_species_labels: list[str] | None = None,
     molecule_labels: list[str],
 ) -> str:
     parts: list[str] = []
     if element_labels:
         parts.append("elements=" + ",".join(element_labels))
+    if raw_species_labels:
+        parts.append(
+            "species="
+            + ",".join(_position_species_display_label(label) for label in raw_species_labels)
+        )
     if molecule_labels:
         parts.append(
             "molecules="
@@ -254,6 +295,7 @@ def _molecule_position_label_is_active(
     *,
     species_label: str,
     active_frame_count: int,
+    consecutive_frame_count: int | None = None,
     apply_min_molecule_frames: bool,
     min_molecule_frames: int,
 ) -> bool:
@@ -263,7 +305,20 @@ def _molecule_position_label_is_active(
         return True
     if species_label == "mol:H2O":
         return True
-    return int(active_frame_count) >= int(min_molecule_frames)
+    threshold_count = active_frame_count if consecutive_frame_count is None else consecutive_frame_count
+    return int(threshold_count) >= int(min_molecule_frames)
+
+
+def _max_consecutive_truthy(values: Any) -> int:
+    best = 0
+    current = 0
+    for value in values:
+        if value:
+            current += 1
+            best = max(best, current)
+        else:
+            current = 0
+    return best
 
 
 def _position_surface_context(
@@ -376,6 +431,23 @@ def _compute_position_profiles_for_labels(
             exc,
         )
         symbols = np.asarray(frames[0].get_chemical_symbols(), dtype=object)
+    if stable_layout and any(
+        str(label).lower().startswith("species:") for label in species_labels
+    ):
+        reference_raw_labels = raw_species_labels(frames[0])
+        for frame_index, frame in enumerate(frames[1:], start=1):
+            current_raw_labels = raw_species_labels(frame)
+            if current_raw_labels.shape != reference_raw_labels.shape or not np.array_equal(
+                current_raw_labels,
+                reference_raw_labels,
+            ):
+                stable_layout = False
+                LOGGER.warning(
+                    "Raw atom species/order changed at frame %d. Falling back to frame-wise "
+                    "position selection with NaN padding.",
+                    frame_index,
+                )
+                break
 
     cell_lengths_angstrom = _resolve_cell_lengths_from_frames(frames)
     axis_index = axis_to_index(axis)
@@ -406,7 +478,9 @@ def _compute_position_profiles_for_labels(
             if species_label == "ALL":
                 atom_indices = np.arange(symbols.size, dtype=int)
             else:
-                atom_indices = np.where(symbols == species_label)[0].astype(int, copy=False)
+                atom_indices = np.where(
+                    _position_selector_mask(frames[0], species_label, symbols=symbols)
+                )[0].astype(int, copy=False)
             if atom_indices.size == 0:
                 raise ValueError(f"No atoms found for species '{species_label}' in frame 0.")
             selected_indices_by_label[species_label] = np.asarray(atom_indices, dtype=int)
@@ -454,6 +528,7 @@ def _compute_position_profiles_for_labels(
                     n_frames=len(frames),
                     n_atoms=int(atom_indices.size),
                     coordinate_mode=coordinate_mode,
+                    selection_kind=_position_selection_kind_for_label(species_label),
                     surface_position=surface_position,
                     surface_position_std=surface_position_std,
                     surface_position_per_frame=(
@@ -477,7 +552,11 @@ def _compute_position_profiles_for_labels(
             if species_label == "ALL":
                 count = int(frame_symbols.size)
             else:
-                count = int(np.count_nonzero(frame_symbols == species_label))
+                count = int(
+                    np.count_nonzero(
+                        _position_selector_mask(frame, species_label, symbols=frame_symbols)
+                    )
+                )
             counts_by_label[species_label][frame_i] = count
             max_counts_by_label[species_label] = max(max_counts_by_label[species_label], count)
 
@@ -501,10 +580,9 @@ def _compute_position_profiles_for_labels(
                 if species_label == "ALL":
                     atom_indices = np.arange(frame_symbols.size, dtype=int)
                 else:
-                    atom_indices = np.where(frame_symbols == species_label)[0].astype(
-                        int,
-                        copy=False,
-                    )
+                    atom_indices = np.where(
+                        _position_selector_mask(frame, species_label, symbols=frame_symbols)
+                    )[0].astype(int, copy=False)
                 if atom_indices.size == 0:
                     continue
                 x_values, y_values, z_values = matrices_by_label[species_label]
@@ -539,6 +617,7 @@ def _compute_position_profiles_for_labels(
                 n_frames=len(frames),
                 n_atoms=max_count,
                 coordinate_mode=coordinate_mode,
+                selection_kind=_position_selection_kind_for_label(species_label),
                 surface_position=surface_position,
                 surface_position_std=surface_position_std,
                 surface_position_per_frame=(
@@ -653,6 +732,7 @@ def _compute_molecule_position_profiles_for_labels(
         if _molecule_position_label_is_active(
             species_label=label,
             active_frame_count=int(np.count_nonzero(counts_by_label[label] > 0)),
+            consecutive_frame_count=_max_consecutive_truthy(counts_by_label[label] > 0),
             apply_min_molecule_frames=apply_min_molecule_frames,
             min_molecule_frames=int(min_molecule_frames),
         )
@@ -838,7 +918,7 @@ def compute_position_profiles(
         if not profiles:
             raise ValueError(f"No molecules found for species '{species_label}' in trajectory.")
         return profiles
-    if selection_mode == "element":
+    if selection_mode in {"element", "species"}:
         return [
             compute_position_profile(
                 frames=frames,
@@ -863,6 +943,11 @@ def compute_position_profiles(
     )
     if selection_mode in {"all", "elements"} and not element_species:
         raise ValueError("No elements found in trajectory.")
+    raw_species_labels_for_output = (
+        [f"species:{label}" for label in available_distinct_raw_species(frames)]
+        if selection_mode == "all"
+        else []
+    )
     molecule_labels = list(MOLECULE_SPECIES_LABELS) if selection_mode in {"all", "molecules"} else []
     profiles: list[PositionProfile] = []
     if element_species:
@@ -870,6 +955,20 @@ def compute_position_profiles(
             _compute_position_profiles_for_labels(
                 frames=frames,
                 species_labels=element_species,
+                axis=axis,
+                timestep_fs=timestep_fs,
+                surface_mode=surface_mode,
+                surface_elements=surface_elements,
+                include_fixed_surface_atoms=include_fixed_surface_atoms,
+                surface_options=surface_options,
+                precomputed_surface_estimate=precomputed_surface_estimate,
+            )
+        )
+    if raw_species_labels_for_output:
+        profiles.extend(
+            _compute_position_profiles_for_labels(
+                frames=frames,
+                species_labels=raw_species_labels_for_output,
                 axis=axis,
                 timestep_fs=timestep_fs,
                 surface_mode=surface_mode,
@@ -900,6 +999,9 @@ def compute_position_profiles(
         "Position selections: %s.",
         _position_selection_summary(
             element_labels=element_species,
+            raw_species_labels=[
+                profile.species for profile in profiles if profile.selection_kind == "species"
+            ],
             molecule_labels=[
                 profile.species for profile in profiles if profile.selection_kind == "molecule"
             ],

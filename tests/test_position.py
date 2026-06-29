@@ -161,8 +161,14 @@ def test_compute_position_profiles_elements_and_molecules_group_selectors():
         frames,
         species="molecules",
         surface_mode="none",
+        min_molecule_frames=1,
     )
-    all_profiles = compute_position_profiles(frames, species="all", surface_mode="none")
+    all_profiles = compute_position_profiles(
+        frames,
+        species="all",
+        surface_mode="none",
+        min_molecule_frames=1,
+    )
 
     assert [profile.species for profile in element_profiles] == ["H", "O"]
     assert [profile.species for profile in molecule_profiles] == ["mol:O", "mol:OH"]
@@ -289,7 +295,7 @@ def test_save_and_load_position_molecule_profile_preserves_entity_counts(tmp_pat
     assert loaded.selection_kind == "molecule"
     assert loaded.entity_kind == "molecule"
     np.testing.assert_array_equal(loaded.entity_counts_per_frame, np.array([1]))
-    assert loaded.oh_cutoff_A == pytest.approx(1.25)
+    assert loaded.oh_cutoff_A == pytest.approx(1.27)
     assert loaded.oh_topology_stride == 100
 
 

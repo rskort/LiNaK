@@ -53,8 +53,12 @@ from ..plot.plotting import (
 from ..progress import ProgressBar
 from ..utils import ensure_positive
 from .common import (
+    available_distinct_raw_species,
     available_element_species as _available_element_species,
     normalize_species_label as _normalize_species,
+    normalize_species_query as _normalize_species_query,
+    raw_species_labels,
+    species_selector_raw_label,
     read_profile_payloads,
     read_profile_payloads_by_index,
     use_multi_series_plot,
@@ -462,15 +466,29 @@ def _rdf_pair_matches_exact_request(
     return True
 
 
-def _select_mask(numbers: np.ndarray, species: str) -> np.ndarray:
+def _select_mask(numbers: np.ndarray, species: str, frame: Atoms | None = None) -> np.ndarray:
     """Return atom-selection mask for one frame."""
     if species == "ALL":
         return np.ones(numbers.size, dtype=bool)
 
+    selection_mode, selection_label = _normalize_species_query(species)
+    if selection_mode == "species":
+        if frame is None:
+            return np.zeros(numbers.size, dtype=bool)
+        labels = raw_species_labels(frame)
+        return labels == species_selector_raw_label(selection_label)
+    if selection_mode == "element":
+        species = selection_label
     atomic_number = atomic_numbers.get(species)
     if atomic_number is None:
         return np.zeros(numbers.size, dtype=bool)
     return numbers == atomic_number
+
+
+def _select_mask_for_frame(numbers: np.ndarray, species: str, frame: Atoms) -> np.ndarray:
+    if _normalize_species_query(species)[0] == "species":
+        return _select_mask(numbers, species, frame)
+    return _select_mask(numbers, species)
 
 
 def _frame_volume(frame: Atoms) -> float:
@@ -1529,6 +1547,10 @@ def _resolve_rdf_selection_cache(
         return None
 
     reference_numbers = np.asarray(frames[0].numbers, dtype=int)
+    needs_raw_species_validation = any(
+        _normalize_species_query(label)[0] == "species" for label in (label_a, label_b)
+    )
+    reference_raw_labels = raw_species_labels(frames[0]) if needs_raw_species_validation else None
     for frame_index, frame in enumerate(frames[1:], start=1):
         current_numbers = np.asarray(frame.numbers, dtype=int)
         if current_numbers.shape != reference_numbers.shape or not np.array_equal(
@@ -1545,6 +1567,18 @@ def _resolve_rdf_selection_cache(
                 frame_index,
             )
             return None
+        if reference_raw_labels is not None:
+            current_raw_labels = raw_species_labels(frame)
+            if current_raw_labels.shape != reference_raw_labels.shape or not np.array_equal(
+                current_raw_labels,
+                reference_raw_labels,
+            ):
+                LOGGER.warning(
+                    "RDF raw atom species/order changed at frame %d; "
+                    "falling back to per-frame species selection.",
+                    frame_index,
+                )
+                return None
 
     if atom_indices_a is not None:
         indices_a = np.asarray(atom_indices_a, dtype=int).reshape(-1)
@@ -1555,7 +1589,7 @@ def _resolve_rdf_selection_cache(
         mask_a = np.zeros(reference_numbers.size, dtype=bool)
         mask_a[indices_a] = True
     else:
-        mask_a = _select_mask(reference_numbers, label_a)
+        mask_a = _select_mask_for_frame(reference_numbers, label_a, frames[0])
         indices_a = np.flatnonzero(mask_a)
 
     if atom_indices_b is not None:
@@ -1567,7 +1601,7 @@ def _resolve_rdf_selection_cache(
         mask_b = np.zeros(reference_numbers.size, dtype=bool)
         mask_b[indices_b] = True
     else:
-        mask_b = _select_mask(reference_numbers, label_b)
+        mask_b = _select_mask_for_frame(reference_numbers, label_b, frames[0])
         indices_b = np.flatnonzero(mask_b)
 
     count_a = int(indices_a.size)
@@ -1598,6 +1632,10 @@ def _resolve_rdf_selection_caches_by_species(
         return {}
 
     reference_numbers = np.asarray(frames[0].numbers, dtype=int)
+    needs_raw_species_validation = any(
+        _normalize_species_query(label)[0] == "species" for label in species_labels
+    )
+    reference_raw_labels = raw_species_labels(frames[0]) if needs_raw_species_validation else None
     for frame_index, frame in enumerate(frames[1:], start=1):
         current_numbers = np.asarray(frame.numbers, dtype=int)
         if current_numbers.shape != reference_numbers.shape or not np.array_equal(
@@ -1610,10 +1648,22 @@ def _resolve_rdf_selection_caches_by_species(
                 frame_index,
             )
             return None
+        if reference_raw_labels is not None:
+            current_raw_labels = raw_species_labels(frame)
+            if current_raw_labels.shape != reference_raw_labels.shape or not np.array_equal(
+                current_raw_labels,
+                reference_raw_labels,
+            ):
+                LOGGER.warning(
+                    "RDF raw atom species/order changed at frame %d; "
+                    "falling back to per-pair framewise species selection.",
+                    frame_index,
+                )
+                return None
 
     caches: dict[str, _RDFSelectionCache] = {}
     for label in species_labels:
-        mask = _select_mask(reference_numbers, label)
+        mask = _select_mask_for_frame(reference_numbers, label, frames[0])
         indices = np.flatnonzero(mask)
         count = int(indices.size)
         if count == 0:
@@ -1709,8 +1759,8 @@ def _compute_rdf_frame_contribution(
         count_b = selection_cache.count_b
         overlap_count = selection_cache.overlap_count
     else:
-        mask_a = _select_mask(numbers, label_a)
-        mask_b = _select_mask(numbers, label_b)
+        mask_a = _select_mask_for_frame(numbers, label_a, frame)
+        mask_b = _select_mask_for_frame(numbers, label_b, frame)
         indices_a = np.flatnonzero(mask_a)
         indices_b = np.flatnonzero(mask_b)
         count_a = int(indices_a.size)
@@ -2212,7 +2262,10 @@ def compute_rdf_profiles(
     if not frames:
         raise ValueError("At least one trajectory frame is required.")
 
-    species_labels = _available_element_species(frames)
+    species_labels = [
+        *_available_element_species(frames),
+        *(f"species:{label}" for label in available_distinct_raw_species(frames)),
+    ]
     if not species_labels:
         raise ValueError("No elements found in trajectory.")
     pairs = list(combinations_with_replacement(species_labels, 2))

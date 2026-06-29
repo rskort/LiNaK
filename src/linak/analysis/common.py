@@ -7,6 +7,7 @@ from typing import Any
 
 import numpy as np
 from ase import Atoms
+from ase.data import atomic_numbers
 
 from ..storage.hdf5_utils import (
     is_hdf5_path,
@@ -35,6 +36,9 @@ _MOLECULE_DISPLAY_LABELS = {
     "mol:H2O": "H2O",
     "mol:H3O": "H3O",
 }
+
+RAW_SPECIES_ARRAY = "linak_raw_species"
+ATOM_ALIAS_INFO_KEY = "linak_atom_aliases"
 
 
 def normalize_molecule_label(species: str | None) -> str | None:
@@ -79,12 +83,38 @@ def normalize_species_label(species: str | None) -> str:
         return "ALL"
     if token.lower() in {"elements", "molecules"}:
         return token.upper()
+    if token.lower().startswith("species:"):
+        raw_label = token.split(":", 1)[1].strip()
+        if not raw_label:
+            raise ValueError("species: selectors require a raw atom label.")
+        return f"species:{raw_label}"
+    if token.lower().startswith("element:"):
+        element_label = _normalize_element_symbol(token.split(":", 1)[1])
+        return f"element:{element_label}"
     molecule_label = normalize_molecule_label(token)
     if token.lower().startswith("mol:") and molecule_label is not None:
         return molecule_label
     if token.upper() == "H2O":
         return "H2O"
-    return token[0].upper() + token[1:].lower()
+    element_label = _try_normalize_element_symbol(token)
+    if element_label is not None:
+        return element_label
+    return f"species:{token}"
+
+
+def _try_normalize_element_symbol(value: str | None) -> str | None:
+    token = "" if value is None else str(value).strip()
+    if not token:
+        return None
+    candidate = token[0].upper() + token[1:].lower()
+    return candidate if candidate in atomic_numbers else None
+
+
+def _normalize_element_symbol(value: str | None) -> str:
+    candidate = _try_normalize_element_symbol(value)
+    if candidate is None:
+        raise ValueError(f"Unknown element symbol '{value}'.")
+    return candidate
 
 
 def normalize_species_query(
@@ -104,10 +134,20 @@ def normalize_species_query(
         return "elements", "ELEMENTS"
     if token.lower() == "molecules":
         return "molecules", "MOLECULES"
+    if token.lower().startswith("species:"):
+        raw_label = token.split(":", 1)[1].strip()
+        if not raw_label:
+            raise ValueError("species: selectors require a raw atom label.")
+        return "species", f"species:{raw_label}"
+    if token.lower().startswith("element:"):
+        return "element", _normalize_element_symbol(token.split(":", 1)[1])
     molecule_label = normalize_molecule_label(token)
     if molecule_label is not None and (allow_molecules or (allow_h2o and molecule_label == "mol:H2O")):
         return "molecule", molecule_label
-    return "element", normalize_species_label(token)
+    element_label = _try_normalize_element_symbol(token)
+    if element_label is not None:
+        return "element", element_label
+    return "species", f"species:{token}"
 
 
 def available_element_species(frames: list[Atoms]) -> list[str]:
@@ -118,10 +158,65 @@ def available_element_species(frames: list[Atoms]) -> list[str]:
     return sorted(species_set)
 
 
+def raw_species_labels(frame: Atoms) -> np.ndarray:
+    """Return LiNaK raw species labels, falling back to resolved element symbols."""
+
+    labels = frame.arrays.get(RAW_SPECIES_ARRAY)
+    if labels is None:
+        return np.asarray(frame.get_chemical_symbols(), dtype=object)
+    return np.asarray(labels, dtype=object).astype(str)
+
+
+def available_raw_species(frames: list[Atoms]) -> list[str]:
+    """Return sorted unique raw atom labels found across all frames."""
+
+    species_set: set[str] = set()
+    for frame in frames:
+        species_set.update(str(label) for label in raw_species_labels(frame))
+    return sorted(species_set)
+
+
+def available_distinct_raw_species(frames: list[Atoms]) -> list[str]:
+    """Return raw labels to expose as exact species selections."""
+
+    has_distinct_raw_labels = False
+    species_set: set[str] = set()
+    for frame in frames:
+        if RAW_SPECIES_ARRAY not in frame.arrays:
+            continue
+        raw_labels = raw_species_labels(frame)
+        element_labels = np.asarray(frame.get_chemical_symbols(), dtype=object).astype(str)
+        if raw_labels.shape != element_labels.shape:
+            has_distinct_raw_labels = True
+        elif np.any(raw_labels != element_labels):
+            has_distinct_raw_labels = True
+        species_set.update(str(label) for label in raw_labels if str(label))
+    if not has_distinct_raw_labels:
+        return []
+    return sorted(species_set)
+
+
+def species_selector_raw_label(species: str) -> str:
+    """Return the raw label part for a normalized species selector."""
+
+    token = str(species).strip()
+    if token.lower().startswith("species:"):
+        return token.split(":", 1)[1].strip()
+    return token
+
+
 def select_species_indices(frame: Atoms, species: str) -> np.ndarray:
     """Return atom indices for one normalized species selection."""
     if species == "ALL":
         return np.arange(len(frame), dtype=int)
+    selection_mode, selection_label = normalize_species_query(species)
+    if selection_mode == "species":
+        labels = raw_species_labels(frame)
+        raw_label = species_selector_raw_label(selection_label)
+        return np.where(labels == raw_label)[0].astype(int, copy=False)
+    if selection_mode == "element":
+        symbols = np.asarray(frame.get_chemical_symbols(), dtype=object)
+        return np.where(symbols == selection_label)[0].astype(int, copy=False)
     symbols = np.asarray(frame.get_chemical_symbols(), dtype=object)
     return np.where(symbols == species)[0].astype(int, copy=False)
 

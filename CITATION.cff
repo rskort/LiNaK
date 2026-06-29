@@ -9,7 +9,7 @@ authors:
     orcid: "https://orcid.org/0009-0003-0541-9521"
     affiliation: "Leiden Institute of Chemistry, Leiden University"
 
-version: "0.8.3"
+version: "0.9.5"
 url: "https://github.com/rskort/LiNaK/"
 repository-code: "https://github.com/rskort/LiNaK/"
 license: "Apache-2.0"

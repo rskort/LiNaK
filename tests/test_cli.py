@@ -39,8 +39,11 @@ from linak.cli import (
 )
 from linak.analysis.density import (
     DensityHeatmapProfile,
+    DensityGridProfile,
+    DensityProfile,
     compute_all_density_profiles,
     compute_density_profile,
+    load_density_grid_profiles,
     load_density_heatmap_profiles,
     load_density_profile,
     load_density_profiles,
@@ -3089,7 +3092,7 @@ def test_compute_density_defaults_surface_detection_options():
     assert args.include_fixed_surface_atoms is False
     assert args.rough_surface_envelope is None
     assert args.outputs is None
-    assert cli_mod._resolve_density_outputs_from_args(args) == "line"
+    assert cli_mod._resolve_density_outputs_from_args(args) == "1d"
     assert args.heatmap_planes is None
 
 
@@ -3133,7 +3136,7 @@ def test_compute_density_default_axis_produces_all_three_axes(tmp_path, monkeypa
     assert load_density_heatmap_profiles(output) == []
 
 
-def test_compute_density_outputs_all_writes_line_profiles_and_heatmaps(tmp_path, monkeypatch):
+def test_compute_density_outputs_all_writes_line_profiles_and_sparse_grids(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     trajectory = tmp_path / "traj.xyz"
     _write_xyz(trajectory)
@@ -3157,16 +3160,17 @@ def test_compute_density_outputs_all_writes_line_profiles_and_heatmaps(tmp_path,
     assert rc == 0
     output = _linak_output_dir(tmp_path) / "traj.density.h5"
     line_profiles = load_density_profiles(output)
-    heatmap_profiles = load_density_heatmap_profiles(output)
+    grid_profiles = load_density_grid_profiles(output)
     assert {profile.axis for profile in line_profiles if profile.coordinate_mode != "distance"} == {
         "x",
         "y",
         "z",
     }
-    assert {profile.plane for profile in heatmap_profiles} == {"xy", "xz", "yz"}
+    assert [profile.species for profile in grid_profiles] == ["O"]
+    assert grid_profiles[0].flat_indices.size > 0
 
 
-def test_compute_density_outputs_heatmap_respects_selected_planes(tmp_path, monkeypatch):
+def test_compute_density_outputs_3d_writes_sparse_grid_only(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     trajectory = tmp_path / "traj.xyz"
     _write_xyz(trajectory)
@@ -3183,16 +3187,14 @@ def test_compute_density_outputs_heatmap_respects_selected_planes(tmp_path, monk
             "--bin-width",
             "0.1",
             "--outputs",
-            "heatmap",
-            "--heatmap-planes",
-            "xy",
+            "3d",
         ]
     )
 
     assert rc == 0
     output = _linak_output_dir(tmp_path) / "traj.density.h5"
     assert load_density_profiles(output) == []
-    assert [profile.plane for profile in load_density_heatmap_profiles(output)] == ["xy"]
+    assert [profile.species for profile in load_density_grid_profiles(output)] == ["O"]
 
 
 def test_compute_density_heatmap_planes_require_heatmap_output(tmp_path, monkeypatch, capsys):
@@ -3217,7 +3219,7 @@ def test_compute_density_heatmap_planes_require_heatmap_output(tmp_path, monkeyp
     )
 
     assert rc == 1
-    assert "--heatmap-planes requires --outputs heatmap or --outputs all" in capsys.readouterr().err
+    assert "--heatmap-planes is no longer used" in capsys.readouterr().err
 
 
 def test_compute_density_rejects_heatmap_planes_with_line_output(capsys):
@@ -3236,7 +3238,7 @@ def test_compute_density_rejects_heatmap_planes_with_line_output(capsys):
     )
 
     assert rc == 1
-    assert "--heatmap-planes requires --outputs heatmap or --outputs all" in capsys.readouterr().err
+    assert "--heatmap-planes is no longer used" in capsys.readouterr().err
 
 
 def test_density_profile_filter_options_only_offer_heatmap_when_sources_exist():
@@ -3323,8 +3325,8 @@ def test_compute_position_defaults_surface_detection_options():
     args = build_parser().parse_args(["compute", "position", "traj.xyz"])
     assert args.species is None
     assert args.axis == "z"
-    assert args.oh_cutoff == pytest.approx(1.25)
-    assert args.min_molecule_frames == 3
+    assert args.oh_cutoff == pytest.approx(1.27)
+    assert args.min_molecule_frames == 5
     assert args.oh_topology_stride == 100
     assert args.surface_mode == "auto"
     assert args.surface_elements is None
@@ -4024,6 +4026,27 @@ def test_apply_gui_settings_to_args_forwards_heatmap_and_padding_without_declare
     assert getattr(args, "heatmap_vmax", None) == 2.0
     assert getattr(args, "heatmap_cmap", None) == "viridis"
     assert getattr(args, "heatmap_colorbar_enabled", None) is False
+
+
+def test_apply_gui_settings_to_args_forwards_density_grid_range_settings_without_declared_cli_attr():
+    args = argparse.Namespace(title="Example")
+    settings = {
+        "density_2d_x_axis": "x",
+        "density_2d_y_axis": "y",
+        "density_filter_x_min": 1.0,
+        "density_filter_x_max": 8.0,
+        "density_filter_y_min": None,
+        "density_filter_y_max": 9.0,
+        "density_filter_z_min": 0.0,
+        "density_filter_z_max": 10.0,
+        "density_filter_distance_min": 0.0,
+        "density_filter_distance_max": 5.0,
+    }
+
+    cli_mod._apply_gui_settings_to_args(args, settings)
+
+    for key, value in settings.items():
+        assert getattr(args, key, object()) == value
 
 
 def test_apply_gui_settings_to_args_preserves_gui_manual_axis_limits():
@@ -5178,22 +5201,21 @@ def test_build_density_gui_context_selects_heatmap_contract(tmp_path):
     assert context.profile_filter_options["density_heatmap_plot_contract"]["default_view_type_id"] == "heatmap_2d"
 
 
-def test_build_density_gui_logical_context_defaults_to_heatmap_for_heatmap_only_hdf5(tmp_path):
+def test_build_density_gui_logical_context_offers_line_and_2d_for_grid_only_hdf5(tmp_path):
     frame = Atoms(
         "OO",
         positions=[[0.0, 1.0, 2.0], [2.0, 3.0, 4.0]],
         cell=[10.0, 11.0, 12.0],
         pbc=True,
     )
-    output = tmp_path / "density_heatmap_only.h5"
+    output = tmp_path / "density_grid_only.h5"
     save_density_profiles(
         compute_all_density_profiles(
             [frame],
             species="O",
             bin_width=1.0,
             surface_mode="none",
-            outputs="heatmap",
-            heatmap_planes=["xy"],
+            outputs="3d",
         ),
         output,
     )
@@ -5220,11 +5242,152 @@ def test_build_density_gui_logical_context_defaults_to_heatmap_for_heatmap_only_
 
     context = cli_mod._build_density_gui_logical_context(args, sources=[str(output)])
 
-    assert context.plotter_kwargs["view_mapping"].view_type_id == "heatmap_2d"
-    assert context.profile_filter_options["density_view_types"] == ["heatmap_2d"]
+    assert context.plotter_kwargs["view_mapping"].view_type_id == "line_1d"
+    assert context.profile_filter_options["density_view_types"] == ["line_1d", "heatmap_2d"]
 
 
-def test_plot_density_non_gui_defaults_to_heatmap_for_heatmap_only_hdf5(
+def test_density_profile_filter_options_expose_cell_axis_ranges():
+    options = cli_mod._build_density_profile_filter_options(
+        [
+            (
+                "density.h5",
+                [
+                    {
+                        "metadata": {
+                            "analysis": "density",
+                            "species": "O",
+                            "axis": "z",
+                            "coordinate_mode": "distance",
+                            "profile_kind": "line_1d",
+                            "resolved_cell_angstrom": [10.0, 11.0, 12.0],
+                            "surface_axis": "y",
+                        }
+                    }
+                ],
+            )
+        ],
+        axis=None,
+        species=None,
+    )
+
+    assert options is not None
+    assert options["density_axis_ranges"] == {
+        "x": [0.0, 10.0],
+        "y": [0.0, 11.0],
+        "z": [0.0, 12.0],
+        "distance": [0.0, 11.0],
+    }
+
+
+def test_density_gui_lazy_grid_species_filter_keeps_molecule_descriptors(tmp_path):
+    frame = Atoms(
+        ["O", "H", "Pt"],
+        positions=[[1.0, 1.0, 1.0], [1.0, 1.0, 1.96], [5.0, 5.0, 5.0]],
+        cell=[10.0, 10.0, 10.0],
+        pbc=True,
+    )
+    output = tmp_path / "density_grid_oh.h5"
+    save_density_profiles(
+        compute_all_density_profiles(
+            [frame],
+            species="all",
+            bin_width=1.0,
+            surface_mode="none",
+            outputs="3d",
+            min_molecule_frames=1,
+        ),
+        output,
+        additional_metadata={"resolved_cell_angstrom": [10.0, 10.0, 10.0]},
+    )
+    args = build_parser().parse_args(["plot", str(output)])
+    args.view_mapping = PlotViewMapping(
+        view_type_id="heatmap_2d",
+        x="x_bin_center",
+        y="y_bin_center",
+        role_assignments={"z": "mass_density_2d"},
+    )
+    args.density_2d_x_axis = "x"
+    args.density_2d_y_axis = "y"
+    args.density_enabled_species = ["mol:OH"]
+
+    catalog = cli_mod._build_density_gui_lazy_catalog(args, sources=[str(output)])
+    descriptors = [
+        descriptor
+        for segment in catalog.descriptor_segments_by_source
+        for descriptor in segment
+    ]
+
+    assert descriptors
+    assert {descriptor["density_species"] for descriptor in descriptors} == {"mol:OH"}
+
+
+def test_density_gui_range_filters_use_grid_with_stable_series_id(tmp_path):
+    frame = Atoms(
+        "OO",
+        positions=[[0.5, 0.5, 1.0], [0.5, 0.5, 6.0]],
+        cell=[10.0, 10.0, 10.0],
+        pbc=True,
+    )
+    output = tmp_path / "density_line_and_grid.h5"
+    save_density_profiles(
+        compute_all_density_profiles(
+            [frame],
+            species="O",
+            bin_width=1.0,
+            surface_mode="none",
+            outputs="all",
+        ),
+        output,
+    )
+    args = build_parser().parse_args(["plot", str(output)])
+    args.x_mode = "z"
+    args.density_filter_z_max = None
+    unfiltered_catalog = cli_mod._build_density_gui_lazy_catalog(args, sources=[str(output)])
+    unfiltered_descriptor = unfiltered_catalog.series_descriptors[0]
+
+    args.density_filter_z_max = 5.0
+    filtered_catalog = cli_mod._build_density_gui_lazy_catalog(args, sources=[str(output)])
+    filtered_descriptor = filtered_catalog.series_descriptors[0]
+    filtered_context = filtered_catalog.build_render_context(args)
+    filtered_profile = filtered_context.profile[0]
+
+    assert filtered_descriptor["series_id"] == unfiltered_descriptor["series_id"]
+    assert filtered_descriptor["profile_kind"] == "grid_3d_sparse"
+    assert filtered_descriptor["density_grid_slice_key"]
+    assert isinstance(filtered_profile, DensityProfile)
+    assert filtered_profile.bin_edges[0] == pytest.approx(0.0)
+    assert filtered_profile.bin_edges[-1] == pytest.approx(10.0)
+    assert float(np.nansum(filtered_profile.entities_per_frame)) == pytest.approx(1.0)
+    assert np.all(filtered_profile.entities_per_frame[5:] == pytest.approx(0.0))
+
+
+def test_density_gui_range_filter_requires_sparse_grid(tmp_path):
+    frame = Atoms(
+        "OO",
+        positions=[[0.5, 0.5, 1.0], [0.5, 0.5, 6.0]],
+        cell=[10.0, 10.0, 10.0],
+        pbc=True,
+    )
+    output = tmp_path / "density_line_only.h5"
+    save_density_profile(
+        compute_density_profile(
+            [frame],
+            species="O",
+            axis="z",
+            bin_width=1.0,
+            surface_mode="none",
+        ),
+        output,
+    )
+    args = build_parser().parse_args(["plot", str(output)])
+    args.x_mode = "z"
+    args.density_filter_z_max = 5.0
+
+    with pytest.raises(ValueError, match="Density ranges require a 3D density grid"):
+        cli_mod._build_density_gui_lazy_catalog(args, sources=[str(output)])
+
+
+def test_plot_density_non_gui_defaults_to_grid_derived_line_for_grid_only_hdf5(
     tmp_path,
     monkeypatch,
 ):
@@ -5234,15 +5397,14 @@ def test_plot_density_non_gui_defaults_to_heatmap_for_heatmap_only_hdf5(
         cell=[10.0, 11.0, 12.0],
         pbc=True,
     )
-    output = tmp_path / "density_heatmap_only.h5"
+    output = tmp_path / "density_grid_only.h5"
     save_density_profiles(
         compute_all_density_profiles(
             [frame],
             species="O",
             bin_width=1.0,
             surface_mode="none",
-            outputs="heatmap",
-            heatmap_planes=["xy"],
+            outputs="3d",
         ),
         output,
     )
@@ -5269,10 +5431,10 @@ def test_plot_density_non_gui_defaults_to_heatmap_for_heatmap_only_hdf5(
     assert rc == 0
     profile = captured["profile"]
     kwargs = captured["kwargs"]
-    assert isinstance(profile, DensityHeatmapProfile)
+    assert isinstance(profile, list)
+    assert isinstance(profile[0], DensityProfile)
     assert isinstance(kwargs, dict)
-    assert profile.plane == "xy"
-    assert kwargs["view_mapping"].view_type_id == "heatmap_2d"
+    assert kwargs["view_mapping"].view_type_id == "line_1d"
 
 
 def test_resolve_density_plot_axis_and_x_mode_prefers_explicit_cartesian_values():
@@ -5850,10 +6012,10 @@ def test_plot_density_gui_multi_source_first_open_matches_reopened_combined_hdf5
 
     reopened_args = cli_mod.build_parser().parse_args(["plot", str(combined_source)])
     reopened_args._runtime_argv = ("plot", str(combined_source))
-    reopened_context = cli_mod._build_density_gui_logical_context(
+    reopened_context = cli_mod._build_density_gui_lazy_catalog(
         reopened_args,
         sources=[str(combined_source)],
-    )
+    ).build_initial_context()
 
     assert reopened_context.default_series_labels == [
         f"{source_h5_a.name}:O",
@@ -7139,6 +7301,63 @@ def test_plot_density_gui_lazy_loading_only_reads_enabled_series_and_evicts_cach
         assert render_args.series_enabled is None
         assert render_args.line_colors is None
         assert render_args.series_show_in_legend is None
+
+
+def test_density_gui_species_filter_only_keeps_matching_molecule_descriptor():
+    descriptors = [
+        {"series_id": "h", "density_species": "mol:H", "default_label": "free H"},
+        {"series_id": "o", "density_species": "mol:O", "default_label": "free O"},
+        {"series_id": "oh", "density_species": "mol:OH", "default_label": "OH"},
+        {"series_id": "h2o", "density_species": "mol:H2O", "default_label": "H2O"},
+    ]
+
+    filtered = _gui_series_descriptors_from_settings(
+        {
+            "series_descriptors": descriptors,
+            "density_enabled_species": ["mol:OH"],
+        },
+        descriptors,
+    )
+
+    assert [item["series_id"] for item in filtered] == ["oh"]
+
+
+def test_density_gui_species_filter_prevents_unchecked_species_lazy_load(
+    tmp_path, monkeypatch
+):
+    frame = Atoms(
+        ["O", "Pt"],
+        positions=[[0.0, 0.0, 0.10], [0.0, 0.0, 1.10]],
+        cell=[10.0, 10.0, 10.0],
+        pbc=True,
+    )
+    profiles = [
+        compute_density_profile([frame], species="O", axis="z", bin_width=1.0),
+        compute_density_profile([frame], species="Pt", axis="z", bin_width=1.0),
+    ]
+    source_h5 = tmp_path / "density.h5"
+    save_density_profiles(profiles, source_h5)
+
+    loaded_species_batches: list[list[str]] = []
+    original_loader = load_density_profiles_by_index
+
+    def _recording_loader(path, indices, *, axis=None, species=None):
+        loaded = original_loader(path, indices, axis=axis, species=species)
+        loaded_species_batches.append([profile.species for profile in loaded])
+        return loaded
+
+    monkeypatch.setattr(
+        "linak.analysis.density.load_density_profiles_by_index",
+        _recording_loader,
+    )
+
+    args = build_parser().parse_args(["plot", str(source_h5)])
+    args.density_enabled_species = ["O"]
+    context = _build_density_gui_context(args, sources=[str(source_h5)])
+
+    assert [descriptor["density_species"] for descriptor in context.series_descriptors] == ["O"]
+    assert [profile.species for profile in context.profile] == ["O"]
+    assert loaded_species_batches == [["O"]]
 
 
 def test_plot_position_gui_lazy_loading_only_reads_requested_parent_profile(tmp_path, monkeypatch):

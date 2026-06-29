@@ -113,6 +113,7 @@ class TrajectoryConversionOptions:
     distance_range: str | None = None
     keep_molecules_intact: bool = False
     output_was_default: bool = False
+    atom_aliases: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1195,7 +1196,10 @@ def _convert_trajectory_request(
     )
     from .trajectory.io import TrajectoryStoredMetadata, read_trajectory, write_trajectory
 
-    frames = read_trajectory(request.source_path)
+    frames = read_trajectory(
+        request.source_path,
+        atom_aliases=options.atom_aliases if options is not None else None,
+    )
     selection_resolution: TrajectorySelectionResolution | None = None
     if options is not None and options.select:
         selection_request = parse_trajectory_selection(options.select)

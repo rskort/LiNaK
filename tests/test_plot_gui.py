@@ -604,7 +604,8 @@ def test_plot_settings_panel_busts_preview_pixmap_cache_before_reload():
 
     assert "QPixmapCache," in source
     assert "QPixmapCache.remove(str(self._preview_image_path))" in source
-    assert "if not pixmap.load(str(self._preview_image_path)):" in source
+    assert "QPixmapCache.remove(str(image_path_obj))" in source
+    assert "if not pixmap.load(str(image_path_obj)):" in source
 
 
 def test_plot_settings_panel_composites_preview_transparency_on_theme_matte():
@@ -619,8 +620,45 @@ def test_plot_settings_panel_composites_preview_transparency_on_theme_matte():
     assert "painter.setBrush(QBrush(matte_b))" in source
     assert "painter.drawPixmap(0, 0, pixmap)" in source
     assert "self._preview_pixmap = self._preview_display_pixmap(pixmap)" in source
-    assert "save_result = on_save_figure(settings, str(self._preview_image_path))" in source
+    assert "save_result = on_save_figure(settings, str(image_path))" in source
     assert "settings[\"figure_alpha\"]" not in source
+
+
+def test_plot_settings_panel_runs_preview_in_background_worker():
+    source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+
+    assert "class _PreviewWorkerBridge(QObject):" in source
+    assert "finished = Signal(int, object)" in source
+    assert "failed = Signal(int, object)" in source
+    assert "self._preview_worker_bridge.finished.connect" in source
+    assert "threading.Thread(" in source
+    assert "target=self._run_preview_worker" in source
+    assert "daemon=True" in source
+    assert "configure_matplotlib_backend(interactive=False)" in source
+
+
+def test_plot_settings_panel_keeps_latest_preview_request():
+    source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+
+    assert "self._preview_generation = 0" in source
+    assert "self._active_preview_generation: int | None = None" in source
+    assert "self._pending_preview_request: tuple[dict[str, Any], bool] | None = None" in source
+    assert "Preview updating... changes will render next." in source
+    assert "def _preview_worker_result_is_stale(self, generation: int) -> bool:" in source
+    assert "or self._pending_preview_request is not None" in source
+    assert "self._start_pending_preview_if_available()" in source
+
+
+def test_plot_settings_panel_preview_loading_only_disables_preview_actions():
+    source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+
+    start = source.index("def _set_preview_loading(self, active: bool) -> None:")
+    end = source.index("def _new_preview_image_path(self) -> Path:", start)
+    body = source[start:end]
+    assert "self._preview_button.setEnabled(" in body
+    assert "self._save_figure_button.setEnabled(" in body
+    assert "self._save_data_button.setEnabled(" in body
+    assert "self.setEnabled(False)" not in body
 
 
 def test_plot_settings_panel_uses_task_first_workspace_pages():
@@ -1473,10 +1511,10 @@ def test_derive_warning_messages_ignores_advanced_json_overlap():
 def test_non_position_mapping_sections_use_role_based_labels_and_notes():
     source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
 
-    assert '"X quantity"' in source
-    assert '"Y / Z quantity"' in source
-    assert '"Plane / source"' in source
-    assert '"Density target"' in source
+    assert '"X-axis quantity"' in source
+    assert '"Z quantity"' in source
+    assert '"2D X-axis quantity"' in source
+    assert '"Species"' in source
     assert '"Y role"' in source
     assert '"View preset"' in source
     assert '"View type"' in source
@@ -1487,12 +1525,20 @@ def test_non_position_mapping_sections_use_role_based_labels_and_notes():
 def test_density_target_filter_and_binning_controls_are_source_level():
     source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
 
-    assert "self._density_target_filter = self._combo(self._density_target_filter_labels())" in source
-    assert "def _handle_density_target_filter_changed" in source
-    assert "self._series_enabled_data[index] = show_all or target == selected" in source
-    assert '"Display Binning / Sectioning"' in source
-    assert '"X bin size"' in source
-    assert '"Y bin size"' in source
+    assert "self._density_species_checkboxes = {}" in source
+    assert "def _handle_density_species_checkbox_changed" in source
+    assert "def _enabled_density_species" in source
+    assert '"density_enabled_species": density_enabled_species' in source
+    assert "QGridLayout(species_widget)" in source
+    assert "def _sync_density_species_selection_for_view_type" in source
+    assert "def _handle_density_range_change" in source
+    assert "lower.textChanged.connect(self._handle_density_range_change)" in source
+    assert "upper.textChanged.connect(self._handle_density_range_change)" in source
+    assert "self._density_mapping_1d_rows" in source
+    assert "self._density_mapping_2d_rows" in source
+    assert '"Density Binning"' in source
+    assert '"X-axis bin size"' in source
+    assert '"Y-axis bin size"' in source
     assert "two_dimensional_binning = is_heatmap or density_heatmap_mode" in source
 
 

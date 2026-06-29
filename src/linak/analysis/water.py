@@ -20,7 +20,7 @@ from .common import MOLECULE_SPECIES_LABELS, normalize_molecule_label
 
 LOGGER = logging.getLogger(__name__)
 
-H2O_OH_CUTOFF_A: float = 1.25
+H2O_OH_CUTOFF_A: float = 1.27
 """Default O-H cutoff (Angstrom) used to identify water molecules."""
 
 H2O_VALIDATION_STRIDE: int = 100

@@ -138,6 +138,7 @@ class _LazyGuiSeriesCatalog:
         Callable[[list[Any], argparse.Namespace, list[dict[str, Any]]], int | None] | None
     ) = None
     _active_profiles_by_series_id: dict[str, Any] = field(default_factory=dict)
+    _active_profile_cache_keys_by_series_id: dict[str, Any] = field(default_factory=dict)
 
     @property
     def series_descriptors(self) -> list[dict[str, Any]]:
@@ -180,6 +181,7 @@ class _LazyGuiSeriesCatalog:
         for series_id in list(self._active_profiles_by_series_id):
             if series_id not in active_id_set:
                 self._active_profiles_by_series_id.pop(series_id, None)
+                self._active_profile_cache_keys_by_series_id.pop(series_id, None)
 
         active_descriptors = [
             dict(descriptor) for segment in active_descriptors_by_source for descriptor in segment
@@ -193,9 +195,15 @@ class _LazyGuiSeriesCatalog:
             descriptor
             for descriptor in active_descriptors
             if str(descriptor.get("series_id") or "") in self._active_profiles_by_series_id
-            and not _cached_gui_profile_matches_descriptor(
-                self._active_profiles_by_series_id[str(descriptor.get("series_id") or "")],
-                descriptor,
+            and (
+                self._active_profile_cache_keys_by_series_id.get(
+                    str(descriptor.get("series_id") or "")
+                )
+                != descriptor.get("density_grid_slice_key")
+                or not _cached_gui_profile_matches_descriptor(
+                    self._active_profiles_by_series_id[str(descriptor.get("series_id") or "")],
+                    descriptor,
+                )
             )
         ]
         descriptors_to_load = missing_descriptors + stale_descriptors
@@ -208,6 +216,9 @@ class _LazyGuiSeriesCatalog:
                 if not series_id:
                     raise ValueError("Lazy GUI descriptor is missing a series_id.")
                 self._active_profiles_by_series_id[series_id] = profile
+                self._active_profile_cache_keys_by_series_id[series_id] = descriptor.get(
+                    "density_grid_slice_key"
+                )
 
         estimated_total_points = (
             self.estimate_render_points(
@@ -663,6 +674,16 @@ _PLOT_SETTINGS_DENSITY_KEYS = (
     "species",
     "axis",
     "plane",
+    "density_2d_x_axis",
+    "density_2d_y_axis",
+    "density_filter_x_min",
+    "density_filter_x_max",
+    "density_filter_y_min",
+    "density_filter_y_max",
+    "density_filter_z_min",
+    "density_filter_z_max",
+    "density_filter_distance_min",
+    "density_filter_distance_max",
     "view_mapping",
     *_PLOT_SETTINGS_COMMON_KEYS,
 )
@@ -865,6 +886,26 @@ def _add_dry_run_option(parser: argparse.ArgumentParser) -> None:
             "trajectory data or running heavy analysis."
         ),
     )
+
+
+def _add_atom_alias_option(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--atom-alias",
+        action="append",
+        default=None,
+        metavar="RAW=ELEMENT",
+        help=(
+            "Map a non-standard atom label to an element while preserving the raw species label, "
+            "for example --atom-alias Ow=O --atom-alias Pt_top=Pt. Repeat as needed."
+        ),
+    )
+
+
+def _read_trajectory_with_optional_atom_aliases(read_trajectory_func: Any, path: Any, args: argparse.Namespace):
+    atom_aliases = getattr(args, "atom_alias", None)
+    if atom_aliases:
+        return read_trajectory_func(path, atom_aliases=atom_aliases)
+    return read_trajectory_func(path)
 
 
 def _format_cli_invocation(argv: list[str]) -> str:
@@ -2504,15 +2545,104 @@ def _build_density_profile_filter_options(
     species: str | None,
 ) -> dict[str, Any] | None:
     from .analysis.density import _density_payload_matches_selection
+    from .analysis.common import is_molecule_species_label, molecule_display_label, normalize_species_query
 
     available_modes: list[str] = []
     seen_modes: set[str] = set()
     heatmap_sources: list[dict[str, str]] = []
     seen_heatmap_sources: set[tuple[str, str]] = set()
+    grid_sources: list[dict[str, str]] = []
+    seen_grid_sources: set[str] = set()
+    species_options: list[dict[str, str]] = []
+    seen_species: set[str] = set()
+    axis_ranges: dict[str, list[float]] = {}
+
+    def _add_mode(mode: str) -> None:
+        if mode not in seen_modes:
+            available_modes.append(mode)
+            seen_modes.add(mode)
+
+    def _add_species(raw_species: str) -> None:
+        candidate = str(raw_species).strip() or "UNKNOWN"
+        if candidate != "UNKNOWN":
+            _selection_mode, candidate = normalize_species_query(
+                candidate,
+                allow_h2o=True,
+                allow_molecules=True,
+            )
+        if candidate in seen_species:
+            return
+        seen_species.add(candidate)
+        species_options.append(
+            {
+                "value": candidate,
+                "label": molecule_display_label(candidate)
+                if is_molecule_species_label(candidate)
+                else candidate,
+            }
+        )
+
+    def _coerce_cell_lengths(metadata: Mapping[str, Any]) -> tuple[float, float, float] | None:
+        raw_cell = metadata.get("resolved_cell_angstrom") or metadata.get("pbc_cell_angstrom")
+        if not isinstance(raw_cell, Sequence) or isinstance(raw_cell, (str, bytes)):
+            return None
+        if len(raw_cell) != 3:
+            return None
+        try:
+            cell = tuple(float(value) for value in raw_cell)
+        except (TypeError, ValueError):
+            return None
+        if any(not math.isfinite(value) or value <= 0.0 for value in cell):
+            return None
+        return cell
+
+    def _merge_axis_range(axis_id: str, lower: float, upper: float) -> None:
+        if not (math.isfinite(lower) and math.isfinite(upper)) or lower >= upper:
+            return
+        current = axis_ranges.get(axis_id)
+        if current is None:
+            axis_ranges[axis_id] = [float(lower), float(upper)]
+        else:
+            current[0] = min(current[0], float(lower))
+            current[1] = max(current[1], float(upper))
+
+    def _add_cell_axis_ranges(metadata: Mapping[str, Any]) -> None:
+        cell = _coerce_cell_lengths(metadata)
+        if cell is None:
+            return
+        _merge_axis_range("x", 0.0, cell[0])
+        _merge_axis_range("y", 0.0, cell[1])
+        _merge_axis_range("z", 0.0, cell[2])
+        surface_axis = str(metadata.get("surface_axis") or axis or "z").strip().lower()
+        distance_index = {"x": 0, "y": 1, "z": 2}.get(surface_axis, 2)
+        _merge_axis_range("distance", 0.0, cell[distance_index])
+
     for _source, source_payloads in raw_payloads_by_source:
         for payload in source_payloads:
             metadata = dict(payload.get("metadata", {}))
+            _add_cell_axis_ranges(metadata)
             profile_kind = str(metadata.get("profile_kind", "line_1d")).strip().lower() or "line_1d"
+            if profile_kind == "grid_3d_sparse":
+                if not _density_payload_matches_selection(
+                    metadata,
+                    species=species,
+                    profile_kind="grid_3d_sparse",
+                ):
+                    continue
+                grid_species = str(metadata.get("species", "")).strip() or "UNKNOWN"
+                _add_species(grid_species)
+                grid_key = grid_species
+                if grid_key not in seen_grid_sources:
+                    grid_sources.append(
+                        {
+                            "label": grid_species,
+                            "species": grid_species,
+                        }
+                    )
+                    seen_grid_sources.add(grid_key)
+                for mode in ("distance", "x", "y", "z"):
+                    _add_mode(mode)
+                continue
             if profile_kind == "heatmap_2d":
                 if not _density_payload_matches_selection(
                     metadata,
@@ -2521,6 +2651,7 @@ def _build_density_profile_filter_options(
                 ):
                     continue
                 heatmap_species = str(metadata.get("species", "")).strip() or "UNKNOWN"
+                _add_species(heatmap_species)
                 heatmap_plane = str(metadata.get("plane", "")).strip().lower() or "xy"
                 source_key = (heatmap_species, heatmap_plane)
                 if source_key not in seen_heatmap_sources:
@@ -2535,15 +2666,14 @@ def _build_density_profile_filter_options(
                 continue
             if not _density_payload_matches_selection(metadata, axis=axis, species=species):
                 continue
+            _add_species(str(metadata.get("species", "")).strip() or "UNKNOWN")
             coordinate_mode = str(metadata.get("coordinate_mode", "axis")).strip().lower()
             axis_value = str(metadata.get("axis", "z")).strip().lower() or "z"
             if coordinate_mode == "distance":
                 mode = "distance"
             else:
                 mode = axis_value if axis_value in {"x", "y", "z"} else "z"
-            if mode not in seen_modes:
-                available_modes.append(mode)
-                seen_modes.add(mode)
+            _add_mode(mode)
     payload: dict[str, Any] = {}
     if available_modes:
         payload.update(
@@ -2552,11 +2682,18 @@ def _build_density_profile_filter_options(
                 "available_modes": list(available_modes),
             }
         )
+    if species_options:
+        payload["density_species_options"] = species_options
     if heatmap_sources:
         payload["density_heatmap_sources"] = heatmap_sources
-    if available_modes and heatmap_sources:
+    if grid_sources:
+        payload["density_grid_sources"] = grid_sources
+    if axis_ranges:
+        payload["density_axis_ranges"] = axis_ranges
+    has_2d = bool(heatmap_sources or grid_sources)
+    if available_modes and has_2d:
         payload["density_view_types"] = ["line_1d", "heatmap_2d"]
-    elif heatmap_sources:
+    elif has_2d:
         payload["density_view_types"] = ["heatmap_2d"]
     elif available_modes:
         payload["density_view_types"] = ["line_1d"]
@@ -2564,15 +2701,18 @@ def _build_density_profile_filter_options(
 
 
 def _resolve_density_outputs_from_args(args: argparse.Namespace) -> str:
+    if getattr(args, "heatmap_planes", None):
+        raise ValueError(
+            "density --heatmap-planes is no longer used. Use --outputs 3d for sparse "
+            "grid-backed 2D slicing in the GUI."
+        )
     requested_outputs = getattr(args, "outputs", None)
-    heatmap_planes = getattr(args, "heatmap_planes", None)
-    if requested_outputs is None:
-        if heatmap_planes:
-            raise ValueError("--heatmap-planes requires --outputs heatmap or --outputs all.")
-        return "line"
-    if requested_outputs == "line" and heatmap_planes:
-        raise ValueError("--heatmap-planes requires --outputs heatmap or --outputs all.")
-    return str(requested_outputs)
+    requested = str(requested_outputs or "1d").strip().lower()
+    if requested == "line":
+        return "1d"
+    if requested not in {"1d", "3d", "all"}:
+        raise ValueError("density --outputs must be one of: 1d, 3d, all (legacy alias: line).")
+    return requested
 
 
 def _density_profile_mode_from_metadata(metadata: Mapping[str, Any]) -> str:
@@ -2590,6 +2730,26 @@ def _density_effective_render_mode(*, axis: str | None, x_mode: str) -> str:
     if axis in {"x", "y", "z"}:
         return axis
     return "z"
+
+
+def _density_grid_filters_from_args(args: argparse.Namespace) -> dict[str, tuple[float | None, float | None]]:
+    filters: dict[str, tuple[float | None, float | None]] = {}
+    for axis_id in ("x", "y", "z", "distance"):
+        lower = getattr(args, f"density_filter_{axis_id}_min", None)
+        upper = getattr(args, f"density_filter_{axis_id}_max", None)
+        if lower is None and upper is None:
+            continue
+        filters[axis_id] = (
+            None if lower is None else float(lower),
+            None if upper is None else float(upper),
+        )
+    return filters
+
+
+def _density_grid_2d_axes_from_args(args: argparse.Namespace) -> tuple[str, str]:
+    x_axis = str(getattr(args, "density_2d_x_axis", None) or "x").strip().lower()
+    y_axis = str(getattr(args, "density_2d_y_axis", None) or "y").strip().lower()
+    return x_axis, y_axis
 
 
 def _density_logical_series_id(*, source_path: str, species: str) -> str:
@@ -2638,13 +2798,27 @@ def _build_density_logical_descriptor_segments(
         grouped_descriptors: dict[tuple[str, str], dict[str, Any]] = {}
         descriptor_order: list[tuple[str, str]] = []
         for metadata in metadata_items:
-            if str(metadata.get("profile_kind", "line_1d")).strip().lower() == "heatmap_2d":
+            profile_kind = str(metadata.get("profile_kind", "line_1d")).strip().lower() or "line_1d"
+            if profile_kind == "heatmap_2d":
                 continue
-            if not _density_payload_matches_selection(metadata, axis=axis, species=species):
+            if profile_kind == "grid_3d_sparse":
+                if not _density_payload_matches_selection(
+                    metadata,
+                    species=species,
+                    profile_kind="grid_3d_sparse",
+                ):
+                    continue
+            elif not _density_payload_matches_selection(metadata, axis=axis, species=species):
                 continue
 
             mode = _density_profile_mode_from_metadata(metadata)
-            if mode not in seen_modes:
+            if profile_kind == "grid_3d_sparse":
+                mode = "grid"
+                for grid_mode in ("distance", "x", "y", "z"):
+                    if grid_mode not in seen_modes:
+                        available_modes.append(grid_mode)
+                        seen_modes.add(grid_mode)
+            elif mode not in seen_modes:
                 available_modes.append(mode)
                 seen_modes.add(mode)
 
@@ -2713,14 +2887,18 @@ def _build_density_logical_descriptor_segments(
                 "profile_index": int(metadata.get("profile_index", 0)),
                 "profile_uid": _profile_uid_from_payload(
                     {"metadata": dict(metadata)},
-                    fallback_prefix="density",
+                    fallback_prefix="density_grid" if profile_kind == "grid_3d_sparse" else "density",
                     index=int(metadata.get("profile_index", 0)),
                 ),
                 "coordinate_mode": mode,
+                "profile_kind": profile_kind,
             }
-            grouped_descriptors[logical_key]["density_backing_profiles_by_mode"][mode] = (
-                active_profile
-            )
+            if profile_kind == "grid_3d_sparse":
+                grouped_descriptors[logical_key]["density_grid_profile"] = active_profile
+            else:
+                grouped_descriptors[logical_key]["density_backing_profiles_by_mode"][mode] = (
+                    active_profile
+                )
             if mode == "distance":
                 axis_mode = str(metadata.get("axis", "")).strip().lower()
                 if axis_mode in {"x", "y", "z"}:
@@ -2762,8 +2940,12 @@ def _resolve_density_render_descriptor_segments(
     *,
     axis: str | None,
     x_mode: str,
+    x_bin_width: float | None = None,
+    grid_filters: Mapping[str, tuple[float | None, float | None]] | None = None,
 ) -> list[list[dict[str, Any]]]:
     active_mode = _density_effective_render_mode(axis=axis, x_mode=x_mode)
+    normalized_grid_filters = dict(grid_filters or {})
+    force_grid = bool(normalized_grid_filters)
     resolved_segments: list[list[dict[str, Any]]] = []
     for segment in descriptor_segments_by_source:
         resolved_segment: list[dict[str, Any]] = []
@@ -2772,13 +2954,40 @@ def _resolve_density_render_descriptor_segments(
             if not isinstance(backing_profiles, dict):
                 continue
             active_profile = backing_profiles.get(active_mode)
-            if not isinstance(active_profile, dict):
-                continue
             resolved_descriptor = dict(descriptor)
-            resolved_descriptor["profile_index"] = int(active_profile["profile_index"])
-            resolved_descriptor["profile_uid"] = str(active_profile["profile_uid"])
-            resolved_descriptor["active_coordinate_mode"] = active_mode
-            resolved_segment.append(resolved_descriptor)
+            if isinstance(active_profile, dict) and not force_grid:
+                resolved_descriptor["profile_kind"] = str(active_profile.get("profile_kind") or "line_1d")
+                resolved_descriptor["profile_index"] = int(active_profile["profile_index"])
+                resolved_descriptor["profile_uid"] = str(active_profile["profile_uid"])
+                resolved_descriptor["active_coordinate_mode"] = active_mode
+                resolved_segment.append(resolved_descriptor)
+                continue
+            grid_profile = descriptor.get("density_grid_profile")
+            if isinstance(grid_profile, dict):
+                slice_key = json.dumps(
+                    {
+                        "kind": "line_1d",
+                        "x_mode": active_mode,
+                        "filters": normalized_grid_filters,
+                        "x_bin_width": x_bin_width,
+                    },
+                    sort_keys=True,
+                    default=str,
+                )
+                resolved_descriptor["profile_kind"] = "grid_3d_sparse"
+                resolved_descriptor["profile_index"] = int(grid_profile["profile_index"])
+                resolved_descriptor["profile_uid"] = str(grid_profile["profile_uid"])
+                resolved_descriptor["active_coordinate_mode"] = active_mode
+                resolved_descriptor["density_grid_filters"] = normalized_grid_filters
+                resolved_descriptor["density_grid_x_bin_width"] = x_bin_width
+                resolved_descriptor["density_grid_slice_key"] = slice_key
+                resolved_segment.append(resolved_descriptor)
+                continue
+            if force_grid and isinstance(active_profile, dict):
+                raise ValueError(
+                    "Density ranges require a 3D density grid. Recompute density with "
+                    "--outputs 3d or --outputs all."
+                )
         resolved_segments.append(resolved_segment)
     return resolved_segments
 
@@ -2789,24 +2998,59 @@ def _load_density_profiles_for_render_descriptors(
     axis: str | None,
     species: str | None,
 ) -> list[Any]:
-    from .analysis.density import load_density_profiles_by_index
+    from .analysis.density import (
+        density_grid_to_line_profile,
+        load_density_grid_profiles_by_index,
+        load_density_profiles_by_index,
+    )
 
     loaded_by_id: dict[str, Any] = {}
     for load_source_path, source_descriptors in _group_descriptors_by_load_source(descriptors):
-        indices = [int(descriptor["profile_index"]) for descriptor in source_descriptors]
-        profiles = load_density_profiles_by_index(
-            load_source_path,
-            indices,
-            axis=axis,
-            species=species,
-        )
-        if len(profiles) != len(source_descriptors):
-            raise ValueError("Density profile metadata does not match loaded profiles.")
-        for descriptor, profile in zip(source_descriptors, profiles):
-            loaded_by_id[str(descriptor["series_id"])] = replace(
-                profile,
-                species=str(descriptor.get("default_label") or profile.species),
+        line_descriptors = [
+            descriptor
+            for descriptor in source_descriptors
+            if str(descriptor.get("profile_kind", "line_1d")).strip().lower() != "grid_3d_sparse"
+        ]
+        grid_descriptors = [
+            descriptor
+            for descriptor in source_descriptors
+            if str(descriptor.get("profile_kind", "line_1d")).strip().lower() == "grid_3d_sparse"
+        ]
+        if line_descriptors:
+            indices = [int(descriptor["profile_index"]) for descriptor in line_descriptors]
+            profiles = load_density_profiles_by_index(
+                load_source_path,
+                indices,
+                axis=axis,
+                species=species,
             )
+            if len(profiles) != len(line_descriptors):
+                raise ValueError("Density profile metadata does not match loaded profiles.")
+            for descriptor, profile in zip(line_descriptors, profiles):
+                loaded_by_id[str(descriptor["series_id"])] = replace(
+                    profile,
+                    species=str(descriptor.get("default_label") or profile.species),
+                )
+        if grid_descriptors:
+            indices = [int(descriptor["profile_index"]) for descriptor in grid_descriptors]
+            grid_profiles = load_density_grid_profiles_by_index(
+                load_source_path,
+                indices,
+                species=species,
+            )
+            if len(grid_profiles) != len(grid_descriptors):
+                raise ValueError("Density sparse-grid metadata does not match loaded profiles.")
+            for descriptor, grid_profile in zip(grid_descriptors, grid_profiles):
+                derived_profile = density_grid_to_line_profile(
+                    grid_profile,
+                    x_mode=str(descriptor.get("active_coordinate_mode") or "distance"),
+                    filters=descriptor.get("density_grid_filters") or {},
+                    x_bin_width=descriptor.get("density_grid_x_bin_width"),
+                )
+                loaded_by_id[str(descriptor["series_id"])] = replace(
+                    derived_profile,
+                    species=str(descriptor.get("default_label") or derived_profile.species),
+                )
     return [loaded_by_id[str(descriptor["series_id"])] for descriptor in descriptors]
 
 
@@ -5611,7 +5855,7 @@ def _resolve_gui_series_enabled_by_id(
         elif enabled_list is not None:
             enabled_by_id[series_id] = bool(enabled_list[index])
         else:
-            enabled_by_id[series_id] = True
+            enabled_by_id[series_id] = bool(descriptor.get("enabled", True))
     return enabled_by_id
 
 
@@ -6594,7 +6838,8 @@ def _build_density_gui_context(
             },
             estimated_total_points=_estimate_total_points_from_loaded_profiles(active_profile),
         )
-    logical_descriptor_segments, filter_options = _build_density_logical_descriptor_segments(
+    base_filter_options = dict(filter_options)
+    logical_descriptor_segments, logical_filter_options = _build_density_logical_descriptor_segments(
         sources=sources,
         metadata_by_source=[
             (source, [dict(payload.get("metadata", {})) for payload in source_payloads])
@@ -6603,10 +6848,16 @@ def _build_density_gui_context(
         axis=None,
         species=args.species,
     )
+    logical_descriptor_segments = _filter_density_descriptor_segments_by_enabled_species(
+        logical_descriptor_segments,
+        getattr(args, "density_enabled_species", None),
+    )
     render_descriptor_segments = _resolve_density_render_descriptor_segments(
         logical_descriptor_segments,
         axis=getattr(args, "axis", None),
         x_mode=resolved_x_mode,
+        x_bin_width=getattr(args, "x_bin_width", None),
+        grid_filters=_density_grid_filters_from_args(args),
     )
     render_descriptors = _flatten_descriptor_segments(render_descriptor_segments)
     plot_profiles = _load_density_profiles_for_render_descriptors(
@@ -6688,6 +6939,10 @@ def _build_density_gui_logical_context(
     )
     if selected_view_type == "heatmap_2d":
         heatmap_contract = default_density_heatmap_plot_data_contract()
+        heatmap_descriptor_context = _build_density_gui_lazy_catalog(
+            args,
+            sources=sources,
+        ).build_initial_context()
         return _GuiPlotRenderContext(
             profile=[],
             plot_source_label=sources[0] if len(sources) == 1 else "multi_source_density",
@@ -6710,9 +6965,9 @@ def _build_density_gui_logical_context(
                 "heatmap_colorbar_shrink": getattr(args, "heatmap_colorbar_shrink", None),
                 "heatmap_colorbar_aspect": getattr(args, "heatmap_colorbar_aspect", None),
             },
-            fallback_labels_by_source=[],
-            default_series_labels=None,
-            series_descriptors=[],
+            fallback_labels_by_source=heatmap_descriptor_context.fallback_labels_by_source,
+            default_series_labels=list(heatmap_descriptor_context.default_series_labels),
+            series_descriptors=heatmap_descriptor_context.series_descriptors,
             profile_filter_options={
                 **filter_options,
                 "density_plot_contract": _serialize_plot_data_contract(
@@ -6722,7 +6977,8 @@ def _build_density_gui_logical_context(
             },
             estimated_total_points=None,
         )
-    logical_descriptor_segments, filter_options = _build_density_logical_descriptor_segments(
+    base_filter_options = dict(filter_options)
+    logical_descriptor_segments, logical_filter_options = _build_density_logical_descriptor_segments(
         sources=sources,
         metadata_by_source=[
             (source, [dict(payload.get("metadata", {})) for payload in source_payloads])
@@ -6730,6 +6986,10 @@ def _build_density_gui_logical_context(
         ],
         axis=None,
         species=args.species,
+    )
+    logical_descriptor_segments = _filter_density_descriptor_segments_by_enabled_species(
+        logical_descriptor_segments,
+        getattr(args, "density_enabled_species", None),
     )
     logical_descriptors = _flatten_descriptor_segments(logical_descriptor_segments)
     fallback_labels_by_source = [
@@ -6740,7 +7000,10 @@ def _build_density_gui_logical_context(
         for segment in logical_descriptor_segments
     ]
     density_contract = default_density_plot_data_contract()
-    profile_filter_options = dict(filter_options or {})
+    profile_filter_options = {
+        **base_filter_options,
+        **(logical_filter_options or {}),
+    }
     profile_filter_options = {
         **profile_filter_options,
         "density_plot_contract": _serialize_plot_data_contract(density_contract),
@@ -7194,9 +7457,12 @@ def _build_density_gui_lazy_catalog(
     *,
     sources: list[str],
     active_profiles_by_series_id: dict[str, Any] | None = None,
+    active_profile_cache_keys_by_series_id: dict[str, Any] | None = None,
 ) -> _LazyGuiSeriesCatalog:
     from .analysis.density import (
         _density_payload_matches_selection,
+        density_grid_to_heatmap_profile,
+        load_density_grid_profiles_by_index,
         load_density_heatmap_profiles_by_index,
     )
     from .plot.contracts.density_contract import (
@@ -7230,6 +7496,175 @@ def _build_density_gui_lazy_catalog(
         x_mode=resolved_density_mapping.x_mode,
     )
     if selected_view_type == "heatmap_2d":
+        grid_x_axis, grid_y_axis = _density_grid_2d_axes_from_args(args)
+        grid_filters = _density_grid_filters_from_args(args)
+        grid_slice_key = json.dumps(
+            {
+                "kind": "heatmap_2d",
+                "x": grid_x_axis,
+                "y": grid_y_axis,
+                "filters": grid_filters,
+                "x_bin_width": getattr(args, "x_bin_width", None),
+                "y_bin_width": getattr(args, "y_bin_width", None),
+            },
+            sort_keys=True,
+            default=str,
+        )
+        grid_descriptors: list[list[dict[str, Any]]] = []
+        for source, headers in headers_by_source:
+            source_grid_descriptors: list[dict[str, Any]] = []
+            for header in headers:
+                header = dict(header)
+                if not _density_payload_matches_selection(
+                    header,
+                    species=args.species,
+                    profile_kind="grid_3d_sparse",
+                ):
+                    continue
+                profile_index = int(header.get("profile_index", 0))
+                profile_uid = _profile_uid_from_payload(
+                    {"metadata": header},
+                    fallback_prefix="density_grid",
+                    index=profile_index,
+                )
+                species_label = str(header.get("species") or "UNKNOWN")
+                series_id = str(profile_uid)
+                source_grid_descriptors.append(
+                    {
+                        "series_id": series_id,
+                        "source_kind": "source",
+                        "source_series_id": series_id,
+                        "is_generated": False,
+                        "source_index": 0,
+                        "series_index": len(source_grid_descriptors),
+                        "source_name": Path(str(header.get("origin_hdf5_path") or source)).name
+                        or str(source),
+                        "source_directory": str(
+                            Path(str(header.get("origin_hdf5_path") or source)).expanduser().parent
+                        ),
+                        "source_path": str(
+                            Path(str(header.get("origin_hdf5_path") or source)).expanduser()
+                        ),
+                        "load_source_path": str(Path(source).expanduser()),
+                        "default_label": f"{species_label} {grid_x_axis.upper()}/{grid_y_axis.upper()}",
+                        "density_species": species_label,
+                        "profile_kind": "grid_3d_sparse",
+                        "profile_index": profile_index,
+                        "profile_uid": profile_uid,
+                        "density_grid_x_axis": grid_x_axis,
+                        "density_grid_y_axis": grid_y_axis,
+                        "density_grid_filters": grid_filters,
+                        "density_grid_x_bin_width": getattr(args, "x_bin_width", None),
+                        "density_grid_y_bin_width": getattr(args, "y_bin_width", None),
+                        "density_grid_slice_key": grid_slice_key,
+                    }
+                )
+            if source_grid_descriptors:
+                grid_descriptors.append(source_grid_descriptors)
+        grid_descriptors = _filter_density_descriptor_segments_by_enabled_species(
+            grid_descriptors,
+            getattr(args, "density_enabled_species", None),
+        )
+        if grid_descriptors:
+            # The current heatmap renderer plots one field at a time. Keep all
+            # descriptors in the layer list, but enable the first one by default.
+            for segment in grid_descriptors:
+                for descriptor in segment[1:]:
+                    descriptor["enabled"] = False
+
+            def _load_grid_heatmap_profiles(descriptors: list[dict[str, Any]]) -> list[Any]:
+                loaded_by_id: dict[str, Any] = {}
+                for load_source_path, source_descriptors in _group_descriptors_by_load_source(
+                    descriptors
+                ):
+                    indices = [int(descriptor["profile_index"]) for descriptor in source_descriptors]
+                    grid_profiles = load_density_grid_profiles_by_index(
+                        load_source_path,
+                        indices,
+                        species=args.species,
+                    )
+                    if len(grid_profiles) != len(source_descriptors):
+                        raise ValueError("Density sparse-grid metadata does not match loaded profiles.")
+                    for descriptor, grid_profile in zip(source_descriptors, grid_profiles):
+                        derived_profile = density_grid_to_heatmap_profile(
+                            grid_profile,
+                            x_axis=str(descriptor.get("density_grid_x_axis") or "x"),
+                            y_axis=str(descriptor.get("density_grid_y_axis") or "y"),
+                            filters=descriptor.get("density_grid_filters") or {},
+                            x_bin_width=descriptor.get("density_grid_x_bin_width"),
+                            y_bin_width=descriptor.get("density_grid_y_bin_width"),
+                        )
+                        loaded_by_id[str(descriptor["series_id"])] = replace(
+                            derived_profile,
+                            species=str(descriptor.get("default_label") or derived_profile.species),
+                        )
+                return [loaded_by_id[str(descriptor["series_id"])] for descriptor in descriptors]
+
+            return _LazyGuiSeriesCatalog(
+                sources=list(sources),
+                plot_source_label=sources[0] if len(sources) == 1 else "multi_source_density",
+                plotter_kwargs={
+                    **_resolve_density_plotter_kwargs(
+                        args,
+                        data_contract=default_density_heatmap_plot_data_contract(),
+                        view_type=selected_view_type,
+                    ),
+                    "heatmap_vmin": getattr(args, "heatmap_vmin", None),
+                    "heatmap_vmax": getattr(args, "heatmap_vmax", None),
+                    "heatmap_cmap": getattr(args, "heatmap_cmap", None),
+                    "heatmap_log_scale": getattr(args, "heatmap_log_scale", False),
+                    "heatmap_colorbar_enabled": getattr(args, "heatmap_colorbar_enabled", True),
+                    "heatmap_colorbar_label": getattr(args, "heatmap_colorbar_label", None),
+                    "heatmap_colorbar_label_size": getattr(args, "heatmap_colorbar_label_size", None),
+                    "heatmap_colorbar_tick_size": getattr(args, "heatmap_colorbar_tick_size", None),
+                    "heatmap_colorbar_position": getattr(args, "heatmap_colorbar_position", "right"),
+                    "heatmap_colorbar_pad": getattr(args, "heatmap_colorbar_pad", None),
+                    "heatmap_colorbar_shrink": getattr(args, "heatmap_colorbar_shrink", None),
+                    "heatmap_colorbar_aspect": getattr(args, "heatmap_colorbar_aspect", None),
+                },
+                descriptor_segments_by_source=grid_descriptors,
+                default_series_labels=[
+                    str(descriptor.get("default_label") or "")
+                    for segment in grid_descriptors
+                    for descriptor in segment
+                ],
+                profile_filter_options={
+                    **filter_options,
+                    "density_plot_contract": _serialize_plot_data_contract(
+                        default_density_plot_data_contract()
+                    ),
+                    "density_heatmap_plot_contract": _serialize_plot_data_contract(
+                        default_density_heatmap_plot_data_contract()
+                    ),
+                    "density_grid_2d_allowed_pairs": [
+                        ["x", "y"],
+                        ["y", "x"],
+                        ["x", "z"],
+                        ["z", "x"],
+                        ["x", "distance"],
+                        ["distance", "x"],
+                        ["y", "z"],
+                        ["z", "y"],
+                        ["y", "distance"],
+                        ["distance", "y"],
+                    ],
+                },
+                load_profiles=_load_grid_heatmap_profiles,
+                _active_profiles_by_series_id=(
+                    active_profiles_by_series_id if active_profiles_by_series_id is not None else {}
+                ),
+                _active_profile_cache_keys_by_series_id=(
+                    active_profile_cache_keys_by_series_id
+                    if active_profile_cache_keys_by_series_id is not None
+                    else {}
+                ),
+            )
+        if grid_filters:
+            raise ValueError(
+                "Density ranges require a 3D density grid. Recompute density with "
+                "--outputs 3d or --outputs all."
+            )
+
         selected_descriptors: list[list[dict[str, Any]]] = []
         for source, headers in headers_by_source:
             matching_headers = [
@@ -7272,6 +7707,7 @@ def _build_density_gui_lazy_catalog(
                         ),
                         "load_source_path": str(Path(source).expanduser()),
                         "default_label": f"{str(header.get('species') or 'UNKNOWN')} {str(header.get('plane') or 'xy').upper()}",
+                        "density_species": str(header.get("species") or "UNKNOWN"),
                         "profile_index": int(header.get("profile_index", 0)),
                         "profile_uid": _profile_uid_from_payload(
                             {"metadata": header},
@@ -7282,6 +7718,10 @@ def _build_density_gui_lazy_catalog(
                 ]
             )
             break
+        selected_descriptors = _filter_density_descriptor_segments_by_enabled_species(
+            selected_descriptors,
+            getattr(args, "density_enabled_species", None),
+        )
 
         def _load_heatmap_profiles(descriptors: list[dict[str, Any]]) -> list[Any]:
             loaded: list[Any] = []
@@ -7322,6 +7762,11 @@ def _build_density_gui_lazy_catalog(
                 "heatmap_colorbar_aspect": getattr(args, "heatmap_colorbar_aspect", None),
             },
             descriptor_segments_by_source=selected_descriptors,
+            default_series_labels=[
+                str(descriptor.get("default_label") or "")
+                for segment in selected_descriptors
+                for descriptor in segment
+            ],
             profile_filter_options={
                 **filter_options,
                 "density_plot_contract": _serialize_plot_data_contract(
@@ -7335,17 +7780,32 @@ def _build_density_gui_lazy_catalog(
             _active_profiles_by_series_id=(
                 active_profiles_by_series_id if active_profiles_by_series_id is not None else {}
             ),
+            _active_profile_cache_keys_by_series_id=(
+                active_profile_cache_keys_by_series_id
+                if active_profile_cache_keys_by_series_id is not None
+                else {}
+            ),
         )
-    logical_descriptor_segments, filter_options = _build_density_logical_descriptor_segments(
+    logical_descriptor_segments, logical_filter_options = _build_density_logical_descriptor_segments(
         sources=sources,
         metadata_by_source=headers_by_source,
         axis=None,
         species=args.species,
     )
+    filter_options = {
+        **filter_options,
+        **(logical_filter_options or {}),
+    }
+    logical_descriptor_segments = _filter_density_descriptor_segments_by_enabled_species(
+        logical_descriptor_segments,
+        getattr(args, "density_enabled_species", None),
+    )
     descriptor_segments = _resolve_density_render_descriptor_segments(
         logical_descriptor_segments,
         axis=getattr(args, "axis", None),
         x_mode=resolved_x_mode,
+        x_bin_width=getattr(args, "x_bin_width", None),
+        grid_filters=_density_grid_filters_from_args(args),
     )
     density_contract = default_density_plot_data_contract()
 
@@ -7368,6 +7828,11 @@ def _build_density_gui_lazy_catalog(
             view_type=selected_view_type,
         ),
         descriptor_segments_by_source=descriptor_segments,
+        default_series_labels=[
+            str(descriptor.get("default_label") or "")
+            for segment in descriptor_segments
+            for descriptor in segment
+        ],
         profile_filter_options={
             **(filter_options or {}),
             "density_plot_contract": _serialize_plot_data_contract(density_contract),
@@ -7378,6 +7843,11 @@ def _build_density_gui_lazy_catalog(
         load_profiles=_load_profiles,
         _active_profiles_by_series_id=(
             active_profiles_by_series_id if active_profiles_by_series_id is not None else {}
+        ),
+        _active_profile_cache_keys_by_series_id=(
+            active_profile_cache_keys_by_series_id
+            if active_profile_cache_keys_by_series_id is not None
+            else {}
         ),
     )
 
@@ -8721,6 +9191,17 @@ def _apply_gui_settings_to_args(args: argparse.Namespace, settings: dict[str, An
         "heatmap_colorbar_shrink",
         "heatmap_colorbar_aspect",
         "view_mapping",
+        "density_enabled_species",
+        "density_2d_x_axis",
+        "density_2d_y_axis",
+        "density_filter_x_min",
+        "density_filter_x_max",
+        "density_filter_y_min",
+        "density_filter_y_max",
+        "density_filter_z_min",
+        "density_filter_z_max",
+        "density_filter_distance_min",
+        "density_filter_distance_max",
         "projection_x",
         "projection_y",
         "projection_value",
@@ -9001,8 +9482,82 @@ def _gui_series_descriptors_from_settings(
 ) -> list[dict[str, Any]]:
     descriptors = gui_settings.get("series_descriptors")
     if isinstance(descriptors, list):
-        return [dict(descriptor) for descriptor in descriptors if isinstance(descriptor, dict)]
-    return [dict(descriptor) for descriptor in fallback_descriptors]
+        resolved = [dict(descriptor) for descriptor in descriptors if isinstance(descriptor, dict)]
+    else:
+        resolved = [dict(descriptor) for descriptor in fallback_descriptors]
+    return _filter_density_descriptors_by_enabled_species(
+        resolved,
+        gui_settings.get("density_enabled_species"),
+    )
+
+
+def _density_enabled_species_set(value: Any) -> set[str] | None:
+    if not isinstance(value, (list, tuple, set)):
+        return None
+    enabled = {str(item).strip() for item in value if str(item).strip()}
+    return enabled
+
+
+def _density_descriptor_species(descriptor: Mapping[str, Any]) -> str:
+    return str(descriptor.get("density_species") or descriptor.get("default_label") or "").strip()
+
+
+def _filter_density_descriptors_by_enabled_species(
+    descriptors: list[dict[str, Any]],
+    enabled_species_value: Any,
+) -> list[dict[str, Any]]:
+    enabled_species = _density_enabled_species_set(enabled_species_value)
+    if enabled_species is None:
+        return [dict(descriptor) for descriptor in descriptors]
+    descriptor_by_id = {
+        str(descriptor.get("series_id") or "").strip(): dict(descriptor)
+        for descriptor in descriptors
+        if str(descriptor.get("series_id") or "").strip()
+    }
+    filtered: list[dict[str, Any]] = []
+    for descriptor in descriptors:
+        source_kind = str(descriptor.get("source_kind") or "source").strip().lower()
+        if source_kind == "group":
+            member_ids = [
+                str(member_id).strip()
+                for member_id in descriptor.get("member_series_ids", [])
+                if str(member_id).strip()
+            ]
+            kept_members = [
+                member_id
+                for member_id in member_ids
+                if _density_descriptor_species(descriptor_by_id.get(member_id, {}))
+                in enabled_species
+            ]
+            if not kept_members:
+                continue
+            updated = dict(descriptor)
+            updated["member_series_ids"] = kept_members
+            filtered.append(updated)
+            continue
+        species = _density_descriptor_species(descriptor)
+        if species and species not in enabled_species:
+            continue
+        filtered.append(dict(descriptor))
+    return filtered
+
+
+def _filter_density_descriptor_segments_by_enabled_species(
+    descriptor_segments_by_source: list[list[dict[str, Any]]],
+    enabled_species_value: Any,
+) -> list[list[dict[str, Any]]]:
+    enabled_species = _density_enabled_species_set(enabled_species_value)
+    if enabled_species is None:
+        return [[dict(descriptor) for descriptor in segment] for segment in descriptor_segments_by_source]
+    return [
+        [
+            dict(descriptor)
+            for descriptor in segment
+            if not _density_descriptor_species(descriptor)
+            or _density_descriptor_species(descriptor) in enabled_species
+        ]
+        for segment in descriptor_segments_by_source
+    ]
 
 
 def _required_source_ids_for_gui_render(gui_settings: dict[str, Any]) -> set[str]:
@@ -9190,10 +9745,6 @@ def _launch_profile_plot_gui(
         preview_args.show = show
         preview_args.output = output
         preview_args._suppress_output_log = output is None or _is_gui_preview_output_path(output)
-        render_descriptors = _gui_series_descriptors_from_settings(
-            gui_settings,
-            initial_context.series_descriptors,
-        )
         load_args = deepcopy(preview_args)
         _force_source_ids_enabled_for_gui_loading(
             load_args,
@@ -9237,7 +9788,7 @@ def _launch_profile_plot_gui(
         )
         if isinstance(gui_settings.get("series_overrides"), dict):
             _clear_gui_positional_series_args(preview_args)
-        return _render_profile_plot(
+        saved_path, render_state = _render_profile_plot(
             args=preview_args,
             source=context.plot_source_label,
             analysis_name=analysis_name,
@@ -9245,8 +9796,24 @@ def _launch_profile_plot_gui(
             plotter=plotter,
             plotter_kwargs=context.plotter_kwargs,
             series_descriptors=context.series_descriptors,
-            render_series_descriptors=render_descriptors,
+            render_series_descriptors=context.series_descriptors,
         )
+        render_state = dict(render_state or {})
+        if analysis_name == "density":
+            descriptor_context = build_full_context(preview_args)
+            descriptor_source = (
+                descriptor_context
+                if descriptor_context.series_descriptors
+                else context
+            )
+            render_state["series_descriptors"] = deepcopy(
+                descriptor_source.series_descriptors
+            )
+            render_state["series_labels"] = list(descriptor_source.default_series_labels)
+            render_state["_profile_filter_options"] = deepcopy(
+                descriptor_source.profile_filter_options
+            )
+        return saved_path, render_state
 
     initial_render_state: dict[str, Any] = {}
     initial_required_source_ids = _required_source_ids_for_gui_render(initial_settings)
@@ -9766,12 +10333,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--species",
         default="all",
         help=(
-            "Density selector: element symbol (e.g. O), group selector elements/molecules/all, "
-            "or O/H molecule selector mol:H, mol:O, mol:OH, mol:H2O, mol:H3O "
+            "Density selector: element symbol (e.g. O), element:<symbol>, species:<raw_label>, "
+            "group selector elements/molecules/all, or O/H molecule selector "
+            "mol:H, mol:O, mol:OH, mol:H2O, mol:H3O "
             "(aliases OH, HO, H2O, H3O and legacy mol:HO accepted). H and O are elements; "
             "use mol:H and mol:O for free molecular H/O. Default: all."
         ),
     )
+    _add_atom_alias_option(compute_density)
     compute_density.add_argument(
         "--axis",
         choices=["x", "y", "z"],
@@ -9787,39 +10356,51 @@ def build_parser() -> argparse.ArgumentParser:
     compute_density.add_argument(
         "--oh-cutoff",
         type=_positive_float,
-        default=1.25,
-        help="O-H cutoff in Angstrom for O/H molecule classification (default: 1.25).",
+        default=1.27,
+        help="O-H cutoff in Angstrom for O/H molecule classification (default: 1.27).",
     )
     compute_density.add_argument(
         "--min-molecule-frames",
         type=int,
-        default=3,
+        default=5,
         help=(
             "Minimum number of frames a non-water O/H molecule type must appear in before "
-            "group selectors create a density profile (default: 3). Explicit molecule selectors "
+            "group selectors create a density profile (default: 5). Explicit molecule selectors "
             "are always honored."
         ),
     )
     compute_density.add_argument(
         "--outputs",
-        choices=["line", "heatmap", "all"],
         default=None,
         help=(
-            "Density outputs to compute. 'line' writes 1D distance/X/Y/Z profiles, "
-            "'heatmap' writes only selected 2D planes, and 'all' writes line plus heatmap "
-            "output (default: line)."
+            "Density outputs to compute: '1d' writes 1D distance/X/Y/Z profiles, "
+            "'3d' writes sparse grid data for GUI slicing/filtering, and 'all' writes both "
+            "(default: 1d; legacy alias: line)."
+        ),
+    )
+    compute_density.add_argument(
+        "--grid-bin-width",
+        type=_positive_float,
+        default=None,
+        help=(
+            "Sparse 3D density grid bin width in Angstrom (default: same as --bin-width). "
+            "Increase this to reduce 3D grid file size."
+        ),
+    )
+    compute_density.add_argument(
+        "--grid-max-nonzero-bins",
+        type=int,
+        default=20_000_000,
+        help=(
+            "Maximum nonzero cells allowed per sparse density grid profile before compute stops "
+            "with guidance to increase --grid-bin-width or request fewer species (default: 20000000)."
         ),
     )
     compute_density.add_argument(
         "--heatmap-planes",
         nargs="+",
-        choices=["xy", "xz", "yz"],
         default=None,
-        metavar="PLANE",
-        help=(
-            "2D density heatmap plane(s) to compute when --outputs is heatmap or all "
-            "(default: xy xz yz)."
-        ),
+        help=argparse.SUPPRESS,
     )
     compute_density.add_argument(
         "--surface-mode",
@@ -9894,8 +10475,12 @@ def build_parser() -> argparse.ArgumentParser:
     compute_msd.add_argument(
         "--species",
         default="all",
-        help="Species for MSD (default: all)",
+        help=(
+            "Species for MSD: element symbol, element:<symbol>, species:<raw_label>, or all "
+            "(default: all)."
+        ),
     )
+    _add_atom_alias_option(compute_msd)
     compute_msd.add_argument(
         "--timestep-fs",
         type=_positive_float,
@@ -9939,6 +10524,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--input",
         help="Optional CP2K input.inp path used to resolve elements and thermal regions.",
     )
+    _add_atom_alias_option(compute_temperature)
     compute_temperature.add_argument(
         "--group-by",
         choices=["auto", "elements", "regions", "both"],
@@ -9998,13 +10584,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--species",
         default=None,
         help=(
-            "Position selector: element symbol (e.g. O), group selector elements/molecules/all, "
-            "or O/H molecule selector mol:H, mol:O, mol:OH, mol:H2O, mol:H3O "
+            "Position selector: element symbol (e.g. O), element:<symbol>, species:<raw_label>, "
+            "group selector elements/molecules/all, or O/H molecule selector "
+            "mol:H, mol:O, mol:OH, mol:H2O, mol:H3O "
             "(aliases OH, HO, H2O, H3O and legacy mol:HO accepted). H and O are elements; "
             "use mol:H and mol:O for free molecular H/O. If omitted, LiNaK warns and writes "
             "one output per element and active O/H molecule."
         ),
     )
+    _add_atom_alias_option(compute_position)
     compute_position.add_argument(
         "--axis",
         choices=["x", "y", "z"],
@@ -10058,16 +10646,16 @@ def build_parser() -> argparse.ArgumentParser:
     compute_position.add_argument(
         "--oh-cutoff",
         type=_positive_float,
-        default=1.25,
-        help="O-H cutoff in Angstrom for O/H molecule classification (default: 1.25).",
+        default=1.27,
+        help="O-H cutoff in Angstrom for O/H molecule classification (default: 1.27).",
     )
     compute_position.add_argument(
         "--min-molecule-frames",
         type=_positive_int,
-        default=3,
+        default=5,
         help=(
             "Minimum number of frames a non-water O/H molecule type must appear in before "
-            "group selectors create a position profile (default: 3). Explicit molecule selectors "
+            "group selectors create a position profile (default: 5). Explicit molecule selectors "
             "are always honored."
         ),
     )
@@ -10119,7 +10707,10 @@ def build_parser() -> argparse.ArgumentParser:
     rdf_selection_group_a.add_argument(
         "--species-a",
         default="all",
-        help="First RDF selector by species (default: all when no explicit selectors are provided)",
+        help=(
+            "First RDF selector by species: element symbol, element:<symbol>, "
+            "or species:<raw_label> (default: all when no explicit selectors are provided)."
+        ),
     )
     rdf_selection_group_a.add_argument(
         "--atoms-a",
@@ -10135,11 +10726,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--species-b",
         default=None,
         help=(
-            "Second RDF selector by species "
+            "Second RDF selector by species: element symbol, element:<symbol>, "
+            "or species:<raw_label> "
             "(default: same as selector A in single-pair mode; when used alone, "
             "write all RDF pairs involving that species)"
         ),
     )
+    _add_atom_alias_option(compute_rdf)
     rdf_selection_group_b.add_argument(
         "--atoms-b",
         nargs="+",
@@ -10204,12 +10797,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     compute_coordination.add_argument(
         "--species-a",
-        help="Center species for coordination analysis (required unless --species-b is provided).",
+        help=(
+            "Center species for coordination analysis: element symbol, element:<symbol>, "
+            "or species:<raw_label> (required unless --species-b is provided)."
+        ),
     )
     compute_coordination.add_argument(
         "--species-b",
-        help="Neighbor species for coordination analysis (required unless --species-a is provided).",
+        help=(
+            "Neighbor species for coordination analysis: element symbol, element:<symbol>, "
+            "or species:<raw_label> (required unless --species-a is provided)."
+        ),
     )
+    _add_atom_alias_option(compute_coordination)
     compute_coordination.add_argument(
         "--axis",
         choices=["x", "y", "z"],
@@ -10424,6 +11024,7 @@ def build_parser() -> argparse.ArgumentParser:
             "this command accepts exactly one source."
         ),
     )
+    _add_atom_alias_option(compute_orientation)
     compute_orientation.add_argument(
         "--axis",
         choices=["x", "y", "z"],
@@ -10541,6 +11142,7 @@ def build_parser() -> argparse.ArgumentParser:
             "into the converted trajectory HDF5."
         ),
     )
+    _add_atom_alias_option(apply_convert)
     apply_convert.add_argument(
         "--select",
         help=(
@@ -12778,12 +13380,14 @@ def _handle_plot_density(args: argparse.Namespace) -> int:
         assert gui_settings_path is not None
 
         active_profiles_by_series_id: dict[str, Any] = {}
+        active_profile_cache_keys_by_series_id: dict[str, Any] = {}
 
         def _build_catalog(current_args: argparse.Namespace) -> _LazyGuiSeriesCatalog:
             catalog = _build_density_gui_lazy_catalog(
                 current_args,
                 sources=gui_sources,
                 active_profiles_by_series_id=active_profiles_by_series_id,
+                active_profile_cache_keys_by_series_id=active_profile_cache_keys_by_series_id,
             )
             catalog.default_series_labels = _resolve_gui_default_series_labels(
                 args=current_args,
@@ -12793,7 +13397,8 @@ def _handle_plot_density(args: argparse.Namespace) -> int:
             )
             return catalog
 
-        initial_context = _build_density_gui_logical_context(args, sources=gui_sources)
+        initial_catalog = _build_catalog(args)
+        initial_context = initial_catalog.build_initial_context()
         _apply_effective_series_settings(
             args=args,
             sources=gui_sources,
@@ -12826,7 +13431,7 @@ def _handle_plot_density(args: argparse.Namespace) -> int:
 
     from .analysis.density import plot_density_profiles
 
-    render_context = _build_density_gui_context(args, sources=sources)
+    render_context = _build_density_gui_lazy_catalog(args, sources=sources).build_render_context(args)
     _warn_for_non_gui_plot_complexity(analysis_name="density", render_context=render_context)
 
     _apply_effective_series_settings(
@@ -13954,6 +14559,10 @@ def _handle_compute_density(args: argparse.Namespace) -> int:
     if min_molecule_frames < 1:
         raise ValueError("--min-molecule-frames must be >= 1.")
     oh_cutoff = float(getattr(args, "oh_cutoff", 1.25))
+    grid_bin_width = getattr(args, "grid_bin_width", None)
+    grid_max_nonzero_bins = int(getattr(args, "grid_max_nonzero_bins", 20_000_000))
+    if grid_max_nonzero_bins < 1:
+        raise ValueError("--grid-max-nonzero-bins must be >= 1.")
 
     if args.dry_run:
         source_path = Path(args.trajectory).expanduser().resolve()
@@ -13982,6 +14591,8 @@ def _handle_compute_density(args: argparse.Namespace) -> int:
                 f"oh_cutoff={oh_cutoff}, "
                 f"min_molecule_frames={min_molecule_frames}, "
                 f"outputs={density_outputs}, "
+                f"grid_bin_width={grid_bin_width if grid_bin_width is not None else args.bin_width}, "
+                f"grid_max_nonzero_bins={grid_max_nonzero_bins}, "
                 f"{_describe_surface_cli_options(args)}"
             ),
             (
@@ -14023,7 +14634,7 @@ def _handle_compute_density(args: argparse.Namespace) -> int:
         analysis_name="density",
     )
     LOGGER.info("Density preflight checks passed; loading trajectory.")
-    frames = read_trajectory(args.trajectory)
+    frames = _read_trajectory_with_optional_atom_aliases(read_trajectory, args.trajectory, args)
     resolved_cell, cell_source, cell_input_path = _maybe_apply_density_cell(
         frames,
         args.trajectory,
@@ -14068,7 +14679,8 @@ def _handle_compute_density(args: argparse.Namespace) -> int:
         surface_options=_surface_options_from_cli_args(args),
         precomputed_surface_estimate=cached_surface_estimate,
         outputs=density_outputs,
-        heatmap_planes=args.heatmap_planes,
+        grid_bin_width=grid_bin_width,
+        grid_max_nonzero_bins=grid_max_nonzero_bins,
         oh_cutoff=oh_cutoff,
         min_molecule_frames=min_molecule_frames,
     )
@@ -14078,6 +14690,8 @@ def _handle_compute_density(args: argparse.Namespace) -> int:
         "surface_axis": surface_axis,
         "oh_cutoff_A": oh_cutoff,
         "min_molecule_frames": min_molecule_frames,
+        "grid_bin_width_A": grid_bin_width if grid_bin_width is not None else args.bin_width,
+        "grid_max_nonzero_bins": grid_max_nonzero_bins,
     }
     if cell_input_path is not None:
         density_metadata["input_path"] = cell_input_path
@@ -14172,7 +14786,7 @@ def _handle_compute_msd(args: argparse.Namespace) -> int:
         analysis_name="MSD",
     )
     LOGGER.info("MSD preflight checks passed; loading trajectory.")
-    frames = read_trajectory(args.trajectory)
+    frames = _read_trajectory_with_optional_atom_aliases(read_trajectory, args.trajectory, args)
     resolved_cell, cell_source, cell_input_path = _resolve_and_apply_required_cell(
         frames,
         args.trajectory,
@@ -14354,7 +14968,7 @@ def _handle_compute_position(args: argparse.Namespace) -> int:
         input_path=args.input,
         analysis_name="position",
     )
-    frames = read_trajectory(args.trajectory)
+    frames = _read_trajectory_with_optional_atom_aliases(read_trajectory, args.trajectory, args)
     resolved_cell, cell_source, cell_input_path = _maybe_apply_density_cell(
         frames,
         args.trajectory,
@@ -14588,7 +15202,7 @@ def _handle_compute_rdf(args: argparse.Namespace) -> int:
         analysis_name="RDF",
     )
     LOGGER.info("RDF preflight checks passed; loading trajectory.")
-    frames = read_trajectory(args.trajectory)
+    frames = _read_trajectory_with_optional_atom_aliases(read_trajectory, args.trajectory, args)
     resolved_cell, cell_source, cell_input_path = _resolve_and_apply_required_cell(
         frames,
         args.trajectory,
@@ -14783,7 +15397,7 @@ def _handle_compute_coordination(args: argparse.Namespace) -> int:
         analysis_name="coordination",
     )
     LOGGER.info("Coordination preflight checks passed; loading trajectory.")
-    frames = read_trajectory(args.trajectory)
+    frames = _read_trajectory_with_optional_atom_aliases(read_trajectory, args.trajectory, args)
     resolved_cell, cell_source, cell_input_path = _maybe_apply_density_cell(
         frames,
         args.trajectory,
@@ -15235,7 +15849,7 @@ def _handle_compute_orientation(args: argparse.Namespace) -> int:
         analysis_name="orientation",
     )
     LOGGER.info("Orientation preflight checks passed; loading trajectory.")
-    frames = read_trajectory(args.trajectory)
+    frames = _read_trajectory_with_optional_atom_aliases(read_trajectory, args.trajectory, args)
     resolved_cell, cell_source, cell_input_path = _maybe_apply_density_cell(
         frames,
         args.trajectory,
@@ -15344,7 +15958,7 @@ def _handle_apply_pbc(args: argparse.Namespace) -> int:
     from .trajectory.io import read_trajectory, write_trajectory
     from .pbc import apply_pbc_to_frames, resolve_cell_dimensions
 
-    frames = read_trajectory(args.trajectory)
+    frames = _read_trajectory_with_optional_atom_aliases(read_trajectory, args.trajectory, args)
 
     cell_arg = _normalize_cell_args(args)
     if cell_arg is None and args.input is None and _frames_have_usable_periodic_cell(frames):
@@ -15428,6 +16042,7 @@ def _handle_apply_convert(args: argparse.Namespace) -> int:
             distance_range=getattr(args, "distance_range", None),
             keep_molecules_intact=bool(getattr(args, "keep_molecules_intact", False)),
             output_was_default=bool(args.output is None),
+            atom_aliases=tuple(getattr(args, "atom_alias", None) or ()),
         )
     else:
         options = CubeConversionOptions()

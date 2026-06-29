@@ -12,6 +12,7 @@ import linak.analysis.density as density_module
 import linak.analysis.water as water_module
 from linak.analysis.density import (
     DensityHeatmapProfile,
+    DensityGridProfile,
     DensityProfile,
     SurfaceEstimatorOptions,
     available_element_species,
@@ -21,6 +22,7 @@ from linak.analysis.density import (
     estimate_surface_reference,
     estimate_surface_position,
     load_density_profile,
+    load_density_grid_profiles,
     load_density_heatmap_profiles,
     load_density_profiles,
     normalize_backend_name,
@@ -28,6 +30,10 @@ from linak.analysis.density import (
     save_density_profiles,
 )
 from linak.plot.mappings.density_mapping import density_plot_options_to_view_mapping
+
+
+def test_density_plot_units_use_mathtext_superscript():
+    assert density_module._format_plot_density_units("g/cm^3") == "g/cm$^3$"
 
 
 def _mixed_oh_frame() -> Atoms:
@@ -151,7 +157,7 @@ def test_compute_all_density_profiles_default_is_line_only():
     assert heatmap_profiles == []
 
 
-def test_compute_all_density_profiles_all_includes_planar_heatmaps():
+def test_compute_all_density_profiles_all_includes_sparse_grid():
     frame = Atoms(
         "OO",
         positions=[[0.0, 1.0, 2.0], [2.0, 3.0, 4.0]],
@@ -168,13 +174,15 @@ def test_compute_all_density_profiles_all_includes_planar_heatmaps():
     )
 
     line_profiles = [profile for profile in profiles if isinstance(profile, DensityProfile)]
-    heatmap_profiles = [profile for profile in profiles if isinstance(profile, DensityHeatmapProfile)]
+    grid_profiles = [profile for profile in profiles if isinstance(profile, DensityGridProfile)]
     assert len(line_profiles) == 4
-    assert {profile.plane for profile in heatmap_profiles} == {"xy", "xz", "yz"}
-    assert all(profile.density.ndim == 2 for profile in heatmap_profiles)
+    assert len(grid_profiles) == 1
+    assert grid_profiles[0].species == "O"
+    assert grid_profiles[0].flat_indices.size > 0
+    assert grid_profiles[0].grid_shape == (10, 11, 12, 12)
 
 
-def test_compute_all_density_profiles_heatmap_scope_selects_planes():
+def test_compute_all_density_profiles_3d_scope_selects_sparse_grid_only():
     frame = Atoms(
         "OO",
         positions=[[0.0, 1.0, 2.0], [2.0, 3.0, 4.0]],
@@ -187,12 +195,29 @@ def test_compute_all_density_profiles_heatmap_scope_selects_planes():
         species="O",
         bin_width=1.0,
         surface_mode="none",
-        outputs="heatmap",
-        heatmap_planes=["xy"],
+        outputs="3d",
     )
 
     assert not any(isinstance(profile, DensityProfile) for profile in profiles)
-    assert [profile.plane for profile in profiles if isinstance(profile, DensityHeatmapProfile)] == ["xy"]
+    assert [profile.species for profile in profiles if isinstance(profile, DensityGridProfile)] == ["O"]
+
+
+def test_compute_all_density_profiles_heatmap_output_is_migration_error():
+    frame = Atoms(
+        "OO",
+        positions=[[0.0, 1.0, 2.0], [2.0, 3.0, 4.0]],
+        cell=[10.0, 11.0, 12.0],
+        pbc=True,
+    )
+
+    with pytest.raises(ValueError, match="replaced by sparse 3D density grids"):
+        compute_all_density_profiles(
+            [frame],
+            species="O",
+            bin_width=1.0,
+            surface_mode="none",
+            outputs="heatmap",
+        )
 
 
 def test_compute_all_density_profiles_matches_single_profile_results_for_one_species():
@@ -227,6 +252,7 @@ def test_compute_all_density_profiles_matches_single_profile_results_for_one_spe
         for profile in profiles
         if isinstance(profile, DensityHeatmapProfile)
     }
+    grid_profiles = [profile for profile in profiles if isinstance(profile, DensityGridProfile)]
 
     for axis in ("x", "y", "z"):
         expected = compute_density_profile(
@@ -246,44 +272,14 @@ def test_compute_all_density_profiles_matches_single_profile_results_for_one_spe
     z_distance = line_profiles[("z", "axis")]
     np.testing.assert_allclose(z_distance.density, line_profiles[("z", "axis")].density)
 
-    for plane in ("xy", "xz", "yz"):
-        expected = density_module._compute_density_heatmap_profile_from_selected(
-            frames=frames,
-            selected_xy_per_frame=[
-                np.column_stack(
-                    (
-                        np.asarray(frame.positions[:, "xyz".index(plane[0])], dtype=float),
-                        np.asarray(frame.positions[:, "xyz".index(plane[1])], dtype=float),
-                    )
-                )
-                for frame in frames
-            ],
-            selected_masses_per_frame=[
-                np.asarray(frame.get_masses(), dtype=float) * 1.66053906660e-24
-                for frame in frames
-            ],
-            plane_axes=(plane[0], plane[1]),
-            orthogonal_axis=next(axis for axis in ("x", "y", "z") if axis not in plane),
-            species_label="O",
-            bin_width=1.0,
-            histogram_bounds=(
-                density_module._cell_histogram_bounds(
-                    frames=frames,
-                    axis_index="xyz".index(plane[0]),
-                    coordinate_mode="axis",
-                    surface_per_frame=None,
-                ),
-                density_module._cell_histogram_bounds(
-                    frames=frames,
-                    axis_index="xyz".index(plane[1]),
-                    coordinate_mode="axis",
-                    surface_per_frame=None,
-                ),
-            ),
-        )
-        actual = heatmap_profiles[plane]
-        np.testing.assert_allclose(actual.density, expected.density)
-        np.testing.assert_allclose(actual.number_density, expected.number_density)
+    assert heatmap_profiles == {}
+    assert len(grid_profiles) == 1
+    expected_mass_sum = sum(
+        float(np.sum(np.asarray(frame.get_masses(), dtype=float) * 1.66053906660e-24))
+        for frame in frames
+    )
+    assert float(np.sum(grid_profiles[0].mass_sum_g)) == pytest.approx(expected_mass_sum)
+    assert float(np.sum(grid_profiles[0].entity_sum)) == pytest.approx(4.0)
 
 
 def test_compute_all_density_profiles_supports_h2o_selection():
@@ -429,7 +425,7 @@ def test_density_hdf5_loads_molecule_profiles_by_alias(tmp_path):
     assert loaded[0].number_density_units == "molecule/nm^3"
 
 
-def test_save_and_load_density_heatmap_profiles_round_trip(tmp_path):
+def test_save_and_load_density_grid_profiles_round_trip(tmp_path):
     frame = Atoms(
         "OO",
         positions=[[0.0, 1.0, 2.0], [2.0, 3.0, 4.0]],
@@ -449,10 +445,186 @@ def test_save_and_load_density_heatmap_profiles_round_trip(tmp_path):
         output,
     )
 
-    loaded = load_density_heatmap_profiles(output, species="O")
+    loaded = load_density_grid_profiles(output, species="O")
 
-    assert len(loaded) == 3
-    assert {profile.plane for profile in loaded} == {"xy", "xz", "yz"}
+    assert len(loaded) == 1
+    assert loaded[0].species == "O"
+    assert loaded[0].flat_indices.size > 0
+    assert loaded[0].mass_sum_g.dtype == np.float32
+
+
+def test_density_grid_to_line_profile_applies_coordinate_filters():
+    frame = Atoms(
+        "OO",
+        positions=[[0.0, 0.0, 1.0], [5.0, 5.0, 6.0]],
+        cell=[10.0, 10.0, 10.0],
+        pbc=True,
+    )
+    grid_profile = next(
+        profile
+        for profile in compute_all_density_profiles(
+            [frame],
+            species="O",
+            bin_width=1.0,
+            surface_mode="none",
+            outputs="3d",
+        )
+        if isinstance(profile, DensityGridProfile)
+    )
+
+    all_line = density_module.density_grid_to_line_profile(grid_profile, x_mode="distance")
+    filtered_line = density_module.density_grid_to_line_profile(
+        grid_profile,
+        x_mode="distance",
+        filters={"x": (0.0, 1.0), "y": (0.0, 1.0)},
+    )
+
+    assert float(np.nansum(all_line.entities_per_frame)) == pytest.approx(2.0)
+    assert float(np.nansum(filtered_line.entities_per_frame)) == pytest.approx(1.0)
+
+
+def test_density_grid_to_line_profile_filters_plotted_z_without_cropping_bins():
+    frame = Atoms(
+        "OO",
+        positions=[[0.5, 0.5, 1.0], [0.5, 0.5, 6.0]],
+        cell=[10.0, 10.0, 10.0],
+        pbc=True,
+    )
+    grid_profile = next(
+        profile
+        for profile in compute_all_density_profiles(
+            [frame],
+            species="O",
+            bin_width=1.0,
+            surface_mode="none",
+            outputs="3d",
+        )
+        if isinstance(profile, DensityGridProfile)
+    )
+
+    filtered_line = density_module.density_grid_to_line_profile(
+        grid_profile,
+        x_mode="z",
+        filters={"z": (0.0, 5.0)},
+    )
+
+    assert filtered_line.bin_edges[0] == pytest.approx(0.0)
+    assert filtered_line.bin_edges[-1] == pytest.approx(10.0)
+    assert float(np.nansum(filtered_line.entities_per_frame)) == pytest.approx(1.0)
+    assert np.all(filtered_line.entities_per_frame[5:] == pytest.approx(0.0))
+
+
+def test_density_grid_to_heatmap_profile_filters_distance_before_xy_projection():
+    frame = Atoms(
+        "OO",
+        positions=[[0.5, 0.5, 1.0], [6.5, 6.5, 6.0]],
+        cell=[10.0, 10.0, 10.0],
+        pbc=True,
+    )
+    grid_profile = next(
+        profile
+        for profile in compute_all_density_profiles(
+            [frame],
+            species="O",
+            bin_width=1.0,
+            surface_mode="none",
+            outputs="3d",
+        )
+        if isinstance(profile, DensityGridProfile)
+    )
+
+    filtered_map = density_module.density_grid_to_heatmap_profile(
+        grid_profile,
+        x_axis="x",
+        y_axis="y",
+        filters={"distance": (0.0, 5.0)},
+    )
+
+    assert filtered_map.x_bin_edges[0] == pytest.approx(0.0)
+    assert filtered_map.x_bin_edges[-1] == pytest.approx(10.0)
+    assert filtered_map.y_bin_edges[0] == pytest.approx(0.0)
+    assert filtered_map.y_bin_edges[-1] == pytest.approx(10.0)
+    assert float(np.nansum(filtered_map.number_density)) == pytest.approx(200.0)
+    assert filtered_map.number_density[0, 0] == pytest.approx(200.0)
+    assert filtered_map.number_density[6, 6] == pytest.approx(0.0)
+
+
+def test_density_grid_to_heatmap_profile_normalizes_by_selected_distance_width():
+    frame = Atoms(
+        "O",
+        positions=[[0.5, 0.5, 1.0]],
+        cell=[10.0, 10.0, 10.0],
+        pbc=True,
+    )
+    grid_profile = next(
+        profile
+        for profile in compute_all_density_profiles(
+            [frame],
+            species="O",
+            bin_width=1.0,
+            surface_mode="none",
+            outputs="3d",
+        )
+        if isinstance(profile, DensityGridProfile)
+    )
+
+    full_map = density_module.density_grid_to_heatmap_profile(
+        grid_profile,
+        x_axis="x",
+        y_axis="y",
+    )
+    filtered_map = density_module.density_grid_to_heatmap_profile(
+        grid_profile,
+        x_axis="x",
+        y_axis="y",
+        filters={"distance": (0.0, 5.0)},
+    )
+
+    assert full_map.number_density[0, 0] == pytest.approx(100.0)
+    assert filtered_map.number_density[0, 0] == pytest.approx(200.0)
+
+
+def test_density_distance_plot_with_gui_descriptors_keeps_nonzero_default_limits(monkeypatch):
+    captured_kwargs = {}
+
+    def _fake_plot_multi_line_series(_x_series, _y_series, _labels, **kwargs):
+        captured_kwargs.update(kwargs)
+        return None
+
+    monkeypatch.setattr(
+        density_module,
+        "plot_multi_line_series",
+        _fake_plot_multi_line_series,
+    )
+    bin_edges = np.arange(0.0, 21.0, 1.0, dtype=float)
+    profile = DensityProfile(
+        axis="z",
+        species="O",
+        bin_edges=bin_edges,
+        bin_centers=0.5 * (bin_edges[:-1] + bin_edges[1:]),
+        counts_per_frame=np.concatenate((np.ones(5, dtype=float), np.zeros(15, dtype=float))),
+        density=np.concatenate((np.ones(5, dtype=float), np.zeros(15, dtype=float))),
+        units="g/cm^3",
+        n_frames=1,
+        coordinate_mode="distance",
+    )
+
+    density_module.plot_density_profiles(
+        [profile],
+        show=False,
+        x_mode="distance",
+        render_series_descriptors=[
+            {
+                "series_id": "density:o",
+                "default_label": "O",
+                "source_kind": "source",
+                "source_series_id": "density:o",
+            }
+        ],
+    )
+
+    assert captured_kwargs["x_lim"] is not None
+    assert captured_kwargs["x_lim"][1] < 7.0
 
 
 def test_plot_density_profiles_keeps_descriptor_render_path_with_single_loaded_profile(
@@ -634,7 +806,7 @@ def test_density_profile_cell_binning_extends_to_empty_bins():
     )
 
 
-def test_density_histogram_edges_follow_numpy_convention():
+def test_density_histogram_right_edge_stays_in_last_bin():
     frame = Atoms("OOO", positions=[[0.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 0.0, 2.0]])
     oxygen_mass_g = float(frame.get_masses()[0]) * 1.66053906660e-24
 
@@ -653,9 +825,9 @@ def test_density_histogram_edges_follow_numpy_convention():
 
     np.testing.assert_allclose(
         profile.counts_per_frame,
-        np.array([oxygen_mass_g, oxygen_mass_g, oxygen_mass_g]),
+        np.array([oxygen_mass_g, 2.0 * oxygen_mass_g]),
     )
-    np.testing.assert_allclose(profile.entities_per_frame, np.array([1.0, 1.0, 1.0]))
+    np.testing.assert_allclose(profile.entities_per_frame, np.array([1.0, 2.0]))
 
     histogram, _edges = np.histogram(np.array([0.0, 1.0, 2.0]), bins=np.array([0.0, 1.0, 2.0]))
     np.testing.assert_array_equal(histogram, np.array([1, 2]))
@@ -1757,7 +1929,7 @@ def test_plot_density_profiles_use_g_per_cm3_without_si_scaling(monkeypatch):
     np.testing.assert_allclose(captured["y_series"][0], np.array([1.0e15]))
     np.testing.assert_allclose(captured["y_series"][1], np.array([2.0e15]))
     assert captured["x_label"] == "Distance to the surface ($\\mathrm{\\AA}$)"
-    assert captured["y_label"] == "Density (g/cm^3)"
+    assert captured["y_label"] == "Density (g/cm$^3$)"
 
 
 def test_plot_density_profiles_auto_limits_ignore_all_zero_tails(monkeypatch):
@@ -1804,8 +1976,8 @@ def test_plot_density_profiles_auto_limits_ignore_all_zero_tails(monkeypatch):
     plot_density_profiles([profile_a, profile_b], show=False, x_mode="axis")
 
     assert captured["x_lim"] is not None
-    assert captured["x_lim"][1] > 20.0
-    assert captured["x_lim"][1] < 25.0
+    assert captured["x_lim"][1] > 40.0
+    assert captured["x_lim"][1] < 43.0
     assert captured["y_lim"] is not None
     assert captured["y_lim"][0] == pytest.approx(0.0)
     assert captured["y_lim"][1] > 2.0
@@ -2614,7 +2786,7 @@ def test_compute_all_density_profiles_logs_single_pass_and_aggregate_binning(cap
     ]
     assert any("Single-pass selection complete:" in message for message in info_messages)
     assert any(
-        "Binning 12 density outputs (4 line profiles + 0 heatmaps per species selection)."
+        "Binning 12 density outputs (4 1D profiles + 0 sparse grid profiles per species selection)."
         in message
         for message in info_messages
     )
@@ -2667,7 +2839,7 @@ def test_compute_all_density_profiles_skips_bounds_progress_for_cell_line_output
     assert progress_records[0]["count"] == 1
 
 
-def test_compute_all_density_profiles_heatmaps_prepare_bounds_before_binning(monkeypatch):
+def test_compute_all_density_profiles_grids_prepare_bounds_before_binning(monkeypatch):
     frame = Atoms(
         "OO",
         positions=[[0.0, 0.0, 0.50], [1.0, 1.0, 1.50]],
@@ -2706,8 +2878,7 @@ def test_compute_all_density_profiles_heatmaps_prepare_bounds_before_binning(mon
         surface_mode="none",
         bin_width=1.0,
         binning="cell",
-        outputs="heatmap",
-        heatmap_planes=["xy"],
+        outputs="3d",
     )
 
     assert [record["desc"] for record in progress_records] == [
@@ -2742,7 +2913,7 @@ def test_density_heatmap_fast_path_does_not_use_numpy_histogram2d_in_frame_loop(
     assert "np.histogram2d(" not in source
 
 
-def test_density_heatmap_geometry_guard_rejects_oversized_grid():
+def test_density_grid_nonzero_limit_rejects_oversized_sparse_output():
     frame = Atoms(
         "OO",
         positions=[[0.0, 0.0, 0.0], [2000.0, 2000.0, 1.0]],
@@ -2750,13 +2921,14 @@ def test_density_heatmap_geometry_guard_rejects_oversized_grid():
         pbc=True,
     )
 
-    with pytest.raises(ValueError, match="Density heatmap grid is too large for a safe compute path"):
+    with pytest.raises(ValueError, match="nonzero-bin limit"):
         compute_all_density_profiles(
             [frame],
             species="O",
             bin_width=1.0,
             surface_mode="none",
-            outputs="heatmap",
+            outputs="3d",
+            grid_max_nonzero_bins=1,
         )
 
 
