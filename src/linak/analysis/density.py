@@ -55,9 +55,10 @@ from ..progress import ProgressBar
 from ..utils import axis_to_index, ensure_positive
 from .common import (
     MOLECULE_SPECIES_LABELS,
-    available_distinct_raw_species,
     available_element_species,
+    available_raw_species,
     frame_has_usable_cell as _common_frame_has_usable_cell,
+    grouped_raw_species_for_split_elements,
     is_molecule_species_label,
     molecule_display_label,
     normalize_species_query as _normalize_species_query,
@@ -1339,7 +1340,7 @@ def _resolve_density_target_specs(
                 count_label="atoms",
                 selection_kind="species",
             )
-            for label in available_distinct_raw_species(frames)
+            for label in grouped_raw_species_for_split_elements(frames)
         ]
         return [
             *element_targets,
@@ -1469,7 +1470,7 @@ def _resolve_density_active_targets_without_bounds_prepass(
                 active_targets.append(target)
             continue
         if target.selection_kind == "species":
-            raw_species = set(available_distinct_raw_species(frames))
+            raw_species = set(available_raw_species(frames))
             if species_selector_raw_label(target.species_label) in raw_species:
                 active_targets.append(target)
             continue
@@ -4767,6 +4768,188 @@ def density_grid_to_heatmap_profile(
         visible_y_max_A=visible_y_max_A,
         oh_cutoff_A=profile.oh_cutoff_A,
         min_molecule_frames=profile.min_molecule_frames,
+    )
+
+
+def _density_grid_common_target_bins(
+    profiles: list[DensityGridProfile],
+    axis_id: str,
+    *,
+    requested_bin_width: float | None,
+) -> tuple[np.ndarray, float]:
+    if not profiles:
+        raise ValueError("At least one density sparse grid is required.")
+    per_profile = [
+        _density_grid_target_bins(
+            profile,
+            axis_id,
+            requested_bin_width=requested_bin_width,
+        )
+        for profile in profiles
+    ]
+    widths = [float(width) for _edges, width in per_profile]
+    common_width = widths[0]
+    for width in widths[1:]:
+        if not np.isclose(width, common_width, rtol=1.0e-9, atol=1.0e-12):
+            raise ValueError(
+                "Cannot average density 2D grids with incompatible bin widths. "
+                "Use a shared X/Y bin size or recompute the grids with matching binning."
+            )
+    lower = min(float(edges[0]) for edges, _width in per_profile)
+    upper = max(float(edges[-1]) for edges, _width in per_profile)
+    n_bins = max(1, int(np.ceil((upper - lower) / common_width)))
+    edges = lower + np.arange(n_bins + 1, dtype=float) * common_width
+    if edges[-1] < upper:
+        edges = np.append(edges, edges[-1] + common_width)
+    return np.asarray(edges, dtype=float), common_width
+
+
+def density_grids_to_averaged_heatmap_profile(
+    profiles: list[DensityGridProfile],
+    *,
+    x_axis: str = "x",
+    y_axis: str = "y",
+    filters: Mapping[str, tuple[float | None, float | None] | None] | None = None,
+    x_bin_width: float | None = None,
+    y_bin_width: float | None = None,
+    species: str | None = None,
+) -> DensityHeatmapProfile:
+    """Derive one frame-weighted 2D density map from active sparse grids."""
+
+    if not profiles:
+        raise ValueError("No active density 2D source series are enabled.")
+    x_key = str(x_axis).strip().lower()
+    y_key = str(y_axis).strip().lower()
+    if (x_key, y_key) not in DENSITY_GRID_2D_ALLOWED_PAIRS:
+        raise ValueError(
+            "Unsupported density 2D axes. Use X/Y, X/Z, X/distance, Y/Z, "
+            "Y/distance, or the reverse of those pairs."
+        )
+    normalized_filters = _normalized_density_grid_filters(filters)
+    x_edges, x_width = _density_grid_common_target_bins(
+        profiles,
+        x_key,
+        requested_bin_width=x_bin_width,
+    )
+    y_edges, y_width = _density_grid_common_target_bins(
+        profiles,
+        y_key,
+        requested_bin_width=y_bin_width,
+    )
+    x_bin_count = int(x_edges.size - 1)
+    y_bin_count = int(y_edges.size - 1)
+    total_bins = x_bin_count * y_bin_count
+    total_mass_sum = np.zeros(total_bins, dtype=float)
+    total_entity_sum = np.zeros(total_bins, dtype=float)
+    total_frames = 0
+    volume_A3: float | None = None
+    number_units: str | None = None
+    oh_cutoff_values = [
+        float(profile.oh_cutoff_A)
+        for profile in profiles
+        if profile.oh_cutoff_A is not None and np.isfinite(float(profile.oh_cutoff_A))
+    ]
+    min_molecule_frame_values = [
+        int(profile.min_molecule_frames)
+        for profile in profiles
+        if profile.min_molecule_frames is not None
+    ]
+    for profile in profiles:
+        n_frames = int(profile.n_frames)
+        if n_frames <= 0:
+            continue
+        mask, indices_by_axis = _density_grid_sparse_mask_and_indices(
+            profile,
+            filters=normalized_filters,
+        )
+        x_indices = _density_grid_target_indices(
+            profile,
+            x_key,
+            indices_by_axis[x_key][mask],
+            target_edges=x_edges,
+            target_bin_width=x_width,
+        )
+        y_indices = _density_grid_target_indices(
+            profile,
+            y_key,
+            indices_by_axis[y_key][mask],
+            target_edges=y_edges,
+            target_bin_width=y_width,
+        )
+        flat_2d = x_indices * y_bin_count + y_indices
+        total_mass_sum += np.bincount(
+            flat_2d,
+            weights=np.asarray(profile.mass_sum_g, dtype=float)[mask],
+            minlength=total_bins,
+        ).astype(float, copy=False)
+        total_entity_sum += np.bincount(
+            flat_2d,
+            weights=np.asarray(profile.entity_sum, dtype=float)[mask],
+            minlength=total_bins,
+        ).astype(float, copy=False)
+        profile_volume_A3 = _density_grid_volume_A3(
+            profile,
+            plotted_axes=(x_key, y_key),
+            target_widths={x_key: x_width, y_key: y_width},
+            filters=normalized_filters,
+        )
+        if not np.isfinite(profile_volume_A3) or profile_volume_A3 <= 0.0:
+            raise ValueError("Density 2D grid selection has zero or invalid normalization volume.")
+        if volume_A3 is None:
+            volume_A3 = float(profile_volume_A3)
+        elif not np.isclose(profile_volume_A3, volume_A3, rtol=1.0e-9, atol=1.0e-12):
+            raise ValueError(
+                "Cannot average density 2D grids with incompatible selected volumes. "
+                "Use matching cells/ranges or plot the sources separately."
+            )
+        candidate_units = profile.number_density_units or _entity_density_units_for_species(
+            profile.species,
+            volumetric=True,
+        )
+        if number_units is None:
+            number_units = candidate_units
+        elif candidate_units != number_units:
+            unified_units = _unify_number_density_units([number_units, candidate_units])
+            if unified_units is None:
+                raise ValueError("Cannot average density 2D grids with incompatible number-density units.")
+            number_units = unified_units
+        total_frames += n_frames
+    if total_frames <= 0:
+        raise ValueError("No frames are available in the active density 2D source series.")
+    if volume_A3 is None:
+        raise ValueError("Density 2D grid selection has no normalization volume.")
+    mass_sum = total_mass_sum.reshape((x_bin_count, y_bin_count))
+    entity_sum = total_entity_sum.reshape((x_bin_count, y_bin_count))
+    density = (mass_sum / total_frames) / volume_A3 / ANGSTROM3_TO_CM3
+    number_density = (entity_sum / total_frames) / volume_A3 / ANGSTROM3_TO_NM3
+    visible_x_min_A, visible_x_max_A, visible_y_min_A, visible_y_max_A = (
+        _heatmap_visible_ranges_from_density(
+            x_bin_edges=x_edges,
+            y_bin_edges=y_edges,
+            values=density,
+        )
+    )
+    display_species = species or profiles[0].species
+    return DensityHeatmapProfile(
+        plane=f"{x_key}{y_key}",
+        plane_axes=(x_key, y_key),
+        species=f"{display_species} averaged {x_key.upper()}/{y_key.upper()}",
+        x_bin_edges=x_edges,
+        y_bin_edges=y_edges,
+        x_bin_centers=0.5 * (x_edges[:-1] + x_edges[1:]),
+        y_bin_centers=0.5 * (y_edges[:-1] + y_edges[1:]),
+        density=density,
+        units="g/cm^3",
+        n_frames=total_frames,
+        number_density=number_density,
+        number_density_units=number_units
+        or _entity_density_units_for_species(display_species, volumetric=True),
+        visible_x_min_A=visible_x_min_A,
+        visible_x_max_A=visible_x_max_A,
+        visible_y_min_A=visible_y_min_A,
+        visible_y_max_A=visible_y_max_A,
+        oh_cutoff_A=oh_cutoff_values[0] if oh_cutoff_values else None,
+        min_molecule_frames=min(min_molecule_frame_values) if min_molecule_frame_values else None,
     )
 
 

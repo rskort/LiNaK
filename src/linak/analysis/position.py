@@ -16,9 +16,9 @@ from ..progress import ProgressBar
 from ..storage.hdf5_utils import write_linak_hdf5
 from .common import (
     MOLECULE_SPECIES_LABELS,
-    available_distinct_raw_species,
     available_element_species,
     frame_has_usable_cell as _common_frame_has_usable_cell,
+    grouped_raw_species_for_split_elements,
     is_molecule_species_label,
     molecule_display_label,
     normalize_species_label as _normalize_species,
@@ -944,7 +944,7 @@ def compute_position_profiles(
     if selection_mode in {"all", "elements"} and not element_species:
         raise ValueError("No elements found in trajectory.")
     raw_species_labels_for_output = (
-        [f"species:{label}" for label in available_distinct_raw_species(frames)]
+        [f"species:{label}" for label in grouped_raw_species_for_split_elements(frames)]
         if selection_mode == "all"
         else []
     )

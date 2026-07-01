@@ -19,6 +19,7 @@ from linak.analysis.position import (
     save_position_profile,
     save_position_profiles,
 )
+from linak.analysis.common import RAW_SPECIES_ARRAY
 from linak.plot.contracts.position_contract import position_profile_to_plot_data_contract
 from linak.plot.mappings.position_mapping import position_mapping_preset
 
@@ -47,6 +48,31 @@ def _surface_test_frames() -> list[Atoms]:
         pbc=True,
     )
     return [frame0, frame1]
+
+
+def _split_raw_species_position_frame() -> Atoms:
+    frame = Atoms(
+        symbols=["Pt", "Pt", "O", "H", "H", "H", "Na"],
+        positions=np.asarray(
+            [
+                [8.0, 0.0, 0.0],
+                [9.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0],
+                [0.95, 0.0, 0.0],
+                [0.0, 0.95, 0.0],
+                [5.0, 0.0, 0.0],
+                [7.0, 0.0, 0.0],
+            ],
+            dtype=float,
+        ),
+        cell=[20.0, 20.0, 20.0],
+        pbc=True,
+    )
+    frame.new_array(
+        RAW_SPECIES_ARRAY,
+        np.asarray(["Pt", "Pt_top", "O", "H", "H", "H", "Na"]),
+    )
+    return frame
 
 
 def test_plot_position_profiles_keeps_descriptor_render_path_with_single_loaded_profile(
@@ -173,6 +199,23 @@ def test_compute_position_profiles_elements_and_molecules_group_selectors():
     assert [profile.species for profile in element_profiles] == ["H", "O"]
     assert [profile.species for profile in molecule_profiles] == ["mol:O", "mol:OH"]
     assert [profile.species for profile in all_profiles] == ["H", "O", "mol:O", "mol:OH"]
+
+
+def test_compute_position_profiles_all_deduplicates_unsplit_raw_species():
+    profiles = compute_position_profiles(
+        [_split_raw_species_position_frame()],
+        species="all",
+        surface_mode="none",
+        min_molecule_frames=1,
+        oh_cutoff=1.27,
+    )
+
+    species = {profile.species for profile in profiles}
+
+    assert {"H", "Na", "O", "Pt", "species:Pt", "species:Pt_top", "mol:H", "mol:H2O"} <= species
+    assert "species:H" not in species
+    assert "species:Na" not in species
+    assert "species:O" not in species
 
 
 @pytest.mark.parametrize("selector", ["OH", "HO", "mol:OH", "mol:HO"])

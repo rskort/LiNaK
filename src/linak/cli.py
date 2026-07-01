@@ -137,8 +137,11 @@ class _LazyGuiSeriesCatalog:
     estimate_render_points: (
         Callable[[list[Any], argparse.Namespace, list[dict[str, Any]]], int | None] | None
     ) = None
+    combined_profile_loader: bool = False
     _active_profiles_by_series_id: dict[str, Any] = field(default_factory=dict)
     _active_profile_cache_keys_by_series_id: dict[str, Any] = field(default_factory=dict)
+    _combined_profile_cache_key: str | None = None
+    _combined_profiles: list[Any] | None = None
 
     @property
     def series_descriptors(self) -> list[dict[str, Any]]:
@@ -186,6 +189,50 @@ class _LazyGuiSeriesCatalog:
         active_descriptors = [
             dict(descriptor) for segment in active_descriptors_by_source for descriptor in segment
         ]
+        if self.combined_profile_loader:
+            combined_cache_key = json.dumps(
+                [
+                    {
+                        "series_id": str(descriptor.get("series_id") or ""),
+                        "slice_key": descriptor.get("density_grid_slice_key"),
+                        "enabled": True,
+                    }
+                    for descriptor in active_descriptors
+                ],
+                sort_keys=True,
+                default=str,
+            )
+            if self._combined_profile_cache_key != combined_cache_key or self._combined_profiles is None:
+                self._combined_profiles = list(self.load_profiles(active_descriptors))
+                self._combined_profile_cache_key = combined_cache_key
+            estimated_total_points = (
+                self.estimate_render_points(
+                    list(self._combined_profiles),
+                    args,
+                    active_descriptors,
+                )
+                if self.estimate_render_points is not None
+                else _estimate_total_points_from_loaded_profiles(list(self._combined_profiles))
+            )
+            return _GuiPlotRenderContext(
+                profile=list(self._combined_profiles),
+                plot_source_label=self.plot_source_label,
+                plotter_kwargs=self.plotter_kwargs,
+                fallback_labels_by_source=[
+                    [
+                        str(descriptor.get("default_label") or f"Series {index + 1}")
+                        for index, descriptor in enumerate(segment)
+                    ]
+                    for segment in active_descriptors_by_source
+                ],
+                default_series_labels=[
+                    str(descriptor.get("default_label") or f"Series {index + 1}")
+                    for index, descriptor in enumerate(active_descriptors)
+                ],
+                series_descriptors=active_descriptors,
+                profile_filter_options=deepcopy(self.profile_filter_options),
+                estimated_total_points=estimated_total_points,
+            )
         missing_descriptors = [
             descriptor
             for descriptor in active_descriptors
@@ -358,6 +405,13 @@ def _build_position_plot_gui_filter_options(reference_profile: Any | None) -> di
             {"id": "y_z_trajectory", "label": "Y vs Z trajectory"},
         ],
     }
+    return _populate_position_plot_gui_filter_options(options, reference_profile)
+
+
+def _populate_position_plot_gui_filter_options(
+    options: dict[str, Any],
+    reference_profile: Any | None,
+) -> dict[str, Any]:
     if reference_profile is None:
         return options
     from .plot.contracts.position_contract import position_profile_to_plot_data_contract
@@ -366,6 +420,52 @@ def _build_position_plot_gui_filter_options(reference_profile: Any | None) -> di
         position_profile_to_plot_data_contract(reference_profile)
     )
     return options
+
+
+def _position_species_display_label_for_gui(species_label: str) -> str:
+    from .analysis.common import is_molecule_species_label, molecule_display_label, species_selector_raw_label
+
+    label = str(species_label).strip()
+    if is_molecule_species_label(label):
+        return molecule_display_label(label)
+    if label.lower().startswith("species:"):
+        return f"{species_selector_raw_label(label)} (species)"
+    return label
+
+
+def _build_position_species_options_from_headers(
+    headers_by_source: list[tuple[str, list[dict[str, Any]]]],
+) -> list[dict[str, str]]:
+    from .analysis.position import _normalize_species as _normalize_position_species
+
+    options: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for _source, headers in headers_by_source:
+        for header in headers:
+            raw_species = str(header.get("species", "")).strip()
+            if not raw_species:
+                continue
+            try:
+                species = _normalize_position_species(raw_species)
+            except ValueError:
+                species = raw_species
+            if species in seen:
+                continue
+            seen.add(species)
+            options.append(
+                {
+                    "value": species,
+                    "label": _position_species_display_label_for_gui(species),
+                }
+            )
+    return options
+
+
+def _position_enabled_species_set(value: Any) -> set[str] | None:
+    if not isinstance(value, (list, tuple, set)):
+        return None
+    enabled = {str(item).strip() for item in value if str(item).strip()}
+    return enabled
 
 
 def _series_descriptors_are_entity_expanded(
@@ -703,6 +803,7 @@ _PLOT_SETTINGS_RDF_KEYS = (
 )
 _PLOT_SETTINGS_POSITION_KEYS = (
     "species",
+    "position_enabled_species",
     "axis",
     "view_mapping",
     "component",
@@ -2556,13 +2657,15 @@ def _build_density_profile_filter_options(
     species_options: list[dict[str, str]] = []
     seen_species: set[str] = set()
     axis_ranges: dict[str, list[float]] = {}
+    axis_range_priorities: dict[str, int] = {}
+    axis_bin_width_values: dict[str, list[float]] = {axis_id: [] for axis_id in ("x", "y", "z", "distance")}
 
     def _add_mode(mode: str) -> None:
         if mode not in seen_modes:
             available_modes.append(mode)
             seen_modes.add(mode)
 
-    def _add_species(raw_species: str) -> None:
+    def _add_species(raw_species: str) -> str:
         candidate = str(raw_species).strip() or "UNKNOWN"
         if candidate != "UNKNOWN":
             _selection_mode, candidate = normalize_species_query(
@@ -2570,17 +2673,17 @@ def _build_density_profile_filter_options(
                 allow_h2o=True,
                 allow_molecules=True,
             )
-        if candidate in seen_species:
-            return
-        seen_species.add(candidate)
-        species_options.append(
-            {
-                "value": candidate,
-                "label": molecule_display_label(candidate)
-                if is_molecule_species_label(candidate)
-                else candidate,
-            }
-        )
+        if candidate not in seen_species:
+            seen_species.add(candidate)
+            species_options.append(
+                {
+                    "value": candidate,
+                    "label": molecule_display_label(candidate)
+                    if is_molecule_species_label(candidate)
+                    else candidate,
+                }
+            )
+        return candidate
 
     def _coerce_cell_lengths(metadata: Mapping[str, Any]) -> tuple[float, float, float] | None:
         raw_cell = metadata.get("resolved_cell_angstrom") or metadata.get("pbc_cell_angstrom")
@@ -2596,26 +2699,71 @@ def _build_density_profile_filter_options(
             return None
         return cell
 
-    def _merge_axis_range(axis_id: str, lower: float, upper: float) -> None:
+    def _optional_metadata_float(metadata: Mapping[str, Any], key: str) -> float | None:
+        try:
+            value = float(metadata.get(key))
+        except (TypeError, ValueError):
+            return None
+        return value if math.isfinite(value) else None
+
+    def _merge_axis_range(axis_id: str, lower: float, upper: float, *, priority: int = 0) -> None:
         if not (math.isfinite(lower) and math.isfinite(upper)) or lower >= upper:
             return
-        current = axis_ranges.get(axis_id)
+        axis_key = str(axis_id).strip().lower()
+        current_priority = axis_range_priorities.get(axis_key)
+        if current_priority is None or int(priority) > current_priority:
+            axis_ranges[axis_key] = [float(lower), float(upper)]
+            axis_range_priorities[axis_key] = int(priority)
+            return
+        if int(priority) < current_priority:
+            return
+        current = axis_ranges.get(axis_key)
         if current is None:
-            axis_ranges[axis_id] = [float(lower), float(upper)]
+            axis_ranges[axis_key] = [float(lower), float(upper)]
         else:
             current[0] = min(current[0], float(lower))
             current[1] = max(current[1], float(upper))
+
+    def _add_axis_bin_width(axis_id: str, width: Any) -> None:
+        try:
+            value = float(width)
+        except (TypeError, ValueError):
+            return
+        if math.isfinite(value) and value > 0.0:
+            axis_bin_width_values.setdefault(str(axis_id).strip().lower(), []).append(value)
 
     def _add_cell_axis_ranges(metadata: Mapping[str, Any]) -> None:
         cell = _coerce_cell_lengths(metadata)
         if cell is None:
             return
-        _merge_axis_range("x", 0.0, cell[0])
-        _merge_axis_range("y", 0.0, cell[1])
-        _merge_axis_range("z", 0.0, cell[2])
+        _merge_axis_range("x", 0.0, cell[0], priority=0)
+        _merge_axis_range("y", 0.0, cell[1], priority=0)
+        _merge_axis_range("z", 0.0, cell[2], priority=0)
         surface_axis = str(metadata.get("surface_axis") or axis or "z").strip().lower()
         distance_index = {"x": 0, "y": 1, "z": 2}.get(surface_axis, 2)
-        _merge_axis_range("distance", 0.0, cell[distance_index])
+        _merge_axis_range("distance", 0.0, cell[distance_index], priority=0)
+
+    def _add_grid_distance_range(metadata: Mapping[str, Any]) -> None:
+        visible_lower = _optional_metadata_float(metadata, "visible_distance_min_A")
+        visible_upper = _optional_metadata_float(metadata, "visible_distance_max_A")
+        if visible_lower is not None and visible_upper is not None and visible_lower < visible_upper:
+            _merge_axis_range("distance", visible_lower, visible_upper, priority=2)
+            return
+        grid_shape = metadata.get("grid_shape")
+        grid_bin_width = _optional_metadata_float(metadata, "grid_bin_width_A")
+        if (
+            isinstance(grid_shape, Sequence)
+            and not isinstance(grid_shape, (str, bytes))
+            and len(grid_shape) >= 4
+            and grid_bin_width is not None
+            and grid_bin_width > 0.0
+        ):
+            try:
+                distance_bins = int(grid_shape[3])
+            except (TypeError, ValueError):
+                return
+            if distance_bins > 0:
+                _merge_axis_range("distance", 0.0, float(distance_bins) * grid_bin_width, priority=1)
 
     for _source, source_payloads in raw_payloads_by_source:
         for payload in source_payloads:
@@ -2629,8 +2777,11 @@ def _build_density_profile_filter_options(
                     profile_kind="grid_3d_sparse",
                 ):
                     continue
-                grid_species = str(metadata.get("species", "")).strip() or "UNKNOWN"
-                _add_species(grid_species)
+                grid_bin_width = metadata.get("grid_bin_width_A")
+                for axis_id in ("x", "y", "z", "distance"):
+                    _add_axis_bin_width(axis_id, grid_bin_width)
+                _add_grid_distance_range(metadata)
+                grid_species = _add_species(str(metadata.get("species", "")).strip() or "UNKNOWN")
                 grid_key = grid_species
                 if grid_key not in seen_grid_sources:
                     grid_sources.append(
@@ -2650,9 +2801,15 @@ def _build_density_profile_filter_options(
                     profile_kind="heatmap_2d",
                 ):
                     continue
-                heatmap_species = str(metadata.get("species", "")).strip() or "UNKNOWN"
-                _add_species(heatmap_species)
+                heatmap_species = _add_species(str(metadata.get("species", "")).strip() or "UNKNOWN")
                 heatmap_plane = str(metadata.get("plane", "")).strip().lower() or "xy"
+                plane_axes = metadata.get("plane_axes")
+                if not isinstance(plane_axes, Sequence) or isinstance(plane_axes, (str, bytes)):
+                    plane_axes = tuple(heatmap_plane[:2])
+                if len(plane_axes) >= 1:
+                    _add_axis_bin_width(str(plane_axes[0]).strip().lower(), metadata.get("x_bin_width_A"))
+                if len(plane_axes) >= 2:
+                    _add_axis_bin_width(str(plane_axes[1]).strip().lower(), metadata.get("y_bin_width_A"))
                 source_key = (heatmap_species, heatmap_plane)
                 if source_key not in seen_heatmap_sources:
                     heatmap_sources.append(
@@ -2673,7 +2830,25 @@ def _build_density_profile_filter_options(
                 mode = "distance"
             else:
                 mode = axis_value if axis_value in {"x", "y", "z"} else "z"
+            _add_axis_bin_width(mode, metadata.get("bin_width_A"))
             _add_mode(mode)
+    species_options = _deduplicate_density_species_options(species_options)
+    allowed_species_options = {
+        str(option.get("value") or "").strip()
+        for option in species_options
+        if str(option.get("value") or "").strip()
+    }
+    if allowed_species_options:
+        heatmap_sources = [
+            source
+            for source in heatmap_sources
+            if str(source.get("species") or "").strip() in allowed_species_options
+        ]
+        grid_sources = [
+            source
+            for source in grid_sources
+            if str(source.get("species") or "").strip() in allowed_species_options
+        ]
     payload: dict[str, Any] = {}
     if available_modes:
         payload.update(
@@ -2690,6 +2865,17 @@ def _build_density_profile_filter_options(
         payload["density_grid_sources"] = grid_sources
     if axis_ranges:
         payload["density_axis_ranges"] = axis_ranges
+    default_axis_bin_widths = {
+        axis_id: max(values)
+        for axis_id, values in axis_bin_width_values.items()
+        if values
+    }
+    if default_axis_bin_widths:
+        payload["density_default_axis_bin_widths_A"] = default_axis_bin_widths
+        if "x" in default_axis_bin_widths:
+            payload["density_default_x_bin_width_A"] = default_axis_bin_widths["x"]
+        if "y" in default_axis_bin_widths:
+            payload["density_default_y_bin_width_A"] = default_axis_bin_widths["y"]
     has_2d = bool(heatmap_sources or grid_sources)
     if available_modes and has_2d:
         payload["density_view_types"] = ["line_1d", "heatmap_2d"]
@@ -2754,6 +2940,103 @@ def _density_grid_2d_axes_from_args(args: argparse.Namespace) -> tuple[str, str]
 
 def _density_logical_series_id(*, source_path: str, species: str) -> str:
     return f"density:{Path(source_path).expanduser().resolve()}:{species.strip()}"
+
+
+def _deduplicate_grouped_density_species_labels(labels: Sequence[str]) -> list[str]:
+    """Hide raw-species duplicates unless an element is split into raw labels."""
+
+    from .analysis.common import (
+        infer_element_from_raw_label,
+        is_molecule_species_label,
+        normalize_species_query,
+        species_selector_raw_label,
+    )
+
+    ordered_labels: list[str] = []
+    seen: set[str] = set()
+    for raw_label in labels:
+        candidate = str(raw_label).strip()
+        if not candidate:
+            continue
+        if candidate != "UNKNOWN":
+            try:
+                _mode, candidate = normalize_species_query(
+                    candidate,
+                    allow_h2o=True,
+                    allow_molecules=True,
+                )
+            except ValueError:
+                pass
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        ordered_labels.append(candidate)
+
+    element_labels: set[str] = set()
+    raw_species_by_element: dict[str, set[str]] = {}
+    raw_species_to_element: dict[str, str | None] = {}
+    for label in ordered_labels:
+        if label == "UNKNOWN" or is_molecule_species_label(label):
+            continue
+        if label.lower().startswith("species:"):
+            raw_species = species_selector_raw_label(label)
+            element = infer_element_from_raw_label(raw_species)
+            raw_species_to_element[label] = element
+            if element is not None:
+                raw_species_by_element.setdefault(element, set()).add(raw_species)
+            continue
+        element_labels.add(label)
+
+    kept: list[str] = []
+    for label in ordered_labels:
+        if not label.lower().startswith("species:"):
+            kept.append(label)
+            continue
+        element = raw_species_to_element.get(label)
+        if element is None:
+            kept.append(label)
+            continue
+        if len(raw_species_by_element.get(element, set())) > 1:
+            kept.append(label)
+            continue
+        if element not in element_labels:
+            kept.append(label)
+    return kept
+
+
+def _deduplicate_density_species_options(
+    species_options: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    allowed_labels = set(
+        _deduplicate_grouped_density_species_labels(
+            [str(option.get("value") or "") for option in species_options]
+        )
+    )
+    return [
+        dict(option)
+        for option in species_options
+        if str(option.get("value") or "").strip() in allowed_labels
+    ]
+
+
+def _deduplicate_density_descriptor_segments_by_species(
+    descriptor_segments_by_source: list[list[dict[str, Any]]],
+) -> list[list[dict[str, Any]]]:
+    labels = [
+        _density_descriptor_species(descriptor)
+        for segment in descriptor_segments_by_source
+        for descriptor in segment
+    ]
+    allowed_labels = set(_deduplicate_grouped_density_species_labels(labels))
+    return [
+        [
+            dict(descriptor)
+            for descriptor in segment
+            if not _density_descriptor_species(descriptor)
+            or _density_descriptor_species(descriptor) in allowed_labels
+        ]
+        for segment in descriptor_segments_by_source
+    ]
 
 
 def _flatten_descriptor_segments(
@@ -6848,6 +7131,9 @@ def _build_density_gui_context(
         axis=None,
         species=args.species,
     )
+    logical_descriptor_segments = _deduplicate_density_descriptor_segments_by_species(
+        logical_descriptor_segments
+    )
     logical_descriptor_segments = _filter_density_descriptor_segments_by_enabled_species(
         logical_descriptor_segments,
         getattr(args, "density_enabled_species", None),
@@ -6986,6 +7272,9 @@ def _build_density_gui_logical_context(
         ],
         axis=None,
         species=args.species,
+    )
+    logical_descriptor_segments = _deduplicate_density_descriptor_segments_by_species(
+        logical_descriptor_segments
     )
     logical_descriptor_segments = _filter_density_descriptor_segments_by_enabled_species(
         logical_descriptor_segments,
@@ -7461,7 +7750,7 @@ def _build_density_gui_lazy_catalog(
 ) -> _LazyGuiSeriesCatalog:
     from .analysis.density import (
         _density_payload_matches_selection,
-        density_grid_to_heatmap_profile,
+        density_grids_to_averaged_heatmap_profile,
         load_density_grid_profiles_by_index,
         load_density_heatmap_profiles_by_index,
     )
@@ -7511,7 +7800,7 @@ def _build_density_gui_lazy_catalog(
             default=str,
         )
         grid_descriptors: list[list[dict[str, Any]]] = []
-        for source, headers in headers_by_source:
+        for source_index, (source, headers) in enumerate(headers_by_source):
             source_grid_descriptors: list[dict[str, Any]] = []
             for header in headers:
                 header = dict(header)
@@ -7528,24 +7817,24 @@ def _build_density_gui_lazy_catalog(
                     index=profile_index,
                 )
                 species_label = str(header.get("species") or "UNKNOWN")
-                series_id = str(profile_uid)
+                resolved_load_source_path = Path(source).expanduser()
+                resolved_source_path = resolved_load_source_path
+                series_id = _density_logical_series_id(
+                    source_path=str(resolved_source_path),
+                    species=f"{species_label}:grid:profile:{profile_index}:{profile_uid}",
+                )
                 source_grid_descriptors.append(
                     {
                         "series_id": series_id,
                         "source_kind": "source",
                         "source_series_id": series_id,
                         "is_generated": False,
-                        "source_index": 0,
+                        "source_index": source_index,
                         "series_index": len(source_grid_descriptors),
-                        "source_name": Path(str(header.get("origin_hdf5_path") or source)).name
-                        or str(source),
-                        "source_directory": str(
-                            Path(str(header.get("origin_hdf5_path") or source)).expanduser().parent
-                        ),
-                        "source_path": str(
-                            Path(str(header.get("origin_hdf5_path") or source)).expanduser()
-                        ),
-                        "load_source_path": str(Path(source).expanduser()),
+                        "source_name": resolved_source_path.name or str(source),
+                        "source_directory": str(resolved_source_path.parent),
+                        "source_path": str(resolved_source_path),
+                        "load_source_path": str(resolved_load_source_path),
                         "default_label": f"{species_label} {grid_x_axis.upper()}/{grid_y_axis.upper()}",
                         "density_species": species_label,
                         "profile_kind": "grid_3d_sparse",
@@ -7561,19 +7850,30 @@ def _build_density_gui_lazy_catalog(
                 )
             if source_grid_descriptors:
                 grid_descriptors.append(source_grid_descriptors)
+        grid_descriptors = _deduplicate_density_descriptor_segments_by_species(
+            grid_descriptors
+        )
         grid_descriptors = _filter_density_descriptor_segments_by_enabled_species(
             grid_descriptors,
             getattr(args, "density_enabled_species", None),
         )
         if grid_descriptors:
-            # The current heatmap renderer plots one field at a time. Keep all
-            # descriptors in the layer list, but enable the first one by default.
-            for segment in grid_descriptors:
-                for descriptor in segment[1:]:
-                    descriptor["enabled"] = False
-
             def _load_grid_heatmap_profiles(descriptors: list[dict[str, Any]]) -> list[Any]:
-                loaded_by_id: dict[str, Any] = {}
+                if not descriptors:
+                    raise ValueError("No density 2D source series are enabled.")
+                active_species = {
+                    str(descriptor.get("density_species") or "").strip()
+                    for descriptor in descriptors
+                    if str(descriptor.get("density_species") or "").strip()
+                }
+                if len(active_species) > 1:
+                    raise ValueError(
+                        "Density 2D rendering supports one mapped species at a time. "
+                        "Select one species in Data/Mapping, then use the series list "
+                        "to choose which source files contribute."
+                    )
+                active_species_label = next(iter(active_species), None)
+                loaded_grids: list[Any] = []
                 for load_source_path, source_descriptors in _group_descriptors_by_load_source(
                     descriptors
                 ):
@@ -7585,20 +7885,19 @@ def _build_density_gui_lazy_catalog(
                     )
                     if len(grid_profiles) != len(source_descriptors):
                         raise ValueError("Density sparse-grid metadata does not match loaded profiles.")
-                    for descriptor, grid_profile in zip(source_descriptors, grid_profiles):
-                        derived_profile = density_grid_to_heatmap_profile(
-                            grid_profile,
-                            x_axis=str(descriptor.get("density_grid_x_axis") or "x"),
-                            y_axis=str(descriptor.get("density_grid_y_axis") or "y"),
-                            filters=descriptor.get("density_grid_filters") or {},
-                            x_bin_width=descriptor.get("density_grid_x_bin_width"),
-                            y_bin_width=descriptor.get("density_grid_y_bin_width"),
-                        )
-                        loaded_by_id[str(descriptor["series_id"])] = replace(
-                            derived_profile,
-                            species=str(descriptor.get("default_label") or derived_profile.species),
-                        )
-                return [loaded_by_id[str(descriptor["series_id"])] for descriptor in descriptors]
+                    loaded_grids.extend(grid_profiles)
+                first_descriptor = descriptors[0]
+                return [
+                    density_grids_to_averaged_heatmap_profile(
+                        loaded_grids,
+                        x_axis=str(first_descriptor.get("density_grid_x_axis") or "x"),
+                        y_axis=str(first_descriptor.get("density_grid_y_axis") or "y"),
+                        filters=first_descriptor.get("density_grid_filters") or {},
+                        x_bin_width=first_descriptor.get("density_grid_x_bin_width"),
+                        y_bin_width=first_descriptor.get("density_grid_y_bin_width"),
+                        species=active_species_label,
+                    )
+                ]
 
             return _LazyGuiSeriesCatalog(
                 sources=list(sources),
@@ -7650,6 +7949,7 @@ def _build_density_gui_lazy_catalog(
                     ],
                 },
                 load_profiles=_load_grid_heatmap_profiles,
+                combined_profile_loader=True,
                 _active_profiles_by_series_id=(
                     active_profiles_by_series_id if active_profiles_by_series_id is not None else {}
                 ),
@@ -7718,6 +8018,9 @@ def _build_density_gui_lazy_catalog(
                 ]
             )
             break
+        selected_descriptors = _deduplicate_density_descriptor_segments_by_species(
+            selected_descriptors
+        )
         selected_descriptors = _filter_density_descriptor_segments_by_enabled_species(
             selected_descriptors,
             getattr(args, "density_enabled_species", None),
@@ -7791,6 +8094,9 @@ def _build_density_gui_lazy_catalog(
         metadata_by_source=headers_by_source,
         axis=None,
         species=args.species,
+    )
+    logical_descriptor_segments = _deduplicate_density_descriptor_segments_by_species(
+        logical_descriptor_segments
     )
     filter_options = {
         **filter_options,
@@ -8087,6 +8393,10 @@ def _build_position_gui_lazy_catalog(
         sources=sources,
         analysis="position",
     )
+    enabled_position_species = _position_enabled_species_set(
+        getattr(args, "position_enabled_species", None)
+    )
+    position_species_options = _build_position_species_options_from_headers(headers_by_source)
     prefix_source_labels = _should_prefix_combined_source_labels(
         sources=sources,
         metadata_items=[
@@ -8122,8 +8432,17 @@ def _build_position_gui_lazy_catalog(
             source_label = _metadata_source_label(header, fallback_source=str(source_path))
             resolved_species = str(header.get("species", "")).strip() or "UNKNOWN"
             resolved_axis = str(header.get("axis", "z")).strip().lower() or "z"
+            try:
+                normalized_resolved_species = _normalize_position_species(resolved_species)
+            except ValueError:
+                normalized_resolved_species = resolved_species
+            if (
+                enabled_position_species is not None
+                and normalized_resolved_species not in enabled_position_species
+            ):
+                continue
             if wanted_species is not None and wanted_species != "ALL":
-                if _normalize_position_species(resolved_species) != wanted_species:
+                if normalized_resolved_species != wanted_species:
                     continue
             if wanted_axis is not None and resolved_axis != wanted_axis:
                 continue
@@ -8151,6 +8470,7 @@ def _build_position_gui_lazy_catalog(
                     {
                         "profile_index": profile_index,
                         "profile_uid": profile_uid,
+                        "position_species": normalized_resolved_species,
                         "rendered_species": rendered_species,
                         "n_frames": n_frames,
                         "frame_timestep_fs": frame_timestep_fs,
@@ -8167,6 +8487,7 @@ def _build_position_gui_lazy_catalog(
                         {
                             "profile_index": profile_index,
                             "profile_uid": profile_uid,
+                            "position_species": normalized_resolved_species,
                             "atom_index": atom_token,
                             "rendered_species": rendered_species,
                             "n_frames": n_frames,
@@ -8307,7 +8628,10 @@ def _build_position_gui_lazy_catalog(
             data_contract=None,
         ),
         descriptor_segments_by_source=descriptor_segments,
-        profile_filter_options=_build_position_plot_gui_filter_options(None),
+        profile_filter_options={
+            **_build_position_plot_gui_filter_options(None),
+            "position_species_options": position_species_options,
+        },
         load_profiles=_load_profiles,
         estimated_total_points=estimated_total_points,
         estimate_render_points=_estimate_render_points,
@@ -8911,6 +9235,49 @@ def _render_profile_plot(
             ordered_profile = [profile[index] for index in indices]
             source_ordered_descriptors = [source_ordered_descriptors[index] for index in indices]
             ordered_descriptors = source_ordered_descriptors + group_ordered_descriptors
+            render_descriptor_by_id = {
+                str(descriptor.get("series_id") or ""): dict(descriptor)
+                for descriptor in ordered_render_descriptors
+                if str(descriptor.get("series_id") or "").strip()
+            }
+            ordered_source_render_descriptors = [
+                render_descriptor_by_id.get(
+                    str(descriptor.get("series_id") or ""),
+                    dict(descriptor),
+                )
+                for descriptor in source_ordered_descriptors
+            ]
+            ordered_source_ids = {
+                str(descriptor.get("series_id") or "")
+                for descriptor in ordered_source_render_descriptors
+            }
+            ordered_render_descriptors = ordered_source_render_descriptors + [
+                dict(descriptor)
+                for descriptor in ordered_render_descriptors
+                if str(descriptor.get("series_id") or "") not in ordered_source_ids
+            ]
+
+            def _reorder_source_list(value: Any) -> Any:
+                if isinstance(value, list) and len(value) == len(indices):
+                    return [value[index] for index in indices]
+                return value
+
+            for attr_name in (
+                "series_labels",
+                "line_colors",
+                "series_enabled",
+                "series_show_in_legend",
+                "series_line_widths",
+                "series_markers",
+                "series_fit_configs",
+                "series_error_configs",
+                "series_normalization_modes",
+                "series_normalization_values",
+                "series_normalization_x_refs",
+                "series_line_kwargs",
+            ):
+                if hasattr(args, attr_name):
+                    setattr(args, attr_name, _reorder_source_list(getattr(args, attr_name)))
 
     # Final transition point: generic style options from argparse are merged
     # here with analysis-specific plotter kwargs and series identity metadata
@@ -9192,6 +9559,7 @@ def _apply_gui_settings_to_args(args: argparse.Namespace, settings: dict[str, An
         "heatmap_colorbar_aspect",
         "view_mapping",
         "density_enabled_species",
+        "position_enabled_species",
         "density_2d_x_axis",
         "density_2d_y_axis",
         "density_filter_x_min",

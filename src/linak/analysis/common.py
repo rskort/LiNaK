@@ -110,6 +110,21 @@ def _try_normalize_element_symbol(value: str | None) -> str | None:
     return candidate if candidate in atomic_numbers else None
 
 
+def infer_element_from_raw_label(raw_label: str | None) -> str | None:
+    """Infer a resolved element from a raw atom label using LiNaK XYZ rules."""
+
+    token = "" if raw_label is None else str(raw_label).strip()
+    if not token:
+        return None
+    exact = _try_normalize_element_symbol(token)
+    if exact is not None:
+        return exact
+    first_two = _try_normalize_element_symbol(token[:2])
+    if first_two is not None:
+        return first_two
+    return _try_normalize_element_symbol(token[:1])
+
+
 def _normalize_element_symbol(value: str | None) -> str:
     candidate = _try_normalize_element_symbol(value)
     if candidate is None:
@@ -194,6 +209,48 @@ def available_distinct_raw_species(frames: list[Atoms]) -> list[str]:
     if not has_distinct_raw_labels:
         return []
     return sorted(species_set)
+
+
+def grouped_raw_species_for_split_elements(frames: list[Atoms]) -> list[str]:
+    """Return raw labels worth exposing in grouped outputs.
+
+    A raw label is exposed for grouped ``all`` selections only when its resolved
+    element has multiple raw labels, for example ``Pt`` and ``Pt_top``. Raw
+    labels that are identical to their sole element label are omitted because
+    the element profile already represents them.
+    """
+
+    raw_to_elements: dict[str, set[str]] = {}
+    element_to_raw: dict[str, set[str]] = {}
+    for frame in frames:
+        if RAW_SPECIES_ARRAY not in frame.arrays:
+            continue
+        raw_labels = raw_species_labels(frame)
+        element_labels = np.asarray(frame.get_chemical_symbols(), dtype=object).astype(str)
+        if raw_labels.shape != element_labels.shape:
+            for raw_label in raw_labels:
+                label = str(raw_label).strip()
+                if label:
+                    raw_to_elements.setdefault(label, set())
+            continue
+        for raw_label, element_label in zip(raw_labels, element_labels):
+            label = str(raw_label).strip()
+            element = str(element_label).strip()
+            if not label or not element:
+                continue
+            raw_to_elements.setdefault(label, set()).add(element)
+            element_to_raw.setdefault(element, set()).add(label)
+
+    exposed: set[str] = set()
+    for raw_label, elements in raw_to_elements.items():
+        if len(elements) != 1:
+            exposed.add(raw_label)
+            continue
+        element = next(iter(elements))
+        raw_labels_for_element = element_to_raw.get(element, set())
+        if len(raw_labels_for_element) > 1:
+            exposed.add(raw_label)
+    return sorted(exposed)
 
 
 def species_selector_raw_label(species: str) -> str:

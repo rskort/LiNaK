@@ -2634,6 +2634,7 @@ def launch_plot_settings_panel(
             self._position_mapping_filter_min_row: tuple[QFormLayout, QWidget] | None = None
             self._position_mapping_filter_max_row: tuple[QFormLayout, QWidget] | None = None
             self._position_mapping_split_by_row: tuple[QFormLayout, QWidget] | None = None
+            self._position_species_checkboxes: dict[str, QCheckBox] = {}
             self._density_mapping_1d_rows: list[tuple[QFormLayout, QWidget]] = []
             self._density_mapping_2d_rows: list[tuple[QFormLayout, QWidget]] = []
             self._density_filter_rows: dict[str, tuple[QFormLayout, QWidget]] = {}
@@ -7795,8 +7796,8 @@ def launch_plot_settings_panel(
             if analysis is None:
                 return
 
-            if analysis in {"msd", "position"}:
-                selection_title = "Source" if analysis == "position" else "Profile Selection"
+            if analysis == "msd":
+                selection_title = "Profile Selection"
                 selection = QGroupBox(selection_title)
                 selection_form = QFormLayout(selection)
                 self.analysis_species = self._line("Leave blank to use file metadata")
@@ -7807,46 +7808,8 @@ def launch_plot_settings_panel(
                     self.analysis_species,
                     tooltip_id="data.profile.species",
                 )
-                if analysis == "position":
-                    self.analysis_axis = self._combo(("", "x", "y", "z"))
-                    self.analysis_axis.currentTextChanged.connect(
-                        self._handle_series_identity_change
-                    )
-                    self._add_form_row(
-                        selection_form,
-                        "Axis",
-                        self.analysis_axis,
-                        tooltip_id="data.profile.axis",
-                    )
-                if analysis == "position":
-                    self._position_source_contract_label = QLabel("")
-                    self._position_source_contract_label.setWordWrap(True)
-                    self._position_source_dimensions_label = QLabel("")
-                    self._position_source_dimensions_label.setWordWrap(True)
-                    self._position_source_quantities_label = QLabel("")
-                    self._position_source_quantities_label.setWordWrap(True)
-                    self._add_form_row(
-                        selection_form,
-                        "Contract",
-                        self._position_source_contract_label,
-                        tooltip_id="data.position.source.contract",
-                    )
-                    self._add_form_row(
-                        selection_form,
-                        "Dimensions",
-                        self._position_source_dimensions_label,
-                        tooltip_id="data.position.source.dimensions",
-                    )
-                    self._add_form_row(
-                        selection_form,
-                        "Quantities",
-                        self._position_source_quantities_label,
-                        tooltip_id="data.position.source.quantities",
-                    )
                 selection_note = QLabel(
                     "Chooses which stored profile is loaded from the current source."
-                    if analysis != "position"
-                    else "Source filters choose which stored position profile is active. The contract summary describes what that source can expose to the mapping layer."
                 )
                 selection_note.setObjectName("sectionNote")
                 selection_note.setWordWrap(True)
@@ -9204,6 +9167,45 @@ def launch_plot_settings_panel(
             target = self._density_target_for_descriptor(descriptor)
             return not target or target in enabled_species
 
+        def _position_species_options(self) -> list[tuple[str, str]]:
+            raw_options = self._profile_filter_options.get("position_species_options")
+            options: list[tuple[str, str]] = []
+            seen: set[str] = set()
+            if isinstance(raw_options, list):
+                for option in raw_options:
+                    if not isinstance(option, dict):
+                        continue
+                    value = str(option.get("value") or "").strip()
+                    if not value or value in seen:
+                        continue
+                    label = str(option.get("label") or value).strip() or value
+                    options.append((value, label))
+                    seen.add(value)
+            if options:
+                return options
+            for descriptor in self._series_descriptors_data:
+                value = str(
+                    descriptor.get("position_species")
+                    or descriptor.get("rendered_species")
+                    or descriptor.get("default_label")
+                    or ""
+                ).strip()
+                if not value or value in seen:
+                    continue
+                options.append((value, value))
+                seen.add(value)
+            return options
+
+        def _enabled_position_species(self) -> set[str] | None:
+            checkboxes = getattr(self, "_position_species_checkboxes", {})
+            if not isinstance(checkboxes, dict) or not checkboxes:
+                return None
+            return {
+                str(value)
+                for value, checkbox in checkboxes.items()
+                if getattr(checkbox, "isChecked", lambda: False)()
+            }
+
         def _density_axis_range_defaults(self, axis_id: str) -> tuple[float, float] | None:
             ranges = self._profile_filter_options.get("density_axis_ranges")
             if not isinstance(ranges, dict):
@@ -9225,6 +9227,63 @@ def launch_plot_settings_panel(
             if defaults is None:
                 return ""
             return f"{defaults[index]:.6g}"
+
+        def _density_selected_axis_for_bin_role(self, role: str) -> str | None:
+            if self._analysis_name != "density":
+                return None
+            if self._is_density_heatmap_mode():
+                widget = (
+                    getattr(self, "density_2d_y_axis", None)
+                    if str(role).strip().lower() == "y"
+                    else getattr(self, "density_2d_x_axis", None)
+                )
+                if widget is None:
+                    return "y" if str(role).strip().lower() == "y" else "x"
+                return _DENSITY_X_MODE_BY_LABEL.get(
+                    widget.currentText().strip().lower(),
+                    "y" if str(role).strip().lower() == "y" else "x",
+                )
+            if str(role).strip().lower() == "y":
+                return None
+            return self._selected_density_x_mode() if hasattr(self, "density_x_mode") else "distance"
+
+        def _density_default_bin_width(self, role: str) -> float | None:
+            defaults = self._profile_filter_options.get("density_default_axis_bin_widths_A")
+            if not isinstance(defaults, dict):
+                return None
+            axis_id = self._density_selected_axis_for_bin_role(role)
+            if axis_id is None:
+                return None
+            try:
+                value = float(defaults.get(axis_id))
+            except (TypeError, ValueError):
+                return None
+            return value if np.isfinite(value) and value > 0.0 else None
+
+        def _density_default_bin_width_text(self, role: str) -> str:
+            value = self._density_default_bin_width(role)
+            return "" if value is None else f"{value:.6g}"
+
+        def _apply_density_default_bin_width_texts(self) -> None:
+            if self._analysis_name != "density":
+                return
+            previous = getattr(self, "_density_auto_bin_width_texts", {})
+            if not isinstance(previous, dict):
+                previous = {}
+            updated: dict[str, str] = {}
+            for role, widget_name in (("x", "x_bin_width"), ("y", "y_bin_width")):
+                widget = getattr(self, widget_name, None)
+                if widget is None:
+                    continue
+                default_text = self._density_default_bin_width_text(role)
+                updated[role] = default_text
+                current_text = widget.text().strip()
+                previous_text = str(previous.get(role) or "")
+                if default_text and (not current_text or current_text == previous_text):
+                    widget.setText(default_text)
+                elif not default_text and current_text == previous_text:
+                    widget.setText("")
+            self._density_auto_bin_width_texts = updated
 
         def _density_effective_filter_values(
             self,
@@ -9532,6 +9591,7 @@ def launch_plot_settings_panel(
 
         def _handle_density_mapping_change(self, *_unused: object) -> None:
             self._sync_density_species_selection_for_view_type()
+            self._apply_density_default_bin_width_texts()
             self._update_density_contract_summary()
             self._handle_series_identity_change()
 
@@ -9541,6 +9601,11 @@ def launch_plot_settings_panel(
             self._update_density_contract_summary()
             self._refresh_widget_states()
             self._schedule_preview_update()
+
+        def _handle_density_binning_change(self, *_unused: object) -> None:
+            if self._analysis_name != "density":
+                return
+            self._handle_series_identity_change()
 
         def _handle_density_target_filter_changed(self, *_unused: object) -> None:
             if self._analysis_name != "density" or self._density_target_filter is None:
@@ -9595,6 +9660,12 @@ def launch_plot_settings_panel(
                                 checkbox.blockSignals(False)
                     finally:
                         self._density_species_checkbox_syncing = False
+            self._record_history_after_non_text_change()
+            self._handle_series_identity_change()
+
+        def _handle_position_species_checkbox_changed(self, *_unused: object) -> None:
+            if self._analysis_name != "position":
+                return
             self._record_history_after_non_text_change()
             self._handle_series_identity_change()
 
@@ -9832,6 +9903,33 @@ def launch_plot_settings_panel(
         def _build_position_mapping_sections(self, layout: QVBoxLayout) -> None:
             mapping_group = QGroupBox("Mapping")
             mapping_form = QFormLayout(mapping_group)
+            self._position_species_checkboxes = {}
+            species_widget = QWidget(mapping_group)
+            species_layout = QGridLayout(species_widget)
+            species_layout.setContentsMargins(0, 0, 0, 0)
+            species_layout.setSpacing(4)
+            position_species_options = self._position_species_options()
+            option_count = max(1, len(position_species_options))
+            species_columns = 1
+            if option_count >= 12:
+                species_columns = 4
+            elif option_count >= 7:
+                species_columns = 3
+            elif option_count >= 4:
+                species_columns = 2
+            for grid_index, (value, label) in enumerate(position_species_options):
+                checkbox = QCheckBox(label)
+                checkbox.setChecked(True)
+                checkbox.setProperty("position_species", value)
+                checkbox.stateChanged.connect(self._handle_position_species_checkbox_changed)
+                species_layout.addWidget(
+                    checkbox,
+                    grid_index // species_columns,
+                    grid_index % species_columns,
+                )
+                self._position_species_checkboxes[value] = checkbox
+            if not self._position_species_checkboxes:
+                species_layout.addWidget(QLabel("No species filters available"), 0, 0)
             self.position_mapping_preset = self._combo(
                 ["Custom", *list(_POSITION_GUI_PRESET_LABEL_BY_ID.values())]
             )
@@ -9878,6 +9976,12 @@ def launch_plot_settings_panel(
                 self._handle_position_mapping_preview_change
             )
             self.position_mapping_split_by = QLabel("atom")
+            self._add_form_row(
+                mapping_form,
+                "Species",
+                species_widget,
+                tooltip_id="data.profile.species",
+            )
             self._add_form_row(
                 mapping_form,
                 "Preset",
@@ -9953,40 +10057,6 @@ def launch_plot_settings_panel(
                     title="Mapping",
                     section_id="data.position.mapping",
                     body_widget=mapping_group,
-                )
-            )
-
-            summary_group = QGroupBox("Summary")
-            summary_form = QFormLayout(summary_group)
-            self._position_mapping_status_label = QLabel("")
-            self._position_mapping_status_label.setWordWrap(True)
-            self._position_mapping_summary_label = QLabel("")
-            self._position_mapping_summary_label.setWordWrap(True)
-            self._position_backend_summary_label = QLabel("")
-            self._position_backend_summary_label.setWordWrap(True)
-            self._add_form_row(
-                summary_form,
-                "Status",
-                self._position_mapping_status_label,
-                tooltip_id="data.position.summary.status",
-            )
-            self._add_form_row(
-                summary_form,
-                "Mapping",
-                self._position_mapping_summary_label,
-                tooltip_id="data.position.summary.mapping",
-            )
-            self._add_form_row(
-                summary_form,
-                "Backend",
-                self._position_backend_summary_label,
-                tooltip_id="data.position.summary.backend",
-            )
-            layout.addWidget(
-                self._make_collapsible_section(
-                    title="Summary",
-                    section_id="data.position.summary",
-                    body_widget=summary_group,
                 )
             )
 
@@ -11341,6 +11411,8 @@ def launch_plot_settings_panel(
             binning_title = (
                 "Density Binning"
                 if self._analysis_name == "density"
+                else "Position Binning / Sampling"
+                if self._analysis_name == "position"
                 else "Display Binning / Sectioning"
             )
             binning = QGroupBox(binning_title)
@@ -11348,6 +11420,8 @@ def launch_plot_settings_panel(
             binning_form = QFormLayout(binning)
             self.x_bin_width = self._line("Leave blank to use the data width")
             self.x_bin_width.textChanged.connect(self._refresh_widget_states)
+            if self._analysis_name == "density":
+                self.x_bin_width.textChanged.connect(self._handle_density_binning_change)
             self.x_bin_reducer = self._combo(_BIN_REDUCERS)
             self._add_form_row(
                 binning_form,
@@ -11380,6 +11454,8 @@ def launch_plot_settings_panel(
             if self._analysis_name in {"density", "orientation"}:
                 self.y_bin_width = self._line("Leave blank to use the data width")
                 self.y_bin_width.textChanged.connect(self._refresh_widget_states)
+                if self._analysis_name == "density":
+                    self.y_bin_width.textChanged.connect(self._handle_density_binning_change)
                 self.y_bin_reducer = self._combo(_BIN_REDUCERS)
                 self._add_form_row(
                     binning_form,
@@ -12896,8 +12972,8 @@ def launch_plot_settings_panel(
                 item_id = str(item.data(Qt.ItemDataRole.UserRole)).strip()
                 if item_id.startswith("fit::") or not item_id:
                     continue
-            if item_id not in desired_order:
-                desired_order.append(item_id)
+                if item_id not in desired_order:
+                    desired_order.append(item_id)
             self._persist_active_series_editor()
             self._apply_series_id_order(desired_order)
             self._restore_active_series_from_id(selected_id)
@@ -14897,6 +14973,7 @@ def launch_plot_settings_panel(
                 self._set_combo_value(
                     self.y_bin_reducer, str(settings.get("y_bin_reducer") or "mean")
                 )
+            self._apply_density_default_bin_width_texts()
             self._initialize_annotation_data(settings)
             self._initialize_series_data(settings)
             self._initialize_normalization_data(settings)
@@ -15773,6 +15850,11 @@ def launch_plot_settings_panel(
                 enabled_species = self._enabled_density_species()
                 if enabled_species is not None:
                     density_enabled_species = sorted(enabled_species)
+            position_enabled_species = None
+            if self._analysis_name == "position":
+                enabled_species = self._enabled_position_species()
+                if enabled_species is not None:
+                    position_enabled_species = sorted(enabled_species)
 
             series_show_in_legend = [bool(value) for value in self._series_show_in_legend_data]
             series_show_in_legend_value: list[bool] | None = None
@@ -16514,6 +16596,7 @@ def launch_plot_settings_panel(
                 ),
                 "series_descriptors": deepcopy(self._series_descriptors_data),
                 "density_enabled_species": density_enabled_species,
+                "position_enabled_species": position_enabled_species,
                 "series_overrides": series_overrides or None,
                 "series_enabled": None if series_overrides else series_enabled_value,
                 "series_show_in_legend": (

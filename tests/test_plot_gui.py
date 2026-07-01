@@ -126,6 +126,25 @@ def test_density_view_type_fallback_is_line_only_without_heatmap_sources():
     assert "tuple(_DENSITY_VIEW_TYPE_LABEL_BY_ID.values())" not in source
 
 
+def test_density_gui_applies_metadata_bin_width_defaults_to_controls():
+    source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+
+    assert "def _density_default_bin_width(self, role: str)" in source
+    assert "def _apply_density_default_bin_width_texts(self) -> None:" in source
+    mapping_handler_start = source.index("def _handle_density_mapping_change")
+    range_handler_start = source.index("def _handle_density_range_change")
+    assert (
+        "self._apply_density_default_bin_width_texts()"
+        in source[mapping_handler_start:range_handler_start]
+    )
+    settings_init_start = source.index("self.x_bin_width.setText")
+    annotation_init_start = source.index("self._initialize_annotation_data", settings_init_start)
+    assert (
+        "self._apply_density_default_bin_width_texts()"
+        in source[settings_init_start:annotation_init_start]
+    )
+
+
 def test_plot_settings_panel_event_filter_uses_qt_modifier_flags_directly():
     source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
 
@@ -837,9 +856,10 @@ def test_plot_settings_panel_exposes_contract_driven_position_mapping_controls()
     source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
 
     assert "def _build_position_mapping_sections(self, layout: QVBoxLayout) -> None:" in source
-    assert 'selection_title = "Source" if analysis == "position" else "Profile Selection"' in source
     assert 'title="Mapping"' in source
-    assert 'title="Summary"' in source
+    assert 'section_id="data.position.summary"' not in source
+    assert 'self._position_species_checkboxes = {}' in source
+    assert '"Species"' in source
     assert 'self.position_view_type = self._combo(' in source
     assert 'self.position_mapping_x = self._combo(["ps", "fs", "step", "frame"])' in source
     assert 'self.position_mapping_y = self._combo(["distance", "x", "y", "z"])' in source
@@ -850,6 +870,7 @@ def test_plot_settings_panel_exposes_contract_driven_position_mapping_controls()
     assert "position_view_mapping_to_plot_options(mapping)" in source
     assert "generic_view_type_compatibility(" in source
     assert "self.position_component = self._combo(_POSITION_COMPONENT_LABELS)" not in source
+    assert 'if analysis in {"msd", "position"}' not in source
 
 
 def test_plot_settings_panel_uses_rdf_layer_summary_and_coordination_selector_choices():
@@ -1540,6 +1561,19 @@ def test_density_target_filter_and_binning_controls_are_source_level():
     assert '"X-axis bin size"' in source
     assert '"Y-axis bin size"' in source
     assert "two_dimensional_binning = is_heatmap or density_heatmap_mode" in source
+
+
+def test_series_list_row_move_collects_full_display_order():
+    source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+    start = source.index("def _handle_series_list_rows_moved")
+    end = source.index("def _set_all_series_enabled", start)
+    body = source[start:end]
+
+    loop_line = "            for row in range(self.series_list.count()):"
+    append_line = "                if item_id not in desired_order:"
+    assert loop_line in body
+    assert append_line in body
+    assert "                    desired_order.append(item_id)" in body
 
 
 def test_non_position_collect_settings_no_longer_emits_active_legacy_mapping_keys():

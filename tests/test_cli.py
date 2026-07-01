@@ -57,6 +57,7 @@ from linak.analysis.position import (
     load_position_profile,
     load_position_profiles_by_index,
     save_position_profile,
+    save_position_profiles,
 )
 from linak.analysis.coordination import (
     CoordinationCutoffResolution,
@@ -388,6 +389,36 @@ def _write_large_position_hdf5(path: Path, *, n_atoms: int, n_frames: int = 3) -
         cell_lengths_angstrom=(10.0, 10.0, 10.0),
     )
     save_position_profile(profile, path)
+
+
+def _small_position_profile(species: str, *, atom_offset: int = 0) -> PositionProfile:
+    frame_index = np.arange(2, dtype=int)
+    step = np.arange(2, dtype=float)
+    time_fs = np.arange(2, dtype=float) * 1000.0
+    time_ps = time_fs / 1000.0
+    atom_indices = np.asarray([atom_offset], dtype=int)
+    values = np.asarray([[0.0], [1.0]], dtype=float)
+    return PositionProfile(
+        species=species,
+        axis="z",
+        atom_indices=atom_indices,
+        frame_index=frame_index,
+        step=step,
+        time_fs=time_fs,
+        time_ps=time_ps,
+        x=values,
+        y=values + 1.0,
+        z=values + 2.0,
+        distance_to_surface=values + 3.0,
+        n_frames=2,
+        n_atoms=1,
+        coordinate_mode="distance",
+        surface_position=0.0,
+        surface_position_std=0.0,
+        surface_position_per_frame=np.zeros(2, dtype=float),
+        surface_estimate=None,
+        cell_lengths_angstrom=(10.0, 10.0, 10.0),
+    )
 
 
 def _write_coordination_hdf5(path: Path) -> None:
@@ -4727,6 +4758,63 @@ def test_materialize_gui_series_overrides_promotes_legacy_normalization_lists():
     assert materialized["series_overrides"]["series:1"]["normalization_value"] == 2.0
 
 
+def test_render_profile_plot_reorders_profiles_labels_colors_and_descriptors_together():
+    args = build_parser().parse_args(["plot", "dummy.h5", "--no-show"])
+    args.series_order = ["series:b", "series:a"]
+    args.series_labels = ["Label A", "Label B"]
+    args.line_colors = ["#111111", "#222222"]
+    args.series_enabled = [True, False]
+    args.series_show_in_legend = [True, False]
+    args.series_line_widths = [1.0, 2.0]
+    args.series_markers = ["o", "s"]
+    args.series_fit_configs = [None, {"fit_enabled": True}]
+    args.series_error_configs = [None, {"enabled": True}]
+    args.series_normalization_modes = ["none", "max"]
+    args.series_normalization_values = [None, 2.0]
+    args.series_normalization_x_refs = [None, 1.0]
+    args.series_line_kwargs = [{"alpha": 0.4}, {"alpha": 0.9}]
+
+    descriptors = [
+        {"series_id": "series:a", "default_label": "A", "source_kind": "source"},
+        {"series_id": "series:b", "default_label": "B", "source_kind": "source"},
+    ]
+    captured: dict[str, object] = {}
+
+    def _fake_plotter(profile, **kwargs):
+        captured["profile"] = profile
+        captured["kwargs"] = kwargs
+        return Path("rendered.png")
+
+    cli_mod._render_profile_plot(
+        args=args,
+        source="dummy.h5",
+        analysis_name="density",
+        profile=["profile-a", "profile-b"],
+        plotter=_fake_plotter,
+        series_descriptors=descriptors,
+        render_series_descriptors=descriptors,
+    )
+
+    kwargs = captured["kwargs"]
+    assert captured["profile"] == ["profile-b", "profile-a"]
+    assert kwargs["series_ids"] == ["series:b", "series:a"]
+    assert kwargs["series_labels"] == ["Label B", "Label A"]
+    assert kwargs["line_colors"] == ["#222222", "#111111"]
+    assert kwargs["series_enabled"] == [False, True]
+    assert kwargs["series_show_in_legend"] == [False, True]
+    assert kwargs["series_line_widths"] == [2.0, 1.0]
+    assert kwargs["series_markers"] == ["s", "o"]
+    assert kwargs["series_fit_configs"] == [{"fit_enabled": True}, None]
+    assert kwargs["series_error_configs"] == [{"enabled": True}, None]
+    assert kwargs["series_normalization_modes"] == ["max", "none"]
+    assert kwargs["series_normalization_values"] == [2.0, None]
+    assert kwargs["series_normalization_x_refs"] == [1.0, None]
+    assert kwargs["series_line_kwargs"] == [{"alpha": 0.9}, {"alpha": 0.4}]
+    assert [
+        item["series_id"] for item in kwargs["render_series_descriptors"]
+    ] == ["series:b", "series:a"]
+
+
 def test_build_gui_series_descriptors_use_origin_paths_for_metadata_and_grouping():
     descriptors = _build_gui_series_descriptors(
         sources=["/tmp/combined_density.h5"],
@@ -5279,6 +5367,133 @@ def test_density_profile_filter_options_expose_cell_axis_ranges():
     }
 
 
+def test_density_profile_filter_options_use_sparse_grid_distance_and_bin_defaults():
+    options = cli_mod._build_density_profile_filter_options(
+        [
+            (
+                "density_grid.h5",
+                [
+                    {
+                        "metadata": {
+                            "analysis": "density",
+                            "species": "Na",
+                            "profile_kind": "grid_3d_sparse",
+                            "resolved_cell_angstrom": [10.0, 11.0, 30.0],
+                            "surface_axis": "z",
+                            "grid_shape": [20, 22, 60, 12],
+                            "grid_bin_width_A": 0.5,
+                            "visible_distance_min_A": 0.25,
+                            "visible_distance_max_A": 4.25,
+                        }
+                    }
+                ],
+            )
+        ],
+        axis=None,
+        species=None,
+    )
+
+    assert options is not None
+    assert options["density_axis_ranges"] == {
+        "x": [0.0, 10.0],
+        "y": [0.0, 11.0],
+        "z": [0.0, 30.0],
+        "distance": [0.25, 4.25],
+    }
+    assert options["density_default_axis_bin_widths_A"] == {
+        "x": 0.5,
+        "y": 0.5,
+        "z": 0.5,
+        "distance": 0.5,
+    }
+    assert options["density_default_x_bin_width_A"] == pytest.approx(0.5)
+    assert options["density_default_y_bin_width_A"] == pytest.approx(0.5)
+
+
+def test_density_profile_filter_options_fall_back_to_grid_shape_distance_range():
+    options = cli_mod._build_density_profile_filter_options(
+        [
+            (
+                "density_grid.h5",
+                [
+                    {
+                        "metadata": {
+                            "analysis": "density",
+                            "species": "Na",
+                            "profile_kind": "grid_3d_sparse",
+                            "resolved_cell_angstrom": [10.0, 11.0, 30.0],
+                            "surface_axis": "z",
+                            "grid_shape": [20, 22, 60, 8],
+                            "grid_bin_width_A": 0.5,
+                        }
+                    }
+                ],
+            )
+        ],
+        axis=None,
+        species=None,
+    )
+
+    assert options is not None
+    assert options["density_axis_ranges"]["distance"] == [0.0, 4.0]
+
+
+def test_density_gui_deduplicates_old_unsplit_raw_species_profiles(tmp_path):
+    output = tmp_path / "old_duplicate_species_density.h5"
+    profiles = [
+        DensityProfile(
+            axis="z",
+            species=species,
+            bin_edges=np.asarray([0.0, 1.0], dtype=float),
+            bin_centers=np.asarray([0.5], dtype=float),
+            counts_per_frame=np.asarray([1.0], dtype=float),
+            density=np.asarray([1.0], dtype=float),
+            units="g/cm^3",
+            n_frames=1,
+            number_density=np.asarray([1.0], dtype=float),
+            number_density_units="atom/nm^3",
+            coordinate_mode="axis",
+        )
+        for species in (
+            "H",
+            "Na",
+            "O",
+            "Pt",
+            "species:H",
+            "species:Na",
+            "species:O",
+            "species:Pt",
+            "species:Pt_top",
+            "mol:H",
+            "mol:H2O",
+        )
+    ]
+    save_density_profiles(profiles, output)
+
+    args = build_parser().parse_args(["plot", str(output)])
+    args.x_mode = "z"
+    catalog = cli_mod._build_density_gui_lazy_catalog(args, sources=[str(output)])
+    descriptor_species = {
+        descriptor["density_species"]
+        for descriptor in catalog.series_descriptors
+        if descriptor.get("density_species")
+    }
+    option_species = {
+        option["value"]
+        for option in catalog.profile_filter_options["density_species_options"]
+    }
+
+    expected = {"H", "Na", "O", "Pt", "species:Pt", "species:Pt_top", "mol:H", "mol:H2O"}
+    assert expected <= descriptor_species
+    assert expected <= option_species
+    assert "species:H" not in descriptor_species
+    assert "species:Na" not in descriptor_species
+    assert "species:O" not in descriptor_species
+    assert "species:H" not in option_species
+    assert "species:Na" not in option_species
+    assert "species:O" not in option_species
+
+
 def test_density_gui_lazy_grid_species_filter_keeps_molecule_descriptors(tmp_path):
     frame = Atoms(
         ["O", "H", "Pt"],
@@ -5319,6 +5534,312 @@ def test_density_gui_lazy_grid_species_filter_keeps_molecule_descriptors(tmp_pat
 
     assert descriptors
     assert {descriptor["density_species"] for descriptor in descriptors} == {"mol:OH"}
+
+
+def test_density_gui_2d_averages_enabled_sparse_grid_sources(tmp_path):
+    edges = np.asarray([0.0, 1.0], dtype=float)
+    source_a = tmp_path / "density_grid_a.h5"
+    source_b = tmp_path / "density_grid_b.h5"
+    save_density_profiles(
+        [
+            DensityGridProfile(
+                species="Na",
+                x_bin_edges=edges,
+                y_bin_edges=edges,
+                z_bin_edges=edges,
+                distance_bin_edges=edges,
+                flat_indices=np.asarray([0], dtype=np.uint64),
+                mass_sum_g=np.asarray([2.0], dtype=float),
+                entity_sum=np.asarray([2.0], dtype=float),
+                n_frames=1,
+                number_density_units="atom/nm^3",
+            )
+        ],
+        source_a,
+    )
+    save_density_profiles(
+        [
+            DensityGridProfile(
+                species="Na",
+                x_bin_edges=edges,
+                y_bin_edges=edges,
+                z_bin_edges=edges,
+                distance_bin_edges=edges,
+                flat_indices=np.asarray([0], dtype=np.uint64),
+                mass_sum_g=np.asarray([12.0], dtype=float),
+                entity_sum=np.asarray([12.0], dtype=float),
+                n_frames=3,
+                number_density_units="atom/nm^3",
+            )
+        ],
+        source_b,
+    )
+    args = build_parser().parse_args(["plot", str(source_a), str(source_b)])
+    args.view_mapping = PlotViewMapping(
+        view_type_id="heatmap_2d",
+        x="x_bin_center",
+        y="y_bin_center",
+        role_assignments={"z": "number_density_2d"},
+    )
+    args.density_2d_x_axis = "x"
+    args.density_2d_y_axis = "y"
+    args.density_enabled_species = ["Na"]
+
+    catalog = cli_mod._build_density_gui_lazy_catalog(
+        args,
+        sources=[str(source_a), str(source_b)],
+    )
+    load_calls = 0
+    original_load_profiles = catalog.load_profiles
+
+    def _counting_load_profiles(descriptors):
+        nonlocal load_calls
+        load_calls += 1
+        return original_load_profiles(descriptors)
+
+    catalog.load_profiles = _counting_load_profiles
+    descriptors = catalog.series_descriptors
+    combined_context = catalog.build_render_context(args)
+    combined_profile = combined_context.profile[0]
+
+    assert len(descriptors) == 2
+    assert len({descriptor["series_id"] for descriptor in descriptors}) == 2
+    assert len({descriptor["source_index"] for descriptor in descriptors}) == 2
+    assert len(combined_context.profile) == 1
+    assert combined_profile.species == "Na averaged X/Y"
+    assert combined_profile.n_frames == 4
+    assert combined_profile.number_density[0, 0] == pytest.approx(3500.0)
+    assert load_calls == 1
+
+    args.title = "Restyled density"
+    restyled_context = catalog.build_render_context(args)
+    assert restyled_context.profile[0] is combined_profile
+    assert load_calls == 1
+
+    args.series_overrides = {
+        descriptors[1]["series_id"]: {"enabled": False},
+    }
+    filtered_context = catalog.build_render_context(args)
+    filtered_profile = filtered_context.profile[0]
+
+    assert len(filtered_context.profile) == 1
+    assert filtered_profile.n_frames == 1
+    assert filtered_profile.number_density[0, 0] == pytest.approx(2000.0)
+    assert load_calls == 2
+
+    args.series_overrides = {
+        descriptors[0]["series_id"]: {"enabled": False},
+    }
+    filtered_context = catalog.build_render_context(args)
+    filtered_profile = filtered_context.profile[0]
+
+    assert len(filtered_context.profile) == 1
+    assert filtered_profile.n_frames == 3
+    assert filtered_profile.number_density[0, 0] == pytest.approx(4000.0)
+    assert load_calls == 3
+
+
+def test_density_gui_2d_source_ids_use_loaded_file_not_origin_metadata(tmp_path):
+    edges = np.asarray([0.0, 1.0], dtype=float)
+    source_a = tmp_path / "density_grid_a.h5"
+    source_b = tmp_path / "density_grid_b.h5"
+    shared_metadata = {
+        "origin_hdf5_path": str(tmp_path / "same_origin.traj.h5"),
+        "profile_uid": "same-grid-profile",
+    }
+    save_density_profiles(
+        [
+            DensityGridProfile(
+                species="Na",
+                x_bin_edges=edges,
+                y_bin_edges=edges,
+                z_bin_edges=edges,
+                distance_bin_edges=edges,
+                flat_indices=np.asarray([0], dtype=np.uint64),
+                mass_sum_g=np.asarray([2.0], dtype=float),
+                entity_sum=np.asarray([2.0], dtype=float),
+                n_frames=1,
+                number_density_units="atom/nm^3",
+            )
+        ],
+        source_a,
+        additional_metadata=shared_metadata,
+    )
+    save_density_profiles(
+        [
+            DensityGridProfile(
+                species="Na",
+                x_bin_edges=edges,
+                y_bin_edges=edges,
+                z_bin_edges=edges,
+                distance_bin_edges=edges,
+                flat_indices=np.asarray([0], dtype=np.uint64),
+                mass_sum_g=np.asarray([12.0], dtype=float),
+                entity_sum=np.asarray([12.0], dtype=float),
+                n_frames=3,
+                number_density_units="atom/nm^3",
+            )
+        ],
+        source_b,
+        additional_metadata=shared_metadata,
+    )
+    args = build_parser().parse_args(["plot", str(source_a), str(source_b)])
+    args.view_mapping = PlotViewMapping(
+        view_type_id="heatmap_2d",
+        x="x_bin_center",
+        y="y_bin_center",
+        role_assignments={"z": "number_density_2d"},
+    )
+    args.density_2d_x_axis = "x"
+    args.density_2d_y_axis = "y"
+    args.density_enabled_species = ["Na"]
+
+    catalog = cli_mod._build_density_gui_lazy_catalog(
+        args,
+        sources=[str(source_a), str(source_b)],
+    )
+    descriptors = catalog.series_descriptors
+
+    assert len(descriptors) == 2
+    assert len({descriptor["series_id"] for descriptor in descriptors}) == 2
+    assert {Path(descriptor["source_path"]).name for descriptor in descriptors} == {
+        source_a.name,
+        source_b.name,
+    }
+
+    args.series_overrides = {descriptors[1]["series_id"]: {"enabled": False}}
+    filtered_profile = catalog.build_render_context(args).profile[0]
+    assert filtered_profile.n_frames == 1
+    assert filtered_profile.number_density[0, 0] == pytest.approx(2000.0)
+
+    args.series_overrides = {descriptors[0]["series_id"]: {"enabled": False}}
+    filtered_profile = catalog.build_render_context(args).profile[0]
+    assert filtered_profile.n_frames == 3
+    assert filtered_profile.number_density[0, 0] == pytest.approx(4000.0)
+
+
+def test_density_gui_2d_combined_hdf5_keeps_grid_contributors_selectable(tmp_path):
+    edges = np.asarray([0.0, 1.0], dtype=float)
+    source_a = tmp_path / "density_grid_a.h5"
+    source_b = tmp_path / "density_grid_b.h5"
+    shared_metadata = {"profile_uid": "same-grid-profile"}
+    save_density_profiles(
+        [
+            DensityGridProfile(
+                species="Na",
+                x_bin_edges=edges,
+                y_bin_edges=edges,
+                z_bin_edges=edges,
+                distance_bin_edges=edges,
+                flat_indices=np.asarray([0], dtype=np.uint64),
+                mass_sum_g=np.asarray([2.0], dtype=float),
+                entity_sum=np.asarray([2.0], dtype=float),
+                n_frames=1,
+                number_density_units="atom/nm^3",
+            )
+        ],
+        source_a,
+        additional_metadata=shared_metadata,
+    )
+    save_density_profiles(
+        [
+            DensityGridProfile(
+                species="Na",
+                x_bin_edges=edges,
+                y_bin_edges=edges,
+                z_bin_edges=edges,
+                distance_bin_edges=edges,
+                flat_indices=np.asarray([0], dtype=np.uint64),
+                mass_sum_g=np.asarray([12.0], dtype=float),
+                entity_sum=np.asarray([12.0], dtype=float),
+                n_frames=3,
+                number_density_units="atom/nm^3",
+            )
+        ],
+        source_b,
+        additional_metadata=shared_metadata,
+    )
+    combined_path = _combine_analysis_hdf5_sources(
+        sources=[str(source_a), str(source_b)],
+        analysis="density",
+        output=tmp_path / "combined_density.h5",
+    )
+    args = build_parser().parse_args(["plot", str(combined_path)])
+    args.view_mapping = PlotViewMapping(
+        view_type_id="heatmap_2d",
+        x="x_bin_center",
+        y="y_bin_center",
+        role_assignments={"z": "number_density_2d"},
+    )
+    args.density_2d_x_axis = "x"
+    args.density_2d_y_axis = "y"
+    args.density_enabled_species = ["Na"]
+
+    catalog = cli_mod._build_density_gui_lazy_catalog(args, sources=[str(combined_path)])
+    descriptors = catalog.series_descriptors
+    combined_profile = catalog.build_render_context(args).profile[0]
+
+    assert len(descriptors) == 2
+    assert len({descriptor["series_id"] for descriptor in descriptors}) == 2
+    assert {descriptor["profile_index"] for descriptor in descriptors} == {0, 1}
+    assert combined_profile.n_frames == 4
+    assert combined_profile.number_density[0, 0] == pytest.approx(3500.0)
+
+    args.series_overrides = {descriptors[1]["series_id"]: {"enabled": False}}
+    filtered_profile = catalog.build_render_context(args).profile[0]
+    assert filtered_profile.n_frames == 1
+    assert filtered_profile.number_density[0, 0] == pytest.approx(2000.0)
+
+    args.series_overrides = {descriptors[0]["series_id"]: {"enabled": False}}
+    filtered_profile = catalog.build_render_context(args).profile[0]
+    assert filtered_profile.n_frames == 3
+    assert filtered_profile.number_density[0, 0] == pytest.approx(4000.0)
+
+
+def test_density_gui_2d_bin_widths_update_sparse_grid_slice_key(tmp_path):
+    edges = np.asarray([0.0, 0.5, 1.0], dtype=float)
+    source = tmp_path / "density_grid_bin_widths.h5"
+    save_density_profiles(
+        [
+            DensityGridProfile(
+                species="Na",
+                x_bin_edges=edges,
+                y_bin_edges=edges,
+                z_bin_edges=edges,
+                distance_bin_edges=edges,
+                flat_indices=np.asarray([0], dtype=np.uint64),
+                mass_sum_g=np.asarray([1.0], dtype=float),
+                entity_sum=np.asarray([1.0], dtype=float),
+                n_frames=1,
+                number_density_units="atom/nm^3",
+            )
+        ],
+        source,
+    )
+    args = build_parser().parse_args(["plot", str(source)])
+    args.view_mapping = PlotViewMapping(
+        view_type_id="heatmap_2d",
+        x="x_bin_center",
+        y="y_bin_center",
+        role_assignments={"z": "number_density_2d"},
+    )
+    args.density_2d_x_axis = "x"
+    args.density_2d_y_axis = "y"
+    args.density_enabled_species = ["Na"]
+
+    default_catalog = cli_mod._build_density_gui_lazy_catalog(args, sources=[str(source)])
+    default_descriptor = default_catalog.series_descriptors[0]
+
+    args.x_bin_width = 1.0
+    args.y_bin_width = 1.0
+    rebinned_catalog = cli_mod._build_density_gui_lazy_catalog(args, sources=[str(source)])
+    rebinned_descriptor = rebinned_catalog.series_descriptors[0]
+
+    assert default_descriptor["density_grid_x_bin_width"] is None
+    assert default_descriptor["density_grid_y_bin_width"] is None
+    assert rebinned_descriptor["density_grid_x_bin_width"] == pytest.approx(1.0)
+    assert rebinned_descriptor["density_grid_y_bin_width"] == pytest.approx(1.0)
+    assert default_descriptor["density_grid_slice_key"] != rebinned_descriptor["density_grid_slice_key"]
 
 
 def test_density_gui_range_filters_use_grid_with_stable_series_id(tmp_path):
@@ -7957,6 +8478,35 @@ def test_plot_position_gui_auto_reduces_excessive_atom_series(tmp_path, monkeypa
     assert "HDF5 data is unchanged" in initial["_auto_display_note"]
     assert "Position GUI auto-reduced display" in caplog.text
     assert "HDF5 data is unchanged" in caplog.text
+
+
+def test_position_gui_lazy_catalog_filters_mapping_species(tmp_path):
+    source_h5 = tmp_path / "position_species.h5"
+    save_position_profiles(
+        [
+            _small_position_profile("H", atom_offset=0),
+            _small_position_profile("O", atom_offset=1),
+        ],
+        source_h5,
+    )
+    args = build_parser().parse_args(["plot", str(source_h5), "--gui"])
+
+    catalog = cli_mod._build_position_gui_lazy_catalog(args, sources=[str(source_h5)])
+    options = catalog.profile_filter_options["position_species_options"]
+    assert {option["value"] for option in options} == {"H", "O"}
+    assert {
+        descriptor["position_species"] for descriptor in catalog.series_descriptors
+    } == {"H", "O"}
+
+    args.position_enabled_species = ["O"]
+    filtered_catalog = cli_mod._build_position_gui_lazy_catalog(
+        args,
+        sources=[str(source_h5)],
+    )
+
+    assert len(filtered_catalog.series_descriptors) == 1
+    assert filtered_catalog.series_descriptors[0]["position_species"] == "O"
+    assert filtered_catalog.series_descriptors[0]["rendered_species"] == "O"
 
 
 def test_plot_position_gui_combined_sources_auto_reduces_after_descriptor_expansion(

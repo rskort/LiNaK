@@ -7,6 +7,7 @@ from ase import Atoms
 
 from linak.analysis.common import (
     RAW_SPECIES_ARRAY,
+    grouped_raw_species_for_split_elements,
     normalize_species_query,
     raw_species_labels,
     select_species_indices,
@@ -81,3 +82,14 @@ def test_oh_topology_uses_resolved_elements_not_raw_species_labels():
     topology = oh_molecule_topology(frame, oh_cutoff=1.27)
 
     assert topology.indices_for("mol:H2O").tolist() == [[0, 1, 2]]
+
+
+def test_grouped_raw_species_only_exposes_split_elements():
+    frame = Atoms(
+        symbols=["Pt", "Pt", "O", "H", "Na"],
+        positions=np.zeros((5, 3)),
+    )
+    frame.new_array(RAW_SPECIES_ARRAY, np.asarray(["Pt", "Pt_top", "O", "H", "Na"]))
+
+    assert grouped_raw_species_for_split_elements([frame]) == ["Pt", "Pt_top"]
+    assert select_species_indices(frame, "species:O").tolist() == [2]

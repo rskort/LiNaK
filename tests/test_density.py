@@ -29,11 +29,37 @@ from linak.analysis.density import (
     save_density_profile,
     save_density_profiles,
 )
+from linak.analysis.common import RAW_SPECIES_ARRAY
 from linak.plot.mappings.density_mapping import density_plot_options_to_view_mapping
 
 
 def test_density_plot_units_use_mathtext_superscript():
     assert density_module._format_plot_density_units("g/cm^3") == "g/cm$^3$"
+
+
+def _split_raw_species_density_frame() -> Atoms:
+    frame = Atoms(
+        symbols=["Pt", "Pt", "O", "H", "H", "H", "Na"],
+        positions=np.asarray(
+            [
+                [8.0, 0.0, 0.0],
+                [9.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0],
+                [0.95, 0.0, 0.0],
+                [0.0, 0.95, 0.0],
+                [5.0, 0.0, 0.0],
+                [7.0, 0.0, 0.0],
+            ],
+            dtype=float,
+        ),
+        cell=[20.0, 20.0, 20.0],
+        pbc=True,
+    )
+    frame.new_array(
+        RAW_SPECIES_ARRAY,
+        np.asarray(["Pt", "Pt_top", "O", "H", "H", "H", "Na"]),
+    )
+    return frame
 
 
 def _mixed_oh_frame() -> Atoms:
@@ -383,6 +409,41 @@ def test_compute_all_density_profiles_group_selectors_and_molecule_threshold():
     assert all_molecule_species == {"mol:H", "mol:O", "mol:OH", "mol:H2O", "mol:H3O"}
 
 
+def test_compute_all_density_profiles_all_deduplicates_unsplit_raw_species():
+    profiles = compute_all_density_profiles(
+        [_split_raw_species_density_frame()],
+        species="all",
+        bin_width=1.0,
+        surface_mode="none",
+        min_molecule_frames=1,
+        oh_cutoff=1.27,
+    )
+
+    z_line_species = {
+        profile.species
+        for profile in profiles
+        if isinstance(profile, DensityProfile)
+        and profile.axis == "z"
+        and profile.coordinate_mode == "axis"
+    }
+
+    assert {"H", "Na", "O", "Pt", "species:Pt", "species:Pt_top", "mol:H", "mol:H2O"} <= z_line_species
+    assert "species:H" not in z_line_species
+    assert "species:Na" not in z_line_species
+    assert "species:O" not in z_line_species
+
+
+def test_compute_all_density_profiles_explicit_raw_species_still_works():
+    profiles = compute_all_density_profiles(
+        [_split_raw_species_density_frame()],
+        species="species:O",
+        bin_width=1.0,
+        surface_mode="none",
+    )
+
+    assert {profile.species for profile in profiles} == {"species:O"}
+
+
 def test_density_molecule_aliases_cutoff_and_visible_metadata_round_trip(tmp_path):
     output = tmp_path / "density_oh.h5"
     profile = compute_density_profile(
@@ -582,6 +643,45 @@ def test_density_grid_to_heatmap_profile_normalizes_by_selected_distance_width()
 
     assert full_map.number_density[0, 0] == pytest.approx(100.0)
     assert filtered_map.number_density[0, 0] == pytest.approx(200.0)
+
+
+def test_density_grids_to_averaged_heatmap_profile_uses_total_frame_weighting():
+    edges = np.asarray([0.0, 1.0], dtype=float)
+    grid_a = DensityGridProfile(
+        species="Na",
+        x_bin_edges=edges,
+        y_bin_edges=edges,
+        z_bin_edges=edges,
+        distance_bin_edges=edges,
+        flat_indices=np.asarray([0], dtype=np.uint64),
+        mass_sum_g=np.asarray([2.0], dtype=float),
+        entity_sum=np.asarray([2.0], dtype=float),
+        n_frames=1,
+        number_density_units="atom/nm^3",
+    )
+    grid_b = DensityGridProfile(
+        species="Na",
+        x_bin_edges=edges,
+        y_bin_edges=edges,
+        z_bin_edges=edges,
+        distance_bin_edges=edges,
+        flat_indices=np.asarray([0], dtype=np.uint64),
+        mass_sum_g=np.asarray([6.0], dtype=float),
+        entity_sum=np.asarray([6.0], dtype=float),
+        n_frames=3,
+        number_density_units="atom/nm^3",
+    )
+
+    averaged = density_module.density_grids_to_averaged_heatmap_profile(
+        [grid_a, grid_b],
+        x_axis="x",
+        y_axis="y",
+        species="Na",
+    )
+
+    assert averaged.n_frames == 4
+    assert averaged.species == "Na averaged X/Y"
+    assert averaged.number_density[0, 0] == pytest.approx(2000.0)
 
 
 def test_density_distance_plot_with_gui_descriptors_keeps_nonzero_default_limits(monkeypatch):
