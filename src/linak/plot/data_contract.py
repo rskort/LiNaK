@@ -11,6 +11,68 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 
 
+PLOT_VIEW_1D_LINE = "plot_1d_line"
+PLOT_VIEW_2D_HEATMAP = "plot_2d_heatmap"
+
+PLOT_VIEW_LABEL_1D_LINE = "1D Line"
+PLOT_VIEW_LABEL_2D_HEATMAP = "2D Heatmap"
+
+_LEGACY_1D_LINE_VIEW_IDS = frozenset({"line_1d"})
+_LEGACY_2D_HEATMAP_VIEW_IDS = frozenset(
+    {
+        "heatmap_2d",
+        "trajectory_2d",
+        "scatter_2d",
+    }
+)
+_LEGACY_VIEW_ID_TO_CANONICAL = {
+    **{view_id: PLOT_VIEW_1D_LINE for view_id in _LEGACY_1D_LINE_VIEW_IDS},
+    **{view_id: PLOT_VIEW_2D_HEATMAP for view_id in _LEGACY_2D_HEATMAP_VIEW_IDS},
+    PLOT_VIEW_1D_LINE: PLOT_VIEW_1D_LINE,
+    PLOT_VIEW_2D_HEATMAP: PLOT_VIEW_2D_HEATMAP,
+}
+_VIEW_LABEL_TO_CANONICAL = {
+    "1d": PLOT_VIEW_1D_LINE,
+    "1d line": PLOT_VIEW_1D_LINE,
+    "line": PLOT_VIEW_1D_LINE,
+    "line 1d": PLOT_VIEW_1D_LINE,
+    PLOT_VIEW_1D_LINE: PLOT_VIEW_1D_LINE,
+    "2d": PLOT_VIEW_2D_HEATMAP,
+    "2d heatmap": PLOT_VIEW_2D_HEATMAP,
+    "heatmap": PLOT_VIEW_2D_HEATMAP,
+    "heatmap 2d": PLOT_VIEW_2D_HEATMAP,
+    "2d map": PLOT_VIEW_2D_HEATMAP,
+    "trajectory 2d": PLOT_VIEW_2D_HEATMAP,
+    "scatter 2d": PLOT_VIEW_2D_HEATMAP,
+    PLOT_VIEW_2D_HEATMAP: PLOT_VIEW_2D_HEATMAP,
+}
+
+
+def canonical_plot_view_id(view_type_id: str | None) -> str:
+    """Return LiNaK's canonical plot-view token for a legacy or canonical id."""
+
+    token = str(view_type_id or "").strip().lower()
+    return _LEGACY_VIEW_ID_TO_CANONICAL.get(token, token)
+
+
+def plot_view_display_label(view_type_id: str | None) -> str:
+    """Return the user-facing plot-view label for a legacy or canonical id."""
+
+    canonical = canonical_plot_view_id(view_type_id)
+    if canonical == PLOT_VIEW_1D_LINE:
+        return PLOT_VIEW_LABEL_1D_LINE
+    if canonical == PLOT_VIEW_2D_HEATMAP:
+        return PLOT_VIEW_LABEL_2D_HEATMAP
+    return str(view_type_id or "").strip()
+
+
+def canonical_plot_view_id_from_label(label: str | None) -> str:
+    """Resolve a user-facing or legacy view label to a canonical plot-view token."""
+
+    token = str(label or "").strip().lower()
+    return _VIEW_LABEL_TO_CANONICAL.get(token, token)
+
+
 @dataclass(frozen=True)
 class PlotDimension:
     """Describe one logical data dimension used by plotted quantities."""

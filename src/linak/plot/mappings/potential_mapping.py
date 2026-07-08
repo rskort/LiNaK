@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
-import numpy as np
+from dataclasses import dataclass, replace
 
 from ..contracts.potential_contract import (
     default_potential_plot_data_contract,
     potential_profiles_to_plot_data_contract,
 )
-from ..data_contract import PlotDataContract, PlotViewMapping
+from ..data_contract import (
+    PLOT_VIEW_1D_LINE,
+    PlotDataContract,
+    PlotViewMapping,
+    canonical_plot_view_id,
+)
 from ..data_validation import MappingStatus, generic_view_type_compatibility
 
 
@@ -41,34 +45,20 @@ class ResolvedPotentialPlotMapping:
 
         return str(self.renderer_options.get("standard_plot") or "").strip().lower()
 
-    @property
-    def is_table_view(self) -> bool:
-        """Return whether the active mapping represents a table inspection view."""
-
-        return self.view_type == "table_records"
-
 
 def potential_plot_options_to_view_mapping(
     *,
     y_quantity: str | None = None,
-    table_view: bool = False,
 ) -> PlotViewMapping:
     """Translate current potential plot options into a generic view mapping."""
 
-    if bool(table_view):
-        return PlotViewMapping(
-            view_type_id="table_records",
-            fixed_values={
-                "columns": "record_id,water_bulk_potential,efermi,electrode_cshe",
-            },
-        )
     normalized_y = "water_bulk_potential" if y_quantity is None else str(y_quantity).strip().lower()
     if normalized_y not in {"water_bulk_potential", "efermi", "electrode_cshe"}:
         raise ValueError(
             "Unsupported potential y quantity. Choose water_bulk_potential, efermi, or electrode_cshe."
         )
     return PlotViewMapping(
-        view_type_id="line_1d",
+        view_type_id=PLOT_VIEW_1D_LINE,
         x="record_id",
         y=normalized_y,
         fixed_values=({"standard_plot": "summary"} if y_quantity is None else {}),
@@ -80,11 +70,13 @@ def potential_view_mapping_to_plot_options(mapping: PlotViewMapping) -> dict[str
 
     view_type_id = str(mapping.view_type_id).strip().lower()
     if view_type_id == "table_records":
-        return {"view_type": "table_records"}
-    if view_type_id != "line_1d":
-        raise ValueError(
-            "Current potential plotting only supports 'line_1d' and 'table_records' mappings."
-        )
+        return {
+            "view_type": "line_1d",
+            "y_quantity": "water_bulk_potential",
+            "standard_plot": "summary",
+        }
+    if canonical_plot_view_id(view_type_id) != PLOT_VIEW_1D_LINE:
+        raise ValueError("Current potential plotting only supports 1D Line mappings.")
     if str(mapping.x or "").strip() != "record_id":
         raise ValueError("Potential line mappings must place record_id on the x role.")
     y_quantity = str(mapping.y or "").strip()
@@ -105,7 +97,6 @@ def resolve_potential_plot_mapping(
     profiles: Sequence[object] | None = None,
     mapping: PlotViewMapping | None = None,
     y_quantity: str | None = None,
-    table_view: bool = False,
 ) -> ResolvedPotentialPlotMapping:
     """Resolve potential options or a mapping into one runtime mapping."""
 
@@ -119,7 +110,13 @@ def resolve_potential_plot_mapping(
     resolved_mapping = (
         mapping
         if mapping is not None
-        else potential_plot_options_to_view_mapping(y_quantity=y_quantity, table_view=table_view)
+        else potential_plot_options_to_view_mapping(y_quantity=y_quantity)
+    )
+    if str(resolved_mapping.view_type_id).strip().lower() == "table_records":
+        resolved_mapping = potential_plot_options_to_view_mapping()
+    resolved_mapping = replace(
+        resolved_mapping,
+        view_type_id=canonical_plot_view_id(resolved_mapping.view_type_id),
     )
     compatibility = generic_view_type_compatibility(resolved_contract, resolved_mapping)
     if compatibility == "invalid":
@@ -130,39 +127,3 @@ def resolve_potential_plot_mapping(
         compatibility=compatibility,
         renderer_options=potential_view_mapping_to_plot_options(resolved_mapping),
     )
-
-
-def potential_table_rows(profiles: Sequence[object]) -> list[dict[str, float | None]]:
-    """Build a simple row-oriented inspection table from fixed potential series."""
-
-    if not profiles:
-        return []
-    series_by_id = {str(getattr(profile, "series_id", "")): profile for profile in profiles}
-    x_values = np.asarray(getattr(profiles[0], "x_values", []), dtype=float)
-    rows: list[dict[str, float | None]] = []
-    for index, record_id in enumerate(x_values.tolist()):
-        row = {
-            "record_id": float(record_id),
-            "water_bulk_potential": _potential_series_value(
-                series_by_id, "water_bulk_potential_ev", index
-            ),
-            "efermi": _potential_series_value(series_by_id, "efermi_ev", index),
-            "electrode_cshe": _potential_series_value(series_by_id, "electrode_cshe_ev", index),
-        }
-        rows.append(row)
-    return rows
-
-
-def _potential_series_value(
-    series_by_id: dict[str, object],
-    series_id: str,
-    index: int,
-) -> float | None:
-    profile = series_by_id.get(series_id)
-    if profile is None:
-        return None
-    values = np.asarray(getattr(profile, "y_values", []), dtype=float)
-    if index >= values.size:
-        return None
-    value = float(values[index])
-    return None if not np.isfinite(value) else value

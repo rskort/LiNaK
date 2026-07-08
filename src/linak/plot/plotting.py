@@ -1857,6 +1857,7 @@ def _capture_plot_state(
             "legend_title": legend_title,
             "legend_loc": legend_loc,
             "legend_kwargs": legend_kwargs,
+            "line_artists": list(getattr(ax, "lines", []) or []),
             "line_colors": list(line_colors),
             "line_color": line_color,
             "markers": any(
@@ -2637,6 +2638,7 @@ def plot_line_series(
     tight_layout_kwargs: dict[str, Any] | None = None,
     savefig_kwargs: dict[str, Any] | None = None,
     suppress_output_log: bool = False,
+    keep_figure_open: bool = False,
 ) -> Path | None:
     """Plot a single line using the shared LiNaK style."""
     resolved_fit_config = None if fit_config is None else dict(fit_config)
@@ -2715,6 +2717,7 @@ def plot_line_series(
         tight_layout_kwargs=tight_layout_kwargs,
         savefig_kwargs=savefig_kwargs,
         suppress_output_log=suppress_output_log,
+        keep_figure_open=keep_figure_open,
     )
 
 
@@ -2755,6 +2758,7 @@ def plot_heatmap_series(
     tight_layout_kwargs: dict[str, Any] | None = None,
     savefig_kwargs: dict[str, Any] | None = None,
     suppress_output_log: bool = False,
+    keep_figure_open: bool = False,
     heatmap_vmin: float | None = None,
     heatmap_vmax: float | None = None,
     heatmap_cmap: str | None = None,
@@ -3004,7 +3008,7 @@ def plot_heatmap_series(
             if not show_blocking:
                 plt.pause(0.001)
 
-        if not (show and not show_blocking):
+        if not keep_figure_open and not (show and not show_blocking):
             plt.close(fig)
         return output_path
 
@@ -3079,6 +3083,7 @@ def plot_multi_line_series(
     tight_layout_kwargs: dict[str, Any] | None = None,
     savefig_kwargs: dict[str, Any] | None = None,
     suppress_output_log: bool = False,
+    keep_figure_open: bool = False,
 ) -> Path | None:
     """Plot multiple line series in a single axes using the shared LiNaK style."""
     if not (len(x_series) == len(y_series) == len(labels)):
@@ -4197,6 +4202,6 @@ def plot_multi_line_series(
                 # Ensure the window is realized in GUI-preview mode.
                 plt.pause(0.001)
 
-        if not (show and not show_blocking):
+        if not keep_figure_open and not (show and not show_blocking):
             plt.close(fig)
         return output_path

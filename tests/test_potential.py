@@ -23,6 +23,7 @@ from linak.analysis.potential import (
     _water_bulk_potential_ev,
 )
 from linak.storage.hdf5_utils import read_linak_hdf5_profiles
+from linak.plot.data_contract import PlotViewMapping
 from linak.plot.mappings.potential_mapping import potential_plot_options_to_view_mapping
 
 
@@ -478,8 +479,8 @@ def test_plot_potential_profiles_accepts_generic_single_series_mapping(monkeypat
     np.testing.assert_allclose(captured["y_series"][0], np.array([1.0, 1.1]))
 
 
-def test_plot_potential_profiles_table_view_populates_capture_state(tmp_path):
-    source = tmp_path / "potential_table_view.h5"
+def test_plot_potential_profiles_legacy_table_view_renders_summary_line(tmp_path):
+    source = tmp_path / "potential_legacy_table_view.h5"
     _write_potential_summary_hdf5(
         source,
         ids=[1, 2],
@@ -490,29 +491,21 @@ def test_plot_potential_profiles_table_view_populates_capture_state(tmp_path):
     )
     profiles, _summary = load_potential_plot_profiles(source)
     capture_state: dict[str, object] = {}
+    output = tmp_path / "potential_legacy_table_view.png"
 
     result = plot_potential_profiles(
         profiles,
         show=False,
-        view_mapping=potential_plot_options_to_view_mapping(table_view=True),
+        output=output,
+        view_mapping=PlotViewMapping(view_type_id="table_records"),
         capture_state=capture_state,
     )
 
-    assert result is None
-    assert capture_state["table_rows"] == [
-        {
-            "record_id": 1.0,
-            "water_bulk_potential": 2.0,
-            "efermi": 1.0,
-            "electrode_cshe": 0.2,
-        },
-        {
-            "record_id": 2.0,
-            "water_bulk_potential": 2.1,
-            "efermi": 1.1,
-            "electrode_cshe": 0.3,
-        },
-    ]
+    assert result == output.resolve()
+    assert output.exists()
+    assert "table_rows" not in capture_state
+    assert capture_state["x_label"] == "Record ID"
+    assert capture_state["y_label"] == "Potential (eV)"
 
 
 def test_plot_potential_hdf5_non_gui_renders_png(tmp_path):

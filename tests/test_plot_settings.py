@@ -21,7 +21,7 @@ from linak.plot.profile_persistence import (
     plot_profile_requires_legacy_mapping_flatten,
     select_plot_profile_settings,
 )
-from linak.plot.data_contract import PlotViewMapping
+from linak.plot.data_contract import PLOT_VIEW_1D_LINE, PLOT_VIEW_2D_HEATMAP, PlotViewMapping
 from linak.storage.hdf5_utils import write_linak_hdf5, write_linak_hdf5_profile_collection
 
 
@@ -304,7 +304,10 @@ def test_select_plot_profile_settings_reads_density_payload_without_flattening()
     assert selected == {
         "species": "H2O",
         "axis": "y",
-        "view_mapping": payload["view_mapping"],
+        "view_mapping": {
+            **payload["view_mapping"],
+            "view_type_id": PLOT_VIEW_1D_LINE,
+        },
         "title": "Saved density",
     }
 
@@ -341,7 +344,7 @@ def test_write_plot_profile_round_trips_structured_density_payload_without_legac
 
     assert payload is not None
     assert payload["source_selection"] == {"species": "H2O", "axis": "y"}
-    assert payload["view_mapping"]["view_type_id"] == "line_1d"
+    assert payload["view_mapping"]["view_type_id"] == PLOT_VIEW_1D_LINE
     assert payload["view_mapping"]["x"] == "axis_coordinate"
     assert payload["view_mapping"]["y"] == "number_density"
     assert payload["view_mapping"]["fixed_values"] == {"x_mode": "axis"}
@@ -383,7 +386,7 @@ def test_temperature_plot_profile_round_trips_time_axis_mapping():
     )
 
     assert payload["source_selection"] == {}
-    assert payload["view_mapping"]["view_type_id"] == "line_1d"
+    assert payload["view_mapping"]["view_type_id"] == PLOT_VIEW_1D_LINE
     assert payload["view_mapping"]["x"] == "time_fs"
     assert payload["view_mapping"]["y"] == "temperature"
     assert payload["style"] == {"title": "Temperature", "legend": True}
@@ -393,6 +396,117 @@ def test_temperature_plot_profile_round_trips_time_axis_mapping():
     assert flattened["time_axis"] == "fs"
     assert flattened["title"] == "Temperature"
     assert flattened["legend"] is True
+
+
+def test_plot_profile_payload_canonicalizes_nested_view_state_ids():
+    payload = build_plot_profile_payload(
+        "plot:position",
+        {
+            "position_active_view_type": "trajectory_2d",
+            "position_view_states": {
+                "line_1d": {
+                    "position_active_view_type": "line_1d",
+                    "view_mapping": {
+                        "view_type_id": "line_1d",
+                        "x": "time_ps",
+                        "y": "distance_to_surface",
+                    },
+                    "x_lim": [0.0, 1.0],
+                },
+                "trajectory_2d": {
+                    "position_active_view_type": "trajectory_2d",
+                    "view_mapping": {
+                        "view_type_id": "trajectory_2d",
+                        "x": "x",
+                        "y": "z",
+                        "color": "distance_to_surface",
+                    },
+                    "x_lim": [0.0, 2.0],
+                },
+            },
+        },
+    )
+
+    style = payload["style"]
+    assert style["position_active_view_type"] == PLOT_VIEW_2D_HEATMAP
+    assert set(style["position_view_states"]) == {PLOT_VIEW_1D_LINE, PLOT_VIEW_2D_HEATMAP}
+    assert (
+        style["position_view_states"][PLOT_VIEW_1D_LINE]["position_active_view_type"]
+        == PLOT_VIEW_1D_LINE
+    )
+    assert (
+        style["position_view_states"][PLOT_VIEW_2D_HEATMAP]["position_active_view_type"]
+        == PLOT_VIEW_2D_HEATMAP
+    )
+    assert (
+        style["position_view_states"][PLOT_VIEW_1D_LINE]["view_mapping"]["view_type_id"]
+        == PLOT_VIEW_1D_LINE
+    )
+    assert (
+        style["position_view_states"][PLOT_VIEW_2D_HEATMAP]["view_mapping"]["view_type_id"]
+        == PLOT_VIEW_2D_HEATMAP
+    )
+
+
+def test_flatten_plot_profile_payload_canonicalizes_loaded_view_state_ids():
+    payload = {
+        "source_selection": {},
+        "view_mapping": {
+            "view_type_id": "trajectory_2d",
+            "x": "x",
+            "y": "z",
+            "color": "distance_to_surface",
+            "split_by": "atom",
+            "filter_by": None,
+            "filter_min": None,
+            "filter_max": None,
+            "role_assignments": {},
+            "fixed_values": {"projection_render_mode": "line-colors"},
+        },
+        "style": {
+            "position_active_view_type": "trajectory_2d",
+            "position_view_states": {
+                "line_1d": {
+                    "position_active_view_type": "line_1d",
+                    "view_mapping": {
+                        "view_type_id": "line_1d",
+                        "x": "time_ps",
+                        "y": "distance_to_surface",
+                    },
+                },
+                "trajectory_2d": {
+                    "position_active_view_type": "trajectory_2d",
+                    "view_mapping": {
+                        "view_type_id": "trajectory_2d",
+                        "x": "x",
+                        "y": "z",
+                        "color": "distance_to_surface",
+                    },
+                },
+            },
+        },
+    }
+
+    flattened = flatten_plot_profile_payload("plot:position", payload)
+
+    assert flattened["position_active_view_type"] == PLOT_VIEW_2D_HEATMAP
+    assert set(flattened["position_view_states"]) == {PLOT_VIEW_1D_LINE, PLOT_VIEW_2D_HEATMAP}
+    assert (
+        flattened["position_view_states"][PLOT_VIEW_1D_LINE]["position_active_view_type"]
+        == PLOT_VIEW_1D_LINE
+    )
+    assert (
+        flattened["position_view_states"][PLOT_VIEW_2D_HEATMAP]["position_active_view_type"]
+        == PLOT_VIEW_2D_HEATMAP
+    )
+    assert (
+        flattened["position_view_states"][PLOT_VIEW_1D_LINE]["view_mapping"]["view_type_id"]
+        == PLOT_VIEW_1D_LINE
+    )
+    assert (
+        flattened["position_view_states"][PLOT_VIEW_2D_HEATMAP]["view_mapping"]["view_type_id"]
+        == PLOT_VIEW_2D_HEATMAP
+    )
 
 
 def test_plot_profile_requires_legacy_mapping_flatten_only_for_compatibility_keys():

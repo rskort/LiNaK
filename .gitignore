@@ -45,3 +45,4 @@ data/
 !src/linak/plot/mappings/temperature_mapping.py
 !docs/temperature.md
 !tests/test_temperature.py
+!docs/plot-gui-unification-plan.md

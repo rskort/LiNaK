@@ -4,7 +4,14 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from ..data_contract import PlotDataContract, PlotDimension, PlotQuantity, PlotViewType
+from ..data_contract import (
+    PLOT_VIEW_1D_LINE,
+    PlotDataContract,
+    PlotDimension,
+    PlotQuantity,
+    PlotViewType,
+    plot_view_display_label,
+)
 
 if TYPE_CHECKING:
     from ...analysis.temperature import TemperatureProfile
@@ -56,13 +63,13 @@ def _temperature_contract(
         ),
         view_types=(
             PlotViewType(
-                id="line_1d",
-                label="Line 1D",
-                kind="line_1d",
+                id=PLOT_VIEW_1D_LINE,
+                label=plot_view_display_label(PLOT_VIEW_1D_LINE),
+                kind=PLOT_VIEW_1D_LINE,
                 supported_roles=("x", "y"),
             ),
         ),
-        default_view_type_id="line_1d",
+        default_view_type_id=PLOT_VIEW_1D_LINE,
     )
 
 

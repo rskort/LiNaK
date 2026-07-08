@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import queue
 from copy import deepcopy
 from dataclasses import dataclass
 import html
@@ -17,11 +18,15 @@ from uuid import uuid4
 import numpy as np
 
 from .data_contract import (
+    PLOT_VIEW_1D_LINE,
+    PLOT_VIEW_2D_HEATMAP,
     PlotDataContract,
     PlotDimension,
     PlotQuantity,
     PlotViewMapping,
     PlotViewType,
+    canonical_plot_view_id,
+    plot_view_display_label,
 )
 from .contracts.position_contract import default_position_plot_data_contract
 from .contracts.density_contract import (
@@ -126,7 +131,6 @@ _MARKER_TYPES = (
     "_",
 )
 _FIT_TYPES = supported_fit_types()
-_FIT_RANGE_MODES = ("visible", "manual")
 _ERROR_STATS = ("sample_sem", "sample_std", "block_sem", "block_std")
 _ERROR_STAT_DISPLAY: dict[str, str] = {
     "sample_sem": "Sample SEM",
@@ -157,21 +161,72 @@ _ANNOTATION_LINE_STYLES = ("-", "--", "-.", ":")
 _ANNOTATION_ARROW_STYLES = ("->", "-|>", "<->", "simple", "fancy")
 _ANNOTATION_HORIZONTAL_ALIGN = ("left", "center", "right")
 _ANNOTATION_VERTICAL_ALIGN = ("top", "center", "bottom", "baseline")
-_POSITION_COMPONENT_LABELS = ("distance", "x", "y", "z", "2D projection")
+_POSITION_COMPONENT_LABELS = ("distance", "x", "y", "z", "2D Heatmap")
 _POSITION_PROJECTION_QUANTITIES = ("x", "y", "z", "distance", "ps", "fs", "step", "frame")
-_POSITION_PROJECTION_RENDER_MODES = ("color-scale", "line-colors")
-_POSITION_GUI_VIEW_TYPE_LABEL_BY_ID = {
-    "line_1d": "Line 1D",
-    "trajectory_2d": "Trajectory 2D",
+_POSITION_PROJECTION_RENDER_MODES = ("color-scale", "source colors")
+_POSITION_RENDER_MODE_BACKEND_BY_LABEL = {
+    "color-scale": "color-scale",
+    "source colors": "line-colors",
+    "line-colors": "line-colors",
 }
-_POSITION_GUI_VIEW_TYPE_ID_BY_LABEL = {
-    label: view_type_id for view_type_id, label in _POSITION_GUI_VIEW_TYPE_LABEL_BY_ID.items()
+_POSITION_RENDER_MODE_LABEL_BY_BACKEND = {
+    "color-scale": "color-scale",
+    "line-colors": "source colors",
 }
+
+_PUBLIC_PLOT_VIEW_LABEL_BY_ID = {
+    PLOT_VIEW_1D_LINE: plot_view_display_label(PLOT_VIEW_1D_LINE),
+    PLOT_VIEW_2D_HEATMAP: plot_view_display_label(PLOT_VIEW_2D_HEATMAP),
+}
+_LEGACY_PLOT_VIEW_LABEL_ALIASES = {
+    "Line 1D": PLOT_VIEW_1D_LINE,
+    "1D": PLOT_VIEW_1D_LINE,
+    "Heatmap 2D": PLOT_VIEW_2D_HEATMAP,
+    "2D Map": PLOT_VIEW_2D_HEATMAP,
+    "Trajectory 2D": PLOT_VIEW_2D_HEATMAP,
+    "2D": PLOT_VIEW_2D_HEATMAP,
+    "line_1d": PLOT_VIEW_1D_LINE,
+    "heatmap_2d": PLOT_VIEW_2D_HEATMAP,
+    "trajectory_2d": PLOT_VIEW_2D_HEATMAP,
+    "plot_1d_line": PLOT_VIEW_1D_LINE,
+    "plot_2d_heatmap": PLOT_VIEW_2D_HEATMAP,
+}
+
+
+def _plot_view_label_by_id(*, include_heatmap: bool) -> dict[str, str]:
+    view_ids = [PLOT_VIEW_1D_LINE]
+    if include_heatmap:
+        view_ids.append(PLOT_VIEW_2D_HEATMAP)
+    return {view_id: _PUBLIC_PLOT_VIEW_LABEL_BY_ID[view_id] for view_id in view_ids}
+
+
+def _plot_view_id_by_label(*, include_heatmap: bool) -> dict[str, str]:
+    label_by_id = _plot_view_label_by_id(include_heatmap=include_heatmap)
+    id_by_label = {label: view_id for view_id, label in label_by_id.items()}
+    for label, view_id in _LEGACY_PLOT_VIEW_LABEL_ALIASES.items():
+        if include_heatmap or view_id == PLOT_VIEW_1D_LINE:
+            id_by_label[label] = view_id
+    return id_by_label
+
+
+def _contract_has_public_heatmap_view(contract: PlotDataContract) -> bool:
+    """Return whether a contract exposes a true public 2D Heatmap view.
+
+    Legacy trajectory/scatter views are still accepted by compatibility adapters,
+    but they should not make the normal GUI advertise `2D Heatmap`.
+    """
+
+    available = {str(view_type.id).strip() for view_type in contract.view_types}
+    return bool({PLOT_VIEW_2D_HEATMAP, "heatmap_2d"} & available)
+
+
+_POSITION_GUI_VIEW_TYPE_LABEL_BY_ID = _plot_view_label_by_id(include_heatmap=True)
+_POSITION_GUI_VIEW_TYPE_ID_BY_LABEL = _plot_view_id_by_label(include_heatmap=True)
 _POSITION_GUI_PRESET_LABEL_BY_ID = {
     "distance_vs_time": "Distance vs time",
-    "x_y_trajectory": "X vs Y trajectory",
-    "x_z_trajectory": "X vs Z trajectory",
-    "y_z_trajectory": "Y vs Z trajectory",
+    "x_y_trajectory": "X/Y view",
+    "x_z_trajectory": "X/Z view",
+    "y_z_trajectory": "Y/Z view",
 }
 _POSITION_GUI_PRESET_ID_BY_LABEL = {
     label: preset_id for preset_id, label in _POSITION_GUI_PRESET_LABEL_BY_ID.items()
@@ -186,27 +241,43 @@ _POSITION_GUI_TOKEN_BY_QUANTITY_ID = {
     "step": "step",
     "frame_index": "frame",
 }
-_POTENTIAL_VIEW_TYPE_LABEL_BY_ID = {
-    "line_1d": "Line 1D",
-    "table_records": "Table records",
-}
-_POTENTIAL_VIEW_TYPE_ID_BY_LABEL = {
-    label: view_type_id for view_type_id, label in _POTENTIAL_VIEW_TYPE_LABEL_BY_ID.items()
-}
+_POTENTIAL_VIEW_TYPE_LABEL_BY_ID = _plot_view_label_by_id(include_heatmap=False)
+_POTENTIAL_VIEW_TYPE_ID_BY_LABEL = _plot_view_id_by_label(include_heatmap=False)
 _POTENTIAL_SERIES_LABEL_BY_ID = {
     "summary": "Summary (all series)",
 }
 _POTENTIAL_SERIES_ID_BY_LABEL = {
     label: quantity_id for quantity_id, label in _POTENTIAL_SERIES_LABEL_BY_ID.items()
 }
+_COORDINATION_VIEW_TYPE_LABEL_BY_ID = _plot_view_label_by_id(include_heatmap=True)
+_COORDINATION_VIEW_TYPE_ID_BY_LABEL = _plot_view_id_by_label(include_heatmap=True)
+_COORDINATION_LINE_X_QUANTITY_LABEL_BY_BACKEND = {
+    "distance": "distance",
+    "time": "time",
+}
+_COORDINATION_LINE_X_QUANTITY_BACKEND_BY_LABEL = {
+    label: backend for backend, label in _COORDINATION_LINE_X_QUANTITY_LABEL_BY_BACKEND.items()
+}
+_ORIENTATION_VIEW_TYPE_LABEL_BY_ID = _plot_view_label_by_id(include_heatmap=True)
+_ORIENTATION_VIEW_TYPE_ID_BY_LABEL = _plot_view_id_by_label(include_heatmap=True)
+_ORIENTATION_LINE_QUANTITY_LABEL_BY_BACKEND = {
+    "average": "Mean orientation",
+    "density": "H2O density",
+    "density-weighted": "Density-weighted orientation",
+}
+_ORIENTATION_LINE_QUANTITY_BACKEND_BY_LABEL = {
+    label: backend for backend, label in _ORIENTATION_LINE_QUANTITY_LABEL_BY_BACKEND.items()
+}
+_ORIENTATION_LINE_QUANTITY_BACKEND_BY_LABEL.update(
+    {
+        "average": "average",
+        "density": "density",
+        "density-weighted": "density-weighted",
+    }
+)
 _DENSITY_X_MODE_LABELS = ("Distance", "X", "Y", "Z")
-_DENSITY_VIEW_TYPE_LABEL_BY_ID = {
-    "line_1d": "1D",
-    "heatmap_2d": "2D",
-}
-_DENSITY_VIEW_TYPE_ID_BY_LABEL = {
-    label: view_type_id for view_type_id, label in _DENSITY_VIEW_TYPE_LABEL_BY_ID.items()
-}
+_DENSITY_VIEW_TYPE_LABEL_BY_ID = _plot_view_label_by_id(include_heatmap=True)
+_DENSITY_VIEW_TYPE_ID_BY_LABEL = _plot_view_id_by_label(include_heatmap=True)
 _DENSITY_X_MODE_BY_LABEL = {
     "distance": "distance",
     "x": "x",
@@ -215,6 +286,9 @@ _DENSITY_X_MODE_BY_LABEL = {
     "axis": "axis",
 }
 _AUTO_PREVIEW_DEBOUNCE_MS = 1000
+_AUTO_PREVIEW_STYLE_DEBOUNCE_MS = 100
+_AUTO_PREVIEW_SERIES_DEBOUNCE_MS = 150
+_AUTO_PREVIEW_DATA_DEBOUNCE_MS = 650
 _WORKSPACE_PANEL_WIDTH = 760
 _WORKSPACE_PANEL_MIN_WIDTH = 520
 _HEATMAP_NORMALIZATION_LABEL_BY_MODE = {
@@ -277,8 +351,8 @@ _TOOLTIPS: dict[str, str] = {
     "shared.sync_mode": "Auto follows the preview; Manual keeps your typed value.",
     "shared.color_picker": "Opens a color picker.",
     "preview.refresh": "Renders the current settings again.",
-    "preview.fit": "Fits the preview image to the panel.",
-    "preview.actual_size": "Shows the preview at actual size.",
+    "preview.fit": "Resets the preview view to the plotted data bounds.",
+    "preview.actual_size": "Resets the preview zoom or view.",
     "preview.reset": "Restores the default plot settings.",
     "preview.auto_update": "Refreshes the preview after each change.",
     "profiles.selector": "Chooses which saved plot profile is active.",
@@ -311,28 +385,29 @@ _TOOLTIPS: dict[str, str] = {
     "data.density.summary.status": "Shows whether the current density mapping is preferred, supported, or invalid for the active contract.",
     "data.density.summary.mapping": "Shows the current density mapping in generic view-role form.",
     "data.density.summary.backend": "Shows how the current density mapping is translated into backend plotting options.",
-    "data.position.component": "Chooses which position component to plot.",
+    "data.position.component": "Chooses the active position view type or line Y quantity.",
     "data.position.source.contract": "Shows the shared plot-data contract detected for the current position source.",
     "data.position.source.dimensions": "Shows the logical dimensions available for position plotting.",
     "data.position.source.quantities": "Shows the quantities exposed by the current position plot-data contract.",
-    "data.position.mapping.preset": "Applies one thin default mapping for common position views.",
+    "data.position.mapping.preset": "Applies a default mapping for common position views.",
     "data.position.mapping.view_type": "Chooses which generic plot view to map onto the current position data.",
     "data.position.mapping.x": "Chooses which quantity is assigned to the x visual role.",
     "data.position.mapping.y": "Chooses which quantity is assigned to the y visual role.",
-    "data.position.mapping.value": "Chooses which quantity supplies color values and optional range filtering for trajectory views.",
+    "data.position.mapping.value": "Chooses which quantity supplies heatmap color values and optional range filtering.",
     "data.position.mapping.split_by": "Shows which dimension the current position mapping splits into separate plotted series.",
-    "data.position.color_by": "Chooses which quantity is used for projection coloring or range filtering.",
-    "data.position.xy_z_distance_max": "Legacy distance cutoff for the projection view. Use the range controls for the general case.",
-    "data.position.projection_x": "Chooses which quantity is shown on the horizontal axis in 2-D projection mode.",
-    "data.position.projection_y": "Chooses which quantity is shown on the vertical axis in 2-D projection mode.",
-    "data.position.projection_render_mode": "Chooses between a continuous colormap view and normal per-atom line colors.",
-    "data.position.projection_range_min": "Optional lower bound for the selected projection value quantity.",
-    "data.position.projection_range_max": "Optional upper bound for the selected projection value quantity.",
+    "data.position.color_by": "Chooses which quantity is used for heatmap coloring or range filtering.",
+    "data.position.xy_z_distance_max": "Legacy distance cutoff for the 2D heatmap view. Use the range controls for the general case.",
+    "data.position.projection_x": "Chooses which quantity is shown on the horizontal axis in 2D Heatmap mode.",
+    "data.position.projection_y": "Chooses which quantity is shown on the vertical axis in 2D Heatmap mode.",
+    "data.position.projection_render_mode": "Chooses between a continuous colormap and source-colored paths.",
+    "data.position.projection_range_min": "Optional lower bound for the selected 2D Heatmap value quantity.",
+    "data.position.projection_range_max": "Optional upper bound for the selected 2D Heatmap value quantity.",
     "data.position.time_axis": "Chooses the time unit on the x-axis.",
     "data.position.summary.status": "Shows whether the current generic mapping is preferred, merely supported, or invalid for the current contract.",
     "data.position.summary.mapping": "Shows the current position mapping in a compact generic form.",
     "data.position.summary.backend": "Shows how the current generic mapping is translated back into the existing position plotting backend.",
-    "data.coordination.component": "Chooses the generic coordination mapping preset.",
+    "data.coordination.view_type": "Chooses whether coordination is shown as a 1D Line or 2D Heatmap.",
+    "data.coordination.x_quantity": "Chooses the x-axis quantity for 1D Line coordination plots.",
     "data.coordination.time_axis": "Chooses which time quantity is assigned to the x role when time is used.",
     "data.coordination.source.contract": "Shows the shared plot-data contract detected for the current coordination source.",
     "data.coordination.source.dimensions": "Shows the logical dimensions available for coordination plotting.",
@@ -340,8 +415,9 @@ _TOOLTIPS: dict[str, str] = {
     "data.coordination.summary.status": "Shows whether the current coordination mapping is preferred, supported, or invalid for the active contract.",
     "data.coordination.summary.mapping": "Shows the current coordination mapping in generic view-role form.",
     "data.coordination.summary.backend": "Shows how the current coordination mapping is translated into backend plotting options.",
-    "data.orientation.component": "Chooses the orientation view preset: line-style quantity or 2-D heatmap.",
-    "data.orientation.angle": "Chooses which angle quantity is assigned to the active mapping.",
+    "data.orientation.view_type": "Chooses whether orientation is shown as a 1D Line or 2D Heatmap.",
+    "data.orientation.y_quantity": "Chooses the line Y quantity for orientation 1D Line plots.",
+    "data.orientation.angle": "Chooses the orientation angle quantity used by the active mapping.",
     "data.orientation.source.contract": "Shows the shared plot-data contract detected for the current orientation source.",
     "data.orientation.source.dimensions": "Shows the logical dimensions available for the active orientation view type.",
     "data.orientation.source.quantities": "Shows the quantities exposed by the active orientation plot-data contract.",
@@ -355,7 +431,7 @@ _TOOLTIPS: dict[str, str] = {
     "data.potential.source.contract": "Shows the shared plot-data contract detected for the current potential source.",
     "data.potential.source.dimensions": "Shows the logical dimensions available for potential plotting.",
     "data.potential.source.quantities": "Shows the quantities exposed by the current potential plot-data contract.",
-    "data.potential.mapping.view_type": "Chooses between line plotting and table-style record inspection.",
+    "data.potential.mapping.view_type": "Shows the fixed potential plot view.",
     "data.potential.mapping.series": "Chooses which potential quantity is assigned to the y role in line mode.",
     "data.potential.summary.status": "Shows whether the current potential mapping is preferred, supported, or invalid for the active contract.",
     "data.potential.summary.mapping": "Shows the current potential mapping in generic view-role form.",
@@ -384,7 +460,6 @@ _TOOLTIPS: dict[str, str] = {
     "series.fit_enabled": "Turns fitting for this series on or off.",
     "series.fit_type": "Chooses the fitting model.",
     "series.fit_degree": "Sets the polynomial degree.",
-    "series.fit_range_mode": "Chooses whether fit range follows the view or manual limits.",
     "series.fit_x_min": "Sets the minimum x value used for fitting.",
     "series.fit_x_max": "Sets the maximum x value used for fitting.",
     "series.fit_show_in_legend": "Shows or hides the fit in the legend.",
@@ -1037,6 +1112,10 @@ def _fit_defaults_for_gui() -> dict[str, Any]:
     return config
 
 
+def _fit_range_mode_from_limits(x_min: Any, x_max: Any) -> str:
+    return "manual" if str(x_min or "").strip() or str(x_max or "").strip() else "visible"
+
+
 def _integration_defaults_for_gui() -> dict[str, Any]:
     return {
         "enabled": False,
@@ -1382,6 +1461,9 @@ class _FigureInspectorCapabilities:
     show_lines: bool
     show_heatmap: bool
     show_colorbar: bool
+    show_axis_transforms: bool
+    show_advanced_legend: bool
+    show_advanced_lines: bool
 
 
 def _plot_family_for_view(
@@ -1395,11 +1477,11 @@ def _plot_family_for_view(
     if normalized_analysis == "orientation" and orientation_heatmap:
         return "heatmap"
     if normalized_analysis == "position" and _is_position_projection_component(position_component):
-        return "projection2d"
+        return "heatmap"
     if normalized_analysis == "coordination":
         component = str(coordination_component).strip().lower()
         if component == "time-distance":
-            return "time-distance"
+            return "heatmap"
     return "line"
 
 
@@ -1497,56 +1579,67 @@ def _derive_warning_messages(
 def _settings_use_heatmap_rendering(settings: dict[str, Any]) -> bool:
     mapping = settings.get("view_mapping")
     if isinstance(mapping, PlotViewMapping):
-        return str(mapping.view_type_id).strip().lower() == "heatmap_2d"
+        return canonical_plot_view_id(mapping.view_type_id) == PLOT_VIEW_2D_HEATMAP
     if isinstance(mapping, dict):
         try:
             resolved_mapping = deserialize_plot_view_mapping(mapping)
         except ValueError:
             resolved_mapping = None
         if resolved_mapping is not None:
-            return str(resolved_mapping.view_type_id).strip().lower() == "heatmap_2d"
+            return canonical_plot_view_id(resolved_mapping.view_type_id) == PLOT_VIEW_2D_HEATMAP
     if str(settings.get("component") or "").strip().lower() == "heatmap":
         return True
     return False
 
 
-def _coordination_mapping_preset_label(component: str) -> str:
-    normalized = str(component or "").strip().lower() or "distance"
-    if normalized == "distance":
-        return "coordination_vs_distance"
-    if normalized == "time":
-        return "coordination_vs_time"
-    if normalized == "time-distance":
-        return "distance_vs_time"
-    return normalized
-
-
 def _density_backend_summary_text(*, view_type_id: str, x_mode: str, quantity: str) -> str:
-    normalized_view_type = str(view_type_id or "").strip().lower() or "line_1d"
+    normalized_view_type = canonical_plot_view_id(view_type_id)
     normalized_quantity = str(quantity or "").strip().lower() or "mass"
-    if normalized_view_type == "heatmap_2d":
-        return f"view type=heatmap_2d, source field={normalized_quantity}_density_2d"
-    return f"view type=line_1d, x role={str(x_mode or '').strip().lower() or 'distance'}, y role={normalized_quantity}_density"
+    if normalized_view_type == PLOT_VIEW_2D_HEATMAP:
+        return (
+            f"view type={plot_view_display_label(PLOT_VIEW_2D_HEATMAP)}, "
+            f"source field={normalized_quantity}_density_2d"
+        )
+    return (
+        f"view type={plot_view_display_label(PLOT_VIEW_1D_LINE)}, "
+        f"x role={str(x_mode or '').strip().lower() or 'distance'}, "
+        f"y role={normalized_quantity}_density"
+    )
 
 
 def _coordination_backend_summary_text(*, component: str, time_axis: str) -> str:
     normalized_component = str(component or "").strip().lower() or "distance"
-    preset = _coordination_mapping_preset_label(normalized_component)
     if normalized_component == "distance":
-        return f"view preset={preset}, x role=distance_to_surface, y role=coordination_number"
-    view_type = "trajectory_2d" if normalized_component == "time-distance" else "line_1d"
+        return (
+            f"view type={plot_view_display_label(PLOT_VIEW_1D_LINE)}, "
+            "x role=distance_to_surface, y role=coordination_number"
+        )
+    view_type = PLOT_VIEW_2D_HEATMAP if normalized_component == "time-distance" else PLOT_VIEW_1D_LINE
+    y_role = "distance_to_surface" if normalized_component == "time-distance" else "coordination_number"
+    color_role = (
+        ", color role=coordination_number"
+        if normalized_component == "time-distance"
+        else ""
+    )
     return (
-        f"view type={view_type}, view preset={preset}, "
-        f"x role=time ({str(time_axis or '').strip().lower() or 'ps'}), y role=coordination_number"
+        f"view type={plot_view_display_label(view_type)}, "
+        f"x role=time ({str(time_axis or '').strip().lower() or 'ps'}), "
+        f"y role={y_role}{color_role}"
     )
 
 
 def _orientation_backend_summary_text(*, component: str, angle: str, is_heatmap: bool) -> str:
     normalized_component = str(component or "").strip().lower() or "average"
     normalized_angle = str(angle or "").strip().lower() or "polar"
-    view_type = "heatmap_2d" if is_heatmap else "line_1d"
+    view_type = PLOT_VIEW_2D_HEATMAP if is_heatmap else PLOT_VIEW_1D_LINE
+    if is_heatmap:
+        return (
+            f"view type={plot_view_display_label(view_type)}, "
+            f"color quantity=mean cos({normalized_angle})"
+        )
     return (
-        f"view type={view_type}, view preset={normalized_component}, angle role={normalized_angle}"
+        f"view type={plot_view_display_label(view_type)}, "
+        f"Y quantity={normalized_component}, angle quantity={normalized_angle}"
     )
 
 
@@ -1556,13 +1649,13 @@ def _potential_backend_summary_text(
     y_quantity: str,
     standard_plot: str,
 ) -> str:
-    normalized_view_type = str(view_type or "").strip().lower() or "line_1d"
-    if normalized_view_type == "table_records":
-        return "view type=table_records, record inspection mode"
     normalized_standard_plot = str(standard_plot or "").strip().lower()
     if normalized_standard_plot == "summary":
-        return "view type=line_1d, y role=summary"
-    return f"view type=line_1d, y role={str(y_quantity or '').strip().lower() or 'water_bulk_potential'}"
+        return f"view type={plot_view_display_label(PLOT_VIEW_1D_LINE)}, y role=summary"
+    return (
+        f"view type={plot_view_display_label(PLOT_VIEW_1D_LINE)}, "
+        f"y role={str(y_quantity or '').strip().lower() or 'water_bulk_potential'}"
+    )
 
 
 def _extract_dict_value(settings: dict[str, Any], *, key: str, nested_key: str) -> Any:
@@ -1691,6 +1784,7 @@ def launch_plot_settings_panel(
     initial_settings: dict[str, Any],
     on_preview: Callable[[dict[str, Any]], dict[str, Any] | None],
     on_save: Callable[[str, dict[str, Any]], str],
+    on_preview_figure: Callable[[dict[str, Any]], dict[str, Any] | None] | None = None,
     on_save_figure: Callable[[dict[str, Any], str], str | tuple[str, dict[str, Any]]] | None = None,
     on_save_data: Callable[[dict[str, Any], str], str | tuple[str, dict[str, Any]]] | None = None,
     on_import_hdf5: Callable[[str, str | None], dict[str, Any]] | None = None,
@@ -1710,10 +1804,14 @@ def launch_plot_settings_panel(
     """Open a PySide6 panel that previews and persists plot settings."""
     try:
         from PySide6.QtCore import (
+            QAbstractListModel,
             QEasingCurve,
             QEvent,
+            QModelIndex,
             QObject,
             QPropertyAnimation,
+            QRect,
+            QSize,
             QTimer,
             Qt,
             Signal,
@@ -1747,6 +1845,7 @@ def launch_plot_settings_panel(
             QInputDialog,
             QLabel,
             QLineEdit,
+            QListView,
             QListWidget,
             QListWidgetItem,
             QMainWindow,
@@ -1757,6 +1856,9 @@ def launch_plot_settings_panel(
             QSizePolicy,
             QSplitter,
             QStackedWidget,
+            QStyle,
+            QStyledItemDelegate,
+            QStyleOptionViewItem,
             QTabWidget,
             QToolButton,
             QVBoxLayout,
@@ -1767,11 +1869,38 @@ def launch_plot_settings_panel(
             from PySide6.QtSvg import QSvgRenderer
         except Exception:  # pragma: no cover - optional Qt module
             QSvgRenderer = None
+        try:
+            from matplotlib.backends.backend_qtagg import (
+                FigureCanvasQTAgg as FigureCanvas,
+                NavigationToolbar2QT,
+            )
+        except Exception:  # pragma: no cover - matplotlib Qt backend availability
+            FigureCanvas = None
+            NavigationToolbar2QT = None
     except Exception as exc:  # pragma: no cover - environment dependent
         raise RuntimeError(
             "PySide6 is unavailable; cannot open GUI plot controls. "
             "Install PySide6 or use CLI plot flags."
         ) from exc
+
+    if NavigationToolbar2QT is not None:
+
+        class _LiNaKNavigationToolbar(NavigationToolbar2QT):  # type: ignore[misc, valid-type]
+            def __init__(
+                self,
+                canvas: Any,
+                parent: QWidget | None,
+                *,
+                on_linak_save_figure: Callable[[], None],
+            ) -> None:
+                super().__init__(canvas, parent)
+                self._on_linak_save_figure = on_linak_save_figure
+
+            def save_figure(self, *args: Any, **kwargs: Any) -> None:
+                self._on_linak_save_figure()
+
+    else:  # pragma: no cover - matplotlib Qt backend availability
+        _LiNaKNavigationToolbar = None
 
     defaults = DEFAULT_PLOT_STYLE
 
@@ -2037,6 +2166,338 @@ def launch_plot_settings_panel(
             self.move_up_button.setVisible(control_enabled)
             self.move_down_button.setVisible(control_enabled)
 
+    _SERIES_ROW_STATE_ROLE = int(Qt.ItemDataRole.UserRole) + 10
+
+    class _SeriesListItem:
+        def __init__(self) -> None:
+            self._text = ""
+            self._tooltip = ""
+            self._data: dict[int, Any] = {}
+
+        def setText(self, text: str) -> None:
+            self._text = str(text)
+
+        def text(self) -> str:
+            return self._text
+
+        def setToolTip(self, text: str) -> None:
+            self._tooltip = str(text)
+
+        def toolTip(self) -> str:
+            return self._tooltip
+
+        def setData(self, role: Any, value: Any) -> None:
+            self._data[int(role)] = value
+
+        def data(self, role: Any) -> Any:
+            return self._data.get(int(role))
+
+    class _SeriesListModel(QAbstractListModel):
+        def __init__(self, parent: QObject | None = None) -> None:
+            super().__init__(parent)
+            self._items: list[_SeriesListItem] = []
+
+        def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
+            if parent.isValid():
+                return 0
+            return len(self._items)
+
+        def data(self, index: QModelIndex, role: int = int(Qt.ItemDataRole.DisplayRole)) -> Any:
+            if not index.isValid():
+                return None
+            row = int(index.row())
+            if row < 0 or row >= len(self._items):
+                return None
+            item = self._items[row]
+            if role == int(Qt.ItemDataRole.DisplayRole):
+                state = item.data(_SERIES_ROW_STATE_ROLE)
+                if isinstance(state, dict):
+                    return str(state.get("text") or "")
+                return item.text()
+            if role == int(Qt.ItemDataRole.ToolTipRole):
+                return item.toolTip()
+            return item.data(role)
+
+        def flags(self, index: QModelIndex) -> Qt.ItemFlag:
+            if not index.isValid():
+                return Qt.ItemFlag.NoItemFlags
+            flags = Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled
+            row = int(index.row())
+            item = self._items[row] if 0 <= row < len(self._items) else None
+            kind = "" if item is None else str(item.data(Qt.ItemDataRole.UserRole + 1) or "")
+            if kind == "base":
+                flags |= Qt.ItemFlag.ItemIsDragEnabled
+            return flags
+
+        def add_item(self, item: _SeriesListItem) -> None:
+            row = len(self._items)
+            self.beginInsertRows(QModelIndex(), row, row)
+            self._items.append(item)
+            self.endInsertRows()
+
+        def clear_items(self) -> None:
+            if not self._items:
+                return
+            self.beginResetModel()
+            self._items = []
+            self.endResetModel()
+
+        def item(self, row: int) -> _SeriesListItem | None:
+            if 0 <= row < len(self._items):
+                return self._items[row]
+            return None
+
+        def index_of_item(self, item: _SeriesListItem) -> int:
+            try:
+                return self._items.index(item)
+            except ValueError:
+                return -1
+
+        def notify_row(self, row: int) -> None:
+            if row < 0 or row >= len(self._items):
+                return
+            model_index = self.index(row, 0)
+            self.dataChanged.emit(model_index, model_index, [])
+
+    class _SeriesListDelegate(QStyledItemDelegate):
+        def __init__(self, owner: Any, parent: QObject | None = None) -> None:
+            super().__init__(parent)
+            self._owner = owner
+
+        def sizeHint(self, option: QStyleOptionViewItem, index: QModelIndex) -> QSize:
+            return QSize(max(260, int(option.rect.width())), 38)
+
+        def _row_state(self, index: QModelIndex) -> dict[str, Any]:
+            state = index.data(_SERIES_ROW_STATE_ROLE)
+            return dict(state) if isinstance(state, dict) else {}
+
+        def _checkbox_rect(self, rect: QRect) -> QRect:
+            return QRect(rect.left() + 10, rect.top() + 11, 16, 16)
+
+        def _up_rect(self, rect: QRect) -> QRect:
+            return QRect(rect.right() - 52, rect.top() + 8, 20, 22)
+
+        def _down_rect(self, rect: QRect) -> QRect:
+            return QRect(rect.right() - 28, rect.top() + 8, 20, 22)
+
+        def paint(
+            self,
+            painter: QPainter,
+            option: QStyleOptionViewItem,
+            index: QModelIndex,
+        ) -> None:  # pragma: no cover - UI paint
+            state = self._row_state(index)
+            theme = state.get("theme") if isinstance(state.get("theme"), dict) else {}
+            selected = bool(option.state & QStyle.StateFlag.State_Selected)
+            enabled = bool(state.get("enabled", True))
+            kind = str(state.get("kind") or "base")
+            layer_role = str(state.get("layer_role") or "Layer")
+            rect = option.rect.adjusted(2, 2, -2, -2)
+
+            painter.save()
+            try:
+                row_bg = (
+                    theme.get("series_row_selected_bg", "#14515a")
+                    if selected
+                    else theme.get("series_row_bg", "#132033")
+                )
+                border = (
+                    theme.get("series_row_selected_border", "#2fb7c9")
+                    if selected
+                    else "transparent"
+                )
+                painter.setPen(QPen(QColor(border)))
+                painter.setBrush(QBrush(QColor(row_bg)))
+                painter.drawRoundedRect(rect, 6, 6)
+
+                text_color = (
+                    theme.get("series_row_selected_text", "#ffffff")
+                    if selected
+                    else theme.get("series_row_text", "#e6edf7")
+                )
+                if not enabled:
+                    text_color = theme.get("series_row_disabled_text", "#8290a3")
+
+                checkbox_rect = self._checkbox_rect(option.rect)
+                painter.setPen(QPen(QColor(theme.get("series_row_swatch_border", "#46627f"))))
+                painter.setBrush(QBrush(QColor("#2fb7c9" if bool(state.get("checked", True)) else "#0f1a2a")))
+                painter.drawRoundedRect(checkbox_rect, 3, 3)
+                if bool(state.get("checked", True)):
+                    painter.setPen(QPen(QColor("#ffffff"), 2))
+                    painter.drawLine(
+                        checkbox_rect.left() + 4,
+                        checkbox_rect.center().y(),
+                        checkbox_rect.center().x() - 1,
+                        checkbox_rect.bottom() - 4,
+                    )
+                    painter.drawLine(
+                        checkbox_rect.center().x() - 1,
+                        checkbox_rect.bottom() - 4,
+                        checkbox_rect.right() - 3,
+                        checkbox_rect.top() + 4,
+                    )
+
+                x_cursor = checkbox_rect.right() + 12
+                color_token = str(state.get("color_token") or "").strip()
+                if color_token:
+                    swatch_color = QColor(color_token)
+                    if not swatch_color.isValid():
+                        swatch_color = QColor(theme.get("series_row_swatch_bg", "#20304a"))
+                    swatch_rect = QRect(x_cursor, option.rect.top() + 13, 12, 12)
+                    painter.setPen(QPen(QColor(theme.get("series_row_swatch_border", "#46627f"))))
+                    painter.setBrush(QBrush(swatch_color))
+                    painter.drawRoundedRect(swatch_rect, 6, 6)
+                    x_cursor = swatch_rect.right() + 10
+
+                badge_text = {
+                    "group": "Group",
+                    "copy": "Copy",
+                    "original": "Original",
+                    "fit": "Fit",
+                    "cumulative": "Cumulative",
+                }.get(layer_role.strip().lower(), layer_role.strip().title() or "Layer")
+                badge_rect = QRect(option.rect.right() - 150, option.rect.top() + 9, 78, 20)
+                if kind != "base":
+                    badge_rect.setWidth(96)
+                    badge_rect.moveLeft(option.rect.right() - 168)
+                badge_prefix = (
+                    "series_badge_group"
+                    if layer_role.strip().lower() == "group"
+                    else "series_badge_copy"
+                    if layer_role.strip().lower() == "copy"
+                    else "series_badge_original"
+                )
+                painter.setPen(QPen(QColor(theme.get(f"{badge_prefix}_border", "#4e6380"))))
+                painter.setBrush(QBrush(QColor(theme.get(f"{badge_prefix}_bg", "#1d2b42"))))
+                painter.drawRoundedRect(badge_rect, 6, 6)
+                painter.setPen(QPen(QColor(theme.get(f"{badge_prefix}_text", text_color))))
+                painter.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter, badge_text)
+
+                text_right = badge_rect.left() - 8
+                if kind == "base":
+                    text_right = min(text_right, self._up_rect(option.rect).left() - 8)
+                text_rect = QRect(
+                    x_cursor,
+                    option.rect.top() + 4,
+                    max(20, text_right - x_cursor),
+                    option.rect.height() - 8,
+                )
+                font = painter.font()
+                font.setBold(selected or kind in {"fit", "cumulative"})
+                font.setItalic(not enabled)
+                painter.setFont(font)
+                painter.setPen(QPen(QColor(text_color)))
+                painter.drawText(
+                    text_rect,
+                    Qt.AlignmentFlag.AlignVCenter | Qt.TextFlag.TextSingleLine,
+                    str(state.get("text") or ""),
+                )
+
+                if kind == "base":
+                    painter.setFont(option.font)
+                    arrow_color = QColor(
+                        text_color
+                        if bool(state.get("can_move_up", False))
+                        else theme.get("series_row_disabled_text", "#8290a3")
+                    )
+                    painter.setPen(QPen(arrow_color))
+                    painter.drawText(self._up_rect(option.rect), Qt.AlignmentFlag.AlignCenter, "^")
+                    arrow_color = QColor(
+                        text_color
+                        if bool(state.get("can_move_down", False))
+                        else theme.get("series_row_disabled_text", "#8290a3")
+                    )
+                    painter.setPen(QPen(arrow_color))
+                    painter.drawText(self._down_rect(option.rect), Qt.AlignmentFlag.AlignCenter, "v")
+            finally:
+                painter.restore()
+
+        def editorEvent(
+            self,
+            event: QEvent,
+            model: QAbstractListModel,
+            option: QStyleOptionViewItem,
+            index: QModelIndex,
+        ) -> bool:  # pragma: no cover - UI flow
+            if event.type() != QEvent.Type.MouseButtonRelease:
+                return super().editorEvent(event, model, option, index)
+            pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
+            row = int(index.row())
+            state = self._row_state(index)
+            if self._checkbox_rect(option.rect).contains(pos):
+                self._owner._handle_series_row_widget_toggle(
+                    row,
+                    not bool(state.get("checked", True)),
+                )
+                return True
+            kind = str(state.get("kind") or "base")
+            series_id = str(state.get("series_id") or "")
+            if kind == "base" and series_id:
+                if self._up_rect(option.rect).contains(pos) and bool(state.get("can_move_up")):
+                    self._owner._move_series_by_delta(series_id, -1)
+                    return True
+                if self._down_rect(option.rect).contains(pos) and bool(state.get("can_move_down")):
+                    self._owner._move_series_by_delta(series_id, 1)
+                    return True
+            return super().editorEvent(event, model, option, index)
+
+    class _SeriesListView(QListView):
+        currentRowChanged = Signal(int)
+
+        def __init__(self, owner: Any, parent: QWidget | None = None) -> None:
+            super().__init__(parent)
+            self._series_model = _SeriesListModel(self)
+            self.setModel(self._series_model)
+            self.setItemDelegate(_SeriesListDelegate(owner, self))
+            self.selectionModel().currentChanged.connect(self._emit_current_row_changed)
+
+        def _emit_current_row_changed(self, current: QModelIndex, _previous: QModelIndex) -> None:
+            self.currentRowChanged.emit(int(current.row()) if current.isValid() else -1)
+
+        def count(self) -> int:
+            return self._series_model.rowCount()
+
+        def item(self, row: int) -> _SeriesListItem | None:
+            return self._series_model.item(row)
+
+        def addItem(self, item: _SeriesListItem) -> None:
+            self._series_model.add_item(item)
+
+        def clear(self) -> None:
+            self._series_model.clear_items()
+
+        def itemWidget(self, _item: _SeriesListItem) -> None:
+            return None
+
+        def setItemWidget(self, _item: _SeriesListItem, _widget: QWidget) -> None:
+            return None
+
+        def removeItemWidget(self, _item: _SeriesListItem) -> None:
+            return None
+
+        def currentRow(self) -> int:
+            current = self.currentIndex()
+            return int(current.row()) if current.isValid() else -1
+
+        def currentItem(self) -> _SeriesListItem | None:
+            return self.item(self.currentRow())
+
+        def setCurrentRow(self, row: int) -> None:
+            if row < 0 or row >= self.count():
+                self.clearSelection()
+                return
+            model_index = self._series_model.index(row, 0)
+            self.setCurrentIndex(model_index)
+
+        def visualItemRect(self, item: _SeriesListItem) -> QRect:
+            row = self._series_model.index_of_item(item)
+            if row < 0:
+                return QRect()
+            return self.visualRect(self._series_model.index(row, 0))
+
+        def notifyRowChanged(self, row: int) -> None:
+            self._series_model.notify_row(row)
+
     class _AnnotationRowWidget(QWidget):
         def __init__(
             self,
@@ -2189,63 +2650,63 @@ def launch_plot_settings_panel(
             preview_title.setObjectName("pageTitle")
             layout.addWidget(preview_title)
 
-            preview_controls = QHBoxLayout()
+            # The embedded Matplotlib toolbar owns visible preview actions.
+            # Keep these hidden widgets so the existing preview-loading and
+            # callback wiring can remain small and predictable.
             self.preview_button = QPushButton("Refresh Preview")
             self.preview_button.clicked.connect(on_refresh)
             register_tooltip(self.preview_button, "preview.refresh")
             apply_tooltip(self.preview_button)
-            preview_controls.addWidget(self.preview_button)
+            self.preview_button.setVisible(False)
 
             self.fit_button = QPushButton("Fit")
             self.fit_button.clicked.connect(on_fit)
             register_tooltip(self.fit_button, "preview.fit")
             apply_tooltip(self.fit_button)
-            preview_controls.addWidget(self.fit_button)
+            self.fit_button.setVisible(False)
 
-            self.actual_size_button = QPushButton("100%")
+            self.actual_size_button = QPushButton("Reset View")
             self.actual_size_button.clicked.connect(on_actual_size)
             register_tooltip(self.actual_size_button, "preview.actual_size")
             apply_tooltip(self.actual_size_button)
-            preview_controls.addWidget(self.actual_size_button)
+            self.actual_size_button.setVisible(False)
 
             self.save_figure_button = QPushButton("Export Figure")
             self.save_figure_button.setEnabled(auto_update_enabled)
             self.save_figure_button.clicked.connect(on_save_figure_callback)
             register_tooltip(self.save_figure_button, "export.figure")
             apply_tooltip(self.save_figure_button)
-            preview_controls.addWidget(self.save_figure_button)
+            self.save_figure_button.setVisible(False)
 
             self.save_data_button = QPushButton("Export Data")
             self.save_data_button.setEnabled(auto_update_enabled)
             self.save_data_button.clicked.connect(on_save_data_callback)
             register_tooltip(self.save_data_button, "export.data")
             apply_tooltip(self.save_data_button)
-            preview_controls.addWidget(self.save_data_button)
+            self.save_data_button.setVisible(False)
 
             self.auto_preview_checkbox = QCheckBox("Auto update")
-            self.auto_preview_checkbox.setChecked(auto_update_enabled)
-            self.auto_preview_checkbox.setEnabled(auto_update_enabled)
+            self.auto_preview_checkbox.setChecked(True)
+            self.auto_preview_checkbox.setEnabled(False)
             self.auto_preview_checkbox.toggled.connect(on_auto_update)
             register_tooltip(self.auto_preview_checkbox, "preview.auto_update")
             apply_tooltip(self.auto_preview_checkbox)
-            preview_controls.addWidget(self.auto_preview_checkbox)
+            self.auto_preview_checkbox.setVisible(False)
 
             self.detach_button: QPushButton | None = None
             if on_detach is not None:
                 self.detach_button = QPushButton("Detach Preview")
                 self.detach_button.clicked.connect(on_detach)
-                preview_controls.addWidget(self.detach_button)
+                self.detach_button.setVisible(False)
 
             self.dock_button: QPushButton | None = None
             if on_dock is not None:
                 self.dock_button = QPushButton("Dock Back")
                 self.dock_button.clicked.connect(on_dock)
-                preview_controls.addWidget(self.dock_button)
+                self.dock_button.setVisible(False)
 
-            preview_controls.addStretch(1)
             self.preview_status = QLabel("Preview ready.")
-            preview_controls.addWidget(self.preview_status)
-            layout.addLayout(preview_controls)
+            self.preview_status.setVisible(False)
 
             self.preview_frame = QFrame(self)
             self.preview_frame.setObjectName("previewFrame")
@@ -2260,13 +2721,20 @@ def launch_plot_settings_panel(
             self.preview_scroll.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self.preview_scroll.viewport().installEventFilter(event_filter_owner)
 
-            self.preview_label = QLabel("Preview will appear here.\nUse mouse wheel to zoom.")
+            self.preview_label = QLabel("Loading...")
             self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self.preview_label.setWordWrap(True)
-            self.preview_label.setMinimumSize(1, 1)
+            self.preview_label.setMinimumSize(3, 3)
             self.preview_label.installEventFilter(event_filter_owner)
             self.preview_scroll.setWidget(self.preview_label)
             preview_frame_layout.addWidget(self.preview_scroll, stretch=1)
+
+            self.preview_canvas_container = QWidget(self.preview_frame)
+            self.preview_canvas_layout = QVBoxLayout(self.preview_canvas_container)
+            self.preview_canvas_layout.setContentsMargins(0, 0, 0, 0)
+            self.preview_canvas_layout.setSpacing(4)
+            self.preview_canvas_container.setVisible(False)
+            preview_frame_layout.addWidget(self.preview_canvas_container, stretch=1)
             layout.addWidget(self.preview_frame, stretch=1)
 
     class _PreviewWorkerBridge(QObject):
@@ -2638,9 +3106,14 @@ def launch_plot_settings_panel(
             self._density_mapping_1d_rows: list[tuple[QFormLayout, QWidget]] = []
             self._density_mapping_2d_rows: list[tuple[QFormLayout, QWidget]] = []
             self._density_filter_rows: dict[str, tuple[QFormLayout, QWidget]] = {}
+            self._orientation_mapping_2d_rows: list[tuple[QFormLayout, QWidget]] = []
+            self._orientation_filter_rows: dict[str, tuple[QFormLayout, QWidget]] = {}
+            self._orientation_line_quantity_row: tuple[QFormLayout, QWidget] | None = None
+            self._orientation_line_x_axis_row: tuple[QFormLayout, QWidget] | None = None
             self._density_species_checkbox_syncing = False
             self._density_previous_view_type_id: str | None = None
             self._density_1d_enabled_species_snapshot: set[str] | None = None
+            self._coordination_line_x_quantity_row: tuple[QFormLayout, QWidget] | None = None
             self._coordination_time_axis_row: tuple[QFormLayout, QWidget] | None = None
             self._axes_ticks_group: QGroupBox | None = None
             self._tick_appearance_group: QGroupBox | None = None
@@ -2707,10 +3180,24 @@ def launch_plot_settings_panel(
             self._series_display_rows: list[dict[str, Any]] = []
             self._last_preview_state: dict[str, Any] = {}
             self._synced_field_modes: dict[str, str] = {}
+            self._density_active_view_type = PLOT_VIEW_1D_LINE
+            self._density_view_states: dict[str, dict[str, Any]] = {}
+            self._density_view_state_switching = False
+            self._position_active_view_type = PLOT_VIEW_1D_LINE
+            self._position_view_states: dict[str, dict[str, Any]] = {}
+            self._position_view_state_switching = False
+            self._orientation_active_view_type = PLOT_VIEW_1D_LINE
+            self._orientation_view_states: dict[str, dict[str, Any]] = {}
+            self._orientation_view_state_switching = False
             self._collapsible_section_state: dict[str, bool] = {}
             self._advanced_json_syncing = False
             self._suspend_preview_events = False
             self._preview_pixmap: QPixmap | None = None
+            self._preview_figure: Any | None = None
+            self._preview_canvas: Any | None = None
+            self._preview_toolbar: Any | None = None
+            self._preview_axis_callback_ids: list[tuple[Any, int]] = []
+            self._canvas_axis_limit_syncing = False
             self._preview_zoom_factor = 1.0
             self._splitter: QSplitter | None = None
             self._preview_splitter_sizes: list[int] | None = None
@@ -2721,14 +3208,24 @@ def launch_plot_settings_panel(
             self._preview_frame: QFrame | None = None
             self._preview_scroll: QScrollArea | None = None
             self._preview_label: QLabel | None = None
+            self._preview_canvas_container: QWidget | None = None
+            self._preview_canvas_layout: QVBoxLayout | None = None
+            self._preview_canvas_scroll: QScrollArea | None = None
             self._preview_status: QLabel | None = None
             self._preview_button: QPushButton | None = None
             self._undo_button: QPushButton | None = None
             self._redo_button: QPushButton | None = None
+            self._header_detach_preview_button: QPushButton | None = None
             self._undo_shortcut: QShortcut | None = None
             self._redo_shortcut: QShortcut | None = None
             self._save_figure_button: QPushButton | None = None
             self._save_data_button: QPushButton | None = None
+            self._data_export_summary_label: QLabel | None = None
+            self._data_export_format: QComboBox | None = None
+            self._data_export_delimiter: QComboBox | None = None
+            self._data_export_include_metadata: QCheckBox | None = None
+            self._data_export_enabled_only: QCheckBox | None = None
+            self._data_export_button: QPushButton | None = None
             self._auto_preview_checkbox: QCheckBox | None = None
             self._detach_preview_button: QPushButton | None = None
             self._dock_preview_button: QPushButton | None = None
@@ -2761,6 +3258,8 @@ def launch_plot_settings_panel(
             self._series_fit_summary_group: QGroupBox | None = None
             self._series_visibility_group: QGroupBox | None = None
             self._series_style_group: QGroupBox | None = None
+            self._series_show_in_legend_row: tuple[QFormLayout, QWidget] | None = None
+            self._series_show_raw_line_row: tuple[QFormLayout, QWidget] | None = None
             self._series_uncertainty_group: QGroupBox | None = None
             self._series_derived_group: QGroupBox | None = None
             self._series_metadata_group: QGroupBox | None = None
@@ -2791,6 +3290,9 @@ def launch_plot_settings_panel(
             self._figure_heatmap_section: QGroupBox | None = None
             self._figure_heatmap_group: QGroupBox | None = None
             self._figure_colorbar_group: QGroupBox | None = None
+            self._x_axis_transform_rows: list[tuple[QFormLayout, QWidget]] = []
+            self._advanced_legend_kwargs_rows: list[tuple[QFormLayout, QWidget]] = []
+            self._advanced_line_kwargs_rows: list[tuple[QFormLayout, QWidget]] = []
             self._y_bin_width_row: tuple[QFormLayout, QWidget] | None = None
             self._y_bin_reducer_row: tuple[QFormLayout, QWidget] | None = None
             self._min_bin_points_row: tuple[QFormLayout, QWidget] | None = None
@@ -2809,10 +3311,17 @@ def launch_plot_settings_panel(
             self._active_preview_image_path: Path | None = None
             self._active_preview_interactive = False
             self._pending_preview_request: tuple[dict[str, Any], bool] | None = None
-            self._preview_worker_thread: threading.Thread | None = None
+            self._preview_worker_queue: queue.Queue[tuple[int, dict[str, Any], Path | None] | None] = queue.Queue()
+            self._preview_worker_stop = threading.Event()
+            self._preview_worker_thread: threading.Thread | None = threading.Thread(
+                target=self._preview_worker_loop,
+                name="LiNaKPreviewWorker",
+                daemon=True,
+            )
             self._preview_worker_bridge = _PreviewWorkerBridge(self)
             self._preview_worker_bridge.finished.connect(self._handle_preview_worker_finished)
             self._preview_worker_bridge.failed.connect(self._handle_preview_worker_failed)
+            self._preview_worker_thread.start()
             self._closing = False
             self._preview_timer = QTimer(self)
             self._preview_timer.setSingleShot(True)
@@ -3226,8 +3735,744 @@ def launch_plot_settings_panel(
             self._update_series_fit_summary(self._series_active_index)
             self._update_integration_summary()
 
+        def _set_axis_limit_fields_from_canvas(self, ax: Any) -> None:
+            if self._canvas_axis_limit_syncing:
+                return
+            self._canvas_axis_limit_syncing = True
+            self._suspend_preview_events = True
+            try:
+                x_lim = [float(value) for value in ax.get_xlim()]
+                y_lim = [float(value) for value in ax.get_ylim()]
+                self._set_synced_field_mode("x_lim", "manual")
+                self._set_synced_field_mode("y_lim", "manual")
+                self.x_min.setText(_format_float_value(x_lim[0]))
+                self.x_max.setText(_format_float_value(x_lim[1]))
+                self.y_min.setText(_format_float_value(y_lim[0]))
+                self.y_max.setText(_format_float_value(y_lim[1]))
+                self._last_preview_state["x_lim"] = x_lim
+                self._last_preview_state["y_lim"] = y_lim
+                modes = dict(self._last_preview_state.get("_gui_sync_modes") or {})
+                modes["x_lim"] = "manual"
+                modes["y_lim"] = "manual"
+                self._last_preview_state["_gui_sync_modes"] = modes
+            finally:
+                self._suspend_preview_events = False
+                self._canvas_axis_limit_syncing = False
+            if self._preview_status is not None:
+                self._preview_status.setText("Axis limits updated from preview.")
+            self._refresh_shell_state()
+
+        def _handle_canvas_axis_limits_changed(self, ax: Any) -> None:
+            self._set_axis_limit_fields_from_canvas(ax)
+
+        def _apply_axis_limit_fields_to_canvas(self, key: str) -> bool:
+            if self._preview_canvas is None or self._preview_figure is None:
+                return False
+            axes = list(getattr(self._preview_figure, "axes", []) or [])
+            if not axes:
+                return False
+            ax = axes[0]
+
+            def _field_value(widget: QLineEdit) -> float | None:
+                text = widget.text().strip()
+                if not text:
+                    return None
+                try:
+                    return float(text)
+                except ValueError:
+                    return None
+
+            x_lim = [_field_value(self.x_min), _field_value(self.x_max)]
+            y_lim = [_field_value(self.y_min), _field_value(self.y_max)]
+            self._canvas_axis_limit_syncing = True
+            try:
+                if key == "x_lim":
+                    ax.set_xlim(left=x_lim[0], right=x_lim[1])
+                    self._last_preview_state["x_lim"] = list(ax.get_xlim())
+                elif key == "y_lim":
+                    ax.set_ylim(bottom=y_lim[0], top=y_lim[1])
+                    self._last_preview_state["y_lim"] = list(ax.get_ylim())
+                else:
+                    return False
+                modes = dict(self._last_preview_state.get("_gui_sync_modes") or {})
+                modes[key] = "manual"
+                self._last_preview_state["_gui_sync_modes"] = modes
+                self._preview_canvas.draw_idle()
+            finally:
+                self._canvas_axis_limit_syncing = False
+            if self._preview_status is not None:
+                self._preview_status.setText("Axis limits updated.")
+            self._refresh_shell_state()
+            return True
+
+        def _apply_text_fields_to_canvas(self) -> bool:
+            if self._preview_canvas is None or self._preview_figure is None:
+                return False
+            axes = list(getattr(self._preview_figure, "axes", []) or [])
+            if not axes:
+                return False
+            ax = axes[0]
+
+            def _optional_float_text(widget: QLineEdit) -> float | None:
+                text = widget.text().strip()
+                if not text:
+                    return None
+                try:
+                    return float(text)
+                except ValueError:
+                    return None
+
+            def _optional_int_text(widget: QLineEdit) -> int | None:
+                value = _optional_float_text(widget)
+                if value is None or value <= 0:
+                    return None
+                return int(round(value))
+
+            title_kwargs: dict[str, Any] = {}
+            title_size = _optional_int_text(self.title_font)
+            if title_size is not None:
+                title_kwargs["fontsize"] = title_size
+            title_pad = _optional_float_text(self.title_pad)
+            if title_pad is not None:
+                title_kwargs["pad"] = title_pad
+            label_kwargs: dict[str, Any] = {}
+            x_label_size = _optional_int_text(self.x_label_font)
+            y_label_size = _optional_int_text(self.y_label_font)
+            x_label_pad = _optional_float_text(self.x_label_pad)
+            y_label_pad = _optional_float_text(self.y_label_pad)
+
+            title = "" if self._synced_field_mode("title") == "off" else self.title_text.text()
+            x_label = "" if self._synced_field_mode("x_label") == "off" else self.x_label.text()
+            y_label = "" if self._synced_field_mode("y_label") == "off" else self.y_label.text()
+            ax.set_title(title, **title_kwargs)
+            x_kwargs = dict(label_kwargs)
+            y_kwargs = dict(label_kwargs)
+            if x_label_size is not None:
+                x_kwargs["fontsize"] = x_label_size
+            if y_label_size is not None:
+                y_kwargs["fontsize"] = y_label_size
+            if x_label_pad is not None:
+                x_kwargs["labelpad"] = x_label_pad
+            if y_label_pad is not None:
+                y_kwargs["labelpad"] = y_label_pad
+            ax.set_xlabel(x_label, **x_kwargs)
+            ax.set_ylabel(y_label, **y_kwargs)
+            try:
+                self._preview_figure.tight_layout()
+            except Exception:
+                pass
+            self._last_preview_state["title"] = title
+            self._last_preview_state["x_label"] = x_label
+            self._last_preview_state["y_label"] = y_label
+            if x_label_pad is not None:
+                self._last_preview_state["x_label_pad"] = x_label_pad
+            if y_label_pad is not None:
+                self._last_preview_state["y_label_pad"] = y_label_pad
+            self._preview_canvas.draw_idle()
+            if self._preview_status is not None:
+                self._preview_status.setText("Preview text updated.")
+            self._refresh_shell_state()
+            return True
+
+        def _apply_axis_style_fields_to_canvas(self) -> bool:
+            if self._preview_canvas is None or self._preview_figure is None:
+                return False
+            axes = list(getattr(self._preview_figure, "axes", []) or [])
+            if not axes:
+                return False
+            ax = axes[0]
+
+            x_scale = self.x_scale.currentText().strip() or "linear"
+            y_scale = self.y_scale.currentText().strip() or "linear"
+            try:
+                ax.set_xscale(x_scale)
+                ax.set_yscale(y_scale)
+            except Exception:
+                return False
+
+            grid_mode = self.grid_mode.currentText().strip().lower()
+            grid_enabled = grid_mode != "off"
+            grid_kwargs: dict[str, Any] = {
+                "axis": self.grid_axis.currentText().strip().lower() or "both",
+                "which": self.grid_which.currentText().strip().lower() or "major",
+            }
+            linestyle = self.grid_linestyle.currentText().strip()
+            if linestyle:
+                grid_kwargs["linestyle"] = linestyle
+            for key, widget in (
+                ("linewidth", self.grid_linewidth),
+                ("alpha", self.grid_alpha),
+            ):
+                text = widget.text().strip()
+                if text:
+                    try:
+                        grid_kwargs[key] = float(text)
+                    except ValueError:
+                        return False
+            color = self.grid_color.text().strip()
+            if color:
+                grid_kwargs["color"] = color
+            if grid_kwargs["axis"] not in _GRID_AXES:
+                grid_kwargs["axis"] = "both"
+            if grid_kwargs["which"] not in _GRID_WHICH:
+                grid_kwargs["which"] = "major"
+            try:
+                if grid_enabled:
+                    ax.grid(True, **grid_kwargs)
+                else:
+                    ax.grid(False)
+                    for axis in (ax.xaxis, ax.yaxis):
+                        for gridline in axis.get_gridlines():
+                            gridline.set_visible(False)
+            except Exception:
+                return False
+            self._last_preview_state["x_scale"] = x_scale
+            self._last_preview_state["y_scale"] = y_scale
+            self._last_preview_state["grid"] = bool(grid_enabled)
+            self._last_preview_state["grid_kwargs"] = dict(grid_kwargs)
+            self._preview_canvas.draw_idle()
+            if self._preview_status is not None:
+                self._preview_status.setText("Preview axes updated.")
+            self._refresh_shell_state()
+            return True
+
+        def _apply_heatmap_style_fields_to_canvas(self) -> bool:
+            if self._preview_canvas is None:
+                return False
+            mesh = self._last_preview_state.get("heatmap_artist")
+            if mesh is None:
+                return False
+            colorbar = self._last_preview_state.get("heatmap_colorbar")
+
+            cmap = self.heatmap_cmap.currentText().strip()
+            if cmap:
+                try:
+                    mesh.set_cmap(cmap)
+                except Exception:
+                    return False
+
+            def _optional_float_text(widget: QLineEdit) -> float | None:
+                text = widget.text().strip()
+                if not text:
+                    return None
+                try:
+                    return float(text)
+                except ValueError:
+                    return None
+
+            vmin = _optional_float_text(self.heatmap_vmin)
+            vmax = _optional_float_text(self.heatmap_vmax)
+            try:
+                mesh.set_clim(vmin=vmin, vmax=vmax)
+            except Exception:
+                return False
+
+            if colorbar is not None:
+                colorbar_enabled = self.heatmap_colorbar_enabled.isChecked()
+                try:
+                    colorbar.ax.set_visible(bool(colorbar_enabled))
+                except Exception:
+                    pass
+                raw_label = self.heatmap_colorbar_label.text().strip()
+                if raw_label.casefold() == "none":
+                    label = ""
+                elif raw_label:
+                    label = raw_label
+                else:
+                    label = None
+                label_size_text = self.heatmap_colorbar_label_size.text().strip()
+                tick_size_text = self.heatmap_colorbar_tick_size.text().strip()
+                label_size = int(label_size_text) if label_size_text.isdigit() else None
+                tick_size = int(tick_size_text) if tick_size_text.isdigit() else None
+                if label is not None:
+                    try:
+                        colorbar.set_label(label, fontsize=label_size)
+                    except TypeError:
+                        colorbar.set_label(label)
+                elif label_size is not None:
+                    current_label = (
+                        colorbar.ax.get_ylabel()
+                        if colorbar.ax.yaxis.get_visible()
+                        else colorbar.ax.get_xlabel()
+                    )
+                    try:
+                        colorbar.set_label(current_label, fontsize=label_size)
+                    except TypeError:
+                        colorbar.set_label(current_label)
+                if tick_size is not None:
+                    colorbar.ax.tick_params(labelsize=tick_size)
+                try:
+                    colorbar.update_normal(mesh)
+                except Exception:
+                    pass
+
+            self._last_preview_state["heatmap_cmap"] = cmap or None
+            self._last_preview_state["heatmap_vmin"] = vmin
+            self._last_preview_state["heatmap_vmax"] = vmax
+            self._last_preview_state["heatmap_colorbar_enabled"] = (
+                self.heatmap_colorbar_enabled.isChecked()
+            )
+            self._preview_canvas.draw_idle()
+            if self._preview_status is not None:
+                self._preview_status.setText("Preview heatmap style updated.")
+            self._refresh_shell_state()
+            return True
+
+        def _apply_line_style_fields_to_canvas(self) -> bool:
+            if self._preview_canvas is None or self._preview_figure is None:
+                return False
+            axes = list(getattr(self._preview_figure, "axes", []) or [])
+            if not axes:
+                return False
+            lines = [
+                line
+                for ax in axes
+                for line in list(getattr(ax, "lines", []) or [])
+            ]
+            if not lines:
+                return False
+
+            def _optional_float_text(widget: QLineEdit) -> float | None:
+                text = widget.text().strip()
+                if not text:
+                    return None
+                try:
+                    return float(text)
+                except ValueError:
+                    return None
+
+            line_width = _optional_float_text(self.line_width)
+            line_alpha = _optional_float_text(self.line_alpha)
+            marker_size = _optional_float_text(self.marker_size)
+            line_style = self.line_style.currentText().strip()
+            marker_mode = self.markers_mode.currentText().strip().lower()
+            marker_type = self.marker_type.currentText().strip() or "o"
+            marker = "" if marker_mode == "off" else marker_type
+            marker_color = self.marker_color.text().strip()
+            try:
+                for line in lines:
+                    if line_width is not None:
+                        line.set_linewidth(line_width)
+                    if line_alpha is not None:
+                        line.set_alpha(line_alpha)
+                    if line_style:
+                        line.set_linestyle(line_style)
+                    line.set_marker(marker)
+                    if marker_size is not None:
+                        line.set_markersize(marker_size)
+                    if marker_color:
+                        line.set_markerfacecolor(marker_color)
+                        line.set_markeredgecolor(marker_color)
+            except Exception:
+                return False
+            self._last_preview_state["line_width"] = line_width
+            self._last_preview_state["markers"] = marker_mode != "off"
+            self._last_preview_state["line_kwargs"] = {
+                "linestyle": line_style or None,
+                "alpha": line_alpha,
+                "marker": marker,
+                "markersize": marker_size,
+            }
+            self._preview_canvas.draw_idle()
+            if self._preview_status is not None:
+                self._preview_status.setText("Preview line style updated.")
+            self._refresh_shell_state()
+            return True
+
+        def _optional_float_from_line(self, widget: QLineEdit) -> float | None:
+            text = widget.text().strip()
+            if not text:
+                return None
+            try:
+                return float(text)
+            except ValueError:
+                return None
+
+        def _optional_int_from_line(self, widget: QLineEdit) -> int | None:
+            value = self._optional_float_from_line(widget)
+            if value is None or value <= 0:
+                return None
+            return int(round(value))
+
+        def _preview_export_figsize(self) -> tuple[float, float]:
+            fig_width = self._optional_float_from_line(self.fig_width)
+            fig_height = self._optional_float_from_line(self.fig_height)
+            if (
+                fig_width is not None
+                and fig_height is not None
+                and fig_width > 0.0
+                and fig_height > 0.0
+            ):
+                return float(fig_width), float(fig_height)
+
+            raw_figsize = self._last_preview_state.get("figsize")
+            if isinstance(raw_figsize, (list, tuple)) and len(raw_figsize) >= 2:
+                try:
+                    state_width = float(raw_figsize[0])
+                    state_height = float(raw_figsize[1])
+                except (TypeError, ValueError):
+                    state_width = 0.0
+                    state_height = 0.0
+                if state_width > 0.0 and state_height > 0.0:
+                    return state_width, state_height
+
+            if self._preview_figure is not None:
+                try:
+                    current_size = self._preview_figure.get_size_inches()
+                    current_width = float(current_size[0])
+                    current_height = float(current_size[1])
+                except Exception:
+                    current_width = 0.0
+                    current_height = 0.0
+                if current_width > 0.0 and current_height > 0.0:
+                    return current_width, current_height
+
+            return tuple(float(value) for value in DEFAULT_PLOT_STYLE.figure_size)
+
+        def _resize_preview_canvas_to_figure(self) -> None:
+            if self._preview_canvas is None or self._preview_figure is None:
+                return
+            available_width = 800
+            available_height = 520
+            candidates: list[QWidget] = []
+            if self._preview_canvas_scroll is not None:
+                viewport = self._preview_canvas_scroll.viewport()
+                if viewport is not None:
+                    candidates.append(viewport)
+                candidates.append(self._preview_canvas_scroll)
+            if self._preview_canvas_container is not None:
+                candidates.append(self._preview_canvas_container)
+            for widget in candidates:
+                width = int(widget.width()) - 8
+                height = int(widget.height()) - 8
+                if width >= 160 and height >= 120:
+                    available_width = width
+                    available_height = height
+                    break
+            available_width = max(320, available_width)
+            available_height = max(240, available_height)
+            export_width, export_height = self._preview_export_figsize()
+            export_aspect = max(1.0e-9, export_width / export_height)
+            available_aspect = available_width / available_height
+            if available_aspect > export_aspect:
+                target_height = available_height
+                target_width = int(round(target_height * export_aspect))
+            else:
+                target_width = available_width
+                target_height = int(round(target_width / export_aspect))
+            target_width = max(1, min(available_width, target_width))
+            target_height = max(1, min(available_height, target_height))
+            try:
+                preview_dpi = max(target_width / export_width, target_height / export_height, 1.0)
+                self._preview_figure.set_size_inches(export_width, export_height, forward=False)
+                self._preview_figure.set_dpi(preview_dpi)
+            except Exception:
+                pass
+            self._preview_canvas.setFixedSize(QSize(target_width, target_height))
+            self._preview_canvas.resize(target_width, target_height)
+            if self._preview_canvas_scroll is not None:
+                self._preview_canvas_scroll.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                self._preview_canvas_scroll.updateGeometry()
+                self._preview_canvas_scroll.viewport().update()
+            self._preview_canvas.updateGeometry()
+            self._preview_canvas.update()
+            QTimer.singleShot(0, self._redraw_preview_canvas)
+
+        def _redraw_preview_canvas(self) -> None:
+            if self._preview_canvas is None:
+                return
+            try:
+                self._preview_canvas.draw_idle()
+            except Exception:
+                pass
+
+        def _apply_canvas_style_fields_to_canvas(self) -> bool:
+            if self._preview_canvas is None or self._preview_figure is None:
+                return False
+            fig = self._preview_figure
+            axes = list(getattr(fig, "axes", []) or [])
+
+            fig_width = self._optional_float_from_line(self.fig_width)
+            fig_height = self._optional_float_from_line(self.fig_height)
+            dpi = self._optional_int_from_line(self.dpi)
+            if (fig_width is None) != (fig_height is None):
+                return False
+
+            facecolor = self.figure_facecolor.text().strip()
+            if facecolor:
+                try:
+                    fig.patch.set_facecolor(facecolor)
+                except ValueError:
+                    return False
+            alpha = self._optional_float_from_line(self.figure_alpha)
+            if alpha is not None:
+                try:
+                    fig.patch.set_alpha(float(alpha))
+                except Exception:
+                    return False
+
+            font_family = self.font_family.text().strip()
+            font_color = self.font_color.text().strip()
+            base_sizes = default_plot_font_sizes(self._resolved_base_font_size_value())
+            x_tick_size = self._optional_int_from_line(self.x_tick_font) or base_sizes[
+                "tick_font_size"
+            ]
+            y_tick_size = self._optional_int_from_line(self.y_tick_font) or base_sizes[
+                "tick_font_size"
+            ]
+            legend_size = self._optional_int_from_line(self.legend_font) or base_sizes[
+                "legend_font_size"
+            ]
+            title_size = self._optional_int_from_line(self.title_font) or base_sizes[
+                "title_font_size"
+            ]
+            label_size = base_sizes["label_font_size"]
+            x_label_size = self._optional_int_from_line(self.x_label_font) or label_size
+            y_label_size = self._optional_int_from_line(self.y_label_font) or label_size
+
+            for ax in axes:
+                text_artists = [
+                    ax.title,
+                    ax.xaxis.label,
+                    ax.yaxis.label,
+                    *list(ax.get_xticklabels()),
+                    *list(ax.get_yticklabels()),
+                ]
+                legend = ax.get_legend()
+                if legend is not None:
+                    text_artists.extend(list(legend.get_texts()))
+                    title = legend.get_title()
+                    if title is not None:
+                        text_artists.append(title)
+                for artist in text_artists:
+                    if font_family:
+                        try:
+                            artist.set_fontfamily(font_family)
+                        except Exception:
+                            pass
+                    if font_color:
+                        try:
+                            artist.set_color(font_color)
+                        except ValueError:
+                            return False
+                ax.title.set_fontsize(title_size)
+                ax.xaxis.label.set_fontsize(x_label_size)
+                ax.yaxis.label.set_fontsize(y_label_size)
+                ax.tick_params(axis="x", labelsize=x_tick_size)
+                ax.tick_params(axis="y", labelsize=y_tick_size)
+                if font_color:
+                    try:
+                        ax.tick_params(axis="both", colors=font_color)
+                    except ValueError:
+                        return False
+                if legend is not None:
+                    for text in legend.get_texts():
+                        text.set_fontsize(legend_size)
+                    legend_title = legend.get_title()
+                    if legend_title is not None:
+                        legend_title.set_fontsize(legend_size)
+
+            if fig_width is not None and fig_height is not None:
+                self._last_preview_state["figsize"] = [float(fig_width), float(fig_height)]
+            else:
+                self._last_preview_state["figsize"] = list(fig.get_size_inches())
+            if dpi is not None:
+                self._last_preview_state["dpi"] = int(dpi)
+            else:
+                try:
+                    state_dpi = int(self._last_preview_state.get("dpi") or DEFAULT_PLOT_STYLE.dpi)
+                except (TypeError, ValueError):
+                    state_dpi = int(DEFAULT_PLOT_STYLE.dpi)
+                self._last_preview_state["dpi"] = state_dpi
+            self._last_preview_state["font_family"] = font_family or None
+            self._last_preview_state["font_color"] = font_color or None
+            self._last_preview_state["figure_kwargs"] = {
+                "facecolor": facecolor or None,
+                "alpha": alpha,
+            }
+            self._resize_preview_canvas_to_figure()
+            try:
+                fig.tight_layout()
+            except Exception:
+                pass
+            self._preview_canvas.draw_idle()
+            if self._preview_status is not None:
+                self._preview_status.setText("Preview canvas updated.")
+            self._refresh_shell_state()
+            return True
+
+        def _apply_series_artist_updates_to_canvas(self) -> bool:
+            if self._preview_canvas is None or self._preview_figure is None:
+                return False
+            line_artists = self._last_preview_state.get("line_artists")
+            plotted_series = self._last_preview_state.get("plotted_xy_series")
+            if not isinstance(line_artists, list) or not isinstance(plotted_series, list):
+                return False
+            if not line_artists or len(line_artists) < len(plotted_series):
+                return False
+            artist_by_series_id: dict[str, Any] = {}
+            for artist, payload in zip(line_artists, plotted_series):
+                if not isinstance(payload, dict):
+                    continue
+                series_id = str(payload.get("series_id") or "").strip()
+                if series_id:
+                    artist_by_series_id[series_id] = artist
+            if not artist_by_series_id:
+                return False
+
+            missing_enabled_artist = False
+            for index, descriptor in enumerate(self._series_descriptors_data):
+                series_id = str(descriptor.get("series_id") or f"series:{index}")
+                artist = artist_by_series_id.get(series_id)
+                enabled = bool(
+                    self._series_enabled_data[index]
+                    if index < len(self._series_enabled_data)
+                    else True
+                )
+                if enabled and artist is None:
+                    missing_enabled_artist = True
+                    break
+                if artist is None:
+                    continue
+                show_raw = bool(
+                    self._series_show_raw_line_data[index]
+                    if index < len(self._series_show_raw_line_data)
+                    else True
+                )
+                artist.set_visible(enabled and show_raw)
+                artist.set_label(self._effective_series_label(index))
+                color = self._effective_series_color(index).strip()
+                if color:
+                    try:
+                        artist.set_color(color)
+                    except ValueError:
+                        pass
+                alpha = (
+                    self._series_alpha_data[index].strip()
+                    if index < len(self._series_alpha_data)
+                    else ""
+                )
+                if alpha:
+                    try:
+                        artist.set_alpha(float(alpha))
+                    except ValueError:
+                        pass
+                width = (
+                    self._series_line_widths_data[index].strip()
+                    if index < len(self._series_line_widths_data)
+                    else ""
+                )
+                if width:
+                    try:
+                        artist.set_linewidth(float(width))
+                    except ValueError:
+                        pass
+                marker = (
+                    self._series_markers_data[index].strip()
+                    if index < len(self._series_markers_data)
+                    else ""
+                )
+                if marker:
+                    artist.set_marker(marker)
+                line_kwargs = (
+                    self._series_line_kwargs_data[index].strip()
+                    if index < len(self._series_line_kwargs_data)
+                    else ""
+                )
+                if line_kwargs:
+                    try:
+                        parsed_kwargs = _optional_json_dict(
+                            line_kwargs,
+                            field_name="Series Matplotlib line options",
+                        )
+                    except ValueError:
+                        parsed_kwargs = None
+                    if parsed_kwargs:
+                        for key, value in parsed_kwargs.items():
+                            if key == "label":
+                                continue
+                            setter = getattr(artist, f"set_{key}", None)
+                            if callable(setter):
+                                try:
+                                    setter(value)
+                                except Exception:
+                                    pass
+                artist.set_zorder(float(index + 2))
+
+                fit_artist = artist_by_series_id.get(f"{series_id}::fit")
+                if fit_artist is not None:
+                    fit_enabled = bool(
+                        index < len(self._series_fit_enabled_data)
+                        and self._series_fit_enabled_data[index]
+                    )
+                    fit_artist.set_visible(fit_enabled)
+                    fit_artist.set_label(self._fit_effective_label(index))
+                    fit_color = (
+                        self._series_fit_color_data[index].strip()
+                        if index < len(self._series_fit_color_data)
+                        else ""
+                    )
+                    if fit_color:
+                        try:
+                            fit_artist.set_color(fit_color)
+                        except ValueError:
+                            pass
+                    fit_artist.set_zorder(float(index + 2.5))
+
+                cumulative_artist = artist_by_series_id.get(f"{series_id}::cumulative")
+                if cumulative_artist is not None:
+                    cumulative_enabled = bool(
+                        index < len(self._series_cumulative_enabled_data)
+                        and self._series_cumulative_enabled_data[index]
+                    )
+                    cumulative_artist.set_visible(cumulative_enabled)
+                    cumulative_artist.set_label(self._cumulative_effective_label(index))
+                    cumulative_color = (
+                        self._series_cumulative_color_data[index].strip()
+                        if index < len(self._series_cumulative_color_data)
+                        else ""
+                    )
+                    if cumulative_color:
+                        try:
+                            cumulative_artist.set_color(cumulative_color)
+                        except ValueError:
+                            pass
+                    cumulative_artist.set_zorder(float(index + 2.25))
+            if missing_enabled_artist:
+                return False
+
+            for ax in self._preview_figure.axes:
+                legend = ax.get_legend()
+                if legend is None:
+                    continue
+                handles, labels = ax.get_legend_handles_labels()
+                visible_pairs = [
+                    (handle, label)
+                    for handle, label in zip(handles, labels)
+                    if getattr(handle, "get_visible", lambda: True)()
+                    and not str(label).startswith("_")
+                ]
+                legend.remove()
+                if visible_pairs and self.legend_mode.currentText().strip().lower() != "off":
+                    ax.legend(
+                        [handle for handle, _label in visible_pairs],
+                        [label for _handle, label in visible_pairs],
+                        loc=self.legend_loc.currentText().strip() or "best",
+                    )
+            self._preview_canvas.draw_idle()
+            if self._preview_status is not None:
+                self._preview_status.setText("Preview series styling updated.")
+            self._refresh_shell_state()
+            return True
+
         def _handle_synced_field_edit(self, key: str) -> None:
             self._set_synced_field_mode(key, "manual")
+            if key in {"x_lim", "y_lim"} and self._apply_axis_limit_fields_to_canvas(key):
+                self._preview_timer.stop()
+                return
+            if key in {"title", "x_label", "y_label"} and self._apply_text_fields_to_canvas():
+                self._preview_timer.stop()
+                return
             self._schedule_preview_update()
 
         def _handle_synced_field_mode_changed(self, key: str, value: str) -> None:
@@ -3893,6 +5138,7 @@ def launch_plot_settings_panel(
                 self._undo_button, disabled_reason="there is nothing to undo."
             )
             header_layout.addWidget(self._undo_button)
+            self._undo_button.setVisible(False)
 
             self._redo_button = QPushButton("Redo")
             self._redo_button.clicked.connect(self._handle_redo)
@@ -3901,6 +5147,13 @@ def launch_plot_settings_panel(
                 self._redo_button, disabled_reason="there is nothing to redo."
             )
             header_layout.addWidget(self._redo_button)
+            self._redo_button.setVisible(False)
+
+            self._header_detach_preview_button = QPushButton("Detach Preview")
+            self._header_detach_preview_button.clicked.connect(
+                self._handle_header_preview_detach_toggle
+            )
+            header_layout.addWidget(self._header_detach_preview_button)
 
             self._save_button = QPushButton("Save Profile")
             self._save_button.setProperty("role", "primary")
@@ -5155,12 +6408,45 @@ def launch_plot_settings_panel(
                 self._warning_summary_label.hide()
 
         def _handle_fit_preview(self) -> None:
+            if self._preview_canvas is not None and self._preview_figure is not None:
+                axes = list(getattr(self._preview_figure, "axes", []) or [])
+                self._canvas_axis_limit_syncing = True
+                try:
+                    for ax in axes:
+                        try:
+                            ax.relim()
+                        except Exception:
+                            pass
+                        try:
+                            ax.autoscale_view()
+                        except Exception:
+                            pass
+                    self._preview_canvas.draw_idle()
+                finally:
+                    self._canvas_axis_limit_syncing = False
+                if axes:
+                    self._set_axis_limit_fields_from_canvas(axes[0])
+                if self._preview_status is not None:
+                    self._preview_status.setText("Preview view reset.")
+                return
             self._set_preview_zoom(1.0)
             self._refresh_preview_pixmap()
             if self._preview_status is not None:
                 self._preview_status.setText("Preview fit to workspace.")
 
         def _handle_actual_size_preview(self) -> None:
+            if self._preview_canvas is not None:
+                if self._preview_toolbar is not None:
+                    try:
+                        self._preview_toolbar.home()
+                    except Exception:
+                        pass
+                else:
+                    self._handle_fit_preview()
+                    return
+                if self._preview_status is not None:
+                    self._preview_status.setText("Preview view reset.")
+                return
             if (
                 self._preview_pixmap is None
                 or self._preview_pixmap.isNull()
@@ -5195,7 +6481,10 @@ def launch_plot_settings_panel(
             self._preview_frame = pane.preview_frame
             self._preview_scroll = pane.preview_scroll
             self._preview_label = pane.preview_label
-            self._preview_status = pane.preview_status
+            self._preview_canvas_container = pane.preview_canvas_container
+            self._preview_canvas_layout = pane.preview_canvas_layout
+            self._preview_canvas_scroll = None
+            self._preview_status = self._status_label
             self._preview_button = pane.preview_button
             self._save_figure_button = pane.save_figure_button
             self._save_data_button = pane.save_data_button
@@ -5205,14 +6494,35 @@ def launch_plot_settings_panel(
 
             self._auto_preview_checkbox.blockSignals(True)
             try:
-                self._auto_preview_checkbox.setChecked(bool(auto_update_checked))
-                self._auto_preview_checkbox.setEnabled(on_save_figure is not None)
+                self._auto_preview_checkbox.setChecked(True)
+                self._auto_preview_checkbox.setEnabled(False)
             finally:
                 self._auto_preview_checkbox.blockSignals(False)
             self._save_figure_button.setEnabled(on_save_figure is not None)
             self._save_data_button.setEnabled(on_save_data is not None)
+            if self._data_export_button is not None:
+                self._data_export_button.setEnabled(on_save_data is not None)
             self._set_preview_loading(self._preview_loading)
-            self._refresh_preview_pixmap()
+            if self._preview_figure is not None:
+                self._install_preview_figure(self._preview_figure, close_previous=False)
+            else:
+                self._refresh_preview_pixmap()
+            self._refresh_header_preview_detach_button()
+
+        def _refresh_header_preview_detach_button(self) -> None:
+            if self._header_detach_preview_button is None:
+                return
+            detached = self._detached_preview_window is not None
+            self._header_detach_preview_button.setText(
+                "Dock Preview" if detached else "Detach Preview"
+            )
+            self._header_detach_preview_button.setEnabled(self._embedded_preview_pane is not None)
+
+        def _handle_header_preview_detach_toggle(self) -> None:
+            if self._detached_preview_window is None:
+                self._handle_detach_preview()
+            else:
+                self._handle_dock_preview()
 
         def _handle_detach_preview(self) -> None:
             if self._detached_preview_window is not None:
@@ -5265,6 +6575,7 @@ def launch_plot_settings_panel(
             detached_window.resize(1100, 820)
             detached_window.show()
             self._status_label.setText("Preview detached to a separate window.")
+            self._refresh_header_preview_detach_button()
             self._refresh_shell_state()
             QTimer.singleShot(0, self._refresh_preview_pixmap)
 
@@ -5301,6 +6612,7 @@ def launch_plot_settings_panel(
             detached_window.close_from_dock()
             detached_window.deleteLater()
             self._status_label.setText("Preview docked in the workspace.")
+            self._refresh_header_preview_detach_button()
             self._refresh_shell_state()
             QTimer.singleShot(0, self._refresh_preview_pixmap)
 
@@ -5586,12 +6898,14 @@ def launch_plot_settings_panel(
                 self.x_axis_scale,
                 tooltip_id="figure.axes.x_axis_scale",
             )
+            self._x_axis_transform_rows.append((x_axis_form, self.x_axis_scale))
             self._add_form_row(
                 x_axis_form,
                 "X offset",
                 self.x_axis_offset,
                 tooltip_id="figure.axes.x_axis_offset",
             )
+            self._x_axis_transform_rows.append((x_axis_form, self.x_axis_offset))
             self._add_form_row(
                 x_axis_form,
                 "X min / max",
@@ -6394,8 +7708,9 @@ def launch_plot_settings_panel(
 
         def _handle_base_font_size_changed(self, *_unused: object) -> None:
             self._refresh_font_size_placeholders()
+            self._propagate_base_font_size_change_to_auto_fields()
 
-        def _on_base_font_size_committed(self) -> None:
+        def _propagate_base_font_size_change_to_auto_fields(self) -> None:
             new_base = self._resolved_base_font_size_value()
             old_base = self._last_resolved_base_font_size
             if old_base == new_base:
@@ -6422,17 +7737,21 @@ def launch_plot_settings_panel(
                     widget.setText(str(new_auto[fallback_key]))
             self._last_resolved_base_font_size = new_base
 
+        def _on_base_font_size_committed(self) -> None:
+            self._propagate_base_font_size_change_to_auto_fields()
+
         def _build_series_tab(self) -> None:
             tab_layout = QVBoxLayout(self._tab_series)
             tab_layout.setContentsMargins(0, 0, 0, 0)
             tab_layout.setSpacing(4)
 
-            self.series_list = QListWidget()
+            self.series_list = _SeriesListView(self)
             self.series_list.setObjectName("seriesList")
             self.series_list.setAlternatingRowColors(True)
             self.series_list.setMinimumHeight(180)
             self.series_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
             self.series_list.setSpacing(2)
+            self.series_list.setUniformItemSizes(True)
             self.series_list.currentRowChanged.connect(self._handle_series_list_selection_change)
             self._selected_layer_card = QFrame()
             self._selected_layer_card.setObjectName("selectedLayerCard")
@@ -6540,12 +7859,14 @@ def launch_plot_settings_panel(
                 self.series_show_in_legend,
                 tooltip_id="series.show_in_legend",
             )
+            self._series_show_in_legend_row = (visibility_form, self.series_show_in_legend)
             self._add_form_row(
                 visibility_form,
                 "Raw data",
                 self._series_show_raw_line,
                 tooltip_id="series.show_raw_line",
             )
+            self._series_show_raw_line_row = (visibility_form, self._series_show_raw_line)
             self._add_form_row(
                 visibility_form, "Label", self.series_label, tooltip_id="series.label"
             )
@@ -6603,23 +7924,24 @@ def launch_plot_settings_panel(
             )
             layout.addWidget(self._series_style_group)
 
-            integration_group = QGroupBox("Integration")
+            integration_group = QGroupBox("Integral")
             self._tab_integration_content = integration_group
             self._build_integration_tab()
-            self._series_integration_group = self._make_collapsible_section(
-                title="Integration",
-                section_id="layers.integration",
-                body_widget=integration_group,
-            )
-            layout.addWidget(self._series_integration_group)
 
-            derived_group = QGroupBox("Derived Lines")
+            derived_group = QGroupBox("Derivations")
             derived_layout = QVBoxLayout(derived_group)
             derived_note = QLabel(
-                "Derived lines are computed from the currently displayed data after transforms, sectioning, and masking."
+                "Derivations are computed from the currently displayed data after transforms, sectioning, and masking."
             )
             derived_note.setWordWrap(True)
             derived_layout.addWidget(derived_note)
+            self._series_integration_group = self._make_collapsible_section(
+                title="Integral",
+                section_id="layers.derived.integral",
+                body_widget=integration_group,
+                subsection=True,
+            )
+            derived_layout.addWidget(self._series_integration_group)
 
             if self._analysis_name in {
                 "density",
@@ -6858,6 +8180,7 @@ def launch_plot_settings_panel(
                 "potential",
                 "position",
                 "coordination",
+                "orientation",
                 "temperature",
             }:
                 fit_group = QGroupBox("Fit")
@@ -6895,19 +8218,7 @@ def launch_plot_settings_panel(
                     self._series_fit_degree,
                     tooltip_id="series.fit_degree",
                 )
-                self._series_fit_range_mode = self._combo(
-                    tuple(mode.title() for mode in _FIT_RANGE_MODES)
-                )
-                self._series_fit_range_mode.currentTextChanged.connect(
-                    self._on_series_editor_changed
-                )
-                self._add_form_row(
-                    fit_form,
-                    "Range",
-                    self._series_fit_range_mode,
-                    tooltip_id="series.fit_range_mode",
-                )
-                self._series_fit_x_min = self._line("Visible range")
+                self._series_fit_x_min = self._line("Auto: full range")
                 self._series_fit_x_min.textChanged.connect(self._on_series_editor_changed)
                 self._add_form_row(
                     fit_form,
@@ -6915,7 +8226,7 @@ def launch_plot_settings_panel(
                     self._series_fit_x_min,
                     tooltip_id="series.fit_x_min",
                 )
-                self._series_fit_x_max = self._line("Visible range")
+                self._series_fit_x_max = self._line("Auto: full range")
                 self._series_fit_x_max.textChanged.connect(self._on_series_editor_changed)
                 self._add_form_row(
                     fit_form,
@@ -6976,7 +8287,6 @@ def launch_plot_settings_panel(
                 self._series_fit_detail_rows = [
                     (fit_form, self._series_fit_type),
                     (fit_form, self._series_fit_degree),
-                    (fit_form, self._series_fit_range_mode),
                     (fit_form, self._series_fit_x_min),
                     (fit_form, self._series_fit_x_max),
                     (fit_form, self._series_fit_show_in_legend),
@@ -7021,7 +8331,7 @@ def launch_plot_settings_panel(
                 derived_layout.addWidget(self._series_fit_group)
 
             self._series_derived_group = self._make_collapsible_section(
-                title="Derived Lines",
+                title="Derivations",
                 section_id="layers.derived",
                 body_widget=derived_group,
             )
@@ -7823,41 +9133,10 @@ def launch_plot_settings_panel(
                 )
 
             if analysis == "rdf":
-                selection = QGroupBox("Source")
-                selection_form = QFormLayout(selection)
                 self._rdf_source_pair_count_label = QLabel("")
-                self._rdf_source_pair_count_label.setWordWrap(True)
                 self._rdf_source_pair_list_label = QLabel("")
-                self._rdf_source_pair_list_label.setWordWrap(True)
-                self._add_form_row(
-                    selection_form,
-                    "Available layers",
-                    self._rdf_source_pair_count_label,
-                    tooltip_id="data.rdf.layer_count",
-                )
-                self._add_form_row(
-                    selection_form,
-                    "Pairs",
-                    self._rdf_source_pair_list_label,
-                    tooltip_id="data.rdf.pairs",
-                )
-                selection_note = QLabel(
-                    "All stored RDF profiles are loaded as layers. Use the Layers panel to toggle visibility, styling, and ordering."
-                )
-                selection_note.setObjectName("sectionNote")
-                selection_note.setWordWrap(True)
-                selection_form.addRow(selection_note)
-                layout.addWidget(
-                    self._make_collapsible_section(
-                        title="Source",
-                        section_id="data.rdf.selection",
-                        body_widget=selection,
-                    )
-                )
 
             if analysis == "coordination":
-                selection = QGroupBox("Source")
-                selection_form = QFormLayout(selection)
                 coord_species_a_options = [
                     str(value)
                     for value in self._profile_filter_options.get("species_a", [])
@@ -7875,61 +9154,9 @@ def launch_plot_settings_panel(
                 )
                 self.analysis_axis = self._combo(tuple(self._coordination_axis_choices(None, None)))
                 self.analysis_axis.currentTextChanged.connect(self._handle_series_identity_change)
-                self._add_form_row(
-                    selection_form,
-                    "Species A",
-                    self.coord_species_a,
-                    tooltip_id="data.coordination.species_a",
-                )
-                self._add_form_row(
-                    selection_form,
-                    "Species B",
-                    self.coord_species_b,
-                    tooltip_id="data.coordination.species_b",
-                )
-                self._add_form_row(
-                    selection_form,
-                    "Axis",
-                    self.analysis_axis,
-                    tooltip_id="data.coordination.axis",
-                )
                 self._coordination_source_contract_label = QLabel("")
-                self._coordination_source_contract_label.setWordWrap(True)
                 self._coordination_source_dimensions_label = QLabel("")
-                self._coordination_source_dimensions_label.setWordWrap(True)
                 self._coordination_source_quantities_label = QLabel("")
-                self._coordination_source_quantities_label.setWordWrap(True)
-                self._add_form_row(
-                    selection_form,
-                    "Contract",
-                    self._coordination_source_contract_label,
-                    tooltip_id="data.coordination.source.contract",
-                )
-                self._add_form_row(
-                    selection_form,
-                    "Dimensions",
-                    self._coordination_source_dimensions_label,
-                    tooltip_id="data.coordination.source.dimensions",
-                )
-                self._add_form_row(
-                    selection_form,
-                    "Quantities",
-                    self._coordination_source_quantities_label,
-                    tooltip_id="data.coordination.source.quantities",
-                )
-                note = QLabel(
-                    "Chooses which stored coordination profile(s) are loaded from the current source."
-                )
-                note.setWordWrap(True)
-                note.setObjectName("sectionNote")
-                selection_form.addRow(note)
-                layout.addWidget(
-                    self._make_collapsible_section(
-                        title="Source",
-                        section_id="data.coordination.selection",
-                        body_widget=selection,
-                    )
-                )
 
             if analysis == "density":
                 mapping = QGroupBox("Mapping")
@@ -7989,11 +9216,16 @@ def launch_plot_settings_panel(
                 available_density_view_types = self._profile_filter_options.get("density_view_types")
                 if isinstance(available_density_view_types, list) and available_density_view_types:
                     density_view_type_labels = tuple(
-                        _DENSITY_VIEW_TYPE_LABEL_BY_ID.get(str(view_type).strip().lower(), "Line 1D")
+                        _DENSITY_VIEW_TYPE_LABEL_BY_ID.get(
+                            canonical_plot_view_id(str(view_type).strip().lower()),
+                            plot_view_display_label(PLOT_VIEW_1D_LINE),
+                        )
                         for view_type in available_density_view_types
                     )
                 else:
-                    density_view_type_labels = (_DENSITY_VIEW_TYPE_LABEL_BY_ID["line_1d"],)
+                    density_view_type_labels = (
+                        _DENSITY_VIEW_TYPE_LABEL_BY_ID[PLOT_VIEW_1D_LINE],
+                    )
                 self.density_view_type = self._combo(density_view_type_labels)
                 self.density_view_type.currentTextChanged.connect(self._handle_density_mapping_change)
                 available_modes = self._profile_filter_options.get("available_modes")
@@ -8030,21 +9262,21 @@ def launch_plot_settings_panel(
                 self._density_mapping_1d_rows.append((mapping_form, self.density_x_mode))
                 self._add_form_row(
                     mapping_form,
-                    "2D X-axis quantity",
+                    "X-axis quantity",
                     self.density_2d_x_axis,
                     tooltip_id="data.density.source.quantities",
                 )
                 self._density_mapping_2d_rows.append((mapping_form, self.density_2d_x_axis))
                 self._add_form_row(
                     mapping_form,
-                    "2D Y-axis quantity",
+                    "Y-axis quantity",
                     self.density_2d_y_axis,
                     tooltip_id="data.density.source.quantities",
                 )
                 self._density_mapping_2d_rows.append((mapping_form, self.density_2d_y_axis))
                 self._add_form_row(
                     mapping_form,
-                    "Z quantity",
+                    "Y quantity",
                     self.density_quantity,
                     tooltip_id="data.density.quantity",
                 )
@@ -8085,45 +9317,9 @@ def launch_plot_settings_panel(
                 )
 
             if analysis == "potential":
-                source = QGroupBox("Source")
-                source_form = QFormLayout(source)
                 self._potential_source_contract_label = QLabel("")
-                self._potential_source_contract_label.setWordWrap(True)
                 self._potential_source_dimensions_label = QLabel("")
-                self._potential_source_dimensions_label.setWordWrap(True)
                 self._potential_source_quantities_label = QLabel("")
-                self._potential_source_quantities_label.setWordWrap(True)
-                self._add_form_row(
-                    source_form,
-                    "Contract",
-                    self._potential_source_contract_label,
-                    tooltip_id="data.potential.source.contract",
-                )
-                self._add_form_row(
-                    source_form,
-                    "Dimensions",
-                    self._potential_source_dimensions_label,
-                    tooltip_id="data.potential.source.dimensions",
-                )
-                self._add_form_row(
-                    source_form,
-                    "Quantities",
-                    self._potential_source_quantities_label,
-                    tooltip_id="data.potential.source.quantities",
-                )
-                source_note = QLabel(
-                    "Potential plotting uses record-based source data. Mapping controls choose line or table inspection and, for line mode, the plotted quantity."
-                )
-                source_note.setWordWrap(True)
-                source_note.setObjectName("sectionNote")
-                source_form.addRow(source_note)
-                layout.addWidget(
-                    self._make_collapsible_section(
-                        title="Source",
-                        section_id="data.potential.source",
-                        body_widget=source,
-                    )
-                )
 
                 mapping = QGroupBox("Mapping")
                 mapping_form = QFormLayout(mapping)
@@ -8147,12 +9343,12 @@ def launch_plot_settings_panel(
                 )
                 self._add_form_row(
                     mapping_form,
-                    "Y role",
+                    "Y quantity",
                     self.potential_series_mode,
                     tooltip_id="data.potential.mapping.series",
                 )
                 mapping_note = QLabel(
-                    "Line mode keeps record_id on x and lets you choose the plotted potential quantity on y. Table mode switches to record-wise inspection."
+                    "Potential uses a 1D Line view with record_id on the x-axis and the selected potential quantity on y. Tabular values belong in data export."
                 )
                 mapping_note.setWordWrap(True)
                 mapping_note.setObjectName("sectionNote")
@@ -8165,71 +9361,13 @@ def launch_plot_settings_panel(
                     )
                 )
 
-                summary = QGroupBox("Summary")
-                summary_form = QFormLayout(summary)
-                summary_note = QLabel(
-                    "Potential HDF5 plots use record id on the x-axis and plot Water bulk, Fermi, and cSHE as fixed series. Missing values remain as gaps."
-                )
-                summary_note.setWordWrap(True)
                 self._potential_summary_x_axis_label = QLabel("")
                 self._potential_summary_total_rows_label = QLabel("")
                 self._potential_summary_complete_rows_label = QLabel("")
                 self._potential_summary_incomplete_rows_label = QLabel("")
-                self._add_form_row(
-                    summary_form,
-                    "X-axis",
-                    self._potential_summary_x_axis_label,
-                    tooltip_id="data.potential.x_axis",
-                )
-                self._add_form_row(
-                    summary_form,
-                    "Total rows",
-                    self._potential_summary_total_rows_label,
-                    tooltip_id="data.potential.total_rows",
-                )
-                self._add_form_row(
-                    summary_form,
-                    "Complete rows",
-                    self._potential_summary_complete_rows_label,
-                    tooltip_id="data.potential.complete_rows",
-                )
-                self._add_form_row(
-                    summary_form,
-                    "Incomplete rows",
-                    self._potential_summary_incomplete_rows_label,
-                    tooltip_id="data.potential.incomplete_rows",
-                )
                 self._potential_mapping_status_label = QLabel("")
                 self._potential_mapping_summary_label = QLabel("")
-                self._potential_mapping_summary_label.setWordWrap(True)
                 self._potential_backend_summary_label = QLabel("")
-                self._potential_backend_summary_label.setWordWrap(True)
-                self._add_form_row(
-                    summary_form,
-                    "Status",
-                    self._potential_mapping_status_label,
-                    tooltip_id="data.potential.summary.status",
-                )
-                self._add_form_row(
-                    summary_form,
-                    "Mapping",
-                    self._potential_mapping_summary_label,
-                    tooltip_id="data.potential.summary.mapping",
-                )
-                self._add_form_row(
-                    summary_form,
-                    "Backend",
-                    self._potential_backend_summary_label,
-                    tooltip_id="data.potential.summary.backend",
-                )
-                summary_form.addRow("", summary_note)
-                layout.addWidget(
-                    self._make_collapsible_section(
-                        title="Summary",
-                        section_id="data.potential.summary",
-                        body_widget=summary,
-                    )
-                )
 
             if analysis == "position":
                 self._build_position_mapping_sections(layout)
@@ -8237,25 +9375,64 @@ def launch_plot_settings_panel(
             if analysis == "coordination":
                 view = QGroupBox("Mapping")
                 view_form = QFormLayout(view)
-                self.coordination_component = self._combo(("distance", "time", "time-distance"))
+                self.coordination_component = self._combo(
+                    tuple(
+                        _COORDINATION_VIEW_TYPE_LABEL_BY_ID[view_type_id]
+                        for view_type_id in self._coordination_supported_view_type_ids()
+                    )
+                )
                 self.coordination_component.currentTextChanged.connect(self._handle_coordination_mapping_change)
+                self.coordination_line_x_quantity = self._combo(
+                    tuple(_COORDINATION_LINE_X_QUANTITY_LABEL_BY_BACKEND.values())
+                )
+                self.coordination_line_x_quantity.currentTextChanged.connect(
+                    self._handle_coordination_mapping_change
+                )
                 self.coordination_time_axis = self._combo(("ps", "fs", "step", "frame"))
                 self.coordination_time_axis.currentTextChanged.connect(self._handle_coordination_mapping_change)
                 self._add_form_row(
                     view_form,
-                    "View preset",
-                    self.coordination_component,
-                    tooltip_id="data.coordination.component",
+                    "Species A",
+                    self.coord_species_a,
+                    tooltip_id="data.coordination.species_a",
                 )
                 self._add_form_row(
                     view_form,
-                    "Time x-role",
+                    "Species B",
+                    self.coord_species_b,
+                    tooltip_id="data.coordination.species_b",
+                )
+                self._add_form_row(
+                    view_form,
+                    "Axis",
+                    self.analysis_axis,
+                    tooltip_id="data.coordination.axis",
+                )
+                self._add_form_row(
+                    view_form,
+                    "View type",
+                    self.coordination_component,
+                    tooltip_id="data.coordination.view_type",
+                )
+                self._add_form_row(
+                    view_form,
+                    "X-axis quantity",
+                    self.coordination_line_x_quantity,
+                    tooltip_id="data.coordination.x_quantity",
+                )
+                self._coordination_line_x_quantity_row = (
+                    view_form,
+                    self.coordination_line_x_quantity,
+                )
+                self._add_form_row(
+                    view_form,
+                    "Time unit",
                     self.coordination_time_axis,
                     tooltip_id="data.coordination.time_axis",
                 )
                 self._coordination_time_axis_row = (view_form, self.coordination_time_axis)
                 note = QLabel(
-                    "These controls generate one generic coordination mapping: distance profile, coordination-vs-time lines, or a distance-vs-time trajectory."
+                    "These controls generate a 1D Line coordination profile or a 2D Heatmap with time on X and distance on Y."
                 )
                 note.setWordWrap(True)
                 note.setObjectName("sectionNote")
@@ -8268,102 +9445,117 @@ def launch_plot_settings_panel(
                     )
                 )
 
-                summary = QGroupBox("Summary")
-                summary_form = QFormLayout(summary)
                 self._coordination_mapping_status_label = QLabel("")
                 self._coordination_mapping_summary_label = QLabel("")
-                self._coordination_mapping_summary_label.setWordWrap(True)
                 self._coordination_backend_summary_label = QLabel("")
-                self._coordination_backend_summary_label.setWordWrap(True)
-                self._add_form_row(
-                    summary_form,
-                    "Status",
-                    self._coordination_mapping_status_label,
-                    tooltip_id="data.coordination.summary.status",
-                )
-                self._add_form_row(
-                    summary_form,
-                    "Mapping",
-                    self._coordination_mapping_summary_label,
-                    tooltip_id="data.coordination.summary.mapping",
-                )
-                self._add_form_row(
-                    summary_form,
-                    "Backend",
-                    self._coordination_backend_summary_label,
-                    tooltip_id="data.coordination.summary.backend",
-                )
-                layout.addWidget(
-                    self._make_collapsible_section(
-                        title="Summary",
-                        section_id="data.coordination.summary",
-                        body_widget=summary,
-                    )
-                )
 
             if analysis == "orientation":
-                source = QGroupBox("Source")
-                source_form = QFormLayout(source)
                 self._orientation_source_contract_label = QLabel("")
-                self._orientation_source_contract_label.setWordWrap(True)
                 self._orientation_source_dimensions_label = QLabel("")
-                self._orientation_source_dimensions_label.setWordWrap(True)
                 self._orientation_source_quantities_label = QLabel("")
-                self._orientation_source_quantities_label.setWordWrap(True)
-                self._add_form_row(
-                    source_form,
-                    "Contract",
-                    self._orientation_source_contract_label,
-                    tooltip_id="data.orientation.source.contract",
-                )
-                self._add_form_row(
-                    source_form,
-                    "Dimensions",
-                    self._orientation_source_dimensions_label,
-                    tooltip_id="data.orientation.source.dimensions",
-                )
-                self._add_form_row(
-                    source_form,
-                    "Quantities",
-                    self._orientation_source_quantities_label,
-                    tooltip_id="data.orientation.source.quantities",
-                )
-                source_note = QLabel(
-                    "Orientation switches between a line-style contract and a heatmap contract based on the selected mapping mode."
-                )
-                source_note.setWordWrap(True)
-                source_note.setObjectName("sectionNote")
-                source_form.addRow(source_note)
-                layout.addWidget(
-                    self._make_collapsible_section(
-                        title="Source",
-                        section_id="data.orientation.source",
-                        body_widget=source,
-                    )
-                )
 
                 view = QGroupBox("Mapping")
                 view_form = QFormLayout(view)
+                self.orientation_view_type = self._combo(
+                    (
+                        _ORIENTATION_VIEW_TYPE_LABEL_BY_ID[PLOT_VIEW_1D_LINE],
+                        _ORIENTATION_VIEW_TYPE_LABEL_BY_ID[PLOT_VIEW_2D_HEATMAP],
+                    )
+                )
+                self.orientation_view_type.currentTextChanged.connect(
+                    self._handle_orientation_mapping_change
+                )
                 self.orientation_component = self._combo(
-                    ("average", "density", "density-weighted", "heatmap")
+                    tuple(_ORIENTATION_LINE_QUANTITY_LABEL_BY_BACKEND.values())
                 )
                 self.orientation_component.currentTextChanged.connect(self._handle_orientation_mapping_change)
+                self.orientation_line_x_axis = self._combo(_DENSITY_X_MODE_LABELS)
+                self._set_combo_value(self.orientation_line_x_axis, "Distance")
+                self.orientation_line_x_axis.currentTextChanged.connect(
+                    self._handle_orientation_mapping_change
+                )
                 self.orientation_angle = self._combo(("polar", "azimuthal"))
                 self.orientation_angle.currentTextChanged.connect(self._handle_orientation_mapping_change)
-                self._add_form_row(
-                    view_form,
-                    "View preset",
-                    self.orientation_component,
-                    tooltip_id="data.orientation.component",
+                self.orientation_heatmap_x_axis = self._combo(_DENSITY_X_MODE_LABELS)
+                self.orientation_heatmap_y_axis = self._combo(("Y", "X", "Z", "Distance"))
+                self._set_combo_value(self.orientation_heatmap_x_axis, "X")
+                self._set_combo_value(self.orientation_heatmap_y_axis, "Y")
+                self.orientation_heatmap_x_axis.currentTextChanged.connect(
+                    self._handle_orientation_mapping_change
+                )
+                self.orientation_heatmap_y_axis.currentTextChanged.connect(
+                    self._handle_orientation_mapping_change
                 )
                 self._add_form_row(
                     view_form,
-                    "Angle role",
+                    "View type",
+                    self.orientation_view_type,
+                    tooltip_id="data.orientation.view_type",
+                )
+                self._add_form_row(
+                    view_form,
+                    "Y quantity",
+                    self.orientation_component,
+                    tooltip_id="data.orientation.y_quantity",
+                )
+                self._orientation_line_quantity_row = (view_form, self.orientation_component)
+                self._add_form_row(
+                    view_form,
+                    "X-axis quantity",
+                    self.orientation_line_x_axis,
+                    tooltip_id="data.orientation.source.quantities",
+                )
+                self._orientation_line_x_axis_row = (view_form, self.orientation_line_x_axis)
+                self._add_form_row(
+                    view_form,
+                    "Angle quantity",
                     self.orientation_angle,
                     tooltip_id="data.orientation.angle",
                 )
+                self._add_form_row(
+                    view_form,
+                    "X-axis quantity",
+                    self.orientation_heatmap_x_axis,
+                    tooltip_id="data.orientation.source.quantities",
+                )
+                self._orientation_mapping_2d_rows.append((view_form, self.orientation_heatmap_x_axis))
+                self._add_form_row(
+                    view_form,
+                    "Y-axis quantity",
+                    self.orientation_heatmap_y_axis,
+                    tooltip_id="data.orientation.source.quantities",
+                )
+                self._orientation_mapping_2d_rows.append((view_form, self.orientation_heatmap_y_axis))
+                self._orientation_filter_widgets = {}
+                for axis_label, axis_id in (("X range", "x"), ("Y range", "y"), ("Z range", "z"), ("Distance range", "distance")):
+                    range_widget = QWidget(view)
+                    range_layout = QHBoxLayout(range_widget)
+                    range_layout.setContentsMargins(0, 0, 0, 0)
+                    default_range = self._orientation_axis_range_defaults(axis_id)
+                    lower = self._bounded_float_line(
+                        self._orientation_axis_range_text(axis_id, 0) or "min",
+                        bottom=default_range[0] if default_range is not None else None,
+                        top=default_range[1] if default_range is not None else None,
+                    )
+                    upper = self._bounded_float_line(
+                        self._orientation_axis_range_text(axis_id, 1) or "max",
+                        bottom=default_range[0] if default_range is not None else None,
+                        top=default_range[1] if default_range is not None else None,
+                    )
+                    lower.textChanged.connect(self._handle_orientation_mapping_change)
+                    upper.textChanged.connect(self._handle_orientation_mapping_change)
+                    range_layout.addWidget(lower)
+                    range_layout.addWidget(upper)
+                    self._orientation_filter_widgets[axis_id] = (lower, upper)
+                    self._add_form_row(
+                        view_form,
+                        axis_label,
+                        range_widget,
+                        tooltip_id="data.orientation.source.quantities",
+                    )
+                    self._orientation_filter_rows[axis_id] = (view_form, range_widget)
                 note = QLabel(
-                    "These controls generate one generic orientation mapping: line_1d for average and density-style modes, or heatmap_2d for heatmap mode."
+                    "1D presets show orientation along distance; 2D Heatmap uses the stored sparse spatial grid when available."
                 )
                 note.setWordWrap(True)
                 note.setObjectName("sectionNote")
@@ -8376,38 +9568,9 @@ def launch_plot_settings_panel(
                     )
                 )
 
-                summary = QGroupBox("Summary")
-                summary_form = QFormLayout(summary)
                 self._orientation_mapping_status_label = QLabel("")
                 self._orientation_mapping_summary_label = QLabel("")
-                self._orientation_mapping_summary_label.setWordWrap(True)
                 self._orientation_backend_summary_label = QLabel("")
-                self._orientation_backend_summary_label.setWordWrap(True)
-                self._add_form_row(
-                    summary_form,
-                    "Status",
-                    self._orientation_mapping_status_label,
-                    tooltip_id="data.orientation.summary.status",
-                )
-                self._add_form_row(
-                    summary_form,
-                    "Mapping",
-                    self._orientation_mapping_summary_label,
-                    tooltip_id="data.orientation.summary.mapping",
-                )
-                self._add_form_row(
-                    summary_form,
-                    "Backend",
-                    self._orientation_backend_summary_label,
-                    tooltip_id="data.orientation.summary.backend",
-                )
-                layout.addWidget(
-                    self._make_collapsible_section(
-                        title="Summary",
-                        section_id="data.orientation.summary",
-                        body_widget=summary,
-                    )
-                )
 
         def _resize_list_with_defaults(
             self,
@@ -8492,9 +9655,14 @@ def launch_plot_settings_panel(
                     "fit_degree": self._series_fit_degrees_data[index]
                     if index < len(self._series_fit_degrees_data)
                     else "2",
-                    "fit_range_mode": self._series_fit_range_modes_data[index]
-                    if index < len(self._series_fit_range_modes_data)
-                    else "visible",
+                    "fit_range_mode": _fit_range_mode_from_limits(
+                        self._series_fit_x_mins_data[index]
+                        if index < len(self._series_fit_x_mins_data)
+                        else "",
+                        self._series_fit_x_maxs_data[index]
+                        if index < len(self._series_fit_x_maxs_data)
+                        else "",
+                    ),
                     "fit_x_min": self._series_fit_x_mins_data[index]
                     if index < len(self._series_fit_x_mins_data)
                     else "",
@@ -9160,6 +10328,30 @@ def launch_plot_settings_panel(
                 if getattr(checkbox, "isChecked", lambda: False)()
             }
 
+        def _apply_density_enabled_species_settings(self, value: Any) -> None:
+            checkboxes = getattr(self, "_density_species_checkboxes", {})
+            if not isinstance(checkboxes, dict) or not checkboxes:
+                return
+            if not isinstance(value, (list, tuple, set)):
+                return
+            enabled = {str(item).strip() for item in value if str(item).strip()}
+            if not enabled:
+                return
+            available = set(checkboxes)
+            selected = enabled & available
+            if not selected:
+                return
+            self._density_species_checkbox_syncing = True
+            try:
+                for species, checkbox in checkboxes.items():
+                    checkbox.blockSignals(True)
+                    try:
+                        checkbox.setChecked(str(species) in selected)
+                    finally:
+                        checkbox.blockSignals(False)
+            finally:
+                self._density_species_checkbox_syncing = False
+
         def _density_descriptor_passes_species_filter(self, descriptor: dict[str, Any]) -> bool:
             enabled_species = self._enabled_density_species()
             if enabled_species is None:
@@ -9300,13 +10492,553 @@ def launch_plot_settings_panel(
                 upper = None
             return lower, upper
 
+        def _orientation_axis_range_defaults(self, axis_id: str) -> tuple[float, float] | None:
+            ranges = self._profile_filter_options.get("orientation_axis_ranges")
+            if not isinstance(ranges, dict):
+                return None
+            raw_range = ranges.get(str(axis_id).strip().lower())
+            if not isinstance(raw_range, (list, tuple)) or len(raw_range) != 2:
+                return None
+            try:
+                lower = float(raw_range[0])
+                upper = float(raw_range[1])
+            except (TypeError, ValueError):
+                return None
+            if not (np.isfinite(lower) and np.isfinite(upper)) or lower >= upper:
+                return None
+            return lower, upper
+
+        def _orientation_axis_range_text(self, axis_id: str, index: int) -> str:
+            defaults = self._orientation_axis_range_defaults(axis_id)
+            if defaults is None:
+                return ""
+            return f"{defaults[index]:.6g}"
+
+        def _orientation_effective_filter_values(
+            self,
+            axis_id: str,
+            lower: float | None,
+            upper: float | None,
+        ) -> tuple[float | None, float | None]:
+            defaults = self._orientation_axis_range_defaults(axis_id)
+            if defaults is None:
+                return lower, upper
+            if lower is not None and abs(float(lower) - defaults[0]) <= 1.0e-9:
+                lower = None
+            if upper is not None and abs(float(upper) - defaults[1]) <= 1.0e-9:
+                upper = None
+            return lower, upper
+
         def _density_current_view_type_id(self) -> str:
             if not hasattr(self, "density_view_type"):
-                return "line_1d"
+                return PLOT_VIEW_1D_LINE
             return _DENSITY_VIEW_TYPE_ID_BY_LABEL.get(
                 self.density_view_type.currentText().strip(),
-                "line_1d",
+                PLOT_VIEW_1D_LINE,
             )
+
+        def _density_active_view_type_id(self) -> str:
+            if self._analysis_name != "density":
+                return PLOT_VIEW_1D_LINE
+            return self._density_current_view_type_id()
+
+        def _normalize_density_view_type_id(self, value: Any) -> str:
+            token = str(value or "").strip().lower()
+            if token in {"2d", "2d heatmap", "heatmap", "heatmap_2d", "projection2d", "plot_2d_heatmap"}:
+                return PLOT_VIEW_2D_HEATMAP
+            return PLOT_VIEW_1D_LINE
+
+        def _clean_density_view_state(self, state: dict[str, Any]) -> dict[str, Any]:
+            cleaned = deepcopy(state)
+            for key in (
+                "_profile_filter_options",
+                "data_contract",
+                "source_selection",
+                "style",
+                "density_view_states",
+            ):
+                cleaned.pop(key, None)
+            return cleaned
+
+        def _default_density_view_state(self, view_type: str) -> dict[str, Any]:
+            defaults = self._clean_density_view_state(deepcopy(self._default_profile_settings))
+            defaults["_density_view_state_initialized"] = True
+            normalized = self._normalize_density_view_type_id(view_type)
+            if normalized == PLOT_VIEW_2D_HEATMAP:
+                defaults.update(
+                    {
+                        "x_lim": None,
+                        "y_lim": None,
+                        "x_min": None,
+                        "x_max": None,
+                        "y_min": None,
+                        "y_max": None,
+                        "density_2d_x_axis": "x",
+                        "density_2d_y_axis": "y",
+                        "x_bin_width": None,
+                        "y_bin_width": None,
+                        "x_bin_reducer": None,
+                        "y_bin_reducer": None,
+                        "legend": False,
+                        "markers": False,
+                        "annotations": None,
+                        "_gui_sync_modes": None,
+                    }
+                )
+                defaults["view_mapping"] = serialize_plot_view_mapping(
+                    density_plot_options_to_view_mapping(
+                        view_type=PLOT_VIEW_2D_HEATMAP,
+                        quantity=str(defaults.get("quantity") or "mass"),
+                    )
+                )
+            else:
+                defaults.update(
+                    {
+                        "x_lim": None,
+                        "y_lim": None,
+                        "x_min": None,
+                        "x_max": None,
+                        "y_min": None,
+                        "y_max": None,
+                        "x_bin_width": None,
+                        "y_bin_width": None,
+                        "y_bin_reducer": None,
+                        "annotations": None,
+                        "_gui_sync_modes": None,
+                    }
+                )
+                defaults["view_mapping"] = serialize_plot_view_mapping(
+                    density_plot_options_to_view_mapping(
+                        view_type=PLOT_VIEW_1D_LINE,
+                        x_mode=str(defaults.get("x_mode") or "distance"),
+                        quantity=str(defaults.get("quantity") or "mass"),
+                    )
+                )
+            return defaults
+
+        def _snapshot_density_view_state(self, view_type: str) -> dict[str, Any]:
+            normalized = self._normalize_density_view_type_id(view_type)
+            if self._analysis_name != "density" or not hasattr(self, "density_view_type"):
+                return {}
+            try:
+                snapshot = self._collect_settings()
+            except Exception:
+                snapshot = {}
+            if not isinstance(snapshot, dict):
+                snapshot = {}
+            snapshot = deepcopy(snapshot)
+            snapshot = self._clean_density_view_state(snapshot)
+            snapshot["_density_view_state_initialized"] = True
+            snapshot["density_active_view_type"] = normalized
+            return snapshot
+
+        def _active_density_settings_with_view_state(
+            self,
+            settings: dict[str, Any],
+            view_type: str,
+            state: dict[str, Any],
+        ) -> dict[str, Any]:
+            merged = dict(settings)
+            merged.update(deepcopy(state))
+            normalized = self._normalize_density_view_type_id(view_type)
+            merged["density_active_view_type"] = normalized
+            if normalized == PLOT_VIEW_2D_HEATMAP:
+                merged["view_mapping"] = serialize_plot_view_mapping(
+                    density_plot_options_to_view_mapping(
+                        view_type=PLOT_VIEW_2D_HEATMAP,
+                        quantity=str(merged.get("quantity") or "mass"),
+                    )
+                )
+            else:
+                merged["view_mapping"] = serialize_plot_view_mapping(
+                    density_plot_options_to_view_mapping(
+                        view_type=PLOT_VIEW_1D_LINE,
+                        x_mode=str(merged.get("x_mode") or "distance"),
+                        quantity=str(merged.get("quantity") or "mass"),
+                    )
+                )
+            return merged
+
+        def _apply_density_view_state(self, view_type: str, state: dict[str, Any]) -> None:
+            if self._analysis_name != "density":
+                return
+            normalized = self._normalize_density_view_type_id(view_type)
+            restore_state = (
+                deepcopy(state)
+                if isinstance(state, dict) and state.get("_density_view_state_initialized")
+                else self._default_density_view_state(normalized)
+            )
+            restore_settings = self._active_density_settings_with_view_state(
+                self._collect_settings() if hasattr(self, "density_view_type") else {},
+                normalized,
+                restore_state,
+            )
+            previous_switching = self._density_view_state_switching
+            previous_suspend = self._suspend_preview_events
+            self._density_view_state_switching = True
+            self._suspend_preview_events = True
+            try:
+                self._populate(restore_settings)
+                self._density_active_view_type = normalized
+            finally:
+                self._suspend_preview_events = previous_suspend
+                self._density_view_state_switching = previous_switching
+
+        def _merge_density_view_state_into_settings(self, settings: dict[str, Any]) -> dict[str, Any]:
+            if self._analysis_name != "density":
+                return settings
+            active = self._density_active_view_type_id()
+            states = deepcopy(self._density_view_states)
+            active_state = self._clean_density_view_state(deepcopy(settings))
+            active_state["_density_view_state_initialized"] = True
+            active_state["density_active_view_type"] = active
+            states[active] = active_state
+            states[active]["_density_view_state_initialized"] = True
+            merged = dict(settings)
+            merged["density_active_view_type"] = active
+            merged["density_view_states"] = states
+            return merged
+
+        def _normalize_position_view_type_id(self, value: Any) -> str:
+            token = str(value or "").strip().lower()
+            if token in {
+                "2d",
+                "2d heatmap",
+                "2d map",
+                "trajectory_2d",
+                "scatter_2d",
+                "projection",
+                "projection2d",
+                "2d-projection",
+                "plot_2d_heatmap",
+            }:
+                return PLOT_VIEW_2D_HEATMAP
+            return PLOT_VIEW_1D_LINE
+
+        def _position_active_view_type_id(self) -> str:
+            if self._analysis_name != "position":
+                return PLOT_VIEW_1D_LINE
+            return self._normalize_position_view_type_id(self._position_view_type_id())
+
+        def _clean_position_view_state(self, state: dict[str, Any]) -> dict[str, Any]:
+            cleaned = deepcopy(state)
+            for key in (
+                "_profile_filter_options",
+                "data_contract",
+                "source_selection",
+                "style",
+                "position_view_states",
+            ):
+                cleaned.pop(key, None)
+            return cleaned
+
+        def _default_position_view_state(self, view_type: str) -> dict[str, Any]:
+            defaults = self._clean_position_view_state(deepcopy(self._default_profile_settings))
+            normalized = self._normalize_position_view_type_id(view_type)
+            defaults["_position_view_state_initialized"] = True
+            defaults["position_active_view_type"] = normalized
+            defaults.update(
+                {
+                    "x_lim": None,
+                    "y_lim": None,
+                    "x_min": None,
+                    "x_max": None,
+                    "y_min": None,
+                    "y_max": None,
+                    "annotations": None,
+                    "_gui_sync_modes": None,
+                }
+            )
+            if normalized == PLOT_VIEW_2D_HEATMAP:
+                defaults.update(
+                    {
+                        "component": "2d-projection",
+                        "projection_x": "x",
+                        "projection_y": "y",
+                        "projection_value": "distance",
+                        "projection_render_mode": "color-scale",
+                        "projection_filter_min": None,
+                        "projection_filter_max": None,
+                        "legend": False,
+                        "markers": False,
+                    }
+                )
+                defaults["view_mapping"] = serialize_plot_view_mapping(
+                    position_plot_options_to_view_mapping(
+                        component="2d-projection",
+                        projection_x="x",
+                        projection_y="y",
+                        projection_value="distance",
+                        projection_render_mode="color-scale",
+                    )
+                )
+            else:
+                defaults.update(
+                    {
+                        "component": "distance",
+                        "time_axis": "ps",
+                        "projection_filter_min": None,
+                        "projection_filter_max": None,
+                    }
+                )
+                defaults["view_mapping"] = serialize_plot_view_mapping(
+                    position_plot_options_to_view_mapping(component="distance", time_axis="ps")
+                )
+            return defaults
+
+        def _snapshot_position_view_state(self, view_type: str) -> dict[str, Any]:
+            normalized = self._normalize_position_view_type_id(view_type)
+            if self._analysis_name != "position" or not hasattr(self, "position_view_type"):
+                return {}
+            try:
+                snapshot = self._collect_settings()
+            except Exception:
+                snapshot = {}
+            if not isinstance(snapshot, dict):
+                snapshot = {}
+            snapshot = self._clean_position_view_state(snapshot)
+            snapshot["_position_view_state_initialized"] = True
+            snapshot["position_active_view_type"] = normalized
+            return snapshot
+
+        def _active_position_settings_with_view_state(
+            self,
+            settings: dict[str, Any],
+            view_type: str,
+            state: dict[str, Any],
+        ) -> dict[str, Any]:
+            merged = dict(settings)
+            merged.update(deepcopy(state))
+            normalized = self._normalize_position_view_type_id(view_type)
+            merged["position_active_view_type"] = normalized
+            return merged
+
+        def _apply_position_view_state(self, view_type: str, state: dict[str, Any]) -> None:
+            if self._analysis_name != "position":
+                return
+            normalized = self._normalize_position_view_type_id(view_type)
+            restore_state = (
+                deepcopy(state)
+                if isinstance(state, dict) and state.get("_position_view_state_initialized")
+                else self._default_position_view_state(normalized)
+            )
+            restore_settings = self._active_position_settings_with_view_state(
+                self._collect_settings() if hasattr(self, "position_view_type") else {},
+                normalized,
+                restore_state,
+            )
+            previous_switching = self._position_view_state_switching
+            previous_suspend = self._suspend_preview_events
+            self._position_view_state_switching = True
+            self._suspend_preview_events = True
+            try:
+                self._populate(restore_settings)
+                self._position_active_view_type = normalized
+            finally:
+                self._suspend_preview_events = previous_suspend
+                self._position_view_state_switching = previous_switching
+
+        def _merge_position_view_state_into_settings(self, settings: dict[str, Any]) -> dict[str, Any]:
+            if self._analysis_name != "position":
+                return settings
+            active = self._position_active_view_type_id()
+            states = deepcopy(self._position_view_states)
+            active_state = self._clean_position_view_state(deepcopy(settings))
+            active_state["_position_view_state_initialized"] = True
+            active_state["position_active_view_type"] = active
+            states[active] = active_state
+            merged = dict(settings)
+            merged["position_active_view_type"] = active
+            merged["position_view_states"] = states
+            return merged
+
+        def _normalize_orientation_view_type_id(self, value: Any) -> str:
+            token = str(value or "").strip().lower()
+            if token in {"2d", "2d heatmap", "heatmap", "heatmap_2d", "plot_2d_heatmap"}:
+                return PLOT_VIEW_2D_HEATMAP
+            return PLOT_VIEW_1D_LINE
+
+        def _orientation_active_view_type_id(self) -> str:
+            if self._analysis_name != "orientation":
+                return PLOT_VIEW_1D_LINE
+            if hasattr(self, "orientation_view_type"):
+                return self._normalize_orientation_view_type_id(
+                    _ORIENTATION_VIEW_TYPE_ID_BY_LABEL.get(
+                        self.orientation_view_type.currentText().strip(),
+                        PLOT_VIEW_1D_LINE,
+                    )
+                )
+            return self._orientation_active_view_type
+
+        def _clean_orientation_view_state(self, state: dict[str, Any]) -> dict[str, Any]:
+            cleaned = deepcopy(state)
+            for key in (
+                "_profile_filter_options",
+                "data_contract",
+                "source_selection",
+                "style",
+                "orientation_view_states",
+            ):
+                cleaned.pop(key, None)
+            return cleaned
+
+        def _default_orientation_view_state(self, view_type: str) -> dict[str, Any]:
+            defaults = self._clean_orientation_view_state(deepcopy(self._default_profile_settings))
+            normalized = self._normalize_orientation_view_type_id(view_type)
+            defaults["_orientation_view_state_initialized"] = True
+            defaults["orientation_active_view_type"] = normalized
+            defaults.update(
+                {
+                    "x_lim": None,
+                    "y_lim": None,
+                    "x_min": None,
+                    "x_max": None,
+                    "y_min": None,
+                    "y_max": None,
+                    "annotations": None,
+                    "_gui_sync_modes": None,
+                }
+            )
+            if normalized == PLOT_VIEW_2D_HEATMAP:
+                defaults.update(
+                    {
+                        "component": "heatmap",
+                        "orientation_line_x_axis": "distance",
+                        "orientation_heatmap_x_axis": None,
+                        "orientation_heatmap_y_axis": None,
+                        "orientation_filter_x_min": None,
+                        "orientation_filter_x_max": None,
+                        "orientation_filter_y_min": None,
+                        "orientation_filter_y_max": None,
+                        "orientation_filter_z_min": None,
+                        "orientation_filter_z_max": None,
+                        "orientation_filter_distance_min": None,
+                        "orientation_filter_distance_max": None,
+                        "x_bin_width": None,
+                        "y_bin_width": None,
+                        "x_bin_reducer": None,
+                        "y_bin_reducer": None,
+                        "legend": False,
+                        "markers": False,
+                    }
+                )
+                defaults["view_mapping"] = serialize_plot_view_mapping(
+                    orientation_plot_options_to_view_mapping(
+                        component="heatmap",
+                        angle=str(defaults.get("angle") or "polar"),
+                    )
+                )
+            else:
+                defaults.update(
+                    {
+                        "component": "average",
+                        "orientation_line_x_axis": "distance",
+                        "orientation_filter_x_min": None,
+                        "orientation_filter_x_max": None,
+                        "orientation_filter_y_min": None,
+                        "orientation_filter_y_max": None,
+                        "orientation_filter_z_min": None,
+                        "orientation_filter_z_max": None,
+                        "orientation_filter_distance_min": None,
+                        "orientation_filter_distance_max": None,
+                        "x_bin_width": None,
+                        "y_bin_width": None,
+                        "y_bin_reducer": None,
+                    }
+                )
+                defaults["view_mapping"] = serialize_plot_view_mapping(
+                    orientation_plot_options_to_view_mapping(
+                        component=str(defaults.get("component") or "average"),
+                        angle=str(defaults.get("angle") or "polar"),
+                        line_x_axis=str(defaults.get("orientation_line_x_axis") or "distance"),
+                    )
+                )
+            return defaults
+
+        def _snapshot_orientation_view_state(self, view_type: str) -> dict[str, Any]:
+            normalized = self._normalize_orientation_view_type_id(view_type)
+            if self._analysis_name != "orientation" or not hasattr(self, "orientation_view_type"):
+                return {}
+            try:
+                snapshot = self._collect_settings()
+            except Exception:
+                snapshot = {}
+            if not isinstance(snapshot, dict):
+                snapshot = {}
+            snapshot = deepcopy(snapshot)
+            snapshot = self._clean_orientation_view_state(snapshot)
+            snapshot["_orientation_view_state_initialized"] = True
+            snapshot["orientation_active_view_type"] = normalized
+            return snapshot
+
+        def _active_orientation_settings_with_view_state(
+            self,
+            settings: dict[str, Any],
+            view_type: str,
+            state: dict[str, Any],
+        ) -> dict[str, Any]:
+            merged = dict(settings)
+            merged.update(deepcopy(state))
+            normalized = self._normalize_orientation_view_type_id(view_type)
+            merged["orientation_active_view_type"] = normalized
+            if normalized == PLOT_VIEW_2D_HEATMAP:
+                merged["view_mapping"] = serialize_plot_view_mapping(
+                    orientation_plot_options_to_view_mapping(
+                        component="heatmap",
+                        angle=str(merged.get("angle") or "polar"),
+                    )
+                )
+            else:
+                component = str(merged.get("component") or "average")
+                if component == "heatmap":
+                    component = "average"
+                merged["view_mapping"] = serialize_plot_view_mapping(
+                    orientation_plot_options_to_view_mapping(
+                        component=component,
+                        angle=str(merged.get("angle") or "polar"),
+                        line_x_axis=str(merged.get("orientation_line_x_axis") or "distance"),
+                    )
+                )
+            return merged
+
+        def _apply_orientation_view_state(self, view_type: str, state: dict[str, Any]) -> None:
+            if self._analysis_name != "orientation":
+                return
+            normalized = self._normalize_orientation_view_type_id(view_type)
+            restore_state = (
+                deepcopy(state)
+                if isinstance(state, dict) and state.get("_orientation_view_state_initialized")
+                else self._default_orientation_view_state(normalized)
+            )
+            restore_settings = self._active_orientation_settings_with_view_state(
+                self._collect_settings() if hasattr(self, "orientation_view_type") else {},
+                normalized,
+                restore_state,
+            )
+            previous_switching = self._orientation_view_state_switching
+            previous_suspend = self._suspend_preview_events
+            self._orientation_view_state_switching = True
+            self._suspend_preview_events = True
+            try:
+                self._populate(restore_settings)
+                self._orientation_active_view_type = normalized
+            finally:
+                self._suspend_preview_events = previous_suspend
+                self._orientation_view_state_switching = previous_switching
+
+        def _merge_orientation_view_state_into_settings(self, settings: dict[str, Any]) -> dict[str, Any]:
+            if self._analysis_name != "orientation":
+                return settings
+            active = self._orientation_active_view_type_id()
+            states = deepcopy(self._orientation_view_states)
+            active_state = self._clean_orientation_view_state(deepcopy(settings))
+            active_state["_orientation_view_state_initialized"] = True
+            active_state["orientation_active_view_type"] = active
+            states[active] = active_state
+            merged = dict(settings)
+            merged["orientation_active_view_type"] = active
+            merged["orientation_view_states"] = states
+            return merged
 
         def _sync_density_species_selection_for_view_type(
             self,
@@ -9321,7 +11053,7 @@ def launch_plot_settings_panel(
             view_type_id = self._density_current_view_type_id()
             previous_view_type_id = self._density_previous_view_type_id
             self._density_previous_view_type_id = view_type_id
-            if view_type_id == "heatmap_2d":
+            if canonical_plot_view_id(view_type_id) == PLOT_VIEW_2D_HEATMAP:
                 if previous_view_type_id != view_type_id and record_snapshot:
                     self._density_1d_enabled_species_snapshot = self._enabled_density_species()
                 active_value = next(
@@ -9343,7 +11075,10 @@ def launch_plot_settings_panel(
                 finally:
                     self._density_species_checkbox_syncing = False
                 return
-            if previous_view_type_id == "heatmap_2d" and self._density_1d_enabled_species_snapshot is not None:
+            if (
+                canonical_plot_view_id(previous_view_type_id) == PLOT_VIEW_2D_HEATMAP
+                and self._density_1d_enabled_species_snapshot is not None
+            ):
                 enabled = set(self._density_1d_enabled_species_snapshot)
                 self._density_species_checkbox_syncing = True
                 try:
@@ -9361,6 +11096,13 @@ def launch_plot_settings_panel(
             if isinstance(contract, PlotDataContract):
                 return contract
             return _fallback_coordination_plot_data_contract()
+
+        def _coordination_supported_view_type_ids(self) -> list[str]:
+            contract = self._coordination_contract()
+            ordered = [PLOT_VIEW_1D_LINE]
+            if _contract_has_public_heatmap_view(contract):
+                ordered.append(PLOT_VIEW_2D_HEATMAP)
+            return ordered
 
         def _orientation_line_contract(self) -> PlotDataContract:
             contract = self._orientation_line_data_contract
@@ -9384,10 +11126,10 @@ def launch_plot_settings_panel(
             view_type = (
                 _DENSITY_VIEW_TYPE_ID_BY_LABEL.get(
                     self.density_view_type.currentText().strip(),
-                    "line_1d",
+                    PLOT_VIEW_1D_LINE,
                 )
                 if hasattr(self, "density_view_type")
-                else "line_1d"
+                else PLOT_VIEW_1D_LINE
             )
             x_mode = self._selected_density_x_mode() if hasattr(self, "density_x_mode") else "distance"
             quantity = (
@@ -9402,10 +11144,28 @@ def launch_plot_settings_panel(
             )
 
         def _current_coordination_mapping(self) -> PlotViewMapping:
-            view_preset = (
-                self.coordination_component.currentText().strip() or "distance"
+            view_type_label = (
+                self.coordination_component.currentText().strip()
                 if hasattr(self, "coordination_component")
-                else "distance"
+                else ""
+            )
+            view_type_id = _COORDINATION_VIEW_TYPE_ID_BY_LABEL.get(
+                view_type_label,
+                PLOT_VIEW_1D_LINE,
+            )
+            line_x_label = (
+                self.coordination_line_x_quantity.currentText().strip()
+                if hasattr(self, "coordination_line_x_quantity")
+                else ""
+            )
+            line_x_quantity = _COORDINATION_LINE_X_QUANTITY_BACKEND_BY_LABEL.get(
+                line_x_label,
+                line_x_label or "distance",
+            )
+            component = (
+                "time-distance"
+                if canonical_plot_view_id(view_type_id) == PLOT_VIEW_2D_HEATMAP
+                else line_x_quantity
             )
             time_x_role = (
                 self.coordination_time_axis.currentText().strip() or "ps"
@@ -9413,24 +11173,77 @@ def launch_plot_settings_panel(
                 else "ps"
             )
             return coordination_plot_options_to_view_mapping(
-                component=view_preset,
+                component=component,
                 time_axis=time_x_role,
             )
 
         def _current_orientation_mapping(self) -> PlotViewMapping:
-            view_preset = (
-                self.orientation_component.currentText().strip() or "average"
-                if hasattr(self, "orientation_component")
-                else "average"
+            view_type = (
+                _ORIENTATION_VIEW_TYPE_ID_BY_LABEL.get(
+                    self.orientation_view_type.currentText().strip(),
+                    PLOT_VIEW_1D_LINE,
+                )
+                if hasattr(self, "orientation_view_type")
+                else PLOT_VIEW_1D_LINE
             )
+            if canonical_plot_view_id(view_type) == PLOT_VIEW_2D_HEATMAP:
+                component = "heatmap"
+            else:
+                line_quantity_label = (
+                    self.orientation_component.currentText().strip()
+                    if hasattr(self, "orientation_component")
+                    else ""
+                )
+                component = _ORIENTATION_LINE_QUANTITY_BACKEND_BY_LABEL.get(
+                    line_quantity_label,
+                    line_quantity_label or "average",
+                )
             angle_role = (
                 self.orientation_angle.currentText().strip() or "polar"
                 if hasattr(self, "orientation_angle")
                 else "polar"
             )
             return orientation_plot_options_to_view_mapping(
-                component=view_preset,
+                component=component,
                 angle=angle_role,
+                line_x_axis=(
+                    _DENSITY_X_MODE_BY_LABEL.get(
+                        self.orientation_line_x_axis.currentText().strip().lower(),
+                        "distance",
+                    )
+                    if hasattr(self, "orientation_line_x_axis")
+                    else "distance"
+                ),
+            )
+
+        def _set_orientation_view_type_from_component(self, component: str) -> None:
+            if not hasattr(self, "orientation_view_type"):
+                return
+            view_type_id = (
+                PLOT_VIEW_2D_HEATMAP
+                if str(component).strip().lower() == "heatmap"
+                else PLOT_VIEW_1D_LINE
+            )
+            self._set_combo_value(
+                self.orientation_view_type,
+                _ORIENTATION_VIEW_TYPE_LABEL_BY_ID.get(
+                    view_type_id,
+                    _ORIENTATION_VIEW_TYPE_LABEL_BY_ID[PLOT_VIEW_1D_LINE],
+                ),
+            )
+
+        def _set_orientation_line_quantity(self, component: str) -> None:
+            if not hasattr(self, "orientation_component"):
+                return
+            backend = str(component or "average").strip().lower()
+            if backend == "heatmap":
+                backend = "average"
+            self._set_combo_value(
+                self.orientation_component,
+                _ORIENTATION_LINE_QUANTITY_LABEL_BY_BACKEND.get(
+                    backend,
+                    _ORIENTATION_LINE_QUANTITY_LABEL_BY_BACKEND["average"],
+                ),
             )
 
         def _current_potential_mapping(self) -> PlotViewMapping:
@@ -9439,8 +11252,6 @@ def launch_plot_settings_panel(
                     self.potential_view_type.currentText().strip(),
                     "line_1d",
                 )
-                if view_type_id == "table_records":
-                    return potential_plot_options_to_view_mapping(table_view=True)
                 series_token = _POTENTIAL_SERIES_ID_BY_LABEL.get(
                     self.potential_series_mode.currentText().strip(),
                     "summary",
@@ -9448,9 +11259,6 @@ def launch_plot_settings_panel(
                 y_quantity = None if series_token == "summary" else series_token
                 return potential_plot_options_to_view_mapping(y_quantity=y_quantity)
             return potential_plot_options_to_view_mapping()
-
-        def _is_potential_table_mode(self) -> bool:
-            return str(self._current_potential_mapping().view_type_id).strip().lower() == "table_records"
 
         def _update_density_contract_summary(self) -> None:
             if self._analysis_name != "density":
@@ -9519,7 +11327,7 @@ def launch_plot_settings_panel(
 
         def _active_orientation_contract(self) -> PlotDataContract:
             mapping = self._current_orientation_mapping()
-            if str(mapping.view_type_id).strip().lower() == "heatmap_2d":
+            if canonical_plot_view_id(mapping.view_type_id) == PLOT_VIEW_2D_HEATMAP:
                 return self._orientation_heatmap_contract()
             return self._orientation_line_contract()
 
@@ -9590,6 +11398,22 @@ def launch_plot_settings_panel(
                 self._potential_backend_summary_label.setText(str(exc))
 
         def _handle_density_mapping_change(self, *_unused: object) -> None:
+            if (
+                self._analysis_name == "density"
+                and not self._density_view_state_switching
+                and hasattr(self, "density_view_type")
+                and self.sender() is self.density_view_type
+            ):
+                previous_view = self._density_active_view_type
+                next_view = self._density_current_view_type_id()
+                if previous_view != next_view:
+                    self._density_view_states[previous_view] = (
+                        self._snapshot_density_view_state(previous_view)
+                    )
+                    target_state = self._density_view_states.get(next_view)
+                    if not isinstance(target_state, dict):
+                        target_state = self._default_density_view_state(next_view)
+                    self._apply_density_view_state(next_view, target_state)
             self._sync_density_species_selection_for_view_type()
             self._apply_density_default_bin_width_texts()
             self._update_density_contract_summary()
@@ -9674,6 +11498,19 @@ def launch_plot_settings_panel(
             self._handle_series_identity_change()
 
         def _handle_orientation_mapping_change(self, *_unused: object) -> None:
+            if self._analysis_name == "orientation" and not self._orientation_view_state_switching:
+                previous_view = self._orientation_active_view_type
+                next_view = self._orientation_active_view_type_id()
+                if previous_view != next_view:
+                    self._orientation_view_states[previous_view] = (
+                        self._snapshot_orientation_view_state(previous_view)
+                    )
+                    target_state = self._orientation_view_states.get(next_view)
+                    if target_state is None:
+                        target_state = self._default_orientation_view_state(next_view)
+                    self._apply_orientation_view_state(next_view, target_state)
+                    self._handle_series_identity_change()
+                    return
             self._update_orientation_contract_summary()
             self._handle_series_identity_change()
 
@@ -9689,17 +11526,11 @@ def launch_plot_settings_panel(
             return _fallback_position_plot_data_contract()
 
         def _position_supported_view_type_ids(self) -> list[str]:
-            available = {
-                str(view_type.id).strip()
-                for view_type in self._position_contract().view_types
-                if str(view_type.id).strip()
-            }
-            ordered = [
-                view_type_id
-                for view_type_id in ("line_1d", "trajectory_2d")
-                if not available or view_type_id in available
-            ]
-            return ordered or ["line_1d"]
+            contract = self._position_contract()
+            ordered = [PLOT_VIEW_1D_LINE]
+            if _contract_has_public_heatmap_view(contract):
+                ordered.append(PLOT_VIEW_2D_HEATMAP)
+            return ordered
 
         def _position_mapping_candidate_quantity_ids(
             self,
@@ -9707,7 +11538,13 @@ def launch_plot_settings_panel(
             view_type_id: str,
             role: str,
         ) -> list[str]:
-            if view_type_id == "line_1d":
+            canonical_view_type_id = canonical_plot_view_id(view_type_id)
+            validation_view_type_id = (
+                "trajectory_2d"
+                if canonical_view_type_id == PLOT_VIEW_2D_HEATMAP
+                else "line_1d"
+            )
+            if canonical_view_type_id == PLOT_VIEW_1D_LINE:
                 backend_supported = (
                     {"time_ps", "time_fs", "step", "frame_index"}
                     if role == "x"
@@ -9715,7 +11552,7 @@ def launch_plot_settings_panel(
                     if role == "y"
                     else set()
                 )
-            elif view_type_id == "trajectory_2d":
+            elif canonical_view_type_id == PLOT_VIEW_2D_HEATMAP:
                 backend_supported = set(_POSITION_GUI_TOKEN_BY_QUANTITY_ID)
             else:
                 backend_supported = set()
@@ -9727,7 +11564,7 @@ def launch_plot_settings_panel(
                     continue
                 status = visual_role_compatibility(
                     contract,
-                    view_type_id=view_type_id,
+                    view_type_id=validation_view_type_id,
                     role=role,
                     quantity_id=quantity_id,
                 )
@@ -9740,9 +11577,9 @@ def launch_plot_settings_panel(
             if hasattr(self, "position_view_type"):
                 return _POSITION_GUI_VIEW_TYPE_ID_BY_LABEL.get(
                     self.position_view_type.currentText().strip(),
-                    "line_1d",
+                    PLOT_VIEW_1D_LINE,
                 )
-            return "line_1d"
+            return PLOT_VIEW_1D_LINE
 
         def _current_position_mapping(
             self,
@@ -9762,11 +11599,11 @@ def launch_plot_settings_panel(
 
             if hasattr(self, "position_view_type"):
                 view_type_id = self._position_view_type_id()
-                if view_type_id == "line_1d":
+                if canonical_plot_view_id(view_type_id) == PLOT_VIEW_1D_LINE:
                     x_token = self.position_mapping_x.currentText().strip() or "ps"
                     y_token = self.position_mapping_y.currentText().strip() or "distance"
                     return PlotViewMapping(
-                        view_type_id="line_1d",
+                        view_type_id=PLOT_VIEW_1D_LINE,
                         x=_position_quantity_id_from_token(x_token),
                         y=_position_quantity_id_from_token(y_token),
                         split_by="atom",
@@ -9774,18 +11611,22 @@ def launch_plot_settings_panel(
                 value_token = self.position_mapping_value.currentText().strip() or "distance"
                 filter_min = _parse_optional_bound(
                     self.position_mapping_filter_min.text(),
-                    field_name="projection range minimum",
+                    field_name="2D Heatmap range minimum",
                 )
                 filter_max = _parse_optional_bound(
                     self.position_mapping_filter_max.text(),
-                    field_name="projection range maximum",
+                    field_name="2D Heatmap range maximum",
                 )
-                render_mode = (
+                render_mode_label = (
                     self.position_mapping_render_mode.currentText().strip() or "color-scale"
+                )
+                render_mode = _POSITION_RENDER_MODE_BACKEND_BY_LABEL.get(
+                    render_mode_label,
+                    render_mode_label,
                 )
                 value_id = _position_quantity_id_from_token(value_token)
                 return PlotViewMapping(
-                    view_type_id="trajectory_2d",
+                    view_type_id=PLOT_VIEW_2D_HEATMAP,
                     x=_position_quantity_id_from_token(
                         self.position_mapping_x.currentText().strip() or "x"
                     ),
@@ -9802,7 +11643,7 @@ def launch_plot_settings_panel(
             return position_plot_options_to_view_mapping(component="distance", time_axis="ps")
 
         def _current_position_is_projection_view(self) -> bool:
-            return self._position_view_type_id() == "trajectory_2d"
+            return canonical_plot_view_id(self._position_view_type_id()) == PLOT_VIEW_2D_HEATMAP
 
         def _set_position_mapping_combo_items(
             self,
@@ -9811,7 +11652,7 @@ def launch_plot_settings_panel(
             if not hasattr(self, "position_mapping_x"):
                 return
             active_mapping = mapping or self._current_position_mapping()
-            view_type_id = str(active_mapping.view_type_id).strip() or "line_1d"
+            view_type_id = str(active_mapping.view_type_id).strip() or PLOT_VIEW_1D_LINE
             self._set_combo_items(
                 self.position_mapping_x,
                 [
@@ -9862,13 +11703,19 @@ def launch_plot_settings_panel(
                 return
             self._set_combo_value(
                 self.position_view_type,
-                _POSITION_GUI_VIEW_TYPE_LABEL_BY_ID.get(mapping.view_type_id, "Line 1D"),
+                _POSITION_GUI_VIEW_TYPE_LABEL_BY_ID.get(
+                    mapping.view_type_id,
+                    plot_view_display_label(PLOT_VIEW_1D_LINE),
+                ),
             )
             self._set_position_mapping_combo_items(mapping)
             if hasattr(self, "position_mapping_render_mode"):
                 self._set_combo_value(
                     self.position_mapping_render_mode,
-                    str(mapping.fixed_values.get("projection_render_mode") or "color-scale"),
+                    _POSITION_RENDER_MODE_LABEL_BY_BACKEND.get(
+                        str(mapping.fixed_values.get("projection_render_mode") or "color-scale"),
+                        str(mapping.fixed_values.get("projection_render_mode") or "color-scale"),
+                    ),
                 )
             if hasattr(self, "position_mapping_filter_min"):
                 self.position_mapping_filter_min.setText(
@@ -9890,6 +11737,19 @@ def launch_plot_settings_panel(
             self._handle_series_identity_change()
 
         def _handle_position_mapping_view_change(self, *_unused: object) -> None:
+            if self._analysis_name == "position" and not self._position_view_state_switching:
+                previous_view = self._position_active_view_type
+                next_view = self._position_view_type_id()
+                if previous_view != next_view:
+                    self._position_view_states[previous_view] = (
+                        self._snapshot_position_view_state(previous_view)
+                    )
+                    target_state = self._position_view_states.get(next_view)
+                    if target_state is None:
+                        target_state = self._default_position_view_state(next_view)
+                    self._apply_position_view_state(next_view, target_state)
+                    self._handle_series_identity_change()
+                    return
             self._set_position_preset_label("Custom")
             self._set_position_mapping_combo_items()
             self._update_position_contract_summary()
@@ -9996,25 +11856,25 @@ def launch_plot_settings_panel(
             )
             self._add_form_row(
                 mapping_form,
-                "X",
+                "X-axis quantity",
                 self.position_mapping_x,
                 tooltip_id="data.position.mapping.x",
             )
             self._add_form_row(
                 mapping_form,
-                "Y",
+                "Y-axis quantity",
                 self.position_mapping_y,
                 tooltip_id="data.position.mapping.y",
             )
             self._add_form_row(
                 mapping_form,
-                "Render mode",
+                "Heatmap rendering",
                 self.position_mapping_render_mode,
                 tooltip_id="data.position.projection_render_mode",
             )
             self._add_form_row(
                 mapping_form,
-                "Value / color / filter by",
+                "Color quantity",
                 self.position_mapping_value,
                 tooltip_id="data.position.mapping.value",
             )
@@ -10026,13 +11886,13 @@ def launch_plot_settings_panel(
             )
             self._add_form_row(
                 mapping_form,
-                "Range min",
+                "Color range min",
                 self.position_mapping_filter_min,
                 tooltip_id="data.position.projection_range_min",
             )
             self._add_form_row(
                 mapping_form,
-                "Range max",
+                "Color range max",
                 self.position_mapping_filter_max,
                 tooltip_id="data.position.projection_range_max",
             )
@@ -10100,38 +11960,45 @@ def launch_plot_settings_panel(
             self._position_mapping_status_label.setText(
                 _mapping_status_label(compatibility)
             )
+            view_label = plot_view_display_label(mapping.view_type_id)
             role_parts = [
-                f"x={_position_quantity_token(mapping.x)}",
-                f"y={_position_quantity_token(mapping.y)}",
+                f"x-axis={_position_quantity_token(mapping.x)}",
+                f"y-axis={_position_quantity_token(mapping.y)}",
             ]
             if mapping.color is not None:
-                role_parts.append(f"color={_position_quantity_token(mapping.color)}")
+                role_parts.append(f"color quantity={_position_quantity_token(mapping.color)}")
             if mapping.filter_by is not None:
-                filter_text = f"filter={_position_quantity_token(mapping.filter_by)}"
+                filter_text = f"range quantity={_position_quantity_token(mapping.filter_by)}"
                 if mapping.filter_min is not None or mapping.filter_max is not None:
                     filter_text += (
                         f" [{'' if mapping.filter_min is None else mapping.filter_min}, "
                         f"{'' if mapping.filter_max is None else mapping.filter_max}]"
                     )
                 role_parts.append(filter_text)
-            role_parts.append(f"split_by={mapping.split_by or 'atom'}")
+            role_parts.append(f"series={mapping.split_by or 'atom'}")
             self._position_mapping_summary_label.setText(
-                f"{mapping.view_type_id}: " + ", ".join(role_parts)
+                f"{view_label}: " + ", ".join(role_parts)
             )
             try:
                 legacy = position_view_mapping_to_plot_options(mapping)
-                backend_parts = [f"component={legacy.get('component')}"]
+                backend_parts = [
+                    f"view={view_label}",
+                ]
                 if legacy.get("component") == "2d-projection":
+                    render_mode = _POSITION_RENDER_MODE_LABEL_BY_BACKEND.get(
+                        str(legacy.get("projection_render_mode") or "color-scale"),
+                        str(legacy.get("projection_render_mode") or "color-scale"),
+                    )
                     backend_parts.extend(
                         [
-                            f"projection_x={legacy.get('projection_x')}",
-                            f"projection_y={legacy.get('projection_y')}",
-                            f"projection_value={legacy.get('projection_value')}",
-                            f"render_mode={legacy.get('projection_render_mode')}",
+                            f"x-axis={legacy.get('projection_x')}",
+                            f"y-axis={legacy.get('projection_y')}",
+                            f"color quantity={legacy.get('projection_value')}",
+                            f"rendering={render_mode}",
                         ]
                     )
                 else:
-                    backend_parts.append(f"time_axis={legacy.get('time_axis')}")
+                    backend_parts.append(f"x-axis time unit={legacy.get('time_axis')}")
                 self._position_backend_summary_label.setText(", ".join(backend_parts))
             except ValueError as exc:
                 self._position_backend_summary_label.setText(str(exc))
@@ -10141,11 +12008,14 @@ def launch_plot_settings_panel(
             if analysis in {"density", "msd", "rdf", "temperature"}:
                 return True
             if analysis == "potential":
-                return not self._is_potential_table_mode()
+                return True
             if analysis == "position":
                 return not self._current_position_is_projection_view()
             if analysis == "coordination":
-                return str(self._current_coordination_mapping().view_type_id).strip().lower() == "line_1d"
+                return (
+                    canonical_plot_view_id(self._current_coordination_mapping().view_type_id)
+                    == PLOT_VIEW_1D_LINE
+                )
             if analysis == "orientation":
                 return not self._is_orientation_heatmap_mode()
             return False
@@ -10153,11 +12023,11 @@ def launch_plot_settings_panel(
         def _error_supported_for_current_view(self) -> bool:
             analysis = str(self._analysis_name or "")
             if analysis == "potential":
-                return not self._is_potential_table_mode()
+                return True
             if analysis == "coordination":
                 return (
-                    str(self._current_coordination_mapping().view_type_id).strip().lower()
-                    == "line_1d"
+                    canonical_plot_view_id(self._current_coordination_mapping().view_type_id)
+                    == PLOT_VIEW_1D_LINE
                 )
             if analysis == "orientation":
                 return not self._is_orientation_heatmap_mode()
@@ -10170,16 +12040,16 @@ def launch_plot_settings_panel(
 
         def _current_plot_family(self) -> str:
             analysis = str(self._analysis_name or "")
-            if analysis == "potential" and self._is_potential_table_mode():
-                return "table"
             if analysis == "coordination":
                 mapping = self._current_coordination_mapping()
-                if str(mapping.view_type_id).strip().lower() == "trajectory_2d":
-                    return "time-distance"
+                if canonical_plot_view_id(mapping.view_type_id) == PLOT_VIEW_2D_HEATMAP:
+                    return "heatmap"
+            if analysis == "density" and self._is_density_heatmap_mode():
+                return "heatmap"
             if analysis == "orientation" and self._is_orientation_heatmap_mode():
                 return "heatmap"
             if analysis == "position" and self._current_position_is_projection_view():
-                return "projection2d"
+                return "heatmap"
             return _plot_family_for_view(
                 analysis,
                 orientation_heatmap=self._is_orientation_heatmap_mode(),
@@ -10200,6 +12070,11 @@ def launch_plot_settings_panel(
             plot_family = self._current_plot_family()
             layer_kind = self._current_layer_kind()
             is_line_family = plot_family == "line"
+            is_heatmap_family = plot_family == "heatmap"
+            active_layer_enabled = (
+                0 <= self._series_active_index < len(self._series_enabled_data)
+                and bool(self._series_enabled_data[self._series_active_index])
+            )
             if layer_kind == "annotation":
                 return _LayerInspectorCapabilities(
                     plot_family=plot_family,
@@ -10223,14 +12098,14 @@ def launch_plot_settings_panel(
                     show_visibility_label=True,
                     show_style=is_line_family,
                     show_markers=is_line_family,
-                    show_derived_lines=is_line_family,
+                    show_derived_lines=is_line_family and active_layer_enabled,
                     show_uncertainty=False,
                     show_normalization=is_line_family,
-                    show_integration=is_line_family,
+                    show_integration=is_line_family and active_layer_enabled,
                     show_group_members=True,
                     show_metadata=True,
-                    show_fit_editor=is_line_family,
-                    show_cumulative_editor=is_line_family,
+                    show_fit_editor=is_line_family and active_layer_enabled,
+                    show_cumulative_editor=is_line_family and active_layer_enabled,
                 )
             if layer_kind == "fit":
                 return _LayerInspectorCapabilities(
@@ -10239,13 +12114,13 @@ def launch_plot_settings_panel(
                     show_visibility_label=False,
                     show_style=False,
                     show_markers=False,
-                    show_derived_lines=True,
+                    show_derived_lines=active_layer_enabled,
                     show_uncertainty=False,
                     show_normalization=False,
                     show_integration=False,
                     show_group_members=False,
                     show_metadata=False,
-                    show_fit_editor=is_line_family,
+                    show_fit_editor=is_line_family and active_layer_enabled,
                     show_cumulative_editor=False,
                 )
             if layer_kind == "cumulative":
@@ -10255,40 +12130,47 @@ def launch_plot_settings_panel(
                     show_visibility_label=False,
                     show_style=False,
                     show_markers=False,
-                    show_derived_lines=True,
+                    show_derived_lines=active_layer_enabled,
                     show_uncertainty=False,
                     show_normalization=False,
                     show_integration=False,
                     show_group_members=False,
                     show_metadata=False,
                     show_fit_editor=False,
-                    show_cumulative_editor=is_line_family,
+                    show_cumulative_editor=is_line_family and active_layer_enabled,
                 )
             return _LayerInspectorCapabilities(
                 plot_family=plot_family,
                 layer_kind=layer_kind,
-                show_visibility_label=is_line_family,
+                show_visibility_label=is_line_family or is_heatmap_family,
                 show_style=is_line_family,
                 show_markers=is_line_family,
-                show_derived_lines=is_line_family,
-                show_uncertainty=self._error_supported_for_current_view(),
+                show_derived_lines=is_line_family and active_layer_enabled,
+                show_uncertainty=self._error_supported_for_current_view()
+                and active_layer_enabled,
                 show_normalization=is_line_family,
-                show_integration=is_line_family,
+                show_integration=is_line_family and active_layer_enabled,
                 show_group_members=False,
                 show_metadata=True,
-                show_fit_editor=is_line_family and self._fit_supported_for_current_view(),
-                show_cumulative_editor=is_line_family,
+                show_fit_editor=is_line_family
+                and active_layer_enabled
+                and self._fit_supported_for_current_view(),
+                show_cumulative_editor=is_line_family and active_layer_enabled,
             )
 
         def _current_figure_capabilities(self) -> _FigureInspectorCapabilities:
             plot_family = self._current_plot_family()
+            is_line = plot_family == "line"
             show_heatmap = plot_family == "heatmap"
             return _FigureInspectorCapabilities(
                 plot_family=plot_family,
-                show_legend=plot_family == "line",
-                show_lines=plot_family == "line",
+                show_legend=is_line,
+                show_lines=is_line,
                 show_heatmap=show_heatmap,
                 show_colorbar=show_heatmap,
+                show_axis_transforms=is_line,
+                show_advanced_legend=is_line,
+                show_advanced_lines=is_line,
             )
 
         def _fit_child_series_id(self, index: int) -> str:
@@ -10478,14 +12360,18 @@ def launch_plot_settings_panel(
                 degree = _coerce_degree_text(self._series_fit_degrees_data[index])
                 if degree is not None:
                     config["fit_degree"] = degree
-            if 0 <= index < len(self._series_fit_range_modes_data):
-                token = self._series_fit_range_modes_data[index].strip().lower()
-                if token in _FIT_RANGE_MODES:
-                    config["fit_range_mode"] = token
             if 0 <= index < len(self._series_fit_x_mins_data):
                 config["fit_x_min"] = _soft_float(self._series_fit_x_mins_data[index])
             if 0 <= index < len(self._series_fit_x_maxs_data):
                 config["fit_x_max"] = _soft_float(self._series_fit_x_maxs_data[index])
+            config["fit_range_mode"] = _fit_range_mode_from_limits(
+                self._series_fit_x_mins_data[index]
+                if 0 <= index < len(self._series_fit_x_mins_data)
+                else "",
+                self._series_fit_x_maxs_data[index]
+                if 0 <= index < len(self._series_fit_x_maxs_data)
+                else "",
+            )
             if 0 <= index < len(self._series_fit_color_data):
                 config["fit_color"] = self._series_fit_color_data[index].strip() or None
             if 0 <= index < len(self._series_fit_alpha_data):
@@ -10587,87 +12473,39 @@ def launch_plot_settings_panel(
                 (self._series_enabled_data, self._series_enabled_data[index]),
                 (self._series_show_in_legend_data, self._series_show_in_legend_data[index]),
                 (self._series_alpha_data, self._series_alpha_data[index]),
-                (self._series_error_enabled_data, self._series_error_enabled_data[index]),
-                (self._series_error_stats_data, self._series_error_stats_data[index]),
-                (self._series_error_styles_data, self._series_error_styles_data[index]),
-                (self._series_error_colors_data, self._series_error_colors_data[index]),
-                (
-                    self._series_error_label_overrides_data,
-                    self._series_error_label_overrides_data[index],
-                ),
-                (
-                    self._series_error_show_in_legend_data,
-                    self._series_error_show_in_legend_data[index],
-                ),
+                (self._series_error_enabled_data, False),
+                (self._series_error_stats_data, "block_sem"),
+                (self._series_error_styles_data, "band"),
+                (self._series_error_colors_data, ""),
+                (self._series_error_label_overrides_data, ""),
+                (self._series_error_show_in_legend_data, False),
                 (self._series_fit_enabled_data, False),
-                (
-                    self._series_fit_label_overrides_data,
-                    self._series_fit_label_overrides_data[index],
-                ),
-                (
-                    self._series_fit_show_in_legend_data,
-                    self._series_fit_show_in_legend_data[index],
-                ),
-                (self._series_fit_types_data, self._series_fit_types_data[index]),
-                (self._series_fit_degrees_data, self._series_fit_degrees_data[index]),
-                (self._series_fit_range_modes_data, self._series_fit_range_modes_data[index]),
-                (self._series_fit_x_mins_data, self._series_fit_x_mins_data[index]),
-                (self._series_fit_x_maxs_data, self._series_fit_x_maxs_data[index]),
-                (self._series_fit_color_data, self._series_fit_color_data[index]),
-                (self._series_fit_alpha_data, self._series_fit_alpha_data[index]),
-                (self._series_fit_line_width_data, self._series_fit_line_width_data[index]),
-                (self._series_fit_line_style_data, self._series_fit_line_style_data[index]),
-                (self._series_cumulative_enabled_data, self._series_cumulative_enabled_data[index]),
-                (
-                    self._series_cumulative_label_overrides_data,
-                    self._series_cumulative_label_overrides_data[index],
-                ),
-                (
-                    self._series_cumulative_show_in_legend_data,
-                    self._series_cumulative_show_in_legend_data[index],
-                ),
-                (self._series_cumulative_color_data, self._series_cumulative_color_data[index]),
-                (self._series_cumulative_alpha_data, self._series_cumulative_alpha_data[index]),
-                (
-                    self._series_cumulative_line_width_data,
-                    self._series_cumulative_line_width_data[index],
-                ),
-                (
-                    self._series_cumulative_line_style_data,
-                    self._series_cumulative_line_style_data[index],
-                ),
-                (
-                    self._series_integration_enabled_data,
-                    self._series_integration_enabled_data[index],
-                ),
-                (
-                    self._series_integration_source_data,
-                    self._series_integration_source_data[index],
-                ),
-                (
-                    self._series_integration_x_min_data,
-                    self._series_integration_x_min_data[index],
-                ),
-                (
-                    self._series_integration_x_max_data,
-                    self._series_integration_x_max_data[index],
-                ),
-                (
-                    self._series_integration_baseline_data,
-                    self._series_integration_baseline_data[index],
-                ),
-                (
-                    self._series_integration_color_mode_data,
-                    self._series_integration_color_mode_data[index],
-                ),
-                (
-                    self._series_integration_color_data,
-                    self._series_integration_color_data[index],
-                ),
-                (
-                    self._series_integration_alpha_data,
-                    self._series_integration_alpha_data[index],
-                ),
+                (self._series_fit_label_overrides_data, ""),
+                (self._series_fit_show_in_legend_data, True),
+                (self._series_fit_types_data, "linear"),
+                (self._series_fit_degrees_data, "2"),
+                (self._series_fit_range_modes_data, "visible"),
+                (self._series_fit_x_mins_data, ""),
+                (self._series_fit_x_maxs_data, ""),
+                (self._series_fit_color_data, ""),
+                (self._series_fit_alpha_data, ""),
+                (self._series_fit_line_width_data, ""),
+                (self._series_fit_line_style_data, ""),
+                (self._series_cumulative_enabled_data, False),
+                (self._series_cumulative_label_overrides_data, ""),
+                (self._series_cumulative_show_in_legend_data, True),
+                (self._series_cumulative_color_data, ""),
+                (self._series_cumulative_alpha_data, ""),
+                (self._series_cumulative_line_width_data, ""),
+                (self._series_cumulative_line_style_data, ""),
+                (self._series_integration_enabled_data, False),
+                (self._series_integration_source_data, "Plotted data"),
+                (self._series_integration_x_min_data, ""),
+                (self._series_integration_x_max_data, ""),
+                (self._series_integration_baseline_data, "0.0"),
+                (self._series_integration_color_mode_data, "Auto"),
+                (self._series_integration_color_data, ""),
+                (self._series_integration_alpha_data, "0.25"),
                 (self._series_show_raw_line_data, self._series_show_raw_line_data[index]),
                 (self._series_line_widths_data, self._series_line_widths_data[index]),
                 (self._series_markers_data, self._series_markers_data[index]),
@@ -10963,7 +12801,7 @@ def launch_plot_settings_panel(
                     self._load_series_into_editor(index)
             self._refresh_series_list_widgets()
             self._record_history_after_non_text_change()
-            self._schedule_preview_update()
+            self._schedule_or_apply_series_preview_update(force_full_render=True)
 
         def _move_series_by_delta(self, series_id: str, delta: int) -> None:
             if self._series_syncing or delta == 0:
@@ -10994,7 +12832,7 @@ def launch_plot_settings_panel(
             finally:
                 self._series_syncing = False
             self._record_history_after_non_text_change()
-            self._schedule_preview_update()
+            self._schedule_or_apply_series_preview_update()
 
         def _update_series_metadata_panel(self, index: int) -> None:
             descriptor = self._series_descriptor(index)
@@ -11240,15 +13078,6 @@ def launch_plot_settings_panel(
         def _clear_series_list_widget_items(self) -> None:
             if not hasattr(self, "series_list") or self.series_list is None:
                 return
-            for row in range(self.series_list.count()):
-                item = self.series_list.item(row)
-                if item is None:
-                    continue
-                widget = self.series_list.itemWidget(item)
-                if widget is not None:
-                    self.series_list.removeItemWidget(item)
-                    widget.setParent(None)
-                    widget.deleteLater()
             self.series_list.clear()
 
         def _apply_series_list_item_visuals(self, item: Any, index: int) -> None:
@@ -11280,6 +13109,57 @@ def launch_plot_settings_panel(
             item.setData(Qt.ItemDataRole.UserRole + 1, kind)
             item.setToolTip(self._series_row_tooltip(base_index, kind=kind))
             item.setText("")
+            heatmap_active = self._is_orientation_heatmap_mode()
+            color_token = (
+                ""
+                if heatmap_active
+                else (
+                    (
+                        self._series_fit_color_data[base_index].strip()
+                        if base_index < len(self._series_fit_color_data)
+                        else ""
+                    )
+                    or self._effective_series_color(base_index)
+                )
+                if kind == "fit"
+                else (
+                    (
+                        self._series_cumulative_color_data[base_index].strip()
+                        if base_index < len(self._series_cumulative_color_data)
+                        else ""
+                    )
+                    or self._effective_series_color(base_index)
+                )
+                if kind == "cumulative"
+                else str(base_state["color"])
+            )
+            layer_role = (
+                "fit"
+                if kind == "fit"
+                else "cumulative"
+                if kind == "cumulative"
+                else str(base_state["layer_role"])
+            )
+            series_id = str(item.data(Qt.ItemDataRole.UserRole) or "")
+            item.setData(
+                _SERIES_ROW_STATE_ROLE,
+                {
+                    "text": self._display_row_text(index).replace("Â·", "-"),
+                    "checked": enabled,
+                    "enabled": enabled,
+                    "selected": self.series_list.currentRow() == index,
+                    "color_token": color_token,
+                    "kind": kind,
+                    "layer_role": layer_role,
+                    "can_move_up": base_index > 0,
+                    "can_move_down": base_index < len(self._series_labels_data) - 1,
+                    "tooltip_text": item.toolTip(),
+                    "theme": self._theme_tokens(),
+                    "series_id": series_id,
+                },
+            )
+            if hasattr(self.series_list, "notifyRowChanged"):
+                self.series_list.notifyRowChanged(index)
             row_widget = self.series_list.itemWidget(item)
             if isinstance(row_widget, _SeriesRowWidget):
                 heatmap_active = self._is_orientation_heatmap_mode()
@@ -11329,47 +13209,14 @@ def launch_plot_settings_panel(
             view_anchor = self._current_series_list_view_anchor()
             self._rebuild_series_display_rows()
             old_signal_block = self.series_list.blockSignals(True)
-            model = self.series_list.model()
-            old_model_block = model.blockSignals(True)
             self.series_list.setUpdatesEnabled(False)
             try:
                 self._clear_series_list_widget_items()
                 for index in range(len(self._series_display_rows)):
-                    item = QListWidgetItem()
-                    item.setFlags(
-                        item.flags() | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled
-                    )
+                    item = _SeriesListItem()
                     row_descriptor = self._display_row(index)
-                    if str(row_descriptor.get("kind") or "base") == "base":
-                        item.setFlags(item.flags() | Qt.ItemFlag.ItemIsDragEnabled)
                     base_index = int(row_descriptor.get("base_index", 0))
-                    base_series_id = str(
-                        self._series_descriptor(base_index).get("series_id")
-                        or f"series:{base_index}"
-                    )
                     self.series_list.addItem(item)
-
-                    def _select_row(row: int = index) -> None:
-                        self.series_list.setCurrentRow(row)
-
-                    def _toggle_row(checked: bool, row: int = index) -> None:
-                        self._handle_series_row_widget_toggle(row, checked)
-
-                    def _move_base_up(series_id: str = base_series_id) -> None:
-                        self._move_series_by_delta(series_id, -1)
-
-                    def _move_base_down(series_id: str = base_series_id) -> None:
-                        self._move_series_by_delta(series_id, 1)
-
-                    row_widget = _SeriesRowWidget(
-                        on_select=_select_row,
-                        on_toggle=_toggle_row,
-                        on_move_up=_move_base_up,
-                        on_move_down=_move_base_down,
-                        parent=self.series_list,
-                    )
-                    item.setSizeHint(row_widget.sizeHint())
-                    self.series_list.setItemWidget(item, row_widget)
                     self._apply_series_list_item_visuals(item, index)
                 if self.series_list.count() > 0:
                     row = self._display_row_for_selection(
@@ -11381,7 +13228,6 @@ def launch_plot_settings_panel(
                     self._refresh_series_list_widgets()
             finally:
                 self.series_list.setUpdatesEnabled(True)
-                model.blockSignals(old_model_block)
                 self.series_list.blockSignals(old_signal_block)
 
         def _handle_series_identity_change(self, *_unused: object) -> None:
@@ -11480,10 +13326,93 @@ def launch_plot_settings_panel(
                 )
             )
 
+        def _build_data_export_section(self, layout: QVBoxLayout) -> None:
+            if on_save_data is None:
+                return
+
+            group = QGroupBox("Export Data")
+            form = QFormLayout(group)
+
+            self._data_export_summary_label = QLabel("")
+            self._data_export_summary_label.setObjectName("sectionNote")
+            self._data_export_summary_label.setWordWrap(True)
+            form.addRow(self._data_export_summary_label)
+
+            self._data_export_format = self._combo(("Auto", "CSV", "DAT", "TSV", "TXT"))
+            self._data_export_format.currentTextChanged.connect(self._refresh_widget_states)
+            self._add_form_row(
+                form,
+                "Format",
+                self._data_export_format,
+                tooltip_id="export.data",
+            )
+
+            self._data_export_delimiter = self._combo(("Auto", "Comma", "Tab", "Space"))
+            self._data_export_delimiter.currentTextChanged.connect(self._refresh_widget_states)
+            self._add_form_row(
+                form,
+                "Delimiter",
+                self._data_export_delimiter,
+                tooltip_id="export.data",
+            )
+
+            self._data_export_enabled_only = QCheckBox("Enabled series only")
+            self._data_export_enabled_only.setChecked(True)
+            self._data_export_enabled_only.setEnabled(False)
+            form.addRow("", self._data_export_enabled_only)
+
+            self._data_export_include_metadata = QCheckBox("Include metadata comments")
+            self._data_export_include_metadata.setChecked(False)
+            self._data_export_include_metadata.toggled.connect(self._refresh_widget_states)
+            form.addRow("", self._data_export_include_metadata)
+
+            self._data_export_button = QPushButton("Export Data")
+            self._data_export_button.clicked.connect(self._handle_save_data)
+            self._register_tooltip(self._data_export_button, "export.data")
+            self._apply_widget_tooltip(self._data_export_button)
+            form.addRow("", self._data_export_button)
+
+            layout.addWidget(
+                self._make_collapsible_section(
+                    title="Export Data",
+                    section_id="data.export",
+                    body_widget=group,
+                )
+            )
+
+        def _update_data_export_summary(self) -> None:
+            if self._data_export_summary_label is None:
+                return
+            enabled_count = sum(1 for value in self._series_enabled_data if value)
+            total_count = len(self._series_enabled_data)
+            view_type = "2D" if self._is_density_heatmap_mode() else "1D"
+            species_text = ""
+            if self._analysis_name == "density":
+                species = self._enabled_density_species()
+                if species:
+                    species_text = "; species=" + ",".join(sorted(species))
+            axes_text = ""
+            if self._analysis_name == "density" and self._is_density_heatmap_mode():
+                x_axis_widget = getattr(self, "density_2d_x_axis", None)
+                y_axis_widget = getattr(self, "density_2d_y_axis", None)
+                axes_text = (
+                    f"; axes={x_axis_widget.currentText()}/"
+                    f"{y_axis_widget.currentText()}"
+                    if x_axis_widget is not None and y_axis_widget is not None
+                    else ""
+                )
+            elif hasattr(self, "density_x_quantity") and self.density_x_quantity is not None:
+                axes_text = f"; x={self.density_x_quantity.currentText()}"
+            self._data_export_summary_label.setText(
+                f"Exports the current plotted data from {enabled_count}/{total_count} "
+                f"enabled series; view={view_type}{species_text}{axes_text}."
+            )
+
         def _build_data_tab(self) -> None:
             layout = QVBoxLayout(self._tab_data_content)
             self._build_analysis_data_sections(layout)
             self._build_binning_section(layout)
+            self._build_data_export_section(layout)
             hint = QLabel(
                 "Data controls decide what gets plotted. Layer styling, annotations, uncertainty, and derived lines live in the Layers workspace."
             )
@@ -11606,6 +13535,9 @@ def launch_plot_settings_panel(
                 self.legend_kwargs_json,
                 tooltip_id="advanced.legend_kwargs",
             )
+            self._advanced_legend_kwargs_rows.append(
+                (style_form, self.legend_kwargs_json)
+            )
             self._add_form_row(
                 style_form,
                 "Grid kwargs",
@@ -11624,6 +13556,7 @@ def launch_plot_settings_panel(
                 self.line_kwargs_json,
                 tooltip_id="advanced.line_kwargs",
             )
+            self._advanced_line_kwargs_rows.append((style_form, self.line_kwargs_json))
             layout.addWidget(
                 self._make_collapsible_section(
                     title="Raw Matplotlib kwargs",
@@ -12204,11 +14137,6 @@ def launch_plot_settings_panel(
                     self._set_combo_value(self._series_fit_type, self._series_fit_types_data[index])
                 if hasattr(self, "_series_fit_degree"):
                     self._series_fit_degree.setText(self._series_fit_degrees_data[index])
-                if hasattr(self, "_series_fit_range_mode"):
-                    self._set_combo_value(
-                        self._series_fit_range_mode,
-                        self._series_fit_range_modes_data[index],
-                    )
                 if hasattr(self, "_series_fit_x_min"):
                     self._series_fit_x_min.setText(self._series_fit_x_mins_data[index])
                 if hasattr(self, "_series_fit_x_max"):
@@ -12300,7 +14228,6 @@ def launch_plot_settings_panel(
                 for widget in (
                     getattr(self, "_series_fit_type", None),
                     getattr(self, "_series_fit_degree", None),
-                    getattr(self, "_series_fit_range_mode", None),
                     getattr(self, "_series_fit_x_min", None),
                     getattr(self, "_series_fit_x_max", None),
                     getattr(self, "_series_fit_show_in_legend", None),
@@ -12399,11 +14326,6 @@ def launch_plot_settings_panel(
                     self._set_combo_value(self._series_fit_type, self._series_fit_types_data[index])
                 if hasattr(self, "_series_fit_degree"):
                     self._series_fit_degree.setText(self._series_fit_degrees_data[index])
-                if hasattr(self, "_series_fit_range_mode"):
-                    self._set_combo_value(
-                        self._series_fit_range_mode,
-                        self._series_fit_range_modes_data[index],
-                    )
                 if hasattr(self, "_series_fit_x_min"):
                     self._series_fit_x_min.setText(self._series_fit_x_mins_data[index])
                 if hasattr(self, "_series_fit_x_max"):
@@ -12446,7 +14368,6 @@ def launch_plot_settings_panel(
                 for widget in (
                     getattr(self, "_series_fit_type", None),
                     getattr(self, "_series_fit_degree", None),
-                    getattr(self, "_series_fit_range_mode", None),
                     getattr(self, "_series_fit_x_min", None),
                     getattr(self, "_series_fit_x_max", None),
                 ):
@@ -12579,11 +14500,6 @@ def launch_plot_settings_panel(
                     self._set_combo_value(self._series_fit_type, self._series_fit_types_data[index])
                 if hasattr(self, "_series_fit_degree"):
                     self._series_fit_degree.setText(self._series_fit_degrees_data[index])
-                if hasattr(self, "_series_fit_range_mode"):
-                    self._set_combo_value(
-                        self._series_fit_range_mode,
-                        self._series_fit_range_modes_data[index],
-                    )
                 if hasattr(self, "_series_fit_x_min"):
                     self._series_fit_x_min.setText(self._series_fit_x_mins_data[index])
                 if hasattr(self, "_series_fit_x_max"):
@@ -12741,10 +14657,6 @@ def launch_plot_settings_panel(
                 )
             if hasattr(self, "_series_fit_degree"):
                 self._series_fit_degrees_data[index] = self._series_fit_degree.text().strip() or "2"
-            if hasattr(self, "_series_fit_range_mode"):
-                self._series_fit_range_modes_data[index] = (
-                    self._series_fit_range_mode.currentText().strip().lower() or "visible"
-                )
             if hasattr(self, "_series_fit_x_min"):
                 self._series_fit_x_mins_data[index] = self._series_fit_x_min.text().strip()
             if hasattr(self, "_series_fit_x_max"):
@@ -12907,6 +14819,51 @@ def launch_plot_settings_panel(
             else:
                 self._persist_series_editor(self._series_active_index)
 
+        def _schedule_or_apply_series_preview_update(self, *, force_full_render: bool = False) -> None:
+            if not force_full_render and self._apply_series_artist_updates_to_canvas():
+                self._preview_timer.stop()
+                return
+            self._schedule_preview_update()
+
+        def _fit_preview_requires_full_render_sender(self, sender: object | None) -> bool:
+            return sender in {
+                getattr(self, "_series_fit_mode", None),
+                getattr(self, "_series_fit_type", None),
+                getattr(self, "_series_fit_degree", None),
+                getattr(self, "_series_fit_x_min", None),
+                getattr(self, "_series_fit_x_max", None),
+                getattr(self, "_series_fit_label", None),
+                getattr(self, "_series_fit_color", None),
+                getattr(self, "_series_fit_alpha", None),
+                getattr(self, "_series_fit_line_width", None),
+                getattr(self, "_series_fit_line_style", None),
+            }
+
+        def _derived_preview_requires_full_render_sender(self, sender: object | None) -> bool:
+            return self._fit_preview_requires_full_render_sender(sender) or sender in {
+                getattr(self, "_series_error_mode", None),
+                getattr(self, "_series_error_stat", None),
+                getattr(self, "_series_error_style", None),
+                getattr(self, "_series_error_color", None),
+                getattr(self, "_series_error_show_in_legend", None),
+                getattr(self, "_series_error_label", None),
+                getattr(self, "_series_cumulative_mode", None),
+                getattr(self, "_series_cumulative_show_in_legend", None),
+                getattr(self, "_series_cumulative_label", None),
+                getattr(self, "_series_cumulative_color", None),
+                getattr(self, "_series_cumulative_alpha", None),
+                getattr(self, "_series_cumulative_line_width", None),
+                getattr(self, "_series_cumulative_line_style", None),
+                getattr(self, "integration_mode", None),
+                getattr(self, "integration_source", None),
+                getattr(self, "integration_x_min", None),
+                getattr(self, "integration_x_max", None),
+                getattr(self, "integration_baseline", None),
+                getattr(self, "integration_color_mode", None),
+                getattr(self, "integration_color", None),
+                getattr(self, "integration_alpha", None),
+            }
+
         def _handle_series_list_selection_change(self, index: int) -> None:
             if self._series_syncing or index < 0:
                 return
@@ -12987,7 +14944,7 @@ def launch_plot_settings_panel(
             finally:
                 self._series_syncing = False
             self._record_history_after_non_text_change()
-            self._schedule_preview_update()
+            self._schedule_or_apply_series_preview_update()
 
         def _set_all_series_enabled(self, enabled: bool) -> None:
             if not self._series_enabled_data:
@@ -13004,16 +14961,19 @@ def launch_plot_settings_panel(
                 self._series_syncing = False
             self._refresh_series_list_widgets()
             self._record_history_after_non_text_change()
-            self._schedule_preview_update()
+            self._schedule_or_apply_series_preview_update()
 
         def _on_series_editor_changed(self, *_unused: object) -> None:
             if self._series_syncing:
                 return
+            sender = self.sender()
             self._persist_active_series_editor()
             self._refresh_widget_states()
             if not self._sender_is_text_editor():
                 self._record_history_after_non_text_change()
-            self._schedule_preview_update()
+            self._schedule_or_apply_series_preview_update(
+                force_full_render=self._derived_preview_requires_full_render_sender(sender)
+            )
 
         def _on_series_label_changed(self, *_unused: object) -> None:
             if self._series_syncing:
@@ -13031,7 +14991,7 @@ def launch_plot_settings_panel(
                     self._series_error_label.setPlaceholderText(self._error_effective_label(index))
             self._update_selected_layer_card(index)
             self._refresh_active_series_list_widgets()
-            self._schedule_preview_update()
+            self._schedule_or_apply_series_preview_update()
 
         def _on_series_fit_label_changed(self, *_unused: object) -> None:
             if self._series_syncing:
@@ -13041,7 +15001,7 @@ def launch_plot_settings_panel(
                 return
             self._series_fit_label_overrides_data[index] = self._series_fit_label.text().strip()
             self._refresh_active_series_list_widgets()
-            self._schedule_preview_update()
+            self._schedule_or_apply_series_preview_update(force_full_render=True)
 
         def _initialize_normalization_data(self, settings: dict[str, Any]) -> None:
             count = len(self._series_labels_data)
@@ -13797,8 +15757,183 @@ def launch_plot_settings_panel(
             self._refresh_shell_state()
             self._schedule_preview_update()
 
+        def _preview_debounce_ms_for_sender(self, sender: object | None) -> int:
+            if sender is None:
+                return _AUTO_PREVIEW_DEBOUNCE_MS
+            data_widgets = {
+                getattr(self, "analysis_species", None),
+                getattr(self, "analysis_axis", None),
+                getattr(self, "density_view_type", None),
+                getattr(self, "density_1d_x_axis", None),
+                getattr(self, "density_1d_z_quantity", None),
+                getattr(self, "density_2d_x_axis", None),
+                getattr(self, "density_2d_y_axis", None),
+                getattr(self, "density_2d_z_quantity", None),
+                getattr(self, "position_view_type", None),
+                getattr(self, "position_quantity", None),
+                getattr(self, "position_x_quantity", None),
+                getattr(self, "position_y_quantity", None),
+                getattr(self, "position_projection_filter_quantity", None),
+                getattr(self, "position_projection_filter_min", None),
+                getattr(self, "position_projection_filter_max", None),
+                getattr(self, "coordination_x_quantity", None),
+                getattr(self, "coordination_y_quantity", None),
+                getattr(self, "orientation_view_type", None),
+                getattr(self, "orientation_component", None),
+                getattr(self, "orientation_line_x_axis", None),
+                getattr(self, "orientation_angle", None),
+                getattr(self, "orientation_heatmap_x_axis", None),
+                getattr(self, "orientation_heatmap_y_axis", None),
+                getattr(self, "potential_quantity", None),
+                getattr(self, "x_bin_width", None),
+                getattr(self, "y_bin_width", None),
+                getattr(self, "x_bin_reducer", None),
+                getattr(self, "y_bin_reducer", None),
+                getattr(self, "min_bin_points", None),
+            }
+            if hasattr(self, "_density_filter_widgets"):
+                for lower, upper in self._density_filter_widgets.values():
+                    data_widgets.add(lower)
+                    data_widgets.add(upper)
+            if hasattr(self, "_orientation_filter_widgets"):
+                for lower, upper in self._orientation_filter_widgets.values():
+                    data_widgets.add(lower)
+                    data_widgets.add(upper)
+            if sender in data_widgets:
+                return _AUTO_PREVIEW_DATA_DEBOUNCE_MS
+            series_widgets = {
+                getattr(self, "series_list", None),
+                getattr(self, "series_name_input", None),
+                getattr(self, "series_color_input", None),
+                getattr(self, "_series_fit_mode", None),
+                getattr(self, "_series_fit_type", None),
+                getattr(self, "_series_fit_degree", None),
+                getattr(self, "_series_fit_x_min", None),
+                getattr(self, "_series_fit_x_max", None),
+                getattr(self, "_series_fit_label", None),
+                getattr(self, "_series_fit_color", None),
+                getattr(self, "_series_fit_alpha", None),
+                getattr(self, "_series_fit_line_width", None),
+                getattr(self, "_series_fit_line_style", None),
+            }
+            if sender in series_widgets:
+                return _AUTO_PREVIEW_SERIES_DEBOUNCE_MS
+            style_widgets = {
+                getattr(self, "title_text", None),
+                getattr(self, "x_label", None),
+                getattr(self, "y_label", None),
+                getattr(self, "title_font", None),
+                getattr(self, "title_pad", None),
+                getattr(self, "x_label_font", None),
+                getattr(self, "y_label_font", None),
+                getattr(self, "x_label_pad", None),
+                getattr(self, "y_label_pad", None),
+                getattr(self, "x_scale", None),
+                getattr(self, "y_scale", None),
+                getattr(self, "grid_mode", None),
+                getattr(self, "grid_linestyle", None),
+                getattr(self, "grid_linewidth", None),
+                getattr(self, "grid_alpha", None),
+                getattr(self, "grid_color", None),
+                getattr(self, "grid_axis", None),
+                getattr(self, "grid_which", None),
+                getattr(self, "heatmap_cmap", None),
+                getattr(self, "heatmap_vmin", None),
+                getattr(self, "heatmap_vmax", None),
+                getattr(self, "heatmap_colorbar_enabled", None),
+                getattr(self, "heatmap_colorbar_label", None),
+                getattr(self, "heatmap_colorbar_label_size", None),
+                getattr(self, "heatmap_colorbar_tick_size", None),
+                getattr(self, "line_width", None),
+                getattr(self, "line_style", None),
+                getattr(self, "line_alpha", None),
+                getattr(self, "markers_mode", None),
+                getattr(self, "marker_size", None),
+                getattr(self, "marker_type", None),
+                getattr(self, "marker_color", None),
+            }
+            if sender in style_widgets:
+                return _AUTO_PREVIEW_STYLE_DEBOUNCE_MS
+            return _AUTO_PREVIEW_DEBOUNCE_MS
+
         def _schedule_preview_update(self, *_unused: object) -> None:
             if self._suspend_preview_events:
+                return
+            sender = self.sender()
+            if sender in {
+                getattr(self, "x_min", None),
+                getattr(self, "x_max", None),
+            } and self._apply_axis_limit_fields_to_canvas("x_lim"):
+                self._preview_timer.stop()
+                return
+            if sender in {
+                getattr(self, "y_min", None),
+                getattr(self, "y_max", None),
+            } and self._apply_axis_limit_fields_to_canvas("y_lim"):
+                self._preview_timer.stop()
+                return
+            if sender in {
+                getattr(self, "title_text", None),
+                getattr(self, "x_label", None),
+                getattr(self, "y_label", None),
+                getattr(self, "title_font", None),
+                getattr(self, "title_pad", None),
+                getattr(self, "x_label_font", None),
+                getattr(self, "y_label_font", None),
+                getattr(self, "x_label_pad", None),
+                getattr(self, "y_label_pad", None),
+            } and self._apply_text_fields_to_canvas():
+                self._preview_timer.stop()
+                return
+            if sender in {
+                getattr(self, "fig_width", None),
+                getattr(self, "fig_height", None),
+                getattr(self, "dpi", None),
+                getattr(self, "font_family", None),
+                getattr(self, "base_font_size", None),
+                getattr(self, "font_color", None),
+                getattr(self, "figure_facecolor", None),
+                getattr(self, "figure_alpha", None),
+                getattr(self, "x_tick_font", None),
+                getattr(self, "y_tick_font", None),
+                getattr(self, "legend_font", None),
+            } and self._apply_canvas_style_fields_to_canvas():
+                self._preview_timer.stop()
+                return
+            if sender in {
+                getattr(self, "x_scale", None),
+                getattr(self, "y_scale", None),
+                getattr(self, "grid_mode", None),
+                getattr(self, "grid_linestyle", None),
+                getattr(self, "grid_linewidth", None),
+                getattr(self, "grid_alpha", None),
+                getattr(self, "grid_color", None),
+                getattr(self, "grid_axis", None),
+                getattr(self, "grid_which", None),
+            } and self._apply_axis_style_fields_to_canvas():
+                self._preview_timer.stop()
+                return
+            if sender in {
+                getattr(self, "heatmap_cmap", None),
+                getattr(self, "heatmap_vmin", None),
+                getattr(self, "heatmap_vmax", None),
+                getattr(self, "heatmap_colorbar_enabled", None),
+                getattr(self, "heatmap_colorbar_label", None),
+                getattr(self, "heatmap_colorbar_label_size", None),
+                getattr(self, "heatmap_colorbar_tick_size", None),
+            } and self._apply_heatmap_style_fields_to_canvas():
+                self._preview_timer.stop()
+                return
+            if sender in {
+                getattr(self, "line_width", None),
+                getattr(self, "line_style", None),
+                getattr(self, "line_alpha", None),
+                getattr(self, "markers_mode", None),
+                getattr(self, "marker_size", None),
+                getattr(self, "marker_type", None),
+                getattr(self, "marker_color", None),
+            } and self._apply_line_style_fields_to_canvas():
+                self._preview_timer.stop()
                 return
             if self._auto_preview_checkbox is None:
                 return
@@ -13807,9 +15942,9 @@ def launch_plot_settings_panel(
             if self._preview_loading:
                 if self._preview_status is not None:
                     self._preview_status.setText(
-                        "Preview updating... changes will render next."
+                        "Preview updating..."
                     )
-            self._preview_timer.start(_AUTO_PREVIEW_DEBOUNCE_MS)
+            self._preview_timer.start(self._preview_debounce_ms_for_sender(sender))
 
         def _handle_debounced_preview(self) -> None:
             self._update_embedded_preview(interactive=False)
@@ -13847,6 +15982,134 @@ def launch_plot_settings_panel(
                 self._save_data_button.setEnabled(
                     (not self._preview_loading) and on_save_data is not None
                 )
+            if self._data_export_button is not None:
+                self._data_export_button.setEnabled(
+                    (not self._preview_loading) and on_save_data is not None
+                )
+
+        def _cleanup_preview_canvas(self, *, close_figure: bool = True) -> None:
+            self._disconnect_preview_axis_callbacks()
+            canvas = self._preview_canvas
+            toolbar = self._preview_toolbar
+            canvas_scroll = self._preview_canvas_scroll
+            figure = self._preview_figure
+            self._preview_canvas = None
+            self._preview_toolbar = None
+            self._preview_canvas_scroll = None
+            if toolbar is not None:
+                toolbar.setParent(None)
+                toolbar.deleteLater()
+            if canvas_scroll is not None:
+                canvas_scroll.setParent(None)
+                canvas_scroll.deleteLater()
+            if canvas is not None:
+                canvas.setParent(None)
+                canvas.deleteLater()
+            if close_figure and figure is not None:
+                try:
+                    import matplotlib.pyplot as plt
+
+                    plt.close(figure)
+                except Exception:
+                    pass
+                self._preview_figure = None
+
+        def _disconnect_preview_axis_callbacks(self) -> None:
+            for ax, callback_id in list(self._preview_axis_callback_ids):
+                try:
+                    ax.callbacks.disconnect(callback_id)
+                except Exception:
+                    pass
+            self._preview_axis_callback_ids = []
+
+        def _connect_preview_axis_callbacks(self, figure: Any) -> None:
+            self._disconnect_preview_axis_callbacks()
+            axes = list(getattr(figure, "axes", []) or [])
+            if not axes:
+                return
+            primary_ax = axes[0]
+            try:
+                x_callback_id = primary_ax.callbacks.connect(
+                    "xlim_changed",
+                    self._handle_canvas_axis_limits_changed,
+                )
+                y_callback_id = primary_ax.callbacks.connect(
+                    "ylim_changed",
+                    self._handle_canvas_axis_limits_changed,
+                )
+            except Exception:
+                self._preview_axis_callback_ids = []
+                return
+            self._preview_axis_callback_ids = [
+                (primary_ax, int(x_callback_id)),
+                (primary_ax, int(y_callback_id)),
+            ]
+
+        def _install_preview_figure(
+            self,
+            figure: Any,
+            *,
+            close_previous: bool = True,
+        ) -> None:
+            if FigureCanvas is None:
+                raise RuntimeError("Matplotlib Qt canvas is unavailable.")
+            if self._preview_canvas_container is None or self._preview_canvas_layout is None:
+                raise RuntimeError("Preview canvas container is unavailable.")
+            if close_previous:
+                self._cleanup_preview_canvas(close_figure=True)
+            else:
+                self._disconnect_preview_axis_callbacks()
+                old_canvas = self._preview_canvas
+                old_toolbar = self._preview_toolbar
+                old_canvas_scroll = self._preview_canvas_scroll
+                self._preview_canvas = None
+                self._preview_toolbar = None
+                self._preview_canvas_scroll = None
+                if old_toolbar is not None:
+                    old_toolbar.setParent(None)
+                    old_toolbar.deleteLater()
+                if old_canvas_scroll is not None:
+                    old_canvas_scroll.setParent(None)
+                    old_canvas_scroll.deleteLater()
+                if old_canvas is not None:
+                    old_canvas.setParent(None)
+                    old_canvas.deleteLater()
+            self._preview_figure = figure
+            canvas = FigureCanvas(figure)
+            toolbar = (
+                _LiNaKNavigationToolbar(
+                    canvas,
+                    self._preview_canvas_container,
+                    on_linak_save_figure=self._handle_save_figure,
+                )
+                if _LiNaKNavigationToolbar is not None
+                else None
+            )
+            if toolbar is not None:
+                self._preview_canvas_layout.addWidget(toolbar)
+            canvas_scroll = QScrollArea(self._preview_canvas_container)
+            canvas_scroll.setWidgetResizable(False)
+            canvas_scroll.setFrameShape(QFrame.Shape.NoFrame)
+            canvas_scroll.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            canvas_scroll.viewport().installEventFilter(self)
+            canvas.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+            canvas_scroll.setWidget(canvas)
+            self._preview_canvas_layout.addWidget(canvas_scroll, stretch=1)
+            self._preview_canvas = canvas
+            self._preview_toolbar = toolbar
+            self._preview_canvas_scroll = canvas_scroll
+            if self._preview_scroll is not None:
+                self._preview_scroll.setVisible(False)
+            self._preview_canvas_container.setVisible(True)
+            self._resize_preview_canvas_to_figure()
+            canvas.draw_idle()
+            self._connect_preview_axis_callbacks(figure)
+
+        def _show_preview_image_fallback(self) -> None:
+            if self._preview_canvas_container is not None:
+                self._preview_canvas_container.setVisible(False)
+            if self._preview_scroll is not None:
+                self._preview_scroll.setVisible(True)
 
         def _new_preview_image_path(self) -> Path:
             path = Path(tempfile.gettempdir()) / f"linak_preview_{uuid4().hex}.png"
@@ -13876,6 +16139,28 @@ def launch_plot_settings_panel(
                 return "", dict(save_result)
             return str(save_result or ""), {}
 
+        def _preview_worker_loop(self) -> None:
+            while not self._preview_worker_stop.is_set():
+                try:
+                    job = self._preview_worker_queue.get()
+                except Exception:
+                    continue
+                if job is None:
+                    self._preview_worker_queue.task_done()
+                    break
+                generation, settings, image_path = job
+                try:
+                    if self._preview_worker_job_cancelled(generation):
+                        self._cleanup_preview_temp_path(image_path)
+                        continue
+                    self._run_preview_worker(
+                        generation=generation,
+                        settings=settings,
+                        image_path=image_path,
+                    )
+                finally:
+                    self._preview_worker_queue.task_done()
+
         def _run_preview_worker(
             self,
             *,
@@ -13884,15 +16169,36 @@ def launch_plot_settings_panel(
             image_path: Path | None,
         ) -> None:
             try:
+                if self._preview_worker_job_cancelled(generation):
+                    self._cleanup_preview_temp_path(image_path)
+                    return
                 try:
                     from .plotting import configure_matplotlib_backend
 
                     configure_matplotlib_backend(interactive=False)
                 except Exception:
                     pass
-                if image_path is None or on_save_figure is None:
+                if self._preview_worker_job_cancelled(generation):
+                    self._cleanup_preview_temp_path(image_path)
+                    return
+                if on_preview_figure is not None and FigureCanvas is not None:
+                    render_state = on_preview_figure(settings)
+                    payload = {
+                        "figure": (
+                            render_state.get("figure")
+                            if isinstance(render_state, dict)
+                            else None
+                        ),
+                        "image_path": None,
+                        "message": "Preview updated.",
+                        "render_state": dict(render_state)
+                        if isinstance(render_state, dict)
+                        else {},
+                    }
+                elif image_path is None or on_save_figure is None:
                     render_state = on_preview(settings)
                     payload = {
+                        "figure": None,
                         "image_path": None,
                         "message": "External preview opened.",
                         "render_state": dict(render_state)
@@ -13903,6 +16209,7 @@ def launch_plot_settings_panel(
                     save_result = on_save_figure(settings, str(image_path))
                     message, render_state = self._parse_preview_worker_result(save_result)
                     payload = {
+                        "figure": None,
                         "image_path": str(image_path),
                         "message": message,
                         "render_state": render_state,
@@ -13927,25 +16234,20 @@ def launch_plot_settings_panel(
                 return False
             self._preview_generation += 1
             generation = self._preview_generation
-            image_path = self._new_preview_image_path() if on_save_figure is not None else None
+            image_path = (
+                None
+                if on_preview_figure is not None and FigureCanvas is not None
+                else self._new_preview_image_path()
+                if on_save_figure is not None
+                else None
+            )
             self._active_preview_generation = generation
             self._active_preview_image_path = image_path
             self._active_preview_interactive = bool(interactive)
             self._set_preview_loading(True)
             if self._preview_status is not None:
                 self._preview_status.setText("Preview updating...")
-            worker = threading.Thread(
-                target=self._run_preview_worker,
-                kwargs={
-                    "generation": generation,
-                    "settings": deepcopy(settings),
-                    "image_path": image_path,
-                },
-                name=f"LiNaKPreview-{generation}",
-                daemon=True,
-            )
-            self._preview_worker_thread = worker
-            worker.start()
+            self._preview_worker_queue.put((generation, deepcopy(settings), image_path))
             return True
 
         def _queue_pending_preview(
@@ -13957,7 +16259,7 @@ def launch_plot_settings_panel(
             self._pending_preview_request = (deepcopy(settings), bool(interactive))
             if self._preview_status is not None:
                 self._preview_status.setText(
-                    "Preview updating... changes will render next."
+                    "Preview updating..."
                 )
 
         def _start_pending_preview_if_available(self) -> bool:
@@ -13973,19 +16275,28 @@ def launch_plot_settings_panel(
                 self._active_preview_generation = None
                 self._active_preview_image_path = None
                 self._active_preview_interactive = False
-                self._preview_worker_thread = None
+
+        def _preview_worker_job_cancelled(self, generation: int) -> bool:
+            return self._closing or generation != self._active_preview_generation
 
         def _preview_worker_result_is_stale(self, generation: int) -> bool:
             return (
-                self._closing
-                or generation != self._active_preview_generation
+                self._preview_worker_job_cancelled(generation)
                 or self._pending_preview_request is not None
             )
 
         def _handle_preview_worker_finished(self, generation: int, payload: object) -> None:
             payload_dict = dict(payload) if isinstance(payload, dict) else {}
             image_path = payload_dict.get("image_path")
+            figure = payload_dict.get("figure")
             if self._preview_worker_result_is_stale(generation):
+                if figure is not None:
+                    try:
+                        import matplotlib.pyplot as plt
+
+                        plt.close(figure)
+                    except Exception:
+                        pass
                 self._cleanup_preview_temp_path(image_path)
                 self._finish_active_preview_generation(generation)
                 self._set_preview_loading(False)
@@ -13997,7 +16308,14 @@ def launch_plot_settings_panel(
                 if isinstance(render_state, dict) and render_state:
                     self._apply_preview_series_state(render_state)
                     self._apply_preview_state_to_synced_fields(render_state)
-                if image_path is not None:
+                if figure is not None:
+                    self._install_preview_figure(figure)
+                    self._preview_pixmap = None
+                    self._cleanup_preview_temp_path(self._preview_image_path)
+                    self._preview_image_path = None
+                elif image_path is not None:
+                    self._cleanup_preview_canvas(close_figure=True)
+                    self._show_preview_image_fallback()
                     image_path_obj = Path(str(image_path))
                     previous_path = self._preview_image_path
                     QPixmapCache.remove(str(image_path_obj))
@@ -14015,7 +16333,7 @@ def launch_plot_settings_panel(
                 if self._preview_status is not None:
                     self._preview_status.setText(
                         "Preview updated."
-                        if image_path is not None
+                        if figure is not None or image_path is not None
                         else str(payload_dict.get("message") or "External preview opened.")
                     )
                 self._refresh_shell_state()
@@ -14249,7 +16567,10 @@ def launch_plot_settings_panel(
         def _is_density_heatmap_mode(self) -> bool:
             if self._analysis_name != "density":
                 return False
-            return str(self._current_density_mapping().view_type_id).strip().lower() == "heatmap_2d"
+            return (
+                canonical_plot_view_id(self._current_density_mapping().view_type_id)
+                == PLOT_VIEW_2D_HEATMAP
+            )
 
         def _selected_density_heatmap_source(self) -> dict[str, str] | None:
             entries = self._profile_filter_options.get("density_heatmap_sources")
@@ -14357,6 +16678,111 @@ def launch_plot_settings_panel(
             self._handle_series_identity_change()
 
         def _populate(self, settings: dict[str, Any]) -> None:
+            if self._analysis_name == "density":
+                raw_states = settings.get("density_view_states")
+                if isinstance(raw_states, dict):
+                    self._density_view_states = {
+                        self._normalize_density_view_type_id(key): deepcopy(value)
+                        for key, value in raw_states.items()
+                        if isinstance(value, dict)
+                    }
+                elif not self._density_view_state_switching:
+                    self._density_view_states = {}
+                settings_mapping_for_view = self._coerce_settings_view_mapping(settings)
+                active_view = self._normalize_density_view_type_id(
+                    settings.get("density_active_view_type")
+                    or (
+                        getattr(settings_mapping_for_view, "view_type_id", None)
+                        if settings_mapping_for_view is not None
+                        else None
+                    )
+                    or PLOT_VIEW_1D_LINE
+                )
+                self._density_active_view_type = active_view
+                active_state = self._density_view_states.get(active_view)
+                if isinstance(active_state, dict) and active_state.get(
+                    "_density_view_state_initialized"
+                ):
+                    settings = self._active_density_settings_with_view_state(
+                        settings,
+                        active_view,
+                        active_state,
+                    )
+                elif not self._density_view_state_switching:
+                    initial_state = deepcopy(settings)
+                    initial_state["_density_view_state_initialized"] = True
+                    initial_state["density_active_view_type"] = active_view
+                    self._density_view_states[active_view] = initial_state
+            if self._analysis_name == "position":
+                raw_states = settings.get("position_view_states")
+                if isinstance(raw_states, dict):
+                    self._position_view_states = {
+                        self._normalize_position_view_type_id(key): deepcopy(value)
+                        for key, value in raw_states.items()
+                        if isinstance(value, dict)
+                    }
+                elif not self._position_view_state_switching:
+                    self._position_view_states = {}
+                settings_mapping_for_view = self._coerce_settings_view_mapping(settings)
+                active_view = self._normalize_position_view_type_id(
+                    settings.get("position_active_view_type")
+                    or (
+                        getattr(settings_mapping_for_view, "view_type_id", None)
+                        if settings_mapping_for_view is not None
+                        else None
+                    )
+                    or PLOT_VIEW_1D_LINE
+                )
+                self._position_active_view_type = active_view
+                active_state = self._position_view_states.get(active_view)
+                if isinstance(active_state, dict) and active_state.get(
+                    "_position_view_state_initialized"
+                ):
+                    settings = self._active_position_settings_with_view_state(
+                        settings,
+                        active_view,
+                        active_state,
+                    )
+                elif not self._position_view_state_switching:
+                    initial_state = deepcopy(settings)
+                    initial_state["_position_view_state_initialized"] = True
+                    initial_state["position_active_view_type"] = active_view
+                    self._position_view_states[active_view] = initial_state
+            if self._analysis_name == "orientation":
+                raw_states = settings.get("orientation_view_states")
+                if isinstance(raw_states, dict):
+                    self._orientation_view_states = {
+                        self._normalize_orientation_view_type_id(key): deepcopy(value)
+                        for key, value in raw_states.items()
+                        if isinstance(value, dict)
+                    }
+                elif not self._orientation_view_state_switching:
+                    self._orientation_view_states = {}
+                settings_mapping_for_view = self._coerce_settings_view_mapping(settings)
+                active_view = self._normalize_orientation_view_type_id(
+                    settings.get("orientation_active_view_type")
+                    or (
+                        getattr(settings_mapping_for_view, "view_type_id", None)
+                        if settings_mapping_for_view is not None
+                        else None
+                    )
+                    or PLOT_VIEW_1D_LINE
+                )
+                self._orientation_active_view_type = active_view
+                active_state = self._orientation_view_states.get(active_view)
+                if isinstance(active_state, dict) and active_state.get(
+                    "_orientation_view_state_initialized"
+                ):
+                    settings = self._active_orientation_settings_with_view_state(
+                        settings,
+                        active_view,
+                        active_state,
+                    )
+                elif not self._orientation_view_state_switching:
+                    initial_state = deepcopy(settings)
+                    initial_state["_orientation_view_state_initialized"] = True
+                    initial_state["orientation_active_view_type"] = active_view
+                    self._orientation_view_states[active_view] = initial_state
             synced_modes = _derive_synced_field_modes(settings)
             title_visible = settings.get("title_visible")
             if title_visible is False:
@@ -14650,15 +17076,15 @@ def launch_plot_settings_panel(
             settings_mapping = self._coerce_settings_view_mapping(settings)
             if hasattr(self, "density_view_type"):
                 density_view_type_id = (
-                    str(getattr(settings_mapping, "view_type_id", "")).strip().lower()
+                    canonical_plot_view_id(getattr(settings_mapping, "view_type_id", None))
                     if settings_mapping is not None
-                    else "line_1d"
-                ) or "line_1d"
+                    else PLOT_VIEW_1D_LINE
+                ) or PLOT_VIEW_1D_LINE
                 self._set_combo_value(
                     self.density_view_type,
                     _DENSITY_VIEW_TYPE_LABEL_BY_ID.get(
                         density_view_type_id,
-                        _DENSITY_VIEW_TYPE_LABEL_BY_ID["line_1d"],
+                        _DENSITY_VIEW_TYPE_LABEL_BY_ID[PLOT_VIEW_1D_LINE],
                     ),
                 )
             if hasattr(self, "density_x_mode"):
@@ -14730,6 +17156,11 @@ def launch_plot_settings_panel(
                         or "mass"
                     ),
                 )
+            if hasattr(self, "_density_species_checkboxes"):
+                self._apply_density_enabled_species_settings(
+                    settings.get("density_enabled_species")
+                )
+                self._sync_density_species_selection_for_view_type(record_snapshot=False)
             if hasattr(self, "coord_species_a"):
                 self._set_combo_value(
                     self.coord_species_a,
@@ -14807,9 +17238,33 @@ def launch_plot_settings_panel(
                         "component": str(settings.get("component") or "distance"),
                         "time_axis": str(settings.get("time_axis") or "ps"),
                     }
+                coordination_component = str(coordination_options.get("component") or "distance")
+                coordination_view_type_id = (
+                    PLOT_VIEW_2D_HEATMAP
+                    if coordination_component == "time-distance"
+                    else PLOT_VIEW_1D_LINE
+                )
                 self._set_combo_value(
                     self.coordination_component,
-                    str(coordination_options.get("component") or "distance"),
+                    _COORDINATION_VIEW_TYPE_LABEL_BY_ID.get(
+                        coordination_view_type_id,
+                        _COORDINATION_VIEW_TYPE_LABEL_BY_ID[PLOT_VIEW_1D_LINE],
+                    ),
+                )
+            if hasattr(self, "coordination_line_x_quantity"):
+                line_component = (
+                    coordination_component
+                    if "coordination_component" in locals()
+                    else str(settings.get("component") or "distance")
+                )
+                if line_component == "time-distance":
+                    line_component = "time"
+                self._set_combo_value(
+                    self.coordination_line_x_quantity,
+                    _COORDINATION_LINE_X_QUANTITY_LABEL_BY_BACKEND.get(
+                        line_component,
+                        _COORDINATION_LINE_X_QUANTITY_LABEL_BY_BACKEND["distance"],
+                    ),
                 )
             if hasattr(self, "coordination_time_axis"):
                 self._set_combo_value(
@@ -14840,11 +17295,13 @@ def launch_plot_settings_panel(
                         "component": str(settings.get("component") or "average"),
                         "angle": str(settings.get("angle") or "polar"),
                     }
+                self._set_orientation_view_type_from_component(
+                    str(orientation_options.get("component") or "average")
+                )
                 self.orientation_component.blockSignals(True)
                 try:
-                    self._set_combo_value(
-                        self.orientation_component,
-                        str(orientation_options.get("component") or "average"),
+                    self._set_orientation_line_quantity(
+                        str(orientation_options.get("component") or "average")
                     )
                 finally:
                     self.orientation_component.blockSignals(False)
@@ -14860,6 +17317,47 @@ def launch_plot_settings_panel(
                         or "polar"
                     ),
                 )
+            if hasattr(self, "orientation_line_x_axis"):
+                self._set_combo_value(
+                    self.orientation_line_x_axis,
+                    self._density_x_mode_display_label(
+                        str(settings.get("orientation_line_x_axis") or "distance"),
+                        axis=None,
+                    ),
+                )
+            if hasattr(self, "orientation_heatmap_x_axis"):
+                self._set_combo_value(
+                    self.orientation_heatmap_x_axis,
+                    self._density_x_mode_display_label(
+                        str(settings.get("orientation_heatmap_x_axis") or "x"),
+                        axis=None,
+                    ),
+                )
+            if hasattr(self, "orientation_heatmap_y_axis"):
+                self._set_combo_value(
+                    self.orientation_heatmap_y_axis,
+                    self._density_x_mode_display_label(
+                        str(settings.get("orientation_heatmap_y_axis") or "y"),
+                        axis=None,
+                    ),
+                )
+            if hasattr(self, "_orientation_filter_widgets"):
+                for axis_id, widgets in self._orientation_filter_widgets.items():
+                    lower_widget, upper_widget = widgets
+                    lower = settings.get(f"orientation_filter_{axis_id}_min")
+                    upper = settings.get(f"orientation_filter_{axis_id}_max")
+                    lower_text = (
+                        self._orientation_axis_range_text(axis_id, 0)
+                        if lower is None
+                        else str(lower)
+                    )
+                    upper_text = (
+                        self._orientation_axis_range_text(axis_id, 1)
+                        if upper is None
+                        else str(upper)
+                    )
+                    lower_widget.setText(lower_text)
+                    upper_widget.setText(upper_text)
             if hasattr(self, "potential_view_type"):
                 potential_options: dict[str, object]
                 if settings_mapping is not None:
@@ -14869,27 +17367,21 @@ def launch_plot_settings_panel(
                         # Compatibility fallback is only used when no
                         # usable mapping-native state can be restored.
                         potential_options = {
-                            "view_type": (
-                                "table_records"
-                                if bool(settings.get("table_view"))
-                                else "line_1d"
-                            ),
+                            "view_type": "line_1d",
                             "y_quantity": settings.get("y_quantity"),
                         }
                 else:
                     potential_options = {
-                        "view_type": (
-                            "table_records"
-                            if bool(settings.get("table_view"))
-                            else "line_1d"
-                        ),
+                        "view_type": "line_1d",
                         "y_quantity": settings.get("y_quantity"),
                     }
                 self._set_combo_value(
                     self.potential_view_type,
                     _POTENTIAL_VIEW_TYPE_LABEL_BY_ID.get(
-                        str(potential_options.get("view_type") or "line_1d"),
-                        _POTENTIAL_VIEW_TYPE_LABEL_BY_ID["line_1d"],
+                        canonical_plot_view_id(
+                            str(potential_options.get("view_type") or PLOT_VIEW_1D_LINE)
+                        ),
+                        _POTENTIAL_VIEW_TYPE_LABEL_BY_ID[PLOT_VIEW_1D_LINE],
                     ),
                 )
                 series_token = str(
@@ -15004,7 +17496,10 @@ def launch_plot_settings_panel(
         def _is_orientation_heatmap_mode(self) -> bool:
             if self._analysis_name != "orientation":
                 return False
-            return str(self._current_orientation_mapping().view_type_id).strip().lower() == "heatmap_2d"
+            return (
+                canonical_plot_view_id(self._current_orientation_mapping().view_type_id)
+                == PLOT_VIEW_2D_HEATMAP
+            )
 
         def _refresh_widget_states(self, *_unused: object) -> None:
             if all(
@@ -15056,18 +17551,31 @@ def launch_plot_settings_panel(
             norm_enabled = norm_mode != "none"
             norm_x_ref_enabled = norm_mode == "value_at_x"
             position_xy_projection = self._current_position_is_projection_view()
-            coordination_component = (
-                self.coordination_component.currentText().strip().lower()
-                if hasattr(self, "coordination_component")
+            coordination_mapping = (
+                self._current_coordination_mapping()
+                if self._analysis_name == "coordination" and hasattr(self, "coordination_component")
+                else None
+            )
+            coordination_view_type_id = (
+                str(getattr(coordination_mapping, "view_type_id", "") or "").strip().lower()
+                if coordination_mapping is not None
                 else ""
             )
-            coordination_time_distance = coordination_component == "time-distance"
-            coordination_distance = coordination_component == "distance"
+            coordination_time_distance = (
+                canonical_plot_view_id(coordination_view_type_id) == PLOT_VIEW_2D_HEATMAP
+            )
+            coordination_line_time = (
+                coordination_mapping is not None
+                and canonical_plot_view_id(coordination_view_type_id) == PLOT_VIEW_1D_LINE
+                and str(getattr(coordination_mapping, "x", "") or "").strip().lower()
+                in {"time_ps", "time_fs", "step", "frame_index"}
+            )
             layer_caps = self._current_layer_capabilities()
             figure_caps = self._current_figure_capabilities()
             fit_supported = bool(layer_caps.show_fit_editor)
             cumulative_supported = bool(layer_caps.show_cumulative_editor)
             selected_group = layer_caps.layer_kind == "group"
+            heatmap_layer_mode = layer_caps.plot_family == "heatmap"
 
             for widget in self._title_detail_widgets:
                 widget.setVisible(title_enabled)
@@ -15144,6 +17652,18 @@ def launch_plot_settings_panel(
 
             if self._series_visibility_group is not None:
                 self._series_visibility_group.setVisible(layer_caps.show_visibility_label)
+            if self._series_show_in_legend_row is not None:
+                self._set_form_row_visible(
+                    self._series_show_in_legend_row[0],
+                    self._series_show_in_legend_row[1],
+                    layer_caps.show_visibility_label and not heatmap_layer_mode,
+                )
+            if self._series_show_raw_line_row is not None:
+                self._set_form_row_visible(
+                    self._series_show_raw_line_row[0],
+                    self._series_show_raw_line_row[1],
+                    layer_caps.show_visibility_label and not heatmap_layer_mode,
+                )
             if self._series_style_group is not None:
                 self._series_style_group.setVisible(layer_caps.show_style)
             if self._series_uncertainty_group is not None:
@@ -15175,6 +17695,18 @@ def launch_plot_settings_panel(
                 self._figure_colorbar_group.setVisible(figure_caps.show_colorbar)
             if self._figure_heatmap_section is not None:
                 self._figure_heatmap_section.setVisible(figure_caps.show_heatmap)
+            self._set_rows_visible(
+                self._x_axis_transform_rows,
+                figure_caps.show_axis_transforms,
+            )
+            self._set_rows_visible(
+                self._advanced_legend_kwargs_rows,
+                figure_caps.show_advanced_legend,
+            )
+            self._set_rows_visible(
+                self._advanced_line_kwargs_rows,
+                figure_caps.show_advanced_lines,
+            )
 
             if self._position_mapping_x_row is not None:
                 self._set_form_row_visible(
@@ -15224,7 +17756,15 @@ def launch_plot_settings_panel(
                 self._set_form_row_visible(
                     coordination_time_axis_row[0],
                     coordination_time_axis_row[1],
-                    not coordination_distance,
+                    coordination_time_distance or coordination_line_time,
+                )
+            if self._coordination_line_x_quantity_row is not None:
+                coordination_line_x_quantity_row = self._coordination_line_x_quantity_row
+                assert coordination_line_x_quantity_row is not None
+                self._set_form_row_visible(
+                    coordination_line_x_quantity_row[0],
+                    coordination_line_x_quantity_row[1],
+                    not coordination_time_distance,
                 )
             density_heatmap_mode = (
                 self._analysis_name == "density" and self._is_density_heatmap_mode()
@@ -15235,6 +17775,16 @@ def launch_plot_settings_panel(
                 self._set_rows_visible(self._density_mapping_2d_rows, density_heatmap_mode)
                 for axis_id, row in self._density_filter_rows.items():
                     self._set_form_row_visible(row[0], row[1], True)
+                if hasattr(self, "density_quantity"):
+                    label = None
+                    try:
+                        parent_layout = self.density_quantity.parentWidget().layout()
+                        if isinstance(parent_layout, QFormLayout):
+                            label = parent_layout.labelForField(self.density_quantity)
+                    except Exception:
+                        label = None
+                    if isinstance(label, QLabel):
+                        label.setText("Color quantity" if density_heatmap_mode else "Y quantity")
             if hasattr(self, "density_x_mode"):
                 self.density_x_mode.setEnabled(not density_heatmap_mode)
             for widget_name in ("density_2d_x_axis", "density_2d_y_axis"):
@@ -15251,20 +17801,61 @@ def launch_plot_settings_panel(
             if self._data_transform_group is not None and self._analysis_name == "coordination":
                 self._data_transform_group.setVisible(not coordination_time_distance)
             if self._data_transform_group is not None and self._analysis_name == "potential":
-                self._data_transform_group.setVisible(not self._is_potential_table_mode())
+                self._data_transform_group.setVisible(True)
             if hasattr(self, "potential_series_mode"):
-                potential_table_mode = self._is_potential_table_mode()
-                self.potential_series_mode.setEnabled(not potential_table_mode)
-                self._apply_widget_tooltip(
-                    self.potential_series_mode,
-                    disabled_reason=(
-                        "line-series selection is unavailable for table view."
-                        if potential_table_mode
-                        else None
-                    ),
-                )
+                self.potential_series_mode.setEnabled(True)
+                self._apply_widget_tooltip(self.potential_series_mode, disabled_reason=None)
             # ── orientation heatmap mode ──────────────────────────────
             is_heatmap = self._is_orientation_heatmap_mode()
+            if self._analysis_name == "orientation":
+                orientation_line_component = "average"
+                if hasattr(self, "orientation_component"):
+                    orientation_line_component = _ORIENTATION_LINE_QUANTITY_BACKEND_BY_LABEL.get(
+                        self.orientation_component.currentText().strip(),
+                        "average",
+                    )
+                orientation_grid_line_controls = (
+                    not is_heatmap and orientation_line_component == "average"
+                )
+                if self._orientation_line_quantity_row is not None:
+                    self._set_form_row_visible(
+                        self._orientation_line_quantity_row[0],
+                        self._orientation_line_quantity_row[1],
+                        not is_heatmap,
+                    )
+                if self._orientation_line_x_axis_row is not None:
+                    self._set_form_row_visible(
+                        self._orientation_line_x_axis_row[0],
+                        self._orientation_line_x_axis_row[1],
+                        not is_heatmap,
+                    )
+                    if hasattr(self, "orientation_line_x_axis"):
+                        self.orientation_line_x_axis.setEnabled(orientation_grid_line_controls)
+                        self._apply_widget_tooltip(
+                            self.orientation_line_x_axis,
+                            disabled_reason=(
+                                "Only Mean orientation supports alternate orientation grid axes."
+                                if not is_heatmap and not orientation_grid_line_controls
+                                else None
+                            ),
+                        )
+                self._set_rows_visible(self._orientation_mapping_2d_rows, False)
+                for row in self._orientation_filter_rows.values():
+                    self._set_form_row_visible(row[0], row[1], orientation_grid_line_controls)
+                for widget_name in ("orientation_heatmap_x_axis", "orientation_heatmap_y_axis"):
+                    widget = getattr(self, widget_name, None)
+                    if widget is not None:
+                        widget.setEnabled(False)
+                if hasattr(self, "orientation_angle"):
+                    label = None
+                    try:
+                        parent_layout = self.orientation_angle.parentWidget().layout()
+                        if isinstance(parent_layout, QFormLayout):
+                            label = parent_layout.labelForField(self.orientation_angle)
+                    except Exception:
+                        label = None
+                    if isinstance(label, QLabel):
+                        label.setText("Angle quantity")
             two_dimensional_binning = is_heatmap or density_heatmap_mode
             if self._data_transform_group is not None and self._analysis_name == "orientation":
                 self._data_transform_group.setEnabled(True)
@@ -15401,15 +17992,19 @@ def launch_plot_settings_panel(
             annotation_selected = bool(self._annotations_data)
             series_selected = bool(self._series_descriptors_data)
             if getattr(self, "_series_duplicate_button", None) is not None:
-                self._series_duplicate_button.setEnabled(series_selected)
+                self._series_duplicate_button.setVisible(not heatmap_layer_mode)
+                self._series_duplicate_button.setEnabled(series_selected and not heatmap_layer_mode)
             if getattr(self, "_series_add_group_button", None) is not None:
+                self._series_add_group_button.setVisible(not heatmap_layer_mode)
                 self._series_add_group_button.setEnabled(
-                    bool(self._group_member_candidate_indices())
+                    bool(self._group_member_candidate_indices()) and not heatmap_layer_mode
                 )
             delete_button = getattr(self, "_series_delete_button", None)
             if delete_button is not None:
+                delete_button.setVisible(not heatmap_layer_mode)
                 can_delete_series = (
                     series_selected
+                    and not heatmap_layer_mode
                     and not self._series_active_is_fit_child
                     and not self._series_active_is_cumulative_child
                     and self._series_is_generated(self._series_active_index)
@@ -15592,21 +18187,11 @@ def launch_plot_settings_panel(
                 if hasattr(self, "_series_fit_type")
                 else "linear"
             )
-            fit_manual_range = (
-                hasattr(self, "_series_fit_range_mode")
-                and self._series_fit_range_mode.currentText().strip().lower() == "manual"
-            )
             polynomial_selected = fit_type == "polynomial"
             for form, field in self._series_fit_detail_rows:
                 visible = fit_active
                 if field is getattr(self, "_series_fit_degree", None):
                     visible = fit_active and polynomial_selected
-                elif field is getattr(self, "_series_fit_x_min", None) or field is getattr(
-                    self,
-                    "_series_fit_x_max",
-                    None,
-                ):
-                    visible = fit_active and fit_manual_range
                 self._set_form_row_visible(form, field, visible)
             for widget in self._series_fit_detail_widgets:
                 widget.setVisible(fit_active)
@@ -15646,20 +18231,6 @@ def launch_plot_settings_panel(
                         else None
                     ),
                 )
-            if hasattr(self, "_series_fit_range_mode"):
-                self._series_fit_range_mode.setEnabled(
-                    fit_supported and not self._series_active_is_fit_child and fit_active
-                )
-                self._apply_widget_tooltip(
-                    self._series_fit_range_mode,
-                    disabled_reason=(
-                        "fit settings are edited on the base series only."
-                        if self._series_active_is_fit_child
-                        else "turn fitting on first."
-                        if not fit_active
-                        else None
-                    ),
-                )
             for widget in (
                 getattr(self, "_series_fit_x_min", None),
                 getattr(self, "_series_fit_x_max", None),
@@ -15670,7 +18241,6 @@ def launch_plot_settings_panel(
                         and not self._series_active_is_fit_child
                         and not self._series_active_is_cumulative_child
                         and fit_active
-                        and fit_manual_range
                     )
                     self._apply_widget_tooltip(
                         widget,
@@ -15680,8 +18250,6 @@ def launch_plot_settings_panel(
                             or self._series_active_is_cumulative_child
                             else "turn fitting on first."
                             if not fit_active
-                            else "manual fit range is not selected."
-                            if not fit_manual_range
                             else None
                         ),
                     )
@@ -15760,6 +18328,7 @@ def launch_plot_settings_panel(
                 for widget in self._series_cumulative_detail_widgets:
                     widget.setVisible(False)
             self._sync_standard_controls_to_advanced_json()
+            self._update_data_export_summary()
             self._refresh_shell_state()
 
         def _collect_settings(self) -> dict[str, Any]:
@@ -16061,13 +18630,6 @@ def launch_plot_settings_panel(
                         raise ValueError(
                             f"Series {index + 1} polynomial degree must be an integer >= 1."
                         )
-                fit_range_mode = (
-                    self._series_fit_range_modes_data[index].strip().lower()
-                    if index < len(self._series_fit_range_modes_data)
-                    else "visible"
-                )
-                if fit_range_mode not in _FIT_RANGE_MODES:
-                    raise ValueError(f"Series {index + 1} fit range mode is invalid.")
                 fit_x_min_value = _optional_float(
                     self._series_fit_x_mins_data[index],
                     field_name=f"Series {index + 1} fit x min",
@@ -16075,6 +18637,11 @@ def launch_plot_settings_panel(
                 fit_x_max_value = _optional_float(
                     self._series_fit_x_maxs_data[index],
                     field_name=f"Series {index + 1} fit x max",
+                )
+                fit_range_mode = (
+                    "manual"
+                    if fit_x_min_value is not None or fit_x_max_value is not None
+                    else "visible"
                 )
                 fit_label_override_value = (
                     self._series_fit_label_overrides_data[index].strip() or None
@@ -16525,6 +19092,26 @@ def launch_plot_settings_panel(
                 title_visible_value = bool(title_value)
                 if not title_visible_value:
                     title_value = None
+            data_export_format = (
+                self._data_export_format.currentText().strip().lower()
+                if self._data_export_format is not None
+                else "auto"
+            )
+            data_export_delimiter = (
+                self._data_export_delimiter.currentText().strip().lower()
+                if self._data_export_delimiter is not None
+                else "auto"
+            )
+            data_export_include_metadata = (
+                bool(self._data_export_include_metadata.isChecked())
+                if self._data_export_include_metadata is not None
+                else False
+            )
+            data_export_enabled_only = (
+                bool(self._data_export_enabled_only.isChecked())
+                if self._data_export_enabled_only is not None
+                else True
+            )
 
             settings = {
                 "title": title_value,
@@ -16641,6 +19228,10 @@ def launch_plot_settings_panel(
                 "tick_params_kwargs": tick_params_kwargs_value,
                 "tight_layout_kwargs": tight_layout_kwargs_value,
                 "savefig_kwargs": savefig_kwargs_value,
+                "plot_data_format": data_export_format,
+                "plot_data_delimiter": data_export_delimiter,
+                "plot_data_include_metadata": data_export_include_metadata,
+                "plot_data_enabled_only": data_export_enabled_only,
                 "_gui_sync_modes": {
                     key: self._synced_field_mode(key)
                     for key in _SYNCED_FIELD_KEYS
@@ -16744,7 +19335,7 @@ def launch_plot_settings_panel(
                     and mapping.filter_min > mapping.filter_max
                 ):
                     raise ValueError(
-                        "Projection range minimum must not exceed the projection range maximum."
+                        "2D Heatmap range minimum must not exceed the range maximum."
                     )
                 compatibility = generic_view_type_compatibility(
                     self._position_contract(),
@@ -16781,6 +19372,63 @@ def launch_plot_settings_panel(
                     raise ValueError(
                         "The selected orientation mapping is incompatible with the current plot-data contract."
                     )
+                orientation_heatmap_mode = self._is_orientation_heatmap_mode()
+                orientation_line_component = "heatmap" if orientation_heatmap_mode else "average"
+                if not orientation_heatmap_mode and hasattr(self, "orientation_component"):
+                    orientation_line_component = _ORIENTATION_LINE_QUANTITY_BACKEND_BY_LABEL.get(
+                        self.orientation_component.currentText().strip(),
+                        self.orientation_component.currentText().strip().lower() or "average",
+                    )
+                orientation_grid_line_enabled = (
+                    not orientation_heatmap_mode and orientation_line_component == "average"
+                )
+                if orientation_heatmap_mode:
+                    settings["orientation_line_x_axis"] = _DENSITY_X_MODE_BY_LABEL.get(
+                        self.orientation_line_x_axis.currentText().strip().lower(),
+                        "distance",
+                    ) if hasattr(self, "orientation_line_x_axis") else "distance"
+                    settings["orientation_heatmap_x_axis"] = None
+                    settings["orientation_heatmap_y_axis"] = None
+                else:
+                    if orientation_grid_line_enabled:
+                        settings["orientation_line_x_axis"] = _DENSITY_X_MODE_BY_LABEL.get(
+                            self.orientation_line_x_axis.currentText().strip().lower(),
+                            "distance",
+                        ) if hasattr(self, "orientation_line_x_axis") else "distance"
+                    else:
+                        settings["orientation_line_x_axis"] = "distance"
+                    settings["orientation_heatmap_x_axis"] = None
+                    settings["orientation_heatmap_y_axis"] = None
+                if hasattr(self, "_orientation_filter_widgets"):
+                    for axis_id, widgets in self._orientation_filter_widgets.items():
+                        if orientation_grid_line_enabled:
+                            lower_widget, upper_widget = widgets
+                            lower_value = _optional_float(
+                                lower_widget.text(),
+                                field_name=f"orientation-{axis_id}-filter-min",
+                            )
+                            upper_value = _optional_float(
+                                upper_widget.text(),
+                                field_name=f"orientation-{axis_id}-filter-max",
+                            )
+                            if (
+                                lower_value is not None
+                                and upper_value is not None
+                                and lower_value > upper_value
+                            ):
+                                raise ValueError(
+                                    f"Orientation {axis_id.upper()} range minimum must not exceed maximum."
+                                )
+                            lower_value, upper_value = self._orientation_effective_filter_values(
+                                axis_id,
+                                lower_value,
+                                upper_value,
+                            )
+                        else:
+                            lower_value = None
+                            upper_value = None
+                        settings[f"orientation_filter_{axis_id}_min"] = lower_value
+                        settings[f"orientation_filter_{axis_id}_max"] = upper_value
             if hasattr(self, "potential_view_type"):
                 potential_mapping = self._current_potential_mapping()
                 if (
@@ -16851,6 +19499,9 @@ def launch_plot_settings_panel(
                 )
             if resolved_view_mapping is not None:
                 settings["view_mapping"] = serialize_plot_view_mapping(resolved_view_mapping)
+            settings = self._merge_density_view_state_into_settings(settings)
+            settings = self._merge_position_view_state_into_settings(settings)
+            settings = self._merge_orientation_view_state_into_settings(settings)
             return settings
 
         def _report_error(self, title_text: str, exc: Exception) -> None:
@@ -16872,11 +19523,26 @@ def launch_plot_settings_panel(
             except Exception as exc:
                 self._report_error("Save failed", exc)
 
+        def _save_current_profile_for_export(self, settings: dict[str, Any]) -> None:
+            # Export uses the same resolved settings path as Save Profile so a
+            # reopened GUI reproduces the exported figure/data for the active profile.
+            on_save(self._current_profile_name, settings)
+            self._saved_signature = self._signature(settings)
+
+        def _sync_preview_canvas_axis_limits_for_export(self) -> None:
+            if self._preview_figure is None:
+                return
+            axes = list(getattr(self._preview_figure, "axes", []) or [])
+            if not axes:
+                return
+            self._set_axis_limit_fields_from_canvas(axes[0])
+
         def _handle_save_figure(self) -> None:
             if on_save_figure is None:
                 self._status_label.setText("Save-figure action is not available.")
                 return
             try:
+                self._sync_preview_canvas_axis_limits_for_export()
                 settings = self._collect_settings()
                 output_path, _selected = QFileDialog.getSaveFileName(
                     self,
@@ -16887,6 +19553,7 @@ def launch_plot_settings_panel(
                 if not output_path:
                     self._status_label.setText("Save figure canceled.")
                     return
+                self._save_current_profile_for_export(settings)
                 result = on_save_figure(settings, output_path)
                 message = result[0] if isinstance(result, tuple) else result
                 render_state = result[1] if isinstance(result, tuple) and len(result) > 1 else None
@@ -16902,16 +19569,31 @@ def launch_plot_settings_panel(
                 self._status_label.setText("Save-data action is not available.")
                 return
             try:
+                self._sync_preview_canvas_axis_limits_for_export()
                 settings = self._collect_settings()
+                data_default_name = self._data_default_name
+                selected_filter = ""
+                requested_format = str(settings.get("plot_data_format") or "auto").lower()
+                format_map = {
+                    "csv": ("CSV data (*.csv)", ".csv"),
+                    "dat": ("DAT data (*.dat)", ".dat"),
+                    "tsv": ("TSV data (*.tsv)", ".tsv"),
+                    "txt": ("Text data (*.txt)", ".txt"),
+                }
+                if requested_format in format_map:
+                    selected_filter, suffix = format_map[requested_format]
+                    data_default_name = str(Path(data_default_name).with_suffix(suffix))
                 output_path, _selected = QFileDialog.getSaveFileName(
                     self,
                     "Save Data",
-                    self._data_default_name,
+                    data_default_name,
                     self._data_save_filters,
+                    selected_filter,
                 )
                 if not output_path:
                     self._status_label.setText("Save data canceled.")
                     return
+                self._save_current_profile_for_export(settings)
                 result = on_save_data(settings, output_path)
                 message = result[0] if isinstance(result, tuple) else result
                 render_state = result[1] if isinstance(result, tuple) and len(result) > 1 else None
@@ -17049,21 +19731,37 @@ def launch_plot_settings_panel(
             self._active_preview_generation = None
             self._active_preview_image_path = None
             self._pending_preview_request = None
+            self._preview_worker_stop.set()
+            try:
+                self._preview_worker_queue.put_nowait(None)
+            except Exception:
+                pass
+            worker = self._preview_worker_thread
+            if worker is not None and worker.is_alive():
+                worker.join(timeout=0.5)
             if self._detached_preview_window is not None:
                 detached_window = self._detached_preview_window
                 self._detached_preview_window = None
                 self._detached_preview_pane = None
                 detached_window.close_from_dock()
                 detached_window.deleteLater()
-            QPixmapCache.remove(str(self._preview_image_path))
-            try:
-                self._preview_image_path.unlink(missing_ok=True)
-            except OSError:
-                pass
+            self._cleanup_preview_canvas(close_figure=True)
+            if self._preview_image_path is not None:
+                QPixmapCache.remove(str(self._preview_image_path))
+                try:
+                    self._preview_image_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
             for path in list(self._preview_temp_paths):
                 self._cleanup_preview_temp_path(path)
 
         def _refresh_preview_after_layout(self) -> None:
+            if self._preview_figure is not None and self._preview_canvas is not None:
+                try:
+                    self._preview_canvas.draw_idle()
+                except Exception:
+                    pass
+                return
             self._refresh_preview_pixmap()
             if self._preview_pixmap is None or self._preview_pixmap.isNull():
                 self._update_embedded_preview(interactive=False)
@@ -17088,7 +19786,13 @@ def launch_plot_settings_panel(
             preview_scroll = self._preview_scroll
             preview_label = self._preview_label
             preview_frame = self._preview_frame
+            preview_canvas_scroll = self._preview_canvas_scroll
             preview_viewport = preview_scroll.viewport() if preview_scroll is not None else None
+            preview_canvas_viewport = (
+                preview_canvas_scroll.viewport()
+                if preview_canvas_scroll is not None
+                else None
+            )
 
             if isinstance(watched, (QLineEdit, QPlainTextEdit)):
                 if event.type() == QEvent.Type.KeyPress:
@@ -17138,11 +19842,14 @@ def launch_plot_settings_panel(
                     return True
             if watched in {preview_frame, preview_viewport} and event.type() == QEvent.Type.Resize:
                 QTimer.singleShot(0, self._refresh_preview_pixmap)
+            if watched in {preview_frame, preview_canvas_viewport} and event.type() == QEvent.Type.Resize:
+                QTimer.singleShot(0, self._resize_preview_canvas_to_figure)
             return super().eventFilter(watched, event)
 
         def resizeEvent(self, event: Any) -> None:  # pragma: no cover - UI flow
             super().resizeEvent(event)
             self._refresh_preview_pixmap()
+            self._resize_preview_canvas_to_figure()
 
         def closeEvent(self, event: Any) -> None:  # pragma: no cover - UI flow
             try:

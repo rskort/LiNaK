@@ -6,7 +6,15 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from ..data_contract import PlotDataContract, PlotDimension, PlotQuantity, PlotViewType
+from ..data_contract import (
+    PLOT_VIEW_1D_LINE,
+    PLOT_VIEW_2D_HEATMAP,
+    PlotDataContract,
+    PlotDimension,
+    PlotQuantity,
+    PlotViewType,
+    plot_view_display_label,
+)
 
 if TYPE_CHECKING:
     from ...analysis.density import DensityHeatmapProfile, DensityProfile
@@ -93,13 +101,13 @@ def _density_contract(
         quantities=tuple(quantities),
         view_types=(
             PlotViewType(
-                id="line_1d",
-                label="Line 1D",
-                kind="line_1d",
+                id=PLOT_VIEW_1D_LINE,
+                label=plot_view_display_label(PLOT_VIEW_1D_LINE),
+                kind=PLOT_VIEW_1D_LINE,
                 supported_roles=("x", "y"),
             ),
         ),
-        default_view_type_id="line_1d",
+        default_view_type_id=PLOT_VIEW_1D_LINE,
     )
 
 
@@ -173,13 +181,13 @@ def _density_heatmap_contract(
         quantities=tuple(quantities),
         view_types=(
             PlotViewType(
-                id="heatmap_2d",
-                label="Heatmap 2D",
-                kind="heatmap_2d",
+                id=PLOT_VIEW_2D_HEATMAP,
+                label=plot_view_display_label(PLOT_VIEW_2D_HEATMAP),
+                kind=PLOT_VIEW_2D_HEATMAP,
                 supported_roles=("x", "y", "z"),
             ),
         ),
-        default_view_type_id="heatmap_2d",
+        default_view_type_id=PLOT_VIEW_2D_HEATMAP,
     )
 
 

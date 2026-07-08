@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from ..contracts.rdf_contract import default_rdf_plot_data_contract, rdf_profile_to_plot_data_contract
-from ..data_contract import PlotDataContract, PlotViewMapping
+from ..data_contract import (
+    PLOT_VIEW_1D_LINE,
+    PlotDataContract,
+    PlotViewMapping,
+    canonical_plot_view_id,
+)
 from ..data_validation import MappingStatus, generic_view_type_compatibility
 
 
@@ -23,14 +28,14 @@ class ResolvedRdfPlotMapping:
 def rdf_plot_options_to_view_mapping() -> PlotViewMapping:
     """Translate current RDF plot options into a generic view mapping."""
 
-    return PlotViewMapping(view_type_id="line_1d", x="radius", y="g_r")
+    return PlotViewMapping(view_type_id=PLOT_VIEW_1D_LINE, x="radius", y="g_r")
 
 
 def rdf_view_mapping_to_plot_options(mapping: PlotViewMapping) -> dict[str, object]:
     """Translate one generic RDF mapping back into legacy plot options."""
 
-    if str(mapping.view_type_id).strip().lower() != "line_1d":
-        raise ValueError("Current RDF plotting only supports 'line_1d' mappings.")
+    if canonical_plot_view_id(mapping.view_type_id) not in {PLOT_VIEW_1D_LINE, "line_1d"}:
+        raise ValueError("Current RDF plotting only supports 1D Line mappings.")
     if str(mapping.x or "").strip() != "radius":
         raise ValueError("RDF line mappings must place radius on the x role.")
     if str(mapping.y or "").strip() != "g_r":
@@ -52,6 +57,10 @@ def resolve_rdf_plot_mapping(
         else default_rdf_plot_data_contract() if profile is None else rdf_profile_to_plot_data_contract(profile)
     )
     resolved_mapping = mapping if mapping is not None else rdf_plot_options_to_view_mapping()
+    resolved_mapping = replace(
+        resolved_mapping,
+        view_type_id=canonical_plot_view_id(resolved_mapping.view_type_id),
+    )
     compatibility = generic_view_type_compatibility(resolved_contract, resolved_mapping)
     if compatibility == "invalid":
         raise ValueError("RDF plot mapping is incompatible with the available plot data.")

@@ -83,7 +83,7 @@ from linak.plot.profile_persistence import (
     build_plot_profile_payload,
     flatten_plot_profile_payload,
 )
-from linak.plot.data_contract import PlotViewMapping
+from linak.plot.data_contract import PLOT_VIEW_1D_LINE, PLOT_VIEW_2D_HEATMAP, PlotViewMapping
 from linak.analysis.rdf import (
     RDFProfile,
     compute_rdf,
@@ -2648,7 +2648,6 @@ def test_plot_potential_reopened_combined_hdf5_preserves_source_layers(tmp_path)
     _write_potential_hdf5(source_b)
     args = argparse.Namespace(
         y_quantity=None,
-        table_view=False,
         view_mapping=None,
         series_labels=None,
         line_colors=None,
@@ -2907,7 +2906,9 @@ def test_plot_help_lists_analysis_and_style_options(capsys):
     assert "--x-mode" in out
     assert "--quantity" in out
     assert "--species-a" in out
-    assert "--component" in out
+    assert "--view-type" in out
+    assert "--y-quantity" in out
+    assert "--component" not in out
     assert "--map-color" in out
     assert "--time-axis" in out
     assert "--time-section-width" in out
@@ -2939,8 +2940,11 @@ def test_plot_position_source_help_is_analysis_specific(tmp_path, capsys):
     out = capsys.readouterr().out
     assert rc == 0
     assert "Detected analysis from input: position" in out
-    assert "--component" in out
-    assert "--projection-x" in out
+    assert "--view-type" in out
+    assert "--y-quantity" in out
+    assert "--component" not in out
+    assert "--heatmap-x" in out
+    assert "--projection-x" not in out
     assert "--time-axis" in out
     assert "--x-mode" not in out
     assert "--quantity" not in out
@@ -2983,7 +2987,9 @@ def test_plot_help_with_mixed_sources_falls_back_to_generic_help(tmp_path, capsy
     assert rc == 0
     assert "Detected analysis from input:" not in out
     assert "--x-mode" in out
-    assert "--component" in out
+    assert "--view-type" in out
+    assert "--y-quantity" in out
+    assert "--component" not in out
 
 
 def test_plot_help_for_generic_hdf5_falls_back_to_generic_help(tmp_path, capsys):
@@ -2996,7 +3002,9 @@ def test_plot_help_for_generic_hdf5_falls_back_to_generic_help(tmp_path, capsys)
     assert rc == 0
     assert "Detected analysis from input:" not in out
     assert "--x-mode" in out
-    assert "--component" in out
+    assert "--view-type" in out
+    assert "--y-quantity" in out
+    assert "--component" not in out
 
 
 def test_plot_help_for_missing_hdf5_falls_back_to_generic_help(tmp_path, capsys):
@@ -3008,7 +3016,9 @@ def test_plot_help_for_missing_hdf5_falls_back_to_generic_help(tmp_path, capsys)
     assert rc == 0
     assert "Detected analysis from input:" not in out
     assert "--x-mode" in out
-    assert "--component" in out
+    assert "--view-type" in out
+    assert "--y-quantity" in out
+    assert "--component" not in out
 
 
 @pytest.mark.parametrize("token", ["density", "position"])
@@ -3058,6 +3068,54 @@ def test_plot_position_accepts_xy_z_component():
     assert args.map_color == "distance"
 
 
+def test_plot_position_public_1d_options_resolve_mapping():
+    args = build_parser().parse_args(
+        [
+            "plot",
+            "input.h5",
+            "--view-type",
+            "1d-line",
+            "--y-quantity",
+            "z",
+            "--time-axis",
+            "fs",
+        ]
+    )
+
+    mapping = cli_mod._resolve_position_plotter_kwargs(args)["view_mapping"]
+
+    assert mapping.view_type_id == PLOT_VIEW_1D_LINE
+    assert mapping.x == "time_fs"
+    assert mapping.y == "z"
+
+
+def test_plot_position_public_2d_heatmap_options_resolve_mapping():
+    args = build_parser().parse_args(
+        [
+            "plot",
+            "input.h5",
+            "--view-type",
+            "2d-heatmap",
+            "--heatmap-x",
+            "x",
+            "--heatmap-y",
+            "distance",
+            "--heatmap-value",
+            "z",
+            "--heatmap-render-mode",
+            "color-scale",
+        ]
+    )
+
+    mapping = cli_mod._resolve_position_plotter_kwargs(args)["view_mapping"]
+
+    assert mapping.view_type_id == PLOT_VIEW_2D_HEATMAP
+    assert mapping.x == "x"
+    assert mapping.y == "distance_to_surface"
+    assert mapping.color == "z"
+    assert mapping.fixed_values["projection_render_mode"] == "color-scale"
+
+
 def test_plot_position_accepts_public_2d_projection_arguments():
     args = build_parser().parse_args(
         [
@@ -3085,6 +3143,37 @@ def test_plot_position_accepts_public_2d_projection_arguments():
     assert args.projection_y == "distance"
     assert args.projection_value == "y"
     assert args.projection_render_mode == "line-colors"
+    assert args.projection_filter_min == pytest.approx(4.0)
+    assert args.projection_filter_max == pytest.approx(6.0)
+
+
+def test_plot_position_accepts_public_2d_heatmap_arguments():
+    args = build_parser().parse_args(
+        [
+            "plot",
+            "input.h5",
+            "--component",
+            "heatmap",
+            "--heatmap-x",
+            "x",
+            "--heatmap-y",
+            "distance",
+            "--heatmap-value",
+            "y",
+            "--heatmap-render-mode",
+            "source-colors",
+            "--heatmap-filter-min",
+            "4.0",
+            "--heatmap-filter-max",
+            "6.0",
+        ]
+    )
+
+    assert args.component == "heatmap"
+    assert args.projection_x == "x"
+    assert args.projection_y == "distance"
+    assert args.projection_value == "y"
+    assert args.projection_render_mode == "source-colors"
     assert args.projection_filter_min == pytest.approx(4.0)
     assert args.projection_filter_max == pytest.approx(6.0)
 
@@ -3122,9 +3211,15 @@ def test_compute_density_defaults_surface_detection_options():
     assert args.surface_elements is None
     assert args.include_fixed_surface_atoms is False
     assert args.rough_surface_envelope is None
-    assert args.outputs is None
-    assert cli_mod._resolve_density_outputs_from_args(args) == "1d"
+    assert args.outputs == "all"
+    assert cli_mod._resolve_density_outputs_from_args(args) == "all"
     assert args.heatmap_planes is None
+
+
+def test_compute_density_missing_outputs_resolves_to_all():
+    args = argparse.Namespace(outputs=None, heatmap_planes=None)
+
+    assert cli_mod._resolve_density_outputs_from_args(args) == "all"
 
 
 def test_compute_density_default_axis_produces_all_three_axes(tmp_path, monkeypatch, capsys):
@@ -4080,6 +4175,23 @@ def test_apply_gui_settings_to_args_forwards_density_grid_range_settings_without
         assert getattr(args, key, object()) == value
 
 
+def test_apply_gui_settings_to_args_forwards_density_bin_widths_without_declared_cli_attr():
+    args = argparse.Namespace(title="Example")
+    settings = {
+        "x_bin_width": 0.75,
+        "x_bin_reducer": "mean",
+        "y_bin_width": 1.25,
+        "y_bin_reducer": "sum",
+    }
+
+    cli_mod._apply_gui_settings_to_args(args, settings)
+
+    assert args.x_bin_width == pytest.approx(0.75)
+    assert args.x_bin_reducer == "mean"
+    assert args.y_bin_width == pytest.approx(1.25)
+    assert args.y_bin_reducer == "sum"
+
+
 def test_apply_gui_settings_to_args_preserves_gui_manual_axis_limits():
     args = argparse.Namespace(
         x_min=1.0,
@@ -4181,6 +4293,54 @@ def test_collect_plot_settings_for_persistence_materializes_density_view_mapping
     assert persisted["view_mapping"]["fixed_values"]["x_mode"] == "axis"
 
 
+def test_collect_plot_settings_for_persistence_keeps_gui_profile_state_keys():
+    args = argparse.Namespace(
+        species="H2O",
+        axis="z",
+        view_mapping=PlotViewMapping(
+            view_type_id=PLOT_VIEW_2D_HEATMAP,
+            x="axis_x",
+            y="axis_y",
+            color="mass_density",
+        ),
+        density_enabled_species=["Na"],
+        density_active_view_type=PLOT_VIEW_2D_HEATMAP,
+        density_view_states={
+            PLOT_VIEW_1D_LINE: {"density_active_view_type": PLOT_VIEW_1D_LINE},
+            PLOT_VIEW_2D_HEATMAP: {
+                "density_active_view_type": PLOT_VIEW_2D_HEATMAP,
+                "density_2d_x_axis": "x",
+                "density_2d_y_axis": "y",
+            },
+        },
+        series_show_in_legend=[True, False],
+        series_alpha=[None, 0.5],
+        plot_data_format="csv",
+        plot_data_delimiter="semicolon",
+        plot_data_include_metadata=True,
+        plot_data_enabled_only=True,
+        _gui_sync_modes={"x_lim": "manual"},
+        x_lim=None,
+        y_lim=None,
+    )
+
+    persisted = cli_mod._collect_plot_settings_for_persistence(
+        args,
+        keys=cli_mod._PLOT_SETTINGS_DENSITY_KEYS,
+    )
+
+    assert persisted["density_enabled_species"] == ["Na"]
+    assert persisted["density_active_view_type"] == PLOT_VIEW_2D_HEATMAP
+    assert persisted["density_view_states"][PLOT_VIEW_2D_HEATMAP]["density_2d_x_axis"] == "x"
+    assert persisted["series_show_in_legend"] == [True, False]
+    assert persisted["series_alpha"] == [None, 0.5]
+    assert persisted["plot_data_format"] == "csv"
+    assert persisted["plot_data_delimiter"] == "semicolon"
+    assert persisted["plot_data_include_metadata"] is True
+    assert persisted["plot_data_enabled_only"] is True
+    assert persisted["_gui_sync_modes"] == {"x_lim": "manual"}
+
+
 def test_apply_saved_plot_settings_restores_view_mapping_without_argparse_field(monkeypatch):
     args = argparse.Namespace(_runtime_argv=())
     saved = {
@@ -4215,6 +4375,155 @@ def test_apply_saved_plot_settings_restores_view_mapping_without_argparse_field(
     assert isinstance(args.view_mapping, dict)
     assert args.view_mapping["x"] == "axis_coordinate"
     assert args.view_mapping["fixed_values"]["quantity"] == "number"
+
+
+def test_apply_saved_plot_settings_restores_density_enabled_species(monkeypatch):
+    args = argparse.Namespace(_runtime_argv=())
+    saved = {
+        "source_selection": {},
+        "view_mapping": {
+            "view_type_id": "line_1d",
+            "x": "distance_to_surface",
+            "y": "mass_density",
+            "color": None,
+            "split_by": None,
+            "filter_by": None,
+            "filter_min": None,
+            "filter_max": None,
+            "role_assignments": {},
+            "fixed_values": {"quantity": "mass"},
+        },
+        "style": {"density_enabled_species": ["Na"]},
+    }
+    monkeypatch.setattr(
+        "linak.plot.plot_settings.read_plot_profile",
+        lambda *args, **kwargs: saved,
+    )
+
+    cli_mod._apply_saved_plot_settings(
+        args=args,
+        source_path=Path("dummy.h5"),
+        profile_key="plot:density",
+        keys=cli_mod._PLOT_SETTINGS_DENSITY_KEYS,
+        profile_name=None,
+    )
+
+    assert args.density_enabled_species == ["Na"]
+
+
+def test_apply_saved_plot_settings_restores_gui_profile_state_keys(monkeypatch):
+    density_args = argparse.Namespace(_runtime_argv=())
+    density_saved = cli_mod._build_saved_plot_profile_payload(
+        profile_key="plot:density",
+        settings={
+            "density_enabled_species": ["Na"],
+            "density_active_view_type": PLOT_VIEW_2D_HEATMAP,
+            "density_view_states": {
+                PLOT_VIEW_1D_LINE: {"density_active_view_type": PLOT_VIEW_1D_LINE},
+                PLOT_VIEW_2D_HEATMAP: {
+                    "density_active_view_type": PLOT_VIEW_2D_HEATMAP,
+                    "density_2d_x_axis": "x",
+                    "density_2d_y_axis": "y",
+                },
+            },
+            "series_show_in_legend": [True, False],
+            "series_alpha": [None, 0.25],
+            "plot_data_format": "csv",
+            "plot_data_delimiter": "tab",
+            "plot_data_include_metadata": True,
+            "plot_data_enabled_only": True,
+            "_gui_sync_modes": {"x_lim": "manual"},
+        },
+    )
+    monkeypatch.setattr(
+        "linak.plot.plot_settings.read_plot_profile",
+        lambda *args, **kwargs: density_saved,
+    )
+
+    cli_mod._apply_saved_plot_settings(
+        args=density_args,
+        source_path=Path("dummy.h5"),
+        profile_key="plot:density",
+        keys=cli_mod._PLOT_SETTINGS_DENSITY_KEYS,
+        profile_name=None,
+    )
+
+    assert density_args.density_active_view_type == PLOT_VIEW_2D_HEATMAP
+    assert density_args.density_view_states[PLOT_VIEW_2D_HEATMAP]["density_2d_y_axis"] == "y"
+    assert density_args.series_show_in_legend == [True, False]
+    assert density_args.series_alpha == [None, 0.25]
+    assert density_args.plot_data_format == "csv"
+    assert density_args.plot_data_delimiter == "tab"
+    assert density_args.plot_data_include_metadata is True
+    assert density_args.plot_data_enabled_only is True
+    assert density_args._gui_sync_modes == {"x_lim": "manual"}
+
+    position_args = argparse.Namespace(_runtime_argv=())
+    position_saved = cli_mod._build_saved_plot_profile_payload(
+        profile_key="plot:position",
+        settings={
+            "position_active_view_type": PLOT_VIEW_2D_HEATMAP,
+            "position_view_states": {
+                PLOT_VIEW_1D_LINE: {"position_active_view_type": PLOT_VIEW_1D_LINE},
+                PLOT_VIEW_2D_HEATMAP: {
+                    "position_active_view_type": PLOT_VIEW_2D_HEATMAP,
+                    "projection_x": "x",
+                    "projection_y": "y",
+                },
+            },
+        },
+    )
+    monkeypatch.setattr(
+        "linak.plot.plot_settings.read_plot_profile",
+        lambda *args, **kwargs: position_saved,
+    )
+
+    cli_mod._apply_saved_plot_settings(
+        args=position_args,
+        source_path=Path("dummy.h5"),
+        profile_key="plot:position",
+        keys=cli_mod._PLOT_SETTINGS_POSITION_KEYS,
+        profile_name=None,
+    )
+
+    assert position_args.position_active_view_type == PLOT_VIEW_2D_HEATMAP
+    assert position_args.position_view_states[PLOT_VIEW_2D_HEATMAP]["projection_y"] == "y"
+
+    orientation_args = argparse.Namespace(_runtime_argv=())
+    orientation_saved = cli_mod._build_saved_plot_profile_payload(
+        profile_key="plot:orientation",
+        settings={
+            "orientation_active_view_type": PLOT_VIEW_2D_HEATMAP,
+            "orientation_view_states": {
+                PLOT_VIEW_1D_LINE: {"orientation_active_view_type": PLOT_VIEW_1D_LINE},
+                PLOT_VIEW_2D_HEATMAP: {
+                    "orientation_active_view_type": PLOT_VIEW_2D_HEATMAP,
+                    "orientation_heatmap_x_axis": "distance",
+                    "orientation_heatmap_y_axis": "angle",
+                },
+            },
+        },
+    )
+    monkeypatch.setattr(
+        "linak.plot.plot_settings.read_plot_profile",
+        lambda *args, **kwargs: orientation_saved,
+    )
+
+    cli_mod._apply_saved_plot_settings(
+        args=orientation_args,
+        source_path=Path("dummy.h5"),
+        profile_key="plot:orientation",
+        keys=cli_mod._PLOT_SETTINGS_ORIENTATION_KEYS,
+        profile_name=None,
+    )
+
+    assert orientation_args.orientation_active_view_type == PLOT_VIEW_2D_HEATMAP
+    assert (
+        orientation_args.orientation_view_states[PLOT_VIEW_2D_HEATMAP][
+            "orientation_heatmap_y_axis"
+        ]
+        == "angle"
+    )
 
 
 def test_apply_saved_plot_settings_does_not_override_explicit_density_mapping_flags(monkeypatch):
@@ -4520,7 +4829,7 @@ def test_resolve_position_plotter_kwargs_uses_generic_view_mapping():
     assert "component" not in kwargs
     assert "time_axis" not in kwargs
     assert "view_mapping" in kwargs
-    assert kwargs["view_mapping"].view_type_id == "trajectory_2d"
+    assert kwargs["view_mapping"].view_type_id == PLOT_VIEW_2D_HEATMAP
     assert kwargs["view_mapping"].x == "x"
     assert kwargs["view_mapping"].y == "z"
 
@@ -4536,7 +4845,7 @@ def test_resolve_coordination_plotter_kwargs_uses_generic_view_mapping():
     assert "component" not in kwargs
     assert "time_axis" not in kwargs
     assert "view_mapping" in kwargs
-    assert kwargs["view_mapping"].view_type_id == "trajectory_2d"
+    assert kwargs["view_mapping"].view_type_id == PLOT_VIEW_2D_HEATMAP
     assert kwargs["view_mapping"].x == "time_fs"
     assert kwargs["view_mapping"].y == "distance_to_surface"
     assert kwargs["view_mapping"].color == "coordination_number"
@@ -4552,7 +4861,7 @@ def test_resolve_density_plotter_kwargs_uses_generic_view_mapping():
 
     assert "x_mode" not in kwargs
     assert "quantity" not in kwargs
-    assert kwargs["view_mapping"].view_type_id == "line_1d"
+    assert kwargs["view_mapping"].view_type_id == PLOT_VIEW_1D_LINE
     assert kwargs["view_mapping"].x == "axis_coordinate"
     assert kwargs["view_mapping"].y == "number_density"
 
@@ -4563,7 +4872,7 @@ def test_resolve_msd_plotter_kwargs_uses_generic_view_mapping():
     kwargs = _resolve_msd_plotter_kwargs(args)
 
     assert "time_axis" not in kwargs
-    assert kwargs["view_mapping"].view_type_id == "line_1d"
+    assert kwargs["view_mapping"].view_type_id == PLOT_VIEW_1D_LINE
     assert kwargs["view_mapping"].x == "time_fs"
     assert kwargs["view_mapping"].y == "msd"
 
@@ -4571,17 +4880,17 @@ def test_resolve_msd_plotter_kwargs_uses_generic_view_mapping():
 def test_resolve_rdf_plotter_kwargs_uses_generic_view_mapping():
     kwargs = _resolve_rdf_plotter_kwargs(argparse.Namespace())
 
-    assert kwargs["view_mapping"].view_type_id == "line_1d"
+    assert kwargs["view_mapping"].view_type_id == PLOT_VIEW_1D_LINE
     assert kwargs["view_mapping"].x == "radius"
     assert kwargs["view_mapping"].y == "g_r"
 
 
 def test_resolve_potential_plotter_kwargs_uses_generic_summary_mapping():
-    args = argparse.Namespace(y_quantity=None, table_view=False)
+    args = argparse.Namespace(y_quantity=None)
 
     kwargs = _resolve_potential_plotter_kwargs(args)
 
-    assert kwargs["view_mapping"].view_type_id == "line_1d"
+    assert kwargs["view_mapping"].view_type_id == PLOT_VIEW_1D_LINE
     assert kwargs["view_mapping"].x == "record_id"
     assert kwargs["view_mapping"].fixed_values["standard_plot"] == "summary"
 
@@ -4593,12 +4902,50 @@ def test_resolve_orientation_plotter_kwargs_uses_generic_heatmap_mapping():
 
     assert "component" not in kwargs
     assert "angle" not in kwargs
-    assert kwargs["view_mapping"].view_type_id == "heatmap_2d"
+    assert kwargs["view_mapping"].view_type_id == PLOT_VIEW_2D_HEATMAP
     assert kwargs["view_mapping"].x == "bin_centers_A"
     assert kwargs["view_mapping"].resolved_role_assignments()["z"] == "heatmap_azimuthal"
 
 
-def test_position_mapping_summary_for_dry_run_uses_view_mapping_terms():
+def test_plot_orientation_public_view_options_resolve_mapping():
+    parser = cli_mod.build_plot_parser(analysis="orientation")
+    args = parser.parse_args(
+        [
+            "input.h5",
+            "--view-type",
+            "2d-heatmap",
+            "--angle",
+            "azimuthal",
+        ]
+    )
+
+    kwargs = _resolve_orientation_plotter_kwargs(args)
+
+    assert kwargs["view_mapping"].view_type_id == PLOT_VIEW_2D_HEATMAP
+    assert kwargs["view_mapping"].resolved_role_assignments()["z"] == "heatmap_azimuthal"
+
+
+def test_plot_orientation_public_1d_y_quantity_resolves_mapping():
+    parser = cli_mod.build_plot_parser(analysis="orientation")
+    args = parser.parse_args(
+        [
+            "input.h5",
+            "--view-type",
+            "1d-line",
+            "--y-quantity",
+            "density",
+            "--angle",
+            "polar",
+        ]
+    )
+
+    kwargs = _resolve_orientation_plotter_kwargs(args)
+
+    assert kwargs["view_mapping"].view_type_id == PLOT_VIEW_1D_LINE
+    assert kwargs["view_mapping"].y == "density"
+
+
+def test_position_mapping_summary_for_dry_run_uses_public_view_terms():
     args = argparse.Namespace(
         component="2d-projection",
         map_color="distance",
@@ -4615,7 +4962,7 @@ def test_position_mapping_summary_for_dry_run_uses_view_mapping_terms():
 
     summary = cli_mod._position_mapping_summary_for_dry_run(args)
 
-    assert "view_mapping=trajectory_2d" in summary
+    assert "view type=2D Heatmap" in summary
     assert "x=x" in summary
     assert "y=z" in summary
     assert "value=distance_to_surface" in summary
@@ -4623,65 +4970,65 @@ def test_position_mapping_summary_for_dry_run_uses_view_mapping_terms():
     assert "filter=distance_to_surface[, 3.0]" in summary
 
 
-def test_density_mapping_summary_for_dry_run_uses_view_mapping_terms():
+def test_density_mapping_summary_for_dry_run_uses_public_view_terms():
     args = argparse.Namespace(x_mode="z", quantity="number", view_mapping=None)
 
     summary = cli_mod._density_mapping_summary_for_dry_run(args)
 
-    assert "view_mapping=line_1d" in summary
+    assert "view type=1D Line" in summary
     assert "x=axis_coordinate" in summary
     assert "y=number_density" in summary
     assert "x_mode=z" in summary
 
 
-def test_msd_mapping_summary_for_dry_run_uses_view_mapping_terms():
+def test_msd_mapping_summary_for_dry_run_uses_public_view_terms():
     args = argparse.Namespace(time_axis="fs", view_mapping=None)
 
     summary = cli_mod._msd_mapping_summary_for_dry_run(args)
 
-    assert "view_mapping=line_1d" in summary
+    assert "view type=1D Line" in summary
     assert "x=time_fs" in summary
     assert "y=msd" in summary
 
 
-def test_rdf_mapping_summary_for_dry_run_uses_view_mapping_terms():
+def test_rdf_mapping_summary_for_dry_run_uses_public_view_terms():
     args = argparse.Namespace(view_mapping=None)
 
     summary = cli_mod._rdf_mapping_summary_for_dry_run(args)
 
-    assert "view_mapping=line_1d" in summary
+    assert "view type=1D Line" in summary
     assert "x=radius" in summary
     assert "y=g_r" in summary
 
 
-def test_coordination_mapping_summary_for_dry_run_uses_view_mapping_terms():
+def test_coordination_mapping_summary_for_dry_run_uses_public_view_terms():
     args = argparse.Namespace(component="time-distance", time_axis="fs", view_mapping=None)
 
     summary = cli_mod._coordination_mapping_summary_for_dry_run(args)
 
-    assert "view_mapping=trajectory_2d" in summary
+    assert "view type=2D Heatmap" in summary
     assert "x=time_fs" in summary
     assert "y=distance_to_surface" in summary
     assert "color=coordination_number" in summary
 
 
-def test_orientation_mapping_summary_for_dry_run_uses_view_mapping_terms():
+def test_orientation_mapping_summary_for_dry_run_uses_public_view_terms():
     args = argparse.Namespace(component="heatmap", angle="azimuthal", view_mapping=None)
 
     summary = cli_mod._orientation_mapping_summary_for_dry_run(args)
 
-    assert "view_mapping=heatmap_2d" in summary
+    assert "view type=2D Heatmap" in summary
     assert "x=bin_centers_A" in summary
     assert "y=heatmap_angle_bin_centers" in summary
     assert "z=heatmap_azimuthal" in summary
 
 
-def test_potential_mapping_summary_for_dry_run_uses_view_mapping_terms():
-    args = argparse.Namespace(y_quantity=None, table_view=False, view_mapping=None)
+def test_potential_mapping_summary_for_dry_run_uses_public_view_terms():
+    args = argparse.Namespace(y_quantity=None, view_mapping=None)
 
     summary = cli_mod._potential_mapping_summary_for_dry_run(args)
 
-    assert "view_mapping=line_1d" in summary
+    assert "view type=1D Line" in summary
     assert "x=record_id" in summary
     assert "standard_plot=summary" in summary
 
@@ -5285,8 +5632,11 @@ def test_build_density_gui_context_selects_heatmap_contract(tmp_path):
 
     context = cli_mod._build_density_gui_context(args, sources=[str(output)])
 
-    assert context.plotter_kwargs["view_mapping"].view_type_id == "heatmap_2d"
-    assert context.profile_filter_options["density_heatmap_plot_contract"]["default_view_type_id"] == "heatmap_2d"
+    assert context.plotter_kwargs["view_mapping"].view_type_id == PLOT_VIEW_2D_HEATMAP
+    assert (
+        context.profile_filter_options["density_heatmap_plot_contract"]["default_view_type_id"]
+        == PLOT_VIEW_2D_HEATMAP
+    )
 
 
 def test_build_density_gui_logical_context_offers_line_and_2d_for_grid_only_hdf5(tmp_path):
@@ -5330,7 +5680,7 @@ def test_build_density_gui_logical_context_offers_line_and_2d_for_grid_only_hdf5
 
     context = cli_mod._build_density_gui_logical_context(args, sources=[str(output)])
 
-    assert context.plotter_kwargs["view_mapping"].view_type_id == "line_1d"
+    assert context.plotter_kwargs["view_mapping"].view_type_id == PLOT_VIEW_1D_LINE
     assert context.profile_filter_options["density_view_types"] == ["line_1d", "heatmap_2d"]
 
 
@@ -5639,6 +5989,58 @@ def test_density_gui_2d_averages_enabled_sparse_grid_sources(tmp_path):
     assert load_calls == 3
 
 
+def test_density_gui_2d_sanitizes_multi_species_mapping_selection(tmp_path):
+    edges = np.asarray([0.0, 1.0], dtype=float)
+    source = tmp_path / "density_grid_multi_species.h5"
+    save_density_profiles(
+        [
+            DensityGridProfile(
+                species="Na",
+                x_bin_edges=edges,
+                y_bin_edges=edges,
+                z_bin_edges=edges,
+                distance_bin_edges=edges,
+                flat_indices=np.asarray([0], dtype=np.uint64),
+                mass_sum_g=np.asarray([2.0], dtype=float),
+                entity_sum=np.asarray([2.0], dtype=float),
+                n_frames=1,
+                number_density_units="atom/nm^3",
+            ),
+            DensityGridProfile(
+                species="H2O",
+                x_bin_edges=edges,
+                y_bin_edges=edges,
+                z_bin_edges=edges,
+                distance_bin_edges=edges,
+                flat_indices=np.asarray([0], dtype=np.uint64),
+                mass_sum_g=np.asarray([4.0], dtype=float),
+                entity_sum=np.asarray([4.0], dtype=float),
+                n_frames=1,
+                number_density_units="molecule/nm^3",
+            ),
+        ],
+        source,
+    )
+    args = build_parser().parse_args(["plot", str(source)])
+    args.view_mapping = PlotViewMapping(
+        view_type_id="heatmap_2d",
+        x="x_bin_center",
+        y="y_bin_center",
+        role_assignments={"z": "number_density_2d"},
+    )
+    args.density_2d_x_axis = "x"
+    args.density_2d_y_axis = "y"
+    args.density_enabled_species = ["Na", "H2O"]
+
+    catalog = cli_mod._build_density_gui_lazy_catalog(args, sources=[str(source)])
+    descriptors = catalog.series_descriptors
+    context = catalog.build_render_context(args)
+
+    assert {descriptor["density_species"] for descriptor in descriptors} == {"Na"}
+    assert len(context.profile) == 1
+    assert context.profile[0].species == "Na averaged X/Y"
+
+
 def test_density_gui_2d_source_ids_use_loaded_file_not_origin_metadata(tmp_path):
     edges = np.asarray([0.0, 1.0], dtype=float)
     source_a = tmp_path / "density_grid_a.h5"
@@ -5796,6 +6198,105 @@ def test_density_gui_2d_combined_hdf5_keeps_grid_contributors_selectable(tmp_pat
     assert filtered_profile.number_density[0, 0] == pytest.approx(4000.0)
 
 
+def test_density_gui_sparse_grid_slice_cache_survives_catalog_rebuild(tmp_path, monkeypatch):
+    edges = np.asarray([0.0, 1.0], dtype=float)
+    source = tmp_path / "density_grid.h5"
+    save_density_profiles(
+        [
+            DensityGridProfile(
+                species="Na",
+                x_bin_edges=edges,
+                y_bin_edges=edges,
+                z_bin_edges=edges,
+                distance_bin_edges=edges,
+                flat_indices=np.asarray([0], dtype=np.uint64),
+                mass_sum_g=np.asarray([2.0], dtype=float),
+                entity_sum=np.asarray([2.0], dtype=float),
+                n_frames=1,
+                number_density_units="atom/nm^3",
+            )
+        ],
+        source,
+    )
+    args = build_parser().parse_args(["plot", str(source)])
+    args.view_mapping = PlotViewMapping(
+        view_type_id="heatmap_2d",
+        x="x_bin_center",
+        y="y_bin_center",
+        role_assignments={"z": "number_density_2d"},
+    )
+    args.density_2d_x_axis = "x"
+    args.density_2d_y_axis = "y"
+    args.density_enabled_species = ["Na"]
+    grid_cache: dict[str, object] = {}
+    slice_cache: dict[str, list[object]] = {}
+    load_calls: list[list[int]] = []
+
+    from linak.analysis import density as density_mod
+
+    original_loader = density_mod.load_density_grid_profiles_by_index
+
+    def _counting_grid_loader(path, indices, *, species=None):
+        load_calls.append([int(index) for index in indices])
+        return original_loader(path, indices, species=species)
+
+    monkeypatch.setattr(
+        "linak.analysis.density.load_density_grid_profiles_by_index",
+        _counting_grid_loader,
+    )
+
+    first_catalog = cli_mod._build_density_gui_lazy_catalog(
+        args,
+        sources=[str(source)],
+        density_grid_profile_cache=grid_cache,
+        density_grid_slice_cache=slice_cache,
+    )
+    first_profile = first_catalog.build_render_context(args).profile[0]
+    second_catalog = cli_mod._build_density_gui_lazy_catalog(
+        args,
+        sources=[str(source)],
+        density_grid_profile_cache=grid_cache,
+        density_grid_slice_cache=slice_cache,
+    )
+    second_profile = second_catalog.build_render_context(args).profile[0]
+
+    assert first_profile is second_profile
+    assert load_calls == [[0]]
+
+
+def test_analysis_profile_header_cache_reuses_unchanged_hdf5_headers(tmp_path, monkeypatch):
+    source = tmp_path / "density.h5"
+    _write_density_hdf5(source)
+    cli_mod._ANALYSIS_PROFILE_HEADER_CACHE.clear()
+    read_calls: list[Path] = []
+
+    from linak.storage import hdf5_utils
+
+    original_reader = hdf5_utils.read_linak_hdf5_profile_headers
+
+    def _counting_header_reader(path, *, expected_analysis=None):
+        read_calls.append(Path(path))
+        return original_reader(path, expected_analysis=expected_analysis)
+
+    monkeypatch.setattr(
+        "linak.storage.hdf5_utils.read_linak_hdf5_profile_headers",
+        _counting_header_reader,
+    )
+
+    first = cli_mod._read_analysis_profile_headers_by_source(
+        sources=[str(source)],
+        analysis="density",
+    )
+    first[0][1][0]["species"] = "MUTATED"
+    second = cli_mod._read_analysis_profile_headers_by_source(
+        sources=[str(source)],
+        analysis="density",
+    )
+
+    assert len(read_calls) == 1
+    assert second[0][1][0]["species"] != "MUTATED"
+
+
 def test_density_gui_2d_bin_widths_update_sparse_grid_slice_key(tmp_path):
     edges = np.asarray([0.0, 0.5, 1.0], dtype=float)
     source = tmp_path / "density_grid_bin_widths.h5"
@@ -5840,6 +6341,49 @@ def test_density_gui_2d_bin_widths_update_sparse_grid_slice_key(tmp_path):
     assert rebinned_descriptor["density_grid_x_bin_width"] == pytest.approx(1.0)
     assert rebinned_descriptor["density_grid_y_bin_width"] == pytest.approx(1.0)
     assert default_descriptor["density_grid_slice_key"] != rebinned_descriptor["density_grid_slice_key"]
+
+
+def test_density_gui_2d_x_bin_width_from_gui_settings_changes_rendered_slice(tmp_path):
+    edges = np.asarray([0.0, 0.5, 1.0], dtype=float)
+    source = tmp_path / "density_grid_gui_x_bin_width.h5"
+    save_density_profiles(
+        [
+            DensityGridProfile(
+                species="Na",
+                x_bin_edges=edges,
+                y_bin_edges=edges,
+                z_bin_edges=edges,
+                distance_bin_edges=edges,
+                flat_indices=np.asarray([0, 8], dtype=np.uint64),
+                mass_sum_g=np.asarray([1.0, 1.0], dtype=float),
+                entity_sum=np.asarray([1.0, 1.0], dtype=float),
+                n_frames=1,
+                number_density_units="atom/nm^3",
+            )
+        ],
+        source,
+    )
+    args = build_parser().parse_args(["plot", str(source)])
+    args.view_mapping = PlotViewMapping(
+        view_type_id="heatmap_2d",
+        x="x_bin_center",
+        y="y_bin_center",
+        role_assignments={"z": "number_density_2d"},
+    )
+    gui_settings = {
+        "density_enabled_species": ["Na"],
+        "density_2d_x_axis": "x",
+        "density_2d_y_axis": "y",
+        "x_bin_width": 1.0,
+    }
+    cli_mod._apply_gui_settings_to_args(args, gui_settings)
+
+    catalog = cli_mod._build_density_gui_lazy_catalog(args, sources=[str(source)])
+    profile = catalog.build_render_context(args).profile[0]
+
+    assert catalog.series_descriptors[0]["density_grid_x_bin_width"] == pytest.approx(1.0)
+    assert profile.x_bin_edges.tolist() == pytest.approx([0.0, 1.0])
+    assert profile.y_bin_edges.tolist() == pytest.approx([0.0, 0.5, 1.0])
 
 
 def test_density_gui_range_filters_use_grid_with_stable_series_id(tmp_path):
@@ -5955,7 +6499,7 @@ def test_plot_density_non_gui_defaults_to_grid_derived_line_for_grid_only_hdf5(
     assert isinstance(profile, list)
     assert isinstance(profile[0], DensityProfile)
     assert isinstance(kwargs, dict)
-    assert kwargs["view_mapping"].view_type_id == "line_1d"
+    assert kwargs["view_mapping"].view_type_id == PLOT_VIEW_1D_LINE
 
 
 def test_resolve_density_plot_axis_and_x_mode_prefers_explicit_cartesian_values():
@@ -6044,7 +6588,7 @@ def test_plot_density_gui_initial_settings_include_analysis_controls(tmp_path, m
     assert isinstance(initial, dict)
     assert initial["species"] == "H2O"
     assert initial["axis"] == "y"
-    assert initial["view_mapping"]["view_type_id"] == "line_1d"
+    assert initial["view_mapping"]["view_type_id"] == PLOT_VIEW_1D_LINE
     assert initial["view_mapping"]["x"] == "axis_coordinate"
     assert initial["view_mapping"]["y"] == "number_density"
     assert initial["view_mapping"]["fixed_values"]["x_mode"] == "axis"
@@ -7214,6 +7758,55 @@ def test_open_plot_settings_gui_forwards_save_data_callback(monkeypatch):
     assert captured["on_save_data"] is _save_data
 
 
+def test_open_plot_settings_gui_forwards_preview_figure_callback(monkeypatch):
+    captured: dict[str, object] = {}
+
+    def _fake_launcher(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr("linak.plot.plot_gui.launch_plot_settings_panel", _fake_launcher)
+
+    def _preview_figure(_settings: dict[str, object]) -> dict[str, object]:
+        return {"figure": object()}
+
+    cli_mod._open_plot_settings_gui(
+        title="Plot",
+        initial_settings={},
+        on_preview=lambda _settings: {},
+        on_preview_figure=_preview_figure,
+        on_save=lambda _profile_name, _settings: "saved",
+    )
+
+    assert captured["on_preview_figure"] is _preview_figure
+
+
+def test_plot_gui_uses_interactive_preview_for_all_analysis_types():
+    source = Path("src/linak/cli.py").read_text(encoding="utf-8")
+    gui_call_start = source.rindex("    _open_plot_settings_gui(")
+    gui_call_body = source[gui_call_start : gui_call_start + 1200]
+
+    assert "on_preview_figure=_preview_figure" in gui_call_body
+    assert 'analysis_name in {"density", "position"}' not in gui_call_body
+
+
+def test_profile_plot_gui_has_data_signature_context_cache():
+    source = Path("src/linak/cli.py").read_text(encoding="utf-8")
+
+    assert "context_cache: dict[str, _GuiPlotRenderContext] = {}" in source
+    assert "def _gui_context_data_signature(" in source
+    assert '"density_filter_distance_max"' in source
+    assert '"projection_filter_max"' in source
+    assert '"required_source_ids": sorted(required_source_ids)' in source
+    assert "GUI %s context cache hit" in source
+    assert "GUI %s context cache miss" in source
+    preview_start = source.index("def _render_gui_preview_settings(")
+    preview_end = source.index("def _preview(gui_settings", preview_start)
+    preview_body = source[preview_start:preview_end]
+    assert "_cached_gui_context(" in preview_body
+    assert "builder=build_context" in preview_body
+    assert "builder=build_full_context" in preview_body
+
+
 def test_plot_density_gui_first_open_materializes_id_keyed_series_state(tmp_path, monkeypatch):
     frame = Atoms(
         "OO",
@@ -7596,6 +8189,59 @@ def test_plot_density_gui_reopen_preserves_enabled_fit_settings(tmp_path, monkey
     assert preview_calls["count"] == 1
 
 
+def test_plot_density_gui_reopen_preserves_mapping_enabled_species(tmp_path, monkeypatch):
+    frame = Atoms(
+        ["O", "Na"],
+        positions=[[0.0, 0.0, 0.10], [0.0, 0.0, 1.10]],
+        cell=[10.0, 10.0, 10.0],
+        pbc=True,
+    )
+    profiles = [
+        compute_density_profile([frame], species="O", axis="z", bin_width=1.0),
+        compute_density_profile([frame], species="Na", axis="z", bin_width=1.0),
+    ]
+    source_h5 = tmp_path / "density.h5"
+    save_density_profiles(profiles, source_h5)
+
+    launches: list[dict[str, object]] = []
+
+    def _fake_gui_launcher(**kwargs):
+        launches.append(deepcopy(kwargs["initial_settings"]))
+        if len(launches) == 1:
+            initial_settings = deepcopy(kwargs["initial_settings"])
+            initial_settings["density_enabled_species"] = ["Na"]
+            kwargs["on_save"]("Default", initial_settings)
+
+    monkeypatch.setattr("linak.cli._open_plot_settings_gui", _fake_gui_launcher)
+
+    rc_first = main(
+        [
+            "--log-level",
+            "ERROR",
+            "plot",
+            str(source_h5),
+            "--gui",
+        ]
+    )
+    rc_second = main(
+        [
+            "--log-level",
+            "ERROR",
+            "plot",
+            str(source_h5),
+            "--gui",
+        ]
+    )
+
+    assert rc_first == 0
+    assert rc_second == 0
+    assert len(launches) == 2
+    saved = _read_flat_plot_profile(source_h5, "plot:density")
+    assert saved is not None
+    assert saved["density_enabled_species"] == ["Na"]
+    assert launches[1]["density_enabled_species"] == ["Na"]
+
+
 def test_plot_density_gui_reopen_preserves_normalization_settings(tmp_path, monkeypatch):
     frame = Atoms(
         "OO",
@@ -7816,7 +8462,7 @@ def test_plot_density_gui_lazy_loading_only_reads_enabled_series_and_evicts_cach
     )
 
     assert rc == 0
-    assert load_calls == [[1], [1]]
+    assert load_calls == [[1]]
     assert len(render_args_seen) >= 2
     for render_args in render_args_seen:
         assert render_args.series_enabled is None
@@ -8284,7 +8930,7 @@ def test_plot_position_multiple_files_overlays_with_source_labels(tmp_path, monk
         f"{source_h5_1.name}:O",
         f"{source_h5_2.name}:O",
     ]
-    assert captured["view_mapping"].view_type_id == "trajectory_2d"
+    assert captured["view_mapping"].view_type_id == PLOT_VIEW_2D_HEATMAP
     assert captured["view_mapping"].x == "x"
     assert captured["view_mapping"].y == "y"
     assert captured["view_mapping"].color == "distance_to_surface"
@@ -8663,6 +9309,42 @@ def test_position_projection_lazy_catalog_uses_filtered_point_count_in_line_colo
     assert "final_points=80" in caplog.text
 
 
+def test_position_projection_lazy_catalog_estimates_without_full_profile_load(
+    tmp_path, monkeypatch
+):
+    source_h5 = tmp_path / "large_position.h5"
+    _write_large_position_hdf5(source_h5, n_atoms=80, n_frames=3)
+
+    args = cli_mod.build_parser().parse_args(
+        [
+            "plot",
+            str(source_h5),
+            "--component",
+            "2d-projection",
+            "--projection-render-mode",
+            "line-colors",
+            "--projection-value",
+            "distance",
+            "--projection-filter-max",
+            "2.1",
+        ]
+    )
+
+    def _fail_full_position_load(*_args, **_kwargs):
+        raise AssertionError("initial position projection catalog should use lightweight HDF5 reads")
+
+    monkeypatch.setattr(
+        "linak.analysis.position.load_position_profiles_by_index",
+        _fail_full_position_load,
+    )
+
+    catalog = cli_mod._build_position_gui_lazy_catalog(args, sources=[str(source_h5)])
+    context = catalog.build_initial_context()
+
+    assert context.series_count == 80
+    assert context.estimated_total_points == 80
+
+
 def test_position_projection_lazy_catalog_uses_filtered_point_count_in_color_scale_render_context(
     tmp_path, caplog
 ):
@@ -8856,7 +9538,7 @@ def test_plot_coordination_gui_defaults_to_distance_and_resolves_time_series(tmp
     assert captured["analysis_name"] == "coordination"
     initial = captured["initial_settings"]
     assert isinstance(initial, dict)
-    assert initial["view_mapping"]["view_type_id"] == "line_1d"
+    assert initial["view_mapping"]["view_type_id"] == PLOT_VIEW_1D_LINE
     assert initial["view_mapping"]["x"] == "distance_to_surface"
     assert initial["view_mapping"]["y"] == "coordination_number"
     assert initial["series_count"] == 1
@@ -8866,7 +9548,7 @@ def test_plot_coordination_gui_defaults_to_distance_and_resolves_time_series(tmp
         {
             **initial,
             "view_mapping": {
-                "view_type_id": "line_1d",
+                "view_type_id": PLOT_VIEW_1D_LINE,
                 "x": "time_ps",
                 "y": "coordination_number",
                 "color": None,
@@ -8885,7 +9567,7 @@ def test_plot_coordination_gui_defaults_to_distance_and_resolves_time_series(tmp
         {
             **initial,
             "view_mapping": {
-                "view_type_id": "trajectory_2d",
+                "view_type_id": PLOT_VIEW_2D_HEATMAP,
                 "x": "time_ps",
                 "y": "distance_to_surface",
                 "color": "coordination_number",
@@ -10440,6 +11122,45 @@ def test_apply_pbc_with_explicit_cell(tmp_path):
     assert wrapped.positions[0, 0] == pytest.approx(0.2)
     assert wrapped.positions[0, 1] == pytest.approx(0.9)
     assert wrapped.positions[0, 2] == pytest.approx(0.5)
+
+
+def test_apply_pbc_preserves_raw_species_label_as_first_xyz_column(tmp_path):
+    trajectory = tmp_path / "in.xyz"
+    out = tmp_path / "in_pbc.xyz"
+    trajectory.write_text(
+        "\n".join(
+            [
+                "2",
+                "raw labels",
+                "Pt_top 1.2 -0.1 0.5",
+                "Pt 0.0 0.0 0.0",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    rc = main(
+        [
+            "--log-level",
+            "ERROR",
+            "apply",
+            "pbc",
+            str(trajectory),
+            "--cell",
+            "1.0",
+            "1.0",
+            "1.0",
+        ]
+    )
+
+    assert rc == 0
+    atom_fields = out.read_text(encoding="utf-8").splitlines()[2].split()
+    assert atom_fields[0] == "Pt_top"
+    assert len(atom_fields) == 4
+    assert [float(value) for value in atom_fields[1:]] == pytest.approx([0.2, 0.9, 0.5])
+    loaded = read_trajectory(out)
+    assert loaded[0].get_chemical_symbols() == ["Pt", "Pt"]
 
 
 def test_apply_pbc_accepts_single_source_via_files_option(tmp_path):

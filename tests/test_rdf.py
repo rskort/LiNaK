@@ -19,6 +19,7 @@ from linak.analysis.rdf import (
     save_rdf_profile,
     save_rdf_profiles,
 )
+from linak.analysis.common import RAW_SPECIES_ARRAY
 from linak.plot.mappings.rdf_mapping import rdf_plot_options_to_view_mapping
 from linak.storage.hdf5_utils import read_linak_hdf5_profiles, write_linak_hdf5_profile_collection
 
@@ -77,6 +78,30 @@ def test_compute_rdf_returns_expected_shape_and_values():
     assert profile.g_r[1] > 0.0
     assert profile.species_a == "O"
     assert profile.species_b == "H"
+
+
+def test_compute_rdf_profiles_exposes_only_split_raw_species_in_grouped_mode():
+    frame = Atoms(
+        symbols=["Pt", "Pt", "O", "H", "Na"],
+        positions=[
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [3.0, 0.0, 0.0],
+            [4.0, 0.0, 0.0],
+            [5.0, 0.0, 0.0],
+        ],
+        cell=[12.0, 12.0, 12.0],
+        pbc=True,
+    )
+    frame.new_array(RAW_SPECIES_ARRAY, np.asarray(["Pt", "Pt_top", "O", "H", "Na"]))
+
+    profiles = compute_rdf_profiles([frame], r_max=2.0, bin_width=1.0)
+    labels = {profile.species_a for profile in profiles} | {profile.species_b for profile in profiles}
+
+    assert {"H", "Na", "O", "Pt", "species:Pt", "species:Pt_top"} <= labels
+    assert "species:H" not in labels
+    assert "species:Na" not in labels
+    assert "species:O" not in labels
 
 
 def test_compute_rdf_requires_fully_periodic_nonzero_cell():

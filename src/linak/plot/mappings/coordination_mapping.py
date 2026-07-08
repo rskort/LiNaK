@@ -10,7 +10,13 @@ from ..contracts.coordination_contract import (
     coordination_profile_to_plot_data_contract,
     default_coordination_plot_data_contract,
 )
-from ..data_contract import PlotDataContract, PlotViewMapping
+from ..data_contract import (
+    PLOT_VIEW_1D_LINE,
+    PLOT_VIEW_2D_HEATMAP,
+    PlotDataContract,
+    PlotViewMapping,
+    canonical_plot_view_id,
+)
 from ..data_validation import MappingStatus, generic_view_type_compatibility
 
 CoordinationMappingPresetName = Literal[
@@ -64,20 +70,20 @@ def coordination_mapping_preset(
 
     if name == "coordination_vs_distance":
         return PlotViewMapping(
-            view_type_id="line_1d",
+            view_type_id=PLOT_VIEW_1D_LINE,
             x="distance_to_surface",
             y="coordination_number",
         )
     if name == "coordination_vs_time":
         return PlotViewMapping(
-            view_type_id="line_1d",
+            view_type_id=PLOT_VIEW_1D_LINE,
             x=_coordination_quantity_id_from_token(time_axis),
             y="coordination_number",
             split_by="atom",
         )
     if name == "distance_vs_time":
         return PlotViewMapping(
-            view_type_id="trajectory_2d",
+            view_type_id=PLOT_VIEW_2D_HEATMAP,
             x=_coordination_quantity_id_from_token(time_axis),
             y="distance_to_surface",
             color="coordination_number",
@@ -98,19 +104,19 @@ def coordination_plot_options_to_view_mapping(
     normalized_component = _normalize_component_token(component)
     if normalized_component == "distance":
         return PlotViewMapping(
-            view_type_id="line_1d",
+            view_type_id=PLOT_VIEW_1D_LINE,
             x="distance_to_surface",
             y="coordination_number",
         )
     if normalized_component == "time":
         return PlotViewMapping(
-            view_type_id="line_1d",
+            view_type_id=PLOT_VIEW_1D_LINE,
             x=_coordination_quantity_id_from_token(time_axis),
             y="coordination_number",
             split_by="atom",
         )
     return PlotViewMapping(
-        view_type_id="trajectory_2d",
+        view_type_id=PLOT_VIEW_2D_HEATMAP,
         x=_coordination_quantity_id_from_token(time_axis),
         y="distance_to_surface",
         color="coordination_number",
@@ -122,7 +128,7 @@ def coordination_view_mapping_to_plot_options(mapping: PlotViewMapping) -> dict[
     """Translate one generic coordination mapping back into legacy plot options."""
 
     view_type_id = str(mapping.view_type_id).strip().lower()
-    if view_type_id == "line_1d":
+    if canonical_plot_view_id(view_type_id) == PLOT_VIEW_1D_LINE:
         x_quantity = str(mapping.x or "").strip()
         y_quantity = str(mapping.y or "").strip()
         if y_quantity != "coordination_number":
@@ -141,10 +147,10 @@ def coordination_view_mapping_to_plot_options(mapping: PlotViewMapping) -> dict[
             }
         raise ValueError(f"Unsupported coordination line x quantity '{x_quantity}'.")
 
-    if view_type_id != "trajectory_2d":
+    if canonical_plot_view_id(view_type_id) != PLOT_VIEW_2D_HEATMAP:
         raise ValueError(
             "Current coordination plotting only translates generic mappings for "
-            "'line_1d' and 'trajectory_2d'."
+            "1D Line and 2D Heatmap."
         )
 
     x_quantity = str(mapping.x or "").strip()
@@ -152,15 +158,15 @@ def coordination_view_mapping_to_plot_options(mapping: PlotViewMapping) -> dict[
     color_quantity = str(mapping.color or "coordination_number").strip()
     if x_quantity not in _COORDINATION_TIME_AXIS_TOKEN_BY_ID:
         raise ValueError(
-            "Coordination trajectory mappings must place one time quantity on the x role."
+            "Coordination 2D Heatmap mappings must place one time quantity on the x role."
         )
     if y_quantity != "distance_to_surface":
         raise ValueError(
-            "Coordination trajectory mappings must place distance_to_surface on the y role."
+            "Coordination 2D Heatmap mappings must place distance_to_surface on the y role."
         )
     if color_quantity != "coordination_number":
         raise ValueError(
-            "Coordination trajectory mappings must color by coordination_number."
+            "Coordination 2D Heatmap mappings must use coordination_number as the color quantity."
         )
     if mapping.filter_by is not None and str(mapping.filter_by).strip() != "coordination_number":
         raise ValueError(

@@ -53,8 +53,8 @@ from ..plot.plotting import (
 from ..progress import ProgressBar
 from ..utils import ensure_positive
 from .common import (
-    available_distinct_raw_species,
     available_element_species as _available_element_species,
+    grouped_raw_species_for_split_elements,
     normalize_species_label as _normalize_species,
     normalize_species_query as _normalize_species_query,
     raw_species_labels,
@@ -2264,7 +2264,7 @@ def compute_rdf_profiles(
 
     species_labels = [
         *_available_element_species(frames),
-        *(f"species:{label}" for label in available_distinct_raw_species(frames)),
+        *(f"species:{label}" for label in grouped_raw_species_for_split_elements(frames)),
     ]
     if not species_labels:
         raise ValueError("No elements found in trajectory.")

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from types import SimpleNamespace
 
 import h5py
@@ -17,6 +18,8 @@ from linak.analysis.orientation import (
     compute_orientation_profile,
     load_orientation_profile,
     load_orientation_profiles,
+    orientation_sparse_grid_to_heatmap,
+    orientation_sparse_grid_to_line,
     save_orientation_profile,
 )
 from linak.plot.mappings.orientation_mapping import orientation_plot_options_to_view_mapping
@@ -110,6 +113,65 @@ def test_compute_orientation_basic():
     assert len(profile.count_azimuthal_valid) == len(profile.bin_centers)
     assert profile.heatmap_polar.shape[0] == len(profile.bin_centers)
     assert profile.heatmap_azimuthal.shape[0] == len(profile.bin_centers)
+    assert profile.sparse_grid is not None
+    assert profile.sparse_grid.flat_indices.size == 1
+    assert profile.sparse_grid.entity_sum[0] == pytest.approx(3.0)
+    assert profile.sparse_grid.count_polar_valid[0] == pytest.approx(3.0)
+    assert profile.sparse_grid.shape[3] == len(profile.bin_centers)
+
+
+def test_orientation_sparse_grid_to_line_filters_data_without_cropping_axis():
+    profile = compute_orientation_profile(frames=_multi_frame_trajectory(3), axis="z", bin_width=1.0)
+
+    x_edges, x_centers, values = orientation_sparse_grid_to_line(
+        profile,
+        x_axis="z",
+        angle="polar",
+        filters={"z": (0.0, 4.0)},
+    )
+
+    assert x_edges[0] == pytest.approx(0.0)
+    assert x_edges[-1] >= 10.0
+    assert x_centers.shape == values.shape
+    assert np.all(np.isnan(values))
+
+    _x_edges, _x_centers, included = orientation_sparse_grid_to_line(
+        profile,
+        x_axis="z",
+        angle="polar",
+        filters={"z": (0.0, 6.0)},
+    )
+
+    assert np.count_nonzero(np.isfinite(included)) == 1
+    assert np.nanmax(included) == pytest.approx(np.nanmax(profile.cos_polar_mean))
+
+
+def test_orientation_sparse_grid_to_heatmap_filters_before_projection():
+    profile = compute_orientation_profile(frames=_multi_frame_trajectory(3), axis="z", bin_width=1.0)
+    occupied_distance = float(profile.bin_centers[_single_occupied_bin(profile)])
+
+    x_edges, y_edges, heatmap = orientation_sparse_grid_to_heatmap(
+        profile,
+        x_axis="x",
+        y_axis="y",
+        angle="polar",
+        filters={"distance": (occupied_distance - 0.25, occupied_distance + 0.25)},
+    )
+
+    assert x_edges[0] == pytest.approx(0.0)
+    assert y_edges[0] == pytest.approx(0.0)
+    assert heatmap.shape == (x_edges.size - 1, y_edges.size - 1)
+    assert np.count_nonzero(np.isfinite(heatmap)) == 1
+
+    _x_edges, _y_edges, excluded = orientation_sparse_grid_to_heatmap(
+        profile,
+        x_axis="x",
+        y_axis="y",
+        angle="polar",
+        filters={"distance": (occupied_distance + 2.0, occupied_distance + 3.0)},
+    )
+
+    assert np.all(np.isnan(excluded))
 
 
 def test_compute_orientation_reports_frame_and_aggregation_progress(monkeypatch, caplog):
@@ -424,6 +486,19 @@ def test_save_load_round_trip(tmp_path):
     np.testing.assert_allclose(loaded.density, profile.density)
     np.testing.assert_allclose(loaded.heatmap_polar, profile.heatmap_polar)
     np.testing.assert_allclose(loaded.heatmap_azimuthal, profile.heatmap_azimuthal)
+    assert loaded.sparse_grid is not None
+    assert profile.sparse_grid is not None
+    assert loaded.sparse_grid.shape == profile.sparse_grid.shape
+    np.testing.assert_array_equal(loaded.sparse_grid.flat_indices, profile.sparse_grid.flat_indices)
+    np.testing.assert_allclose(loaded.sparse_grid.entity_sum, profile.sparse_grid.entity_sum)
+    np.testing.assert_allclose(
+        loaded.sparse_grid.cos_polar_sum,
+        profile.sparse_grid.cos_polar_sum,
+    )
+    np.testing.assert_allclose(
+        loaded.sparse_grid.count_polar_valid,
+        profile.sparse_grid.count_polar_valid,
+    )
 
 
 def test_load_orientation_profiles_list(tmp_path):
@@ -565,6 +640,142 @@ def test_plot_orientation_profile_heatmap(tmp_path):
     )
     assert result is not None
     assert out.exists()
+
+
+def test_plot_orientation_profile_sparse_grid_heatmap_uses_filtered_grid(tmp_path):
+    from linak.analysis.orientation import plot_orientation_profile
+
+    profile = compute_orientation_profile(frames=_multi_frame_trajectory(3), axis="z", bin_width=1.0)
+    occupied_distance = float(profile.bin_centers[_single_occupied_bin(profile)])
+    capture_state: dict[str, object] = {}
+
+    result = plot_orientation_profile(
+        profile,
+        output=str(tmp_path / "orient_grid_heatmap.png"),
+        show=False,
+        component="heatmap",
+        angle="polar",
+        orientation_heatmap_x_axis="x",
+        orientation_heatmap_y_axis="y",
+        orientation_grid_filters={
+            "distance": (occupied_distance - 0.25, occupied_distance + 0.25)
+        },
+        capture_state=capture_state,
+    )
+
+    assert result is not None
+    assert capture_state["orientation_grid_heatmap"] is True
+    assert capture_state["orientation_grid_x_axis"] == "x"
+    assert capture_state["orientation_grid_y_axis"] == "y"
+    assert capture_state["x_label"] == "X (Angstrom)"
+    assert capture_state["y_label"] == "Y (Angstrom)"
+    mesh = capture_state["axes"].collections[0]
+    values = np.asarray(mesh.get_array(), dtype=float)
+    assert np.count_nonzero(np.isfinite(values)) == 1
+
+
+def test_plot_orientation_profile_sparse_grid_line_uses_filtered_grid(tmp_path):
+    from linak.analysis.orientation import plot_orientation_profile
+
+    profile = compute_orientation_profile(frames=_multi_frame_trajectory(3), axis="z", bin_width=1.0)
+    occupied_distance = float(profile.bin_centers[_single_occupied_bin(profile)])
+    capture_state: dict[str, object] = {}
+
+    result = plot_orientation_profile(
+        profile,
+        output=str(tmp_path / "orient_grid_line.png"),
+        show=False,
+        component="average",
+        angle="polar",
+        orientation_grid_filters={
+            "distance": (occupied_distance - 0.25, occupied_distance + 0.25)
+        },
+        capture_state=capture_state,
+    )
+
+    assert result is not None
+    assert capture_state["orientation_grid_line"] is True
+    assert capture_state["orientation_grid_x_axis"] == "distance"
+    assert capture_state["x_label"] == "Distance to surface (Angstrom)"
+    plotted = capture_state["plotted_xy_series"][0]
+    y_values = np.asarray(plotted["y"], dtype=float)
+    assert np.count_nonzero(np.isfinite(y_values)) == 1
+
+
+def test_plot_orientation_profiles_sparse_grid_line_uses_selected_x_axis(tmp_path):
+    from linak.analysis.orientation import plot_orientation_profiles
+
+    profile = compute_orientation_profile(frames=_multi_frame_trajectory(3), axis="z", bin_width=1.0)
+    capture_state: dict[str, object] = {}
+
+    result = plot_orientation_profiles(
+        [profile],
+        output=str(tmp_path / "orient_grid_line_z.png"),
+        show=False,
+        component="average",
+        angle="polar",
+        orientation_line_x_axis="z",
+        capture_state=capture_state,
+    )
+
+    assert result is not None
+    assert capture_state["orientation_grid_line"] is True
+    assert capture_state["orientation_grid_x_axis"] == "z"
+    assert capture_state["x_label"] == "Z (Angstrom)"
+    plotted = capture_state["plotted_xy_series"][0]
+    y_values = np.asarray(plotted["y"], dtype=float)
+    assert np.count_nonzero(np.isfinite(y_values)) == 1
+
+
+def test_plot_orientation_profile_sparse_grid_line_rejects_filtered_density(tmp_path):
+    from linak.analysis.orientation import plot_orientation_profile
+
+    profile = compute_orientation_profile(frames=_multi_frame_trajectory(3), axis="z", bin_width=1.0)
+
+    with pytest.raises(ValueError, match="Mean orientation"):
+        plot_orientation_profile(
+            profile,
+            output=str(tmp_path / "orient_grid_density_line.png"),
+            show=False,
+            component="density",
+            angle="polar",
+            orientation_grid_filters={"distance": (0.0, 10.0)},
+        )
+
+
+def test_plot_orientation_profile_sparse_grid_line_requires_grid(tmp_path):
+    from linak.analysis.orientation import plot_orientation_profile
+
+    profile = compute_orientation_profile(frames=_multi_frame_trajectory(2), axis="z", bin_width=1.0)
+    profile_without_grid = replace(profile, sparse_grid=None)
+
+    with pytest.raises(ValueError, match="orientation sparse grid"):
+        plot_orientation_profile(
+            profile_without_grid,
+            output=str(tmp_path / "orient_grid_line_missing.png"),
+            show=False,
+            component="average",
+            angle="polar",
+            orientation_grid_filters={"distance": (0.0, 10.0)},
+        )
+
+
+def test_plot_orientation_profile_sparse_grid_heatmap_requires_grid(tmp_path):
+    from linak.analysis.orientation import plot_orientation_profile
+
+    profile = compute_orientation_profile(frames=_multi_frame_trajectory(2), axis="z", bin_width=1.0)
+    profile_without_grid = replace(profile, sparse_grid=None)
+
+    with pytest.raises(ValueError, match="orientation sparse grid"):
+        plot_orientation_profile(
+            profile_without_grid,
+            output=str(tmp_path / "orient_grid_missing.png"),
+            show=False,
+            component="heatmap",
+            angle="polar",
+            orientation_heatmap_x_axis="x",
+            orientation_heatmap_y_axis="y",
+        )
 
 
 def test_plot_orientation_profile_accepts_generic_line_view_mapping(tmp_path):

@@ -72,6 +72,7 @@ _GUI_COMPLEXITY_MAX_POINTS = 1_000_000
 _POSITION_GUI_AUTO_DISPLAY_SERIES = 64
 _POSITION_GUI_AUTO_DISPLAY_TRIGGER_SERIES = _GUI_COMPLEXITY_MAX_SERIES
 _POSITION_GUI_AUTO_DISPLAY_TARGET_POINTS = 200_000
+_ANALYSIS_PROFILE_HEADER_CACHE: dict[tuple[str, str, int | None, int | None], list[dict[str, Any]]] = {}
 
 
 @dataclass(frozen=True)
@@ -400,9 +401,9 @@ def _build_position_plot_gui_filter_options(reference_profile: Any | None) -> di
     options: dict[str, Any] = {
         "position_mapping_presets": [
             {"id": "distance_vs_time", "label": "Distance vs time"},
-            {"id": "x_y_trajectory", "label": "X vs Y trajectory"},
-            {"id": "x_z_trajectory", "label": "X vs Z trajectory"},
-            {"id": "y_z_trajectory", "label": "Y vs Z trajectory"},
+            {"id": "x_y_trajectory", "label": "X/Y view"},
+            {"id": "x_z_trajectory", "label": "X/Z view"},
+            {"id": "y_z_trajectory", "label": "Y/Z view"},
         ],
     }
     return _populate_position_plot_gui_filter_options(options, reference_profile)
@@ -540,7 +541,7 @@ def _format_plot_complexity_message(
         suggestions.append("narrow the input sources or filter the data")
     if estimate.analysis_name == "position":
         suggestions.append(
-            "use --component 2d-projection with --projection-filter-min/--projection-filter-max when that lighter view is sufficient"
+            "use --view-type 2d-heatmap with --heatmap-filter-min/--heatmap-filter-max when that lighter view is sufficient"
         )
     if interactive_gui:
         return f"{message} {'; '.join(suggestions)}. Or use --force-gui to proceed with rendering anyway, but be aware that the GUI may become unresponsive or crash."
@@ -588,7 +589,12 @@ class _ResolvedPositionProjectionEstimate:
 
     @property
     def is_projection(self) -> bool:
-        return str(getattr(self.mapping, "view_type_id", "")).strip().lower() == "trajectory_2d"
+        from .plot.data_contract import PLOT_VIEW_2D_HEATMAP, canonical_plot_view_id
+
+        return (
+            canonical_plot_view_id(getattr(self.mapping, "view_type_id", None))
+            == PLOT_VIEW_2D_HEATMAP
+        )
 
 
 def _position_projection_token_from_quantity_id(quantity_id: str | None) -> str:
@@ -688,12 +694,12 @@ _PERSISTED_PLOT_SETTING_OPTION_FLAGS = {
     "markers": ("--markers",),
     "component": ("--component",),
     "map_color": ("--map-color",),
-    "projection_x": ("--projection-x",),
-    "projection_y": ("--projection-y",),
-    "projection_value": ("--projection-value",),
-    "projection_render_mode": ("--projection-render-mode",),
-    "projection_filter_min": ("--projection-filter-min",),
-    "projection_filter_max": ("--projection-filter-max",),
+    "projection_x": ("--heatmap-x",),
+    "projection_y": ("--heatmap-y",),
+    "projection_value": ("--heatmap-value",),
+    "projection_render_mode": ("--heatmap-render-mode",),
+    "projection_filter_min": ("--heatmap-filter-min",),
+    "projection_filter_max": ("--heatmap-filter-max",),
     "xy_z_distance_max": ("--xy-z-distance-max",),
     "time_axis": ("--time-axis",),
     "time_section_width": ("--time-section-width",),
@@ -721,6 +727,8 @@ _PLOT_SETTINGS_COMMON_KEYS = (
     "series_descriptors",
     "series_overrides",
     "series_enabled",
+    "series_show_in_legend",
+    "series_alpha",
     "series_line_widths",
     "series_markers",
     "series_normalization_modes",
@@ -769,9 +777,17 @@ _PLOT_SETTINGS_COMMON_KEYS = (
     "grid_linestyle",
     "grid_linewidth",
     "grid_alpha",
+    "plot_data_format",
+    "plot_data_delimiter",
+    "plot_data_include_metadata",
+    "plot_data_enabled_only",
+    "_gui_sync_modes",
 )
 _PLOT_SETTINGS_DENSITY_KEYS = (
     "species",
+    "density_enabled_species",
+    "density_active_view_type",
+    "density_view_states",
     "axis",
     "plane",
     "density_2d_x_axis",
@@ -804,8 +820,12 @@ _PLOT_SETTINGS_RDF_KEYS = (
 _PLOT_SETTINGS_POSITION_KEYS = (
     "species",
     "position_enabled_species",
+    "position_active_view_type",
+    "position_view_states",
     "axis",
     "view_mapping",
+    "plot_view_type",
+    "plot_y_quantity",
     "component",
     "map_color",
     "projection_x",
@@ -823,12 +843,29 @@ _PLOT_SETTINGS_COORDINATION_KEYS = (
     "species_a",
     "species_b",
     "axis",
+    "plot_view_type",
+    "plot_x_quantity",
     "view_mapping",
     *_PLOT_SETTINGS_COMMON_KEYS,
 )
 _PLOT_SETTINGS_POTENTIAL_KEYS = ("view_mapping", *_PLOT_SETTINGS_COMMON_KEYS)
 _PLOT_SETTINGS_ORIENTATION_KEYS = (
     "view_mapping",
+    "orientation_active_view_type",
+    "orientation_view_states",
+    "plot_view_type",
+    "plot_y_quantity",
+    "orientation_line_x_axis",
+    "orientation_heatmap_x_axis",
+    "orientation_heatmap_y_axis",
+    "orientation_filter_x_min",
+    "orientation_filter_x_max",
+    "orientation_filter_y_min",
+    "orientation_filter_y_max",
+    "orientation_filter_z_min",
+    "orientation_filter_z_max",
+    "orientation_filter_distance_min",
+    "orientation_filter_distance_max",
     "heatmap_vmin",
     "heatmap_vmax",
     "heatmap_cmap",
@@ -1639,6 +1676,78 @@ def _coerce_runtime_view_mapping(value: Any) -> Any | None:
     raise ValueError("view_mapping must be a PlotViewMapping or mapping payload dictionary.")
 
 
+def _public_plot_view_type(value: Any | None) -> str | None:
+    from .plot.data_contract import PLOT_VIEW_1D_LINE, PLOT_VIEW_2D_HEATMAP
+
+    token = str(value or "").strip().lower().replace("_", "-").replace(" ", "-")
+    if not token:
+        return None
+    if token in {"1d", "line", "1d-line", "line-1d", "plot-1d-line"}:
+        return PLOT_VIEW_1D_LINE
+    if token in {"2d", "heatmap", "2d-heatmap", "heatmap-2d", "plot-2d-heatmap"}:
+        return PLOT_VIEW_2D_HEATMAP
+    raise ValueError("View type must be one of: 1D Line, 2D Heatmap.")
+
+
+def _position_component_from_public_args(args: argparse.Namespace) -> str:
+    view_type = _public_plot_view_type(getattr(args, "plot_view_type", None))
+    from .plot.data_contract import PLOT_VIEW_2D_HEATMAP
+
+    y_quantity = str(getattr(args, "plot_y_quantity", "") or "").strip().lower()
+    if view_type == PLOT_VIEW_2D_HEATMAP:
+        return "heatmap"
+    if y_quantity:
+        return y_quantity
+    return getattr(args, "component", "distance")
+
+
+def _coordination_component_from_public_args(args: argparse.Namespace) -> str:
+    view_type = _public_plot_view_type(getattr(args, "plot_view_type", None))
+    from .plot.data_contract import PLOT_VIEW_2D_HEATMAP
+
+    x_quantity = str(getattr(args, "plot_x_quantity", "") or "").strip().lower()
+    if view_type == PLOT_VIEW_2D_HEATMAP:
+        return "time-distance"
+    if x_quantity == "time":
+        return "time"
+    if x_quantity == "distance":
+        return "distance"
+    return getattr(args, "component", "distance")
+
+
+def _orientation_component_from_public_args(args: argparse.Namespace) -> str:
+    view_type = _public_plot_view_type(getattr(args, "plot_view_type", None))
+    from .plot.data_contract import PLOT_VIEW_2D_HEATMAP
+
+    y_quantity = str(getattr(args, "plot_y_quantity", "") or "").strip().lower()
+    if view_type == PLOT_VIEW_2D_HEATMAP:
+        return "heatmap"
+    if y_quantity:
+        return y_quantity
+    return getattr(args, "component", "average")
+
+
+def _public_mapping_view_label(view_type_id: Any) -> str:
+    from .plot.data_contract import plot_view_display_label
+
+    return plot_view_display_label(str(view_type_id or "line_1d").strip() or "line_1d")
+
+
+def _canonical_mapping_view_id(view_type_id: Any) -> str:
+    from .plot.data_contract import canonical_plot_view_id
+
+    return canonical_plot_view_id(str(view_type_id or "line_1d").strip() or "line_1d")
+
+
+def _mapping_is_2d_heatmap(mapping: Any) -> bool:
+    from .plot.data_contract import PLOT_VIEW_2D_HEATMAP
+
+    return (
+        _canonical_mapping_view_id(getattr(mapping, "view_type_id", None))
+        == PLOT_VIEW_2D_HEATMAP
+    )
+
+
 def _resolve_position_plotter_kwargs(
     args: argparse.Namespace,
     *,
@@ -1650,7 +1759,7 @@ def _resolve_position_plotter_kwargs(
     resolved = resolve_position_plot_mapping(
         contract=data_contract,
         mapping=mapping,
-        component=getattr(args, "component", "distance"),
+        component=_position_component_from_public_args(args),
         time_axis=getattr(args, "time_axis", "ps"),
         map_color=getattr(args, "map_color", "distance"),
         projection_x=getattr(args, "projection_x", None),
@@ -1678,7 +1787,7 @@ def _resolve_coordination_plotter_kwargs(
     resolved = resolve_coordination_plot_mapping(
         contract=data_contract,
         mapping=mapping,
-        component=getattr(args, "component", "distance"),
+        component=_coordination_component_from_public_args(args),
         time_axis=getattr(args, "time_axis", "ps"),
     )
     payload: dict[str, Any] = {"view_mapping": resolved.mapping}
@@ -1779,7 +1888,6 @@ def _resolve_potential_plotter_kwargs(
         contract=data_contract,
         mapping=mapping,
         y_quantity=getattr(args, "y_quantity", None),
-        table_view=getattr(args, "table_view", False),
     )
     payload: dict[str, Any] = {"view_mapping": resolved.mapping}
     if data_contract is not None:
@@ -1799,12 +1907,15 @@ def _resolve_orientation_plotter_kwargs(
 
     mapping = _coerce_runtime_view_mapping(getattr(args, "view_mapping", None))
     if mapping is None:
-        raw_component = getattr(args, "component", "average")
+        raw_component = _orientation_component_from_public_args(args)
         component = raw_component if raw_component in _ORIENTATION_COMPONENTS else "average"
         resolved = resolve_orientation_plot_mapping(
             contract=data_contract,
             component=component,
             angle=getattr(args, "angle", "polar"),
+            line_x_axis=getattr(args, "orientation_line_x_axis", None),
+            heatmap_x_axis=getattr(args, "orientation_heatmap_x_axis", None),
+            heatmap_y_axis=getattr(args, "orientation_heatmap_y_axis", None),
         )
     else:
         resolved = resolve_orientation_plot_mapping(
@@ -1824,7 +1935,7 @@ def _resolve_position_projection_estimation_settings(
 
     resolved_mapping = resolve_position_plot_mapping(
         mapping=_coerce_runtime_view_mapping(getattr(args, "view_mapping", None)),
-        component=getattr(args, "component", "distance"),
+        component=_position_component_from_public_args(args),
         time_axis=getattr(args, "time_axis", "ps"),
         map_color=getattr(args, "map_color", "distance"),
         projection_x=getattr(args, "projection_x", None),
@@ -1858,9 +1969,10 @@ def _resolve_position_projection_estimation_settings(
 def _position_mapping_summary_for_dry_run(args: argparse.Namespace) -> str:
     mapping = _resolve_position_plotter_kwargs(args).get("view_mapping")
     if mapping is None:
-        return "view_mapping=<unresolved>"
+        return "view type=<unresolved>"
     view_type_id = str(getattr(mapping, "view_type_id", "")).strip().lower() or "line_1d"
-    if view_type_id == "trajectory_2d":
+    view_label = _public_mapping_view_label(view_type_id)
+    if _mapping_is_2d_heatmap(mapping):
         render_mode = (
             str(
                 mapping.fixed_values.get("projection_render_mode")
@@ -1877,51 +1989,52 @@ def _position_mapping_summary_for_dry_run(args: argparse.Namespace) -> str:
                 f"{'' if mapping.filter_max is None else mapping.filter_max}]"
             )
         return (
-            f"view_mapping={view_type_id}, x={mapping.x}, y={mapping.y}, "
+            f"view type={view_label}, x={mapping.x}, y={mapping.y}, "
             f"value={value_role}, render_mode={render_mode}{filter_text}"
         )
-    return f"view_mapping={view_type_id}, x={mapping.x}, y={mapping.y}"
+    return f"view type={view_label}, x={mapping.x}, y={mapping.y}"
 
 
 def _density_mapping_summary_for_dry_run(args: argparse.Namespace) -> str:
     mapping = _resolve_density_plotter_kwargs(args).get("view_mapping")
     if mapping is None:
-        return "view_mapping=<unresolved>"
+        return "view type=<unresolved>"
     view_type_id = str(getattr(mapping, "view_type_id", "")).strip().lower() or "line_1d"
-    if view_type_id == "heatmap_2d":
+    view_label = _public_mapping_view_label(view_type_id)
+    if _mapping_is_2d_heatmap(mapping):
         resolved_roles = mapping.resolved_role_assignments()
         z_role = resolved_roles.get("z")
         return (
-            f"view_mapping={view_type_id}, x={mapping.x}, y={mapping.y}, "
+            f"view type={view_label}, x={mapping.x}, y={mapping.y}, "
             f"z={z_role if z_role is not None else '<unassigned>'}"
         )
     quantity = str(mapping.y or "").strip() or "density"
     x_mode = str(mapping.fixed_values.get("x_mode") or "distance").strip() or "distance"
-    return f"view_mapping={view_type_id}, x={mapping.x}, y={quantity}, x_mode={x_mode}"
+    return f"view type={view_label}, x={mapping.x}, y={quantity}, x_mode={x_mode}"
 
 
 def _msd_mapping_summary_for_dry_run(args: argparse.Namespace) -> str:
     mapping = _resolve_msd_plotter_kwargs(args).get("view_mapping")
     if mapping is None:
-        return "view_mapping=<unresolved>"
+        return "view type=<unresolved>"
     view_type_id = str(getattr(mapping, "view_type_id", "")).strip().lower() or "line_1d"
-    return f"view_mapping={view_type_id}, x={mapping.x}, y={mapping.y}"
+    return f"view type={_public_mapping_view_label(view_type_id)}, x={mapping.x}, y={mapping.y}"
 
 
 def _rdf_mapping_summary_for_dry_run(args: argparse.Namespace) -> str:
     mapping = _resolve_rdf_plotter_kwargs(args).get("view_mapping")
     if mapping is None:
-        return "view_mapping=<unresolved>"
+        return "view type=<unresolved>"
     view_type_id = str(getattr(mapping, "view_type_id", "")).strip().lower() or "line_1d"
-    return f"view_mapping={view_type_id}, x={mapping.x}, y={mapping.y}"
+    return f"view type={_public_mapping_view_label(view_type_id)}, x={mapping.x}, y={mapping.y}"
 
 
 def _coordination_mapping_summary_for_dry_run(args: argparse.Namespace) -> str:
     mapping = _resolve_coordination_plotter_kwargs(args).get("view_mapping")
     if mapping is None:
-        return "view_mapping=<unresolved>"
+        return "view type=<unresolved>"
     view_type_id = str(getattr(mapping, "view_type_id", "")).strip().lower() or "line_1d"
-    parts = [f"view_mapping={view_type_id}", f"x={mapping.x}", f"y={mapping.y}"]
+    parts = [f"view type={_public_mapping_view_label(view_type_id)}", f"x={mapping.x}", f"y={mapping.y}"]
     resolved_roles = mapping.resolved_role_assignments()
     if "color" in resolved_roles:
         parts.append(f"color={resolved_roles['color']}")
@@ -1931,9 +2044,9 @@ def _coordination_mapping_summary_for_dry_run(args: argparse.Namespace) -> str:
 def _orientation_mapping_summary_for_dry_run(args: argparse.Namespace) -> str:
     mapping = _resolve_orientation_plotter_kwargs(args).get("view_mapping")
     if mapping is None:
-        return "view_mapping=<unresolved>"
+        return "view type=<unresolved>"
     view_type_id = str(getattr(mapping, "view_type_id", "")).strip().lower() or "line_1d"
-    parts = [f"view_mapping={view_type_id}", f"x={mapping.x}", f"y={mapping.y}"]
+    parts = [f"view type={_public_mapping_view_label(view_type_id)}", f"x={mapping.x}", f"y={mapping.y}"]
     resolved_roles = mapping.resolved_role_assignments()
     if "z" in resolved_roles:
         parts.append(f"z={resolved_roles['z']}")
@@ -1943,15 +2056,14 @@ def _orientation_mapping_summary_for_dry_run(args: argparse.Namespace) -> str:
 def _potential_mapping_summary_for_dry_run(args: argparse.Namespace) -> str:
     mapping = _resolve_potential_plotter_kwargs(args).get("view_mapping")
     if mapping is None:
-        return "view_mapping=<unresolved>"
+        return "view type=<unresolved>"
     view_type_id = str(getattr(mapping, "view_type_id", "")).strip().lower() or "line_1d"
-    if view_type_id == "table_records":
-        return f"view_mapping={view_type_id}, x={mapping.x}, y={mapping.y}"
+    view_label = _public_mapping_view_label(view_type_id)
     fixed_values = getattr(mapping, "fixed_values", {})
     standard_plot = str(fixed_values.get("standard_plot") or "").strip()
     if standard_plot:
-        return f"view_mapping={view_type_id}, x={mapping.x}, standard_plot={standard_plot}"
-    return f"view_mapping={view_type_id}, x={mapping.x}, y={mapping.y}"
+        return f"view type={view_label}, x={mapping.x}, standard_plot={standard_plot}"
+    return f"view type={view_label}, x={mapping.x}, y={mapping.y}"
 
 
 def _estimate_position_projection_point_counts(
@@ -1983,6 +2095,111 @@ def _estimate_position_projection_point_counts(
         visible_mask &= value_matrix <= float(filter_max)
     final_visible_points = int(np.count_nonzero(visible_mask))
     return raw_candidate_points, final_visible_points
+
+
+def _position_projection_dataset_name(quantity: str) -> str:
+    token = str(quantity or "").strip().lower().replace("_", "-").replace(" ", "-")
+    if token in {"distance", "surface-distance", "dist", "distance-to-surface"}:
+        return "distance_to_surface_A"
+    if token in {"x", "y", "z"}:
+        return f"{token}_A"
+    if token == "ps":
+        return "time_ps"
+    if token == "fs":
+        return "time_fs"
+    if token == "step":
+        return "step"
+    if token == "frame":
+        return "frame_index"
+    return "distance_to_surface_A"
+
+
+def _position_projection_estimate_dataset_names(
+    resolved_projection: _ResolvedPositionProjectionEstimate,
+) -> tuple[str, ...]:
+    names = {
+        "atom_indices",
+        _position_projection_dataset_name(resolved_projection.projection_x),
+        _position_projection_dataset_name(resolved_projection.projection_y),
+        _position_projection_dataset_name(resolved_projection.projection_value),
+    }
+    return tuple(sorted(names))
+
+
+def _position_projection_matrix_from_payload(
+    datasets: Mapping[str, Any],
+    *,
+    quantity: str,
+    n_frames: int,
+    n_atoms: int,
+) -> np.ndarray | None:
+    dataset_name = _position_projection_dataset_name(quantity)
+    if dataset_name not in datasets:
+        return None
+    values = np.asarray(datasets[dataset_name], dtype=float)
+    if dataset_name in {"x_A", "y_A", "z_A", "distance_to_surface_A"}:
+        if values.ndim != 2:
+            return None
+        return values
+    if values.ndim == 2:
+        return values
+    if values.ndim != 1 or n_frames <= 0 or n_atoms <= 0 or values.size != n_frames:
+        return None
+    return np.repeat(values[:, np.newaxis], n_atoms, axis=1)
+
+
+def _estimate_position_projection_point_counts_from_payload(
+    datasets: Mapping[str, Any],
+    metadata: Mapping[str, Any],
+    *,
+    resolved_projection: _ResolvedPositionProjectionEstimate,
+) -> tuple[int, int]:
+    atom_indices = np.asarray(datasets.get("atom_indices", []), dtype=int)
+    try:
+        n_frames = int(metadata.get("n_frames", 0) or 0)
+    except (TypeError, ValueError):
+        n_frames = 0
+    try:
+        n_atoms = int(metadata.get("n_atoms", 0) or 0)
+    except (TypeError, ValueError):
+        n_atoms = 0
+    if atom_indices.size > 0:
+        n_atoms = int(atom_indices.size)
+
+    x_matrix = _position_projection_matrix_from_payload(
+        datasets,
+        quantity=resolved_projection.projection_x,
+        n_frames=n_frames,
+        n_atoms=n_atoms,
+    )
+    y_matrix = _position_projection_matrix_from_payload(
+        datasets,
+        quantity=resolved_projection.projection_y,
+        n_frames=n_frames,
+        n_atoms=n_atoms,
+    )
+    value_matrix = _position_projection_matrix_from_payload(
+        datasets,
+        quantity=resolved_projection.projection_value,
+        n_frames=n_frames,
+        n_atoms=n_atoms,
+    )
+    if x_matrix is None or y_matrix is None or value_matrix is None:
+        fallback_points = max(0, int(n_frames)) * max(0, int(n_atoms))
+        return fallback_points, fallback_points
+    if x_matrix.shape != y_matrix.shape or x_matrix.shape != value_matrix.shape:
+        fallback_points = max(0, int(n_frames)) * max(0, int(n_atoms))
+        return fallback_points, fallback_points
+
+    visible_mask = np.isfinite(x_matrix) & np.isfinite(y_matrix) & np.isfinite(value_matrix)
+    raw_candidate_points = int(np.count_nonzero(visible_mask))
+    filter_min = resolved_projection.filter_min
+    filter_max = resolved_projection.filter_max
+    if filter_min is not None:
+        visible_mask &= value_matrix >= float(filter_min)
+    if filter_max is not None:
+        visible_mask &= value_matrix <= float(filter_max)
+    return raw_candidate_points, int(np.count_nonzero(visible_mask))
 
 
 def _estimate_position_gui_point_counts(
@@ -2630,13 +2847,13 @@ def _density_selected_view_type(
 ) -> str:
     mapping = _coerce_runtime_view_mapping(getattr(args, "view_mapping", None))
     if mapping is not None:
-        return str(getattr(mapping, "view_type_id", "") or "line_1d").strip().lower() or "line_1d"
+        return _canonical_mapping_view_id(getattr(mapping, "view_type_id", None))
     view_types_raw = None if filter_options is None else filter_options.get("density_view_types")
     if isinstance(view_types_raw, (list, tuple, set)):
         view_types = {str(value).strip().lower() for value in view_types_raw}
         if "heatmap_2d" in view_types and "line_1d" not in view_types:
-            return "heatmap_2d"
-    return "line_1d"
+            return _canonical_mapping_view_id("heatmap_2d")
+    return _canonical_mapping_view_id("line_1d")
 
 
 def _build_density_profile_filter_options(
@@ -2893,7 +3110,7 @@ def _resolve_density_outputs_from_args(args: argparse.Namespace) -> str:
             "grid-backed 2D slicing in the GUI."
         )
     requested_outputs = getattr(args, "outputs", None)
-    requested = str(requested_outputs or "1d").strip().lower()
+    requested = str(requested_outputs or "all").strip().lower()
     if requested == "line":
         return "1d"
     if requested not in {"1d", "3d", "all"}:
@@ -4472,7 +4689,7 @@ def _runtime_view_mapping_was_provided(
             "time_axis",
         ),
         "plot:coordination": ("component", "time_axis"),
-        "plot:potential": ("y_quantity", "table_view", "view_type"),
+        "plot:potential": ("y_quantity", "view_type"),
         "plot:orientation": ("component", "angle"),
         "plot:temperature": ("time_axis",),
         "plot:table": ("kind", "x", "y", "bins"),
@@ -5511,6 +5728,8 @@ def _add_position_plot_options(
     include_projection: bool,
     include_time_axis: bool,
     include_time_section_width: bool,
+    include_line_y_quantity: bool = False,
+    include_line_x_quantity: bool = False,
     group_title: str = "Position plot options",
 ) -> None:
     group = parser.add_argument_group(group_title)
@@ -5526,6 +5745,29 @@ def _add_position_plot_options(
         )
     if include_component:
         group.add_argument(
+            "--view-type",
+            dest="plot_view_type",
+            choices=["1d-line", "2d-heatmap", "line", "heatmap", "1d", "2d"],
+            default=None,
+            help="Plot view type: 1D Line or 2D Heatmap.",
+        )
+        if include_line_y_quantity:
+            group.add_argument(
+                "--y-quantity",
+                dest="plot_y_quantity",
+                choices=["distance", "x", "y", "z"],
+                default=None,
+                help="Y quantity for 1D Line position plots.",
+            )
+        if include_line_x_quantity:
+            group.add_argument(
+                "--x-quantity",
+                dest="plot_x_quantity",
+                choices=["distance", "time"],
+                default=None,
+                help="X-axis quantity for 1D Line coordination plots.",
+            )
+        group.add_argument(
             "--component",
             choices=[
                 "distance",
@@ -5540,12 +5782,9 @@ def _add_position_plot_options(
                 "density-weighted",
                 "heatmap",
             ],
+            metavar="COMPONENT",
             default="distance",
-            help=(
-                "Plot component. Position supports distance/x/y/z and 2d-projection "
-                "(alias: xy-z). Coordination supports distance, time, and time-distance. "
-                "Orientation supports average, density-weighted, and heatmap."
-            ),
+            help=argparse.SUPPRESS,
         )
     if include_map_color:
         group.add_argument(
@@ -5553,61 +5792,106 @@ def _add_position_plot_options(
             choices=["distance", "z"],
             default="distance",
             help=(
-                "Legacy color source for projection mode (default: distance). "
-                "Equivalent to --projection-value when projection-specific settings are not set."
+                "Legacy compatibility color source for 2D Heatmap mode (default: distance). "
+                "Equivalent to --heatmap-value when heatmap-specific settings are not set."
             ),
         )
     if include_projection:
         group.add_argument(
-            "--projection-x",
+            "--heatmap-x",
+            dest="projection_x",
             choices=["x", "y", "z", "distance", "ps", "fs", "step", "frame"],
             default=None,
-            help="X quantity for --component 2d-projection (default: x).",
+            help="X-axis quantity for a 2D Heatmap (default: x).",
         )
         group.add_argument(
-            "--projection-y",
+            "--heatmap-y",
+            dest="projection_y",
             choices=["x", "y", "z", "distance", "ps", "fs", "step", "frame"],
             default=None,
-            help="Y quantity for --component 2d-projection (default: y).",
+            help="Y-axis quantity for a 2D Heatmap (default: y).",
         )
         group.add_argument(
-            "--projection-value",
+            "--heatmap-value",
+            dest="projection_value",
             choices=["x", "y", "z", "distance", "ps", "fs", "step", "frame"],
             default=None,
             help=(
-                "Color/filter quantity for --component 2d-projection. "
+                "Color/filter quantity for a 2D Heatmap. "
                 "Defaults to --map-color compatibility behavior."
             ),
         )
         group.add_argument(
-            "--projection-render-mode",
-            choices=["color-scale", "line-colors"],
+            "--heatmap-render-mode",
+            dest="projection_render_mode",
+            choices=["color-scale", "source-colors", "line-colors"],
             default=None,
             help=(
-                "How --component 2d-projection is rendered: a continuous color scale or "
-                "normal per-atom line colors."
+                "How a 2D Heatmap is rendered: a continuous color scale or source colors. "
+                "'line-colors' is accepted as a legacy alias for source colors."
             ),
         )
         group.add_argument(
-            "--projection-filter-min",
+            "--heatmap-filter-min",
+            dest="projection_filter_min",
             type=float,
             default=None,
-            help="Optional lower bound for the selected projection value quantity.",
+            help="Optional lower bound for the selected 2D Heatmap value quantity.",
+        )
+        group.add_argument(
+            "--heatmap-filter-max",
+            dest="projection_filter_max",
+            type=float,
+            default=None,
+            help="Optional upper bound for the selected 2D Heatmap value quantity.",
+        )
+        group.add_argument(
+            "--projection-x",
+            dest="projection_x",
+            choices=["x", "y", "z", "distance", "ps", "fs", "step", "frame"],
+            default=argparse.SUPPRESS,
+            help=argparse.SUPPRESS,
+        )
+        group.add_argument(
+            "--projection-y",
+            dest="projection_y",
+            choices=["x", "y", "z", "distance", "ps", "fs", "step", "frame"],
+            default=argparse.SUPPRESS,
+            help=argparse.SUPPRESS,
+        )
+        group.add_argument(
+            "--projection-value",
+            dest="projection_value",
+            choices=["x", "y", "z", "distance", "ps", "fs", "step", "frame"],
+            default=argparse.SUPPRESS,
+            help=argparse.SUPPRESS,
+        )
+        group.add_argument(
+            "--projection-render-mode",
+            dest="projection_render_mode",
+            choices=["color-scale", "source-colors", "line-colors"],
+            default=argparse.SUPPRESS,
+            help=argparse.SUPPRESS,
+        )
+        group.add_argument(
+            "--projection-filter-min",
+            dest="projection_filter_min",
+            type=float,
+            default=argparse.SUPPRESS,
+            help=argparse.SUPPRESS,
         )
         group.add_argument(
             "--projection-filter-max",
+            dest="projection_filter_max",
             type=float,
-            default=None,
-            help="Optional upper bound for the selected projection value quantity.",
+            default=argparse.SUPPRESS,
+            help=argparse.SUPPRESS,
         )
         group.add_argument(
             "--xy-z-distance-max",
             type=_positive_float,
             default=None,
-            help=(
-                "Legacy compatibility alias for a projection distance cutoff. "
-                "Equivalent to --projection-filter-max when filtering by distance."
-            ),
+            help=argparse.SUPPRESS,
         )
     if include_time_axis:
         group.add_argument(
@@ -5637,18 +5921,39 @@ def _add_orientation_plot_options(
     group = parser.add_argument_group(group_title)
     if include_component:
         group.add_argument(
+            "--view-type",
+            dest="plot_view_type",
+            choices=["1d-line", "2d-heatmap", "line", "heatmap", "1d", "2d"],
+            default=None,
+            help="Plot view type: 1D Line or 2D Heatmap.",
+        )
+        group.add_argument(
+            "--y-quantity",
+            dest="plot_y_quantity",
+            choices=["average", "density", "density-weighted"],
+            default=None,
+            help="Y quantity for 1D Line orientation plots.",
+        )
+        group.add_argument(
+            "--x-quantity",
+            dest="orientation_line_x_axis",
+            choices=["distance", "x", "y", "z"],
+            default=None,
+            help="X-axis quantity for 1D Line orientation plots (default: distance).",
+        )
+        group.add_argument(
             "--component",
-            choices=["average", "density-weighted", "heatmap"],
+            choices=["average", "density", "density-weighted", "heatmap"],
             default="average",
-            help=("Plot component. Orientation supports average, density-weighted, and heatmap."),
+            help=argparse.SUPPRESS,
         )
     group.add_argument(
         "--angle",
         choices=["polar", "azimuthal"],
         default="polar",
         help=(
-            "Which angle component to plot for orientation analysis "
-            "(default: polar). Ignored by non-orientation analyses."
+            "Orientation angle quantity for 1D Line and 2D Heatmap plots "
+            "(default: polar)."
         ),
     )
 
@@ -5672,6 +5977,7 @@ def _configure_plot_parser(parser: argparse.ArgumentParser, *, analysis: str | N
             include_projection=True,
             include_time_axis=True,
             include_time_section_width=True,
+            include_line_y_quantity=True,
         )
         _add_orientation_plot_options(parser, include_component=False)
         return
@@ -5700,6 +6006,7 @@ def _configure_plot_parser(parser: argparse.ArgumentParser, *, analysis: str | N
             include_projection=True,
             include_time_axis=True,
             include_time_section_width=True,
+            include_line_y_quantity=True,
             group_title="Position plot options",
         )
         return
@@ -5713,6 +6020,7 @@ def _configure_plot_parser(parser: argparse.ArgumentParser, *, analysis: str | N
             include_projection=False,
             include_time_axis=True,
             include_time_section_width=False,
+            include_line_x_quantity=True,
             group_title="Coordination plot options",
         )
         return
@@ -7011,7 +7319,7 @@ def _build_density_gui_context(
         "density_plot_contract": _serialize_plot_data_contract(line_contract),
         "density_heatmap_plot_contract": _serialize_plot_data_contract(heatmap_contract),
     }
-    if selected_view_type == "heatmap_2d":
+    if _canonical_mapping_view_id(selected_view_type) == "plot_2d_heatmap":
         (
             heatmap_profiles,
             fallback_labels_by_source,
@@ -7223,7 +7531,7 @@ def _build_density_gui_logical_context(
         axis=getattr(args, "axis", None),
         x_mode=resolved_density_mapping.x_mode,
     )
-    if selected_view_type == "heatmap_2d":
+    if _canonical_mapping_view_id(selected_view_type) == "plot_2d_heatmap":
         heatmap_contract = default_density_heatmap_plot_data_contract()
         heatmap_descriptor_context = _build_density_gui_lazy_catalog(
             args,
@@ -7747,6 +8055,8 @@ def _build_density_gui_lazy_catalog(
     sources: list[str],
     active_profiles_by_series_id: dict[str, Any] | None = None,
     active_profile_cache_keys_by_series_id: dict[str, Any] | None = None,
+    density_grid_profile_cache: dict[str, Any] | None = None,
+    density_grid_slice_cache: dict[str, list[Any]] | None = None,
 ) -> _LazyGuiSeriesCatalog:
     from .analysis.density import (
         _density_payload_matches_selection,
@@ -7784,7 +8094,7 @@ def _build_density_gui_lazy_catalog(
         axis=getattr(args, "axis", None),
         x_mode=resolved_density_mapping.x_mode,
     )
-    if selected_view_type == "heatmap_2d":
+    if _canonical_mapping_view_id(selected_view_type) == "plot_2d_heatmap":
         grid_x_axis, grid_y_axis = _density_grid_2d_axes_from_args(args)
         grid_filters = _density_grid_filters_from_args(args)
         grid_slice_key = json.dumps(
@@ -7853,9 +8163,13 @@ def _build_density_gui_lazy_catalog(
         grid_descriptors = _deduplicate_density_descriptor_segments_by_species(
             grid_descriptors
         )
-        grid_descriptors = _filter_density_descriptor_segments_by_enabled_species(
+        active_2d_species = _density_2d_single_species_from_segments(
             grid_descriptors,
             getattr(args, "density_enabled_species", None),
+        )
+        grid_descriptors = _filter_density_descriptor_segments_to_single_species(
+            grid_descriptors,
+            active_2d_species,
         )
         if grid_descriptors:
             def _load_grid_heatmap_profiles(descriptors: list[dict[str, Any]]) -> list[Any]:
@@ -7873,10 +8187,79 @@ def _build_density_gui_lazy_catalog(
                         "to choose which source files contribute."
                     )
                 active_species_label = next(iter(active_species), None)
-                loaded_grids: list[Any] = []
-                for load_source_path, source_descriptors in _group_descriptors_by_load_source(
-                    descriptors
-                ):
+                first_descriptor = descriptors[0]
+                slice_cache_payload = []
+                for descriptor in descriptors:
+                    load_source_path = str(descriptor.get("load_source_path") or "")
+                    try:
+                        stat = Path(load_source_path).expanduser().stat()
+                        source_state = {
+                            "path": str(Path(load_source_path).expanduser().resolve()),
+                            "mtime_ns": int(stat.st_mtime_ns),
+                            "size": int(stat.st_size),
+                        }
+                    except OSError:
+                        source_state = {"path": load_source_path, "mtime_ns": None, "size": None}
+                    slice_cache_payload.append(
+                        {
+                            "source": source_state,
+                            "profile_index": int(descriptor.get("profile_index", 0)),
+                            "profile_uid": str(descriptor.get("profile_uid") or ""),
+                            "series_id": str(descriptor.get("series_id") or ""),
+                            "slice_key": descriptor.get("density_grid_slice_key"),
+                            "species": str(descriptor.get("density_species") or ""),
+                        }
+                    )
+                slice_cache_key = json.dumps(slice_cache_payload, sort_keys=True, default=str)
+                if density_grid_slice_cache is not None and slice_cache_key in density_grid_slice_cache:
+                    LOGGER.debug("Density sparse-grid slice cache hit: key=%s.", slice_cache_key[:96])
+                    return list(density_grid_slice_cache[slice_cache_key])
+
+                LOGGER.debug("Density sparse-grid slice cache miss: key=%s.", slice_cache_key[:96])
+                loaded_by_descriptor_key: dict[str, Any] = {}
+                missing_by_source: dict[str, list[dict[str, Any]]] = {}
+                source_order: list[str] = []
+                for descriptor in descriptors:
+                    load_source_path = str(descriptor.get("load_source_path") or "")
+                    profile_index = int(descriptor.get("profile_index", 0))
+                    try:
+                        stat = Path(load_source_path).expanduser().stat()
+                        grid_source_state = {
+                            "path": str(Path(load_source_path).expanduser().resolve()),
+                            "mtime_ns": int(stat.st_mtime_ns),
+                            "size": int(stat.st_size),
+                        }
+                    except OSError:
+                        grid_source_state = {
+                            "path": load_source_path,
+                            "mtime_ns": None,
+                            "size": None,
+                        }
+                    descriptor_cache_key = json.dumps(
+                        {
+                            "source": grid_source_state,
+                            "profile_index": profile_index,
+                            "profile_uid": str(descriptor.get("profile_uid") or ""),
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                    if (
+                        density_grid_profile_cache is not None
+                        and descriptor_cache_key in density_grid_profile_cache
+                    ):
+                        loaded_by_descriptor_key[descriptor_cache_key] = density_grid_profile_cache[
+                            descriptor_cache_key
+                        ]
+                        continue
+                    if load_source_path not in missing_by_source:
+                        missing_by_source[load_source_path] = []
+                        source_order.append(load_source_path)
+                    descriptor["_density_grid_profile_cache_key"] = descriptor_cache_key
+                    missing_by_source[load_source_path].append(descriptor)
+
+                for load_source_path in source_order:
+                    source_descriptors = missing_by_source[load_source_path]
                     indices = [int(descriptor["profile_index"]) for descriptor in source_descriptors]
                     grid_profiles = load_density_grid_profiles_by_index(
                         load_source_path,
@@ -7885,9 +8268,41 @@ def _build_density_gui_lazy_catalog(
                     )
                     if len(grid_profiles) != len(source_descriptors):
                         raise ValueError("Density sparse-grid metadata does not match loaded profiles.")
-                    loaded_grids.extend(grid_profiles)
-                first_descriptor = descriptors[0]
-                return [
+                    for descriptor, grid_profile in zip(source_descriptors, grid_profiles):
+                        descriptor_cache_key = str(
+                            descriptor.get("_density_grid_profile_cache_key") or ""
+                        )
+                        loaded_by_descriptor_key[descriptor_cache_key] = grid_profile
+                        if density_grid_profile_cache is not None and descriptor_cache_key:
+                            density_grid_profile_cache[descriptor_cache_key] = grid_profile
+
+                loaded_grids: list[Any] = []
+                for payload_item, descriptor in zip(slice_cache_payload, descriptors):
+                    profile_index = int(descriptor.get("profile_index", 0))
+                    load_source_path = str(descriptor.get("load_source_path") or "")
+                    try:
+                        stat = Path(load_source_path).expanduser().stat()
+                        grid_source_state = {
+                            "path": str(Path(load_source_path).expanduser().resolve()),
+                            "mtime_ns": int(stat.st_mtime_ns),
+                            "size": int(stat.st_size),
+                        }
+                    except OSError:
+                        grid_source_state = payload_item["source"]
+                    descriptor_cache_key = json.dumps(
+                        {
+                            "source": grid_source_state,
+                            "profile_index": profile_index,
+                            "profile_uid": str(descriptor.get("profile_uid") or ""),
+                        },
+                        sort_keys=True,
+                        default=str,
+                    )
+                    if descriptor_cache_key not in loaded_by_descriptor_key:
+                        raise ValueError("Density sparse-grid cache is missing an enabled profile.")
+                    loaded_grids.append(loaded_by_descriptor_key[descriptor_cache_key])
+
+                combined_profiles = [
                     density_grids_to_averaged_heatmap_profile(
                         loaded_grids,
                         x_axis=str(first_descriptor.get("density_grid_x_axis") or "x"),
@@ -7898,6 +8313,9 @@ def _build_density_gui_lazy_catalog(
                         species=active_species_label,
                     )
                 ]
+                if density_grid_slice_cache is not None:
+                    density_grid_slice_cache[slice_cache_key] = list(combined_profiles)
+                return combined_profiles
 
             return _LazyGuiSeriesCatalog(
                 sources=list(sources),
@@ -8415,6 +8833,7 @@ def _build_position_gui_lazy_catalog(
         args,
         resolved_projection=resolved_projection,
     )
+    projection_estimate_indices_by_source: list[tuple[str, list[int]]] = []
     for source, headers in headers_by_source:
         source_path = Path(source).expanduser().resolve()
         lightweight_payloads = read_linak_hdf5_profiles_by_index(
@@ -8428,6 +8847,7 @@ def _build_position_gui_lazy_catalog(
         source_origins: list[str] = []
         source_load_paths: list[str] = []
         source_extras: list[dict[str, Any]] = []
+        projection_estimate_indices: list[int] = []
         for header, (datasets, _metadata) in zip(headers, lightweight_payloads):
             source_label = _metadata_source_label(header, fallback_source=str(source_path))
             resolved_species = str(header.get("species", "")).strip() or "UNKNOWN"
@@ -8461,6 +8881,7 @@ def _build_position_gui_lazy_catalog(
             )
             atom_indices = np.asarray(datasets.get("atom_indices", []), dtype=int)
             raw_estimated_total_points += n_frames * int(atom_indices.size)
+            projection_estimate_indices.append(profile_index)
             if profile_level_projection:
                 source_labels.append(rendered_species)
                 source_ids.append(str(profile_uid))
@@ -8499,6 +8920,7 @@ def _build_position_gui_lazy_catalog(
         origin_path_segments_by_source.append(source_origins)
         load_source_path_segments_by_source.append(source_load_paths)
         extra_segments_by_source.append(source_extras)
+        projection_estimate_indices_by_source.append((str(source_path), projection_estimate_indices))
 
     descriptor_segments = _build_gui_descriptor_segments(
         sources=sources,
@@ -8560,19 +8982,22 @@ def _build_position_gui_lazy_catalog(
     if resolved_projection.is_projection:
         raw_candidate_points = 0
         estimated_total_points = 0
-        for source, headers in headers_by_source:
+        dataset_names = _position_projection_estimate_dataset_names(resolved_projection)
+        for source, indices in projection_estimate_indices_by_source:
+            if not indices:
+                continue
             source_path = Path(source).expanduser().resolve()
-            indices = [int(header.get("profile_index", 0)) for header in headers]
-            loaded_profiles = load_position_profiles_by_index(
+            payloads = read_linak_hdf5_profiles_by_index(
                 source_path,
                 indices,
-                species=args.species,
-                axis=args.axis,
+                expected_analysis="position",
+                dataset_names=dataset_names,
             )
-            for profile in loaded_profiles:
+            for datasets, metadata in payloads:
                 profile_raw_points, profile_final_points = (
-                    _estimate_position_projection_point_counts(
-                        profile,
+                    _estimate_position_projection_point_counts_from_payload(
+                        datasets,
+                        metadata,
                         resolved_projection=resolved_projection,
                     )
                 )
@@ -9017,10 +9442,55 @@ def _build_orientation_gui_context(
     else:
         line_contract = orientation_line_profile_to_plot_data_contract(reference_profile)
         heatmap_contract = orientation_heatmap_profile_to_plot_data_contract(reference_profile)
+    orientation_axis_ranges: dict[str, list[float]] = {}
+    orientation_axis_bin_widths: dict[str, float] = {}
+
+    def _merge_orientation_axis_range(axis_id: str, edges: Any) -> None:
+        try:
+            values = np.asarray(edges, dtype=float)
+        except (TypeError, ValueError):
+            return
+        finite = values[np.isfinite(values)]
+        if finite.size < 2:
+            return
+        lower = float(finite[0])
+        upper = float(finite[-1])
+        if lower >= upper:
+            return
+        current = orientation_axis_ranges.get(axis_id)
+        if current is None:
+            orientation_axis_ranges[axis_id] = [lower, upper]
+        else:
+            current[0] = min(current[0], lower)
+            current[1] = max(current[1], upper)
+        widths = np.diff(finite)
+        positive = widths[np.isfinite(widths) & (widths > 0.0)]
+        if positive.size:
+            orientation_axis_bin_widths[axis_id] = float(np.median(positive))
+
+    for profile in plot_profiles:
+        grid = getattr(profile, "sparse_grid", None)
+        if grid is not None:
+            _merge_orientation_axis_range("x", getattr(grid, "x_edges", None))
+            _merge_orientation_axis_range("y", getattr(grid, "y_edges", None))
+            _merge_orientation_axis_range("z", getattr(grid, "z_edges", None))
+            _merge_orientation_axis_range("distance", getattr(grid, "distance_edges", None))
+            continue
+        metadata = dict(getattr(profile, "metadata", {}) or {})
+        raw_cell = metadata.get("resolved_cell_angstrom") or metadata.get("pbc_cell_angstrom")
+        if isinstance(raw_cell, Sequence) and not isinstance(raw_cell, (str, bytes)) and len(raw_cell) == 3:
+            try:
+                cell = [float(value) for value in raw_cell]
+            except (TypeError, ValueError):
+                cell = []
+            if len(cell) == 3 and all(math.isfinite(value) and value > 0.0 for value in cell):
+                for axis_id, value in zip(("x", "y", "z"), cell):
+                    _merge_orientation_axis_range(axis_id, [0.0, value])
+        _merge_orientation_axis_range("distance", getattr(profile, "bin_edges", None))
     resolved_mapping = _resolve_orientation_plotter_kwargs(args).get("view_mapping")
     reference_contract = None
     if reference_profile is not None and resolved_mapping is not None:
-        if str(getattr(resolved_mapping, "view_type_id", "")).strip().lower() == "heatmap_2d":
+        if _canonical_mapping_view_id(getattr(resolved_mapping, "view_type_id", None)) == "plot_2d_heatmap":
             reference_contract = heatmap_contract
         else:
             reference_contract = line_contract
@@ -9045,6 +9515,17 @@ def _build_orientation_gui_context(
             "heatmap_colorbar_pad": getattr(args, "heatmap_colorbar_pad", None),
             "heatmap_colorbar_shrink": getattr(args, "heatmap_colorbar_shrink", None),
             "heatmap_colorbar_aspect": getattr(args, "heatmap_colorbar_aspect", None),
+            "orientation_line_x_axis": getattr(args, "orientation_line_x_axis", None),
+            "orientation_heatmap_x_axis": getattr(args, "orientation_heatmap_x_axis", None),
+            "orientation_heatmap_y_axis": getattr(args, "orientation_heatmap_y_axis", None),
+            "orientation_filter_x_min": getattr(args, "orientation_filter_x_min", None),
+            "orientation_filter_x_max": getattr(args, "orientation_filter_x_max", None),
+            "orientation_filter_y_min": getattr(args, "orientation_filter_y_min", None),
+            "orientation_filter_y_max": getattr(args, "orientation_filter_y_max", None),
+            "orientation_filter_z_min": getattr(args, "orientation_filter_z_min", None),
+            "orientation_filter_z_max": getattr(args, "orientation_filter_z_max", None),
+            "orientation_filter_distance_min": getattr(args, "orientation_filter_distance_min", None),
+            "orientation_filter_distance_max": getattr(args, "orientation_filter_distance_max", None),
         },
         fallback_labels_by_source=fallback_labels_by_source,
         default_series_labels=_resolve_gui_default_series_labels(
@@ -9062,6 +9543,8 @@ def _build_orientation_gui_context(
         profile_filter_options={
             "orientation_line_plot_contract": _serialize_plot_data_contract(line_contract),
             "orientation_heatmap_plot_contract": _serialize_plot_data_contract(heatmap_contract),
+            "orientation_axis_ranges": orientation_axis_ranges,
+            "orientation_default_axis_bin_widths_A": orientation_axis_bin_widths,
         },
         estimated_total_points=_estimate_total_points_from_loaded_profiles(plot_profiles),
     )
@@ -9187,6 +9670,7 @@ def _render_profile_plot(
     plotter_kwargs: dict[str, Any] | None = None,
     series_descriptors: list[dict[str, Any]] | None = None,
     render_series_descriptors: list[dict[str, Any]] | None = None,
+    keep_figure_open: bool = False,
 ) -> tuple[Path | None, dict[str, Any]]:
     from .plot.plotting import configure_matplotlib_backend
 
@@ -9351,6 +9835,7 @@ def _render_profile_plot(
             else None
         ),
         "show_blocking": not bool(getattr(args, "gui", False)),
+        "keep_figure_open": bool(keep_figure_open),
         "capture_state": captured_state,
         "suppress_output_log": bool(getattr(args, "_suppress_output_log", False)),
     }
@@ -9559,7 +10044,13 @@ def _apply_gui_settings_to_args(args: argparse.Namespace, settings: dict[str, An
         "heatmap_colorbar_aspect",
         "view_mapping",
         "density_enabled_species",
+        "density_active_view_type",
+        "density_view_states",
         "position_enabled_species",
+        "position_active_view_type",
+        "position_view_states",
+        "orientation_active_view_type",
+        "orientation_view_states",
         "density_2d_x_axis",
         "density_2d_y_axis",
         "density_filter_x_min",
@@ -9570,12 +10061,25 @@ def _apply_gui_settings_to_args(args: argparse.Namespace, settings: dict[str, An
         "density_filter_z_max",
         "density_filter_distance_min",
         "density_filter_distance_max",
+        "orientation_line_x_axis",
+        "orientation_heatmap_x_axis",
+        "orientation_heatmap_y_axis",
+        "orientation_filter_x_min",
+        "orientation_filter_x_max",
+        "orientation_filter_y_min",
+        "orientation_filter_y_max",
+        "orientation_filter_z_min",
+        "orientation_filter_z_max",
+        "orientation_filter_distance_min",
+        "orientation_filter_distance_max",
         "projection_x",
         "projection_y",
         "projection_value",
         "projection_render_mode",
         "projection_filter_min",
         "projection_filter_max",
+        "x_bin_width",
+        "x_bin_reducer",
         "y_bin_width",
         "y_bin_reducer",
         "xy_z_distance_max",
@@ -9588,6 +10092,13 @@ def _apply_gui_settings_to_args(args: argparse.Namespace, settings: dict[str, An
         "tick_params_kwargs",
         "tight_layout_kwargs",
         "savefig_kwargs",
+        "series_show_in_legend",
+        "series_alpha",
+        "plot_data_format",
+        "plot_data_delimiter",
+        "plot_data_include_metadata",
+        "plot_data_enabled_only",
+        "_gui_sync_modes",
     }
     for key, value in settings.items():
         if key not in always_forward and not hasattr(args, key):
@@ -9660,6 +10171,7 @@ def _open_plot_settings_gui(
     initial_settings: dict[str, Any],
     on_preview: Callable[[dict[str, Any]], dict[str, Any] | None],
     on_save: Callable[[str, dict[str, Any]], str],
+    on_preview_figure: Callable[[dict[str, Any]], dict[str, Any] | None] | None = None,
     on_save_figure: Callable[[dict[str, Any], str], str | tuple[str, dict[str, Any]]] | None = None,
     on_save_data: Callable[[dict[str, Any], str], str | tuple[str, dict[str, Any]]] | None = None,
     on_import_hdf5: Callable[[str, str | None], dict[str, Any]] | None = None,
@@ -9683,6 +10195,7 @@ def _open_plot_settings_gui(
         initial_settings=initial_settings,
         on_preview=on_preview,
         on_save=on_save,
+        on_preview_figure=on_preview_figure,
         on_save_figure=on_save_figure,
         on_save_data=on_save_data,
         on_import_hdf5=on_import_hdf5,
@@ -9719,6 +10232,21 @@ def _plot_data_export_delimiter(path: str | Path) -> str:
     return ","
 
 
+def _plot_data_export_delimiter_from_setting(value: Any, path: str | Path) -> str:
+    token = str(value or "auto").strip().lower()
+    if token in {"", "auto"}:
+        return _plot_data_export_delimiter(path)
+    if token == "comma":
+        return ","
+    if token == "tab":
+        return "\t"
+    if token == "space":
+        return " "
+    if len(token) == 1:
+        return token
+    return _plot_data_export_delimiter(path)
+
+
 def _format_plot_data_export_value(value: Any) -> str:
     if isinstance(value, (float, int, np.floating, np.integer)):
         return format(float(value), ".15g")
@@ -9728,6 +10256,9 @@ def _format_plot_data_export_value(value: Any) -> str:
 def _write_plotted_xy_data_export(
     render_state: Mapping[str, Any],
     output_path: str | Path,
+    *,
+    delimiter: Any = None,
+    include_metadata: bool = False,
 ) -> Path:
     series_payload = render_state.get("plotted_xy_series")
     if not isinstance(series_payload, list) or not series_payload:
@@ -9760,8 +10291,11 @@ def _write_plotted_xy_data_export(
 
     target_path = Path(output_path).expanduser().resolve()
     target_path.parent.mkdir(parents=True, exist_ok=True)
-    delimiter = _plot_data_export_delimiter(target_path)
+    delimiter = _plot_data_export_delimiter_from_setting(delimiter, target_path)
     with target_path.open("w", encoding="utf-8", newline="") as handle:
+        if include_metadata:
+            handle.write("# LiNaK plotted data export\n")
+            handle.write(f"# series_count={len(normalized_series)}\n")
         writer = csv.writer(handle, delimiter=delimiter, lineterminator="\n")
         if len(normalized_series) == 1:
             writer.writerow(["x", "y"])
@@ -9928,6 +10462,49 @@ def _filter_density_descriptor_segments_by_enabled_species(
     ]
 
 
+def _density_2d_single_species_from_segments(
+    descriptor_segments_by_source: list[list[dict[str, Any]]],
+    enabled_species_value: Any,
+) -> str | None:
+    available_species: list[str] = []
+    available_set: set[str] = set()
+    for segment in descriptor_segments_by_source:
+        for descriptor in segment:
+            species = _density_descriptor_species(descriptor)
+            if species and species not in available_set:
+                available_species.append(species)
+                available_set.add(species)
+    if not available_species:
+        return None
+    if isinstance(enabled_species_value, (list, tuple)):
+        for item in enabled_species_value:
+            species = str(item).strip()
+            if species in available_set:
+                return species
+    enabled_species = _density_enabled_species_set(enabled_species_value)
+    if enabled_species:
+        for species in available_species:
+            if species in enabled_species:
+                return species
+    return available_species[0]
+
+
+def _filter_density_descriptor_segments_to_single_species(
+    descriptor_segments_by_source: list[list[dict[str, Any]]],
+    species: str | None,
+) -> list[list[dict[str, Any]]]:
+    if not species:
+        return []
+    return [
+        [
+            dict(descriptor)
+            for descriptor in segment
+            if _density_descriptor_species(descriptor) == species
+        ]
+        for segment in descriptor_segments_by_source
+    ]
+
+
 def _required_source_ids_for_gui_render(gui_settings: dict[str, Any]) -> set[str]:
     descriptors = _gui_series_descriptors_from_settings(gui_settings, [])
     if not descriptors:
@@ -10058,6 +10635,112 @@ def _launch_profile_plot_gui(
         )
     initial_settings = _strip_redundant_series_lists_for_gui(initial_settings)
 
+    context_cache: dict[str, _GuiPlotRenderContext] = {}
+
+    def _source_state_signature() -> dict[str, Any]:
+        try:
+            stat = source_path.stat()
+        except OSError:
+            return {"path": str(source_path), "mtime_ns": None, "size": None}
+        return {
+            "path": str(source_path),
+            "mtime_ns": int(stat.st_mtime_ns),
+            "size": int(stat.st_size),
+        }
+
+    def _gui_context_data_signature(
+        settings: dict[str, Any],
+        *,
+        kind: str,
+        required_source_ids: set[str],
+    ) -> str:
+        data_keys = (
+            "species",
+            "axis",
+            "component",
+            "time_axis",
+            "map_color",
+            "view_mapping",
+            "density_enabled_species",
+            "density_2d_x_axis",
+            "density_2d_y_axis",
+            "density_filter_x_min",
+            "density_filter_x_max",
+            "density_filter_y_min",
+            "density_filter_y_max",
+            "density_filter_z_min",
+            "density_filter_z_max",
+            "density_filter_distance_min",
+            "density_filter_distance_max",
+            "orientation_line_x_axis",
+            "orientation_heatmap_x_axis",
+            "orientation_heatmap_y_axis",
+            "orientation_filter_x_min",
+            "orientation_filter_x_max",
+            "orientation_filter_y_min",
+            "orientation_filter_y_max",
+            "orientation_filter_z_min",
+            "orientation_filter_z_max",
+            "orientation_filter_distance_min",
+            "orientation_filter_distance_max",
+            "projection_x",
+            "projection_y",
+            "projection_value",
+            "projection_render_mode",
+            "projection_filter_min",
+            "projection_filter_max",
+            "xy_z_distance_max",
+            "x_bin_width",
+            "y_bin_width",
+            "x_bin_reducer",
+            "y_bin_reducer",
+            "min_bin_points",
+        )
+        payload = {
+            "analysis": analysis_name,
+            "kind": kind,
+            "source": _source_state_signature(),
+            "required_source_ids": sorted(required_source_ids),
+            "settings": {
+                key: deepcopy(settings.get(key))
+                for key in data_keys
+                if key in settings
+            },
+        }
+        return json.dumps(payload, sort_keys=True, default=str)
+
+    def _cached_gui_context(
+        *,
+        kind: str,
+        builder: Callable[[argparse.Namespace], _GuiPlotRenderContext],
+        current_args: argparse.Namespace,
+        settings: dict[str, Any],
+        required_source_ids: set[str],
+    ) -> _GuiPlotRenderContext:
+        cache_key = _gui_context_data_signature(
+            settings,
+            kind=kind,
+            required_source_ids=required_source_ids,
+        )
+        cached = context_cache.get(cache_key)
+        if cached is not None:
+            LOGGER.debug(
+                "GUI %s context cache hit: analysis=%s key=%s.",
+                kind,
+                analysis_name,
+                cache_key[:96],
+            )
+            return cached
+        LOGGER.debug(
+            "GUI %s context cache miss: analysis=%s key=%s.",
+            kind,
+            analysis_name,
+            cache_key[:96],
+        )
+        context = builder(current_args)
+        context_cache[cache_key] = context
+        return context
+
     effective_guard_args = deepcopy(args)
     _apply_gui_settings_to_args(effective_guard_args, initial_settings)
     effective_context = (
@@ -10104,6 +10787,7 @@ def _launch_profile_plot_gui(
         show: bool,
         output: str | None,
         empty_error_message: str,
+        keep_figure_open: bool = False,
     ) -> tuple[Path | None, dict[str, Any]]:
         # Preview/export do not use a separate render path. They replay GUI
         # settings back into argparse-like state, rebuild context, and then
@@ -10114,11 +10798,18 @@ def _launch_profile_plot_gui(
         preview_args.output = output
         preview_args._suppress_output_log = output is None or _is_gui_preview_output_path(output)
         load_args = deepcopy(preview_args)
+        required_source_ids = _required_source_ids_for_gui_render(gui_settings)
         _force_source_ids_enabled_for_gui_loading(
             load_args,
-            _required_source_ids_for_gui_render(gui_settings),
+            required_source_ids,
         )
-        context = build_context(load_args)
+        context = _cached_gui_context(
+            kind="render",
+            builder=build_context,
+            current_args=load_args,
+            settings=gui_settings,
+            required_source_ids=required_source_ids,
+        )
         if context.series_count <= 0:
             raise ValueError(empty_error_message)
         if output is None:
@@ -10165,10 +10856,17 @@ def _launch_profile_plot_gui(
             plotter_kwargs=context.plotter_kwargs,
             series_descriptors=context.series_descriptors,
             render_series_descriptors=context.series_descriptors,
+            keep_figure_open=keep_figure_open,
         )
         render_state = dict(render_state or {})
         if analysis_name == "density":
-            descriptor_context = build_full_context(preview_args)
+            descriptor_context = _cached_gui_context(
+                kind="full",
+                builder=build_full_context,
+                current_args=preview_args,
+                settings=gui_settings,
+                required_source_ids=required_source_ids,
+            )
             descriptor_source = (
                 descriptor_context
                 if descriptor_context.series_descriptors
@@ -10222,6 +10920,19 @@ def _launch_profile_plot_gui(
             output=None,
             empty_error_message="No series are enabled. Turn on at least one series to preview.",
         )
+        return render_state
+
+    def _preview_figure(gui_settings: dict[str, Any]) -> dict[str, Any]:
+        _saved_path, render_state = _render_gui_preview_settings(
+            gui_settings,
+            show=False,
+            output=None,
+            empty_error_message="No series are enabled. Turn on at least one series to preview.",
+            keep_figure_open=True,
+        )
+        figure = render_state.get("figure") if isinstance(render_state, dict) else None
+        if figure is None:
+            raise RuntimeError("Preview renderer did not return a Matplotlib figure.")
         return render_state
 
     def _save(profile_name: str, gui_settings: dict[str, Any]) -> str:
@@ -10287,7 +10998,12 @@ def _launch_profile_plot_gui(
                 "No series are enabled. Turn on at least one series before exporting data."
             ),
         )
-        saved_path = _write_plotted_xy_data_export(render_state, output_path)
+        saved_path = _write_plotted_xy_data_export(
+            render_state,
+            output_path,
+            delimiter=gui_settings.get("plot_data_delimiter"),
+            include_metadata=bool(gui_settings.get("plot_data_include_metadata", False)),
+        )
         return f"Saved data to '{saved_path}'.", render_state
 
     def _list_import_hdf5_profiles(source_hdf5_path: str) -> dict[str, Any]:
@@ -10410,6 +11126,7 @@ def _launch_profile_plot_gui(
         title=gui_title,
         initial_settings=initial_settings,
         on_preview=_preview,
+        on_preview_figure=_preview_figure,
         on_save=_save,
         on_save_figure=_save_figure,
         on_save_data=_save_data,
@@ -10504,8 +11221,8 @@ def _handle_plot_overview(_args: argparse.Namespace) -> int:
                 "  linak plot -f run1.density.h5 run2.density.h5 --no-show --output density.png",
                 "  linak plot /path/to/traj.msd.h5 --no-show --output msd.png",
                 "  linak plot /path/to/traj.rdf.h5 --species-a O --species-b H",
-                "  linak plot /path/to/traj.position.h5 --component distance",
-                "  linak plot /path/to/traj.coordination.h5 --component distance",
+                "  linak plot /path/to/traj.position.h5 --view-type 1d-line --y-quantity distance",
+                "  linak plot /path/to/traj.coordination.h5 --view-type 1d-line --x-quantity distance",
                 "  linak plot /path/to/potentials.h5",
                 "  linak plot /path/to/run.temperature.h5",
                 "",
@@ -10739,11 +11456,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     compute_density.add_argument(
         "--outputs",
-        default=None,
+        default="all",
         help=(
             "Density outputs to compute: '1d' writes 1D distance/X/Y/Z profiles, "
             "'3d' writes sparse grid data for GUI slicing/filtering, and 'all' writes both "
-            "(default: 1d; legacy alias: line)."
+            "(default: all)."
         ),
     )
     compute_density.add_argument(
@@ -11455,8 +12172,8 @@ def build_parser() -> argparse.ArgumentParser:
     compute_orientation.add_argument(
         "--oh-cutoff",
         type=_positive_float,
-        default=1.25,
-        help="O-H cutoff in Angstrom for water-molecule detection (default: 1.25).",
+        default=1.27,
+        help="O-H cutoff in Angstrom for water-molecule detection (default: 1.27).",
     )
     _add_cell_resolution_options(compute_orientation)
     _add_spatial_filter_cli_args(compute_orientation)
@@ -11561,6 +12278,7 @@ def build_parser() -> argparse.ArgumentParser:
             "into the combined trajectory HDF5."
         ),
     )
+    _add_atom_alias_option(apply_combine)
     apply_combine.add_argument(
         "--cell",
         nargs=3,
@@ -11625,6 +12343,7 @@ def build_parser() -> argparse.ArgumentParser:
         metavar=("A", "B", "C"),
         help="Explicit orthorhombic cell lengths in Angstrom (overrides auto-discovery).",
     )
+    _add_atom_alias_option(apply_pbc)
     _add_dry_run_option(apply_pbc)
     apply_pbc.set_defaults(handler=_handle_apply_pbc)
 
@@ -13578,7 +14297,27 @@ def _read_analysis_profile_headers_by_source(
     headers_by_source: list[tuple[str, list[dict[str, Any]]]] = []
     for source_index, source in enumerate(sources):
         source_path = Path(source).expanduser().resolve()
-        headers = read_linak_hdf5_profile_headers(source_path, expected_analysis=analysis)
+        try:
+            stat = source_path.stat()
+            header_cache_key = (
+                str(source_path),
+                str(analysis),
+                int(stat.st_mtime_ns),
+                int(stat.st_size),
+            )
+        except OSError:
+            header_cache_key = (str(source_path), str(analysis), None, None)
+        cached_headers = _ANALYSIS_PROFILE_HEADER_CACHE.get(header_cache_key)
+        if cached_headers is None:
+            headers = read_linak_hdf5_profile_headers(source_path, expected_analysis=analysis)
+            _ANALYSIS_PROFILE_HEADER_CACHE[header_cache_key] = [
+                dict(header) for header in headers
+            ]
+            if len(_ANALYSIS_PROFILE_HEADER_CACHE) > 128:
+                oldest_key = next(iter(_ANALYSIS_PROFILE_HEADER_CACHE))
+                _ANALYSIS_PROFILE_HEADER_CACHE.pop(oldest_key, None)
+        else:
+            headers = [dict(header) for header in cached_headers]
         if not headers:
             raise ValueError(f"No '{analysis}' profiles found in '{source_path}'.")
         source_headers: list[dict[str, Any]] = []
@@ -13749,6 +14488,8 @@ def _handle_plot_density(args: argparse.Namespace) -> int:
 
         active_profiles_by_series_id: dict[str, Any] = {}
         active_profile_cache_keys_by_series_id: dict[str, Any] = {}
+        density_grid_profile_cache: dict[str, Any] = {}
+        density_grid_slice_cache: dict[str, list[Any]] = {}
 
         def _build_catalog(current_args: argparse.Namespace) -> _LazyGuiSeriesCatalog:
             catalog = _build_density_gui_lazy_catalog(
@@ -13756,6 +14497,8 @@ def _handle_plot_density(args: argparse.Namespace) -> int:
                 sources=gui_sources,
                 active_profiles_by_series_id=active_profiles_by_series_id,
                 active_profile_cache_keys_by_series_id=active_profile_cache_keys_by_series_id,
+                density_grid_profile_cache=density_grid_profile_cache,
+                density_grid_slice_cache=density_grid_slice_cache,
             )
             catalog.default_series_labels = _resolve_gui_default_series_labels(
                 args=current_args,
@@ -14923,10 +15666,10 @@ def _handle_compute_density(args: argparse.Namespace) -> int:
 
     surface_axis: str = args.axis
     density_outputs = _resolve_density_outputs_from_args(args)
-    min_molecule_frames = int(getattr(args, "min_molecule_frames", 3))
+    min_molecule_frames = int(getattr(args, "min_molecule_frames", 5))
     if min_molecule_frames < 1:
         raise ValueError("--min-molecule-frames must be >= 1.")
-    oh_cutoff = float(getattr(args, "oh_cutoff", 1.25))
+    oh_cutoff = float(getattr(args, "oh_cutoff", 1.27))
     grid_bin_width = getattr(args, "grid_bin_width", None)
     grid_max_nonzero_bins = int(getattr(args, "grid_max_nonzero_bins", 20_000_000))
     if grid_max_nonzero_bins < 1:
@@ -16351,7 +17094,7 @@ def _handle_apply_pbc(args: argparse.Namespace) -> int:
     )
 
     wrapped_frames = apply_pbc_to_frames(frames, cell)
-    write_trajectory(wrapped_frames, output_path)
+    write_trajectory(wrapped_frames, output_path, raw_species_as_symbols=True)
 
     LOGGER.info("PBC application finished in %.2f s.", perf_counter() - start)
     return 0
@@ -16475,6 +17218,7 @@ def _handle_apply_combine(args: argparse.Namespace) -> int:
             if getattr(args, "cell", None) is None
             else tuple(float(value) for value in args.cell)
         ),
+        atom_aliases=tuple(getattr(args, "atom_alias", None) or ()),
     )
 
     if args.dry_run:

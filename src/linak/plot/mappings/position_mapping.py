@@ -14,7 +14,13 @@ from ..contracts.position_contract import (
     default_position_plot_data_contract,
     position_profile_to_plot_data_contract,
 )
-from ..data_contract import PlotDataContract, PlotViewMapping
+from ..data_contract import (
+    PLOT_VIEW_1D_LINE,
+    PLOT_VIEW_2D_HEATMAP,
+    PlotDataContract,
+    PlotViewMapping,
+    canonical_plot_view_id,
+)
 from ..data_validation import MappingStatus, generic_view_type_compatibility
 
 PositionMappingPresetName = Literal[
@@ -81,14 +87,14 @@ def position_mapping_preset(
 
     if name == "distance_vs_time":
         return PlotViewMapping(
-            view_type_id="line_1d",
+            view_type_id=PLOT_VIEW_1D_LINE,
             x=_position_quantity_id_from_token(time_axis),
             y="distance_to_surface",
             split_by="atom",
         )
     if name == "x_y_trajectory":
         return PlotViewMapping(
-            view_type_id="trajectory_2d",
+            view_type_id=PLOT_VIEW_2D_HEATMAP,
             x="x",
             y="y",
             color=str(color_quantity),
@@ -97,7 +103,7 @@ def position_mapping_preset(
         )
     if name == "x_z_trajectory":
         return PlotViewMapping(
-            view_type_id="trajectory_2d",
+            view_type_id=PLOT_VIEW_2D_HEATMAP,
             x="x",
             y="z",
             color=str(color_quantity),
@@ -106,7 +112,7 @@ def position_mapping_preset(
         )
     if name == "y_z_trajectory":
         return PlotViewMapping(
-            view_type_id="trajectory_2d",
+            view_type_id=PLOT_VIEW_2D_HEATMAP,
             x="y",
             y="z",
             color=str(color_quantity),
@@ -139,7 +145,7 @@ def position_plot_options_to_view_mapping(
     normalized_component = _normalize_component_token(component)
     if normalized_component != "2d-projection":
         return PlotViewMapping(
-            view_type_id="line_1d",
+            view_type_id=PLOT_VIEW_1D_LINE,
             x=_position_quantity_id_from_token(time_axis),
             y=_position_quantity_id_from_token(normalized_component),
             split_by="atom",
@@ -183,7 +189,7 @@ def position_plot_options_to_view_mapping(
             fixed_values["legacy_xy_z_distance_cutoff"] = "true"
 
     return PlotViewMapping(
-        view_type_id="trajectory_2d",
+        view_type_id=PLOT_VIEW_2D_HEATMAP,
         x=_position_quantity_id_from_token(resolved_projection_x),
         y=_position_quantity_id_from_token(resolved_projection_y),
         color=value_quantity_id if use_color_role else None,
@@ -199,7 +205,7 @@ def position_view_mapping_to_plot_options(mapping: PlotViewMapping) -> dict[str,
     """Translate one generic position mapping back into legacy plot options."""
 
     view_type_id = str(mapping.view_type_id).strip().lower()
-    if view_type_id == "line_1d":
+    if canonical_plot_view_id(view_type_id) == PLOT_VIEW_1D_LINE:
         x_quantity = str(mapping.x or "").strip()
         y_quantity = str(mapping.y or "").strip()
         if x_quantity not in _POSITION_TIME_AXIS_TOKEN_BY_ID:
@@ -208,7 +214,7 @@ def position_view_mapping_to_plot_options(mapping: PlotViewMapping) -> dict[str,
             )
         if y_quantity not in _POSITION_COMPONENT_TOKEN_BY_ID:
             raise ValueError(
-                "Position line mappings must place one position component on the y role."
+                "Position 1D Line mappings must place one position quantity on the y role."
             )
         return {
             "component": _POSITION_COMPONENT_TOKEN_BY_ID[y_quantity],
@@ -223,18 +229,18 @@ def position_view_mapping_to_plot_options(mapping: PlotViewMapping) -> dict[str,
             "xy_z_distance_max": None,
         }
 
-    if view_type_id != "trajectory_2d":
+    if canonical_plot_view_id(view_type_id) != PLOT_VIEW_2D_HEATMAP:
         raise ValueError(
             "Current position plotting only translates generic mappings for "
-            "'line_1d' and 'trajectory_2d'."
+            "1D Line and 2D Heatmap."
         )
 
     x_quantity = str(mapping.x or "").strip()
     y_quantity = str(mapping.y or "").strip()
     if x_quantity not in _POSITION_PROJECTION_TOKEN_BY_ID:
-        raise ValueError(f"Unsupported position trajectory x quantity '{x_quantity}'.")
+        raise ValueError(f"Unsupported position 2D Heatmap x quantity '{x_quantity}'.")
     if y_quantity not in _POSITION_PROJECTION_TOKEN_BY_ID:
-        raise ValueError(f"Unsupported position trajectory y quantity '{y_quantity}'.")
+        raise ValueError(f"Unsupported position 2D Heatmap y quantity '{y_quantity}'.")
 
     value_quantity = str(mapping.color or mapping.filter_by or "distance_to_surface").strip()
     if mapping.color is not None and mapping.filter_by is not None:
@@ -245,7 +251,7 @@ def position_view_mapping_to_plot_options(mapping: PlotViewMapping) -> dict[str,
             )
     if value_quantity not in _POSITION_PROJECTION_TOKEN_BY_ID:
         raise ValueError(
-            f"Unsupported position trajectory value quantity '{value_quantity}'."
+            f"Unsupported position 2D Heatmap color quantity '{value_quantity}'."
         )
 
     render_mode = str(

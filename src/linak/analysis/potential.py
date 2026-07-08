@@ -21,7 +21,6 @@ from .. import __version__
 from ..cube_io import CubeDataset, read_cube_sources, validate_cube_source
 from ..plot.data_contract import PlotDataContract, PlotViewMapping
 from ..plot.mappings.potential_mapping import (
-    potential_table_rows,
     resolve_potential_plot_mapping,
 )
 from ..plot.plotting import (
@@ -1399,17 +1398,6 @@ def plot_potential_profiles(
         profiles=profiles,
         mapping=view_mapping,
     )
-    if resolved_mapping.is_table_view:
-        if capture_state is not None:
-            capture_state["table_rows"] = potential_table_rows(profiles)
-            capture_state["potential_summary"] = {
-                "x_axis_label": "Record ID",
-                "total_rows": int(profiles[0].total_rows),
-                "complete_rows": int(profiles[0].complete_rows),
-                "incomplete_rows": int(profiles[0].incomplete_rows),
-            }
-        return None
-
     runtime_y_quantity = resolved_mapping.y_quantity
     runtime_standard_plot = resolved_mapping.standard_plot
     selected_profiles = profiles

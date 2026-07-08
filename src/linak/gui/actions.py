@@ -132,6 +132,14 @@ def _trajectory_settings() -> list[SettingField]:
             help_text="Optional explicit orthorhombic cell lengths in Angstrom.",
             placeholder="auto from .out.h5 when available",
         ),
+        SettingField(
+            "atom_alias",
+            "Atom aliases",
+            "text",
+            group="Atom labels",
+            help_text="Optional RAW=ELEMENT aliases for labels such as Ow=O or Pt_top=Pt.",
+            placeholder="Ow=O Pt_top=Pt",
+        ),
     ]
 
 
@@ -157,6 +165,14 @@ def _convert_settings(item: ProjectItem) -> list[SettingField]:
         SettingField("select", "Frame selection", "text", group="Trajectory selection", help_text="Optional selector such as first:1000f, last:5ps, or range:100f:500f."),
         SettingField("input", "Simulation input", "path", group="Cell / Metadata", widget="path"),
         SettingField("cell", "Cell A B C", "text", group="Cell / Metadata", placeholder="auto from .out.h5 when available"),
+        SettingField(
+            "atom_alias",
+            "Atom aliases",
+            "text",
+            group="Atom labels",
+            help_text="Optional RAW=ELEMENT aliases for trajectory labels such as Ow=O or Pt_top=Pt.",
+            placeholder="Ow=O Pt_top=Pt",
+        ),
     ]
 
 
@@ -175,10 +191,9 @@ def _density_settings(_item: ProjectItem) -> list[SettingField]:
         SettingField("species", "Species", "text", "all", True, group="Selection", widget="species", multi=True, help_text="Use elements, elements/molecules/all, or molecule selectors mol:H, mol:O, mol:OH, mol:H2O, mol:H3O."),
         SettingField("axis", "Axis", "choice", "z", ("x", "y", "z"), True, "Binning", widget="axis"),
         SettingField("bin_width", "Bin width", "float", 0.05, True, "Binning", minimum=0.0, widget="float", unit="A"),
-        SettingField("oh_cutoff", "O-H cutoff", "float", 1.25, required=False, group="Binning", minimum=0.0, widget="float", unit="A"),
-        SettingField("min_molecule_frames", "Min molecule frames", "int", 3, required=False, group="Binning", minimum=1, widget="int"),
-        SettingField("outputs", "Outputs", "choice", "line", ("line", "heatmap", "all"), True, "Binning", widget="choice"),
-        SettingField("heatmap_planes", "Heatmap planes", "text", group="Binning", help_text="Space-separated xy, xz, yz."),
+        SettingField("oh_cutoff", "O-H cutoff", "float", 1.27, required=False, group="Binning", minimum=0.0, widget="float", unit="A"),
+        SettingField("min_molecule_frames", "Min molecule frames", "int", 5, required=False, group="Binning", minimum=1, widget="int"),
+        SettingField("outputs", "Outputs", "choice", "all", ("1d", "3d", "all"), True, "Binning", widget="choice"),
         *_surface_settings(),
         *_trajectory_settings(),
     ]
@@ -196,6 +211,14 @@ def _temperature_settings(_item: ProjectItem) -> list[SettingField]:
     return [
         SettingField("group_by", "Group by", "choice", "auto", ("auto", "elements", "regions", "both"), True, "Selection", widget="choice"),
         SettingField("input", "CP2K input", "path", group="Metadata", widget="path"),
+        SettingField(
+            "atom_alias",
+            "Atom aliases",
+            "text",
+            group="Atom labels",
+            help_text="Optional RAW=ELEMENT aliases for trajectory labels such as Ow=O or Pt_top=Pt.",
+            placeholder="Ow=O Pt_top=Pt",
+        ),
         SettingField("velocity_unit", "Velocity unit", "choice", "auto", ("auto", "atomic", "angstrom/fs"), True, "Velocity", widget="choice"),
         SettingField("remove_com", "Remove COM velocity", "bool", False, group="Velocity"),
     ]
@@ -218,8 +241,8 @@ def _position_settings(_item: ProjectItem) -> list[SettingField]:
         SettingField("species", "Species", "text", "all", True, group="Selection", widget="species", multi=True, help_text="Use elements/molecules/all, elements like O/H, or molecule selectors mol:H, mol:O, mol:OH, mol:H2O, mol:H3O."),
         SettingField("axis", "Axis", "choice", "z", ("x", "y", "z"), True, "Geometry", widget="axis"),
         SettingField("timestep_fs", "Timestep fs", "float", None, group="Time", minimum=0.0, widget="float", unit="fs"),
-        SettingField("oh_cutoff", "O-H cutoff", "float", 1.25, required=False, group="O/H molecules", minimum=0.0, widget="float", unit="A"),
-        SettingField("min_molecule_frames", "Min molecule frames", "int", 3, required=False, group="O/H molecules", minimum=1, widget="int"),
+        SettingField("oh_cutoff", "O-H cutoff", "float", 1.27, required=False, group="O/H molecules", minimum=0.0, widget="float", unit="A"),
+        SettingField("min_molecule_frames", "Min molecule frames", "int", 5, required=False, group="O/H molecules", minimum=1, widget="int"),
         SettingField("oh_topology_stride", "O/H topology stride", "int", 100, required=False, group="O/H molecules", minimum=1, widget="int"),
         *_surface_settings(),
         *_trajectory_settings(),
@@ -246,7 +269,7 @@ def _orientation_settings(_item: ProjectItem) -> list[SettingField]:
         SettingField("reference_axis", "Reference axis", "choice", "z", ("x", "y", "z"), True, "Geometry", widget="axis"),
         SettingField("bin_width", "Bin width", "float", 0.01, True, "Binning", minimum=0.0, widget="float", unit="A"),
         SettingField("angle_bins", "Angle bins", "int", 100, True, "Binning", minimum=1.0, widget="int"),
-        SettingField("oh_cutoff", "O-H cutoff", "float", 1.25, True, "Water detection", minimum=0.0, widget="float", unit="A"),
+        SettingField("oh_cutoff", "O-H cutoff", "float", 1.27, True, "Water detection", minimum=0.0, widget="float", unit="A"),
         *_surface_settings(),
         *_trajectory_settings(),
     ]
@@ -256,6 +279,14 @@ def _pbc_settings(_item: ProjectItem) -> list[SettingField]:
     return [
         SettingField("cell", "Cell A B C", "text", group="Cell", help_text="Optional explicit orthorhombic cell lengths in Angstrom.", placeholder="auto from .out.h5 when available"),
         SettingField("input", "Simulation input", "path", group="Cell", widget="path"),
+        SettingField(
+            "atom_alias",
+            "Atom aliases",
+            "text",
+            group="Atom labels",
+            help_text="Optional RAW=ELEMENT aliases for trajectory labels such as Ow=O or Pt_top=Pt.",
+            placeholder="Ow=O Pt_top=Pt",
+        ),
     ]
 
 
@@ -331,6 +362,11 @@ def _add_cell(argv: list[str], value: Any) -> None:
     if len(tokens) != 3:
         raise ValueError("Cell must contain exactly three numbers: A B C.")
     argv.extend(["--cell", *tokens])
+
+
+def _add_atom_aliases(argv: list[str], settings: dict[str, Any]) -> None:
+    for alias in _split_words(settings.get("atom_alias")):
+        argv.extend(["--atom-alias", alias])
 
 
 def validate_action_settings(action: Action, item: ProjectItem, settings: dict[str, Any]) -> None:
@@ -455,6 +491,7 @@ def _convert_backend(ctx: ActionContext) -> ActionExecutionResult:
             input_path=ctx.settings.get("input") or None,
             select=ctx.settings.get("select") or None,
             cell=tuple(float(token) for token in cell_tokens) if cell_tokens else None,
+            atom_aliases=tuple(_split_words(ctx.settings.get("atom_alias"))),
             output_was_default=False,
         )
     else:
@@ -506,12 +543,10 @@ def _compute_density_backend(ctx: ActionContext) -> ActionExecutionResult:
     _add_optional(argv, "--oh-cutoff", ctx.settings.get("oh_cutoff"))
     _add_optional(argv, "--min-molecule-frames", ctx.settings.get("min_molecule_frames"))
     _add_optional(argv, "--outputs", ctx.settings.get("outputs"))
-    planes = _split_words(ctx.settings.get("heatmap_planes"))
-    if planes:
-        argv.extend(["--heatmap-planes", *planes])
     _add_surface(argv, ctx.settings)
     _add_optional(argv, "--input", ctx.settings.get("input"))
     _add_cell(argv, ctx.settings.get("cell"))
+    _add_atom_aliases(argv, ctx.settings)
     return _run_cli_with_expected_outputs(ctx, argv, (output,))
 
 
@@ -522,6 +557,7 @@ def _compute_msd_backend(ctx: ActionContext) -> ActionExecutionResult:
     _add_optional(argv, "--timestep-fs", ctx.settings.get("timestep_fs"))
     _add_optional(argv, "--input", ctx.settings.get("input"))
     _add_cell(argv, ctx.settings.get("cell"))
+    _add_atom_aliases(argv, ctx.settings)
     return _run_cli_with_expected_outputs(ctx, argv, (output,))
 
 
@@ -531,6 +567,7 @@ def _compute_temperature_backend(ctx: ActionContext) -> ActionExecutionResult:
     _add_optional(argv, "--group-by", ctx.settings.get("group_by"))
     _add_optional(argv, "--input", ctx.settings.get("input"))
     _add_optional(argv, "--velocity-unit", ctx.settings.get("velocity_unit"))
+    _add_atom_aliases(argv, ctx.settings)
     if bool(ctx.settings.get("remove_com", False)):
         argv.append("--remove-com")
     return _run_cli_with_expected_outputs(ctx, argv, (output,))
@@ -547,6 +584,7 @@ def _compute_rdf_backend(ctx: ActionContext) -> ActionExecutionResult:
     _add_surface(argv, ctx.settings)
     _add_optional(argv, "--input", ctx.settings.get("input"))
     _add_cell(argv, ctx.settings.get("cell"))
+    _add_atom_aliases(argv, ctx.settings)
     return _run_cli_with_expected_outputs(ctx, argv, (output,))
 
 
@@ -562,6 +600,7 @@ def _compute_position_backend(ctx: ActionContext) -> ActionExecutionResult:
     _add_surface(argv, ctx.settings)
     _add_optional(argv, "--input", ctx.settings.get("input"))
     _add_cell(argv, ctx.settings.get("cell"))
+    _add_atom_aliases(argv, ctx.settings)
     return _run_cli_with_expected_outputs(ctx, argv, (output,))
 
 
@@ -578,6 +617,7 @@ def _compute_coordination_backend(ctx: ActionContext) -> ActionExecutionResult:
     _add_surface(argv, ctx.settings)
     _add_optional(argv, "--input", ctx.settings.get("input"))
     _add_cell(argv, ctx.settings.get("cell"))
+    _add_atom_aliases(argv, ctx.settings)
     return _run_cli_with_expected_outputs(ctx, argv, (output,))
 
 
@@ -592,6 +632,7 @@ def _compute_orientation_backend(ctx: ActionContext) -> ActionExecutionResult:
     _add_surface(argv, ctx.settings)
     _add_optional(argv, "--input", ctx.settings.get("input"))
     _add_cell(argv, ctx.settings.get("cell"))
+    _add_atom_aliases(argv, ctx.settings)
     return _run_cli_with_expected_outputs(ctx, argv, (output,))
 
 
@@ -600,6 +641,7 @@ def _apply_pbc_backend(ctx: ActionContext) -> ActionExecutionResult:
     argv = ["apply", "pbc", str(ctx.item.path), "--output", str(output)]
     _add_optional(argv, "--input", ctx.settings.get("input"))
     _add_cell(argv, ctx.settings.get("cell"))
+    _add_atom_aliases(argv, ctx.settings)
     return _run_cli_with_expected_outputs(ctx, argv, (output,))
 
 

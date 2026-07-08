@@ -124,6 +124,39 @@ def _raw_species_labels_for_frame(frame: Atoms) -> np.ndarray:
     return np.asarray(labels, dtype=object).astype(str)
 
 
+def _format_xyz_float(value: float) -> str:
+    return f"{float(value):.15g}"
+
+
+def _xyz_comment_for_frame(frame: Atoms) -> str:
+    cell = np.asarray(frame.cell.array, dtype=float)
+    has_cell = bool(np.any(np.abs(cell) > 1e-15))
+    if has_cell:
+        lattice = " ".join(_format_xyz_float(value) for value in cell.reshape(-1))
+        pbc = " ".join("T" if bool(value) else "F" for value in frame.get_pbc())
+        return f'Lattice="{lattice}" pbc="{pbc}"'
+    return str(frame.info.get("comment", "")).strip()
+
+
+def _write_xyz_like_frames(frames: list[Atoms], output_path: Path) -> None:
+    with output_path.open("w", encoding="utf-8") as handle:
+        for frame in frames:
+            raw_labels = _raw_species_labels_for_frame(frame)
+            if len(raw_labels) != len(frame):
+                raise ValueError("Raw species label count does not match atom count.")
+            positions = np.asarray(frame.positions, dtype=float)
+            handle.write(f"{len(frame)}\n")
+            handle.write(f"{_xyz_comment_for_frame(frame)}\n")
+            for label, (x, y, z) in zip(raw_labels, positions):
+                atom_label = str(label).strip()
+                if not atom_label or any(character.isspace() for character in atom_label):
+                    raise ValueError(f"Invalid XYZ atom label '{label}'.")
+                handle.write(
+                    f"{atom_label} {_format_xyz_float(x)} {_format_xyz_float(y)} "
+                    f"{_format_xyz_float(z)}\n"
+                )
+
+
 def _decode_hdf5_string_array(values: np.ndarray) -> np.ndarray:
     array = np.asarray(values)
     if array.dtype.kind == "S":
@@ -1972,6 +2005,7 @@ def write_trajectory(
     source_path: str | Path | None = None,
     source_format: str | None = None,
     metadata: TrajectoryStoredMetadata | None = None,
+    raw_species_as_symbols: bool = False,
 ) -> Path:
     """Write trajectory frames to disk and return the written path."""
     if not frames:
@@ -1991,13 +2025,16 @@ def write_trajectory(
         return written
 
     with ProgressBar(desc="Writing trajectory", total=1, unit="step") as progress:
-        try:
-            write(str(output_path), frames)
-        except UnknownFileTypeError as exc:
-            raise ValueError(
-                f"Unsupported output trajectory format for '{output_path}'. "
-                "Use a writable extension such as .xyz or .traj.h5."
-            ) from exc
+        if raw_species_as_symbols and output_path.suffix.lower() in _XYZ_LIKE_SUFFIXES:
+            _write_xyz_like_frames(frames, output_path)
+        else:
+            try:
+                write(str(output_path), frames)
+            except UnknownFileTypeError as exc:
+                raise ValueError(
+                    f"Unsupported output trajectory format for '{output_path}'. "
+                    "Use a writable extension such as .xyz or .traj.h5."
+                ) from exc
         progress.update()
     LOGGER.info("Wrote %d frame(s) to '%s'.", len(frames), output_path)
     return output_path

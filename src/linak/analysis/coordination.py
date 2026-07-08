@@ -38,6 +38,7 @@ from ..storage.hdf5_utils import (
 from .common import (
     available_element_species,
     frame_has_usable_cell as _common_frame_has_usable_cell,
+    grouped_raw_species_for_split_elements,
     normalize_species_label as _normalize_species,
     optional_cell_lengths as _optional_cell_lengths,
     optional_finite_float as _optional_finite_float,
@@ -156,7 +157,10 @@ class _CoordinationSelectionCache:
 
 def _ordered_coordination_pairs_from_frames(frames: list[Atoms]) -> list[tuple[str, str]]:
     """Return the ordered center->neighbor species pairs for bare collection mode."""
-    species_labels = available_element_species(frames)
+    species_labels = [
+        *available_element_species(frames),
+        *(f"species:{label}" for label in grouped_raw_species_for_split_elements(frames)),
+    ]
     if not species_labels:
         raise ValueError("No elements found in trajectory.")
     return [(species_a, species_b) for species_a in species_labels for species_b in species_labels]
@@ -192,7 +196,7 @@ def _normalize_component_token(component: str) -> str:
         return "time-distance"
     raise ValueError(
         f"Unsupported coordination component '{component}'. "
-        "Choose 'distance', 'time', or 'time-distance'."
+        "Choose 'distance', 'time', or 'heatmap'."
     )
 
 
@@ -2039,17 +2043,17 @@ def _plot_coordination_time_distance_projection(
         )
     if line_colors is not None:
         LOGGER.warning(
-            "Coordination component 'time-distance' ignores fixed line colors and uses coordination-number colors."
+            "Coordination 2D Heatmap ignores fixed line colors and uses coordination-number colors."
         )
     if series_markers is not None:
-        LOGGER.warning("Coordination component 'time-distance' ignores per-series markers.")
+        LOGGER.warning("Coordination 2D Heatmap ignores per-series markers.")
     if series_normalization_modes is not None:
         LOGGER.warning(
-            "Coordination component 'time-distance' ignores per-series normalization settings."
+            "Coordination 2D Heatmap ignores per-series normalization settings."
         )
     if x_bin_width is not None:
         LOGGER.warning(
-            "Coordination component 'time-distance' ignores x-bin settings (received %.6g; reducer=%s).",
+            "Coordination 2D Heatmap ignores x-bin settings (received %.6g; reducer=%s).",
             x_bin_width,
             x_bin_reducer or "mean",
         )
@@ -2098,7 +2102,7 @@ def _plot_coordination_time_distance_projection(
 
     if not segment_blocks and not point_x_values:
         raise ValueError(
-            "No enabled atom trajectories available for coordination 'time-distance' plotting."
+            "No enabled atom trajectories available for coordination 2D Heatmap plotting."
         )
 
     color_values_flat: list[np.ndarray] = []

@@ -5,10 +5,12 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from ..data_contract import (
+    PLOT_VIEW_1D_LINE,
     PlotDataContract,
     PlotDimension,
     PlotQuantity,
     PlotViewType,
+    plot_view_display_label,
 )
 
 if TYPE_CHECKING:
@@ -106,20 +108,20 @@ def _coordination_contract(
 
     view_types = (
         PlotViewType(
-            id="line_1d",
-            label="Line 1D",
-            kind="line_1d",
+            id=PLOT_VIEW_1D_LINE,
+            label=plot_view_display_label(PLOT_VIEW_1D_LINE),
+            kind=PLOT_VIEW_1D_LINE,
             supported_roles=("x", "y"),
         ),
         PlotViewType(
             id="scatter_2d",
-            label="Scatter 2D",
+            label=plot_view_display_label("scatter_2d"),
             kind="scatter_2d",
             supported_roles=("x", "y", "color"),
         ),
         PlotViewType(
             id="trajectory_2d",
-            label="Trajectory 2D",
+            label=plot_view_display_label("trajectory_2d"),
             kind="trajectory_2d",
             supported_roles=("x", "y", "color"),
         ),
@@ -131,7 +133,7 @@ def _coordination_contract(
         dimensions=dimensions,
         quantities=quantities,
         view_types=view_types,
-        default_view_type_id="line_1d",
+        default_view_type_id=PLOT_VIEW_1D_LINE,
     )
 
 

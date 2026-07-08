@@ -12,7 +12,7 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any
 
-from .data_contract import PlotViewMapping
+from .data_contract import PlotViewMapping, canonical_plot_view_id
 
 _PLOT_PROFILE_DENSITY = "plot:density"
 _PLOT_PROFILE_MSD = "plot:msd"
@@ -55,7 +55,7 @@ _LEGACY_MAPPING_FIELDS_BY_PROFILE_KEY: dict[str, tuple[str, ...]] = {
         "time_axis",
     ),
     _PLOT_PROFILE_COORDINATION: ("component", "time_axis"),
-    _PLOT_PROFILE_POTENTIAL: ("y_quantity", "table_view", "view_type"),
+    _PLOT_PROFILE_POTENTIAL: ("y_quantity", "view_type"),
     _PLOT_PROFILE_ORIENTATION: ("component", "angle"),
     _PLOT_PROFILE_TEMPERATURE: ("time_axis",),
     _PLOT_PROFILE_TABLE: ("kind", "x", "y", "bins"),
@@ -78,7 +78,7 @@ def serialize_plot_view_mapping(mapping: PlotViewMapping) -> dict[str, Any]:
     """Convert one mapping object into a JSON-ready payload."""
 
     return {
-        "view_type_id": str(mapping.view_type_id),
+        "view_type_id": canonical_plot_view_id(mapping.view_type_id),
         "x": None if mapping.x is None else str(mapping.x),
         "y": None if mapping.y is None else str(mapping.y),
         "color": None if mapping.color is None else str(mapping.color),
@@ -105,7 +105,7 @@ def deserialize_plot_view_mapping(payload: dict[str, Any]) -> PlotViewMapping:
     if not isinstance(payload, dict):
         raise ValueError("Saved plot profile view_mapping must be an object.")
     return PlotViewMapping(
-        view_type_id=str(payload.get("view_type_id") or "").strip(),
+        view_type_id=canonical_plot_view_id(str(payload.get("view_type_id") or "").strip()),
         x=None if payload.get("x") is None else str(payload.get("x")),
         y=None if payload.get("y") is None else str(payload.get("y")),
         color=None if payload.get("color") is None else str(payload.get("color")),
@@ -147,6 +147,7 @@ def build_plot_profile_payload(profile_key: str, settings: dict[str, Any]) -> di
         and key not in source_fields
         and key not in mapping_fields
     }
+    style = _canonicalize_plot_view_state_style(style)
     return {
         _PLOT_PROFILE_SENTINEL: _PLOT_PROFILE_VERSION,
         "source_selection": source_selection,
@@ -167,6 +168,7 @@ def flatten_plot_profile_payload(profile_key: str, payload: dict[str, Any]) -> d
         raise ValueError("Saved plot profile source_selection must be an object.")
     if not isinstance(style, dict):
         raise ValueError("Saved plot profile style must be an object.")
+    style = _canonicalize_plot_view_state_style(style)
     mapping = deserialize_plot_view_mapping(view_mapping_payload)
     flattened = {str(key): deepcopy(value) for key, value in source_selection.items()}
     mapping_settings = _flatten_view_mapping(str(profile_key), mapping)
@@ -212,12 +214,15 @@ def select_plot_profile_settings(
         raise ValueError("Saved plot profile source_selection must be an object.")
     if not isinstance(style, dict):
         raise ValueError("Saved plot profile style must be an object.")
+    style = _canonicalize_plot_view_state_style(style)
 
     selected: dict[str, Any] = {
         str(key): deepcopy(value) for key, value in source_selection.items() if str(key) in keys
     }
     if isinstance(view_mapping_payload, dict) and "view_mapping" in keys:
-        selected["view_mapping"] = deepcopy(view_mapping_payload)
+        selected["view_mapping"] = serialize_plot_view_mapping(
+            deserialize_plot_view_mapping(view_mapping_payload)
+        )
     for key, value in style.items():
         if str(key) in keys:
             selected[str(key)] = deepcopy(value)
@@ -267,12 +272,8 @@ def _build_view_mapping(profile_key: str, settings: dict[str, Any]) -> PlotViewM
     if profile_key == _PLOT_PROFILE_POTENTIAL:
         from .mappings.potential_mapping import potential_plot_options_to_view_mapping
 
-        table_view = bool(settings.get("table_view")) or (
-            str(settings.get("view_type") or "").strip().lower() == "table_records"
-        )
         return potential_plot_options_to_view_mapping(
             y_quantity=_optional_str(settings.get("y_quantity")),
-            table_view=table_view,
         )
     if profile_key == _PLOT_PROFILE_ORIENTATION:
         from .mappings.orientation_mapping import orientation_plot_options_to_view_mapping
@@ -280,6 +281,9 @@ def _build_view_mapping(profile_key: str, settings: dict[str, Any]) -> PlotViewM
         return orientation_plot_options_to_view_mapping(
             component=str(settings.get("component") or "average"),
             angle=str(settings.get("angle") or "polar"),
+            line_x_axis=_optional_str(settings.get("orientation_line_x_axis")),
+            heatmap_x_axis=_optional_str(settings.get("orientation_heatmap_x_axis")),
+            heatmap_y_axis=_optional_str(settings.get("orientation_heatmap_y_axis")),
         )
     if profile_key == _PLOT_PROFILE_TEMPERATURE:
         from .mappings.temperature_mapping import temperature_plot_options_to_view_mapping
@@ -327,14 +331,8 @@ def _flatten_view_mapping(profile_key: str, mapping: PlotViewMapping) -> dict[st
 
         options = potential_view_mapping_to_plot_options(mapping)
         flattened: dict[str, Any] = {}
-        view_type = str(options.get("view_type") or "").strip().lower()
-        if view_type == "table_records":
-            flattened["table_view"] = True
-            flattened["view_type"] = "table_records"
-        else:
-            flattened["table_view"] = False
-            if options.get("y_quantity") is not None:
-                flattened["y_quantity"] = options.get("y_quantity")
+        if options.get("y_quantity") is not None:
+            flattened["y_quantity"] = options.get("y_quantity")
         return flattened
     if profile_key == _PLOT_PROFILE_ORIENTATION:
         from .mappings.orientation_mapping import orientation_view_mapping_to_plot_options
@@ -369,6 +367,40 @@ def _flatten_view_mapping(profile_key: str, mapping: PlotViewMapping) -> dict[st
 
 def _default_mapping_settings(profile_key: str) -> dict[str, Any]:
     return _flatten_view_mapping(profile_key, _build_view_mapping(profile_key, {}))
+
+
+def _canonicalize_plot_view_state_style(style: dict[str, Any]) -> dict[str, Any]:
+    """Return a style payload with saved view-state ids normalized.
+
+    Legacy view ids remain accepted on load, but newly written profiles should
+    store canonical ids in active-view fields and in nested per-view state maps.
+    """
+
+    canonical_style = deepcopy(style)
+    for key, value in list(canonical_style.items()):
+        key_text = str(key)
+        if key_text.endswith("_active_view_type") and value is not None:
+            canonical_style[key_text] = canonical_plot_view_id(str(value))
+            continue
+        if not key_text.endswith("_view_states") or not isinstance(value, dict):
+            continue
+        normalized_states: dict[str, Any] = {}
+        for state_key, state_value in value.items():
+            canonical_state_key = canonical_plot_view_id(str(state_key))
+            if isinstance(state_value, dict):
+                normalized_state = deepcopy(state_value)
+                for nested_key, nested_value in list(normalized_state.items()):
+                    if str(nested_key).endswith("_active_view_type") and nested_value is not None:
+                        normalized_state[str(nested_key)] = canonical_plot_view_id(str(nested_value))
+                    elif str(nested_key) == "view_mapping" and isinstance(nested_value, dict):
+                        normalized_state[str(nested_key)] = serialize_plot_view_mapping(
+                            deserialize_plot_view_mapping(nested_value)
+                        )
+                normalized_states[canonical_state_key] = normalized_state
+            else:
+                normalized_states[canonical_state_key] = deepcopy(state_value)
+        canonical_style[key_text] = normalized_states
+    return canonical_style
 
 
 def _optional_str(value: Any) -> str | None:

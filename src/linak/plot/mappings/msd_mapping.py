@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from ..contracts.msd_contract import default_msd_plot_data_contract, msd_profile_to_plot_data_contract
-from ..data_contract import PlotDataContract, PlotViewMapping
+from ..data_contract import (
+    PLOT_VIEW_1D_LINE,
+    PlotDataContract,
+    PlotViewMapping,
+    canonical_plot_view_id,
+)
 from ..data_validation import MappingStatus, generic_view_type_compatibility
 
 
@@ -25,7 +30,7 @@ def msd_plot_options_to_view_mapping(*, time_axis: str = "ps") -> PlotViewMappin
 
     x_quantity = "time_ps" if str(time_axis).strip().lower() != "fs" else "time_fs"
     return PlotViewMapping(
-        view_type_id="line_1d",
+        view_type_id=PLOT_VIEW_1D_LINE,
         x=x_quantity,
         y="msd",
         fixed_values={"time_axis": "fs" if x_quantity == "time_fs" else "ps"},
@@ -35,8 +40,8 @@ def msd_plot_options_to_view_mapping(*, time_axis: str = "ps") -> PlotViewMappin
 def msd_view_mapping_to_plot_options(mapping: PlotViewMapping) -> dict[str, object]:
     """Translate one generic MSD mapping back into legacy plot options."""
 
-    if str(mapping.view_type_id).strip().lower() != "line_1d":
-        raise ValueError("Current MSD plotting only supports 'line_1d' mappings.")
+    if canonical_plot_view_id(mapping.view_type_id) != PLOT_VIEW_1D_LINE:
+        raise ValueError("Current MSD plotting only supports 1D Line mappings.")
     x_quantity = str(mapping.x or "").strip()
     if x_quantity not in {"time_ps", "time_fs"}:
         raise ValueError("MSD line mappings must use time_fs or time_ps on the x role.")
@@ -60,6 +65,10 @@ def resolve_msd_plot_mapping(
         else default_msd_plot_data_contract() if profile is None else msd_profile_to_plot_data_contract(profile)
     )
     resolved_mapping = mapping if mapping is not None else msd_plot_options_to_view_mapping(time_axis=time_axis)
+    resolved_mapping = replace(
+        resolved_mapping,
+        view_type_id=canonical_plot_view_id(resolved_mapping.view_type_id),
+    )
     compatibility = generic_view_type_compatibility(resolved_contract, resolved_mapping)
     if compatibility == "invalid":
         raise ValueError("MSD plot mapping is incompatible with the available plot data.")

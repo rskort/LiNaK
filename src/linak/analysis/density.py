@@ -1383,7 +1383,7 @@ def _resolve_density_target_specs(
 
 
 def _normalize_density_outputs(outputs: str | None) -> str:
-    normalized = str(outputs or "1d").strip().lower()
+    normalized = str(outputs or "all").strip().lower()
     if normalized == "line":
         return "1d"
     if normalized == "heatmap":
@@ -3498,7 +3498,7 @@ def compute_all_density_profiles(
     binning: str = "cell",
     surface_options: SurfaceEstimatorOptions | None = None,
     precomputed_surface_estimate: SurfaceEstimate | None = None,
-    outputs: str | None = "1d",
+    outputs: str | None = "all",
     heatmap_planes: list[str] | tuple[str, ...] | None = None,
     grid_bin_width: float | None = None,
     grid_max_nonzero_bins: int = DEFAULT_DENSITY_GRID_MAX_NONZERO_BINS,
@@ -5343,6 +5343,7 @@ def plot_density_profile(
     output: str | Path | None = None,
     show: bool = True,
     show_blocking: bool = True,
+    keep_figure_open: bool = False,
     preferred_backend: str | None = None,
     series_id: str | None = None,
     style: PlotStyle = DEFAULT_PLOT_STYLE,
@@ -5445,6 +5446,7 @@ def plot_density_profile(
             output=output,
             show=show,
             show_blocking=show_blocking,
+            keep_figure_open=keep_figure_open,
             preferred_backend=preferred_backend,
             style=style,
             x_lim=x_lim,
@@ -5565,6 +5567,7 @@ def plot_density_profile(
         output=output,
         show=show,
         show_blocking=show_blocking,
+        keep_figure_open=keep_figure_open,
         preferred_backend=preferred_backend,
         series_id=series_id,
         line_label=resolved_line_label,
@@ -5629,6 +5632,7 @@ def plot_density_profiles(
     output: str | Path | None = None,
     show: bool = True,
     show_blocking: bool = True,
+    keep_figure_open: bool = False,
     preferred_backend: str | None = None,
     style: PlotStyle = DEFAULT_PLOT_STYLE,
     data_contract: PlotDataContract | None = None,
@@ -5728,6 +5732,7 @@ def plot_density_profiles(
             output=output,
             show=show,
             show_blocking=show_blocking,
+            keep_figure_open=keep_figure_open,
             preferred_backend=preferred_backend,
             style=style,
             data_contract=resolved_mapping.contract,
@@ -5791,6 +5796,7 @@ def plot_density_profiles(
             output=output,
             show=show,
             show_blocking=show_blocking,
+            keep_figure_open=keep_figure_open,
             preferred_backend=preferred_backend,
             style=style,
             data_contract=resolved_mapping.contract,
@@ -5965,6 +5971,7 @@ def plot_density_profiles(
         output=output,
         show=show,
         show_blocking=show_blocking,
+        keep_figure_open=keep_figure_open,
         preferred_backend=preferred_backend,
         series_ids=series_ids,
         style=style,

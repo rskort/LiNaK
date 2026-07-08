@@ -8,6 +8,7 @@ import pytest
 from ase import Atoms
 
 import linak.analysis.coordination as coordination_module
+from linak.analysis.common import RAW_SPECIES_ARRAY
 from linak.analysis.coordination import (
     CoordinationCutoffResolution,
     CoordinationProfile,
@@ -51,6 +52,21 @@ def _coordination_test_frames() -> list[Atoms]:
         pbc=True,
     )
     return [frame0, frame1]
+
+
+def test_coordination_grouped_pairs_expose_only_split_raw_species():
+    frame = Atoms(
+        symbols=["Pt", "Pt", "O", "H", "Na"],
+        positions=np.zeros((5, 3)),
+        cell=[10.0, 10.0, 10.0],
+        pbc=True,
+    )
+    frame.new_array(RAW_SPECIES_ARRAY, np.asarray(["Pt", "Pt_top", "O", "H", "Na"]))
+
+    pairs = coordination_module._ordered_coordination_pairs_from_frames([frame])
+    labels = {label for pair in pairs for label in pair}
+
+    assert labels == {"H", "Na", "O", "Pt", "species:Pt", "species:Pt_top"}
 
 
 def _orthorhombic_cn_frames() -> list[Atoms]:

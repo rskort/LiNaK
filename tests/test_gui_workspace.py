@@ -204,14 +204,14 @@ def test_action_settings_validation_rejects_invalid_values(tmp_path):
     validate_action_settings(
         action,
         item,
-        {"species": "O", "axis": "z", "bin_width": 0.1, "outputs": "line"},
+        {"species": "O", "axis": "z", "bin_width": 0.1, "outputs": "1d"},
     )
 
     try:
         validate_action_settings(
             action,
             item,
-            {"species": "O", "axis": "q", "bin_width": -1, "outputs": "line"},
+            {"species": "O", "axis": "q", "bin_width": -1, "outputs": "1d"},
         )
     except ValueError as exc:
         assert "Axis" in str(exc) or "Bin width" in str(exc)
@@ -232,10 +232,26 @@ def test_expected_output_naming_versions_collisions(tmp_path):
     outputs = action.expected_outputs(
         project_dir=project,
         item=item,
-        settings={"species": "O", "axis": "z", "bin_width": 0.1, "outputs": "line"},
+        settings={"species": "O", "axis": "z", "bin_width": 0.1, "outputs": "1d"},
     )
 
     assert outputs == (project / "traj_1.density.h5",)
+
+
+def test_gui_density_defaults_match_current_density_engine(tmp_path):
+    trajectory = tmp_path / "traj.xyz"
+    _write_xyz(trajectory)
+    item = detect_project_item(trajectory, origin="external")
+    action = ActionRegistry().by_id("density")
+    defaults = default_settings_for_action(action, item, tmp_path)
+
+    assert defaults["outputs"] == "all"
+    assert defaults["oh_cutoff"] == 1.27
+    assert defaults["min_molecule_frames"] == 5
+    fields = {field.key: field for field in action.settings_schema(item)}
+    assert fields["outputs"].choices == ("1d", "3d", "all")
+    assert "heatmap_planes" not in fields
+    assert "atom_alias" in fields
 
 
 def test_viewmodels_build_guided_display_rows(tmp_path):
@@ -397,7 +413,7 @@ def test_gui_action_settings_snapshot_and_hash_are_stable(tmp_path):
     _write_xyz(trajectory)
     item = detect_project_item(trajectory, origin="external")
     action = ActionRegistry().by_id("density")
-    settings = {"species": "O", "axis": "z", "bin_width": 0.1, "outputs": "line"}
+    settings = {"species": "O", "axis": "z", "bin_width": 0.1, "outputs": "1d"}
 
     gui_settings = build_gui_action_settings(action, item, settings, project_dir=project)
 
@@ -459,6 +475,46 @@ def test_position_gui_backend_forwards_oh_molecule_options(tmp_path, monkeypatch
         "--oh-topology-stride",
         "3",
     )
+
+
+def test_density_gui_backend_forwards_atom_aliases(tmp_path, monkeypatch):
+    import linak.gui.actions as actions_mod
+
+    project = tmp_path / "project"
+    project.mkdir()
+    trajectory = tmp_path / "traj.xyz"
+    _write_xyz(trajectory)
+    item = detect_project_item(trajectory, origin="external")
+    action = ActionRegistry().by_id("density")
+    captured: dict[str, object] = {}
+
+    def _fake_run(ctx, argv, expected_outputs):
+        captured["argv"] = tuple(argv)
+        return ActionExecutionResult(output_paths=tuple(expected_outputs))
+
+    monkeypatch.setattr(actions_mod, "_run_cli_with_expected_outputs", _fake_run)
+
+    action.backend(
+        ActionContext(
+            project_dir=project,
+            item=item,
+            settings={
+                "species": "all",
+                "axis": "z",
+                "bin_width": 0.1,
+                "outputs": "all",
+                "atom_alias": "Ow=O Pt_top=Pt",
+            },
+            log=lambda _level, _message: None,
+            progress=lambda _label, _current, _total: None,
+        )
+    )
+
+    argv = captured["argv"]
+    assert "--atom-alias" in argv
+    assert argv.count("--atom-alias") == 2
+    assert "Ow=O" in argv
+    assert "Pt_top=Pt" in argv
 
 
 def test_component_viewmodels_group_items_and_flag_outputs(tmp_path):

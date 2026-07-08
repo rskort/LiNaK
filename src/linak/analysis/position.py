@@ -1382,11 +1382,14 @@ def _normalize_component_token(component: str) -> str:
         "projection-2d",
         "projection2d",
         "projection",
+        "heatmap",
+        "2d-heatmap",
+        "heatmap-2d",
     }:
         return _POSITION_PROJECTION_COMPONENT
     raise ValueError(
         f"Unsupported position component '{component}'. "
-        "Choose 'distance', 'x', 'y', 'z', or '2d-projection' (alias 'xy-z')."
+        "Choose 'distance', 'x', 'y', 'z', or 'heatmap'."
     )
 
 
@@ -1418,11 +1421,19 @@ def _normalize_projection_render_mode_token(render_mode: str) -> str:
         return token
     if token in {"color", "colormap", "colorscale"}:
         return "color-scale"
-    if token in {"lines", "line-colour", "line-colours", "line-colors"}:
+    if token in {
+        "lines",
+        "line-colour",
+        "line-colours",
+        "line-colors",
+        "source-colour",
+        "source-colours",
+        "source-colors",
+    }:
         return "line-colors"
     raise ValueError(
         f"Unsupported position projection render mode '{render_mode}'. "
-        "Choose 'color-scale' or 'line-colors'."
+        "Choose 'color-scale' or 'source-colors'."
     )
 
 
@@ -1673,6 +1684,7 @@ def _plot_position_xy_z_projection(
     output: str | Path | None,
     show: bool,
     show_blocking: bool,
+    keep_figure_open: bool = False,
     preferred_backend: str | None,
     style: PlotStyle,
     title: str | None,
@@ -1737,6 +1749,7 @@ def _plot_position_xy_z_projection(
         output=output,
         show=show,
         show_blocking=show_blocking,
+        keep_figure_open=keep_figure_open,
         preferred_backend=preferred_backend,
         style=style,
         title=title,
@@ -2168,7 +2181,7 @@ def _plot_position_xy_z_projection(
             if not show_blocking:
                 plt.pause(0.001)
 
-        if not (show and not show_blocking):
+        if not keep_figure_open and not (show and not show_blocking):
             plt.close(fig)
         return output_path
 
@@ -2179,6 +2192,7 @@ def _plot_position_projection(
     output: str | Path | None,
     show: bool,
     show_blocking: bool,
+    keep_figure_open: bool = False,
     preferred_backend: str | None,
     style: PlotStyle,
     title: str | None,
@@ -2786,7 +2800,7 @@ def _plot_position_projection(
             plt.show(block=show_blocking)
             if not show_blocking:
                 plt.pause(0.001)
-        if not (show and not show_blocking):
+        if not keep_figure_open and not (show and not show_blocking):
             plt.close(fig)
         return output_path
 
@@ -2796,6 +2810,7 @@ def plot_position_profile(
     output: str | Path | None = None,
     show: bool = True,
     show_blocking: bool = True,
+    keep_figure_open: bool = False,
     preferred_backend: str | None = None,
     series_id: str | None = None,
     style: PlotStyle = DEFAULT_PLOT_STYLE,
@@ -2920,6 +2935,7 @@ def plot_position_profile(
             output=output,
             show=show,
             show_blocking=show_blocking,
+            keep_figure_open=keep_figure_open,
             preferred_backend=preferred_backend,
             style=style,
             title=title,
@@ -3015,6 +3031,7 @@ def plot_position_profile(
             output=output,
             show=show,
             show_blocking=show_blocking,
+            keep_figure_open=keep_figure_open,
             preferred_backend=preferred_backend,
             series_id=series_id,
             line_label=resolved_label,
@@ -3079,6 +3096,7 @@ def plot_position_profile(
         output=output,
         show=show,
         show_blocking=show_blocking,
+        keep_figure_open=keep_figure_open,
         preferred_backend=preferred_backend,
         style=style,
         line_colors=line_colors,
@@ -3143,6 +3161,7 @@ def plot_position_profiles(
     output: str | Path | None = None,
     show: bool = True,
     show_blocking: bool = True,
+    keep_figure_open: bool = False,
     preferred_backend: str | None = None,
     style: PlotStyle = DEFAULT_PLOT_STYLE,
     data_contract: PlotDataContract | None = None,
@@ -3268,6 +3287,7 @@ def plot_position_profiles(
             output=output,
             show=show,
             show_blocking=show_blocking,
+            keep_figure_open=keep_figure_open,
             preferred_backend=preferred_backend,
             style=style,
             title=title,
@@ -3336,6 +3356,7 @@ def plot_position_profiles(
             output=output,
             show=show,
             show_blocking=show_blocking,
+            keep_figure_open=keep_figure_open,
             preferred_backend=preferred_backend,
             style=style,
             data_contract=resolved_mapping.contract,
@@ -3444,6 +3465,7 @@ def plot_position_profiles(
         output=output,
         show=show,
         show_blocking=show_blocking,
+        keep_figure_open=keep_figure_open,
         preferred_backend=preferred_backend,
         series_ids=series_ids,
         style=style,

@@ -30,6 +30,7 @@ from linak.analysis.density import (
     save_density_profiles,
 )
 from linak.analysis.common import RAW_SPECIES_ARRAY
+from linak.analysis.statistics import SeriesStatistics
 from linak.plot.mappings.density_mapping import density_plot_options_to_view_mapping
 
 
@@ -167,7 +168,7 @@ def test_density_profile_linear_density_without_cell():
     assert profile.axis == "z"
 
 
-def test_compute_all_density_profiles_default_is_line_only():
+def test_compute_all_density_profiles_default_is_all_outputs():
     frame = Atoms(
         "OO",
         positions=[[0.0, 1.0, 2.0], [2.0, 3.0, 4.0]],
@@ -178,9 +179,10 @@ def test_compute_all_density_profiles_default_is_line_only():
     profiles = compute_all_density_profiles([frame], species="O", bin_width=1.0, surface_mode="none")
 
     line_profiles = [profile for profile in profiles if isinstance(profile, DensityProfile)]
-    heatmap_profiles = [profile for profile in profiles if isinstance(profile, DensityHeatmapProfile)]
+    grid_profiles = [profile for profile in profiles if isinstance(profile, DensityGridProfile)]
     assert len(line_profiles) == 4
-    assert heatmap_profiles == []
+    assert len(grid_profiles) == 1
+    assert grid_profiles[0].species == "O"
 
 
 def test_compute_all_density_profiles_all_includes_sparse_grid():
@@ -318,7 +320,7 @@ def test_compute_all_density_profiles_supports_h2o_selection():
 
     profiles = compute_all_density_profiles([frame], species="H2O", surface_mode="none", bin_width=1.0)
 
-    assert len(profiles) == 4
+    assert len(profiles) == 5
     assert all(profile.species == "mol:H2O" for profile in profiles)
 
 
@@ -1985,6 +1987,53 @@ def test_plot_density_profile_preserves_explicit_blank_axis_labels(monkeypatch):
     assert captured["y_label"] == ""
 
 
+def test_plot_density_profile_renders_uncertainty_from_saved_statistics(tmp_path):
+    from linak.analysis.density import DensityProfile, plot_density_profile
+
+    profile = DensityProfile(
+        axis="z",
+        species="O",
+        bin_edges=np.array([0.0, 1.0, 2.0, 3.0]),
+        bin_centers=np.array([0.5, 1.5, 2.5]),
+        counts_per_frame=np.array([1.0, 2.0, 3.0]),
+        density=np.array([0.4, 0.6, 0.5]),
+        units="g/cm^3",
+        n_frames=3,
+        surface_position=0.0,
+        series_statistics={
+            "density": SeriesStatistics(
+                point_count=np.array([3, 3, 3]),
+                sample_n=np.array([3, 3, 3]),
+                sample_std=np.array([0.2, 0.3, 0.2]),
+                sample_sem=np.array([0.1, 0.15, 0.1]),
+                block_n=np.array([2, 2, 2]),
+                block_std=np.array([0.25, 0.35, 0.25]),
+                block_sem=np.array([0.12, 0.18, 0.12]),
+            )
+        },
+    )
+    capture_state: dict[str, object] = {}
+
+    plot_density_profile(
+        profile,
+        output=tmp_path / "density_uncertainty.png",
+        show=False,
+        error_config={"enabled": True, "stat": "sample_sem", "style": "band"},
+        capture_state=capture_state,
+    )
+
+    summary = capture_state["series_error_summaries"]["series"]
+    assert summary["status"] == "ok"
+    assert summary["stat"] == "sample_sem"
+    assert summary["statistics_mode"] == "direct"
+    assert capture_state["series_available_error_stats"]["series"] == [
+        "sample_std",
+        "sample_sem",
+        "block_std",
+        "block_sem",
+    ]
+
+
 def test_plot_density_profiles_use_g_per_cm3_without_si_scaling(monkeypatch):
     from linak.analysis.density import DensityProfile, plot_density_profiles
 
@@ -2328,6 +2377,59 @@ def test_plot_line_series_blocking_show_closes_figure(monkeypatch):
 
     assert show_blocks == [True]
     assert len(close_calls) == 1
+
+
+def test_plot_line_series_keep_figure_open_retains_noninteractive_figure(monkeypatch):
+    import matplotlib.pyplot as plt
+
+    from linak.plot import plotting as plotting_mod
+
+    close_calls: list[object] = []
+
+    monkeypatch.setattr(plotting_mod, "configure_matplotlib_backend", lambda **_kwargs: "Agg")
+    monkeypatch.setattr(plotting_mod, "_import_pyplot", lambda: plt)
+    monkeypatch.setattr(
+        plt, "close", lambda *args, **_kwargs: close_calls.append(args[0] if args else None)
+    )
+
+    captured: dict[str, object] = {}
+    plotting_mod.plot_line_series(
+        np.array([0.0, 1.0, 2.0], dtype=float),
+        np.array([0.2, 0.6, 1.0], dtype=float),
+        title="demo",
+        x_label="x",
+        y_label="y",
+        show=False,
+        keep_figure_open=True,
+        capture_state=captured,
+    )
+
+    assert close_calls == []
+    assert captured.get("figure") is not None
+
+
+def test_plot_line_series_capture_state_includes_line_artists(monkeypatch):
+    import matplotlib.pyplot as plt
+
+    from linak.plot import plotting as plotting_mod
+
+    monkeypatch.setattr(plotting_mod, "configure_matplotlib_backend", lambda **_kwargs: "Agg")
+    monkeypatch.setattr(plotting_mod, "_import_pyplot", lambda: plt)
+
+    captured: dict[str, object] = {}
+    plotting_mod.plot_line_series(
+        np.array([0.0, 1.0, 2.0], dtype=float),
+        np.array([0.2, 0.6, 1.0], dtype=float),
+        title="demo",
+        x_label="x",
+        y_label="y",
+        show=False,
+        keep_figure_open=True,
+        capture_state=captured,
+    )
+
+    assert captured.get("line_artists")
+    assert captured["line_artists"][0] in captured["axes"].lines
 
 
 def test_plot_multi_line_series_hides_disabled_series_in_capture_state():
@@ -2880,13 +2982,13 @@ def test_compute_all_density_profiles_logs_single_pass_and_aggregate_binning(cap
             bin_width=1.0,
         )
 
-    assert len(profiles) == 12
+    assert len(profiles) == 15
     info_messages = [
         record.getMessage() for record in caplog.records if record.levelno == logging.INFO
     ]
     assert any("Single-pass selection complete:" in message for message in info_messages)
     assert any(
-        "Binning 12 density outputs (4 1D profiles + 0 sparse grid profiles per species selection)."
+        "Binning 15 density outputs (4 1D profiles + 1 sparse grid profiles per species selection)."
         in message
         for message in info_messages
     )

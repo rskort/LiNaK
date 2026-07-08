@@ -10,7 +10,14 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import Literal
 
-from .data_contract import PlotDataContract, PlotQuantity, PlotViewMapping
+from .data_contract import (
+    PLOT_VIEW_1D_LINE,
+    PLOT_VIEW_2D_HEATMAP,
+    PlotDataContract,
+    PlotQuantity,
+    PlotViewMapping,
+    canonical_plot_view_id,
+)
 
 MappingStatus = Literal["valid_preferred", "valid_nonpreferred", "invalid"]
 
@@ -20,24 +27,27 @@ _SUPPORTED_GENERIC_VIEW_TYPES = frozenset(
         "scatter_2d",
         "trajectory_2d",
         "heatmap_2d",
-        "table_records",
+        PLOT_VIEW_1D_LINE,
+        PLOT_VIEW_2D_HEATMAP,
     }
 )
 
 _REQUIRED_ROLES_BY_VIEW_TYPE: dict[str, tuple[str, ...]] = {
     "line_1d": ("x", "y"),
+    PLOT_VIEW_1D_LINE: ("x", "y"),
     "scatter_2d": ("x", "y"),
     "trajectory_2d": ("x", "y"),
-    "heatmap_2d": ("x", "y", "z"),
-    "table_records": (),
+    "heatmap_2d": ("x", "y"),
+    PLOT_VIEW_2D_HEATMAP: ("x", "y"),
 }
 
 _OPTIONAL_ROLES_BY_VIEW_TYPE: dict[str, tuple[str, ...]] = {
     "line_1d": (),
+    PLOT_VIEW_1D_LINE: (),
     "scatter_2d": ("color", "split_by", "filter_by"),
     "trajectory_2d": ("color", "split_by", "filter_by"),
-    "heatmap_2d": (),
-    "table_records": (),
+    "heatmap_2d": ("z", "color", "split_by", "filter_by"),
+    PLOT_VIEW_2D_HEATMAP: ("z", "color", "split_by", "filter_by"),
 }
 
 _NON_QUANTITATIVE_KINDS = frozenset(
@@ -109,7 +119,7 @@ def visual_role_compatibility(
 ) -> MappingStatus:
     """Classify whether one quantity is suitable for one visual role."""
 
-    normalized_view_type = str(view_type_id).strip()
+    normalized_view_type = _validation_view_type_id(contract, view_type_id)
     normalized_role = str(role).strip()
     if normalized_view_type not in _SUPPORTED_GENERIC_VIEW_TYPES:
         return "invalid"
@@ -136,7 +146,7 @@ def generic_view_type_compatibility(
 ) -> MappingStatus:
     """Classify whether one generic view mapping is structurally compatible."""
 
-    view_type_id = str(mapping.view_type_id).strip()
+    view_type_id = _validation_view_type_id(contract, mapping.view_type_id)
     if view_type_id not in _SUPPORTED_GENERIC_VIEW_TYPES:
         return "invalid"
     if not _contract_supports_view_type(contract, view_type_id):
@@ -163,10 +173,7 @@ def generic_view_type_compatibility(
     if split_by is not None and not _dimension_exists(contract, split_by):
         return "invalid"
 
-    if view_type_id == "table_records":
-        return _merge_statuses(role_statuses)
-
-    if view_type_id == "line_1d":
+    if view_type_id in {"line_1d", PLOT_VIEW_1D_LINE}:
         x_quantity = _quantity_by_id(contract, role_assignments["x"])
         y_quantity = _quantity_by_id(contract, role_assignments["y"])
         if exact_shape_compatibility(contract, (x_quantity.id, y_quantity.id)):
@@ -187,20 +194,31 @@ def generic_view_type_compatibility(
             return _merge_statuses(("valid_nonpreferred", *role_statuses))
         return "invalid"
 
-    if view_type_id == "heatmap_2d":
+    if view_type_id in {"heatmap_2d", PLOT_VIEW_2D_HEATMAP}:
         x_quantity = _quantity_by_id(contract, role_assignments["x"])
         y_quantity = _quantity_by_id(contract, role_assignments["y"])
-        z_quantity = _quantity_by_id(contract, role_assignments["z"])
-        if len(x_quantity.dimensions) != 1 or len(y_quantity.dimensions) != 1:
+        z_quantity_id = role_assignments.get("z")
+        color_quantity_id = role_assignments.get("color")
+        if z_quantity_id is not None:
+            z_quantity = _quantity_by_id(contract, z_quantity_id)
+            if len(x_quantity.dimensions) != 1 or len(y_quantity.dimensions) != 1:
+                return "invalid"
+            if len(z_quantity.dimensions) != 2:
+                return "invalid"
+            x_dimension = x_quantity.dimensions[0]
+            y_dimension = y_quantity.dimensions[0]
+            if z_quantity.dimensions == (x_dimension, y_dimension):
+                return _merge_statuses(role_statuses)
+            if set(z_quantity.dimensions) == {x_dimension, y_dimension}:
+                return _merge_statuses(("valid_nonpreferred", *role_statuses))
             return "invalid"
-        if len(z_quantity.dimensions) != 2:
+        if color_quantity_id is not None:
+            base_ids = [x_quantity.id, y_quantity.id, color_quantity_id]
+            if exact_shape_compatibility(contract, base_ids):
+                return _merge_statuses(role_statuses)
+            if broadcast_compatibility(contract, base_ids):
+                return _merge_statuses(("valid_nonpreferred", *role_statuses))
             return "invalid"
-        x_dimension = x_quantity.dimensions[0]
-        y_dimension = y_quantity.dimensions[0]
-        if z_quantity.dimensions == (x_dimension, y_dimension):
-            return _merge_statuses(role_statuses)
-        if set(z_quantity.dimensions) == {x_dimension, y_dimension}:
-            return _merge_statuses(("valid_nonpreferred", *role_statuses))
         return "invalid"
 
     return "invalid"
@@ -208,7 +226,30 @@ def generic_view_type_compatibility(
 
 def _contract_supports_view_type(contract: PlotDataContract, view_type_id: str) -> bool:
     available = {str(view_type.id).strip() for view_type in contract.view_types}
-    return not available or view_type_id in available
+    if not available or view_type_id in available:
+        return True
+    canonical_target = canonical_plot_view_id(view_type_id)
+    return any(canonical_plot_view_id(available_id) == canonical_target for available_id in available)
+
+
+def _validation_view_type_id(contract: PlotDataContract, view_type_id: str | None) -> str:
+    token = str(view_type_id or "").strip()
+    if token == PLOT_VIEW_1D_LINE:
+        available = {str(view_type.id).strip() for view_type in contract.view_types}
+        if PLOT_VIEW_1D_LINE in available:
+            return PLOT_VIEW_1D_LINE
+        return "line_1d"
+    if token == PLOT_VIEW_2D_HEATMAP:
+        available = {str(view_type.id).strip() for view_type in contract.view_types}
+        if PLOT_VIEW_2D_HEATMAP in available:
+            return PLOT_VIEW_2D_HEATMAP
+        if "heatmap_2d" in available or not available:
+            return "heatmap_2d"
+        if "trajectory_2d" in available:
+            return "trajectory_2d"
+        if "scatter_2d" in available:
+            return "scatter_2d"
+    return token
 
 
 def _dimension_length_map(contract: PlotDataContract) -> dict[str, int | None]:
