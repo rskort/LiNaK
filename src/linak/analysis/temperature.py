@@ -23,6 +23,7 @@ from ..plot.plotting import (
     resolve_series_labels,
     resolve_single_series_options,
 )
+from ..trajectory.io import read_trajectory
 from .common import read_profile_payloads, read_profile_payloads_by_index, use_multi_series_plot, write_profile_collection
 from .schema import build_profile_metadata, default_plot_labels
 
@@ -274,15 +275,27 @@ def _sibling_input_path(source: Path) -> Path | None:
     return candidate if candidate.exists() else None
 
 
-def _sibling_xyz_atom_symbols(source: Path) -> tuple[str, ...]:
+def _resolved_xyz_atom_symbols(
+    path: Path,
+    *,
+    atom_aliases: Any = None,
+) -> tuple[str, ...]:
+    try:
+        frames = read_trajectory(path, atom_aliases=atom_aliases)
+    except (FileNotFoundError, OSError, ValueError) as exc:
+        LOGGER.warning("Could not resolve atom symbols from XYZ '%s': %s", path, exc)
+        return ()
+    if not frames:
+        return ()
+    return tuple(str(symbol) for symbol in frames[0].get_chemical_symbols())
+
+
+def _sibling_xyz_atom_symbols(source: Path, *, atom_aliases: Any = None) -> tuple[str, ...]:
     candidates = list(source.parent.glob("*-vel-*.xyz")) + list(source.parent.glob("*-pos-*.xyz"))
     for candidate in candidates:
-        try:
-            symbols = _first_frame_symbols_from_xyz(candidate)
-        except OSError:
-            continue
+        symbols = _resolved_xyz_atom_symbols(candidate, atom_aliases=atom_aliases)
         if symbols:
-            return tuple(symbols)
+            return symbols
     return ()
 
 
@@ -312,6 +325,7 @@ def discover_temperature_metadata(
     source: str | Path,
     *,
     input_path: str | Path | None = None,
+    atom_aliases: Any = None,
 ) -> TemperatureMetadata:
     """Discover element and region labels for a temperature source."""
 
@@ -331,12 +345,9 @@ def discover_temperature_metadata(
             LOGGER.warning("Could not read CP2K input '%s': %s", resolved_input, exc)
             resolved_input = None
 
-    atom_symbols = _sibling_xyz_atom_symbols(source_path)
+    atom_symbols = _sibling_xyz_atom_symbols(source_path, atom_aliases=atom_aliases)
     if source_path.suffix.lower() == ".xyz":
-        try:
-            atom_symbols = tuple(_first_frame_symbols_from_xyz(source_path))
-        except OSError:
-            atom_symbols = ()
+        atom_symbols = _resolved_xyz_atom_symbols(source_path, atom_aliases=atom_aliases)
     elements = _ordered_unique(atom_symbols) or input_elements
 
     if fixed_indices:
@@ -507,37 +518,19 @@ def _parse_velocity_frame_comment(comment: str, frame_index: int) -> tuple[int, 
     return int(match.group(1)), float(match.group(2))
 
 
-def _iter_velocity_xyz(path: Path) -> list[tuple[int, float, list[str], np.ndarray]]:
+def _iter_velocity_xyz(
+    path: Path,
+    *,
+    atom_aliases: Any = None,
+) -> list[tuple[int, float, list[str], np.ndarray]]:
+    resolved_frames = read_trajectory(path, atom_aliases=atom_aliases)
     frames: list[tuple[int, float, list[str], np.ndarray]] = []
-    with path.open("r", encoding="utf-8", errors="replace") as handle:
-        frame_index = 0
-        while True:
-            first = handle.readline()
-            if not first:
-                break
-            if not first.strip():
-                continue
-            try:
-                atom_count = int(first.strip())
-            except ValueError as exc:
-                raise ValueError(f"Velocity XYZ '{path}' has an invalid atom-count line.") from exc
-            comment = handle.readline()
-            if not comment:
-                raise ValueError(f"Velocity XYZ '{path}' ended before frame comment.")
-            step, time_fs = _parse_velocity_frame_comment(comment, frame_index)
-            symbols: list[str] = []
-            velocities = np.zeros((atom_count, 3), dtype=float)
-            for atom_index in range(atom_count):
-                line = handle.readline()
-                if not line:
-                    raise ValueError(f"Velocity XYZ '{path}' ended inside frame {frame_index}.")
-                parts = line.split()
-                if len(parts) < 4:
-                    raise ValueError(f"Velocity XYZ '{path}' has an invalid atom row: {line!r}")
-                symbols.append(parts[0])
-                velocities[atom_index, :] = [float(parts[1]), float(parts[2]), float(parts[3])]
-            frames.append((step, time_fs, symbols, velocities))
-            frame_index += 1
+    for frame_index, frame in enumerate(resolved_frames):
+        comment = str(frame.info.get("comment", ""))
+        step, time_fs = _parse_velocity_frame_comment(comment, frame_index)
+        symbols = [str(symbol) for symbol in frame.get_chemical_symbols()]
+        velocities = np.asarray(frame.positions, dtype=float).copy()
+        frames.append((step, time_fs, symbols, velocities))
     if not frames:
         raise ValueError(f"Velocity XYZ '{path}' contains no frames.")
     return frames
@@ -592,12 +585,13 @@ def compute_temperature_from_velocity_xyz(
     group_by: str = "auto",
     velocity_unit: str = "auto",
     remove_com: bool = False,
+    atom_aliases: Any = None,
 ) -> list[TemperatureProfile]:
     """Compute element and/or region temperatures from a CP2K velocity XYZ file."""
 
     source_path = Path(source).expanduser().resolve()
-    frames = _iter_velocity_xyz(source_path)
-    metadata = metadata or discover_temperature_metadata(source_path)
+    frames = _iter_velocity_xyz(source_path, atom_aliases=atom_aliases)
+    metadata = metadata or discover_temperature_metadata(source_path, atom_aliases=atom_aliases)
     normalized_group = str(group_by or "auto").strip().lower()
     if normalized_group == "auto":
         normalized_group = "both" if metadata.regions else "elements"
@@ -606,7 +600,7 @@ def compute_temperature_from_velocity_xyz(
     resolved_unit, factor = _velocity_factor(velocity_unit)
 
     first_symbols = frames[0][2]
-    elements = list(metadata.elements or _ordered_unique(first_symbols))
+    elements = list(_ordered_unique(first_symbols))
     selections: list[tuple[str, str, str | None, TemperatureRegion | None, np.ndarray]] = []
     if normalized_group in {"elements", "both"}:
         for element in elements:
@@ -688,11 +682,16 @@ def compute_temperature_profiles(
     group_by: str = "auto",
     velocity_unit: str = "auto",
     remove_com: bool = False,
+    atom_aliases: Any = None,
 ) -> list[TemperatureProfile]:
     """Compute or load temperature profiles from a supported source file."""
 
     source_path = Path(source).expanduser().resolve()
-    metadata = discover_temperature_metadata(source_path, input_path=input_path)
+    metadata = discover_temperature_metadata(
+        source_path,
+        input_path=input_path,
+        atom_aliases=atom_aliases,
+    )
     suffix = source_path.suffix.lower()
     name = source_path.name.lower()
     if suffix == ".temp":
@@ -706,6 +705,7 @@ def compute_temperature_profiles(
             group_by=group_by,
             velocity_unit=velocity_unit,
             remove_com=remove_com,
+            atom_aliases=atom_aliases,
         )
     raise ValueError(
         f"Unsupported temperature source '{source_path.name}'. Use .temp, .tregion, or *-vel-*.xyz."

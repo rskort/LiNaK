@@ -79,6 +79,16 @@ def _write_velocity_xyz(path: Path, *, k_temperature: float = 320.0) -> None:
     )
 
 
+def _write_labeled_velocity_xyz(path: Path, labels: list[str]) -> None:
+    rows = "\n".join(f"{label} 0.0000000000 0.0000000000 0.0000000000" for label in labels)
+    path.write_text(
+        f"{len(labels)}\n"
+        " i =        10, time =        5.000, E = -1.0\n"
+        f"{rows}\n",
+        encoding="utf-8",
+    )
+
+
 def test_temp_table_uses_sibling_velocity_element_order(tmp_path: Path) -> None:
     _write_cp2k_input(tmp_path / "input.inp")
     _write_velocity_xyz(tmp_path / "run-vel-1.xyz")
@@ -168,6 +178,32 @@ def test_velocity_temperature_uses_atomic_velocity_units_and_regions(tmp_path: P
     assert by_label["Region 1 [K1]"].dof_mode == "3N"
 
 
+def test_velocity_temperature_infers_pt_top_as_pt_without_alias(tmp_path: Path) -> None:
+    velocity = tmp_path / "run-vel-1.xyz"
+    _write_labeled_velocity_xyz(velocity, ["Pt_top", "Pt"])
+
+    profiles = compute_temperature_profiles(velocity, group_by="elements")
+
+    assert [profile.default_label for profile in profiles] == ["Pt"]
+    assert profiles[0].atom_count == 2
+    assert profiles[0].atom_indices.tolist() == [0, 1]
+
+
+def test_velocity_temperature_accepts_explicit_atom_aliases(tmp_path: Path) -> None:
+    velocity = tmp_path / "run-vel-1.xyz"
+    _write_labeled_velocity_xyz(velocity, ["Qq_top"])
+
+    profiles = compute_temperature_profiles(
+        velocity,
+        group_by="elements",
+        atom_aliases=["Qq_top=O"],
+    )
+
+    assert [profile.default_label for profile in profiles] == ["O"]
+    assert profiles[0].atom_count == 1
+    assert profiles[0].atom_indices.tolist() == [0]
+
+
 def test_temperature_hdf5_round_trip_and_metadata(tmp_path: Path) -> None:
     _write_cp2k_input(tmp_path / "input.inp")
     _write_velocity_xyz(tmp_path / "run-vel-1.xyz")
@@ -219,6 +255,15 @@ def test_temperature_cli_default_output_uses_clean_dot_name(tmp_path: Path) -> N
     assert main(["compute", "temperature", str(tmp_path / "Pt110_1x2_Na4_H-vel-1.xyz")]) == 0
 
     assert (tmp_path / "LiNaK_outputs" / "Pt110_1x2_Na4_H.temperature.h5").exists()
+
+
+def test_temperature_cli_velocity_accepts_pt_top_labels(tmp_path: Path) -> None:
+    velocity = tmp_path / "run-vel-1.xyz"
+    output = tmp_path / "temperature.h5"
+    _write_labeled_velocity_xyz(velocity, ["Pt_top", "Pt"])
+
+    assert main(["compute", "temperature", str(velocity), "--group-by", "elements", "--output", str(output)]) == 0
+    assert output.exists()
 
 
 def test_gui_detects_temperature_sources_and_velocity_readiness(tmp_path: Path) -> None:

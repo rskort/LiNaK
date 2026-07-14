@@ -30,6 +30,10 @@ whose velocity columns are already in Angstrom/fs. `--remove-com` removes the
 center-of-mass velocity per selected element or region and changes the effective
 degrees of freedom from `3N` to `3N-3`.
 
+Velocity XYZ atom labels follow the normal LiNaK XYZ rules. Labels that imply an
+element, such as `Pt_top`, are resolved automatically to `Pt`, and truly custom
+labels can be mapped with `--atom-alias RAW=ELEMENT`.
+
 Metadata discovery is best effort. LiNaK first uses `--input`, then sibling
 `input.inp`, then sibling velocity/position XYZ files where useful. If labels
 still cannot be resolved, LiNaK warns and writes generic labels rather than

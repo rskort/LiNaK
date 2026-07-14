@@ -15981,6 +15981,7 @@ def _handle_compute_temperature(args: argparse.Namespace) -> int:
         group_by=args.group_by,
         velocity_unit=args.velocity_unit,
         remove_com=bool(args.remove_com),
+        atom_aliases=getattr(args, "atom_alias", None),
     )
     metadata: dict[str, Any] = {
         "source_path": str(source_path),
