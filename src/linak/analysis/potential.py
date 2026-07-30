@@ -1587,10 +1587,11 @@ def _read_max_existing_id(path: Path) -> int:
 
 
 def _fallback_csv_path(path: Path) -> Path:
-    from .output_naming import numbered_hdf5_path
+    from .output_naming import numbered_hdf5_path, split_analysis_hdf5_name
 
     suffix = path.suffix if path.suffix.lower() in {".h5", ".hdf5"} else ".h5"
-    stem = path.stem if path.suffix else path.name
+    split = split_analysis_hdf5_name(path.name)
+    stem = split[0] if split is not None else (path.stem if path.suffix else path.name)
     candidate = path.with_name(f"{stem}.linak.potential{suffix}")
     counter = 1
     while candidate.exists():

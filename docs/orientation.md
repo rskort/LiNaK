@@ -175,6 +175,31 @@ LiNaK stores:
 These heatmaps store raw counts. Any normalization to probabilities happens
 only at plotting time when explicitly requested.
 
+For orientation frequency heatmaps, **Displayed values** controls the
+display-time representation:
+
+- `raw_counts`: observations per displayed bin.
+- `joint_probability_density`: counts divided by the total count and both bin
+  widths, so the complete heatmap integrates to one.
+- `conditional_probability_density`: an orientation density within each
+  occupied distance row, so each row integrates to one.
+- `bulk_relative_enrichment`: the conditional density divided by the pooled
+  bulk orientation density; `1` is bulk-like.
+
+Counts from all enabled sources are combined and rebinned by summation before
+this transformation. Linear or logarithmic color mapping is applied afterward
+and does not change the displayed values. Bulk-relative plots automatically use
+the longest contiguous density plateau at least 80% of peak density, or can use
+`--heatmap-bulk-reference manual` with `--heatmap-bulk-min` and
+`--heatmap-bulk-max`.
+
+For example:
+
+```bash
+linak plot traj.orientation.h5 --view-type 2d-heatmap \
+  --heatmap-value-mode conditional_probability_density
+```
+
 Values exactly equal to `-1` and `+1` are handled deterministically and are
 assigned to the first and last cosine bins respectively.
 

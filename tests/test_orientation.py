@@ -669,9 +669,29 @@ def test_plot_orientation_profile_sparse_grid_heatmap_uses_filtered_grid(tmp_pat
     assert capture_state["orientation_grid_y_axis"] == "y"
     assert capture_state["x_label"] == "X (Angstrom)"
     assert capture_state["y_label"] == "Y (Angstrom)"
+    assert capture_state["heatmap_value_mode"] == "mean_orientation"
+    assert capture_state["heatmap_value_modes_supported"] == []
     mesh = capture_state["axes"].collections[0]
     values = np.asarray(mesh.get_array(), dtype=float)
     assert np.count_nonzero(np.isfinite(values)) == 1
+
+
+def test_sparse_orientation_mean_heatmap_rejects_frequency_value_modes(tmp_path):
+    from linak.analysis.orientation import plot_orientation_profile
+
+    profile = compute_orientation_profile(
+        frames=_multi_frame_trajectory(2), axis="z", bin_width=1.0
+    )
+    with pytest.raises(ValueError, match="no frequency value transformation"):
+        plot_orientation_profile(
+            profile,
+            output=str(tmp_path / "invalid_grid_value_mode.png"),
+            show=False,
+            component="heatmap",
+            orientation_heatmap_x_axis="x",
+            orientation_heatmap_y_axis="y",
+            heatmap_value_mode="joint_probability_density",
+        )
 
 
 def test_plot_orientation_profile_sparse_grid_line_uses_filtered_grid(tmp_path):
@@ -850,7 +870,145 @@ def test_plot_orientation_profile_heatmap_normalize_uses_global_probability(tmp_
     values = np.asarray(mesh.get_array(), dtype=float)
     finite_values = values[np.isfinite(values)]
     assert finite_values.size > 0
-    np.testing.assert_allclose(np.sum(finite_values), 1.0)
+    dx = float(np.diff(profile.bin_edges)[0])
+    dy = float(np.diff(profile.heatmap_angle_bin_edges)[0])
+    np.testing.assert_allclose(np.sum(finite_values) * dx * dy, 1.0)
+    assert capture_state["heatmap_value_mode"] == "joint_probability_density"
+
+
+def test_orientation_heatmap_value_modes_use_nonuniform_bin_areas():
+    counts = np.asarray([[2.0, 3.0], [4.0, 1.0]], dtype=float)
+    x_edges = np.asarray([0.0, 1.0, 3.0], dtype=float)
+    y_edges = np.asarray([-1.0, -0.5, 1.0], dtype=float)
+    dx = np.diff(x_edges)
+    dy = np.diff(y_edges)
+
+    raw = orientation_mod._transform_orientation_frequency_heatmap(
+        counts, x_edges, y_edges, mode="raw_counts"
+    )
+    np.testing.assert_array_equal(raw.values, counts)
+
+    joint = orientation_mod._transform_orientation_frequency_heatmap(
+        counts, x_edges, y_edges, mode="joint_probability_density"
+    )
+    expected_joint = counts / (
+        np.sum(counts) * dx[:, np.newaxis] * dy[np.newaxis, :]
+    )
+    np.testing.assert_allclose(joint.values, expected_joint)
+    np.testing.assert_allclose(
+        np.sum(joint.values * dx[:, np.newaxis] * dy[np.newaxis, :]),
+        1.0,
+    )
+
+    conditional = orientation_mod._transform_orientation_frequency_heatmap(
+        counts, x_edges, y_edges, mode="conditional_probability_density"
+    )
+    np.testing.assert_allclose(
+        np.sum(conditional.values * dy[np.newaxis, :], axis=1),
+        np.ones(2),
+    )
+
+
+def test_orientation_heatmap_conditional_masks_empty_rows():
+    result = orientation_mod._transform_orientation_frequency_heatmap(
+        np.asarray([[0.0, 0.0], [1.0, 3.0]], dtype=float),
+        np.asarray([0.0, 1.0, 2.0], dtype=float),
+        np.asarray([-1.0, 0.0, 1.0], dtype=float),
+        mode="conditional_probability_density",
+    )
+    assert np.all(np.isnan(result.values[0]))
+    np.testing.assert_allclose(result.values[1], [0.25, 0.75])
+
+
+def test_orientation_heatmap_bulk_relative_uses_pooled_distribution_and_masks_zero_bins():
+    counts = np.asarray(
+        [
+            [4.0, 6.0, 0.0],
+            [8.0, 12.0, 0.0],
+            [2.0, 18.0, 4.0],
+        ],
+        dtype=float,
+    )
+    result = orientation_mod._transform_orientation_frequency_heatmap(
+        counts,
+        np.asarray([0.0, 1.0, 2.0, 3.0], dtype=float),
+        np.asarray([-1.0, -0.5, 0.5, 1.0], dtype=float),
+        mode="bulk_relative_enrichment",
+        bulk_rows=np.asarray([0, 1], dtype=int),
+    )
+    np.testing.assert_allclose(result.values[:2, :2], np.ones((2, 2)))
+    assert np.all(np.isnan(result.values[:, 2]))
+    assert result.values[2, 0] < 1.0
+    assert result.values[2, 1] > 1.0
+
+
+def test_orientation_heatmap_bulk_reference_manual_range_and_validation():
+    rows, metadata = orientation_mod._resolve_bulk_water_reference_rows(
+        bin_centers=np.asarray([0.5, 1.5, 2.5, 3.5], dtype=float),
+        density=np.asarray([1.0, 8.0, 9.0, 8.0], dtype=float),
+        reference_mode="manual",
+        manual_min=1.0,
+        manual_max=3.0,
+    )
+    np.testing.assert_array_equal(rows, [1, 2])
+    assert metadata["resolved_min"] == pytest.approx(1.5)
+    assert metadata["resolved_max"] == pytest.approx(2.5)
+    assert metadata["row_count"] == 2
+
+    with pytest.raises(ValueError, match="minimum < maximum"):
+        orientation_mod._resolve_bulk_water_reference_rows(
+            bin_centers=np.asarray([0.5, 1.5], dtype=float),
+            density=np.asarray([1.0, 1.0], dtype=float),
+            reference_mode="manual",
+            manual_min=2.0,
+            manual_max=1.0,
+        )
+
+
+def test_orientation_heatmap_combines_then_sum_rebins_before_value_transform(tmp_path):
+    from linak.analysis.orientation import plot_orientation_profiles
+
+    profile = compute_orientation_profile(
+        frames=_multi_frame_trajectory(2), axis="z", bin_width=1.0
+    )
+    shape = profile.heatmap_polar.shape
+    first_counts = np.arange(1, np.prod(shape) + 1, dtype=float).reshape(shape)
+    second_counts = np.flip(first_counts, axis=1)
+    first = replace(profile, heatmap_polar=first_counts)
+    second = replace(profile, heatmap_polar=second_counts)
+    rebinned_counts, rebinned_x_edges = orientation_mod._rebin_heatmap_axis(
+        first_counts + second_counts,
+        profile.bin_edges,
+        2.0,
+        axis=0,
+        reducer="sum",
+    )
+    expected = orientation_mod._transform_orientation_frequency_heatmap(
+        rebinned_counts,
+        rebinned_x_edges,
+        profile.heatmap_angle_bin_edges,
+        mode="conditional_probability_density",
+    ).values
+    capture_state: dict[str, object] = {}
+
+    with pytest.warns(FutureWarning, match="always sum-preserving"):
+        result = plot_orientation_profiles(
+            [first, second],
+            output=str(tmp_path / "combined_rebinned_orientation.png"),
+            show=False,
+            component="heatmap",
+            heatmap_value_mode="conditional_probability_density",
+            x_bin_width=2.0,
+            x_bin_reducer="mean",
+            capture_state=capture_state,
+        )
+
+    assert result is not None
+    rendered = np.asarray(
+        capture_state["heatmap_artist"].get_array(), dtype=float
+    )
+    np.testing.assert_allclose(rendered.T, expected)
+    assert "sum-preserving rebin" in capture_state["heatmap_value_pipeline"]
 
 
 def test_plot_orientation_profile_heatmap_rejects_unknown_normalization_mode(tmp_path):
@@ -924,7 +1082,9 @@ def test_plot_orientation_profile_heatmap_bulk_water_reference_normalizes_bulk_m
     mesh = capture_state["axes"].collections[0]
     values = np.asarray(mesh.get_array(), dtype=float)
     np.testing.assert_allclose(np.mean(values[:, 3:5]), 1.0)
-    np.testing.assert_allclose(np.mean(values[:, 0:2]), 0.5)
+    np.testing.assert_allclose(np.mean(values[:, 0:2]), 1.0)
+    assert capture_state["heatmap_bulk_reference"]["resolved_min"] == pytest.approx(3.5)
+    assert capture_state["heatmap_bulk_reference"]["resolved_max"] == pytest.approx(4.5)
 
 
 def test_plot_orientation_profile_heatmap_bulk_water_reference_requires_distance_mode(tmp_path):
@@ -1079,7 +1239,8 @@ def test_plot_orientation_profile_heatmap_honors_shared_plot_settings(tmp_path):
     assert capture_state["font_family"] == "serif"
     assert capture_state["x_label_pad"] == pytest.approx(13.0)
     assert capture_state["y_label_pad"] == pytest.approx(17.0)
-    assert capture_state["heatmap_normalization_mode"] == "counts"
+    assert capture_state["heatmap_value_mode"] == "raw_counts"
+    assert capture_state["heatmap_value_units"] == "observations/bin"
     assert capture_state["heatmap_colorbar_enabled"] is True
 
 

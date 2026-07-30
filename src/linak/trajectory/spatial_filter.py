@@ -101,14 +101,9 @@ def parse_spatial_range(axis_id: str, raw: str | None) -> SpatialRangeSpec | Non
 
 
 def append_output_name_suffix(path: Path, suffix: str) -> Path:
-    path_text = str(path)
-    lower = path_text.lower()
-    for token in (".traj.hdf5", ".traj.h5", ".cube.hdf5", ".cube.h5", ".hdf5", ".h5"):
-        if lower.endswith(token):
-            base = path_text[: -len(token)]
-            return Path(base + suffix + path_text[-len(token) :])
-    stem = path.stem or path.name
-    return path.with_name(f"{stem}{suffix}{path.suffix}")
+    from ..analysis.output_naming import append_hdf5_name_suffix
+
+    return append_hdf5_name_suffix(path, suffix)
 
 
 def spatial_filter_options_from_mapping(

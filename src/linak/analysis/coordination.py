@@ -18,6 +18,7 @@ from ..plot.mappings.coordination_mapping import resolve_coordination_plot_mappi
 from ..plot.plotting import (
     DEFAULT_PLOT_STYLE,
     PlotStyle,
+    _apply_plot_grid,
     _apply_minor_tick_modes,
     _axis_tick_params,
     _extract_tick_controls,
@@ -2230,17 +2231,7 @@ def _plot_coordination_time_distance_projection(
         if not y_ticks_visible:
             ax.tick_params(axis="y", which="both", left=False, right=False, labelleft=False)
 
-        if style.grid:
-            resolved_grid_kwargs: dict[str, Any] = {
-                "linestyle": style.grid_linestyle,
-                "linewidth": style.grid_linewidth,
-                "alpha": style.grid_alpha,
-            }
-            if grid_kwargs is not None:
-                resolved_grid_kwargs.update(dict(grid_kwargs))
-            ax.grid(True, **resolved_grid_kwargs)
-        elif grid_kwargs is not None:
-            ax.grid(**dict(grid_kwargs))
+        _apply_plot_grid(ax, style=style, grid_kwargs=grid_kwargs)
 
         ax.set_xscale(x_scale)
         ax.set_yscale(y_scale)

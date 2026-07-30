@@ -56,6 +56,7 @@ from ..plot.mappings.position_mapping import resolve_position_plot_mapping
 from ..plot.plotting import (
     DEFAULT_PLOT_STYLE,
     PlotStyle,
+    _apply_plot_grid,
     _extract_tick_controls,
     _resolve_tick_visibility,
     _render_plot_annotations,
@@ -1733,11 +1734,24 @@ def _plot_position_xy_z_projection(
     tick_params_kwargs: dict[str, Any] | None,
     tight_layout_kwargs: dict[str, Any] | None,
     savefig_kwargs: dict[str, Any] | None,
+    heatmap_vmin: float | None = None,
+    heatmap_vmax: float | None = None,
+    heatmap_cmap: str | None = None,
+    heatmap_log_scale: bool = False,
+    heatmap_colorbar_enabled: bool = True,
+    heatmap_colorbar_label: str | None = None,
+    heatmap_colorbar_label_size: int | None = None,
+    heatmap_colorbar_tick_size: int | None = None,
+    heatmap_colorbar_position: str = "right",
+    heatmap_colorbar_pad: float | None = None,
+    heatmap_colorbar_shrink: float | None = None,
+    heatmap_colorbar_aspect: float | None = None,
     component: str = "xy-z",
     projection_x: str | None = None,
     projection_y: str | None = None,
     projection_value: str | None = None,
     projection_render_mode: str | None = None,
+    projection_line_width: float | None = None,
     projection_filter_min: float | None = None,
     projection_filter_max: float | None = None,
     xy_z_distance_max: float | None = None,
@@ -1798,12 +1812,25 @@ def _plot_position_xy_z_projection(
         tick_params_kwargs=tick_params_kwargs,
         tight_layout_kwargs=tight_layout_kwargs,
         savefig_kwargs=savefig_kwargs,
+        heatmap_vmin=heatmap_vmin,
+        heatmap_vmax=heatmap_vmax,
+        heatmap_cmap=heatmap_cmap,
+        heatmap_log_scale=heatmap_log_scale,
+        heatmap_colorbar_enabled=heatmap_colorbar_enabled,
+        heatmap_colorbar_label=heatmap_colorbar_label,
+        heatmap_colorbar_label_size=heatmap_colorbar_label_size,
+        heatmap_colorbar_tick_size=heatmap_colorbar_tick_size,
+        heatmap_colorbar_position=heatmap_colorbar_position,
+        heatmap_colorbar_pad=heatmap_colorbar_pad,
+        heatmap_colorbar_shrink=heatmap_colorbar_shrink,
+        heatmap_colorbar_aspect=heatmap_colorbar_aspect,
         component=component,
         map_color=map_color,
         projection_x=projection_x,
         projection_y=projection_y,
         projection_value=projection_value,
         projection_render_mode=projection_render_mode,
+        projection_line_width=projection_line_width,
         projection_filter_min=projection_filter_min,
         projection_filter_max=projection_filter_max,
         xy_z_distance_max=xy_z_distance_max,
@@ -2074,17 +2101,7 @@ def _plot_position_xy_z_projection(
         if y_tick_rotation is not None:
             ax.tick_params(axis="y", rotation=float(y_tick_rotation))
 
-        if style.grid:
-            resolved_grid_kwargs: dict[str, Any] = {
-                "linestyle": style.grid_linestyle,
-                "linewidth": style.grid_linewidth,
-                "alpha": style.grid_alpha,
-            }
-            if grid_kwargs is not None:
-                resolved_grid_kwargs.update(dict(grid_kwargs))
-            ax.grid(True, **resolved_grid_kwargs)
-        elif grid_kwargs is not None:
-            ax.grid(**dict(grid_kwargs))
+        _apply_plot_grid(ax, style=style, grid_kwargs=grid_kwargs)
 
         ax.set_xscale(x_scale)
         ax.set_yscale(y_scale)
@@ -2241,12 +2258,25 @@ def _plot_position_projection(
     tick_params_kwargs: dict[str, Any] | None,
     tight_layout_kwargs: dict[str, Any] | None,
     savefig_kwargs: dict[str, Any] | None,
+    heatmap_vmin: float | None,
+    heatmap_vmax: float | None,
+    heatmap_cmap: str | None,
+    heatmap_log_scale: bool,
+    heatmap_colorbar_enabled: bool,
+    heatmap_colorbar_label: str | None,
+    heatmap_colorbar_label_size: int | None,
+    heatmap_colorbar_tick_size: int | None,
+    heatmap_colorbar_position: str,
+    heatmap_colorbar_pad: float | None,
+    heatmap_colorbar_shrink: float | None,
+    heatmap_colorbar_aspect: float | None,
     component: str,
     map_color: str,
     projection_x: str | None,
     projection_y: str | None,
     projection_value: str | None,
     projection_render_mode: str | None,
+    projection_line_width: float | None,
     projection_filter_min: float | None,
     projection_filter_max: float | None,
     xy_z_distance_max: float | None,
@@ -2284,6 +2314,15 @@ def _plot_position_projection(
     if resolved_render_mode == "color-scale":
         line_colors = None
     series_total = sum(max(0, int(profile.n_atoms)) for profile in profiles)
+    ordered_descriptors = list(render_series_descriptors or [])
+    overrides = dict(series_overrides_by_id) if isinstance(series_overrides_by_id, Mapping) else {}
+    profile_descriptor_mode = len(ordered_descriptors) == len(profiles)
+    atom_descriptor_mode = (
+        resolved_render_mode == "line-colors"
+        and not profile_descriptor_mode
+        and len(ordered_descriptors) == series_total
+    )
+    option_count = len(profiles) if profile_descriptor_mode else series_total
     for values, field_name in (
         (series_enabled, "series_enabled"),
         (line_colors, "line_colors"),
@@ -2295,10 +2334,11 @@ def _plot_position_projection(
         (series_normalization_values, "series_normalization_values"),
         (series_normalization_x_refs, "series_normalization_x_refs"),
     ):
-        if values is not None and len(values) != series_total:
+        if values is not None and len(values) != option_count:
+            layer_kind = "species/profile layers" if profile_descriptor_mode else "atom series"
             raise ValueError(
-                f"{field_name} count must match the number of plotted position atom series "
-                f"({series_total})."
+                f"{field_name} count must match the number of plotted position "
+                f"{layer_kind} ({option_count})."
             )
 
     if x_bin_width is not None:
@@ -2321,6 +2361,7 @@ def _plot_position_projection(
 
     from matplotlib.collections import LineCollection
     import matplotlib.colors as mcolors
+    from matplotlib.colors import LogNorm
     import matplotlib.pyplot as plt
 
     def _build_profile_line_shades(base_color: str, count: int) -> list[str]:
@@ -2349,6 +2390,7 @@ def _plot_position_projection(
 
     color_scale_segment_blocks: list[np.ndarray] = []
     color_scale_segment_color_blocks: list[np.ndarray] = []
+    color_scale_value_blocks: list[np.ndarray] = []
     color_scale_point_x: list[float] = []
     color_scale_point_y: list[float] = []
     color_scale_point_values: list[float] = []
@@ -2362,15 +2404,6 @@ def _plot_position_projection(
     default_line_colors = default_series_colors(series_total)
     default_projection_x_lim: tuple[float | None, float | None] | None = None
     default_projection_y_lim: tuple[float | None, float | None] | None = None
-    ordered_descriptors = list(render_series_descriptors or [])
-    overrides = dict(series_overrides_by_id) if isinstance(series_overrides_by_id, Mapping) else {}
-    profile_descriptor_mode = resolved_render_mode == "color-scale" and len(
-        ordered_descriptors
-    ) == len(profiles)
-    atom_descriptor_mode = (
-        resolved_render_mode == "line-colors" and len(ordered_descriptors) == series_total
-    )
-
     def _override_entry(series_id: str | None) -> dict[str, Any]:
         token = str(series_id or "").strip()
         value = overrides.get(token)
@@ -2404,6 +2437,13 @@ def _plot_position_projection(
             profile_enabled = bool(profile_override.get("enabled", True)) and bool(
                 profile_override.get("show_raw_line", True)
             )
+            profile_label = (
+                str(profile_override.get("label_override") or "").strip()
+                or str(profile_descriptor.get("default_label") or "").strip()
+                or _position_species_display_label(profile.species)
+            )
+        else:
+            profile_label = _position_species_display_label(profile.species)
         x_matrix, default_x_label = _position_projection_quantity_data(
             profile, quantity=resolved_projection_x
         )
@@ -2428,11 +2468,17 @@ def _plot_position_projection(
             )
         profile_base_color = default_series_colors(len(profiles))[profile_index]
         if line_colors is not None:
-            profile_series_end = series_index + int(profile.n_atoms)
-            for raw_color in line_colors[series_index:profile_series_end]:
+            color_slice = (
+                line_colors[profile_index : profile_index + 1]
+                if profile_descriptor_mode
+                else line_colors[series_index : series_index + int(profile.n_atoms)]
+            )
+            for raw_color in color_slice:
                 if str(raw_color or "").strip():
                     profile_base_color = str(raw_color).strip()
                     break
+        if profile_descriptor_mode and profile_override.get("color") not in {None, ""}:
+            profile_base_color = str(profile_override.get("color"))
         if atom_descriptor_mode:
             profile_series_end = series_index + int(profile.n_atoms)
             for descriptor_index in range(series_index, profile_series_end):
@@ -2443,7 +2489,8 @@ def _plot_position_projection(
                     break
         profile_line_payloads: list[dict[str, Any]] = []
         for atom_column, atom_default_label in enumerate(_default_position_series_labels(profile)):
-            descriptor_label = atom_default_label
+            option_index = profile_index if profile_descriptor_mode else series_index
+            descriptor_label = profile_label if profile_descriptor_mode else atom_default_label
             current_override: dict[str, Any] = {}
             if atom_descriptor_mode:
                 descriptor = ordered_descriptors[series_index]
@@ -2451,7 +2498,7 @@ def _plot_position_projection(
                 descriptor_label = str(current_override.get("label_override") or "").strip() or str(
                     descriptor.get("default_label") or atom_default_label
                 )
-            is_enabled = True if series_enabled is None else bool(series_enabled[series_index])
+            is_enabled = True if series_enabled is None else bool(series_enabled[option_index])
             if atom_descriptor_mode:
                 is_enabled = bool(current_override.get("enabled", True)) and bool(
                     current_override.get("show_raw_line", True)
@@ -2459,30 +2506,47 @@ def _plot_position_projection(
             elif profile_descriptor_mode:
                 is_enabled = profile_enabled
             show_in_legend = (
-                True if series_show_in_legend is None else bool(series_show_in_legend[series_index])
+                True
+                if series_show_in_legend is None
+                else bool(series_show_in_legend[option_index])
             )
             if atom_descriptor_mode:
                 show_in_legend = bool(current_override.get("show_in_legend", show_in_legend))
+            elif profile_descriptor_mode:
+                show_in_legend = bool(
+                    profile_override.get("show_in_legend", show_in_legend)
+                ) and atom_column == 0
             line_width_value = (
-                None if series_line_widths is None else series_line_widths[series_index]
+                None if series_line_widths is None else series_line_widths[option_index]
             )
             line_width = style.line_width if line_width_value is None else float(line_width_value)
             if atom_descriptor_mode and current_override.get("line_width") not in {None, ""}:
                 line_width = float(current_override["line_width"])
+            elif (
+                profile_descriptor_mode
+                and profile_override.get("line_width") not in {None, ""}
+            ):
+                line_width = float(profile_override["line_width"])
             line_color = (
-                default_line_colors[series_index]
-                if line_colors is None or not str(line_colors[series_index]).strip()
-                else str(line_colors[series_index]).strip()
+                profile_base_color
+                if profile_descriptor_mode
+                else default_line_colors[series_index]
+                if line_colors is None or not str(line_colors[option_index]).strip()
+                else str(line_colors[option_index]).strip()
             )
             if atom_descriptor_mode and current_override.get("color") not in {None, ""}:
                 line_color = str(current_override.get("color"))
             extra_line_kwargs = (
                 {}
-                if series_line_kwargs is None or series_line_kwargs[series_index] is None
-                else dict(series_line_kwargs[series_index] or {})
+                if series_line_kwargs is None or series_line_kwargs[option_index] is None
+                else dict(series_line_kwargs[option_index] or {})
             )
             if atom_descriptor_mode and isinstance(current_override.get("line_kwargs"), Mapping):
                 extra_line_kwargs.update(dict(current_override.get("line_kwargs") or {}))
+            elif profile_descriptor_mode and isinstance(
+                profile_override.get("line_kwargs"), Mapping
+            ):
+                extra_line_kwargs.update(dict(profile_override.get("line_kwargs") or {}))
             series_index += 1
             if not is_enabled:
                 continue
@@ -2504,17 +2568,22 @@ def _plot_position_projection(
             visible_x_values.extend(float(value) for value in visible_x)
             visible_y_values.extend(float(value) for value in visible_y)
             if resolved_render_mode == "color-scale":
-                color_scale_point_x.extend(float(value) for value in visible_x)
-                color_scale_point_y.extend(float(value) for value in visible_y)
-                color_scale_point_values.extend(float(value) for value in visible_values)
+                color_scale_value_blocks.append(visible_values)
                 for start, stop in _contiguous_true_runs(visible_mask):
+                    run_x = np.asarray(x_values[start:stop], dtype=float)
+                    run_y = np.asarray(y_values[start:stop], dtype=float)
+                    run_values = np.asarray(value_values[start:stop], dtype=float)
                     segments, segment_values = _build_xy_segments(
-                        np.asarray(x_values[start:stop], dtype=float),
-                        np.asarray(y_values[start:stop], dtype=float),
-                        np.asarray(value_values[start:stop], dtype=float),
+                        run_x,
+                        run_y,
+                        run_values,
                         cell_lengths_xy=cell_lengths_xy,
                     )
                     if segments.size == 0:
+                        if len(run_x) == 1:
+                            color_scale_point_x.append(float(run_x[0]))
+                            color_scale_point_y.append(float(run_y[0]))
+                            color_scale_point_values.append(float(run_values[0]))
                         continue
                     color_scale_segment_blocks.append(segments)
                     color_scale_segment_color_blocks.append(segment_values)
@@ -2542,7 +2611,11 @@ def _plot_position_projection(
                     line_series_labels.append(descriptor_label)
 
         if profile_line_payloads:
-            shaded_colors = _build_profile_line_shades(profile_base_color, len(profile_line_payloads))
+            shaded_colors = (
+                [profile_base_color] * len(profile_line_payloads)
+                if profile_descriptor_mode
+                else _build_profile_line_shades(profile_base_color, len(profile_line_payloads))
+            )
             for payload, shaded_color in zip(profile_line_payloads, shaded_colors):
                 payload["color"] = shaded_color
 
@@ -2571,7 +2644,20 @@ def _plot_position_projection(
 
     labels = resolve_series_labels(line_series_labels, None, series_kind="position")
     effective_legend = (len(labels) <= 12) if legend is None else bool(legend)
-    marker_size = max(9.0, (style.line_width * 7.0) ** 2)
+    explicit_series_line_width = _first_non_none(series_line_widths)
+    resolved_projection_line_width = (
+        style.line_width
+        if projection_line_width is None and explicit_series_line_width is None
+        else explicit_series_line_width
+        if projection_line_width is None
+        else float(projection_line_width)
+    )
+    if (
+        not np.isfinite(resolved_projection_line_width)
+        or resolved_projection_line_width <= 0.0
+    ):
+        raise ValueError("Position 2D trajectory line width must be a positive finite number.")
+    isolated_point_size = max(1.0, float(resolved_projection_line_width) ** 2)
 
     with plt.rc_context(rc_context_args):
         fig, ax = plt.subplots(figsize=style.figure_size)
@@ -2579,29 +2665,57 @@ def _plot_position_projection(
             fig.set(**dict(figure_kwargs))
 
         if resolved_render_mode == "color-scale":
-            color_samples = []
-            if color_scale_segment_color_blocks:
-                color_samples.extend(color_scale_segment_color_blocks)
-            if color_scale_point_values:
-                color_samples.append(np.asarray(color_scale_point_values, dtype=float))
-            color_all = np.concatenate(color_samples)
-            color_min = float(np.nanmin(color_all))
-            color_max = float(np.nanmax(color_all))
-            if color_min == color_max:
-                color_min -= 0.5
-                color_max += 0.5
-            norm = mcolors.Normalize(vmin=color_min, vmax=color_max)
+            color_all = np.concatenate(color_scale_value_blocks)
+            finite_colors = color_all[np.isfinite(color_all)]
+            if finite_colors.size == 0:
+                raise ValueError("Position 2D Heatmap requires at least one finite color value.")
+            resolved_vmin = None if heatmap_vmin is None else float(heatmap_vmin)
+            resolved_vmax = None if heatmap_vmax is None else float(heatmap_vmax)
+            if resolved_vmin is not None and not np.isfinite(resolved_vmin):
+                raise ValueError("Heatmap color minimum must be finite.")
+            if resolved_vmax is not None and not np.isfinite(resolved_vmax):
+                raise ValueError("Heatmap color maximum must be finite.")
+            if (
+                resolved_vmin is not None
+                and resolved_vmax is not None
+                and resolved_vmin > resolved_vmax
+            ):
+                raise ValueError("Heatmap color minimum must not exceed the maximum.")
+            if heatmap_log_scale:
+                positive_colors = finite_colors[finite_colors > 0.0]
+                if positive_colors.size == 0:
+                    raise ValueError(
+                        "Heatmap log scale requires at least one positive color value."
+                    )
+                if resolved_vmin is not None and resolved_vmin <= 0.0:
+                    raise ValueError("Heatmap log scale requires a positive color minimum.")
+                if resolved_vmax is not None and resolved_vmax <= 0.0:
+                    raise ValueError("Heatmap log scale requires a positive color maximum.")
+                if resolved_vmin is None:
+                    resolved_vmin = float(np.min(positive_colors))
+                if resolved_vmax is None:
+                    resolved_vmax = float(np.max(positive_colors))
+                norm = LogNorm(vmin=resolved_vmin, vmax=resolved_vmax)
+            else:
+                if resolved_vmin is None:
+                    resolved_vmin = float(np.min(finite_colors))
+                if resolved_vmax is None:
+                    resolved_vmax = float(np.max(finite_colors))
+                if resolved_vmin == resolved_vmax:
+                    resolved_vmin -= 0.5
+                    resolved_vmax += 0.5
+                norm = mcolors.Normalize(vmin=resolved_vmin, vmax=resolved_vmax)
+            resolved_cmap = str(heatmap_cmap or "turbo").strip() or "turbo"
             projection_line_kwargs = _sanitize_line_collection_kwargs(line_kwargs)
-            explicit_line_width = _first_non_none(series_line_widths)
-            projection_line_kwargs.setdefault(
-                "linewidths",
-                style.line_width if explicit_line_width is None else explicit_line_width,
-            )
+            for width_key in ("linewidth", "linewidths", "lw"):
+                projection_line_kwargs.pop(width_key, None)
+            projection_line_kwargs["linewidths"] = resolved_projection_line_width
             mappable = None
+            point_artist = None
             if color_scale_segment_blocks:
                 collection = LineCollection(
                     np.concatenate(color_scale_segment_blocks, axis=0),
-                    cmap="turbo",
+                    cmap=resolved_cmap,
                     norm=norm,
                     **projection_line_kwargs,
                 )
@@ -2609,25 +2723,49 @@ def _plot_position_projection(
                 ax.add_collection(collection)
                 mappable = collection
             if color_scale_point_x:
-                scatter = ax.scatter(
+                point_artist = ax.scatter(
                     np.asarray(color_scale_point_x, dtype=float),
                     np.asarray(color_scale_point_y, dtype=float),
                     c=np.asarray(color_scale_point_values, dtype=float),
-                    cmap="turbo",
+                    cmap=resolved_cmap,
                     norm=norm,
-                    s=marker_size,
+                    s=isolated_point_size,
                     edgecolors="none",
                 )
                 if mappable is None:
-                    mappable = scatter
-            if mappable is not None:
-                colorbar = fig.colorbar(mappable, ax=ax)
-                colorbar.set_label(
-                    value_label_reference or "Projection value",
-                    fontsize=style.label_font_size,
+                    mappable = point_artist
+            colorbar = None
+            if mappable is not None and heatmap_colorbar_enabled:
+                colorbar_kwargs: dict[str, Any] = {
+                    "location": (
+                        heatmap_colorbar_position
+                        if heatmap_colorbar_position in {"right", "left", "top", "bottom"}
+                        else "right"
+                    )
+                }
+                if heatmap_colorbar_pad is not None:
+                    colorbar_kwargs["pad"] = float(heatmap_colorbar_pad)
+                if heatmap_colorbar_shrink is not None:
+                    colorbar_kwargs["shrink"] = float(heatmap_colorbar_shrink)
+                if heatmap_colorbar_aspect is not None:
+                    colorbar_kwargs["aspect"] = float(heatmap_colorbar_aspect)
+                colorbar = fig.colorbar(mappable, ax=ax, **colorbar_kwargs)
+                colorbar_label = (
+                    value_label_reference
+                    if heatmap_colorbar_label is None
+                    else str(heatmap_colorbar_label)
                 )
-                colorbar.ax.tick_params(labelsize=style.tick_font_size)
+                colorbar.set_label(
+                    colorbar_label or "",
+                    fontsize=heatmap_colorbar_label_size or style.label_font_size,
+                )
+                colorbar.ax.tick_params(
+                    labelsize=heatmap_colorbar_tick_size or style.tick_font_size
+                )
         else:
+            mappable = None
+            colorbar = None
+            point_artist = None
             for payload, resolved_label in zip(line_series_payloads, labels):
                 label_used = False
                 plot_kwargs = dict(line_kwargs or {})
@@ -2715,17 +2853,7 @@ def _plot_position_projection(
             ax.tick_params(axis="x", rotation=float(x_tick_rotation))
         if y_tick_rotation is not None:
             ax.tick_params(axis="y", rotation=float(y_tick_rotation))
-        if style.grid:
-            resolved_grid_kwargs: dict[str, Any] = {
-                "linestyle": style.grid_linestyle,
-                "linewidth": style.grid_linewidth,
-                "alpha": style.grid_alpha,
-            }
-            if grid_kwargs is not None:
-                resolved_grid_kwargs.update(dict(grid_kwargs))
-            ax.grid(True, **resolved_grid_kwargs)
-        elif grid_kwargs is not None:
-            ax.grid(**dict(grid_kwargs))
+        _apply_plot_grid(ax, style=style, grid_kwargs=grid_kwargs)
         ax.set_xscale(x_scale)
         ax.set_yscale(y_scale)
         if x_ticks is not None:
@@ -2782,6 +2910,32 @@ def _plot_position_projection(
                     "projection_y": resolved_projection_y,
                     "projection_value": resolved_projection_value,
                     "projection_render_mode": resolved_render_mode,
+                    "projection_line_width": float(resolved_projection_line_width),
+                    "heatmap_artist": mappable,
+                    "heatmap_point_artist": point_artist,
+                    "heatmap_colorbar": colorbar,
+                    "heatmap_cmap": (
+                        str(heatmap_cmap or "turbo")
+                        if resolved_render_mode == "color-scale"
+                        else None
+                    ),
+                    "heatmap_vmin": (
+                        None
+                        if resolved_render_mode != "color-scale"
+                        else float(mappable.norm.vmin)
+                    ),
+                    "heatmap_vmax": (
+                        None
+                        if resolved_render_mode != "color-scale"
+                        else float(mappable.norm.vmax)
+                    ),
+                    "heatmap_log_scale": bool(
+                        resolved_render_mode == "color-scale" and heatmap_log_scale
+                    ),
+                    "heatmap_colorbar_enabled": bool(
+                        resolved_render_mode == "color-scale"
+                        and heatmap_colorbar_enabled
+                    ),
                 }
             )
 
@@ -2876,10 +3030,23 @@ def plot_position_profile(
     tick_params_kwargs: dict[str, Any] | None = None,
     tight_layout_kwargs: dict[str, Any] | None = None,
     savefig_kwargs: dict[str, Any] | None = None,
+    heatmap_vmin: float | None = None,
+    heatmap_vmax: float | None = None,
+    heatmap_cmap: str | None = None,
+    heatmap_log_scale: bool = False,
+    heatmap_colorbar_enabled: bool = True,
+    heatmap_colorbar_label: str | None = None,
+    heatmap_colorbar_label_size: int | None = None,
+    heatmap_colorbar_tick_size: int | None = None,
+    heatmap_colorbar_position: str = "right",
+    heatmap_colorbar_pad: float | None = None,
+    heatmap_colorbar_shrink: float | None = None,
+    heatmap_colorbar_aspect: float | None = None,
     projection_x: str | None = None,
     projection_y: str | None = None,
     projection_value: str | None = None,
     projection_render_mode: str | None = None,
+    projection_line_width: float | None = None,
     projection_filter_min: float | None = None,
     projection_filter_max: float | None = None,
     xy_z_distance_max: float | None = None,
@@ -2984,11 +3151,24 @@ def plot_position_profile(
             tick_params_kwargs=tick_params_kwargs,
             tight_layout_kwargs=tight_layout_kwargs,
             savefig_kwargs=savefig_kwargs,
+            heatmap_vmin=heatmap_vmin,
+            heatmap_vmax=heatmap_vmax,
+            heatmap_cmap=heatmap_cmap,
+            heatmap_log_scale=heatmap_log_scale,
+            heatmap_colorbar_enabled=heatmap_colorbar_enabled,
+            heatmap_colorbar_label=heatmap_colorbar_label,
+            heatmap_colorbar_label_size=heatmap_colorbar_label_size,
+            heatmap_colorbar_tick_size=heatmap_colorbar_tick_size,
+            heatmap_colorbar_position=heatmap_colorbar_position,
+            heatmap_colorbar_pad=heatmap_colorbar_pad,
+            heatmap_colorbar_shrink=heatmap_colorbar_shrink,
+            heatmap_colorbar_aspect=heatmap_colorbar_aspect,
             component=runtime_component,
             projection_x=runtime_projection_x,
             projection_y=runtime_projection_y,
             projection_value=runtime_projection_value,
             projection_render_mode=runtime_projection_render_mode,
+            projection_line_width=projection_line_width,
             projection_filter_min=runtime_projection_filter_min,
             projection_filter_max=runtime_projection_filter_max,
             xy_z_distance_max=runtime_xy_z_distance_max,
@@ -3225,10 +3405,23 @@ def plot_position_profiles(
     tick_params_kwargs: dict[str, Any] | None = None,
     tight_layout_kwargs: dict[str, Any] | None = None,
     savefig_kwargs: dict[str, Any] | None = None,
+    heatmap_vmin: float | None = None,
+    heatmap_vmax: float | None = None,
+    heatmap_cmap: str | None = None,
+    heatmap_log_scale: bool = False,
+    heatmap_colorbar_enabled: bool = True,
+    heatmap_colorbar_label: str | None = None,
+    heatmap_colorbar_label_size: int | None = None,
+    heatmap_colorbar_tick_size: int | None = None,
+    heatmap_colorbar_position: str = "right",
+    heatmap_colorbar_pad: float | None = None,
+    heatmap_colorbar_shrink: float | None = None,
+    heatmap_colorbar_aspect: float | None = None,
     projection_x: str | None = None,
     projection_y: str | None = None,
     projection_value: str | None = None,
     projection_render_mode: str | None = None,
+    projection_line_width: float | None = None,
     projection_filter_min: float | None = None,
     projection_filter_max: float | None = None,
     xy_z_distance_max: float | None = None,
@@ -3336,11 +3529,24 @@ def plot_position_profiles(
             tick_params_kwargs=tick_params_kwargs,
             tight_layout_kwargs=tight_layout_kwargs,
             savefig_kwargs=savefig_kwargs,
+            heatmap_vmin=heatmap_vmin,
+            heatmap_vmax=heatmap_vmax,
+            heatmap_cmap=heatmap_cmap,
+            heatmap_log_scale=heatmap_log_scale,
+            heatmap_colorbar_enabled=heatmap_colorbar_enabled,
+            heatmap_colorbar_label=heatmap_colorbar_label,
+            heatmap_colorbar_label_size=heatmap_colorbar_label_size,
+            heatmap_colorbar_tick_size=heatmap_colorbar_tick_size,
+            heatmap_colorbar_position=heatmap_colorbar_position,
+            heatmap_colorbar_pad=heatmap_colorbar_pad,
+            heatmap_colorbar_shrink=heatmap_colorbar_shrink,
+            heatmap_colorbar_aspect=heatmap_colorbar_aspect,
             component=runtime_component,
             projection_x=runtime_projection_x,
             projection_y=runtime_projection_y,
             projection_value=runtime_projection_value,
             projection_render_mode=runtime_projection_render_mode,
+            projection_line_width=projection_line_width,
             projection_filter_min=runtime_projection_filter_min,
             projection_filter_max=runtime_projection_filter_max,
             xy_z_distance_max=runtime_xy_z_distance_max,

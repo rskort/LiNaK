@@ -3,6 +3,10 @@
 `linak compute position` stores atom-resolved trajectories for selected species.
 Unlike density or RDF, this analysis preserves per-atom and per-frame structure.
 
+Position output filenames always end in `.position.h5` (or
+`.position.hdf5`). Any qualifier belongs before that compound ending, for
+example `Pt111_Cs1_Z10-all.position.h5`.
+
 ## What Is Being Computed
 
 For each selected atom and each frame, LiNaK stores:
@@ -160,6 +164,27 @@ does not change the HDF5 data model. The projection view lets the user choose:
 
 Projection value filters are pointwise masks on the chosen value quantity.
 Hidden points do not get bridged by artificial connector lines.
+
+In the interactive plotting GUI, select `2D Heatmap` as the view type and then
+choose the X-axis and Y-axis quantities. The color mode controls how trajectories
+are distinguished:
+
+- `Continuous quantity` colors trajectory segments by any stored coordinate or
+  time quantity, including distance to the surface and time.
+- `Species / layer` assigns a categorical color to each selected species/profile.
+  Colors, visibility, labels, and legend participation can then be edited in the
+  Layers panel.
+
+The Figure panel exposes colormap, color limits, logarithmic scaling, colorbar
+controls, and a uniform `Trajectory line width` under Heatmap rendering for
+continuous-color views. These settings are saved with the position plot
+profile. Continuous trajectories are rendered as strokes; point markers appear
+only for isolated samples that cannot form a line segment.
+
+A file computed with `--species Cs` contains only the Cs profile. To compare
+categorical colors for several species in one GUI session, compute a position
+file containing those species (for example with `--species all`) or plot
+compatible position HDF5 sources together.
 
 ## Related Documentation
 

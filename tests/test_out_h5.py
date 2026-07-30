@@ -112,7 +112,7 @@ def test_compute_density_accepts_out_h5_input(tmp_path):
     sim.mkdir()
     _write_xyz(sim / "traj.xyz")
     container = pack_simulation_directory(sim, tmp_path / "run.out.h5").output_path
-    output = tmp_path / "density.h5"
+    output = tmp_path / "density.density.h5"
 
     rc = main(
         [
@@ -142,7 +142,7 @@ def test_compute_potential_accepts_out_h5_input(tmp_path):
     _write_cube(sim / "density.cube")
     (sim / "output.out").write_text("Fermi energy: -0.100000\n", encoding="utf-8")
     container = pack_simulation_directory(sim, tmp_path / "run.out.h5").output_path
-    output = tmp_path / "potential.h5"
+    output = tmp_path / "potential.potential.h5"
 
     rc = main(
         [

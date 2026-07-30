@@ -70,6 +70,10 @@ linak compute density /path/to/traj.h5 --species O --axis z
 linak plot /path/to/traj.density.h5
 ```
 
+Analysis HDF5 endings are invariant. Qualifiers and collision counters belong
+to the base name: use `traj-all.position.h5` and `traj_1.density.h5`, never
+`traj.position-all.h5` or `traj.density_1.h5`.
+
 For repeated analysis, first convert raw text trajectories into LiNaK trajectory
 HDF5:
 
@@ -100,11 +104,13 @@ groups, and annotations are all previewed live and are persisted as part of the
 plot profile. Turning a raw line off hides only that base line; other derived
 overlays for the same enabled layer can still render if they are turned on.
 
-For `position` plots, Studio now exposes the public `2D projection` view rather
-than only the legacy `xy-z` controls. That projection view lets the user choose
-the X quantity, Y quantity, value quantity, render mode (`color-scale` or
-`line-colors`), and optional value filter range. The legacy `xy-z` name is
-still accepted as a compatibility alias in the CLI and saved profiles.
+For `position` plots, Studio exposes `2D Heatmap` as a first-class view rather
+than only the legacy `xy-z` controls. The view lets the user choose the X and Y
+quantities, color continuously by a coordinate or time quantity, or assign one
+editable categorical color per species/layer. Optional value filters and the
+shared colormap/colorbar controls update the preview interactively. The legacy
+`xy-z` name is still accepted as a compatibility alias in the CLI and saved
+profiles.
 
 ### Combined HDF5 Files
 

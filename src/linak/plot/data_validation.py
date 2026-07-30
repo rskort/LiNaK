@@ -199,6 +199,19 @@ def generic_view_type_compatibility(
         y_quantity = _quantity_by_id(contract, role_assignments["y"])
         z_quantity_id = role_assignments.get("z")
         color_quantity_id = role_assignments.get("color")
+        categorical_split = (
+            str(mapping.fixed_values.get("projection_render_mode") or "")
+            .strip()
+            .lower()
+            == "line-colors"
+            and split_by is not None
+        )
+        if categorical_split and z_quantity_id is None and color_quantity_id is None:
+            if exact_shape_compatibility(contract, (x_quantity.id, y_quantity.id)):
+                return _merge_statuses(role_statuses)
+            if broadcast_compatibility(contract, (x_quantity.id, y_quantity.id)):
+                return _merge_statuses(("valid_nonpreferred", *role_statuses))
+            return "invalid"
         if z_quantity_id is not None:
             z_quantity = _quantity_by_id(contract, z_quantity_id)
             if len(x_quantity.dimensions) != 1 or len(y_quantity.dimensions) != 1:

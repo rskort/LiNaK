@@ -11,6 +11,7 @@ from pathlib import Path
 import re
 import tempfile
 import threading
+import warnings
 from collections.abc import Sequence
 from typing import Any, Callable
 from uuid import uuid4
@@ -163,15 +164,17 @@ _ANNOTATION_HORIZONTAL_ALIGN = ("left", "center", "right")
 _ANNOTATION_VERTICAL_ALIGN = ("top", "center", "bottom", "baseline")
 _POSITION_COMPONENT_LABELS = ("distance", "x", "y", "z", "2D Heatmap")
 _POSITION_PROJECTION_QUANTITIES = ("x", "y", "z", "distance", "ps", "fs", "step", "frame")
-_POSITION_PROJECTION_RENDER_MODES = ("color-scale", "source colors")
+_POSITION_PROJECTION_RENDER_MODES = ("Continuous quantity", "Species / layer")
 _POSITION_RENDER_MODE_BACKEND_BY_LABEL = {
+    "Continuous quantity": "color-scale",
+    "Species / layer": "line-colors",
     "color-scale": "color-scale",
     "source colors": "line-colors",
     "line-colors": "line-colors",
 }
 _POSITION_RENDER_MODE_LABEL_BY_BACKEND = {
-    "color-scale": "color-scale",
-    "line-colors": "source colors",
+    "color-scale": "Continuous quantity",
+    "line-colors": "Species / layer",
 }
 
 _PUBLIC_PLOT_VIEW_LABEL_BY_ID = {
@@ -291,13 +294,27 @@ _AUTO_PREVIEW_SERIES_DEBOUNCE_MS = 150
 _AUTO_PREVIEW_DATA_DEBOUNCE_MS = 650
 _WORKSPACE_PANEL_WIDTH = 760
 _WORKSPACE_PANEL_MIN_WIDTH = 520
-_HEATMAP_NORMALIZATION_LABEL_BY_MODE = {
-    "counts": "Raw frequencies",
-    "global_probability": "Global normalization",
-    "bulk_water_reference": "Normalize to water bulk",
+_HEATMAP_VALUE_LABEL_BY_MODE = {
+    "raw_counts": "Observation count per bin",
+    "joint_probability_density": "Joint probability density",
+    "conditional_probability_density": "Orientation distribution at each distance",
+    "bulk_relative_enrichment": "Relative to bulk orientation",
 }
-_HEATMAP_NORMALIZATION_MODE_BY_LABEL = {
-    label: mode for mode, label in _HEATMAP_NORMALIZATION_LABEL_BY_MODE.items()
+_HEATMAP_VALUE_MODE_BY_LABEL = {
+    label: mode for mode, label in _HEATMAP_VALUE_LABEL_BY_MODE.items()
+}
+_HEATMAP_VALUE_DESCRIPTION_BY_MODE = {
+    "raw_counts": "C\u1d62\u2c7c. The color is the number of observations in each displayed bin.",
+    "joint_probability_density": (
+        "C\u1d62\u2c7c / (N \u0394x\u1d62 \u0394y\u2c7c). The complete heatmap integrates to one."
+    ),
+    "conditional_probability_density": (
+        "C\u1d62\u2c7c / (C\u1d62* \u0394y\u2c7c). Every occupied distance row integrates to one."
+    ),
+    "bulk_relative_enrichment": (
+        "The conditional orientation density divided by the pooled bulk distribution. "
+        "A value of 1 is bulk-like."
+    ),
 }
 _TEXT_SYNC_FIELD_KEYS = frozenset({"title", "x_label", "y_label"})
 _SERIES_SPECIFIC_SETTINGS = frozenset(
@@ -570,8 +587,11 @@ _TOOLTIPS: dict[str, str] = {
     "figure.heatmap.vmin": "Minimum value for the colorbar range. Leave blank for auto.",
     "figure.heatmap.vmax": "Maximum value for the colorbar range. Leave blank for auto.",
     "figure.heatmap.cmap": "Matplotlib colormap name for the heatmap.",
-    "figure.heatmap.normalize_mode": "Choose raw frequencies, whole-heatmap global probability, or bulk-water-referenced normalization.",
-    "figure.heatmap.log_scale": "Use a logarithmic color scale. Zero and negative cells are masked.",
+    "figure.heatmap.value_mode": "Choose the scientific values represented by the colors. This transformation runs after count aggregation and rebinning.",
+    "figure.heatmap.bulk_reference": "Select the bulk orientation reference automatically from the density plateau or enter a manual distance range.",
+    "figure.heatmap.bulk_range": "Distance bounds for the pooled manual bulk orientation reference.",
+    "figure.heatmap.log_scale": "Choose linear or logarithmic color mapping. Logarithmic mapping masks zero and negative cells but does not transform the represented data.",
+    "figure.heatmap.trajectory_width": "Set one uniform stroke width for all continuously colored 2D position trajectories.",
     "figure.heatmap.colorbar_enabled": "Show or hide the colorbar.",
     "figure.heatmap.colorbar_label": "Colorbar label text. 'none' hides the label; blank uses the default.",
     "figure.heatmap.colorbar_label_size": "Font size for the colorbar label.",
@@ -3289,7 +3309,12 @@ def launch_plot_settings_panel(
             self._figure_lines_group: QGroupBox | None = None
             self._figure_heatmap_section: QGroupBox | None = None
             self._figure_heatmap_group: QGroupBox | None = None
+            self._heatmap_value_group: QWidget | None = None
+            self._heatmap_bulk_rows: list[tuple[QFormLayout, QWidget]] = []
+            self._heatmap_bulk_manual_rows: list[tuple[QFormLayout, QWidget]] = []
+            self._heatmap_trajectory_group: QWidget | None = None
             self._figure_colorbar_group: QGroupBox | None = None
+            self._position_projection_stroke_row: tuple[QFormLayout, QWidget] | None = None
             self._x_axis_transform_rows: list[tuple[QFormLayout, QWidget]] = []
             self._advanced_legend_kwargs_rows: list[tuple[QFormLayout, QWidget]] = []
             self._advanced_line_kwargs_rows: list[tuple[QFormLayout, QWidget]] = []
@@ -3734,6 +3759,7 @@ def launch_plot_settings_panel(
             self._update_series_error_summary(self._series_active_index)
             self._update_series_fit_summary(self._series_active_index)
             self._update_integration_summary()
+            self._update_heatmap_value_summary()
 
         def _set_axis_limit_fields_from_canvas(self, ax: Any) -> None:
             if self._canvas_axis_limit_syncing:
@@ -3967,6 +3993,28 @@ def launch_plot_settings_panel(
             except Exception:
                 return False
 
+            projection_width = (
+                _optional_float_text(self.projection_line_width)
+                if self._analysis_name == "position"
+                and self._current_position_is_projection_view()
+                and self._current_position_uses_continuous_color()
+                else None
+            )
+            if projection_width is not None:
+                if projection_width <= 0.0:
+                    return False
+                try:
+                    if hasattr(mesh, "set_linewidths"):
+                        mesh.set_linewidths([projection_width])
+                    point_artist = self._last_preview_state.get("heatmap_point_artist")
+                    if point_artist is not None and hasattr(point_artist, "set_sizes"):
+                        point_count = len(point_artist.get_offsets())
+                        point_artist.set_sizes(
+                            [max(1.0, projection_width**2)] * point_count
+                        )
+                except Exception:
+                    return False
+
             if colorbar is not None:
                 colorbar_enabled = self.heatmap_colorbar_enabled.isChecked()
                 try:
@@ -4009,6 +4057,7 @@ def launch_plot_settings_panel(
             self._last_preview_state["heatmap_cmap"] = cmap or None
             self._last_preview_state["heatmap_vmin"] = vmin
             self._last_preview_state["heatmap_vmax"] = vmax
+            self._last_preview_state["projection_line_width"] = projection_width
             self._last_preview_state["heatmap_colorbar_enabled"] = (
                 self.heatmap_colorbar_enabled.isChecked()
             )
@@ -7468,7 +7517,88 @@ def launch_plot_settings_panel(
 
         def _build_heatmap_tab(self) -> None:
             layout = QVBoxLayout(self._tab_heatmap_content)
-            group = QGroupBox("Heatmap Rendering")
+
+            value_group = QGroupBox("Data Representation")
+            value_form = QFormLayout(value_group)
+            self.heatmap_value_mode = self._combo(
+                tuple(_HEATMAP_VALUE_LABEL_BY_MODE.values())
+            )
+            self.heatmap_value_mode.currentTextChanged.connect(
+                self._refresh_widget_states
+            )
+            self.heatmap_value_mode.currentTextChanged.connect(
+                self._schedule_preview_update
+            )
+            self._add_form_row(
+                value_form,
+                "Displayed values",
+                self.heatmap_value_mode,
+                tooltip_id="figure.heatmap.value_mode",
+            )
+            self.heatmap_value_description = QLabel("")
+            self.heatmap_value_description.setWordWrap(True)
+            self.heatmap_value_description.setObjectName("sectionNote")
+            value_form.addRow(self.heatmap_value_description)
+            self.heatmap_value_pipeline = QLabel(
+                "Applied after sources are combined and counts are rebinned; "
+                "applied before color limits and color mapping."
+            )
+            self.heatmap_value_pipeline.setWordWrap(True)
+            self.heatmap_value_pipeline.setObjectName("sectionNote")
+            value_form.addRow(self.heatmap_value_pipeline)
+
+            self.heatmap_bulk_reference_mode = self._combo(("Automatic", "Manual"))
+            self.heatmap_bulk_reference_mode.currentTextChanged.connect(
+                self._refresh_widget_states
+            )
+            self.heatmap_bulk_reference_mode.currentTextChanged.connect(
+                self._schedule_preview_update
+            )
+            self.heatmap_bulk_min = self._line("auto")
+            self.heatmap_bulk_min.textChanged.connect(self._schedule_preview_update)
+            self.heatmap_bulk_max = self._line("auto")
+            self.heatmap_bulk_max.textChanged.connect(self._schedule_preview_update)
+            self._add_form_row(
+                value_form,
+                "Bulk reference",
+                self.heatmap_bulk_reference_mode,
+                tooltip_id="figure.heatmap.bulk_reference",
+            )
+            self._add_form_row(
+                value_form,
+                "Minimum distance",
+                self.heatmap_bulk_min,
+                tooltip_id="figure.heatmap.bulk_range",
+            )
+            self._add_form_row(
+                value_form,
+                "Maximum distance",
+                self.heatmap_bulk_max,
+                tooltip_id="figure.heatmap.bulk_range",
+            )
+            self.heatmap_bulk_summary = QLabel(
+                "The resolved bulk range will appear after preview."
+            )
+            self.heatmap_bulk_summary.setWordWrap(True)
+            self.heatmap_bulk_summary.setObjectName("sectionNote")
+            value_form.addRow(self.heatmap_bulk_summary)
+            self._heatmap_bulk_rows = [
+                (value_form, self.heatmap_bulk_reference_mode),
+                (value_form, self.heatmap_bulk_summary),
+            ]
+            self._heatmap_bulk_manual_rows = [
+                (value_form, self.heatmap_bulk_min),
+                (value_form, self.heatmap_bulk_max),
+            ]
+            self._heatmap_value_group = self._make_collapsible_section(
+                title="Data Representation",
+                section_id="figure.heatmap.value_representation",
+                body_widget=value_group,
+                subsection=True,
+            )
+            layout.addWidget(self._heatmap_value_group)
+
+            group = QGroupBox("Color Mapping")
             form = QFormLayout(group)
             self.heatmap_cmap = self._combo(
                 (
@@ -7498,30 +7628,41 @@ def launch_plot_settings_panel(
             self._add_form_row(
                 form, "Color max", self.heatmap_vmax, tooltip_id="figure.heatmap.vmax"
             )
-            self.heatmap_normalization_mode = self._combo(
-                tuple(_HEATMAP_NORMALIZATION_LABEL_BY_MODE.values())
-            )
-            self.heatmap_normalization_mode.currentTextChanged.connect(
-                self._schedule_preview_update
-            )
-            self._add_form_row(
-                form,
-                "Normalization",
-                self.heatmap_normalization_mode,
-                tooltip_id="figure.heatmap.normalize_mode",
-            )
-            self.heatmap_log_scale = QCheckBox("Use log color scale")
-            self.heatmap_log_scale.stateChanged.connect(self._schedule_preview_update)
+            self.heatmap_log_scale = self._combo(("Linear", "Logarithmic"))
+            self.heatmap_log_scale.currentTextChanged.connect(self._schedule_preview_update)
             self._add_form_row(
                 form, "Color scale", self.heatmap_log_scale, tooltip_id="figure.heatmap.log_scale"
             )
+
             self._figure_heatmap_group = self._make_collapsible_section(
-                title="Heatmap",
+                title="Color Mapping",
                 section_id="figure.heatmap.rendering",
                 body_widget=group,
                 subsection=True,
             )
             layout.addWidget(self._figure_heatmap_group)
+
+            trajectory_group = QGroupBox("Trajectory Rendering")
+            trajectory_form = QFormLayout(trajectory_group)
+            self.projection_line_width = self._bounded_float_line(bottom=0.01)
+            self.projection_line_width.textChanged.connect(self._schedule_preview_update)
+            self._add_form_row(
+                trajectory_form,
+                "Trajectory line width",
+                self.projection_line_width,
+                tooltip_id="figure.heatmap.trajectory_width",
+            )
+            self._position_projection_stroke_row = (
+                trajectory_form,
+                self.projection_line_width,
+            )
+            self._heatmap_trajectory_group = self._make_collapsible_section(
+                title="Trajectory Rendering",
+                section_id="figure.heatmap.trajectory",
+                body_widget=trajectory_group,
+                subsection=True,
+            )
+            layout.addWidget(self._heatmap_trajectory_group)
 
             cb_group = QGroupBox("Colorbar")
             cb_form = QFormLayout(cb_group)
@@ -9100,6 +9241,35 @@ def launch_plot_settings_panel(
                     reason = str(item.get("reason") or "Integration is unavailable.").strip()
                     lines.append(f"{label}: {reason}")
             summary_label.setText("\n".join(lines) if lines else "No integration result available.")
+
+        def _update_heatmap_value_summary(self) -> None:
+            if not hasattr(self, "heatmap_value_mode"):
+                return
+            label = self.heatmap_value_mode.currentText().strip()
+            mode = _HEATMAP_VALUE_MODE_BY_LABEL.get(label, "raw_counts")
+            if hasattr(self, "heatmap_value_description"):
+                self.heatmap_value_description.setText(
+                    _HEATMAP_VALUE_DESCRIPTION_BY_MODE[mode]
+                )
+            if not hasattr(self, "heatmap_bulk_summary"):
+                return
+            if mode != "bulk_relative_enrichment":
+                self.heatmap_bulk_summary.setText("")
+                return
+            reference = self._last_preview_state.get("heatmap_bulk_reference")
+            if not isinstance(reference, dict):
+                self.heatmap_bulk_summary.setText(
+                    "The resolved bulk range will appear after preview."
+                )
+                return
+            lower = _format_float_value(reference.get("resolved_min"))
+            upper = _format_float_value(reference.get("resolved_max"))
+            row_count = int(reference.get("row_count") or 0)
+            resolved_mode = str(reference.get("mode") or "auto").strip().capitalize()
+            self.heatmap_bulk_summary.setText(
+                f"{resolved_mode} reference: {lower} to {upper} \u00c5 "
+                f"({row_count} contributing distance bins)."
+            )
 
         def _build_analysis_data_sections(self, layout: QVBoxLayout) -> None:
             analysis = self._analysis_name
@@ -10878,6 +11048,8 @@ def launch_plot_settings_panel(
                 "source_selection",
                 "style",
                 "orientation_view_states",
+                "heatmap_normalize",
+                "heatmap_normalization_mode",
             ):
                 cleaned.pop(key, None)
             return cleaned
@@ -10918,6 +11090,10 @@ def launch_plot_settings_panel(
                         "y_bin_width": None,
                         "x_bin_reducer": None,
                         "y_bin_reducer": None,
+                        "heatmap_value_mode": "raw_counts",
+                        "heatmap_bulk_reference_mode": "auto",
+                        "heatmap_bulk_min": None,
+                        "heatmap_bulk_max": None,
                         "legend": False,
                         "markers": False,
                     }
@@ -11540,9 +11716,9 @@ def launch_plot_settings_panel(
         ) -> list[str]:
             canonical_view_type_id = canonical_plot_view_id(view_type_id)
             validation_view_type_id = (
-                "trajectory_2d"
+                PLOT_VIEW_2D_HEATMAP
                 if canonical_view_type_id == PLOT_VIEW_2D_HEATMAP
-                else "line_1d"
+                else PLOT_VIEW_1D_LINE
             )
             if canonical_view_type_id == PLOT_VIEW_1D_LINE:
                 backend_supported = (
@@ -11644,6 +11820,16 @@ def launch_plot_settings_panel(
 
         def _current_position_is_projection_view(self) -> bool:
             return canonical_plot_view_id(self._position_view_type_id()) == PLOT_VIEW_2D_HEATMAP
+
+        def _current_position_uses_continuous_color(self) -> bool:
+            if not self._current_position_is_projection_view():
+                return False
+            mapping = self._current_position_mapping()
+            render_mode = str(
+                mapping.fixed_values.get("projection_render_mode")
+                or ("color-scale" if mapping.color is not None else "line-colors")
+            ).strip()
+            return render_mode == "color-scale"
 
         def _set_position_mapping_combo_items(
             self,
@@ -11821,6 +12007,9 @@ def launch_plot_settings_panel(
                 lambda *_unused: self._update_position_contract_summary()
             )
             self.position_mapping_render_mode.currentTextChanged.connect(
+                self._refresh_widget_states
+            )
+            self.position_mapping_render_mode.currentTextChanged.connect(
                 self._handle_series_identity_change
             )
             self.position_mapping_value = self._combo(list(_POSITION_PROJECTION_QUANTITIES))
@@ -11868,13 +12057,13 @@ def launch_plot_settings_panel(
             )
             self._add_form_row(
                 mapping_form,
-                "Heatmap rendering",
+                "Color mode",
                 self.position_mapping_render_mode,
                 tooltip_id="data.position.projection_render_mode",
             )
             self._add_form_row(
                 mapping_form,
-                "Color quantity",
+                "Value quantity",
                 self.position_mapping_value,
                 tooltip_id="data.position.mapping.value",
             )
@@ -11886,13 +12075,13 @@ def launch_plot_settings_panel(
             )
             self._add_form_row(
                 mapping_form,
-                "Color range min",
+                "Value filter min",
                 self.position_mapping_filter_min,
                 tooltip_id="data.position.projection_range_min",
             )
             self._add_form_row(
                 mapping_form,
-                "Color range max",
+                "Value filter max",
                 self.position_mapping_filter_max,
                 tooltip_id="data.position.projection_range_max",
             )
@@ -12049,7 +12238,11 @@ def launch_plot_settings_panel(
             if analysis == "orientation" and self._is_orientation_heatmap_mode():
                 return "heatmap"
             if analysis == "position" and self._current_position_is_projection_view():
-                return "heatmap"
+                return (
+                    "heatmap"
+                    if self._current_position_uses_continuous_color()
+                    else "line"
+                )
             return _plot_family_for_view(
                 analysis,
                 orientation_heatmap=self._is_orientation_heatmap_mode(),
@@ -12075,6 +12268,27 @@ def launch_plot_settings_panel(
                 0 <= self._series_active_index < len(self._series_enabled_data)
                 and bool(self._series_enabled_data[self._series_active_index])
             )
+            if (
+                self._analysis_name == "position"
+                and self._current_position_is_projection_view()
+                and layer_kind == "source"
+            ):
+                categorical_color = not self._current_position_uses_continuous_color()
+                return _LayerInspectorCapabilities(
+                    plot_family=plot_family,
+                    layer_kind=layer_kind,
+                    show_visibility_label=True,
+                    show_style=categorical_color,
+                    show_markers=False,
+                    show_derived_lines=False,
+                    show_uncertainty=False,
+                    show_normalization=False,
+                    show_integration=False,
+                    show_group_members=False,
+                    show_metadata=True,
+                    show_fit_editor=False,
+                    show_cumulative_editor=False,
+                )
             if layer_kind == "annotation":
                 return _LayerInspectorCapabilities(
                     plot_family=plot_family,
@@ -12160,6 +12374,21 @@ def launch_plot_settings_panel(
 
         def _current_figure_capabilities(self) -> _FigureInspectorCapabilities:
             plot_family = self._current_plot_family()
+            if (
+                self._analysis_name == "position"
+                and self._current_position_is_projection_view()
+            ):
+                continuous_color = self._current_position_uses_continuous_color()
+                return _FigureInspectorCapabilities(
+                    plot_family=plot_family,
+                    show_legend=not continuous_color,
+                    show_lines=not continuous_color,
+                    show_heatmap=continuous_color,
+                    show_colorbar=continuous_color,
+                    show_axis_transforms=False,
+                    show_advanced_legend=not continuous_color,
+                    show_advanced_lines=not continuous_color,
+                )
             is_line = plot_family == "line"
             show_heatmap = plot_family == "heatmap"
             return _FigureInspectorCapabilities(
@@ -15840,6 +16069,7 @@ def launch_plot_settings_panel(
                 getattr(self, "heatmap_cmap", None),
                 getattr(self, "heatmap_vmin", None),
                 getattr(self, "heatmap_vmax", None),
+                getattr(self, "projection_line_width", None),
                 getattr(self, "heatmap_colorbar_enabled", None),
                 getattr(self, "heatmap_colorbar_label", None),
                 getattr(self, "heatmap_colorbar_label_size", None),
@@ -15917,6 +16147,7 @@ def launch_plot_settings_panel(
                 getattr(self, "heatmap_cmap", None),
                 getattr(self, "heatmap_vmin", None),
                 getattr(self, "heatmap_vmax", None),
+                getattr(self, "projection_line_width", None),
                 getattr(self, "heatmap_colorbar_enabled", None),
                 getattr(self, "heatmap_colorbar_label", None),
                 getattr(self, "heatmap_colorbar_label_size", None),
@@ -16751,11 +16982,40 @@ def launch_plot_settings_panel(
             if self._analysis_name == "orientation":
                 raw_states = settings.get("orientation_view_states")
                 if isinstance(raw_states, dict):
-                    self._orientation_view_states = {
-                        self._normalize_orientation_view_type_id(key): deepcopy(value)
-                        for key, value in raw_states.items()
-                        if isinstance(value, dict)
-                    }
+                    migrated_states: dict[str, dict[str, Any]] = {}
+                    migrated_legacy_state = False
+                    for key, value in raw_states.items():
+                        if not isinstance(value, dict):
+                            continue
+                        state = deepcopy(value)
+                        if "heatmap_value_mode" not in state:
+                            legacy_mode = state.get("heatmap_normalization_mode")
+                            if legacy_mode is None and state.get("heatmap_normalize"):
+                                legacy_mode = "global_probability"
+                            legacy_mapping = {
+                                "counts": "raw_counts",
+                                "global_probability": "joint_probability_density",
+                                "bulk_water_reference": "bulk_relative_enrichment",
+                            }
+                            if legacy_mode in legacy_mapping:
+                                state["heatmap_value_mode"] = legacy_mapping[
+                                    str(legacy_mode)
+                                ]
+                                migrated_legacy_state = True
+                        state.pop("heatmap_normalize", None)
+                        state.pop("heatmap_normalization_mode", None)
+                        migrated_states[
+                            self._normalize_orientation_view_type_id(key)
+                        ] = state
+                    self._orientation_view_states = migrated_states
+                    if migrated_legacy_state:
+                        warnings.warn(
+                            "Legacy orientation heatmap normalization settings were "
+                            "migrated to displayed-value modes. The next save writes only "
+                            "the new fields.",
+                            UserWarning,
+                            stacklevel=2,
+                        )
                 elif not self._orientation_view_state_switching:
                     self._orientation_view_states = {}
                 settings_mapping_for_view = self._coerce_settings_view_mapping(settings)
@@ -16968,6 +17228,13 @@ def launch_plot_settings_panel(
                 )
             )
             self.line_width.setText(str(settings.get("line_width") or defaults.line_width))
+            self.projection_line_width.setText(
+                str(
+                    settings.get("projection_line_width")
+                    or settings.get("line_width")
+                    or defaults.line_width
+                )
+            )
             self._set_combo_value(
                 self.line_style,
                 _extract_dict_text(settings, key="line_kwargs", nested_key="linestyle"),
@@ -17406,23 +17673,60 @@ def launch_plot_settings_panel(
                     self.heatmap_cmap,
                     str(settings.get("heatmap_cmap") or "turbo"),
                 )
-            if hasattr(self, "heatmap_normalization_mode"):
-                raw_mode = settings.get("heatmap_normalization_mode")
+            if hasattr(self, "heatmap_value_mode"):
+                raw_mode = settings.get("heatmap_value_mode")
                 if raw_mode is None:
-                    raw_mode = (
-                        "global_probability"
-                        if bool(settings.get("heatmap_normalize", False))
-                        else "counts"
+                    legacy_mode = settings.get("heatmap_normalization_mode")
+                    legacy_settings_present = (
+                        legacy_mode is not None
+                        or bool(settings.get("heatmap_normalize", False))
                     )
+                    if legacy_mode is None and bool(settings.get("heatmap_normalize", False)):
+                        legacy_mode = "global_probability"
+                    legacy_mapping = {
+                        "counts": "raw_counts",
+                        "global_probability": "joint_probability_density",
+                        "bulk_water_reference": "bulk_relative_enrichment",
+                    }
+                    raw_mode = legacy_mapping.get(str(legacy_mode), "raw_counts")
+                    if legacy_settings_present:
+                        warnings.warn(
+                            "This plot profile used legacy heatmap normalization. It was "
+                            "migrated to the nearest displayed-value representation; the "
+                            "updated semantics will be saved using only the new fields.",
+                            UserWarning,
+                            stacklevel=2,
+                        )
                 self._set_combo_value(
-                    self.heatmap_normalization_mode,
-                    _HEATMAP_NORMALIZATION_LABEL_BY_MODE.get(
+                    self.heatmap_value_mode,
+                    _HEATMAP_VALUE_LABEL_BY_MODE.get(
                         str(raw_mode).strip().lower(),
-                        _HEATMAP_NORMALIZATION_LABEL_BY_MODE["counts"],
+                        _HEATMAP_VALUE_LABEL_BY_MODE["raw_counts"],
                     ),
                 )
+            if hasattr(self, "heatmap_bulk_reference_mode"):
+                bulk_mode = str(
+                    settings.get("heatmap_bulk_reference_mode") or "auto"
+                ).strip().lower()
+                self._set_combo_value(
+                    self.heatmap_bulk_reference_mode,
+                    "Manual" if bulk_mode == "manual" else "Automatic",
+                )
+                bulk_min = settings.get("heatmap_bulk_min")
+                bulk_max = settings.get("heatmap_bulk_max")
+                self.heatmap_bulk_min.setText(
+                    "" if bulk_min is None else str(bulk_min)
+                )
+                self.heatmap_bulk_max.setText(
+                    "" if bulk_max is None else str(bulk_max)
+                )
             if hasattr(self, "heatmap_log_scale"):
-                self.heatmap_log_scale.setChecked(bool(settings.get("heatmap_log_scale", False)))
+                self._set_combo_value(
+                    self.heatmap_log_scale,
+                    "Logarithmic"
+                    if bool(settings.get("heatmap_log_scale", False))
+                    else "Linear",
+                )
             if hasattr(self, "heatmap_colorbar_label"):
                 raw_cb_label = settings.get("heatmap_colorbar_label")
                 if raw_cb_label is None:
@@ -17691,10 +17995,47 @@ def launch_plot_settings_panel(
                 self._figure_lines_group.setVisible(figure_caps.show_lines)
             if self._figure_heatmap_group is not None:
                 self._figure_heatmap_group.setVisible(figure_caps.show_heatmap)
+            orientation_frequency_heatmap = (
+                self._analysis_name == "orientation"
+                and self._is_orientation_heatmap_mode()
+            )
+            if self._heatmap_value_group is not None:
+                self._heatmap_value_group.setVisible(orientation_frequency_heatmap)
+            selected_heatmap_value_mode = "raw_counts"
+            if hasattr(self, "heatmap_value_mode"):
+                selected_heatmap_value_mode = _HEATMAP_VALUE_MODE_BY_LABEL.get(
+                    self.heatmap_value_mode.currentText().strip(),
+                    "raw_counts",
+                )
+            bulk_relative = (
+                orientation_frequency_heatmap
+                and selected_heatmap_value_mode == "bulk_relative_enrichment"
+            )
+            self._set_rows_visible(self._heatmap_bulk_rows, bulk_relative)
+            bulk_manual = (
+                bulk_relative
+                and hasattr(self, "heatmap_bulk_reference_mode")
+                and self.heatmap_bulk_reference_mode.currentText().strip().lower()
+                == "manual"
+            )
+            self._set_rows_visible(self._heatmap_bulk_manual_rows, bulk_manual)
+            if self._heatmap_trajectory_group is not None:
+                self._heatmap_trajectory_group.setVisible(
+                    position_xy_projection
+                    and self._current_position_uses_continuous_color()
+                )
+            self._update_heatmap_value_summary()
             if self._figure_colorbar_group is not None:
                 self._figure_colorbar_group.setVisible(figure_caps.show_colorbar)
             if self._figure_heatmap_section is not None:
                 self._figure_heatmap_section.setVisible(figure_caps.show_heatmap)
+            if self._position_projection_stroke_row is not None:
+                self._set_form_row_visible(
+                    self._position_projection_stroke_row[0],
+                    self._position_projection_stroke_row[1],
+                    position_xy_projection
+                    and self._current_position_uses_continuous_color(),
+                )
             self._set_rows_visible(
                 self._x_axis_transform_rows,
                 figure_caps.show_axis_transforms,
@@ -17875,7 +18216,7 @@ def launch_plot_settings_panel(
                 self._set_form_row_visible(
                     self._y_bin_reducer_row[0],
                     self._y_bin_reducer_row[1],
-                    y_rebin_enabled,
+                    y_rebin_enabled and not orientation_frequency_heatmap,
                 )
                 if two_dimensional_binning:
                     self._set_form_row_enabled(
@@ -17917,7 +18258,7 @@ def launch_plot_settings_panel(
                 self._set_form_row_visible(
                     self._x_bin_reducer_row[0],
                     self._x_bin_reducer_row[1],
-                    rebin_enabled,
+                    rebin_enabled and not orientation_frequency_heatmap,
                 )
                 self._set_form_row_enabled(
                     self._x_bin_reducer_row[0],
@@ -19112,6 +19453,15 @@ def launch_plot_settings_panel(
                 if self._data_export_enabled_only is not None
                 else True
             )
+            projection_line_width_value = _optional_float(
+                self.projection_line_width.text(),
+                field_name="trajectory-line-width",
+            )
+            if (
+                projection_line_width_value is not None
+                and projection_line_width_value <= 0.0
+            ):
+                raise ValueError("Trajectory line width must be positive.")
 
             settings = {
                 "title": title_value,
@@ -19174,6 +19524,7 @@ def launch_plot_settings_panel(
                     self.legend_font.text(), field_name="legend-font-size"
                 ),
                 "line_width": _optional_float(self.line_width.text(), field_name="line-width"),
+                "projection_line_width": projection_line_width_value,
                 "line_colors": None if series_overrides else line_colors_value,
                 "series_labels": series_labels,
                 "series_order": (
@@ -19204,12 +19555,22 @@ def launch_plot_settings_panel(
                 ),
                 "annotations": annotations_value,
                 "x_bin_width": x_bin_width,
-                "x_bin_reducer": (self.x_bin_reducer.currentText().strip() or "mean")
+                "x_bin_reducer": (
+                    "sum"
+                    if self._analysis_name == "orientation"
+                    and self._is_orientation_heatmap_mode()
+                    else self.x_bin_reducer.currentText().strip() or "mean"
+                )
                 if x_bin_width is not None
                 else None,
                 "min_bin_points": min_bin_points,
                 "y_bin_width": y_bin_width,
-                "y_bin_reducer": (self.y_bin_reducer.currentText().strip() or "mean")
+                "y_bin_reducer": (
+                    "sum"
+                    if self._analysis_name == "orientation"
+                    and self._is_orientation_heatmap_mode()
+                    else self.y_bin_reducer.currentText().strip() or "mean"
+                )
                 if hasattr(self, "y_bin_reducer") and y_bin_width is not None
                 else None,
                 "grid_linestyle": _explicit_text(self.grid_linestyle.currentText()) or None,
@@ -19452,16 +19813,49 @@ def launch_plot_settings_panel(
                 )
             if hasattr(self, "heatmap_cmap"):
                 settings["heatmap_cmap"] = self.heatmap_cmap.currentText().strip() or None
-            if hasattr(self, "heatmap_normalization_mode"):
-                normalization_label = self.heatmap_normalization_mode.currentText().strip()
-                normalization_mode = _HEATMAP_NORMALIZATION_MODE_BY_LABEL.get(
-                    normalization_label,
-                    "counts",
+            if (
+                hasattr(self, "heatmap_value_mode")
+                and self._analysis_name == "orientation"
+            ):
+                value_label = self.heatmap_value_mode.currentText().strip()
+                value_mode = _HEATMAP_VALUE_MODE_BY_LABEL.get(
+                    value_label,
+                    "raw_counts",
                 )
-                settings["heatmap_normalization_mode"] = normalization_mode
-                settings["heatmap_normalize"] = normalization_mode == "global_probability"
+                settings["heatmap_value_mode"] = value_mode
+                bulk_reference_mode = (
+                    "manual"
+                    if self.heatmap_bulk_reference_mode.currentText().strip().lower()
+                    == "manual"
+                    else "auto"
+                )
+                settings["heatmap_bulk_reference_mode"] = bulk_reference_mode
+                settings["heatmap_bulk_min"] = None
+                settings["heatmap_bulk_max"] = None
+                if (
+                    value_mode == "bulk_relative_enrichment"
+                    and bulk_reference_mode == "manual"
+                ):
+                    bulk_min = _optional_float(
+                        self.heatmap_bulk_min.text(),
+                        field_name="bulk-reference minimum distance",
+                    )
+                    bulk_max = _optional_float(
+                        self.heatmap_bulk_max.text(),
+                        field_name="bulk-reference maximum distance",
+                    )
+                    if bulk_min is None or bulk_max is None or bulk_min >= bulk_max:
+                        raise ValueError(
+                            "Manual bulk reference requires finite minimum and maximum "
+                            "distances with minimum < maximum."
+                        )
+                    settings["heatmap_bulk_min"] = bulk_min
+                    settings["heatmap_bulk_max"] = bulk_max
             if hasattr(self, "heatmap_log_scale"):
-                settings["heatmap_log_scale"] = self.heatmap_log_scale.isChecked()
+                settings["heatmap_log_scale"] = (
+                    self.heatmap_log_scale.currentText().strip().lower()
+                    == "logarithmic"
+                )
             if hasattr(self, "heatmap_colorbar_label"):
                 raw = self.heatmap_colorbar_label.text().strip()
                 if raw.lower() in {"none", "off"}:

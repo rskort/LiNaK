@@ -126,16 +126,20 @@ def test_position_profile_to_plot_data_contract_exposes_frame_atom_structure():
 
     assert [view.id for view in contract.view_types] == [
         PLOT_VIEW_1D_LINE,
-        "scatter_2d",
-        "trajectory_2d",
+        PLOT_VIEW_2D_HEATMAP,
     ]
     assert [view.label for view in contract.view_types] == [
         PLOT_VIEW_LABEL_1D_LINE,
         PLOT_VIEW_LABEL_2D_HEATMAP,
-        PLOT_VIEW_LABEL_2D_HEATMAP,
     ]
     assert contract.view_types[0].supported_roles == ("x", "y")
-    assert contract.view_types[1].supported_roles == ("x", "y", "color")
+    assert contract.view_types[1].supported_roles == (
+        "x",
+        "y",
+        "color",
+        "split_by",
+        "filter_by",
+    )
 
 
 def test_plot_view_display_labels_are_global_and_legacy_compatible():
@@ -459,6 +463,21 @@ def test_resolve_position_plot_mapping_validates_and_marks_profile_descriptor_mo
     assert resolved.mapping.view_type_id == PLOT_VIEW_2D_HEATMAP
     assert resolved.renderer_options["component"] == "2d-projection"
     assert resolved.renderer_options["projection_x"] == "x"
+    assert resolved.uses_profile_descriptors is True
+
+
+def test_resolve_position_categorical_2d_mapping_uses_profile_descriptors():
+    resolved = resolve_position_plot_mapping(
+        component="2d-projection",
+        projection_x="x",
+        projection_y="y",
+        projection_render_mode="line-colors",
+    )
+
+    assert resolved.compatibility == "valid_preferred"
+    assert resolved.mapping.view_type_id == PLOT_VIEW_2D_HEATMAP
+    assert resolved.mapping.color is None
+    assert resolved.mapping.fixed_values["projection_render_mode"] == "line-colors"
     assert resolved.uses_profile_descriptors is True
 
 

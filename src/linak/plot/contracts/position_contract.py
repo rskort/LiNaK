@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 
 from ..data_contract import (
     PLOT_VIEW_1D_LINE,
+    PLOT_VIEW_2D_HEATMAP,
     PlotDataContract,
     PlotDimension,
     PlotQuantity,
@@ -133,16 +134,10 @@ def _position_contract(
             supported_roles=("x", "y"),
         ),
         PlotViewType(
-            id="scatter_2d",
-            label=plot_view_display_label("scatter_2d"),
-            kind="scatter_2d",
-            supported_roles=("x", "y", "color"),
-        ),
-        PlotViewType(
-            id="trajectory_2d",
-            label=plot_view_display_label("trajectory_2d"),
-            kind="trajectory_2d",
-            supported_roles=("x", "y", "color"),
+            id=PLOT_VIEW_2D_HEATMAP,
+            label=plot_view_display_label(PLOT_VIEW_2D_HEATMAP),
+            kind=PLOT_VIEW_2D_HEATMAP,
+            supported_roles=("x", "y", "color", "split_by", "filter_by"),
         ),
     )
 

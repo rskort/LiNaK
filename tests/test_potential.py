@@ -511,7 +511,7 @@ def test_plot_potential_profiles_legacy_table_view_renders_summary_line(tmp_path
 def test_plot_potential_hdf5_non_gui_renders_png(tmp_path):
     run_dir = tmp_path / "run"
     cube = _write_potential_case(run_dir, fermi_au=0.0367493036)
-    source = tmp_path / "potential_summary.h5"
+    source = tmp_path / "potential_summary.potential.h5"
     output = tmp_path / "potential_plot.png"
 
     compute_rc = main(
@@ -550,7 +550,7 @@ def test_compute_potential_water_bulk_uses_clean_span_when_ion_is_in_water_regio
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     cube = run_dir / "ion-in-water-v_hartree-1_0.cube"
-    output = tmp_path / "potential_summary.h5"
+    output = tmp_path / "potential_summary.potential.h5"
     potential_ev = np.asarray([4.0, 4.0, 99.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0])
     _write_cube(
         cube,
@@ -693,7 +693,7 @@ def test_compute_potential_accepts_cube_hdf5_input(tmp_path):
     run_dir = tmp_path / "run"
     cube = _write_potential_case(run_dir, fermi_au=0.0367493036)
     cube_h5 = tmp_path / "field.cube.h5"
-    output = tmp_path / "potential_summary.h5"
+    output = tmp_path / "potential_summary.potential.h5"
 
     assert (
         main(
@@ -735,7 +735,7 @@ def test_compute_potential_accepts_combined_cube_hdf5_input(tmp_path):
     cube_a = _write_potential_case(run_a, fermi_au=0.0367493036)
     cube_b = _write_potential_case(run_b, fermi_au=0.0734986072)
     combined = tmp_path / "combined.cube.h5"
-    output = tmp_path / "potential_summary.h5"
+    output = tmp_path / "potential_summary.potential.h5"
 
     assert (
         main(
@@ -848,7 +848,7 @@ def test_compute_potential_writes_and_appends_hdf5(tmp_path):
     cube1 = _write_potential_case(run1, fermi_au=0.0367493036)  # about 1.0 eV
     cube2 = _write_potential_case(run2, fermi_au=0.0734986072)  # about 2.0 eV
 
-    output_h5 = tmp_path / "potentials.h5"
+    output_h5 = tmp_path / "potentials.potential.h5"
     rc = main(
         [
             "--log-level",
@@ -913,7 +913,7 @@ def test_compute_potential_shows_loading_progress_for_raw_inputs(tmp_path, monke
     run2 = tmp_path / "run2"
     cube1 = _write_potential_case(run1, fermi_au=0.0367493036)
     cube2 = _write_potential_case(run2, fermi_au=0.0734986072)
-    output_h5 = tmp_path / "potentials.h5"
+    output_h5 = tmp_path / "potentials.potential.h5"
 
     class RecordingProgressBar:
         instances: list["RecordingProgressBar"] = []
@@ -976,7 +976,7 @@ def test_compute_potential_incompatible_hdf5_schema_uses_fallback_file(tmp_path)
     run_dir = tmp_path / "run"
     cube = _write_potential_case(run_dir, fermi_au=0.0367493036)
 
-    output_h5 = tmp_path / "potentials.h5"
+    output_h5 = tmp_path / "potentials.potential.h5"
     with h5py.File(output_h5, "w") as handle:
         handle.attrs["linak_format"] = "linak-hdf5"
         handle.attrs["analysis"] = "unexpected"
@@ -1013,7 +1013,7 @@ def test_compute_potential_incompatible_hdf5_schema_versions_fallback_before_ana
     run_dir = tmp_path / "run"
     cube = _write_potential_case(run_dir, fermi_au=0.0367493036)
 
-    output_h5 = tmp_path / "potentials.h5"
+    output_h5 = tmp_path / "potentials.potential.h5"
     fallback_path = tmp_path / "potentials.linak.potential.h5"
     with h5py.File(output_h5, "w") as handle:
         handle.attrs["linak_format"] = "linak-hdf5"
@@ -1046,7 +1046,7 @@ def test_compute_potential_strict_mode_returns_error_but_still_writes_hdf5(tmp_p
     run_dir = tmp_path / "run_missing_fermi"
     cube = _write_potential_case(run_dir, fermi_au=None)
 
-    output_h5 = tmp_path / "strict.h5"
+    output_h5 = tmp_path / "strict.potential.h5"
     rc = main(
         [
             "--log-level",
@@ -1075,7 +1075,7 @@ def test_compute_potential_persists_rows_before_post_compute_crash(tmp_path, mon
     cube1 = _write_potential_case(run1, fermi_au=0.0367493036)
     cube2 = _write_potential_case(run2, fermi_au=0.0734986072)
 
-    output_h5 = tmp_path / "partial.h5"
+    output_h5 = tmp_path / "partial.potential.h5"
 
     def _raise_after_compute(_records):
         raise RuntimeError("synthetic post-compute crash")

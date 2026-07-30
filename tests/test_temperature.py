@@ -210,7 +210,7 @@ def test_temperature_hdf5_round_trip_and_metadata(tmp_path: Path) -> None:
     tregion = tmp_path / "run-1.tregion"
     tregion.write_text("10 5.0 0.0 320.0 300.0 310.0\n", encoding="utf-8")
     profiles = compute_temperature_profiles(tregion)
-    output = tmp_path / "temperature.h5"
+    output = tmp_path / "temperature.temperature.h5"
 
     save_temperature_profiles(profiles, output, additional_metadata={"source_path": str(tregion)})
     loaded = load_temperature_profiles(output)
@@ -239,7 +239,7 @@ def test_temperature_cli_compute_and_plot(tmp_path: Path) -> None:
     _write_velocity_xyz(tmp_path / "run-vel-1.xyz")
     temp = tmp_path / "run-1.temp"
     temp.write_text("10 5.0 100.0 200.0 300.0 400.0\n", encoding="utf-8")
-    output = tmp_path / "temperature.h5"
+    output = tmp_path / "temperature.temperature.h5"
     plot = tmp_path / "temperature.png"
 
     assert main(["compute", "temperature", str(temp), "--output", str(output)]) == 0
@@ -259,7 +259,7 @@ def test_temperature_cli_default_output_uses_clean_dot_name(tmp_path: Path) -> N
 
 def test_temperature_cli_velocity_accepts_pt_top_labels(tmp_path: Path) -> None:
     velocity = tmp_path / "run-vel-1.xyz"
-    output = tmp_path / "temperature.h5"
+    output = tmp_path / "temperature.temperature.h5"
     _write_labeled_velocity_xyz(velocity, ["Pt_top", "Pt"])
 
     assert main(["compute", "temperature", str(velocity), "--group-by", "elements", "--output", str(output)]) == 0

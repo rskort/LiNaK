@@ -144,7 +144,7 @@ linak compute coordination traj.xyz --species-a O --species-b H --cutoff-from-rd
 linak compute orientation traj.xyz
 linak compute temperature run-1.temp
 linak compute temperature run-vel-1.xyz --input input.inp
-linak compute potential -f run1/*-v_hartree-1_0.cube run2/*-v_hartree-1_0.cube --output potentials.h5
+linak compute potential -f run1/*-v_hartree-1_0.cube run2/*-v_hartree-1_0.cube --output potentials.potential.h5
 ```
 
 ### `linak plot`
@@ -382,6 +382,13 @@ Position plotting components:
   - default axes limits use cell dimensions (`x: 0..A`, `y: 0..B`) for legacy `xy-z` when cell data is available
   - PBC boundary jumps are rendered without artificial cross-box connector lines
 
+In the interactive GUI, the same projection is available through `View type =
+2D Heatmap`. `Color mode = Continuous quantity` can color X/Y trajectories by
+distance, time, or another stored quantity. `Color mode = Species / layer`
+uses editable categorical layer colors and a legend. A position file computed
+for one species contains only that species; use `--species all` (or compatible
+multiple position sources) when comparing several species.
+
 ### Potential
 
 `linak compute potential` is CP2K-focused. For each Hartree cube file, LiNaK:
@@ -450,6 +457,12 @@ linak compute temperature run-1.tregion --input input.inp
 linak compute temperature run-vel-1.xyz --input input.inp
 linak plot run.temperature.h5
 ```
+
+Analysis HDF5 endings are invariant file types. Put qualifiers and collision
+counters in the base name: use `traj-all.position.h5` or
+`traj_1.density.h5`, never `traj.position-all.h5` or
+`traj.density_1.h5`. Custom compute outputs are normalized to the analysis
+ending, such as `.position.h5`, `.density.h5`, or `.rdf.h5`.
 
 ## Plotting and Plot Studio
 

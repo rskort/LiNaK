@@ -24,6 +24,7 @@ import logging
 import os
 from pathlib import Path
 from typing import Any
+import warnings
 
 import numpy as np
 from ase import Atoms
@@ -83,6 +84,23 @@ _PLANE_NORMAL_NORM_EPSILON: float = 1.0e-12
 _PROJECTED_NORMAL_NORM_EPSILON: float = 1.0e-12
 _OH_LENGTH_SANITY_TOLERANCE: float = 1.0e-8
 _HEATMAP_BULK_DENSITY_FRACTION: float = 0.8
+_HEATMAP_VALUE_MODES = (
+    "raw_counts",
+    "joint_probability_density",
+    "conditional_probability_density",
+    "bulk_relative_enrichment",
+)
+
+
+@dataclass(frozen=True)
+class OrientationHeatmapValueResult:
+    """Display-time representation of an orientation frequency matrix."""
+
+    values: np.ndarray
+    mode: str
+    units: str
+    colorbar_label: str
+    summary: str
 
 
 # Data containers
@@ -1585,6 +1603,10 @@ def plot_orientation_profile(
     orientation_filter_z_max: float | None = None,
     orientation_filter_distance_min: float | None = None,
     orientation_filter_distance_max: float | None = None,
+    heatmap_value_mode: str | None = None,
+    heatmap_bulk_reference_mode: str = "auto",
+    heatmap_bulk_min: float | None = None,
+    heatmap_bulk_max: float | None = None,
     heatmap_normalize: bool = False,
     heatmap_normalization_mode: str | None = None,
     heatmap_log_scale: bool = False,
@@ -1693,6 +1715,10 @@ def plot_orientation_profile(
             orientation_filter_z_max=orientation_filter_z_max,
             orientation_filter_distance_min=orientation_filter_distance_min,
             orientation_filter_distance_max=orientation_filter_distance_max,
+            heatmap_value_mode=heatmap_value_mode,
+            heatmap_bulk_reference_mode=heatmap_bulk_reference_mode,
+            heatmap_bulk_min=heatmap_bulk_min,
+            heatmap_bulk_max=heatmap_bulk_max,
             heatmap_normalize=heatmap_normalize,
             heatmap_normalization_mode=heatmap_normalization_mode,
             heatmap_log_scale=heatmap_log_scale,
@@ -1906,6 +1932,10 @@ def plot_orientation_profiles(
     orientation_filter_z_max: float | None = None,
     orientation_filter_distance_min: float | None = None,
     orientation_filter_distance_max: float | None = None,
+    heatmap_value_mode: str | None = None,
+    heatmap_bulk_reference_mode: str = "auto",
+    heatmap_bulk_min: float | None = None,
+    heatmap_bulk_max: float | None = None,
     heatmap_normalize: bool = False,
     heatmap_normalization_mode: str | None = None,
     heatmap_log_scale: bool = False,
@@ -2018,6 +2048,10 @@ def plot_orientation_profiles(
             orientation_filter_z_max=orientation_filter_z_max,
             orientation_filter_distance_min=orientation_filter_distance_min,
             orientation_filter_distance_max=orientation_filter_distance_max,
+            heatmap_value_mode=heatmap_value_mode,
+            heatmap_bulk_reference_mode=heatmap_bulk_reference_mode,
+            heatmap_bulk_min=heatmap_bulk_min,
+            heatmap_bulk_max=heatmap_bulk_max,
             heatmap_normalize=heatmap_normalize,
             heatmap_normalization_mode=heatmap_normalization_mode,
             heatmap_log_scale=heatmap_log_scale,
@@ -2235,22 +2269,137 @@ def _rebin_heatmap_axis(
     return rebinned, np.array(new_edges)
 
 
-def _resolve_heatmap_normalization_mode(
+def _resolve_heatmap_value_mode(
     *,
+    heatmap_value_mode: str | None,
     heatmap_normalization_mode: str | None,
     heatmap_normalize: bool,
 ) -> str:
-    normalization_mode = "global_probability" if heatmap_normalize else "counts"
-    if heatmap_normalization_mode is None:
-        return normalization_mode
+    if heatmap_value_mode is not None:
+        candidate_mode = str(heatmap_value_mode).strip().lower()
+        if candidate_mode not in _HEATMAP_VALUE_MODES:
+            raise ValueError(
+                "heatmap_value_mode must be one of: " + ", ".join(_HEATMAP_VALUE_MODES) + "."
+            )
+        return candidate_mode
 
-    candidate_mode = str(heatmap_normalization_mode).strip().lower()
-    if candidate_mode not in {"counts", "global_probability", "bulk_water_reference"}:
+    legacy_mode = (
+        str(heatmap_normalization_mode).strip().lower()
+        if heatmap_normalization_mode is not None
+        else "global_probability"
+        if heatmap_normalize
+        else "counts"
+    )
+    legacy_mapping = {
+        "counts": "raw_counts",
+        "global_probability": "joint_probability_density",
+        "bulk_water_reference": "bulk_relative_enrichment",
+    }
+    if legacy_mode not in legacy_mapping:
         raise ValueError(
             "heatmap_normalization_mode must be one of: "
             "counts, global_probability, bulk_water_reference."
         )
-    return candidate_mode
+    if heatmap_normalization_mode is not None or heatmap_normalize:
+        warnings.warn(
+            "heatmap_normalize and heatmap_normalization_mode are deprecated; "
+            "use heatmap_value_mode instead. Legacy modes now map to the closest "
+            "scientific value representation.",
+            FutureWarning,
+            stacklevel=3,
+        )
+    return legacy_mapping[legacy_mode]
+
+
+def _transform_orientation_frequency_heatmap(
+    counts: np.ndarray,
+    x_edges: np.ndarray,
+    y_edges: np.ndarray,
+    *,
+    mode: str,
+    bulk_rows: np.ndarray | None = None,
+) -> OrientationHeatmapValueResult:
+    count_values = np.asarray(counts, dtype=float)
+    x_bins = np.asarray(x_edges, dtype=float)
+    y_bins = np.asarray(y_edges, dtype=float)
+    if count_values.ndim != 2:
+        raise ValueError("Orientation heatmap counts must be a two-dimensional matrix.")
+    if x_bins.shape != (count_values.shape[0] + 1,) or y_bins.shape != (
+        count_values.shape[1] + 1,
+    ):
+        raise ValueError("Orientation heatmap edges do not match the count matrix.")
+    if np.any(~np.isfinite(count_values)) or np.any(count_values < 0.0):
+        raise ValueError("Orientation heatmap counts must be finite and non-negative.")
+    dx = np.diff(x_bins)
+    dy = np.diff(y_bins)
+    if np.any(~np.isfinite(dx)) or np.any(dx <= 0.0) or np.any(~np.isfinite(dy)) or np.any(
+        dy <= 0.0
+    ):
+        raise ValueError("Orientation heatmap bin edges must be finite and strictly increasing.")
+
+    if mode == "raw_counts":
+        return OrientationHeatmapValueResult(
+            values=count_values.copy(),
+            mode=mode,
+            units="observations/bin",
+            colorbar_label="Observation count per bin",
+            summary="Raw molecule-frame observations in each displayed bin.",
+        )
+
+    total = float(np.sum(count_values, dtype=float))
+    if mode == "joint_probability_density":
+        values = np.full(count_values.shape, np.nan, dtype=float)
+        if total > 0.0:
+            values = count_values / (total * dx[:, np.newaxis] * dy[np.newaxis, :])
+        return OrientationHeatmapValueResult(
+            values=values,
+            mode=mode,
+            units="1/\u00c5",
+            colorbar_label="Joint probability density (1/\u00c5)",
+            summary="Joint probability density; its bin-area-weighted integral is 1.",
+        )
+
+    row_totals = np.sum(count_values, axis=1, dtype=float)
+    conditional = np.full(count_values.shape, np.nan, dtype=float)
+    occupied = row_totals > 0.0
+    conditional[occupied, :] = count_values[occupied, :] / (
+        row_totals[occupied, np.newaxis] * dy[np.newaxis, :]
+    )
+    if mode == "conditional_probability_density":
+        return OrientationHeatmapValueResult(
+            values=conditional,
+            mode=mode,
+            units="1",
+            colorbar_label="Conditional orientation probability density",
+            summary="Orientation probability density at each occupied distance; every row integrates to 1.",
+        )
+
+    if mode != "bulk_relative_enrichment":
+        raise ValueError("Unsupported orientation heatmap value mode.")
+    if bulk_rows is None:
+        raise ValueError("Bulk-relative enrichment requires resolved bulk-reference rows.")
+    rows = np.asarray(bulk_rows, dtype=int)
+    if rows.ndim != 1 or rows.size == 0 or np.any(rows < 0) or np.any(
+        rows >= count_values.shape[0]
+    ):
+        raise ValueError("Bulk-relative enrichment requires valid bulk-reference rows.")
+    bulk_counts = np.sum(count_values[rows, :], axis=0, dtype=float)
+    bulk_total = float(np.sum(bulk_counts, dtype=float))
+    if bulk_total <= 0.0:
+        raise ValueError("The selected bulk-reference region contains no orientation observations.")
+    bulk_density = bulk_counts / (bulk_total * dy)
+    values = np.full(count_values.shape, np.nan, dtype=float)
+    valid_reference = np.isfinite(bulk_density) & (bulk_density > 0.0)
+    values[:, valid_reference] = (
+        conditional[:, valid_reference] / bulk_density[np.newaxis, valid_reference]
+    )
+    return OrientationHeatmapValueResult(
+        values=values,
+        mode=mode,
+        units="1",
+        colorbar_label="Orientation enrichment relative to bulk (1 = bulk-like)",
+        summary="Conditional orientation density divided by the pooled bulk distribution; 1 is bulk-like.",
+    )
 
 
 def _rebin_heatmap_density_for_display(
@@ -2329,6 +2478,52 @@ def _select_bulk_water_reference_rows(
     return np.asarray(best_segment, dtype=int)
 
 
+def _resolve_bulk_water_reference_rows(
+    *,
+    bin_centers: np.ndarray,
+    density: np.ndarray,
+    reference_mode: str,
+    manual_min: float | None,
+    manual_max: float | None,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    mode = str(reference_mode or "auto").strip().lower()
+    if mode not in {"auto", "manual"}:
+        raise ValueError("heatmap_bulk_reference_mode must be auto or manual.")
+    centers = np.asarray(bin_centers, dtype=float)
+    if mode == "manual":
+        if manual_min is None or manual_max is None:
+            raise ValueError("Manual bulk reference requires both minimum and maximum distance.")
+        lower = float(manual_min)
+        upper = float(manual_max)
+        if not np.isfinite(lower) or not np.isfinite(upper) or lower >= upper:
+            raise ValueError(
+                "Manual bulk-reference bounds must be finite and satisfy minimum < maximum."
+            )
+        rows = np.flatnonzero(np.isfinite(centers) & (centers >= lower) & (centers <= upper))
+        if rows.size == 0:
+            raise ValueError("Manual bulk-reference range does not contain any displayed bins.")
+    else:
+        rows = _select_bulk_water_reference_rows(
+            bin_centers=centers,
+            density=density,
+        )
+        lower = float(np.min(centers[rows]))
+        upper = float(np.max(centers[rows]))
+    resolved_lower = float(np.min(centers[rows]))
+    resolved_upper = float(np.max(centers[rows]))
+    return rows, {
+        "mode": mode,
+        "requested_min": None if manual_min is None else float(manual_min),
+        "requested_max": None if manual_max is None else float(manual_max),
+        "resolved_min": resolved_lower,
+        "resolved_max": resolved_upper,
+        "row_count": int(rows.size),
+        "density_threshold_fraction": (
+            _HEATMAP_BULK_DENSITY_FRACTION if mode == "auto" else None
+        ),
+    }
+
+
 # Heatmap renderer
 
 
@@ -2372,6 +2567,10 @@ def _plot_orientation_heatmap(
     orientation_filter_z_max: float | None,
     orientation_filter_distance_min: float | None,
     orientation_filter_distance_max: float | None,
+    heatmap_value_mode: str | None,
+    heatmap_bulk_reference_mode: str,
+    heatmap_bulk_min: float | None,
+    heatmap_bulk_max: float | None,
     heatmap_normalize: bool,
     heatmap_normalization_mode: str | None,
     heatmap_log_scale: bool,
@@ -2398,7 +2597,8 @@ def _plot_orientation_heatmap(
     savefig_kwargs: dict[str, Any] | None,
 ) -> Path | None:
     """Render a 2-D heatmap of orientation frequency vs distance."""
-    normalization_mode = _resolve_heatmap_normalization_mode(
+    value_mode = _resolve_heatmap_value_mode(
+        heatmap_value_mode=heatmap_value_mode,
         heatmap_normalization_mode=heatmap_normalization_mode,
         heatmap_normalize=heatmap_normalize,
     )
@@ -2420,10 +2620,10 @@ def _plot_orientation_heatmap(
     )
 
     if use_sparse_grid:
-        if normalization_mode != "counts":
+        if value_mode != "raw_counts":
             raise ValueError(
                 "Orientation sparse-grid heatmaps show mean orientation values and support "
-                "only counts normalization."
+                "no frequency value transformation."
             )
         x_axis = (orientation_heatmap_x_axis or "x").strip().lower()
         y_axis = (orientation_heatmap_y_axis or "y").strip().lower()
@@ -2566,7 +2766,17 @@ def _plot_orientation_heatmap(
                 "orientation_grid_x_axis": x_axis,
                 "orientation_grid_y_axis": y_axis,
                 "orientation_grid_filters": dict(grid_filters),
-                "heatmap_normalization_mode": normalization_mode,
+                "heatmap_value_mode": "mean_orientation",
+                "heatmap_value_units": "1",
+                "heatmap_value_summary": (
+                    "Mean orientation values; no frequency transformation was applied."
+                ),
+                "heatmap_value_pipeline": (
+                    "Raw observations \u2192 combine sources \u2192 filter \u2192 "
+                    "weighted-mean rebin \u2192 color mapping"
+                ),
+                "heatmap_value_modes_supported": [],
+                "heatmap_bulk_reference": None,
                 "heatmap_log_scale": bool(heatmap_log_scale),
                 "heatmap_colorbar_enabled": bool(heatmap_colorbar_enabled),
                 "heatmap_colorbar_label": resolved_colorbar_label,
@@ -2580,22 +2790,46 @@ def _plot_orientation_heatmap(
     density_contributors = 1
     for p in profiles[1:]:
         extra = _select_heatmap_data(p, angle)
-        if extra.shape == heatmap.shape:
-            heatmap += extra
-            if (
-                np.asarray(p.density).shape == density_accumulator.shape
-                and np.asarray(p.bin_edges).shape == np.asarray(ref.bin_edges).shape
-                and np.allclose(
-                    np.asarray(p.bin_edges, dtype=float), np.asarray(ref.bin_edges, dtype=float)
-                )
-            ):
-                density_accumulator += np.asarray(p.density, dtype=float)
-                density_contributors += 1
+        compatible = (
+            extra.shape == heatmap.shape
+            and np.asarray(p.bin_edges).shape == np.asarray(ref.bin_edges).shape
+            and np.asarray(p.heatmap_angle_bin_edges).shape
+            == np.asarray(ref.heatmap_angle_bin_edges).shape
+            and np.allclose(
+                np.asarray(p.bin_edges, dtype=float),
+                np.asarray(ref.bin_edges, dtype=float),
+            )
+            and np.allclose(
+                np.asarray(p.heatmap_angle_bin_edges, dtype=float),
+                np.asarray(ref.heatmap_angle_bin_edges, dtype=float),
+            )
+        )
+        if not compatible:
+            raise ValueError(
+                "Combined orientation frequency heatmaps require compatible distance "
+                "and angle bin edges."
+            )
+        heatmap += extra
+        if np.asarray(p.density).shape == density_accumulator.shape:
+            density_accumulator += np.asarray(p.density, dtype=float)
+            density_contributors += 1
 
     x_edges = ref.bin_edges
     y_edges = ref.heatmap_angle_bin_edges
     x_centers = np.asarray(ref.bin_centers, dtype=float)
     density_reference = density_accumulator / float(density_contributors)
+
+    for reducer_name, reducer in (
+        ("x_bin_reducer", x_bin_reducer),
+        ("y_bin_reducer", y_bin_reducer),
+    ):
+        if reducer is not None and str(reducer).strip().lower() != "sum":
+            warnings.warn(
+                f"{reducer_name}={reducer!r} is ignored for orientation frequency "
+                "heatmaps; count rebinning is always sum-preserving.",
+                FutureWarning,
+                stacklevel=3,
+            )
 
     # Rebin distance axis (x)
     if x_bin_width is not None and x_bin_width > 0:
@@ -2604,7 +2838,7 @@ def _plot_orientation_heatmap(
             x_edges,
             x_bin_width,
             axis=0,
-            reducer=x_bin_reducer or "sum",
+            reducer="sum",
         )
         x_centers = 0.5 * (x_edges[:-1] + x_edges[1:])
         density_reference = _rebin_heatmap_density_for_display(
@@ -2619,44 +2853,48 @@ def _plot_orientation_heatmap(
             y_edges,
             y_bin_width,
             axis=1,
-            reducer=y_bin_reducer or "sum",
+            reducer="sum",
         )
 
-    if normalization_mode == "global_probability":
-        total = float(np.sum(heatmap))
-        heatmap_plot = heatmap if total <= 0.0 else heatmap / total
-    elif normalization_mode == "bulk_water_reference":
+    bulk_rows: np.ndarray | None = None
+    bulk_reference: dict[str, Any] | None = None
+    if value_mode == "bulk_relative_enrichment":
         if ref.coordinate_mode != "distance":
             raise ValueError(
-                "Bulk heatmap normalization requires a distance-aligned profile with a "
+                "Bulk-relative orientation values require a distance-aligned profile with a "
                 "resolvable water-bulk density plateau."
             )
-        bulk_rows = _select_bulk_water_reference_rows(
+        bulk_rows, bulk_reference = _resolve_bulk_water_reference_rows(
             bin_centers=x_centers,
             density=density_reference,
+            reference_mode=heatmap_bulk_reference_mode,
+            manual_min=heatmap_bulk_min,
+            manual_max=heatmap_bulk_max,
         )
-        bulk_mean = float(np.mean(heatmap[bulk_rows, :], dtype=float))
-        if not np.isfinite(bulk_mean) or bulk_mean <= 0.0:
-            raise ValueError(
-                "Bulk heatmap normalization requires a distance-aligned profile with a "
-                "resolvable water-bulk density plateau."
-            )
-        heatmap_plot = heatmap / bulk_mean
-    else:
-        heatmap_plot = heatmap
+        selected_bin_count = int(bulk_reference["row_count"])
+        contributing_bin_count = int(
+            np.count_nonzero(np.sum(heatmap[bulk_rows, :], axis=1, dtype=float) > 0.0)
+        )
+        bulk_reference["selected_bin_count"] = selected_bin_count
+        bulk_reference["row_count"] = contributing_bin_count
+
+    value_result = _transform_orientation_frequency_heatmap(
+        heatmap,
+        np.asarray(x_edges, dtype=float),
+        np.asarray(y_edges, dtype=float),
+        mode=value_mode,
+        bulk_rows=bulk_rows,
+    )
+    heatmap_plot = value_result.values
 
     angle_symbol = "\u03b8" if angle == "polar" else "\u03c6"
     default_title = f"H2O orientation heatmap ({angle})"
     default_x = _distance_label(ref)
     default_y = f"cos({angle_symbol})"
-    if normalization_mode == "counts":
-        default_cb_label = "Frequency"
-    elif normalization_mode == "global_probability":
-        default_cb_label = "Global probability"
-    else:
-        default_cb_label = "Bulk-normalized frequency (bulk mean = 1)"
     resolved_colorbar_label = (
-        heatmap_colorbar_label if heatmap_colorbar_label is not None else default_cb_label
+        heatmap_colorbar_label
+        if heatmap_colorbar_label is not None
+        else value_result.colorbar_label
     )
     return plot_heatmap_series(
         x_edges,
@@ -2706,7 +2944,15 @@ def _plot_orientation_heatmap(
         heatmap_colorbar_aspect=heatmap_colorbar_aspect,
         annotations=annotations,
         capture_state_extra={
-            "heatmap_normalization_mode": normalization_mode,
+            "heatmap_value_mode": value_result.mode,
+            "heatmap_value_units": value_result.units,
+            "heatmap_value_summary": value_result.summary,
+            "heatmap_value_pipeline": (
+                "Raw observations \u2192 combine sources \u2192 filter \u2192 "
+                "sum-preserving rebin \u2192 displayed values \u2192 color mapping"
+            ),
+            "heatmap_value_modes_supported": list(_HEATMAP_VALUE_MODES),
+            "heatmap_bulk_reference": bulk_reference,
             "heatmap_log_scale": bool(heatmap_log_scale),
             "heatmap_colorbar_enabled": bool(heatmap_colorbar_enabled),
             "heatmap_colorbar_label": resolved_colorbar_label,

@@ -117,7 +117,7 @@ def test_gui_view_type_labels_use_global_vocabulary_with_legacy_aliases():
 
 def test_public_heatmap_support_requires_real_heatmap_contract():
     assert _contract_has_public_heatmap_view(default_density_heatmap_plot_data_contract()) is True
-    assert _contract_has_public_heatmap_view(default_position_plot_data_contract()) is False
+    assert _contract_has_public_heatmap_view(default_position_plot_data_contract()) is True
     assert _contract_has_public_heatmap_view(default_coordination_plot_data_contract()) is False
 
 
@@ -1863,7 +1863,7 @@ def test_plot_settings_panel_exposes_contract_driven_position_mapping_controls()
     assert 'self.position_mapping_value = self._combo(list(_POSITION_PROJECTION_QUANTITIES))' in source
     assert '"X-axis quantity"' in source
     assert '"Y-axis quantity"' in source
-    assert '"Heatmap rendering"' in source
+    assert '"Color mode"' in source
     assert '"Color quantity"' in source
     assert '"Value / color / filter by"' not in source
     assert '"Split by"' in source
@@ -1872,6 +1872,16 @@ def test_plot_settings_panel_exposes_contract_driven_position_mapping_controls()
     assert "generic_view_type_compatibility(" in source
     assert "self.position_component = self._combo(_POSITION_COMPONENT_LABELS)" not in source
     assert 'if analysis in {"msd", "position"}' not in source
+
+
+def test_position_2d_trajectory_width_lives_with_heatmap_rendering_and_persists():
+    source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+
+    assert '"Trajectory line width"' in source
+    assert 'tooltip_id="figure.heatmap.trajectory_width"' in source
+    assert '"projection_line_width": projection_line_width_value' in source
+    assert 'settings.get("projection_line_width")' in source
+    assert '"heatmap_point_artist"' in source
 
 
 def test_plot_settings_panel_uses_rdf_layer_summary_and_coordination_selector_choices():
@@ -2655,3 +2665,16 @@ def test_resolve_asset_path_finds_installed_share_assets(tmp_path):
     resolved = _resolve_asset_path("linak_gui_banner.svg", module_path=module_path)
 
     assert resolved == expected.resolve()
+
+
+def test_heatmap_gui_separates_value_representation_from_color_mapping():
+    source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+
+    assert 'QGroupBox("Data Representation")' in source
+    assert '"Displayed values"' in source
+    assert 'QGroupBox("Color Mapping")' in source
+    assert 'self._combo(("Linear", "Logarithmic"))' in source
+    assert "orientation_frequency_heatmap" in source
+    assert 'settings["heatmap_value_mode"] = value_mode' in source
+    assert 'settings["heatmap_normalization_mode"] =' not in source
+    assert 'settings["heatmap_normalize"] =' not in source

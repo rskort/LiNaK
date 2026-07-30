@@ -618,7 +618,11 @@ def _position_projection_uses_profile_descriptors(
 ) -> bool:
     if resolved_projection is None:
         resolved_projection = _resolve_position_projection_estimation_settings(args)
-    return resolved_projection.is_projection and resolved_projection.render_mode != "line-colors"
+    # A 2-D trajectory layer represents one selected species/profile. Keeping
+    # the GUI layer identity at that level makes visibility and categorical
+    # color styling stable even when a profile contains many tracked atoms.
+    # The renderer still iterates over the individual atoms inside each layer.
+    return resolved_projection.is_projection
 
 
 def _coordination_plot_uses_atom_descriptors(
@@ -832,9 +836,22 @@ _PLOT_SETTINGS_POSITION_KEYS = (
     "projection_y",
     "projection_value",
     "projection_render_mode",
+    "projection_line_width",
     "projection_filter_min",
     "projection_filter_max",
     "xy_z_distance_max",
+    "heatmap_vmin",
+    "heatmap_vmax",
+    "heatmap_cmap",
+    "heatmap_log_scale",
+    "heatmap_colorbar_enabled",
+    "heatmap_colorbar_label",
+    "heatmap_colorbar_label_size",
+    "heatmap_colorbar_tick_size",
+    "heatmap_colorbar_position",
+    "heatmap_colorbar_pad",
+    "heatmap_colorbar_shrink",
+    "heatmap_colorbar_aspect",
     "time_axis",
     "time_section_width",
     *_PLOT_SETTINGS_COMMON_KEYS,
@@ -869,6 +886,11 @@ _PLOT_SETTINGS_ORIENTATION_KEYS = (
     "heatmap_vmin",
     "heatmap_vmax",
     "heatmap_cmap",
+    "heatmap_value_mode",
+    "heatmap_bulk_reference_mode",
+    "heatmap_bulk_min",
+    "heatmap_bulk_max",
+    # Read-only legacy keys retained for one-way profile migration.
     "heatmap_normalize",
     "heatmap_normalization_mode",
     "heatmap_log_scale",
@@ -1235,8 +1257,12 @@ def _resolve_single_analysis_hdf5_output_path(
     ):
         return _resolve_non_overwriting_hdf5_path(base_path / default_path.name)
 
-    if not base_path.suffix:
-        base_path = base_path.with_suffix(".h5")
+    from .analysis.output_naming import ensure_analysis_hdf5_path, split_analysis_hdf5_name
+
+    default_split = split_analysis_hdf5_name(default_path.name)
+    if default_split is None:
+        raise ValueError(f"Default analysis output has no analysis suffix: '{default_path}'.")
+    base_path = ensure_analysis_hdf5_path(base_path, default_split[1])
     return _resolve_non_overwriting_hdf5_path(base_path)
 
 
@@ -1256,8 +1282,12 @@ def _resolve_requested_analysis_hdf5_output_path(
     ):
         return resolve_hdf5_output_path(base_path / default_path.name)
 
-    if not base_path.suffix:
-        base_path = base_path.with_suffix(".h5")
+    from .analysis.output_naming import ensure_analysis_hdf5_path, split_analysis_hdf5_name
+
+    default_split = split_analysis_hdf5_name(default_path.name)
+    if default_split is None:
+        raise ValueError(f"Default analysis output has no analysis suffix: '{default_path}'.")
+    base_path = ensure_analysis_hdf5_path(base_path, default_split[1])
     return resolve_hdf5_output_path(base_path)
 
 
@@ -1496,9 +1526,7 @@ def _position_hdf5_output_path(
     base_path = Path(base_output).expanduser()
     if _output_request_looks_like_directory(base_output) or (base_path.exists() and base_path.is_dir()):
         return _resolve_non_overwriting_hdf5_path(base_path / default_path.name)
-    if not base_path.suffix:
-        base_path = base_path.with_suffix(".h5")
-    return _resolve_non_overwriting_hdf5_path(base_path)
+    return _resolve_single_analysis_hdf5_output_path(base_output, default_path)
 
 
 def _default_rdf_collection_hdf5_output_path(source: str | Path) -> Path:
@@ -5832,6 +5860,13 @@ def _add_position_plot_options(
             ),
         )
         group.add_argument(
+            "--trajectory-line-width",
+            dest="projection_line_width",
+            type=float,
+            default=None,
+            help="Uniform line width for 2D position trajectories.",
+        )
+        group.add_argument(
             "--heatmap-filter-min",
             dest="projection_filter_min",
             type=float,
@@ -5955,6 +5990,42 @@ def _add_orientation_plot_options(
             "Orientation angle quantity for 1D Line and 2D Heatmap plots "
             "(default: polar)."
         ),
+    )
+    group.add_argument(
+        "--heatmap-value-mode",
+        choices=[
+            "raw_counts",
+            "joint_probability_density",
+            "conditional_probability_density",
+            "bulk_relative_enrichment",
+        ],
+        default=None,
+        help=(
+            "Displayed values for orientation frequency heatmaps. Transformations are "
+            "applied after profiles are combined and counts are rebinned."
+        ),
+    )
+    group.add_argument(
+        "--heatmap-bulk-reference-mode",
+        "--heatmap-bulk-reference",
+        choices=["auto", "manual"],
+        default="auto",
+        help=(
+            "Bulk reference selection for bulk-relative enrichment: automatic density "
+            "plateau detection or an explicit distance range (default: auto)."
+        ),
+    )
+    group.add_argument(
+        "--heatmap-bulk-min",
+        type=float,
+        default=None,
+        help="Manual minimum distance for the bulk orientation reference.",
+    )
+    group.add_argument(
+        "--heatmap-bulk-max",
+        type=float,
+        default=None,
+        help="Manual maximum distance for the bulk orientation reference.",
     )
 
 
@@ -9504,8 +9575,17 @@ def _build_orientation_gui_context(
             "heatmap_cmap": getattr(args, "heatmap_cmap", None),
             "y_bin_width": getattr(args, "y_bin_width", None),
             "y_bin_reducer": getattr(args, "y_bin_reducer", None),
+            "heatmap_value_mode": getattr(args, "heatmap_value_mode", None),
+            "heatmap_bulk_reference_mode": getattr(
+                args, "heatmap_bulk_reference_mode", "auto"
+            ),
+            "heatmap_bulk_min": getattr(args, "heatmap_bulk_min", None),
+            "heatmap_bulk_max": getattr(args, "heatmap_bulk_max", None),
+            # Compatibility adapters for settings written before the value-mode redesign.
             "heatmap_normalize": getattr(args, "heatmap_normalize", False),
-            "heatmap_normalization_mode": getattr(args, "heatmap_normalization_mode", None),
+            "heatmap_normalization_mode": getattr(
+                args, "heatmap_normalization_mode", None
+            ),
             "heatmap_log_scale": getattr(args, "heatmap_log_scale", False),
             "heatmap_colorbar_enabled": getattr(args, "heatmap_colorbar_enabled", True),
             "heatmap_colorbar_label": getattr(args, "heatmap_colorbar_label", None),
@@ -9823,6 +9903,27 @@ def _render_profile_plot(
         "tick_params_kwargs": getattr(args, "tick_params_kwargs", None),
         "tight_layout_kwargs": getattr(args, "tight_layout_kwargs", None),
         "savefig_kwargs": getattr(args, "savefig_kwargs", None),
+        "heatmap_vmin": getattr(args, "heatmap_vmin", None),
+        "heatmap_vmax": getattr(args, "heatmap_vmax", None),
+        "heatmap_cmap": getattr(args, "heatmap_cmap", None),
+        "heatmap_log_scale": bool(getattr(args, "heatmap_log_scale", False)),
+        "heatmap_colorbar_enabled": bool(
+            getattr(args, "heatmap_colorbar_enabled", True)
+        ),
+        "heatmap_colorbar_label": getattr(args, "heatmap_colorbar_label", None),
+        "heatmap_colorbar_label_size": getattr(
+            args, "heatmap_colorbar_label_size", None
+        ),
+        "heatmap_colorbar_tick_size": getattr(
+            args, "heatmap_colorbar_tick_size", None
+        ),
+        "heatmap_colorbar_position": getattr(
+            args, "heatmap_colorbar_position", "right"
+        ),
+        "heatmap_colorbar_pad": getattr(args, "heatmap_colorbar_pad", None),
+        "heatmap_colorbar_shrink": getattr(args, "heatmap_colorbar_shrink", None),
+        "heatmap_colorbar_aspect": getattr(args, "heatmap_colorbar_aspect", None),
+        "projection_line_width": getattr(args, "projection_line_width", None),
         "line_colors": (
             args.line_colors
             if getattr(args, "line_colors", None) is not None
@@ -9923,6 +10024,43 @@ def _collect_plot_settings_for_persistence(
     args: argparse.Namespace, *, keys: tuple[str, ...]
 ) -> dict[str, Any]:
     candidate = _collect_plot_settings_from_args(args, keys=keys)
+    if keys is _PLOT_SETTINGS_ORIENTATION_KEYS:
+        if "heatmap_value_mode" not in candidate:
+            legacy_mode = candidate.get("heatmap_normalization_mode")
+            if legacy_mode is None and candidate.get("heatmap_normalize"):
+                legacy_mode = "global_probability"
+            legacy_mapping = {
+                "counts": "raw_counts",
+                "global_probability": "joint_probability_density",
+                "bulk_water_reference": "bulk_relative_enrichment",
+            }
+            if legacy_mode in legacy_mapping:
+                candidate["heatmap_value_mode"] = legacy_mapping[str(legacy_mode)]
+        candidate.pop("heatmap_normalize", None)
+        candidate.pop("heatmap_normalization_mode", None)
+        raw_states = candidate.get("orientation_view_states")
+        if isinstance(raw_states, dict):
+            migrated_states: dict[str, Any] = {}
+            for view_id, raw_state in raw_states.items():
+                if not isinstance(raw_state, dict):
+                    migrated_states[str(view_id)] = raw_state
+                    continue
+                state = dict(raw_state)
+                if "heatmap_value_mode" not in state:
+                    legacy_mode = state.get("heatmap_normalization_mode")
+                    if legacy_mode is None and state.get("heatmap_normalize"):
+                        legacy_mode = "global_probability"
+                    legacy_mapping = {
+                        "counts": "raw_counts",
+                        "global_probability": "joint_probability_density",
+                        "bulk_water_reference": "bulk_relative_enrichment",
+                    }
+                    if legacy_mode in legacy_mapping:
+                        state["heatmap_value_mode"] = legacy_mapping[str(legacy_mode)]
+                state.pop("heatmap_normalize", None)
+                state.pop("heatmap_normalization_mode", None)
+                migrated_states[str(view_id)] = state
+            candidate["orientation_view_states"] = migrated_states
     resolved_view_mapping = _resolve_plot_settings_view_mapping(args, keys=keys)
     if resolved_view_mapping is not None:
         from .plot.profile_persistence import serialize_plot_view_mapping
@@ -10003,6 +10141,28 @@ def _derive_gui_sync_modes(settings: dict[str, Any]) -> dict[str, str]:
 
 
 def _apply_gui_settings_to_args(args: argparse.Namespace, settings: dict[str, Any]) -> None:
+    settings = deepcopy(settings)
+    migrated_legacy_heatmap_values = False
+    if "heatmap_value_mode" not in settings:
+        legacy_mode = settings.get("heatmap_normalization_mode")
+        if legacy_mode is None and settings.get("heatmap_normalize"):
+            legacy_mode = "global_probability"
+        legacy_mapping = {
+            "counts": "raw_counts",
+            "global_probability": "joint_probability_density",
+            "bulk_water_reference": "bulk_relative_enrichment",
+        }
+        if legacy_mode in legacy_mapping:
+            settings["heatmap_value_mode"] = legacy_mapping[str(legacy_mode)]
+            migrated_legacy_heatmap_values = True
+    settings.pop("heatmap_normalize", None)
+    settings.pop("heatmap_normalization_mode", None)
+    if migrated_legacy_heatmap_values:
+        LOGGER.warning(
+            "Migrated legacy heatmap normalization to '%s'. Semantics were updated; "
+            "the next profile save writes only the new displayed-value fields.",
+            settings["heatmap_value_mode"],
+        )
     always_forward = {
         "title",
         "title_visible",
@@ -10031,8 +10191,10 @@ def _apply_gui_settings_to_args(args: argparse.Namespace, settings: dict[str, An
         "heatmap_vmin",
         "heatmap_vmax",
         "heatmap_cmap",
-        "heatmap_normalize",
-        "heatmap_normalization_mode",
+        "heatmap_value_mode",
+        "heatmap_bulk_reference_mode",
+        "heatmap_bulk_min",
+        "heatmap_bulk_max",
         "heatmap_log_scale",
         "heatmap_colorbar_enabled",
         "heatmap_colorbar_label",
@@ -11998,7 +12160,7 @@ def build_parser() -> argparse.ArgumentParser:
             "Examples:\n"
             "  linak compute potential /path/to/*-v_hartree-1_0.cube\n"
             "  linak compute potential -f run1/*-v_hartree-1_0.cube run2/*-v_hartree-1_0.cube "
-            "--output potentials.h5\n"
+            "--output potentials.potential.h5\n"
             "  linak compute potential -f *.cube --threads 4 --water-padding-ang 4.0"
         ),
         formatter_class=argparse.RawTextHelpFormatter,
@@ -16725,9 +16887,10 @@ def _handle_compute_potential(args: argparse.Namespace) -> int:
 
     default_output = _default_potential_hdf5_output_for_sources(validated_sources)
     if args.output:
-        from .storage.hdf5_utils import resolve_hdf5_output_path
-
-        output_target = resolve_hdf5_output_path(args.output)
+        output_target = _resolve_requested_analysis_hdf5_output_path(
+            args.output,
+            default_output,
+        )
     else:
         output_target = default_output
 

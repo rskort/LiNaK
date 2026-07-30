@@ -72,7 +72,12 @@ from linak.storage.hdf5_utils import (
     write_linak_hdf5_profile_collection,
 )
 from linak.analysis.msd import compute_msd, load_msd_profile, save_msd_profile
-from linak.analysis.output_naming import analysis_source_base, numbered_hdf5_path
+from linak.analysis.output_naming import (
+    analysis_source_base,
+    append_hdf5_name_suffix,
+    ensure_analysis_hdf5_path,
+    numbered_hdf5_path,
+)
 from linak.plot.plot_settings import (
     read_active_plot_profile_name,
     read_plot_profile,
@@ -1684,7 +1689,7 @@ def test_compute_position_reuses_conversion_cached_pbc_and_surface(tmp_path, mon
     monkeypatch.setattr(pbc_module, "apply_pbc_to_frames", _fail_pbc)
     monkeypatch.setattr(density_module, "_select_surface_estimate", _fail_surface)
 
-    output = tmp_path / "position.h5"
+    output = tmp_path / "position.position.h5"
     rc = main(
         [
             "--log-level",
@@ -1815,7 +1820,7 @@ def test_compute_rdf_uses_converted_trajectory_hdf5_cell_metadata_without_input(
     )
     assert rc_convert == 0
 
-    output = converted_dir / "rdf.h5"
+    output = converted_dir / "rdf.rdf.h5"
     rc = main(
         [
             "--log-level",
@@ -1855,7 +1860,7 @@ def test_compute_density_accepts_converted_trajectory_hdf5(tmp_path):
         ),
     ]
     write_trajectory(frames, trajectory_h5)
-    output = tmp_path / "density.h5"
+    output = tmp_path / "density.density.h5"
 
     rc = main(
         [
@@ -4154,6 +4159,47 @@ def test_apply_gui_settings_to_args_forwards_heatmap_and_padding_without_declare
     assert getattr(args, "heatmap_colorbar_enabled", None) is False
 
 
+def test_apply_gui_settings_migrates_legacy_heatmap_normalization_one_way():
+    args = argparse.Namespace()
+    cli_mod._apply_gui_settings_to_args(
+        args,
+        {
+            "heatmap_normalization_mode": "bulk_water_reference",
+            "heatmap_normalize": False,
+        },
+    )
+
+    assert args.heatmap_value_mode == "bulk_relative_enrichment"
+    assert not hasattr(args, "heatmap_normalization_mode")
+    assert not hasattr(args, "heatmap_normalize")
+
+
+def test_orientation_profile_persistence_writes_only_new_heatmap_value_fields():
+    args = argparse.Namespace(
+        heatmap_normalization_mode="global_probability",
+        heatmap_normalize=True,
+        orientation_view_states={
+            "plot_2d_heatmap": {
+                "heatmap_normalization_mode": "bulk_water_reference",
+                "heatmap_normalize": False,
+            }
+        },
+    )
+
+    settings = cli_mod._collect_plot_settings_for_persistence(
+        args,
+        keys=cli_mod._PLOT_SETTINGS_ORIENTATION_KEYS,
+    )
+
+    assert settings["heatmap_value_mode"] == "joint_probability_density"
+    assert "heatmap_normalization_mode" not in settings
+    assert "heatmap_normalize" not in settings
+    heatmap_state = settings["orientation_view_states"]["plot_2d_heatmap"]
+    assert heatmap_state["heatmap_value_mode"] == "bulk_relative_enrichment"
+    assert "heatmap_normalization_mode" not in heatmap_state
+    assert "heatmap_normalize" not in heatmap_state
+
+
 def test_apply_gui_settings_to_args_forwards_density_grid_range_settings_without_declared_cli_attr():
     args = argparse.Namespace(title="Example")
     settings = {
@@ -4923,6 +4969,30 @@ def test_plot_orientation_public_view_options_resolve_mapping():
 
     assert kwargs["view_mapping"].view_type_id == PLOT_VIEW_2D_HEATMAP
     assert kwargs["view_mapping"].resolved_role_assignments()["z"] == "heatmap_azimuthal"
+
+
+def test_plot_orientation_public_heatmap_value_options_parse():
+    parser = cli_mod.build_plot_parser(analysis="orientation")
+    args = parser.parse_args(
+        [
+            "input.h5",
+            "--view-type",
+            "2d-heatmap",
+            "--heatmap-value-mode",
+            "bulk_relative_enrichment",
+            "--heatmap-bulk-reference",
+            "manual",
+            "--heatmap-bulk-min",
+            "7.5",
+            "--heatmap-bulk-max",
+            "12.0",
+        ]
+    )
+
+    assert args.heatmap_value_mode == "bulk_relative_enrichment"
+    assert args.heatmap_bulk_reference_mode == "manual"
+    assert args.heatmap_bulk_min == pytest.approx(7.5)
+    assert args.heatmap_bulk_max == pytest.approx(12.0)
 
 
 def test_plot_orientation_public_1d_y_quantity_resolves_mapping():
@@ -8901,6 +8971,7 @@ def test_plot_position_multiple_files_overlays_with_source_labels(tmp_path, monk
         captured["species"] = [item.species for item in profiles]
         captured["view_mapping"] = kwargs.get("view_mapping")
         captured["x_bin_width"] = kwargs.get("x_bin_width")
+        captured["projection_line_width"] = kwargs.get("projection_line_width")
         return None
 
     monkeypatch.setattr(
@@ -8921,6 +8992,8 @@ def test_plot_position_multiple_files_overlays_with_source_labels(tmp_path, monk
             "xy-z",
             "--time-section-width",
             "0.5",
+            "--trajectory-line-width",
+            "0.65",
             "--no-show",
         ]
     )
@@ -8935,6 +9008,7 @@ def test_plot_position_multiple_files_overlays_with_source_labels(tmp_path, monk
     assert captured["view_mapping"].y == "y"
     assert captured["view_mapping"].color == "distance_to_surface"
     assert captured["x_bin_width"] == pytest.approx(0.5)
+    assert captured["projection_line_width"] == pytest.approx(0.65)
 
 
 def test_plot_position_rejects_trajectory_input(tmp_path, capsys):
@@ -9302,7 +9376,7 @@ def test_position_projection_lazy_catalog_uses_filtered_point_count_in_line_colo
     catalog = cli_mod._build_position_gui_lazy_catalog(args, sources=[str(source_h5)])
     context = catalog.build_initial_context()
 
-    assert context.series_count == 80
+    assert context.series_count == 1
     assert context.estimated_total_points == 80
     assert "position GUI complexity at lazy_catalog" in caplog.text
     assert "raw_points=240" in caplog.text
@@ -9341,7 +9415,7 @@ def test_position_projection_lazy_catalog_estimates_without_full_profile_load(
     catalog = cli_mod._build_position_gui_lazy_catalog(args, sources=[str(source_h5)])
     context = catalog.build_initial_context()
 
-    assert context.series_count == 80
+    assert context.series_count == 1
     assert context.estimated_total_points == 80
 
 
@@ -10611,7 +10685,9 @@ def test_compute_density_output_trailing_slash_uses_directory_with_default_filen
     assert not (tmp_path / "custom_output.h5").exists()
 
 
-def test_compute_density_output_without_suffix_stays_file_path(tmp_path, monkeypatch):
+def test_compute_density_output_without_suffix_adds_invariant_analysis_suffix(
+    tmp_path, monkeypatch
+):
     monkeypatch.chdir(tmp_path)
     trajectory = tmp_path / "traj.xyz"
     _write_xyz(trajectory)
@@ -10636,7 +10712,8 @@ def test_compute_density_output_without_suffix_stays_file_path(tmp_path, monkeyp
     )
 
     assert rc == 0
-    assert (tmp_path / "custom_output.h5").exists()
+    assert (tmp_path / "custom_output.density.h5").exists()
+    assert not (tmp_path / "custom_output.h5").exists()
     assert not (output_base / "traj.density.h5").exists()
 
 
@@ -10878,6 +10955,25 @@ def test_numbered_hdf5_path_inserts_counter_before_analysis_suffix(tmp_path):
     assert numbered_hdf5_path(tmp_path / "run.density.hdf5", 1).name == "run_1.density.hdf5"
 
 
+def test_analysis_output_additions_never_change_the_compound_file_type(tmp_path):
+    assert (
+        append_hdf5_name_suffix(tmp_path / "sample.position.h5", "-all").name
+        == "sample-all.position.h5"
+    )
+    assert (
+        append_hdf5_name_suffix(tmp_path / "sample.density.hdf5", "_filtered").name
+        == "sample_filtered.density.hdf5"
+    )
+    assert (
+        ensure_analysis_hdf5_path(tmp_path / "custom-all.h5", "position").name
+        == "custom-all.position.h5"
+    )
+    assert (
+        ensure_analysis_hdf5_path(tmp_path / "custom-all", "density").name
+        == "custom-all.density.h5"
+    )
+
+
 def test_unique_hdf5_path_preserves_analysis_suffix_when_versioning(tmp_path):
     first = tmp_path / "linak_combined.potential.h5"
     second = tmp_path / "linak_combined_1.potential.h5"
@@ -10974,7 +11070,7 @@ def test_compute_density_supports_save_data_alias(tmp_path, monkeypatch):
     trajectory = tmp_path / "traj.xyz"
     _write_xyz(trajectory)
 
-    custom_output = tmp_path / "custom_density.h5"
+    custom_output = tmp_path / "custom_density.density.h5"
     rc = main(
         [
             "--log-level",
@@ -11366,12 +11462,12 @@ def test_compute_msd_from_lammps_dump_with_lmp_input(tmp_path, monkeypatch):
             "--input",
             str(lammps_input),
             "--output",
-            str(tmp_path / "msd_from_dump.h5"),
+            str(tmp_path / "msd_from_dump.msd.h5"),
         ]
     )
 
     assert rc == 0
-    data = load_msd_profile(tmp_path / "msd_from_dump.h5")
+    data = load_msd_profile(tmp_path / "msd_from_dump.msd.h5")
     assert data.time_fs[1] == pytest.approx(10.0)
 
 
@@ -11398,12 +11494,12 @@ def test_compute_msd_from_lammps_input_source(tmp_path, monkeypatch):
             "--species",
             "O",
             "--output",
-            str(tmp_path / "msd_from_lmp.h5"),
+            str(tmp_path / "msd_from_lmp.msd.h5"),
         ]
     )
 
     assert rc == 0
-    data = load_msd_profile(tmp_path / "msd_from_lmp.h5")
+    data = load_msd_profile(tmp_path / "msd_from_lmp.msd.h5")
     assert data.time_fs[1] == pytest.approx(10.0)
 
 
@@ -11432,12 +11528,15 @@ def test_compute_rdf_writes_resolution_metadata_to_hdf5(tmp_path, monkeypatch):
             "--bin-width",
             "0.2",
             "--output",
-            str(tmp_path / "rdf_metadata.h5"),
+            str(tmp_path / "rdf_metadata.rdf.h5"),
         ]
     )
     assert rc == 0
 
-    _datasets, metadata = read_linak_hdf5(tmp_path / "rdf_metadata.h5", expected_analysis="rdf")
+    _datasets, metadata = read_linak_hdf5(
+        tmp_path / "rdf_metadata.rdf.h5",
+        expected_analysis="rdf",
+    )
     assert metadata["source_path"] == str(trajectory.resolve())
     assert metadata["cell_source"].startswith("auto-detected")
     assert metadata["input_path"] == str(simulation_input.resolve())

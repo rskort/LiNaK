@@ -1,4 +1,5 @@
 import colorsys
+from dataclasses import replace
 import json
 
 import h5py
@@ -22,6 +23,7 @@ from linak.analysis.position import (
 from linak.analysis.common import RAW_SPECIES_ARRAY
 from linak.plot.contracts.position_contract import position_profile_to_plot_data_contract
 from linak.plot.mappings.position_mapping import position_mapping_preset
+from linak.plot.plotting import PlotStyle
 
 
 def _surface_test_frames() -> list[Atoms]:
@@ -953,6 +955,140 @@ def test_plot_position_profile_2d_projection_color_scale_ignores_mismatched_line
         "ignores per-series fixed line colors in color-scale mode" in message
         for message in caplog.messages
     )
+
+
+def test_plot_position_profile_2d_projection_supports_time_color_and_heatmap_style():
+    profile = compute_position_profile(
+        _surface_test_frames(),
+        species="O",
+        axis="z",
+        timestep_fs=2.0,
+        surface_mode="rough",
+        surface_elements=["Pt"],
+    )
+    captured: dict[str, object] = {}
+
+    plot_position_profile(
+        profile,
+        component="2d-projection",
+        projection_x="x",
+        projection_y="y",
+        projection_value="ps",
+        projection_render_mode="color-scale",
+        heatmap_cmap="viridis",
+        heatmap_vmin=0.0,
+        heatmap_vmax=0.01,
+        heatmap_colorbar_label="Elapsed time",
+        show=False,
+        capture_state=captured,
+    )
+
+    artist = captured["heatmap_artist"]
+    colorbar = captured["heatmap_colorbar"]
+    assert artist is not None
+    assert artist.get_cmap().name == "viridis"
+    assert artist.norm.vmin == pytest.approx(0.0)
+    assert artist.norm.vmax == pytest.approx(0.01)
+    assert colorbar is not None
+    assert colorbar.ax.get_ylabel() == "Elapsed time"
+    assert captured["projection_value"] == "ps"
+
+
+def test_plot_position_projection_uses_one_uniform_width_without_point_overlay():
+    profile = compute_position_profile(
+        _surface_test_frames(),
+        species="O",
+        axis="z",
+        timestep_fs=2.0,
+        surface_mode="rough",
+        surface_elements=["Pt"],
+    )
+    captured: dict[str, object] = {}
+
+    plot_position_profile(
+        profile,
+        component="2d-projection",
+        projection_x="x",
+        projection_y="y",
+        projection_value="ps",
+        projection_render_mode="color-scale",
+        projection_line_width=0.75,
+        line_kwargs={"linewidths": [8.0, 1.0]},
+        show=False,
+        capture_state=captured,
+    )
+
+    artist = captured["heatmap_artist"]
+    assert artist is not None
+    assert captured["heatmap_point_artist"] is None
+    assert captured["projection_line_width"] == pytest.approx(0.75)
+    assert np.asarray(artist.get_linewidths(), dtype=float) == pytest.approx([0.75])
+
+
+def test_plot_position_profiles_2d_species_color_mode_uses_profile_layers():
+    profile_o = compute_position_profile(
+        _surface_test_frames(),
+        species="O",
+        axis="z",
+        timestep_fs=2.0,
+        surface_mode="rough",
+        surface_elements=["Pt"],
+    )
+    profile_h = replace(profile_o, species="H", x=profile_o.x + 0.1)
+    captured: dict[str, object] = {}
+
+    plot_position_profiles(
+        [profile_o, profile_h],
+        component="2d-projection",
+        projection_x="x",
+        projection_y="y",
+        projection_render_mode="line-colors",
+        render_series_descriptors=[
+            {"series_id": "species:O", "default_label": "O"},
+            {"series_id": "species:H", "default_label": "H"},
+        ],
+        series_overrides_by_id={
+            "species:O": {"color": "#ff0000"},
+            "species:H": {"color": "#0000ff"},
+        },
+        show=False,
+        capture_state=captured,
+    )
+
+    ax = captured["axes"]
+    assert {line.get_color() for line in ax.lines} == {"#ff0000", "#0000ff"}
+    assert [text.get_text() for text in ax.get_legend().get_texts()] == ["O", "H"]
+    assert captured["heatmap_artist"] is None
+    assert captured["heatmap_colorbar"] is None
+
+
+def test_plot_position_projection_keeps_grid_off_when_grid_style_kwargs_are_present():
+    profile = compute_position_profile(
+        _surface_test_frames(),
+        species="O",
+        axis="z",
+        timestep_fs=2.0,
+        surface_mode="rough",
+        surface_elements=["Pt"],
+    )
+    captured: dict[str, object] = {}
+
+    plot_position_profile(
+        profile,
+        component="2d-projection",
+        projection_x="x",
+        projection_y="y",
+        projection_value="distance",
+        projection_render_mode="color-scale",
+        style=PlotStyle(grid=False),
+        grid_kwargs={"color": "#ff0000", "axis": "both", "which": "major"},
+        show=False,
+        capture_state=captured,
+    )
+
+    ax = captured["axes"]
+    assert not any(line.get_visible() for line in ax.get_xgridlines())
+    assert not any(line.get_visible() for line in ax.get_ygridlines())
 
 
 def test_plot_position_profiles_accepts_contract_driven_trajectory_mapping():

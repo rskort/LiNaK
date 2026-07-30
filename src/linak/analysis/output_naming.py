@@ -58,6 +58,31 @@ def combined_analysis_hdf5_filename(analysis: str, *, base: str = "linak_combine
     return f"{base_token}.{analysis_token}.h5"
 
 
+def ensure_analysis_hdf5_path(path: str | Path, analysis: str) -> Path:
+    """Return *path* with an invariant ``.<analysis>.h5/.hdf5`` ending.
+
+    The analysis token is part of the file type, not part of the user-editable
+    base name.  For example, ``sample-all.h5`` becomes
+    ``sample-all.position.h5`` for the position analysis.
+    """
+
+    path_obj = Path(path)
+    analysis_token = str(analysis).strip().lower() or "analysis"
+    lower_name = path_obj.name.lower()
+    hdf5_suffix = next(
+        (item for item in _HDF5_SUFFIXES if lower_name.endswith(item)),
+        ".h5",
+    )
+    expected_ending = f".{analysis_token}{hdf5_suffix}"
+    if lower_name.endswith(expected_ending):
+        return path_obj
+    if lower_name.endswith(hdf5_suffix):
+        base_name = path_obj.name[: -len(hdf5_suffix)]
+    else:
+        base_name = path_obj.name
+    return path_obj.with_name(f"{base_name}.{analysis_token}{hdf5_suffix}")
+
+
 def split_analysis_hdf5_name(name: str | Path) -> tuple[str, str, str] | None:
     """Split '<base>.<analysis>.h5/.hdf5' into base, analysis, suffix."""
 
@@ -84,3 +109,22 @@ def numbered_hdf5_path(path: str | Path, index: int) -> Path:
         base, analysis, suffix = split
         return path_obj.with_name(f"{base}_{index}.{analysis}{suffix}")
     return path_obj.with_name(f"{path_obj.stem}_{index}{path_obj.suffix}")
+
+
+def append_hdf5_name_suffix(path: str | Path, suffix: str) -> Path:
+    """Append a base-name suffix without changing a compound HDF5 file type."""
+
+    path_obj = Path(path)
+    split = split_analysis_hdf5_name(path_obj.name)
+    if split is not None:
+        base, analysis, hdf5_suffix = split
+        return path_obj.with_name(f"{base}{suffix}.{analysis}{hdf5_suffix}")
+    lower_name = path_obj.name.lower()
+    hdf5_suffix = next(
+        (item for item in _HDF5_SUFFIXES if lower_name.endswith(item)),
+        None,
+    )
+    if hdf5_suffix is not None:
+        base = path_obj.name[: -len(hdf5_suffix)]
+        return path_obj.with_name(f"{base}{suffix}{path_obj.name[-len(hdf5_suffix):]}")
+    return path_obj.with_name(f"{path_obj.stem}{suffix}{path_obj.suffix}")

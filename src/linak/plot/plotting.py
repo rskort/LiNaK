@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 import difflib
 import logging
@@ -115,6 +115,33 @@ class PlotStyle:
 
 
 DEFAULT_PLOT_STYLE = PlotStyle()
+
+
+def _apply_plot_grid(
+    ax: Any,
+    *,
+    style: PlotStyle,
+    grid_kwargs: Mapping[str, Any] | None,
+) -> None:
+    """Apply the grid visibility as authoritative state.
+
+    Matplotlib enables a grid when line properties are passed without an
+    explicit ``visible`` argument.  Keeping the off branch free of style
+    properties prevents a saved false state from being reversed on rerender.
+    """
+
+    if not style.grid:
+        ax.grid(False, which="both", axis="both")
+        return
+    resolved_grid_kwargs: dict[str, Any] = {
+        "linestyle": style.grid_linestyle,
+        "linewidth": style.grid_linewidth,
+        "alpha": style.grid_alpha,
+    }
+    if grid_kwargs is not None:
+        resolved_grid_kwargs.update(dict(grid_kwargs))
+    resolved_grid_kwargs.pop("visible", None)
+    ax.grid(True, **resolved_grid_kwargs)
 
 
 _MOJIBAKE_MARKERS = ("Ã", "â", "Î", "Ï", "Â")
@@ -2890,17 +2917,7 @@ def plot_heatmap_series(
             tick_params_kwargs
         )
 
-        if style.grid:
-            resolved_grid_kwargs: dict[str, Any] = {
-                "linestyle": style.grid_linestyle,
-                "linewidth": style.grid_linewidth,
-                "alpha": style.grid_alpha,
-            }
-            if grid_kwargs is not None:
-                resolved_grid_kwargs.update(dict(grid_kwargs))
-            ax.grid(True, **resolved_grid_kwargs)
-        else:
-            ax.grid(False)
+        _apply_plot_grid(ax, style=style, grid_kwargs=grid_kwargs)
         x_ticks_visible, y_ticks_visible = _resolve_tick_visibility(
             tick_params_kwargs,
             ticks_visible,
@@ -4069,17 +4086,7 @@ def plot_multi_line_series(
             tick_params_kwargs
         )
 
-        if style.grid:
-            resolved_grid_kwargs: dict[str, Any] = {
-                "linestyle": style.grid_linestyle,
-                "linewidth": style.grid_linewidth,
-                "alpha": style.grid_alpha,
-            }
-            if grid_kwargs is not None:
-                resolved_grid_kwargs.update(dict(grid_kwargs))
-            ax.grid(True, **resolved_grid_kwargs)
-        else:
-            ax.grid(False)
+        _apply_plot_grid(ax, style=style, grid_kwargs=grid_kwargs)
         x_ticks_visible, y_ticks_visible = _resolve_tick_visibility(
             tick_params_kwargs,
             ticks_visible,
