@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any
-from typing import Literal
+from typing import Literal, TypedDict
 
 from ..contracts.position_contract import (
     default_position_plot_data_contract,
@@ -57,6 +57,19 @@ _POSITION_LEGACY_XY_Z_ALIAS_TOKENS = frozenset(
 )
 
 
+class PositionRendererOptions(TypedDict):
+    component: str
+    time_axis: str
+    map_color: str
+    projection_x: str
+    projection_y: str
+    projection_value: str
+    projection_render_mode: str
+    projection_filter_min: float | None
+    projection_filter_max: float | None
+    xy_z_distance_max: float | None
+
+
 @dataclass(frozen=True)
 class ResolvedPositionPlotMapping:
     """Bundle the validated generic mapping and translated renderer options."""
@@ -64,7 +77,7 @@ class ResolvedPositionPlotMapping:
     contract: PlotDataContract
     mapping: PlotViewMapping
     compatibility: MappingStatus
-    renderer_options: dict[str, object]
+    renderer_options: PositionRendererOptions
 
     @property
     def uses_profile_descriptors(self) -> bool:
@@ -197,7 +210,7 @@ def position_plot_options_to_view_mapping(
     )
 
 
-def position_view_mapping_to_plot_options(mapping: PlotViewMapping) -> dict[str, object]:
+def position_view_mapping_to_plot_options(mapping: PlotViewMapping) -> PositionRendererOptions:
     """Translate one generic position mapping back into legacy plot options."""
 
     view_type_id = str(mapping.view_type_id).strip().lower()
@@ -205,9 +218,7 @@ def position_view_mapping_to_plot_options(mapping: PlotViewMapping) -> dict[str,
         x_quantity = str(mapping.x or "").strip()
         y_quantity = str(mapping.y or "").strip()
         if x_quantity not in _POSITION_TIME_AXIS_TOKEN_BY_ID:
-            raise ValueError(
-                "Position line mappings must place one time quantity on the x role."
-            )
+            raise ValueError("Position line mappings must place one time quantity on the x role.")
         if y_quantity not in _POSITION_COMPONENT_TOKEN_BY_ID:
             raise ValueError(
                 "Position 1D Line mappings must place one position quantity on the y role."
@@ -227,8 +238,7 @@ def position_view_mapping_to_plot_options(mapping: PlotViewMapping) -> dict[str,
 
     if canonical_plot_view_id(view_type_id) != PLOT_VIEW_2D_HEATMAP:
         raise ValueError(
-            "Current position plotting only translates generic mappings for "
-            "1D Line and 2D Heatmap."
+            "Current position plotting only translates generic mappings for 1D Line and 2D Heatmap."
         )
 
     x_quantity = str(mapping.x or "").strip()
@@ -246,20 +256,20 @@ def position_view_mapping_to_plot_options(mapping: PlotViewMapping) -> dict[str,
                 "quantities for the same trajectory view."
             )
     if value_quantity not in _POSITION_PROJECTION_TOKEN_BY_ID:
-        raise ValueError(
-            f"Unsupported position 2D Heatmap color quantity '{value_quantity}'."
-        )
+        raise ValueError(f"Unsupported position 2D Heatmap color quantity '{value_quantity}'.")
 
-    render_mode = str(
-        mapping.fixed_values.get("projection_render_mode")
-        or ("color-scale" if mapping.color is not None else "line-colors")
-    ).strip() or "color-scale"
+    render_mode = (
+        str(
+            mapping.fixed_values.get("projection_render_mode")
+            or ("color-scale" if mapping.color is not None else "line-colors")
+        ).strip()
+        or "color-scale"
+    )
     projection_value = _POSITION_PROJECTION_TOKEN_BY_ID[value_quantity]
     projection_filter_min = mapping.filter_min
     projection_filter_max = mapping.filter_max
     use_legacy_xy_z_cutoff = (
-        str(mapping.fixed_values.get("legacy_xy_z_distance_cutoff") or "").strip().lower()
-        == "true"
+        str(mapping.fixed_values.get("legacy_xy_z_distance_cutoff") or "").strip().lower() == "true"
     )
     xy_z_distance_max = None
     if use_legacy_xy_z_cutoff and projection_value == "distance" and projection_filter_min is None:

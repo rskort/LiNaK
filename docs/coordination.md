@@ -1,8 +1,40 @@
 # Coordination
 
+## Symmetric Cells
+
+Coordination v2 carries the same folded/top/bottom distance matrices and
+`interface_side` values as position. Coordination is computed once;
+side-specific views mask the atom-resolved result rather than duplicating or
+recomputing the trajectory.
+
+`interface_view=all` overlays folded, top, and bottom line series with explicit
+legend suffixes; a side view masks both distance and coordination values.
+`interface_view=full` uses the additive `axis_coordinate_A` matrix and retains
+all atoms. Files created before this dataset was introduced remain readable,
+but the Studio disables **Full cell (unfolded)** and asks for recomputation.
+The remaining Studio choices are **Positive-axis interface**,
+**Negative-axis interface**, **Combined interfaces (folded mean)**, and
+**Compare interface curves**.
+
 `linak compute coordination` computes a continuous coordination number for each
 selected center atom as a function of time and, when surface alignment is
 available, distance to a surface.
+
+Select center/neighbor pairs with repeatable `--species A B` arguments:
+
+```bash
+linak compute cn trajectory.traj.h5 --species O H --species H O --cutoff 1.3
+linak plot trajectory.coordination.h5 --species O H --species H O
+```
+
+At least one pair is required for computation. Each occurrence takes exactly
+two selectors: center `A`, then neighbor `B`. Unlike RDF, `O H` and `H O` are
+distinct coordination profiles. Duplicate ordered pairs are computed once, and
+the requested profiles share one trajectory load and output collection.
+Selectors support elements, `element:<symbol>`, `species:<stored raw label>`, and
+`all`; dynamic molecule selectors are not supported by the coordination CLI.
+An explicit `--cutoff` applies to every requested pair. RDF-derived cutoffs are
+resolved separately for each physical pair.
 
 ## What Is Being Computed
 
@@ -13,6 +45,7 @@ The stored result is atom-resolved and time-resolved:
 
 - `coordination_number[T, N_center]`
 - `distance_to_surface_A[T, N_center]`
+- `axis_coordinate_A[T, N_center]`
 
 This is not just one average CN per frame. Each tracked center atom keeps its
 own coordination trajectory.
@@ -47,8 +80,9 @@ documented in [Position](position.md) and [Surface Estimation](surface-estimatio
 
 ## Step 2: Resolve Neighbor Atoms
 
-LiNaK identifies the neighbor selection for species `B`. If `species_b` is not
-given, it defaults to the same species token as `species_a`.
+LiNaK identifies the neighbor selection for species `B`, the second token in
+`--species A B`. For same-species coordination, provide both tokens explicitly,
+for example `--species O O`.
 
 If `A == B`, self-pairs are excluded when computing neighbor contributions for a
 given center atom.

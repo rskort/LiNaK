@@ -77,7 +77,11 @@ def validation_badge(item: ProjectItem) -> Badge:
 
 
 def origin_badge(item: ProjectItem) -> Badge:
-    return Badge("external", "external") if item.origin == "external" else Badge("generated", "generated")
+    return (
+        Badge("external", "external")
+        if item.origin == "external"
+        else Badge("generated", "generated")
+    )
 
 
 def metadata_lines_for_item(item: ProjectItem, *, max_lines: int = 5) -> tuple[str, ...]:
@@ -217,11 +221,11 @@ def suggested_actions_for_item(
 ) -> tuple[Action, ...]:
     actions = registry.available_for(item)
     priority_by_type = {
-        "raw_trajectory": ("convert", "density", "msd"),
+        "raw_trajectory": ("convert", "density", "rdf"),
         "temperature_file": ("temperature",),
         "simulation_directory": ("pack_out_h5",),
-        "out_hdf5": ("density", "msd", "rdf"),
-        "trajectory_hdf5": ("density", "msd", "rdf"),
+        "out_hdf5": ("density", "rdf"),
+        "trajectory_hdf5": ("density", "rdf"),
         "cube_file": ("convert", "potential"),
         "cube_hdf5": ("potential", "open_plot"),
         "analysis_hdf5": ("open_plot",),
@@ -263,7 +267,10 @@ def filter_items(
         if normalized_query and normalized_query not in haystack:
             continue
         filtered.append(item)
-    return sorted(filtered, key=lambda item: (0 if item.origin == "external" else 1, item.display_name.lower()))
+    return sorted(
+        filtered,
+        key=lambda item: (0 if item.origin == "external" else 1, item.display_name.lower()),
+    )
 
 
 def relationship_names(store: ProjectStore, item: ProjectItem, relation: str) -> tuple[str, ...]:

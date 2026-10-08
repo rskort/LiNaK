@@ -290,7 +290,7 @@ def orientation_heatmap_profile_to_plot_data_contract(
     sparse_grid_cell_count = (
         None
         if sparse_grid is None
-        else int(np.asarray(getattr(sparse_grid, "flat_indices"), dtype=np.int64).size)
+        else int(np.asarray(sparse_grid.flat_indices, dtype=np.int64).size)
     )
     return _orientation_heatmap_contract(
         source_id=(

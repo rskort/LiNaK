@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from pathlib import Path
 
 import h5py
@@ -138,7 +140,7 @@ def test_read_trajectory_lammps_input_progress_uses_resolved_dump_total(tmp_path
     assert captured["total"] == 2
 
 
-def test_read_trajectory_extxyz_progress_uses_exact_total(tmp_path, monkeypatch):
+def test_read_trajectory_extxyz_progress_uses_byte_total(tmp_path, monkeypatch):
     path = tmp_path / "traj.xyz"
     frames = [
         Atoms("O", positions=[[0.0, 0.0, 0.0]]),
@@ -166,7 +168,7 @@ def test_read_trajectory_extxyz_progress_uses_exact_total(tmp_path, monkeypatch)
     loaded = read_trajectory(path)
 
     assert len(loaded) == 3
-    assert captured["total"] is None
+    assert captured["total"] == path.stat().st_size
 
 
 def test_read_trajectory_generic_ase_uses_single_pass_with_unknown_total(tmp_path, monkeypatch):
@@ -180,6 +182,7 @@ def test_read_trajectory_generic_ase_uses_single_pass_with_unknown_total(tmp_pat
     original_iread = io_mod.iread
 
     def _counting_iread(*args, **kwargs):
+        assert captured["calls"] is not None
         captured["calls"] += 1
         yield from original_iread(*args, **kwargs)
 
@@ -351,6 +354,7 @@ def test_read_trajectory_hdf5_surface_cache_rejects_malformed_available_cache(tm
         surface_cache.attrs["status"] = "available"
         surface_cache.attrs["axis"] = "z"
         surface_cache.attrs["surface_mode"] = "auto"
+        surface_cache.attrs["surface_layout"] = "auto"
 
     with pytest.raises(ValueError, match="surface cache is malformed"):
         read_trajectory_hdf5_surface_cache(

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from .settings_validation import validate_current_plot_settings
+
 import json
 import queue
 from copy import deepcopy
@@ -11,7 +13,6 @@ from pathlib import Path
 import re
 import tempfile
 import threading
-import warnings
 from collections.abc import Sequence
 from typing import Any, Callable
 from uuid import uuid4
@@ -43,6 +44,7 @@ from .contracts.potential_contract import default_potential_plot_data_contract
 from .data_validation import generic_view_type_compatibility, visual_role_compatibility
 from .fitting import coerce_fit_config, default_fit_config, supported_fit_types
 from .mappings.position_mapping import (
+    PositionMappingPresetName,
     _position_quantity_id_from_token,
     position_mapping_preset,
     position_plot_options_to_view_mapping,
@@ -225,7 +227,7 @@ def _contract_has_public_heatmap_view(contract: PlotDataContract) -> bool:
 
 _POSITION_GUI_VIEW_TYPE_LABEL_BY_ID = _plot_view_label_by_id(include_heatmap=True)
 _POSITION_GUI_VIEW_TYPE_ID_BY_LABEL = _plot_view_id_by_label(include_heatmap=True)
-_POSITION_GUI_PRESET_LABEL_BY_ID = {
+_POSITION_GUI_PRESET_LABEL_BY_ID: dict[PositionMappingPresetName, str] = {
     "distance_vs_time": "Distance vs time",
     "x_y_trajectory": "X/Y view",
     "x_z_trajectory": "X/Z view",
@@ -279,6 +281,12 @@ _ORIENTATION_LINE_QUANTITY_BACKEND_BY_LABEL.update(
     }
 )
 _DENSITY_X_MODE_LABELS = ("Distance", "X", "Y", "Z")
+_INTERFACE_VIEW_ORDER = ("full", "top", "bottom", "folded", "all")
+_INTERFACE_VIEW_STATIC_LABELS = {
+    "full": "Full cell (unfolded)",
+    "folded": "Combined interfaces (folded mean)",
+    "all": "Compare interface curves",
+}
 _DENSITY_VIEW_TYPE_LABEL_BY_ID = _plot_view_label_by_id(include_heatmap=True)
 _DENSITY_VIEW_TYPE_ID_BY_LABEL = _plot_view_id_by_label(include_heatmap=True)
 _DENSITY_X_MODE_BY_LABEL = {
@@ -300,9 +308,7 @@ _HEATMAP_VALUE_LABEL_BY_MODE = {
     "conditional_probability_density": "Orientation distribution at each distance",
     "bulk_relative_enrichment": "Relative to bulk orientation",
 }
-_HEATMAP_VALUE_MODE_BY_LABEL = {
-    label: mode for mode, label in _HEATMAP_VALUE_LABEL_BY_MODE.items()
-}
+_HEATMAP_VALUE_MODE_BY_LABEL = {label: mode for mode, label in _HEATMAP_VALUE_LABEL_BY_MODE.items()}
 _HEATMAP_VALUE_DESCRIPTION_BY_MODE = {
     "raw_counts": "C\u1d62\u2c7c. The color is the number of observations in each displayed bin.",
     "joint_probability_density": (
@@ -387,6 +393,10 @@ _TOOLTIPS: dict[str, str] = {
     "export.figure": "Saves the current figure to an image file.",
     "export.data": "Saves the current preview line data to a text data file.",
     "data.density.x_values": "Chooses which source quantity is assigned to the x role.",
+    "data.interface_view": (
+        "Chooses the unfolded periodic cell, one outward-facing interface, the equal-weight "
+        "folded mean, or a comparison overlay."
+    ),
     "data.density.quantity": "Chooses which density quantity is assigned to the y role.",
     "data.profile.species": "Filters the stored profile by species.",
     "data.profile.axis": "Filters the stored profile by axis.",
@@ -829,8 +839,6 @@ def _inferred_available_error_stats(
         return []
     if statistics_mode in {"raw_grouped", "saved_rebinned_sample"}:
         return ["sample_std", "sample_sem"]
-    if str(analysis_name or "").strip().lower() == "msd":
-        return ["sample_std", "sample_sem"]
     return ["sample_std", "sample_sem", "block_std", "block_sem"]
 
 
@@ -901,6 +909,23 @@ def _optional_float_list(value: str, *, field_name: str) -> list[float] | None:
                 f"{field_name} must contain only float values (comma or space separated)."
             ) from exc
     return parsed
+
+
+def _normalize_full_range_bound(
+    value: float | None,
+    default: float,
+) -> float | None:
+    """Treat exact and GUI-formatted dataset boundaries as unfiltered."""
+    if value is None:
+        return None
+    numeric_value = float(value)
+    numeric_default = float(default)
+    displayed_default = float(f"{numeric_default:.6g}")
+    if np.isclose(numeric_value, numeric_default, rtol=1.0e-12, atol=1.0e-12):
+        return None
+    if np.isclose(numeric_value, displayed_default, rtol=1.0e-12, atol=1.0e-12):
+        return None
+    return numeric_value
 
 
 def _format_float_list(value: Any) -> str:
@@ -1296,7 +1321,7 @@ def _error_supported_for_view(
 ) -> bool:
     """Return whether one GUI view supports 1-D error overlays and min-bin masking."""
     normalized_analysis = str(analysis).strip().lower()
-    if normalized_analysis in {"density", "msd", "rdf", "potential", "temperature"}:
+    if normalized_analysis in {"density", "rdf", "potential", "temperature"}:
         return True
     if normalized_analysis == "orientation":
         return not bool(orientation_heatmap)
@@ -1332,9 +1357,7 @@ def _plot_data_contract_from_payload(value: Any) -> PlotDataContract | None:
             id=str(item.get("id") or ""),
             label=str(item.get("label") or ""),
             kind=str(item.get("kind") or ""),
-            length=(
-                None if item.get("length") is None else int(item.get("length"))
-            ),
+            length=(None if item.get("length") is None else int(item["length"])),
             unit=None if item.get("unit") is None else str(item.get("unit")),
         )
         for item in value.get("dimensions", [])
@@ -1345,11 +1368,11 @@ def _plot_data_contract_from_payload(value: Any) -> PlotDataContract | None:
             id=str(item.get("id") or ""),
             label=str(item.get("label") or ""),
             kind=str(item.get("kind") or ""),
-            dimensions=tuple(str(token) for token in item.get("dimensions", []) if str(token).strip()),
-            unit=None if item.get("unit") is None else str(item.get("unit")),
-            source_name=(
-                None if item.get("source_name") is None else str(item.get("source_name"))
+            dimensions=tuple(
+                str(token) for token in item.get("dimensions", []) if str(token).strip()
             ),
+            unit=None if item.get("unit") is None else str(item.get("unit")),
+            source_name=(None if item.get("source_name") is None else str(item.get("source_name"))),
         )
         for item in value.get("quantities", [])
         if isinstance(item, dict) and str(item.get("id") or "").strip()
@@ -1449,7 +1472,9 @@ def _mapping_summary_text(mapping: PlotViewMapping) -> str:
         if value is None:
             continue
         token = f"{role}={value}"
-        if role == "filter_by" and (mapping.filter_min is not None or mapping.filter_max is not None):
+        if role == "filter_by" and (
+            mapping.filter_min is not None or mapping.filter_max is not None
+        ):
             token += f" [{'' if mapping.filter_min is None else mapping.filter_min}, {'' if mapping.filter_max is None else mapping.filter_max}]"
         parts.append(token)
     if not parts:
@@ -1634,12 +1659,14 @@ def _coordination_backend_summary_text(*, component: str, time_axis: str) -> str
             f"view type={plot_view_display_label(PLOT_VIEW_1D_LINE)}, "
             "x role=distance_to_surface, y role=coordination_number"
         )
-    view_type = PLOT_VIEW_2D_HEATMAP if normalized_component == "time-distance" else PLOT_VIEW_1D_LINE
-    y_role = "distance_to_surface" if normalized_component == "time-distance" else "coordination_number"
+    view_type = (
+        PLOT_VIEW_2D_HEATMAP if normalized_component == "time-distance" else PLOT_VIEW_1D_LINE
+    )
+    y_role = (
+        "distance_to_surface" if normalized_component == "time-distance" else "coordination_number"
+    )
     color_role = (
-        ", color role=coordination_number"
-        if normalized_component == "time-distance"
-        else ""
+        ", color role=coordination_number" if normalized_component == "time-distance" else ""
     )
     return (
         f"view type={plot_view_display_label(view_type)}, "
@@ -1903,9 +1930,10 @@ def launch_plot_settings_panel(
             "Install PySide6 or use CLI plot flags."
         ) from exc
 
+    navigation_toolbar_type = None
     if NavigationToolbar2QT is not None:
 
-        class _LiNaKNavigationToolbar(NavigationToolbar2QT):  # type: ignore[misc, valid-type]
+        class _LiNaKNavigationToolbar(NavigationToolbar2QT):
             def __init__(
                 self,
                 canvas: Any,
@@ -1919,8 +1947,7 @@ def launch_plot_settings_panel(
             def save_figure(self, *args: Any, **kwargs: Any) -> None:
                 self._on_linak_save_figure()
 
-    else:  # pragma: no cover - matplotlib Qt backend availability
-        _LiNaKNavigationToolbar = None
+        navigation_toolbar_type = _LiNaKNavigationToolbar
 
     defaults = DEFAULT_PLOT_STYLE
 
@@ -1958,234 +1985,6 @@ def launch_plot_settings_panel(
             finally:
                 painter.end()
 
-    class _SeriesRowWidget(QWidget):
-        def __init__(
-            self,
-            *,
-            on_select: Callable[[], None],
-            on_toggle: Callable[[bool], None],
-            on_move_up: Callable[[], None],
-            on_move_down: Callable[[], None],
-            parent: QWidget | None = None,
-        ) -> None:
-            super().__init__(parent)
-            self._on_select = on_select
-            self._on_toggle = on_toggle
-            self._on_move_up = on_move_up
-            self._on_move_down = on_move_down
-            self.setObjectName("seriesRowWidget")
-
-            layout = QHBoxLayout(self)
-            layout.setContentsMargins(8, 4, 8, 4)
-            layout.setSpacing(8)
-
-            self.checkbox = QCheckBox(self)
-            self.checkbox.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-            self.checkbox.toggled.connect(self._on_toggle)
-            layout.addWidget(self.checkbox)
-
-            self.color_swatch = QFrame(self)
-            self.color_swatch.setObjectName("seriesRowSwatch")
-            self.color_swatch.setFixedSize(12, 12)
-            layout.addWidget(self.color_swatch)
-
-            self.text_label = QLabel(self)
-            self.text_label.setSizePolicy(
-                QSizePolicy.Policy.Expanding,
-                QSizePolicy.Policy.Preferred,
-            )
-            layout.addWidget(self.text_label, stretch=1)
-
-            self.kind_badge = QLabel(self)
-            self.kind_badge.setObjectName("seriesRowKindBadge")
-            layout.addWidget(self.kind_badge)
-
-            self.move_up_button = QToolButton(self)
-            self.move_up_button.setObjectName("seriesRowButton")
-            self.move_up_button.setText("▴")
-            self.move_up_button.setAutoRaise(True)
-            self.move_up_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-            self.move_up_button.setFixedSize(22, 22)
-            self.move_up_button.setArrowType(Qt.ArrowType.UpArrow)
-            self.move_up_button.setText("")
-            self.move_up_button.clicked.connect(self._handle_move_up_clicked)
-            layout.addWidget(self.move_up_button)
-
-            self.move_down_button = QToolButton(self)
-            self.move_down_button.setObjectName("seriesRowButton")
-            self.move_down_button.setText("▾")
-            self.move_down_button.setAutoRaise(True)
-            self.move_down_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-            self.move_down_button.setFixedSize(22, 22)
-            self.move_down_button.setArrowType(Qt.ArrowType.DownArrow)
-            self.move_down_button.setText("")
-            self.move_down_button.clicked.connect(self._handle_move_down_clicked)
-            layout.addWidget(self.move_down_button)
-
-            for target in (self, self.text_label, self.color_swatch):
-                target.installEventFilter(self)
-
-        def eventFilter(self, watched: Any, event: Any) -> bool:  # pragma: no cover - UI flow
-            if watched in {
-                self,
-                self.text_label,
-                self.color_swatch,
-            } and event.type() in {
-                QEvent.Type.MouseButtonPress,
-                QEvent.Type.MouseButtonDblClick,
-            }:
-                QTimer.singleShot(0, self._on_select)
-            return super().eventFilter(watched, event)
-
-        def _handle_move_up_clicked(self) -> None:
-            self._on_select()
-            self._on_move_up()
-
-        def _handle_move_down_clicked(self) -> None:
-            self._on_select()
-            self._on_move_down()
-
-        def update_content(
-            self,
-            *,
-            text: str,
-            checked: bool,
-            enabled: bool,
-            selected: bool,
-            color_token: str,
-            kind: str,
-            layer_role: str,
-            can_move_up: bool,
-            can_move_down: bool,
-            tooltip_text: str,
-            theme: dict[str, str],
-        ) -> None:
-            self.checkbox.blockSignals(True)
-            try:
-                self.checkbox.setChecked(checked)
-            finally:
-                self.checkbox.blockSignals(False)
-            self.checkbox.setEnabled(kind == "base")
-            self.checkbox.setVisible(True)
-            self.text_label.setText(text)
-            self.setToolTip(tooltip_text)
-            self.text_label.setToolTip(tooltip_text)
-
-            if not color_token:
-                self.color_swatch.setVisible(False)
-            else:
-                self.color_swatch.setVisible(True)
-                swatch_color = QColor(color_token)
-                if swatch_color.isValid():
-                    self.color_swatch.setStyleSheet(
-                        "background-color: "
-                        f"{swatch_color.name()}; "
-                        f"border: 1px solid {theme['series_row_swatch_border']}; "
-                        "border-radius: 6px;"
-                    )
-                else:
-                    self.color_swatch.setStyleSheet(
-                        "background-color: "
-                        f"{theme['series_row_swatch_bg']}; "
-                        f"border: 1px solid {theme['series_row_swatch_border']}; "
-                        "border-radius: 6px;"
-                    )
-
-            text_color = theme["series_row_selected_text"] if selected else theme["series_row_text"]
-            if not enabled:
-                text_color = theme["series_row_disabled_text"]
-            normalized_role = layer_role.strip().lower()
-            badge_label = {
-                "group": "Group",
-                "copy": "Copy",
-                "original": "Original",
-            }.get(normalized_role, layer_role.strip().title() or "Layer")
-            badge_prefix = (
-                "series_badge_group"
-                if normalized_role == "group"
-                else "series_badge_copy"
-                if normalized_role == "copy"
-                else "series_badge_original"
-            )
-            badge_bg = theme[f"{badge_prefix}_bg"]
-            badge_border = theme[f"{badge_prefix}_border"]
-            badge_text = theme[f"{badge_prefix}_text"]
-            self.kind_badge.setText(badge_label)
-            self.kind_badge.setStyleSheet(
-                "padding: 2px 8px;"
-                "border-radius: 999px;"
-                f"background-color: {badge_bg};"
-                f"border: 1px solid {badge_border};"
-                f"color: {badge_text};"
-                "font-weight: 700;"
-                "font-size: 10px;"
-            )
-
-            if selected:
-                row_bg = theme["series_row_selected_bg"]
-                left_border = f"5px solid {theme['series_row_selected_border']}"
-                edge_border = f"1px solid {theme['series_row_selected_border']}"
-                tl_radius = "4px"
-                bl_radius = "4px"
-                tr_radius = "8px"
-                br_radius = "8px"
-            else:
-                row_bg = theme["series_row_bg"]
-                left_border = "4px solid transparent"
-                edge_border = "1px solid transparent"
-                tl_radius = "4px"
-                bl_radius = "4px"
-                tr_radius = "8px"
-                br_radius = "8px"
-
-            self.setStyleSheet(
-                "QWidget#seriesRowWidget {"
-                f"background-color: {row_bg};"
-                f"border-left: {left_border};"
-                f"border-top: {edge_border};"
-                f"border-right: {edge_border};"
-                f"border-bottom: {edge_border};"
-                f"border-top-left-radius: {tl_radius};"
-                f"border-bottom-left-radius: {bl_radius};"
-                f"border-top-right-radius: {tr_radius};"
-                f"border-bottom-right-radius: {br_radius};"
-                "}"
-                "QToolButton#seriesRowButton {"
-                "padding: 0px;"
-                "margin: 0px;"
-                "border: none;"
-                "background: transparent;"
-                f"color: {text_color};"
-                "}"
-                "QToolButton#seriesRowButton:hover {"
-                "border-radius: 6px;"
-                f"background-color: {theme['series_row_button_hover']};"
-                "}"
-                "QToolButton#seriesRowButton:disabled {"
-                f"color: {theme['series_row_disabled_text']};"
-                "}"
-            )
-
-            label_font_style = "italic" if not enabled else "normal"
-            if kind == "fit":
-                label_font_weight = "700"
-            elif kind in {"error", "cumulative"}:
-                label_font_weight = "700" if selected else "600"
-            else:
-                label_font_weight = "600" if selected else "400"
-            self.text_label.setStyleSheet(
-                "border: none;"
-                f"color: {text_color};"
-                f"font-style: {label_font_style};"
-                f"font-weight: {label_font_weight};"
-            )
-
-            control_enabled = kind == "base"
-            self.move_up_button.setEnabled(control_enabled and can_move_up)
-            self.move_down_button.setEnabled(control_enabled and can_move_down)
-            self.move_up_button.setVisible(control_enabled)
-            self.move_down_button.setVisible(control_enabled)
-
     _SERIES_ROW_STATE_ROLE = int(Qt.ItemDataRole.UserRole) + 10
 
     class _SeriesListItem:
@@ -2217,8 +2016,8 @@ def launch_plot_settings_panel(
             super().__init__(parent)
             self._items: list[_SeriesListItem] = []
 
-        def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
-            if parent.isValid():
+        def rowCount(self, parent: QModelIndex | None = None) -> int:
+            if parent is not None and parent.isValid():
                 return 0
             return len(self._items)
 
@@ -2307,7 +2106,9 @@ def launch_plot_settings_panel(
             index: QModelIndex,
         ) -> None:  # pragma: no cover - UI paint
             state = self._row_state(index)
-            theme = state.get("theme") if isinstance(state.get("theme"), dict) else {}
+            theme = state.get("theme")
+            if not isinstance(theme, dict):
+                theme = {}
             selected = bool(option.state & QStyle.StateFlag.State_Selected)
             enabled = bool(state.get("enabled", True))
             kind = str(state.get("kind") or "base")
@@ -2340,7 +2141,9 @@ def launch_plot_settings_panel(
 
                 checkbox_rect = self._checkbox_rect(option.rect)
                 painter.setPen(QPen(QColor(theme.get("series_row_swatch_border", "#46627f"))))
-                painter.setBrush(QBrush(QColor("#2fb7c9" if bool(state.get("checked", True)) else "#0f1a2a")))
+                painter.setBrush(
+                    QBrush(QColor("#2fb7c9" if bool(state.get("checked", True)) else "#0f1a2a"))
+                )
                 painter.drawRoundedRect(checkbox_rect, 3, 3)
                 if bool(state.get("checked", True)):
                     painter.setPen(QPen(QColor("#ffffff"), 2))
@@ -2428,7 +2231,9 @@ def launch_plot_settings_panel(
                         else theme.get("series_row_disabled_text", "#8290a3")
                     )
                     painter.setPen(QPen(arrow_color))
-                    painter.drawText(self._down_rect(option.rect), Qt.AlignmentFlag.AlignCenter, "v")
+                    painter.drawText(
+                        self._down_rect(option.rect), Qt.AlignmentFlag.AlignCenter, "v"
+                    )
             finally:
                 painter.restore()
 
@@ -3038,10 +2843,7 @@ def launch_plot_settings_panel(
                 if self._analysis_name == "coordination"
                 else None
             )
-            if (
-                self._analysis_name == "coordination"
-                and self._coordination_data_contract is None
-            ):
+            if self._analysis_name == "coordination" and self._coordination_data_contract is None:
                 self._coordination_data_contract = _fallback_coordination_plot_data_contract()
             self._orientation_line_data_contract = (
                 _plot_data_contract_from_payload(
@@ -3327,16 +3129,21 @@ def launch_plot_settings_panel(
             self._gui_artwork_path = _default_gui_artwork_path()
             self._figure_save_filters, self._figure_default_name = _figure_filetype_filters()
             self._data_save_filters, self._data_default_name = _data_filetype_filters()
-            self._preview_image_path = (
+            self._preview_image_path: Path | None = (
                 Path(tempfile.gettempdir()) / f"linak_preview_{uuid4().hex}.png"
             )
-            self._preview_temp_paths: set[Path] = {self._preview_image_path}
+            self._preview_temp_paths: set[Path] = set()
+            if self._preview_image_path is not None:
+                self._preview_temp_paths.add(self._preview_image_path)
             self._preview_generation = 0
             self._active_preview_generation: int | None = None
+            self._active_preview_signature: str | None = None
             self._active_preview_image_path: Path | None = None
             self._active_preview_interactive = False
             self._pending_preview_request: tuple[dict[str, Any], bool] | None = None
-            self._preview_worker_queue: queue.Queue[tuple[int, dict[str, Any], Path | None] | None] = queue.Queue()
+            self._preview_worker_queue: queue.Queue[
+                tuple[int, dict[str, Any], Path | None] | None
+            ] = queue.Queue()
             self._preview_worker_stop = threading.Event()
             self._preview_worker_thread: threading.Thread | None = threading.Thread(
                 target=self._preview_worker_loop,
@@ -3377,7 +3184,9 @@ def launch_plot_settings_panel(
             except Exception:
                 self._saved_signature = None
             self._reset_undo_history()
-            self._update_embedded_preview(interactive=False)
+            # Start the first render after the maximized window has entered the
+            # event loop.  Rendering during construction contends with Qt's
+            # initial layout and can leave the window looking unresponsive.
 
         def _signature(self, settings: dict[str, Any]) -> str:
             return json.dumps(settings, sort_keys=True, separators=(",", ":"), default=str)
@@ -3392,7 +3201,7 @@ def launch_plot_settings_panel(
 
         def _combo(
             self,
-            values: tuple[str, ...],
+            values: Sequence[str],
             *,
             editable: bool = False,
             minimum_contents_length: int = 12,
@@ -4009,9 +3818,7 @@ def launch_plot_settings_panel(
                     point_artist = self._last_preview_state.get("heatmap_point_artist")
                     if point_artist is not None and hasattr(point_artist, "set_sizes"):
                         point_count = len(point_artist.get_offsets())
-                        point_artist.set_sizes(
-                            [max(1.0, projection_width**2)] * point_count
-                        )
+                        point_artist.set_sizes([max(1.0, projection_width**2)] * point_count)
                 except Exception:
                     return False
 
@@ -4073,11 +3880,7 @@ def launch_plot_settings_panel(
             axes = list(getattr(self._preview_figure, "axes", []) or [])
             if not axes:
                 return False
-            lines = [
-                line
-                for ax in axes
-                for line in list(getattr(ax, "lines", []) or [])
-            ]
+            lines = [line for ax in axes for line in list(getattr(ax, "lines", []) or [])]
             if not lines:
                 return False
 
@@ -4176,7 +3979,8 @@ def launch_plot_settings_panel(
                 if current_width > 0.0 and current_height > 0.0:
                     return current_width, current_height
 
-            return tuple(float(value) for value in DEFAULT_PLOT_STYLE.figure_size)
+            width, height = DEFAULT_PLOT_STYLE.figure_size
+            return float(width), float(height)
 
         def _resize_preview_canvas_to_figure(self) -> None:
             if self._preview_canvas is None or self._preview_figure is None:
@@ -4263,18 +4067,18 @@ def launch_plot_settings_panel(
             font_family = self.font_family.text().strip()
             font_color = self.font_color.text().strip()
             base_sizes = default_plot_font_sizes(self._resolved_base_font_size_value())
-            x_tick_size = self._optional_int_from_line(self.x_tick_font) or base_sizes[
-                "tick_font_size"
-            ]
-            y_tick_size = self._optional_int_from_line(self.y_tick_font) or base_sizes[
-                "tick_font_size"
-            ]
-            legend_size = self._optional_int_from_line(self.legend_font) or base_sizes[
-                "legend_font_size"
-            ]
-            title_size = self._optional_int_from_line(self.title_font) or base_sizes[
-                "title_font_size"
-            ]
+            x_tick_size = (
+                self._optional_int_from_line(self.x_tick_font) or base_sizes["tick_font_size"]
+            )
+            y_tick_size = (
+                self._optional_int_from_line(self.y_tick_font) or base_sizes["tick_font_size"]
+            )
+            legend_size = (
+                self._optional_int_from_line(self.legend_font) or base_sizes["legend_font_size"]
+            )
+            title_size = (
+                self._optional_int_from_line(self.title_font) or base_sizes["title_font_size"]
+            )
             label_size = base_sizes["label_font_size"]
             x_label_size = self._optional_int_from_line(self.x_label_font) or label_size
             y_label_size = self._optional_int_from_line(self.y_label_font) or label_size
@@ -4539,16 +4343,12 @@ def launch_plot_settings_panel(
             if not isinstance(raw_descriptors, list):
                 return
             descriptors = [
-                dict(descriptor)
-                for descriptor in raw_descriptors
-                if isinstance(descriptor, dict)
+                dict(descriptor) for descriptor in raw_descriptors if isinstance(descriptor, dict)
             ]
             if not descriptors:
                 return
             labels = [
-                str(label)
-                for label in render_state.get("series_labels", [])
-                if str(label).strip()
+                str(label) for label in render_state.get("series_labels", []) if str(label).strip()
             ]
             if not labels:
                 labels = [
@@ -4560,8 +4360,7 @@ def launch_plot_settings_panel(
                 for descriptor in self._series_descriptors_data
             ]
             next_ids = [
-                str(descriptor.get("series_id") or "").strip()
-                for descriptor in descriptors
+                str(descriptor.get("series_id") or "").strip() for descriptor in descriptors
             ]
             if current_ids == next_ids:
                 return
@@ -4618,7 +4417,9 @@ def launch_plot_settings_panel(
         def _profile_name_unchanged_message(name: str) -> str:
             return f"Profile name is still '{name}'. Enter a different name to rename it."
 
-        def _set_profile_names(self, names: Sequence[str], *, active_name: str | None = None) -> None:
+        def _set_profile_names(
+            self, names: Sequence[str], *, active_name: str | None = None
+        ) -> None:
             normalized_names: list[str] = []
             seen_names: set[str] = set()
             for raw_name in names:
@@ -5090,13 +4891,18 @@ def launch_plot_settings_panel(
                     raise ValueError(profile_name_conflict_message(name))
                 message = on_rename_profile(current_name, name)
                 self._set_profile_names(
-                    [name if entry.casefold() == current_name.casefold() else entry for entry in self._profile_names],
+                    [
+                        name if entry.casefold() == current_name.casefold() else entry
+                        for entry in self._profile_names
+                    ],
                     active_name=name,
                 )
                 if on_load_profile is None:
                     raise ValueError("Profile loading is unavailable after renaming.")
                 loaded = on_load_profile(name)
-                self._load_settings_into_editor(loaded, profile_name=name, status_message=message, mark_saved=True)
+                self._load_settings_into_editor(
+                    loaded, profile_name=name, status_message=message, mark_saved=True
+                )
                 self._schedule_preview_update()
             except Exception as exc:
                 self._report_error("Rename profile failed", exc)
@@ -5128,7 +4934,9 @@ def launch_plot_settings_panel(
                 deleted_name = self._current_profile_name
                 next_profile_name, message = on_delete_profile(deleted_name)
                 remaining_names = [
-                    name for name in self._profile_names if name.casefold() != deleted_name.casefold()
+                    name
+                    for name in self._profile_names
+                    if name.casefold() != deleted_name.casefold()
                 ]
                 self._set_profile_names(
                     remaining_names,
@@ -7520,15 +7328,9 @@ def launch_plot_settings_panel(
 
             value_group = QGroupBox("Data Representation")
             value_form = QFormLayout(value_group)
-            self.heatmap_value_mode = self._combo(
-                tuple(_HEATMAP_VALUE_LABEL_BY_MODE.values())
-            )
-            self.heatmap_value_mode.currentTextChanged.connect(
-                self._refresh_widget_states
-            )
-            self.heatmap_value_mode.currentTextChanged.connect(
-                self._schedule_preview_update
-            )
+            self.heatmap_value_mode = self._combo(tuple(_HEATMAP_VALUE_LABEL_BY_MODE.values()))
+            self.heatmap_value_mode.currentTextChanged.connect(self._refresh_widget_states)
+            self.heatmap_value_mode.currentTextChanged.connect(self._schedule_preview_update)
             self._add_form_row(
                 value_form,
                 "Displayed values",
@@ -7548,9 +7350,7 @@ def launch_plot_settings_panel(
             value_form.addRow(self.heatmap_value_pipeline)
 
             self.heatmap_bulk_reference_mode = self._combo(("Automatic", "Manual"))
-            self.heatmap_bulk_reference_mode.currentTextChanged.connect(
-                self._refresh_widget_states
-            )
+            self.heatmap_bulk_reference_mode.currentTextChanged.connect(self._refresh_widget_states)
             self.heatmap_bulk_reference_mode.currentTextChanged.connect(
                 self._schedule_preview_update
             )
@@ -7576,9 +7376,7 @@ def launch_plot_settings_panel(
                 self.heatmap_bulk_max,
                 tooltip_id="figure.heatmap.bulk_range",
             )
-            self.heatmap_bulk_summary = QLabel(
-                "The resolved bulk range will appear after preview."
-            )
+            self.heatmap_bulk_summary = QLabel("The resolved bulk range will appear after preview.")
             self.heatmap_bulk_summary.setWordWrap(True)
             self.heatmap_bulk_summary.setObjectName("sectionNote")
             value_form.addRow(self.heatmap_bulk_summary)
@@ -8086,7 +7884,6 @@ def launch_plot_settings_panel(
 
             if self._analysis_name in {
                 "density",
-                "msd",
                 "rdf",
                 "potential",
                 "position",
@@ -8316,7 +8113,6 @@ def launch_plot_settings_panel(
 
             if self._analysis_name in {
                 "density",
-                "msd",
                 "rdf",
                 "potential",
                 "position",
@@ -9248,9 +9044,7 @@ def launch_plot_settings_panel(
             label = self.heatmap_value_mode.currentText().strip()
             mode = _HEATMAP_VALUE_MODE_BY_LABEL.get(label, "raw_counts")
             if hasattr(self, "heatmap_value_description"):
-                self.heatmap_value_description.setText(
-                    _HEATMAP_VALUE_DESCRIPTION_BY_MODE[mode]
-                )
+                self.heatmap_value_description.setText(_HEATMAP_VALUE_DESCRIPTION_BY_MODE[mode])
             if not hasattr(self, "heatmap_bulk_summary"):
                 return
             if mode != "bulk_relative_enrichment":
@@ -9271,34 +9065,283 @@ def launch_plot_settings_panel(
                 f"({row_count} contributing distance bins)."
             )
 
+        def _interface_surface_axis(self) -> str:
+            if hasattr(self, "analysis_axis"):
+                candidate = self.analysis_axis.currentText().strip().lower()
+                if candidate in {"x", "y", "z"}:
+                    return candidate
+            candidate = str(self._profile_filter_options.get("surface_axis") or "").lower()
+            if candidate in {"x", "y", "z"}:
+                return candidate
+            axes = self._profile_filter_options.get("axes")
+            if isinstance(axes, list) and len(axes) == 1:
+                candidate = str(axes[0]).strip().lower()
+                if candidate in {"x", "y", "z"}:
+                    return candidate
+            return "z"
+
+        def _interface_view_labels(self) -> dict[str, str]:
+            axis = self._interface_surface_axis().upper()
+            return {
+                "full": _INTERFACE_VIEW_STATIC_LABELS["full"],
+                "top": f"Positive-axis interface (+{axis})",
+                "bottom": f"Negative-axis interface (−{axis})",
+                "folded": _INTERFACE_VIEW_STATIC_LABELS["folded"],
+                "all": _INTERFACE_VIEW_STATIC_LABELS["all"],
+            }
+
+        def _selected_interface_view(self) -> str:
+            if not hasattr(self, "interface_view_combo"):
+                return "folded"
+            selected = self.interface_view_combo.currentText().strip()
+            for value, label in self._interface_view_labels().items():
+                if selected == label:
+                    return value
+            lowered = selected.lower()
+            if lowered.startswith("positive-axis"):
+                return "top"
+            if lowered.startswith("negative-axis"):
+                return "bottom"
+            return "folded"
+
+        def _has_symmetric_interface_views(self) -> bool:
+            resolved = (
+                str(self._profile_filter_options.get("surface_layout_resolved") or "")
+                .strip()
+                .lower()
+            )
+            if resolved:
+                return resolved == "symmetric"
+            capabilities = self._profile_filter_options.get("surface_view_capabilities")
+            if not isinstance(capabilities, (list, tuple, set)):
+                return False
+            normalized = {str(value).strip().lower() for value in capabilities}
+            return {"top", "bottom", "all"}.issubset(normalized)
+
+        def _density_symmetric_1d_coordinate_locked(self) -> bool:
+            if (
+                self._analysis_name != "density"
+                or not hasattr(self, "density_x_mode")
+                or not self._has_symmetric_interface_views()
+            ):
+                return False
+            return self._density_current_view_type_id() == PLOT_VIEW_1D_LINE
+
+        def _sync_density_interface_coordinate(self) -> None:
+            if not self._density_symmetric_1d_coordinate_locked():
+                return
+            target = (
+                self._interface_surface_axis().upper()
+                if self._selected_interface_view() == "full"
+                else "Distance"
+            )
+            previous = self.density_x_mode.blockSignals(True)
+            try:
+                self._set_combo_value(self.density_x_mode, target)
+            finally:
+                self.density_x_mode.blockSignals(previous)
+
+        def _refresh_interface_view_control(self, preferred: str | None = None) -> None:
+            if not hasattr(self, "interface_view_combo"):
+                return
+            selected = preferred or self._selected_interface_view()
+            labels = self._interface_view_labels()
+            self.interface_view_combo.blockSignals(True)
+            try:
+                self._set_combo_items(
+                    self.interface_view_combo,
+                    [labels[value] for value in _INTERFACE_VIEW_ORDER],
+                    preferred_value=labels.get(selected, labels["folded"]),
+                )
+                capabilities_raw = self._profile_filter_options.get("surface_view_capabilities")
+                capabilities = (
+                    {str(value).strip().lower() for value in capabilities_raw}
+                    if isinstance(capabilities_raw, (list, tuple, set))
+                    else set(_INTERFACE_VIEW_ORDER)
+                )
+                for index, value in enumerate(_INTERFACE_VIEW_ORDER):
+                    item = self.interface_view_combo.model().item(index)
+                    if item is not None:
+                        item.setEnabled(value in capabilities)
+            finally:
+                self.interface_view_combo.blockSignals(False)
+            if hasattr(self, "_interface_view_note"):
+                if selected == "full":
+                    self._interface_view_note.setText(
+                        f"Uses the complete periodic {self._interface_surface_axis().upper()} "
+                        "coordinate. No interface folding or side masking is applied."
+                    )
+                elif selected == "folded":
+                    self._interface_view_note.setText(
+                        "Uses the equal-weight mean of the independently normalized interfaces."
+                    )
+                elif selected == "all":
+                    self._interface_view_note.setText(
+                        "Overlays the combined, positive-axis, and negative-axis curves. "
+                        "Available for 1D plots only."
+                    )
+                else:
+                    self._interface_view_note.setText(
+                        "Uses outward distance and includes only entities assigned to this interface."
+                    )
+                unavailable_reason = str(
+                    self._profile_filter_options.get("surface_view_unavailable_reason") or ""
+                ).strip()
+                if unavailable_reason:
+                    self._interface_view_note.setText(
+                        f"{self._interface_view_note.text()} {unavailable_reason}"
+                    )
+
+        def _handle_interface_view_change(self, *_unused: object) -> None:
+            view = self._selected_interface_view()
+            self._refresh_interface_view_control(view)
+            axis_label = self._interface_surface_axis().upper()
+            if self._analysis_name == "density" and hasattr(self, "density_x_mode"):
+                if self._density_symmetric_1d_coordinate_locked():
+                    self._sync_density_interface_coordinate()
+                elif view == "full":
+                    if not hasattr(self, "_density_interface_relative_x_mode"):
+                        self._density_interface_relative_x_mode = (
+                            self.density_x_mode.currentText().strip() or "Distance"
+                        )
+                    self._set_combo_value(self.density_x_mode, axis_label)
+                    if hasattr(self, "density_2d_x_axis") and hasattr(self, "density_2d_y_axis"):
+                        if not hasattr(self, "_density_interface_relative_2d_axes"):
+                            self._density_interface_relative_2d_axes = (
+                                self.density_2d_x_axis.currentText().strip(),
+                                self.density_2d_y_axis.currentText().strip(),
+                            )
+                        x_label = self.density_2d_x_axis.currentText().strip()
+                        y_label = self.density_2d_y_axis.currentText().strip()
+                        if x_label == "Distance":
+                            replacement = axis_label
+                            if replacement == y_label:
+                                replacement = next(
+                                    value for value in ("X", "Y", "Z") if value != y_label
+                                )
+                            self._set_combo_value(self.density_2d_x_axis, replacement)
+                        if y_label == "Distance":
+                            replacement = axis_label
+                            if replacement == self.density_2d_x_axis.currentText().strip():
+                                replacement = next(
+                                    value
+                                    for value in ("X", "Y", "Z")
+                                    if value != self.density_2d_x_axis.currentText().strip()
+                                )
+                            self._set_combo_value(self.density_2d_y_axis, replacement)
+                elif hasattr(self, "_density_interface_relative_x_mode"):
+                    self._set_combo_value(
+                        self.density_x_mode,
+                        self._density_interface_relative_x_mode,
+                    )
+                    del self._density_interface_relative_x_mode
+                    if hasattr(self, "_density_interface_relative_2d_axes"):
+                        previous_x, previous_y = self._density_interface_relative_2d_axes
+                        self._set_combo_value(self.density_2d_x_axis, previous_x)
+                        self._set_combo_value(self.density_2d_y_axis, previous_y)
+                        del self._density_interface_relative_2d_axes
+            if self._analysis_name == "orientation" and hasattr(self, "orientation_line_x_axis"):
+                if view == "full":
+                    if not hasattr(self, "_orientation_interface_relative_x_axis"):
+                        self._orientation_interface_relative_x_axis = (
+                            self.orientation_line_x_axis.currentText().strip() or "Distance"
+                        )
+                    self._set_combo_value(self.orientation_line_x_axis, axis_label)
+                elif hasattr(self, "_orientation_interface_relative_x_axis"):
+                    self._set_combo_value(
+                        self.orientation_line_x_axis,
+                        self._orientation_interface_relative_x_axis,
+                    )
+                    del self._orientation_interface_relative_x_axis
+            if self._analysis_name == "position" and hasattr(self, "position_mapping_y"):
+                position_widgets = tuple(
+                    widget
+                    for widget in (
+                        getattr(self, "position_mapping_x", None),
+                        self.position_mapping_y,
+                        getattr(self, "position_mapping_value", None),
+                    )
+                    if widget is not None
+                )
+                if view == "full":
+                    if not hasattr(self, "_position_interface_relative_mapping"):
+                        self._position_interface_relative_mapping = tuple(
+                            widget.currentText().strip() for widget in position_widgets
+                        )
+                    self._set_position_mapping_combo_items()
+                    for widget in position_widgets:
+                        if widget.currentText().strip() == "distance":
+                            self._set_combo_value(widget, axis_label.lower())
+                else:
+                    previous = getattr(self, "_position_interface_relative_mapping", None)
+                    self._set_position_mapping_combo_items()
+                    if isinstance(previous, tuple):
+                        for widget, value in zip(position_widgets, previous):
+                            self._set_combo_value(widget, value)
+                        del self._position_interface_relative_mapping
+            if self._analysis_name == "coordination" and hasattr(
+                self, "coordination_line_x_quantity"
+            ):
+                if view == "full":
+                    if not hasattr(self, "_coordination_interface_relative_x_quantity"):
+                        self._coordination_interface_relative_x_quantity = (
+                            self.coordination_line_x_quantity.currentText().strip() or "distance"
+                        )
+                    current = self.coordination_line_x_quantity.currentText().strip()
+                    self._set_combo_items(
+                        self.coordination_line_x_quantity,
+                        [axis_label.lower(), "time"],
+                        preferred_value=(axis_label.lower() if current == "distance" else current),
+                    )
+                else:
+                    previous = getattr(
+                        self,
+                        "_coordination_interface_relative_x_quantity",
+                        "distance",
+                    )
+                    self._set_combo_items(
+                        self.coordination_line_x_quantity,
+                        list(_COORDINATION_LINE_X_QUANTITY_LABEL_BY_BACKEND.values()),
+                        preferred_value=previous,
+                    )
+                    if hasattr(self, "_coordination_interface_relative_x_quantity"):
+                        del self._coordination_interface_relative_x_quantity
+            self._refresh_widget_states()
+            self._record_history_after_non_text_change()
+            self._handle_series_identity_change()
+
         def _build_analysis_data_sections(self, layout: QVBoxLayout) -> None:
             analysis = self._analysis_name
             if analysis is None:
                 return
 
-            if analysis == "msd":
-                selection_title = "Profile Selection"
-                selection = QGroupBox(selection_title)
-                selection_form = QFormLayout(selection)
-                self.analysis_species = self._line("Leave blank to use file metadata")
-                self.analysis_species.textChanged.connect(self._handle_series_identity_change)
+            if (
+                analysis in {"density", "position", "coordination", "orientation"}
+                and self._has_symmetric_interface_views()
+            ):
+                surface_group = QGroupBox("Surface representation")
+                surface_form = QFormLayout(surface_group)
+                self.interface_view_combo = self._combo(
+                    tuple(self._interface_view_labels().values())
+                )
+                self.interface_view_combo.currentTextChanged.connect(
+                    self._handle_interface_view_change
+                )
                 self._add_form_row(
-                    selection_form,
-                    "Species",
-                    self.analysis_species,
-                    tooltip_id="data.profile.species",
+                    surface_form,
+                    "Cell / interface view",
+                    self.interface_view_combo,
+                    tooltip_id="data.interface_view",
                 )
-                selection_note = QLabel(
-                    "Chooses which stored profile is loaded from the current source."
-                )
-                selection_note.setObjectName("sectionNote")
-                selection_note.setWordWrap(True)
-                selection_form.addRow(selection_note)
+                self._interface_view_note = QLabel("")
+                self._interface_view_note.setObjectName("sectionNote")
+                self._interface_view_note.setWordWrap(True)
+                surface_form.addRow(self._interface_view_note)
                 layout.addWidget(
                     self._make_collapsible_section(
-                        title=selection_title,
-                        section_id=f"data.{analysis}.selection",
-                        body_widget=selection,
+                        title="Surface representation",
+                        section_id=f"data.{analysis}.surface_view",
+                        body_widget=surface_group,
                     )
                 )
 
@@ -9383,7 +9426,9 @@ def launch_plot_settings_panel(
                     species_widget,
                     tooltip_id="data.density.target",
                 )
-                available_density_view_types = self._profile_filter_options.get("density_view_types")
+                available_density_view_types = self._profile_filter_options.get(
+                    "density_view_types"
+                )
                 if isinstance(available_density_view_types, list) and available_density_view_types:
                     density_view_type_labels = tuple(
                         _DENSITY_VIEW_TYPE_LABEL_BY_ID.get(
@@ -9393,11 +9438,11 @@ def launch_plot_settings_panel(
                         for view_type in available_density_view_types
                     )
                 else:
-                    density_view_type_labels = (
-                        _DENSITY_VIEW_TYPE_LABEL_BY_ID[PLOT_VIEW_1D_LINE],
-                    )
+                    density_view_type_labels = (_DENSITY_VIEW_TYPE_LABEL_BY_ID[PLOT_VIEW_1D_LINE],)
                 self.density_view_type = self._combo(density_view_type_labels)
-                self.density_view_type.currentTextChanged.connect(self._handle_density_mapping_change)
+                self.density_view_type.currentTextChanged.connect(
+                    self._handle_density_mapping_change
+                )
                 available_modes = self._profile_filter_options.get("available_modes")
                 if isinstance(available_modes, list) and available_modes:
                     mode_labels: list[str] = []
@@ -9406,17 +9451,25 @@ def launch_plot_settings_panel(
                             mode_labels.append("Distance")
                         elif mode in {"x", "y", "z"}:
                             mode_labels.append(mode.upper())
-                    density_x_mode_labels = tuple(mode_labels) if mode_labels else _DENSITY_X_MODE_LABELS
+                    density_x_mode_labels = (
+                        tuple(mode_labels) if mode_labels else _DENSITY_X_MODE_LABELS
+                    )
                 else:
                     density_x_mode_labels = _DENSITY_X_MODE_LABELS
                 self.density_x_mode = self._combo(density_x_mode_labels)
                 self.density_x_mode.currentTextChanged.connect(self._handle_density_mapping_change)
                 self.density_2d_x_axis = self._combo(_DENSITY_X_MODE_LABELS)
                 self.density_2d_y_axis = self._combo(("Y", "X", "Z", "Distance"))
-                self.density_2d_x_axis.currentTextChanged.connect(self._handle_density_mapping_change)
-                self.density_2d_y_axis.currentTextChanged.connect(self._handle_density_mapping_change)
+                self.density_2d_x_axis.currentTextChanged.connect(
+                    self._handle_density_mapping_change
+                )
+                self.density_2d_y_axis.currentTextChanged.connect(
+                    self._handle_density_mapping_change
+                )
                 self.density_quantity = self._combo(("mass", "number"))
-                self.density_quantity.currentTextChanged.connect(self._handle_density_mapping_change)
+                self.density_quantity.currentTextChanged.connect(
+                    self._handle_density_mapping_change
+                )
                 self._add_form_row(
                     mapping_form,
                     "View type",
@@ -9451,7 +9504,12 @@ def launch_plot_settings_panel(
                     tooltip_id="data.density.quantity",
                 )
                 self._density_filter_widgets = {}
-                for axis_label, axis_id in (("X range", "x"), ("Y range", "y"), ("Z range", "z"), ("Distance range", "distance")):
+                for axis_label, axis_id in (
+                    ("X range", "x"),
+                    ("Y range", "y"),
+                    ("Z range", "z"),
+                    ("Distance range", "distance"),
+                ):
                     range_widget = QWidget(mapping)
                     range_layout = QHBoxLayout(range_widget)
                     range_layout.setContentsMargins(0, 0, 0, 0)
@@ -9551,7 +9609,9 @@ def launch_plot_settings_panel(
                         for view_type_id in self._coordination_supported_view_type_ids()
                     )
                 )
-                self.coordination_component.currentTextChanged.connect(self._handle_coordination_mapping_change)
+                self.coordination_component.currentTextChanged.connect(
+                    self._handle_coordination_mapping_change
+                )
                 self.coordination_line_x_quantity = self._combo(
                     tuple(_COORDINATION_LINE_X_QUANTITY_LABEL_BY_BACKEND.values())
                 )
@@ -9559,7 +9619,9 @@ def launch_plot_settings_panel(
                     self._handle_coordination_mapping_change
                 )
                 self.coordination_time_axis = self._combo(("ps", "fs", "step", "frame"))
-                self.coordination_time_axis.currentTextChanged.connect(self._handle_coordination_mapping_change)
+                self.coordination_time_axis.currentTextChanged.connect(
+                    self._handle_coordination_mapping_change
+                )
                 self._add_form_row(
                     view_form,
                     "Species A",
@@ -9638,14 +9700,18 @@ def launch_plot_settings_panel(
                 self.orientation_component = self._combo(
                     tuple(_ORIENTATION_LINE_QUANTITY_LABEL_BY_BACKEND.values())
                 )
-                self.orientation_component.currentTextChanged.connect(self._handle_orientation_mapping_change)
+                self.orientation_component.currentTextChanged.connect(
+                    self._handle_orientation_mapping_change
+                )
                 self.orientation_line_x_axis = self._combo(_DENSITY_X_MODE_LABELS)
                 self._set_combo_value(self.orientation_line_x_axis, "Distance")
                 self.orientation_line_x_axis.currentTextChanged.connect(
                     self._handle_orientation_mapping_change
                 )
                 self.orientation_angle = self._combo(("polar", "azimuthal"))
-                self.orientation_angle.currentTextChanged.connect(self._handle_orientation_mapping_change)
+                self.orientation_angle.currentTextChanged.connect(
+                    self._handle_orientation_mapping_change
+                )
                 self.orientation_heatmap_x_axis = self._combo(_DENSITY_X_MODE_LABELS)
                 self.orientation_heatmap_y_axis = self._combo(("Y", "X", "Z", "Distance"))
                 self._set_combo_value(self.orientation_heatmap_x_axis, "X")
@@ -9688,16 +9754,25 @@ def launch_plot_settings_panel(
                     self.orientation_heatmap_x_axis,
                     tooltip_id="data.orientation.source.quantities",
                 )
-                self._orientation_mapping_2d_rows.append((view_form, self.orientation_heatmap_x_axis))
+                self._orientation_mapping_2d_rows.append(
+                    (view_form, self.orientation_heatmap_x_axis)
+                )
                 self._add_form_row(
                     view_form,
                     "Y-axis quantity",
                     self.orientation_heatmap_y_axis,
                     tooltip_id="data.orientation.source.quantities",
                 )
-                self._orientation_mapping_2d_rows.append((view_form, self.orientation_heatmap_y_axis))
+                self._orientation_mapping_2d_rows.append(
+                    (view_form, self.orientation_heatmap_y_axis)
+                )
                 self._orientation_filter_widgets = {}
-                for axis_label, axis_id in (("X range", "x"), ("Y range", "y"), ("Z range", "z"), ("Distance range", "distance")):
+                for axis_label, axis_id in (
+                    ("X range", "x"),
+                    ("Y range", "y"),
+                    ("Z range", "z"),
+                    ("Distance range", "distance"),
+                ):
                     range_widget = QWidget(view)
                     range_layout = QHBoxLayout(range_widget)
                     range_layout.setContentsMargins(0, 0, 0, 0)
@@ -10471,9 +10546,7 @@ def launch_plot_settings_panel(
             seen = {"All targets"}
             for descriptor in self._series_descriptors_data:
                 target = str(
-                    descriptor.get("density_species")
-                    or descriptor.get("default_label")
-                    or ""
+                    descriptor.get("density_species") or descriptor.get("default_label") or ""
                 ).strip()
                 if not target or target in seen:
                     continue
@@ -10483,9 +10556,7 @@ def launch_plot_settings_panel(
 
         def _density_target_for_descriptor(self, descriptor: dict[str, Any]) -> str:
             return str(
-                descriptor.get("density_species")
-                or descriptor.get("default_label")
-                or ""
+                descriptor.get("density_species") or descriptor.get("default_label") or ""
             ).strip()
 
         def _enabled_density_species(self) -> set[str] | None:
@@ -10607,7 +10678,9 @@ def launch_plot_settings_panel(
                 )
             if str(role).strip().lower() == "y":
                 return None
-            return self._selected_density_x_mode() if hasattr(self, "density_x_mode") else "distance"
+            return (
+                self._selected_density_x_mode() if hasattr(self, "density_x_mode") else "distance"
+            )
 
         def _density_default_bin_width(self, role: str) -> float | None:
             defaults = self._profile_filter_options.get("density_default_axis_bin_widths_A")
@@ -10617,8 +10690,8 @@ def launch_plot_settings_panel(
             if axis_id is None:
                 return None
             try:
-                value = float(defaults.get(axis_id))
-            except (TypeError, ValueError):
+                value = float(defaults[axis_id])
+            except (KeyError, TypeError, ValueError):
                 return None
             return value if np.isfinite(value) and value > 0.0 else None
 
@@ -10656,11 +10729,10 @@ def launch_plot_settings_panel(
             defaults = self._density_axis_range_defaults(axis_id)
             if defaults is None:
                 return lower, upper
-            if lower is not None and abs(float(lower) - defaults[0]) <= 1.0e-9:
-                lower = None
-            if upper is not None and abs(float(upper) - defaults[1]) <= 1.0e-9:
-                upper = None
-            return lower, upper
+            return (
+                _normalize_full_range_bound(lower, defaults[0]),
+                _normalize_full_range_bound(upper, defaults[1]),
+            )
 
         def _orientation_axis_range_defaults(self, axis_id: str) -> tuple[float, float] | None:
             ranges = self._profile_filter_options.get("orientation_axis_ranges")
@@ -10714,7 +10786,14 @@ def launch_plot_settings_panel(
 
         def _normalize_density_view_type_id(self, value: Any) -> str:
             token = str(value or "").strip().lower()
-            if token in {"2d", "2d heatmap", "heatmap", "heatmap_2d", "projection2d", "plot_2d_heatmap"}:
+            if token in {
+                "2d",
+                "2d heatmap",
+                "heatmap",
+                "heatmap_2d",
+                "projection2d",
+                "plot_2d_heatmap",
+            }:
                 return PLOT_VIEW_2D_HEATMAP
             return PLOT_VIEW_1D_LINE
 
@@ -10854,7 +10933,9 @@ def launch_plot_settings_panel(
                 self._suspend_preview_events = previous_suspend
                 self._density_view_state_switching = previous_switching
 
-        def _merge_density_view_state_into_settings(self, settings: dict[str, Any]) -> dict[str, Any]:
+        def _merge_density_view_state_into_settings(
+            self, settings: dict[str, Any]
+        ) -> dict[str, Any]:
             if self._analysis_name != "density":
                 return settings
             active = self._density_active_view_type_id()
@@ -11008,7 +11089,9 @@ def launch_plot_settings_panel(
                 self._suspend_preview_events = previous_suspend
                 self._position_view_state_switching = previous_switching
 
-        def _merge_position_view_state_into_settings(self, settings: dict[str, Any]) -> dict[str, Any]:
+        def _merge_position_view_state_into_settings(
+            self, settings: dict[str, Any]
+        ) -> dict[str, Any]:
             if self._analysis_name != "position":
                 return settings
             active = self._position_active_view_type_id()
@@ -11048,8 +11131,6 @@ def launch_plot_settings_panel(
                 "source_selection",
                 "style",
                 "orientation_view_states",
-                "heatmap_normalize",
-                "heatmap_normalization_mode",
             ):
                 cleaned.pop(key, None)
             return cleaned
@@ -11202,7 +11283,9 @@ def launch_plot_settings_panel(
                 self._suspend_preview_events = previous_suspend
                 self._orientation_view_state_switching = previous_switching
 
-        def _merge_orientation_view_state_into_settings(self, settings: dict[str, Any]) -> dict[str, Any]:
+        def _merge_orientation_view_state_into_settings(
+            self, settings: dict[str, Any]
+        ) -> dict[str, Any]:
             if self._analysis_name != "orientation":
                 return settings
             active = self._orientation_active_view_type_id()
@@ -11233,11 +11316,7 @@ def launch_plot_settings_panel(
                 if previous_view_type_id != view_type_id and record_snapshot:
                     self._density_1d_enabled_species_snapshot = self._enabled_density_species()
                 active_value = next(
-                    (
-                        str(value)
-                        for value, checkbox in checkboxes.items()
-                        if checkbox.isChecked()
-                    ),
+                    (str(value) for value, checkbox in checkboxes.items() if checkbox.isChecked()),
                     next(iter(checkboxes)),
                 )
                 self._density_species_checkbox_syncing = True
@@ -11307,7 +11386,15 @@ def launch_plot_settings_panel(
                 if hasattr(self, "density_view_type")
                 else PLOT_VIEW_1D_LINE
             )
-            x_mode = self._selected_density_x_mode() if hasattr(self, "density_x_mode") else "distance"
+            x_mode = (
+                self._selected_density_x_mode() if hasattr(self, "density_x_mode") else "distance"
+            )
+            if self._density_symmetric_1d_coordinate_locked():
+                x_mode = (
+                    self._interface_surface_axis()
+                    if self._selected_interface_view() == "full"
+                    else "distance"
+                )
             quantity = (
                 self.density_quantity.currentText().strip() or "mass"
                 if hasattr(self, "density_quantity")
@@ -11338,6 +11425,11 @@ def launch_plot_settings_panel(
                 line_x_label,
                 line_x_label or "distance",
             )
+            if (
+                self._selected_interface_view() == "full"
+                and line_x_label == self._interface_surface_axis().lower()
+            ):
+                line_x_quantity = "distance"
             component = (
                 "time-distance"
                 if canonical_plot_view_id(view_type_id) == PLOT_VIEW_2D_HEATMAP
@@ -11424,14 +11516,14 @@ def launch_plot_settings_panel(
 
         def _current_potential_mapping(self) -> PlotViewMapping:
             if hasattr(self, "potential_view_type"):
-                view_type_id = _POTENTIAL_VIEW_TYPE_ID_BY_LABEL.get(
-                    self.potential_view_type.currentText().strip(),
-                    "line_1d",
+                series_token = (
+                    _POTENTIAL_SERIES_ID_BY_LABEL.get(
+                        self.potential_series_mode.currentText().strip(),
+                        "summary",
+                    )
+                    if hasattr(self, "potential_series_mode")
+                    else "summary"
                 )
-                series_token = _POTENTIAL_SERIES_ID_BY_LABEL.get(
-                    self.potential_series_mode.currentText().strip(),
-                    "summary",
-                ) if hasattr(self, "potential_series_mode") else "summary"
                 y_quantity = None if series_token == "summary" else series_token
                 return potential_plot_options_to_view_mapping(y_quantity=y_quantity)
             return potential_plot_options_to_view_mapping()
@@ -11478,9 +11570,13 @@ def launch_plot_settings_panel(
                     str(contract.label or contract.source_id or "Coordination data")
                 )
             if hasattr(self, "_coordination_source_dimensions_label"):
-                self._coordination_source_dimensions_label.setText(_contract_dimensions_text(contract))
+                self._coordination_source_dimensions_label.setText(
+                    _contract_dimensions_text(contract)
+                )
             if hasattr(self, "_coordination_source_quantities_label"):
-                self._coordination_source_quantities_label.setText(_contract_quantities_text(contract))
+                self._coordination_source_quantities_label.setText(
+                    _contract_quantities_text(contract)
+                )
             if not hasattr(self, "_coordination_mapping_status_label"):
                 return
             mapping = self._current_coordination_mapping()
@@ -11516,9 +11612,13 @@ def launch_plot_settings_panel(
                     str(contract.label or contract.source_id or "Orientation data")
                 )
             if hasattr(self, "_orientation_source_dimensions_label"):
-                self._orientation_source_dimensions_label.setText(_contract_dimensions_text(contract))
+                self._orientation_source_dimensions_label.setText(
+                    _contract_dimensions_text(contract)
+                )
             if hasattr(self, "_orientation_source_quantities_label"):
-                self._orientation_source_quantities_label.setText(_contract_quantities_text(contract))
+                self._orientation_source_quantities_label.setText(
+                    _contract_quantities_text(contract)
+                )
             if not hasattr(self, "_orientation_mapping_status_label"):
                 return
             mapping = self._current_orientation_mapping()
@@ -11583,8 +11683,8 @@ def launch_plot_settings_panel(
                 previous_view = self._density_active_view_type
                 next_view = self._density_current_view_type_id()
                 if previous_view != next_view:
-                    self._density_view_states[previous_view] = (
-                        self._snapshot_density_view_state(previous_view)
+                    self._density_view_states[previous_view] = self._snapshot_density_view_state(
+                        previous_view
                     )
                     target_state = self._density_view_states.get(next_view)
                     if not isinstance(target_state, dict):
@@ -11592,6 +11692,7 @@ def launch_plot_settings_panel(
                     self._apply_density_view_state(next_view, target_state)
             self._sync_density_species_selection_for_view_type()
             self._apply_density_default_bin_width_texts()
+            self._refresh_widget_states()
             self._update_density_contract_summary()
             self._handle_series_identity_change()
 
@@ -11687,6 +11788,7 @@ def launch_plot_settings_panel(
                     self._apply_orientation_view_state(next_view, target_state)
                     self._handle_series_identity_change()
                     return
+            self._refresh_widget_states()
             self._update_orientation_contract_summary()
             self._handle_series_identity_change()
 
@@ -11736,6 +11838,11 @@ def launch_plot_settings_panel(
             contract = self._position_contract()
             for quantity in contract.quantities:
                 quantity_id = str(quantity.id).strip()
+                if (
+                    self._selected_interface_view() == "full"
+                    and quantity_id == "distance_to_surface"
+                ):
+                    continue
                 if quantity_id not in backend_supported:
                     continue
                 status = visual_role_compatibility(
@@ -11811,7 +11918,9 @@ def launch_plot_settings_panel(
                     ),
                     color=value_id if render_mode == "color-scale" else None,
                     split_by="atom",
-                    filter_by=value_id if filter_min is not None or filter_max is not None else None,
+                    filter_by=value_id
+                    if filter_min is not None or filter_max is not None
+                    else None,
                     filter_min=filter_min,
                     filter_max=filter_max,
                     fixed_values={"projection_render_mode": render_mode},
@@ -11862,7 +11971,9 @@ def launch_plot_settings_panel(
                 preferred_value=_position_quantity_token(active_mapping.y or "distance_to_surface"),
             )
             if hasattr(self, "position_mapping_value"):
-                value_quantity = active_mapping.color or active_mapping.filter_by or "distance_to_surface"
+                value_quantity = (
+                    active_mapping.color or active_mapping.filter_by or "distance_to_surface"
+                )
                 self._set_combo_items(
                     self.position_mapping_value,
                     [
@@ -11927,8 +12038,8 @@ def launch_plot_settings_panel(
                 previous_view = self._position_active_view_type
                 next_view = self._position_view_type_id()
                 if previous_view != next_view:
-                    self._position_view_states[previous_view] = (
-                        self._snapshot_position_view_state(previous_view)
+                    self._position_view_states[previous_view] = self._snapshot_position_view_state(
+                        previous_view
                     )
                     target_state = self._position_view_states.get(next_view)
                     if target_state is None:
@@ -12146,9 +12257,7 @@ def launch_plot_settings_panel(
                 return
             mapping = self._current_position_mapping()
             compatibility = generic_view_type_compatibility(contract, mapping)
-            self._position_mapping_status_label.setText(
-                _mapping_status_label(compatibility)
-            )
+            self._position_mapping_status_label.setText(_mapping_status_label(compatibility))
             view_label = plot_view_display_label(mapping.view_type_id)
             role_parts = [
                 f"x-axis={_position_quantity_token(mapping.x)}",
@@ -12165,9 +12274,7 @@ def launch_plot_settings_panel(
                     )
                 role_parts.append(filter_text)
             role_parts.append(f"series={mapping.split_by or 'atom'}")
-            self._position_mapping_summary_label.setText(
-                f"{view_label}: " + ", ".join(role_parts)
-            )
+            self._position_mapping_summary_label.setText(f"{view_label}: " + ", ".join(role_parts))
             try:
                 legacy = position_view_mapping_to_plot_options(mapping)
                 backend_parts = [
@@ -12194,7 +12301,7 @@ def launch_plot_settings_panel(
 
         def _fit_supported_for_current_view(self) -> bool:
             analysis = self._analysis_name
-            if analysis in {"density", "msd", "rdf", "temperature"}:
+            if analysis in {"density", "rdf", "temperature"}:
                 return True
             if analysis == "potential":
                 return True
@@ -12238,11 +12345,7 @@ def launch_plot_settings_panel(
             if analysis == "orientation" and self._is_orientation_heatmap_mode():
                 return "heatmap"
             if analysis == "position" and self._current_position_is_projection_view():
-                return (
-                    "heatmap"
-                    if self._current_position_uses_continuous_color()
-                    else "line"
-                )
+                return "heatmap" if self._current_position_uses_continuous_color() else "line"
             return _plot_family_for_view(
                 analysis,
                 orientation_heatmap=self._is_orientation_heatmap_mode(),
@@ -12264,10 +12367,9 @@ def launch_plot_settings_panel(
             layer_kind = self._current_layer_kind()
             is_line_family = plot_family == "line"
             is_heatmap_family = plot_family == "heatmap"
-            active_layer_enabled = (
-                0 <= self._series_active_index < len(self._series_enabled_data)
-                and bool(self._series_enabled_data[self._series_active_index])
-            )
+            active_layer_enabled = 0 <= self._series_active_index < len(
+                self._series_enabled_data
+            ) and bool(self._series_enabled_data[self._series_active_index])
             if (
                 self._analysis_name == "position"
                 and self._current_position_is_projection_view()
@@ -12360,8 +12462,7 @@ def launch_plot_settings_panel(
                 show_style=is_line_family,
                 show_markers=is_line_family,
                 show_derived_lines=is_line_family and active_layer_enabled,
-                show_uncertainty=self._error_supported_for_current_view()
-                and active_layer_enabled,
+                show_uncertainty=self._error_supported_for_current_view() and active_layer_enabled,
                 show_normalization=is_line_family,
                 show_integration=is_line_family and active_layer_enabled,
                 show_group_members=False,
@@ -12374,10 +12475,7 @@ def launch_plot_settings_panel(
 
         def _current_figure_capabilities(self) -> _FigureInspectorCapabilities:
             plot_family = self._current_plot_family()
-            if (
-                self._analysis_name == "position"
-                and self._current_position_is_projection_view()
-            ):
+            if self._analysis_name == "position" and self._current_position_is_projection_view():
                 continuous_color = self._current_position_uses_continuous_color()
                 return _FigureInspectorCapabilities(
                     plot_family=plot_family,
@@ -13179,7 +13277,7 @@ def launch_plot_settings_panel(
                 except ValueError:
                     requested_width = None
 
-            lines: list[str] = []
+            lines = []
             if source_width is not None:
                 lines.append(f"Source bin size: {_format_float_value(source_width)}")
 
@@ -13204,9 +13302,7 @@ def launch_plot_settings_panel(
                 )
             if masked_count is not None:
                 if min_points_text:
-                    lines.append(
-                        f"Masked bins at threshold {min_points_text}: {int(masked_count)}"
-                    )
+                    lines.append(f"Masked bins at threshold {min_points_text}: {int(masked_count)}")
                 else:
                     lines.append(f"Masked bins: {int(masked_count)}")
 
@@ -13389,50 +13485,6 @@ def launch_plot_settings_panel(
             )
             if hasattr(self.series_list, "notifyRowChanged"):
                 self.series_list.notifyRowChanged(index)
-            row_widget = self.series_list.itemWidget(item)
-            if isinstance(row_widget, _SeriesRowWidget):
-                heatmap_active = self._is_orientation_heatmap_mode()
-                row_widget.update_content(
-                    text=self._display_row_text(index).replace("·", "-"),
-                    checked=enabled,
-                    enabled=enabled,
-                    selected=self.series_list.currentRow() == index,
-                    color_token=(
-                        ""
-                        if heatmap_active
-                        else (
-                            (
-                                self._series_fit_color_data[base_index].strip()
-                                if base_index < len(self._series_fit_color_data)
-                                else ""
-                            )
-                            or self._effective_series_color(base_index)
-                        )
-                        if kind == "fit"
-                        else (
-                            (
-                                self._series_cumulative_color_data[base_index].strip()
-                                if base_index < len(self._series_cumulative_color_data)
-                                else ""
-                            )
-                            or self._effective_series_color(base_index)
-                        )
-                        if kind == "cumulative"
-                        else str(base_state["color"])
-                    ),
-                    kind=kind,
-                    layer_role=(
-                        "fit"
-                        if kind == "fit"
-                        else "cumulative"
-                        if kind == "cumulative"
-                        else str(base_state["layer_role"])
-                    ),
-                    can_move_up=base_index > 0,
-                    can_move_down=base_index < len(self._series_labels_data) - 1,
-                    tooltip_text=item.toolTip(),
-                    theme=self._theme_tokens(),
-                )
 
         def _sync_series_selection_widgets(self, selected_index: int) -> None:
             view_anchor = self._current_series_list_view_anchor()
@@ -13443,8 +13495,6 @@ def launch_plot_settings_panel(
                 self._clear_series_list_widget_items()
                 for index in range(len(self._series_display_rows)):
                     item = _SeriesListItem()
-                    row_descriptor = self._display_row(index)
-                    base_index = int(row_descriptor.get("base_index", 0))
                     self.series_list.addItem(item)
                     self._apply_series_list_item_visuals(item, index)
                 if self.series_list.count() > 0:
@@ -13625,8 +13675,7 @@ def launch_plot_settings_panel(
                 x_axis_widget = getattr(self, "density_2d_x_axis", None)
                 y_axis_widget = getattr(self, "density_2d_y_axis", None)
                 axes_text = (
-                    f"; axes={x_axis_widget.currentText()}/"
-                    f"{y_axis_widget.currentText()}"
+                    f"; axes={x_axis_widget.currentText()}/{y_axis_widget.currentText()}"
                     if x_axis_widget is not None and y_axis_widget is not None
                     else ""
                 )
@@ -13651,6 +13700,26 @@ def launch_plot_settings_panel(
 
         def _build_advanced_tab(self) -> None:
             layout = QVBoxLayout(self._tab_advanced_content)
+            cache_group = QGroupBox("Preview resources")
+            cache_form = QFormLayout(cache_group)
+            self._cache_budget_mib_edit = QLineEdit()
+            self._cache_budget_mib_edit.setPlaceholderText("512 (or LINAK_CACHE_BUDGET_MIB)")
+            self._cache_budget_mib_edit.editingFinished.connect(self._apply_preview_cache_budget)
+            self._add_form_row(
+                cache_form,
+                "Cache budget (MiB)",
+                self._cache_budget_mib_edit,
+            )
+            clear_cache_button = QPushButton("Clear preview cache")
+            clear_cache_button.clicked.connect(self._clear_preview_cache)
+            cache_form.addRow("", clear_cache_button)
+            layout.addWidget(
+                self._make_collapsible_section(
+                    title="Preview resources",
+                    section_id="advanced.preview_resources",
+                    body_widget=cache_group,
+                )
+            )
             guide_link = QLabel(
                 '<a href="https://matplotlib.org/stable/users/index.html">Matplotlib user guide</a>'
             )
@@ -13764,9 +13833,7 @@ def launch_plot_settings_panel(
                 self.legend_kwargs_json,
                 tooltip_id="advanced.legend_kwargs",
             )
-            self._advanced_legend_kwargs_rows.append(
-                (style_form, self.legend_kwargs_json)
-            )
+            self._advanced_legend_kwargs_rows.append((style_form, self.legend_kwargs_json))
             self._add_form_row(
                 style_form,
                 "Grid kwargs",
@@ -13801,6 +13868,28 @@ def launch_plot_settings_panel(
             hint.setWordWrap(True)
             layout.addWidget(hint)
             layout.addStretch(1)
+
+        def _apply_preview_cache_budget(self) -> None:
+            from ..cache import PREVIEW_CACHE
+
+            raw = self._cache_budget_mib_edit.text().strip()
+            if not raw:
+                return
+            try:
+                resolved = float(raw)
+                PREVIEW_CACHE.set_budget_mib(resolved)
+            except ValueError as exc:
+                self._status_label.setText(f"Invalid preview cache budget: {exc}")
+                return
+            self._status_label.setText(f"Preview cache budget set to {resolved:g} MiB.")
+
+        def _clear_preview_cache(self) -> None:
+            from ..cache import clear_preview_cache
+
+            released = clear_preview_cache()
+            self._status_label.setText(
+                f"Cleared in-memory preview cache ({released / (1024 * 1024):.1f} MiB released)."
+            )
 
         def _series_count_from_settings(self, settings: dict[str, Any]) -> int:
             candidates = [1]
@@ -13905,7 +13994,7 @@ def launch_plot_settings_panel(
             self._series_normalization_x_refs_data = []
 
             for index in range(count):
-                descriptor = (
+                descriptor: dict[str, Any] = (
                     dict(descriptors[index])
                     if index < len(descriptors)
                     else {"series_id": f"series:{index}"}
@@ -15048,7 +15137,9 @@ def launch_plot_settings_panel(
             else:
                 self._persist_series_editor(self._series_active_index)
 
-        def _schedule_or_apply_series_preview_update(self, *, force_full_render: bool = False) -> None:
+        def _schedule_or_apply_series_preview_update(
+            self, *, force_full_render: bool = False
+        ) -> None:
             if not force_full_render and self._apply_series_artist_updates_to_canvas():
                 self._preview_timer.stop()
                 return
@@ -15838,7 +15929,7 @@ def launch_plot_settings_panel(
                             lines.append(f"{key}: {_format_float_value(parameters[key])}")
                 elif isinstance(parameters, dict):
                     for key, value in parameters.items():
-                            lines.append(f"{key}: {_format_float_value(value)}")
+                        lines.append(f"{key}: {_format_float_value(value)}")
                 if isinstance(characteristic_point, dict):
                     label = str(characteristic_point.get("label") or "Characteristic point").strip()
                     point_x = characteristic_point.get("x")
@@ -16102,68 +16193,88 @@ def launch_plot_settings_panel(
             } and self._apply_axis_limit_fields_to_canvas("y_lim"):
                 self._preview_timer.stop()
                 return
-            if sender in {
-                getattr(self, "title_text", None),
-                getattr(self, "x_label", None),
-                getattr(self, "y_label", None),
-                getattr(self, "title_font", None),
-                getattr(self, "title_pad", None),
-                getattr(self, "x_label_font", None),
-                getattr(self, "y_label_font", None),
-                getattr(self, "x_label_pad", None),
-                getattr(self, "y_label_pad", None),
-            } and self._apply_text_fields_to_canvas():
+            if (
+                sender
+                in {
+                    getattr(self, "title_text", None),
+                    getattr(self, "x_label", None),
+                    getattr(self, "y_label", None),
+                    getattr(self, "title_font", None),
+                    getattr(self, "title_pad", None),
+                    getattr(self, "x_label_font", None),
+                    getattr(self, "y_label_font", None),
+                    getattr(self, "x_label_pad", None),
+                    getattr(self, "y_label_pad", None),
+                }
+                and self._apply_text_fields_to_canvas()
+            ):
                 self._preview_timer.stop()
                 return
-            if sender in {
-                getattr(self, "fig_width", None),
-                getattr(self, "fig_height", None),
-                getattr(self, "dpi", None),
-                getattr(self, "font_family", None),
-                getattr(self, "base_font_size", None),
-                getattr(self, "font_color", None),
-                getattr(self, "figure_facecolor", None),
-                getattr(self, "figure_alpha", None),
-                getattr(self, "x_tick_font", None),
-                getattr(self, "y_tick_font", None),
-                getattr(self, "legend_font", None),
-            } and self._apply_canvas_style_fields_to_canvas():
+            if (
+                sender
+                in {
+                    getattr(self, "fig_width", None),
+                    getattr(self, "fig_height", None),
+                    getattr(self, "dpi", None),
+                    getattr(self, "font_family", None),
+                    getattr(self, "base_font_size", None),
+                    getattr(self, "font_color", None),
+                    getattr(self, "figure_facecolor", None),
+                    getattr(self, "figure_alpha", None),
+                    getattr(self, "x_tick_font", None),
+                    getattr(self, "y_tick_font", None),
+                    getattr(self, "legend_font", None),
+                }
+                and self._apply_canvas_style_fields_to_canvas()
+            ):
                 self._preview_timer.stop()
                 return
-            if sender in {
-                getattr(self, "x_scale", None),
-                getattr(self, "y_scale", None),
-                getattr(self, "grid_mode", None),
-                getattr(self, "grid_linestyle", None),
-                getattr(self, "grid_linewidth", None),
-                getattr(self, "grid_alpha", None),
-                getattr(self, "grid_color", None),
-                getattr(self, "grid_axis", None),
-                getattr(self, "grid_which", None),
-            } and self._apply_axis_style_fields_to_canvas():
+            if (
+                sender
+                in {
+                    getattr(self, "x_scale", None),
+                    getattr(self, "y_scale", None),
+                    getattr(self, "grid_mode", None),
+                    getattr(self, "grid_linestyle", None),
+                    getattr(self, "grid_linewidth", None),
+                    getattr(self, "grid_alpha", None),
+                    getattr(self, "grid_color", None),
+                    getattr(self, "grid_axis", None),
+                    getattr(self, "grid_which", None),
+                }
+                and self._apply_axis_style_fields_to_canvas()
+            ):
                 self._preview_timer.stop()
                 return
-            if sender in {
-                getattr(self, "heatmap_cmap", None),
-                getattr(self, "heatmap_vmin", None),
-                getattr(self, "heatmap_vmax", None),
-                getattr(self, "projection_line_width", None),
-                getattr(self, "heatmap_colorbar_enabled", None),
-                getattr(self, "heatmap_colorbar_label", None),
-                getattr(self, "heatmap_colorbar_label_size", None),
-                getattr(self, "heatmap_colorbar_tick_size", None),
-            } and self._apply_heatmap_style_fields_to_canvas():
+            if (
+                sender
+                in {
+                    getattr(self, "heatmap_cmap", None),
+                    getattr(self, "heatmap_vmin", None),
+                    getattr(self, "heatmap_vmax", None),
+                    getattr(self, "projection_line_width", None),
+                    getattr(self, "heatmap_colorbar_enabled", None),
+                    getattr(self, "heatmap_colorbar_label", None),
+                    getattr(self, "heatmap_colorbar_label_size", None),
+                    getattr(self, "heatmap_colorbar_tick_size", None),
+                }
+                and self._apply_heatmap_style_fields_to_canvas()
+            ):
                 self._preview_timer.stop()
                 return
-            if sender in {
-                getattr(self, "line_width", None),
-                getattr(self, "line_style", None),
-                getattr(self, "line_alpha", None),
-                getattr(self, "markers_mode", None),
-                getattr(self, "marker_size", None),
-                getattr(self, "marker_type", None),
-                getattr(self, "marker_color", None),
-            } and self._apply_line_style_fields_to_canvas():
+            if (
+                sender
+                in {
+                    getattr(self, "line_width", None),
+                    getattr(self, "line_style", None),
+                    getattr(self, "line_alpha", None),
+                    getattr(self, "markers_mode", None),
+                    getattr(self, "marker_size", None),
+                    getattr(self, "marker_type", None),
+                    getattr(self, "marker_color", None),
+                }
+                and self._apply_line_style_fields_to_canvas()
+            ):
                 self._preview_timer.stop()
                 return
             if self._auto_preview_checkbox is None:
@@ -16172,9 +16283,7 @@ def launch_plot_settings_panel(
                 return
             if self._preview_loading:
                 if self._preview_status is not None:
-                    self._preview_status.setText(
-                        "Preview updating..."
-                    )
+                    self._preview_status.setText("Preview updating...")
             self._preview_timer.start(self._preview_debounce_ms_for_sender(sender))
 
         def _handle_debounced_preview(self) -> None:
@@ -16308,12 +16417,12 @@ def launch_plot_settings_panel(
             self._preview_figure = figure
             canvas = FigureCanvas(figure)
             toolbar = (
-                _LiNaKNavigationToolbar(
+                navigation_toolbar_type(
                     canvas,
                     self._preview_canvas_container,
                     on_linak_save_figure=self._handle_save_figure,
                 )
-                if _LiNaKNavigationToolbar is not None
+                if navigation_toolbar_type is not None
                 else None
             )
             if toolbar is not None:
@@ -16416,9 +16525,7 @@ def launch_plot_settings_panel(
                     render_state = on_preview_figure(settings)
                     payload = {
                         "figure": (
-                            render_state.get("figure")
-                            if isinstance(render_state, dict)
-                            else None
+                            render_state.get("figure") if isinstance(render_state, dict) else None
                         ),
                         "image_path": None,
                         "message": "Preview updated.",
@@ -16473,6 +16580,10 @@ def launch_plot_settings_panel(
                 else None
             )
             self._active_preview_generation = generation
+            self._active_preview_signature = self._preview_request_signature(
+                settings,
+                interactive=interactive,
+            )
             self._active_preview_image_path = image_path
             self._active_preview_interactive = bool(interactive)
             self._set_preview_loading(True)
@@ -16481,17 +16592,39 @@ def launch_plot_settings_panel(
             self._preview_worker_queue.put((generation, deepcopy(settings), image_path))
             return True
 
+        def _preview_request_signature(
+            self,
+            settings: dict[str, Any],
+            *,
+            interactive: bool,
+        ) -> str:
+            return json.dumps(
+                {"interactive": bool(interactive), "settings": settings},
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            )
+
         def _queue_pending_preview(
             self,
             settings: dict[str, Any],
             *,
             interactive: bool,
         ) -> None:
+            signature = self._preview_request_signature(settings, interactive=interactive)
+            if signature == self._active_preview_signature:
+                self._pending_preview_request = None
+                return
+            if self._pending_preview_request is not None:
+                pending_settings, pending_interactive = self._pending_preview_request
+                if signature == self._preview_request_signature(
+                    pending_settings,
+                    interactive=pending_interactive,
+                ):
+                    return
             self._pending_preview_request = (deepcopy(settings), bool(interactive))
             if self._preview_status is not None:
-                self._preview_status.setText(
-                    "Preview updating..."
-                )
+                self._preview_status.setText("Preview updating...")
 
         def _start_pending_preview_if_available(self) -> bool:
             pending = self._pending_preview_request
@@ -16504,8 +16637,18 @@ def launch_plot_settings_panel(
         def _finish_active_preview_generation(self, generation: int) -> None:
             if self._active_preview_generation == generation:
                 self._active_preview_generation = None
+                self._active_preview_signature = None
                 self._active_preview_image_path = None
                 self._active_preview_interactive = False
+
+        def _set_preview_failure(self, error: Exception) -> None:
+            message = str(error).strip() or type(error).__name__
+            self._preview_error = message
+            if self._preview_status is not None:
+                display = message if len(message) <= 180 else f"{message[:177]}..."
+                self._preview_status.setText(f"Preview failed: {display}")
+                self._preview_status.setToolTip(message)
+            self._refresh_shell_state()
 
         def _preview_worker_job_cancelled(self, generation: int) -> bool:
             return self._closing or generation != self._active_preview_generation
@@ -16572,10 +16715,7 @@ def launch_plot_settings_panel(
                 if self._active_preview_interactive:
                     self._report_error("Preview failed", exc)
                 else:
-                    self._preview_error = str(exc)
-                    if self._preview_status is not None:
-                        self._preview_status.setText("Preview paused.")
-                    self._refresh_shell_state()
+                    self._set_preview_failure(exc)
             finally:
                 self._finish_active_preview_generation(generation)
                 self._set_preview_loading(False)
@@ -16599,10 +16739,7 @@ def launch_plot_settings_panel(
                 if self._active_preview_interactive:
                     self._report_error("Preview failed", error)
                 else:
-                    self._preview_error = str(error)
-                    if self._preview_status is not None:
-                        self._preview_status.setText("Preview paused.")
-                    self._refresh_shell_state()
+                    self._set_preview_failure(error)
             finally:
                 self._finish_active_preview_generation(generation)
                 self._set_preview_loading(False)
@@ -16711,10 +16848,7 @@ def launch_plot_settings_panel(
                 if interactive:
                     self._report_error("Preview failed", exc)
                 else:
-                    self._preview_error = str(exc)
-                    if self._preview_status is not None:
-                        self._preview_status.setText("Preview paused.")
-                    self._refresh_shell_state()
+                    self._set_preview_failure(exc)
                 return False
             if self._preview_loading:
                 self._queue_pending_preview(settings, interactive=interactive)
@@ -16906,9 +17040,11 @@ def launch_plot_settings_panel(
                     self._coordination_axis_choices(species_a, species_b),
                     preferred_value=current_axis,
                 )
+            self._refresh_interface_view_control()
             self._handle_series_identity_change()
 
         def _populate(self, settings: dict[str, Any]) -> None:
+            validate_current_plot_settings(settings)
             if self._analysis_name == "density":
                 raw_states = settings.get("density_view_states")
                 if isinstance(raw_states, dict):
@@ -16982,40 +17118,11 @@ def launch_plot_settings_panel(
             if self._analysis_name == "orientation":
                 raw_states = settings.get("orientation_view_states")
                 if isinstance(raw_states, dict):
-                    migrated_states: dict[str, dict[str, Any]] = {}
-                    migrated_legacy_state = False
-                    for key, value in raw_states.items():
-                        if not isinstance(value, dict):
-                            continue
-                        state = deepcopy(value)
-                        if "heatmap_value_mode" not in state:
-                            legacy_mode = state.get("heatmap_normalization_mode")
-                            if legacy_mode is None and state.get("heatmap_normalize"):
-                                legacy_mode = "global_probability"
-                            legacy_mapping = {
-                                "counts": "raw_counts",
-                                "global_probability": "joint_probability_density",
-                                "bulk_water_reference": "bulk_relative_enrichment",
-                            }
-                            if legacy_mode in legacy_mapping:
-                                state["heatmap_value_mode"] = legacy_mapping[
-                                    str(legacy_mode)
-                                ]
-                                migrated_legacy_state = True
-                        state.pop("heatmap_normalize", None)
-                        state.pop("heatmap_normalization_mode", None)
-                        migrated_states[
-                            self._normalize_orientation_view_type_id(key)
-                        ] = state
-                    self._orientation_view_states = migrated_states
-                    if migrated_legacy_state:
-                        warnings.warn(
-                            "Legacy orientation heatmap normalization settings were "
-                            "migrated to displayed-value modes. The next save writes only "
-                            "the new fields.",
-                            UserWarning,
-                            stacklevel=2,
-                        )
+                    self._orientation_view_states = {
+                        self._normalize_orientation_view_type_id(key): deepcopy(value)
+                        for key, value in raw_states.items()
+                        if isinstance(value, dict)
+                    }
                 elif not self._orientation_view_state_switching:
                     self._orientation_view_states = {}
                 settings_mapping_for_view = self._coerce_settings_view_mapping(settings)
@@ -17399,18 +17506,14 @@ def launch_plot_settings_panel(
                     lower_widget, upper_widget = widgets
                     lower = settings.get(f"density_filter_{axis_id}_min")
                     upper = settings.get(f"density_filter_{axis_id}_max")
-                    lower_text = (
-                        self._density_axis_range_text(axis_id, 0)
-                        if lower is None
-                        else str(lower)
+                    lower_widget.setPlaceholderText(
+                        self._density_axis_range_text(axis_id, 0) or "min"
                     )
-                    upper_text = (
-                        self._density_axis_range_text(axis_id, 1)
-                        if upper is None
-                        else str(upper)
+                    upper_widget.setPlaceholderText(
+                        self._density_axis_range_text(axis_id, 1) or "max"
                     )
-                    lower_widget.setText(lower_text)
-                    upper_widget.setText(upper_text)
+                    lower_widget.setText("" if lower is None else str(lower))
+                    upper_widget.setText("" if upper is None else str(upper))
             if hasattr(self, "density_quantity"):
                 self._set_combo_value(
                     self.density_quantity,
@@ -17429,13 +17532,18 @@ def launch_plot_settings_panel(
                 )
                 self._sync_density_species_selection_for_view_type(record_snapshot=False)
             if hasattr(self, "coord_species_a"):
+                selected_pairs = settings.get("species_pairs")
+                self._coordination_loaded_species_pairs = deepcopy(selected_pairs)
+                species_a_value, species_b_value = (
+                    selected_pairs[0]
+                    if selected_pairs and len(selected_pairs) == 1
+                    else (None, None)
+                )
                 self._set_combo_value(
                     self.coord_species_a,
-                    self._profile_filter_display_value(settings.get("species_a")),
+                    self._profile_filter_display_value(species_a_value),
                 )
             if hasattr(self, "coord_species_b"):
-                species_a_value = settings.get("species_a")
-                species_b_value = settings.get("species_b")
                 self._set_combo_items(
                     self.coord_species_b,
                     self._coordination_species_b_choices(
@@ -17452,6 +17560,10 @@ def launch_plot_settings_panel(
                         ),
                         preferred_value=str(settings.get("axis") or ""),
                     )
+                self._coordination_pair_filter_state = (
+                    self._selected_profile_filter_value(self.coord_species_a),
+                    self._selected_profile_filter_value(self.coord_species_b),
+                )
             if hasattr(self, "position_view_type"):
                 position_mapping = settings_mapping
                 if position_mapping is None:
@@ -17485,14 +17597,14 @@ def launch_plot_settings_panel(
                         projection_filter_max=settings.get("projection_filter_max"),
                         xy_z_distance_max=settings.get("xy_z_distance_max"),
                     )
-                self._apply_position_mapping_controls(
-                    position_mapping
-                )
+                self._apply_position_mapping_controls(position_mapping)
             if hasattr(self, "coordination_component"):
                 coordination_options: dict[str, object]
                 if settings_mapping is not None:
                     try:
-                        coordination_options = coordination_view_mapping_to_plot_options(settings_mapping)
+                        coordination_options = coordination_view_mapping_to_plot_options(
+                            settings_mapping
+                        )
                     except ValueError:
                         # Compatibility fallback is only used when no
                         # usable mapping-native state can be restored.
@@ -17549,7 +17661,9 @@ def launch_plot_settings_panel(
                 orientation_options: dict[str, object]
                 if settings_mapping is not None:
                     try:
-                        orientation_options = orientation_view_mapping_to_plot_options(settings_mapping)
+                        orientation_options = orientation_view_mapping_to_plot_options(
+                            settings_mapping
+                        )
                     except ValueError:
                         # Compatibility fallback is only used when no
                         # usable mapping-native state can be restored.
@@ -17653,7 +17767,12 @@ def launch_plot_settings_panel(
                 )
                 series_token = str(
                     potential_options.get("y_quantity")
-                    or ("summary" if str(potential_options.get("standard_plot") or "").strip().lower() == "summary" else "summary")
+                    or (
+                        "summary"
+                        if str(potential_options.get("standard_plot") or "").strip().lower()
+                        == "summary"
+                        else "summary"
+                    )
                 )
                 self._set_combo_value(
                     self.potential_series_mode,
@@ -17674,29 +17793,7 @@ def launch_plot_settings_panel(
                     str(settings.get("heatmap_cmap") or "turbo"),
                 )
             if hasattr(self, "heatmap_value_mode"):
-                raw_mode = settings.get("heatmap_value_mode")
-                if raw_mode is None:
-                    legacy_mode = settings.get("heatmap_normalization_mode")
-                    legacy_settings_present = (
-                        legacy_mode is not None
-                        or bool(settings.get("heatmap_normalize", False))
-                    )
-                    if legacy_mode is None and bool(settings.get("heatmap_normalize", False)):
-                        legacy_mode = "global_probability"
-                    legacy_mapping = {
-                        "counts": "raw_counts",
-                        "global_probability": "joint_probability_density",
-                        "bulk_water_reference": "bulk_relative_enrichment",
-                    }
-                    raw_mode = legacy_mapping.get(str(legacy_mode), "raw_counts")
-                    if legacy_settings_present:
-                        warnings.warn(
-                            "This plot profile used legacy heatmap normalization. It was "
-                            "migrated to the nearest displayed-value representation; the "
-                            "updated semantics will be saved using only the new fields.",
-                            UserWarning,
-                            stacklevel=2,
-                        )
+                raw_mode = settings.get("heatmap_value_mode") or "raw_counts"
                 self._set_combo_value(
                     self.heatmap_value_mode,
                     _HEATMAP_VALUE_LABEL_BY_MODE.get(
@@ -17705,27 +17802,21 @@ def launch_plot_settings_panel(
                     ),
                 )
             if hasattr(self, "heatmap_bulk_reference_mode"):
-                bulk_mode = str(
-                    settings.get("heatmap_bulk_reference_mode") or "auto"
-                ).strip().lower()
+                bulk_mode = (
+                    str(settings.get("heatmap_bulk_reference_mode") or "auto").strip().lower()
+                )
                 self._set_combo_value(
                     self.heatmap_bulk_reference_mode,
                     "Manual" if bulk_mode == "manual" else "Automatic",
                 )
                 bulk_min = settings.get("heatmap_bulk_min")
                 bulk_max = settings.get("heatmap_bulk_max")
-                self.heatmap_bulk_min.setText(
-                    "" if bulk_min is None else str(bulk_min)
-                )
-                self.heatmap_bulk_max.setText(
-                    "" if bulk_max is None else str(bulk_max)
-                )
+                self.heatmap_bulk_min.setText("" if bulk_min is None else str(bulk_min))
+                self.heatmap_bulk_max.setText("" if bulk_max is None else str(bulk_max))
             if hasattr(self, "heatmap_log_scale"):
                 self._set_combo_value(
                     self.heatmap_log_scale,
-                    "Logarithmic"
-                    if bool(settings.get("heatmap_log_scale", False))
-                    else "Linear",
+                    "Logarithmic" if bool(settings.get("heatmap_log_scale", False)) else "Linear",
                 )
             if hasattr(self, "heatmap_colorbar_label"):
                 raw_cb_label = settings.get("heatmap_colorbar_label")
@@ -17759,6 +17850,35 @@ def launch_plot_settings_panel(
             if hasattr(self, "heatmap_colorbar_aspect"):
                 raw = settings.get("heatmap_colorbar_aspect")
                 self.heatmap_colorbar_aspect.setText(str(raw) if raw is not None else "20")
+            if hasattr(self, "interface_view_combo"):
+                interface_view = str(settings.get("interface_view") or "folded").strip().lower()
+                if interface_view not in set(_INTERFACE_VIEW_ORDER):
+                    interface_view = "folded"
+                self._refresh_interface_view_control(interface_view)
+                if interface_view == "full":
+                    axis_label = self._interface_surface_axis().upper()
+                    if hasattr(self, "density_x_mode"):
+                        self._set_combo_value(self.density_x_mode, axis_label)
+                    if hasattr(self, "orientation_line_x_axis"):
+                        self._set_combo_value(self.orientation_line_x_axis, axis_label)
+                    if hasattr(self, "position_mapping_y"):
+                        self._set_position_mapping_combo_items()
+                        for widget in (
+                            getattr(self, "position_mapping_x", None),
+                            self.position_mapping_y,
+                            getattr(self, "position_mapping_value", None),
+                        ):
+                            if widget is not None and widget.currentText() == "distance":
+                                self._set_combo_value(widget, axis_label.lower())
+                    if hasattr(self, "coordination_line_x_quantity"):
+                        current = self.coordination_line_x_quantity.currentText().strip()
+                        self._set_combo_items(
+                            self.coordination_line_x_quantity,
+                            [axis_label.lower(), "time"],
+                            preferred_value=(
+                                axis_label.lower() if current == "distance" else current
+                            ),
+                        )
             self._auto_display_note = str(settings.get("_auto_display_note") or "").strip()
             self.x_bin_width.setText(str(settings.get("x_bin_width") or ""))
             self._set_combo_value(self.x_bin_reducer, str(settings.get("x_bin_reducer") or "mean"))
@@ -17996,8 +18116,7 @@ def launch_plot_settings_panel(
             if self._figure_heatmap_group is not None:
                 self._figure_heatmap_group.setVisible(figure_caps.show_heatmap)
             orientation_frequency_heatmap = (
-                self._analysis_name == "orientation"
-                and self._is_orientation_heatmap_mode()
+                self._analysis_name == "orientation" and self._is_orientation_heatmap_mode()
             )
             if self._heatmap_value_group is not None:
                 self._heatmap_value_group.setVisible(orientation_frequency_heatmap)
@@ -18015,14 +18134,12 @@ def launch_plot_settings_panel(
             bulk_manual = (
                 bulk_relative
                 and hasattr(self, "heatmap_bulk_reference_mode")
-                and self.heatmap_bulk_reference_mode.currentText().strip().lower()
-                == "manual"
+                and self.heatmap_bulk_reference_mode.currentText().strip().lower() == "manual"
             )
             self._set_rows_visible(self._heatmap_bulk_manual_rows, bulk_manual)
             if self._heatmap_trajectory_group is not None:
                 self._heatmap_trajectory_group.setVisible(
-                    position_xy_projection
-                    and self._current_position_uses_continuous_color()
+                    position_xy_projection and self._current_position_uses_continuous_color()
                 )
             self._update_heatmap_value_summary()
             if self._figure_colorbar_group is not None:
@@ -18033,8 +18150,7 @@ def launch_plot_settings_panel(
                 self._set_form_row_visible(
                     self._position_projection_stroke_row[0],
                     self._position_projection_stroke_row[1],
-                    position_xy_projection
-                    and self._current_position_uses_continuous_color(),
+                    position_xy_projection and self._current_position_uses_continuous_color(),
                 )
             self._set_rows_visible(
                 self._x_axis_transform_rows,
@@ -18110,12 +18226,33 @@ def launch_plot_settings_panel(
             density_heatmap_mode = (
                 self._analysis_name == "density" and self._is_density_heatmap_mode()
             )
+            interface_view = self._selected_interface_view()
+            if hasattr(self, "interface_view_combo"):
+                compare_item = self.interface_view_combo.model().item(
+                    _INTERFACE_VIEW_ORDER.index("all")
+                )
+                if compare_item is not None:
+                    compare_item.setEnabled(
+                        not (
+                            density_heatmap_mode
+                            or coordination_time_distance
+                            or position_xy_projection
+                            or (
+                                self._analysis_name == "orientation"
+                                and self._is_orientation_heatmap_mode()
+                            )
+                        )
+                    )
             if self._analysis_name == "density":
                 self._sync_density_species_selection_for_view_type()
                 self._set_rows_visible(self._density_mapping_1d_rows, not density_heatmap_mode)
                 self._set_rows_visible(self._density_mapping_2d_rows, density_heatmap_mode)
                 for axis_id, row in self._density_filter_rows.items():
-                    self._set_form_row_visible(row[0], row[1], True)
+                    self._set_form_row_visible(
+                        row[0],
+                        row[1],
+                        not (interface_view == "full" and axis_id == "distance"),
+                    )
                 if hasattr(self, "density_quantity"):
                     label = None
                     try:
@@ -18127,11 +18264,45 @@ def launch_plot_settings_panel(
                     if isinstance(label, QLabel):
                         label.setText("Color quantity" if density_heatmap_mode else "Y quantity")
             if hasattr(self, "density_x_mode"):
-                self.density_x_mode.setEnabled(not density_heatmap_mode)
+                density_coordinate_locked = self._density_symmetric_1d_coordinate_locked()
+                if density_coordinate_locked:
+                    self._sync_density_interface_coordinate()
+                self.density_x_mode.setEnabled(
+                    not density_heatmap_mode and not density_coordinate_locked
+                )
+                self._apply_widget_tooltip(
+                    self.density_x_mode,
+                    disabled_reason=(
+                        "The symmetric-cell representation selects raw surface-axis or "
+                        "outward-distance coordinates automatically."
+                        if density_coordinate_locked
+                        else None
+                    ),
+                )
             for widget_name in ("density_2d_x_axis", "density_2d_y_axis"):
                 widget = getattr(self, widget_name, None)
                 if widget is not None:
+                    if interface_view == "full" and widget.currentText() == "Distance":
+                        other_name = (
+                            "density_2d_y_axis"
+                            if widget_name == "density_2d_x_axis"
+                            else "density_2d_x_axis"
+                        )
+                        other = getattr(self, other_name, None)
+                        other_label = "" if other is None else other.currentText().strip()
+                        preferred = self._interface_surface_axis().upper()
+                        replacement = preferred
+                        if replacement == other_label:
+                            replacement = next(
+                                value for value in ("X", "Y", "Z") if value != other_label
+                            )
+                        self._set_combo_value(widget, replacement)
                     widget.setEnabled(density_heatmap_mode)
+                    distance_index = widget.findText("Distance")
+                    if distance_index >= 0:
+                        distance_item = widget.model().item(distance_index)
+                        if distance_item is not None:
+                            distance_item.setEnabled(interface_view != "full")
             if self._data_transform_group is not None and self._analysis_name == "position":
                 self._data_transform_group.setVisible(not position_xy_projection)
             self._update_position_contract_summary()
@@ -18171,18 +18342,33 @@ def launch_plot_settings_panel(
                         not is_heatmap,
                     )
                     if hasattr(self, "orientation_line_x_axis"):
-                        self.orientation_line_x_axis.setEnabled(orientation_grid_line_controls)
+                        if interface_view == "full":
+                            self._set_combo_value(
+                                self.orientation_line_x_axis,
+                                self._interface_surface_axis().upper(),
+                            )
+                        self.orientation_line_x_axis.setEnabled(
+                            orientation_grid_line_controls and interface_view != "full"
+                        )
                         self._apply_widget_tooltip(
                             self.orientation_line_x_axis,
                             disabled_reason=(
-                                "Only Mean orientation supports alternate orientation grid axes."
+                                "Full cell uses the raw surface-axis coordinate; choose an "
+                                "interface view to use outward distance."
+                                if interface_view == "full"
+                                else "Only Mean orientation supports alternate orientation grid axes."
                                 if not is_heatmap and not orientation_grid_line_controls
                                 else None
                             ),
                         )
                 self._set_rows_visible(self._orientation_mapping_2d_rows, False)
-                for row in self._orientation_filter_rows.values():
-                    self._set_form_row_visible(row[0], row[1], orientation_grid_line_controls)
+                for axis_id, row in self._orientation_filter_rows.items():
+                    self._set_form_row_visible(
+                        row[0],
+                        row[1],
+                        orientation_grid_line_controls
+                        and not (interface_view == "full" and axis_id == "distance"),
+                    )
                 for widget_name in ("orientation_heatmap_x_axis", "orientation_heatmap_y_axis"):
                     widget = getattr(self, widget_name, None)
                     if widget is not None:
@@ -19457,10 +19643,7 @@ def launch_plot_settings_panel(
                 self.projection_line_width.text(),
                 field_name="trajectory-line-width",
             )
-            if (
-                projection_line_width_value is not None
-                and projection_line_width_value <= 0.0
-            ):
+            if projection_line_width_value is not None and projection_line_width_value <= 0.0:
                 raise ValueError("Trajectory line width must be positive.")
 
             settings = {
@@ -19557,8 +19740,7 @@ def launch_plot_settings_panel(
                 "x_bin_width": x_bin_width,
                 "x_bin_reducer": (
                     "sum"
-                    if self._analysis_name == "orientation"
-                    and self._is_orientation_heatmap_mode()
+                    if self._analysis_name == "orientation" and self._is_orientation_heatmap_mode()
                     else self.x_bin_reducer.currentText().strip() or "mean"
                 )
                 if x_bin_width is not None
@@ -19567,8 +19749,7 @@ def launch_plot_settings_panel(
                 "y_bin_width": y_bin_width,
                 "y_bin_reducer": (
                     "sum"
-                    if self._analysis_name == "orientation"
-                    and self._is_orientation_heatmap_mode()
+                    if self._analysis_name == "orientation" and self._is_orientation_heatmap_mode()
                     else self.y_bin_reducer.currentText().strip() or "mean"
                 )
                 if hasattr(self, "y_bin_reducer") and y_bin_width is not None
@@ -19605,6 +19786,8 @@ def launch_plot_settings_panel(
             if hasattr(self, "analysis_axis"):
                 axis_value = self.analysis_axis.currentText().strip().lower()
                 settings["axis"] = None if axis_value == "" else axis_value
+            if hasattr(self, "interface_view_combo"):
+                settings["interface_view"] = self._selected_interface_view()
             if hasattr(self, "density_x_mode") or hasattr(self, "density_quantity"):
                 resolved_view_mapping = self._current_density_mapping()
                 if (
@@ -19618,14 +19801,22 @@ def launch_plot_settings_panel(
                         "The selected density mapping is incompatible with the current plot-data contract."
                     )
                 if self._is_density_heatmap_mode():
-                    settings["density_2d_x_axis"] = _DENSITY_X_MODE_BY_LABEL.get(
-                        self.density_2d_x_axis.currentText().strip().lower(),
-                        "x",
-                    ) if hasattr(self, "density_2d_x_axis") else "x"
-                    settings["density_2d_y_axis"] = _DENSITY_X_MODE_BY_LABEL.get(
-                        self.density_2d_y_axis.currentText().strip().lower(),
-                        "y",
-                    ) if hasattr(self, "density_2d_y_axis") else "y"
+                    settings["density_2d_x_axis"] = (
+                        _DENSITY_X_MODE_BY_LABEL.get(
+                            self.density_2d_x_axis.currentText().strip().lower(),
+                            "x",
+                        )
+                        if hasattr(self, "density_2d_x_axis")
+                        else "x"
+                    )
+                    settings["density_2d_y_axis"] = (
+                        _DENSITY_X_MODE_BY_LABEL.get(
+                            self.density_2d_y_axis.currentText().strip().lower(),
+                            "y",
+                        )
+                        if hasattr(self, "density_2d_y_axis")
+                        else "y"
+                    )
                     if settings["density_2d_x_axis"] == settings["density_2d_y_axis"]:
                         raise ValueError("Density 2D axes must be different.")
                     if {
@@ -19650,7 +19841,9 @@ def launch_plot_settings_panel(
                                 and upper_value is not None
                                 and lower_value > upper_value
                             ):
-                                raise ValueError(f"{axis_id.upper()} range minimum must not exceed maximum.")
+                                raise ValueError(
+                                    f"{axis_id.upper()} range minimum must not exceed maximum."
+                                )
                             lower_value, upper_value = self._density_effective_filter_values(
                                 axis_id,
                                 lower_value,
@@ -19676,7 +19869,9 @@ def launch_plot_settings_panel(
                                 and upper_value is not None
                                 and lower_value > upper_value
                             ):
-                                raise ValueError(f"{axis_id.upper()} range minimum must not exceed maximum.")
+                                raise ValueError(
+                                    f"{axis_id.upper()} range minimum must not exceed maximum."
+                                )
                             lower_value, upper_value = self._density_effective_filter_values(
                                 axis_id,
                                 lower_value,
@@ -19684,10 +19879,25 @@ def launch_plot_settings_panel(
                             )
                             settings[f"density_filter_{axis_id}_min"] = lower_value
                             settings[f"density_filter_{axis_id}_max"] = upper_value
-            if hasattr(self, "coord_species_a"):
-                settings["species_a"] = self._selected_profile_filter_value(self.coord_species_a)
-            if hasattr(self, "coord_species_b"):
-                settings["species_b"] = self._selected_profile_filter_value(self.coord_species_b)
+            if hasattr(self, "coord_species_a") and hasattr(self, "coord_species_b"):
+                selected = (
+                    self._selected_profile_filter_value(self.coord_species_a),
+                    self._selected_profile_filter_value(self.coord_species_b),
+                )
+                if selected == getattr(self, "_coordination_pair_filter_state", None):
+                    settings["species_pairs"] = deepcopy(self._coordination_loaded_species_pairs)
+                elif selected == (None, None):
+                    settings["species_pairs"] = None
+                else:
+                    pairs_by_center = self._profile_filter_options.get("species_b_by_species_a", {})
+                    settings["species_pairs"] = [
+                        [a, b]
+                        for a, neighbors in pairs_by_center.items()
+                        if a
+                        for b in neighbors
+                        if (selected[0] is None or a == selected[0])
+                        and (selected[1] is None or b == selected[1])
+                    ]
             if hasattr(self, "position_view_type"):
                 mapping = self._current_position_mapping(strict=True)
                 if (
@@ -19695,16 +19905,12 @@ def launch_plot_settings_panel(
                     and mapping.filter_max is not None
                     and mapping.filter_min > mapping.filter_max
                 ):
-                    raise ValueError(
-                        "2D Heatmap range minimum must not exceed the range maximum."
-                    )
+                    raise ValueError("2D Heatmap range minimum must not exceed the range maximum.")
                 compatibility = generic_view_type_compatibility(
                     self._position_contract(),
                     mapping,
                 )
-                if (
-                    compatibility == "invalid"
-                ):
+                if compatibility == "invalid":
                     raise ValueError(
                         "The selected position mapping is incompatible with the current plot-data contract."
                     )
@@ -19744,18 +19950,26 @@ def launch_plot_settings_panel(
                     not orientation_heatmap_mode and orientation_line_component == "average"
                 )
                 if orientation_heatmap_mode:
-                    settings["orientation_line_x_axis"] = _DENSITY_X_MODE_BY_LABEL.get(
-                        self.orientation_line_x_axis.currentText().strip().lower(),
-                        "distance",
-                    ) if hasattr(self, "orientation_line_x_axis") else "distance"
+                    settings["orientation_line_x_axis"] = (
+                        _DENSITY_X_MODE_BY_LABEL.get(
+                            self.orientation_line_x_axis.currentText().strip().lower(),
+                            "distance",
+                        )
+                        if hasattr(self, "orientation_line_x_axis")
+                        else "distance"
+                    )
                     settings["orientation_heatmap_x_axis"] = None
                     settings["orientation_heatmap_y_axis"] = None
                 else:
                     if orientation_grid_line_enabled:
-                        settings["orientation_line_x_axis"] = _DENSITY_X_MODE_BY_LABEL.get(
-                            self.orientation_line_x_axis.currentText().strip().lower(),
-                            "distance",
-                        ) if hasattr(self, "orientation_line_x_axis") else "distance"
+                        settings["orientation_line_x_axis"] = (
+                            _DENSITY_X_MODE_BY_LABEL.get(
+                                self.orientation_line_x_axis.currentText().strip().lower(),
+                                "distance",
+                            )
+                            if hasattr(self, "orientation_line_x_axis")
+                            else "distance"
+                        )
                     else:
                         settings["orientation_line_x_axis"] = "distance"
                     settings["orientation_heatmap_x_axis"] = None
@@ -19813,10 +20027,7 @@ def launch_plot_settings_panel(
                 )
             if hasattr(self, "heatmap_cmap"):
                 settings["heatmap_cmap"] = self.heatmap_cmap.currentText().strip() or None
-            if (
-                hasattr(self, "heatmap_value_mode")
-                and self._analysis_name == "orientation"
-            ):
+            if hasattr(self, "heatmap_value_mode") and self._analysis_name == "orientation":
                 value_label = self.heatmap_value_mode.currentText().strip()
                 value_mode = _HEATMAP_VALUE_MODE_BY_LABEL.get(
                     value_label,
@@ -19825,17 +20036,13 @@ def launch_plot_settings_panel(
                 settings["heatmap_value_mode"] = value_mode
                 bulk_reference_mode = (
                     "manual"
-                    if self.heatmap_bulk_reference_mode.currentText().strip().lower()
-                    == "manual"
+                    if self.heatmap_bulk_reference_mode.currentText().strip().lower() == "manual"
                     else "auto"
                 )
                 settings["heatmap_bulk_reference_mode"] = bulk_reference_mode
                 settings["heatmap_bulk_min"] = None
                 settings["heatmap_bulk_max"] = None
-                if (
-                    value_mode == "bulk_relative_enrichment"
-                    and bulk_reference_mode == "manual"
-                ):
+                if value_mode == "bulk_relative_enrichment" and bulk_reference_mode == "manual":
                     bulk_min = _optional_float(
                         self.heatmap_bulk_min.text(),
                         field_name="bulk-reference minimum distance",
@@ -19853,8 +20060,7 @@ def launch_plot_settings_panel(
                     settings["heatmap_bulk_max"] = bulk_max
             if hasattr(self, "heatmap_log_scale"):
                 settings["heatmap_log_scale"] = (
-                    self.heatmap_log_scale.currentText().strip().lower()
-                    == "logarithmic"
+                    self.heatmap_log_scale.currentText().strip().lower() == "logarithmic"
                 )
             if hasattr(self, "heatmap_colorbar_label"):
                 raw = self.heatmap_colorbar_label.text().strip()
@@ -20123,6 +20329,7 @@ def launch_plot_settings_panel(
             self._preview_timer.stop()
             self._preview_generation += 1
             self._active_preview_generation = None
+            self._active_preview_signature = None
             self._active_preview_image_path = None
             self._pending_preview_request = None
             self._preview_worker_stop.set()
@@ -20157,6 +20364,8 @@ def launch_plot_settings_panel(
                     pass
                 return
             self._refresh_preview_pixmap()
+            if self._preview_loading:
+                return
             if self._preview_pixmap is None or self._preview_pixmap.isNull():
                 self._update_embedded_preview(interactive=False)
 
@@ -20183,9 +20392,7 @@ def launch_plot_settings_panel(
             preview_canvas_scroll = self._preview_canvas_scroll
             preview_viewport = preview_scroll.viewport() if preview_scroll is not None else None
             preview_canvas_viewport = (
-                preview_canvas_scroll.viewport()
-                if preview_canvas_scroll is not None
-                else None
+                preview_canvas_scroll.viewport() if preview_canvas_scroll is not None else None
             )
 
             if isinstance(watched, (QLineEdit, QPlainTextEdit)):
@@ -20236,7 +20443,10 @@ def launch_plot_settings_panel(
                     return True
             if watched in {preview_frame, preview_viewport} and event.type() == QEvent.Type.Resize:
                 QTimer.singleShot(0, self._refresh_preview_pixmap)
-            if watched in {preview_frame, preview_canvas_viewport} and event.type() == QEvent.Type.Resize:
+            if (
+                watched in {preview_frame, preview_canvas_viewport}
+                and event.type() == QEvent.Type.Resize
+            ):
                 QTimer.singleShot(0, self._resize_preview_canvas_to_figure)
             return super().eventFilter(watched, event)
 

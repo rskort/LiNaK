@@ -12,10 +12,11 @@ import os
 from pathlib import Path
 import re
 from types import TracebackType
-from typing import Any
+from typing import Any, TYPE_CHECKING
 from collections.abc import Callable
 
 import numpy as np
+from ase import Atoms
 
 from .. import __version__
 from ..cube_io import CubeDataset, read_cube_sources, validate_cube_source
@@ -31,21 +32,34 @@ from ..plot.plotting import (
     resolve_series_labels,
 )
 from ..storage.hdf5_utils import (
+    _read_required_linak_header,
     LINAK_HDF5_FORMAT,
     LINAK_HDF5_VERSION,
     hdf5_string_dtype,
     require_h5py,
     resolve_hdf5_output_path,
 )
+from ..storage.policies import STORAGE_PRECISION_POLICY, normalize_compression_profile
 from ..progress import ProgressBar
+from ..runtime_resources import MIB, resolve_resource_policy, resolve_worker_count
+from .surface import (
+    canonical_surface_axis_values,
+    estimate_surface_layout_reference,
+    surface_distance_components,
+)
+from .water import water_molecule_triplets, water_triplet_geometry
+
+if TYPE_CHECKING:
+    import h5py
 
 LOGGER = logging.getLogger(__name__)
+_POTENTIAL_SCHEMA_VERSION = 2
 
 BOHR_TO_ANG = 0.529177210903
 HARTREE_TO_EV = 27.211386245988
 
 # DOI: 10.1063/5.0322322
-DEFAULT_CSHE_OFFSET_EV = 15.51 - 0.35 - 15.81 # = -0.65
+DEFAULT_CSHE_OFFSET_EV = 15.51 - 0.35 - 15.81  # = -0.65
 _DEFAULT_POTENTIAL_THREAD_CAP = 1
 _WATER_ATOMIC_NUMBERS = {1, 8}
 
@@ -74,6 +88,17 @@ POTENTIAL_CSV_COLUMNS = [
     "efermi_ev",
     "water_bulk_potential_ev",
     "electrode_cshe_ev",
+    "water_bulk_potential_top_ev",
+    "water_bulk_potential_bottom_ev",
+    "electrode_cshe_top_ev",
+    "electrode_cshe_bottom_ev",
+    "water_bulk_window_top_min_A",
+    "water_bulk_window_top_max_A",
+    "water_bulk_window_bottom_min_A",
+    "water_bulk_window_bottom_max_A",
+    "surface_layout_requested",
+    "surface_layout_resolved",
+    "water_bulk_provenance",
     "status",
     "error",
 ]
@@ -99,6 +124,7 @@ class CubeHeader:
     vz_bohr: np.ndarray
     atom_numbers: np.ndarray
     atom_z_bohr: np.ndarray
+    atom_positions_bohr: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -107,6 +133,8 @@ class PotentialConfig:
 
     water_padding_ang: float = 5.0
     cshe_offset_ev: float = DEFAULT_CSHE_OFFSET_EV
+    surface_layout: str = "auto"
+    surface_mode: str = "auto"
 
 
 @dataclass(frozen=True)
@@ -122,16 +150,23 @@ class PotentialRecord:
     electrode_cshe_ev: float | None
     status: str
     error: str | None
+    water_bulk_potential_top_ev: float | None = None
+    water_bulk_potential_bottom_ev: float | None = None
+    electrode_cshe_top_ev: float | None = None
+    electrode_cshe_bottom_ev: float | None = None
+    water_bulk_window_top_min_A: float | None = None
+    water_bulk_window_top_max_A: float | None = None
+    water_bulk_window_bottom_min_A: float | None = None
+    water_bulk_window_bottom_max_A: float | None = None
+    surface_layout_requested: str | None = None
+    surface_layout_resolved: str | None = None
+    water_bulk_provenance: str | None = None
 
     def as_row_dict(self) -> dict[str, object]:
         row: dict[str, object] = {}
         for field in POTENTIAL_CSV_COLUMNS:
             row[field] = getattr(self, field)
         return row
-
-    def as_csv_row(self) -> dict[str, object]:
-        """Backward-compatible alias used by existing call sites."""
-        return self.as_row_dict()
 
     def is_complete(self) -> bool:
         return (
@@ -187,6 +222,7 @@ class PotentialCsvAppender:
         append: bool = True,
         overwrite: bool = False,
         sync_on_write: bool = True,
+        compression_profile: str = "fast",
     ) -> None:
         self.requested_output = resolve_hdf5_output_path(output)
         self.plan = plan_potential_csv_output(
@@ -200,6 +236,7 @@ class PotentialCsvAppender:
         self.used_fallback_path = self.plan.used_fallback_path
         self.existing_source_keys = set(self.plan.existing_source_keys)
         self.sync_on_write = sync_on_write
+        self.compression_profile = normalize_compression_profile(compression_profile)
 
         self._handle: Any | None = None
         self._datasets: dict[str, Any] = {}
@@ -222,7 +259,19 @@ class PotentialCsvAppender:
     def _dataset_dtype_for(field: str) -> Any:
         if field == "id":
             return np.int64
-        if field in {"efermi_ev", "water_bulk_potential_ev", "electrode_cshe_ev"}:
+        if field in {
+            "efermi_ev",
+            "water_bulk_potential_ev",
+            "electrode_cshe_ev",
+            "water_bulk_potential_top_ev",
+            "water_bulk_potential_bottom_ev",
+            "electrode_cshe_top_ev",
+            "electrode_cshe_bottom_ev",
+            "water_bulk_window_top_min_A",
+            "water_bulk_window_top_max_A",
+            "water_bulk_window_bottom_min_A",
+            "water_bulk_window_bottom_max_A",
+        }:
             return np.float64
         return hdf5_string_dtype()
 
@@ -230,7 +279,19 @@ class PotentialCsvAppender:
     def _storage_value(field: str, value: Any) -> Any:
         if field == "id":
             return int(value) if value is not None else -1
-        if field in {"efermi_ev", "water_bulk_potential_ev", "electrode_cshe_ev"}:
+        if field in {
+            "efermi_ev",
+            "water_bulk_potential_ev",
+            "electrode_cshe_ev",
+            "water_bulk_potential_top_ev",
+            "water_bulk_potential_bottom_ev",
+            "electrode_cshe_top_ev",
+            "electrode_cshe_bottom_ev",
+            "water_bulk_window_top_min_A",
+            "water_bulk_window_top_max_A",
+            "water_bulk_window_bottom_min_A",
+            "water_bulk_window_bottom_max_A",
+        }:
             return np.nan if value is None else float(value)
         return "" if value is None else str(value)
 
@@ -240,6 +301,7 @@ class PotentialCsvAppender:
 
         handle = h5py.File(path, mode)
         records_group = handle.require_group("records")
+        existing_rows = int(records_group["id"].shape[0]) if "id" in records_group else 0
         for field in POTENTIAL_CSV_COLUMNS:
             if field in records_group:
                 dataset = records_group[field]
@@ -247,25 +309,44 @@ class PotentialCsvAppender:
                     raise ValueError(f"Potential dataset '{field}' must be 1D.")
                 self._datasets[field] = dataset
                 continue
+            dataset_options: dict[str, Any] = {"chunks": (4096,)}
+            if self.compression_profile == "fast":
+                dataset_options["compression"] = "lzf"
+            elif self.compression_profile == "balanced":
+                dataset_options["compression"] = "gzip"
+                dataset_options["compression_opts"] = 4
+            if self.compression_profile != "none" and field == "id":
+                dataset_options["shuffle"] = True
             self._datasets[field] = records_group.create_dataset(
                 field,
-                shape=(0,),
+                shape=(existing_rows,),
                 maxshape=(None,),
                 dtype=self._dataset_dtype_for(field),
+                **dataset_options,
             )
+            if existing_rows:
+                self._datasets[field][...] = self._storage_value(field, None)
 
         handle.attrs["linak_format"] = LINAK_HDF5_FORMAT
         handle.attrs["linak_format_version"] = LINAK_HDF5_VERSION
         handle.attrs["analysis"] = "potential"
+        handle.attrs["analysis_schema_version"] = _POTENTIAL_SCHEMA_VERSION
         if "created_utc" not in handle.attrs:
             handle.attrs["created_utc"] = (
                 datetime.now(timezone.utc).replace(microsecond=0).isoformat()
             )
         handle.attrs["linak_version"] = __version__
+        handle.attrs["compression_profile"] = self.compression_profile
+        handle.attrs["storage_precision_policy"] = STORAGE_PRECISION_POLICY
         handle.attrs["columns_json"] = json.dumps(POTENTIAL_CSV_COLUMNS)
         if "metadata_json" not in handle.attrs:
             handle.attrs["metadata_json"] = json.dumps(
-                {"columns": POTENTIAL_CSV_COLUMNS, "analysis": "potential"},
+                {
+                    "columns": POTENTIAL_CSV_COLUMNS,
+                    "analysis": "potential",
+                    "compression_profile": self.compression_profile,
+                    "storage_precision_policy": STORAGE_PRECISION_POLICY,
+                },
                 sort_keys=True,
             )
         return handle
@@ -397,6 +478,15 @@ def validate_potential_config(config: PotentialConfig) -> None:
     """Validate potential-analysis configuration values."""
     if config.water_padding_ang < 0.0:
         raise ValueError(f"water_padding_ang must be >= 0 (got {config.water_padding_ang}).")
+    if str(config.surface_layout).strip().lower() not in {
+        "auto",
+        "single-top",
+        "single-bottom",
+        "symmetric",
+    }:
+        raise ValueError("surface_layout must be auto, single-top, single-bottom, or symmetric.")
+    if str(config.surface_mode).strip().lower() not in {"auto", "layered", "rough"}:
+        raise ValueError("surface_mode must be auto, layered, or rough.")
 
 
 def validate_hartree_cube_source(path: str | Path) -> Path:
@@ -534,6 +624,7 @@ def _read_cube_header(path: Path) -> tuple[CubeHeader, int]:
 
         atom_numbers = np.empty((natoms,), dtype=int)
         atom_z_bohr = np.empty((natoms,), dtype=float)
+        atom_positions_bohr = np.empty((natoms, 3), dtype=float)
         for atom_index in range(natoms):
             line = handle.readline()
             if not line:
@@ -542,6 +633,10 @@ def _read_cube_header(path: Path) -> tuple[CubeHeader, int]:
             if len(tokens) < 5:
                 raise ValueError(f"Invalid atom line in cube file '{path}'.")
             atom_numbers[atom_index] = int(round(float(tokens[0])))
+            atom_positions_bohr[atom_index] = np.asarray(
+                [float(tokens[2]), float(tokens[3]), float(tokens[4])],
+                dtype=float,
+            )
             atom_z_bohr[atom_index] = float(tokens[4])
 
     data_start_line = 2 + 1 + 3 + natoms
@@ -556,6 +651,7 @@ def _read_cube_header(path: Path) -> tuple[CubeHeader, int]:
         vz_bohr=vz,
         atom_numbers=atom_numbers,
         atom_z_bohr=atom_z_bohr,
+        atom_positions_bohr=atom_positions_bohr,
     )
     return header, data_start_line
 
@@ -578,6 +674,7 @@ def _cube_header_from_dataset(dataset: CubeDataset) -> CubeHeader:
         vz_bohr=np.asarray(dataset.grid_vectors_bohr[2], dtype=float),
         atom_numbers=np.asarray(dataset.atom_numbers, dtype=int),
         atom_z_bohr=np.asarray(atom_positions_bohr[:, 2], dtype=float),
+        atom_positions_bohr=atom_positions_bohr,
     )
 
 
@@ -737,6 +834,163 @@ def _non_water_contaminated_z_slices(z_ang: np.ndarray, header: CubeHeader) -> n
     return contaminated
 
 
+def _contaminated_slices_for_atom_mask(
+    coordinate_ang: np.ndarray,
+    atom_coordinate_ang: np.ndarray,
+    atom_mask: np.ndarray,
+) -> np.ndarray:
+    """Mark profile slices occupied by excluded/non-water atoms."""
+    values = np.asarray(coordinate_ang, dtype=float)
+    contaminated = np.zeros(values.shape, dtype=bool)
+    selected_atoms = np.asarray(atom_coordinate_ang, dtype=float)[np.asarray(atom_mask, dtype=bool)]
+    if values.size == 0 or selected_atoms.size == 0:
+        return contaminated
+    order, edges = _z_slice_edges_ang(values)
+    for atom_coordinate in selected_atoms:
+        if atom_coordinate < edges[0] or atom_coordinate > edges[-1]:
+            continue
+        sorted_index = int(np.searchsorted(edges, atom_coordinate, side="right") - 1)
+        sorted_index = min(max(sorted_index, 0), order.size - 1)
+        contaminated[int(order[sorted_index])] = True
+    return contaminated
+
+
+def _cube_atoms(header: CubeHeader) -> Atoms | None:
+    positions_bohr = header.atom_positions_bohr
+    if positions_bohr is None:
+        return None
+    positions = np.asarray(positions_bohr, dtype=float) * BOHR_TO_ANG
+    cell = (
+        np.asarray(
+            [
+                float(header.nx) * np.asarray(header.vx_bohr, dtype=float),
+                float(header.ny) * np.asarray(header.vy_bohr, dtype=float),
+                float(header.nz) * np.asarray(header.vz_bohr, dtype=float),
+            ],
+            dtype=float,
+        )
+        * BOHR_TO_ANG
+    )
+    atoms = Atoms(
+        numbers=np.asarray(header.atom_numbers, dtype=int),
+        positions=positions,
+        cell=cell,
+        pbc=True,
+    )
+    atoms.set_celldisp(np.asarray(header.origin_bohr, dtype=float) * BOHR_TO_ANG)
+    return atoms
+
+
+def _two_sided_water_bulk_potentials(
+    *,
+    header: CubeHeader,
+    z_ang: np.ndarray,
+    v_xyavg_ev: np.ndarray,
+    config: PotentialConfig,
+) -> dict[str, Any] | None:
+    """Resolve topology-aware water windows relative to paired slab surfaces."""
+    atoms = _cube_atoms(header)
+    if atoms is None:
+        return None
+    triplets = water_molecule_triplets(atoms)
+    if triplets.size == 0:
+        return None
+    try:
+        reference = estimate_surface_layout_reference(
+            [atoms],
+            axis="z",
+            surface_layout=config.surface_layout,
+            mode=config.surface_mode,
+        )
+    except (ValueError, RuntimeError) as exc:
+        LOGGER.warning("Surface-aware potential windows unavailable: %s", exc)
+        reference = None
+    if reference is None or not reference.uses_distance:
+        water_indices = np.unique(np.asarray(triplets, dtype=int).reshape(-1))
+        water_coordinates = np.asarray(atoms.positions[water_indices, 2], dtype=float)
+        true_water_mask = np.zeros(len(atoms), dtype=bool)
+        true_water_mask[water_indices] = True
+        raw_axis_window = _water_bulk_potential_ev(
+            z_ang=np.asarray(z_ang, dtype=float),
+            v_xyavg_ev=np.asarray(v_xyavg_ev, dtype=float),
+            water_z_min_ang=float(np.min(water_coordinates)),
+            water_z_max_ang=float(np.max(water_coordinates)),
+            padding_ang=float(config.water_padding_ang),
+            contaminated_z_mask=_contaminated_slices_for_atom_mask(
+                np.asarray(z_ang, dtype=float),
+                np.asarray(atoms.positions[:, 2], dtype=float),
+                ~true_water_mask,
+            ),
+        )
+        explicit_symmetric = str(config.surface_layout).strip().lower() == "symmetric"
+        return {
+            "reference": reference,
+            "top": (None, None, None) if explicit_symmetric else raw_axis_window,
+            "bottom": (None, None, None),
+            "combined": None if explicit_symmetric else raw_axis_window[0],
+            "reason": (
+                "explicit symmetric surface reference fell back to raw-axis coordinates"
+                if explicit_symmetric
+                else "true H2O topology; raw-axis single-window fallback"
+            ),
+        }
+
+    grid_q = canonical_surface_axis_values(reference, np.asarray(z_ang, dtype=float), frame_index=0)
+    atom_q = canonical_surface_axis_values(
+        reference,
+        np.asarray(atoms.positions[:, 2], dtype=float),
+        frame_index=0,
+    )
+    geometry = water_triplet_geometry(atoms, triplets)
+    com_q = canonical_surface_axis_values(
+        reference,
+        np.asarray(geometry.com_positions[:, 2], dtype=float),
+        frame_index=0,
+    )
+    _folded, _top_distance, _bottom_distance, molecule_side = surface_distance_components(
+        reference,
+        np.asarray(geometry.com_positions[:, 2], dtype=float),
+        frame_index=0,
+    )
+
+    water_indices = np.unique(np.asarray(triplets, dtype=int).reshape(-1))
+    true_water_mask = np.zeros(len(atoms), dtype=bool)
+    true_water_mask[water_indices] = True
+    contaminated = _contaminated_slices_for_atom_mask(
+        grid_q,
+        atom_q,
+        ~true_water_mask,
+    )
+
+    results: dict[str, tuple[float | None, float | None, float | None]] = {}
+    for side_name, side_value in (("top", 1), ("bottom", -1)):
+        selected_molecules = np.where(molecule_side == side_value)[0]
+        if selected_molecules.size == 0:
+            results[side_name] = (None, None, None)
+            continue
+        selected_atom_indices = np.unique(
+            np.asarray(triplets, dtype=int)[selected_molecules].reshape(-1)
+        )
+        side_coordinates = atom_q[selected_atom_indices]
+        results[side_name] = _water_bulk_potential_ev(
+            z_ang=grid_q,
+            v_xyavg_ev=np.asarray(v_xyavg_ev, dtype=float),
+            water_z_min_ang=float(np.min(side_coordinates)),
+            water_z_max_ang=float(np.max(side_coordinates)),
+            padding_ang=float(config.water_padding_ang),
+            contaminated_z_mask=contaminated,
+        )
+    return {
+        "reference": reference,
+        "top": results["top"],
+        "bottom": results["bottom"],
+        "reason": "true H2O topology; non-water atoms excluded from clean windows",
+        "combined": None,
+        "water_molecule_count": int(triplets.shape[0]),
+        "water_com_coordinate_A": com_q.tolist(),
+    }
+
+
 def _widest_clean_run_mask(
     *,
     z_ang: np.ndarray,
@@ -851,8 +1105,9 @@ def compute_potential_record(
 ) -> PotentialRecord:
     """Compute cSHE-related quantities for one Hartree cube file."""
     validate_potential_config(config)
-    dataset: CubeDataset | None = source if isinstance(source, CubeDataset) else None
-    if dataset is None:
+    if isinstance(source, CubeDataset):
+        dataset = source
+    else:
         source_path = validate_hartree_cube_source(source)
         expanded = read_cube_sources(source_path)
         if len(expanded) != 1:
@@ -868,35 +1123,75 @@ def compute_potential_record(
         raise ValueError("Potential profile is empty.")
 
     v_xyavg_ev = np.asarray(v_xyavg_hartree, dtype=float) * HARTREE_TO_EV
-    water_bounds = water_z_bounds_ang(header)
-
     water_bulk_potential_ev: float | None = None
+    water_bulk_potential_top_ev: float | None = None
+    water_bulk_potential_bottom_ev: float | None = None
+    top_window_min: float | None = None
+    top_window_max: float | None = None
+    bottom_window_min: float | None = None
+    bottom_window_max: float | None = None
+    layout_requested = str(config.surface_layout).strip().lower() or "auto"
+    layout_resolved: str | None = None
+    water_bulk_provenance: str | None = None
 
-    if water_bounds is None:
+    topology_result = _two_sided_water_bulk_potentials(
+        header=header,
+        z_ang=z_ang,
+        v_xyavg_ev=v_xyavg_ev,
+        config=config,
+    )
+    if topology_result is None:
         LOGGER.warning(
-            "No O/H atoms found in cube header for '%s'; water-bulk potential unavailable.",
+            "No topologically valid H2O molecules found in cube header for '%s'; "
+            "side-resolved water-bulk potentials are unavailable.",
             _compact_path(source_path),
         )
-        LOGGER.debug("No O/H atoms found for source: %s", source_path)
+        water_bulk_provenance = "unavailable: no complete H2O topology"
     else:
-        water_z_min_ang, water_z_max_ang = water_bounds
+        reference = topology_result["reference"]
+        if reference is not None:
+            layout_requested = reference.requested_layout
+            layout_resolved = reference.resolved_layout
+        water_bulk_provenance = str(topology_result["reason"])
         (
-            water_bulk_potential_ev,
-            _water_bulk_z_min_ang,
-            _water_bulk_z_max_ang,
-        ) = _water_bulk_potential_ev(
-            z_ang=z_ang,
-            v_xyavg_ev=v_xyavg_ev,
-            water_z_min_ang=water_z_min_ang,
-            water_z_max_ang=water_z_max_ang,
-            padding_ang=float(config.water_padding_ang),
-            contaminated_z_mask=_non_water_contaminated_z_slices(z_ang, header),
-        )
+            water_bulk_potential_top_ev,
+            top_window_min,
+            top_window_max,
+        ) = topology_result["top"]
+        (
+            water_bulk_potential_bottom_ev,
+            bottom_window_min,
+            bottom_window_max,
+        ) = topology_result["bottom"]
+        if layout_resolved == "symmetric":
+            if (
+                water_bulk_potential_top_ev is not None
+                and water_bulk_potential_bottom_ev is not None
+            ):
+                water_bulk_potential_ev = 0.5 * (
+                    water_bulk_potential_top_ev + water_bulk_potential_bottom_ev
+                )
+        elif layout_resolved == "single-bottom":
+            water_bulk_potential_ev = water_bulk_potential_bottom_ev
+        elif layout_resolved == "single-top":
+            water_bulk_potential_ev = water_bulk_potential_top_ev
+        elif topology_result.get("combined") is not None:
+            water_bulk_potential_ev = float(topology_result["combined"])
 
     output_out = find_cp2k_output_file(source_dir)
     efermi_ev = parse_fermi_ev(output_out) if output_out is not None else None
 
     electrode_cshe_ev = None
+    electrode_cshe_top_ev = None
+    electrode_cshe_bottom_ev = None
+    if efermi_ev is not None and water_bulk_potential_top_ev is not None:
+        electrode_cshe_top_ev = (
+            water_bulk_potential_top_ev - efermi_ev + float(config.cshe_offset_ev)
+        )
+    if efermi_ev is not None and water_bulk_potential_bottom_ev is not None:
+        electrode_cshe_bottom_ev = (
+            water_bulk_potential_bottom_ev - efermi_ev + float(config.cshe_offset_ev)
+        )
     if efermi_ev is not None and water_bulk_potential_ev is not None:
         electrode_cshe_ev = water_bulk_potential_ev - efermi_ev + float(config.cshe_offset_ev)
 
@@ -924,6 +1219,17 @@ def compute_potential_record(
         electrode_cshe_ev=electrode_cshe_ev,
         status=status,
         error=None,
+        water_bulk_potential_top_ev=water_bulk_potential_top_ev,
+        water_bulk_potential_bottom_ev=water_bulk_potential_bottom_ev,
+        electrode_cshe_top_ev=electrode_cshe_top_ev,
+        electrode_cshe_bottom_ev=electrode_cshe_bottom_ev,
+        water_bulk_window_top_min_A=top_window_min,
+        water_bulk_window_top_max_A=top_window_max,
+        water_bulk_window_bottom_min_A=bottom_window_min,
+        water_bulk_window_bottom_max_A=bottom_window_max,
+        surface_layout_requested=layout_requested,
+        surface_layout_resolved=layout_resolved,
+        water_bulk_provenance=water_bulk_provenance,
     )
 
 
@@ -947,15 +1253,52 @@ def error_record_for_source(source: str | Path, error: str) -> PotentialRecord:
     )
 
 
-def _resolve_worker_count(threads: int | None, n_sources: int) -> int:
+def _estimate_cube_worker_bytes(source: str | Path | CubeDataset) -> int:
+    """Estimate cube payload and scratch bytes without loading raw cube values."""
+
+    if isinstance(source, CubeDataset):
+        return max(64 * MIB, int(np.asarray(source.values).nbytes) * 4)
+    path = Path(source).expanduser().resolve()
+    if path.suffix.lower() == ".cube":
+        try:
+            with path.open("r", encoding="utf-8", errors="replace") as handle:
+                handle.readline()
+                handle.readline()
+                origin_fields = handle.readline().split()
+                atom_count = abs(int(origin_fields[0]))
+                counts = [abs(int(handle.readline().split()[0])) for _ in range(3)]
+            value_bytes = int(np.prod(counts, dtype=np.int64)) * 8
+            atom_bytes = atom_count * 5 * 8
+            return max(64 * MIB, 4 * (value_bytes + atom_bytes))
+        except (OSError, ValueError, IndexError):
+            pass
+    try:
+        return max(64 * MIB, int(path.stat().st_size) * 4)
+    except OSError:
+        return 64 * MIB
+
+
+def _resolve_worker_count(
+    threads: int | None,
+    n_sources: int,
+    *,
+    estimated_bytes_per_worker: int = 64 * MIB,
+    memory_budget_mib: float | None = None,
+) -> int:
     if n_sources <= 0:
         return 1
 
-    if threads is None:
-        threads = min(_DEFAULT_POTENTIAL_THREAD_CAP, os.cpu_count() or 1)
-    if threads < 1:
+    if threads is not None and threads < 1:
         raise ValueError("Potential threads must be >= 1.")
-    return min(threads, n_sources)
+    return resolve_worker_count(
+        task_count=n_sources,
+        estimated_bytes_per_worker=estimated_bytes_per_worker,
+        requested_threads=threads,
+        policy=resolve_resource_policy(memory_budget_mib),
+        cpu_count=min(_DEFAULT_POTENTIAL_THREAD_CAP, os.cpu_count() or 1),
+        logger=LOGGER,
+        context="Potential analysis",
+    )
 
 
 def compute_potential_records(
@@ -963,6 +1306,7 @@ def compute_potential_records(
     *,
     config: PotentialConfig,
     threads: int | None = None,
+    memory_budget_mib: float | None = None,
     on_record: PotentialRecordCallback | None = None,
     on_failure: PotentialFailureCallback | None = None,
 ) -> tuple[list[PotentialRecord], list[PotentialComputationFailure]]:
@@ -989,7 +1333,12 @@ def compute_potential_records(
     if not sources:
         raise ValueError("At least one source path is required.")
 
-    worker_count = _resolve_worker_count(threads, len(sources))
+    worker_count = _resolve_worker_count(
+        threads,
+        len(sources),
+        estimated_bytes_per_worker=max(_estimate_cube_worker_bytes(source) for source in sources),
+        memory_budget_mib=memory_budget_mib,
+    )
     records_by_index: dict[int, PotentialRecord] = {}
     failures_by_index: dict[int, PotentialComputationFailure] = {}
 
@@ -1076,6 +1425,39 @@ def summarize_potential_statistics(
     }
 
 
+def _validate_potential_table(handle: h5py.File, *, path: Path) -> None:
+    """Check current table metadata and column shapes without reading payloads."""
+    import h5py
+
+    _read_required_linak_header(handle, path=path, expected_analysis="potential")
+    if handle.attrs.get("analysis_schema_version") != _POTENTIAL_SCHEMA_VERSION:
+        raise ValueError(
+            f"Potential HDF5 '{path}' requires analysis schema version "
+            f"{_POTENTIAL_SCHEMA_VERSION}. Recompute this analysis with the current LiNaK."
+        )
+    records = handle.get("records")
+    if not isinstance(records, h5py.Group):
+        raise ValueError(f"Potential HDF5 '{path}' is missing '/records'. Recompute this analysis.")
+    missing = [
+        column
+        for column in POTENTIAL_CSV_COLUMNS
+        if not isinstance(records.get(column), h5py.Dataset)
+    ]
+    if missing:
+        raise ValueError(
+            f"Potential HDF5 '{path}' is missing required column(s): {', '.join(missing)}. "
+            "Recompute this analysis."
+        )
+    row_shape = records["id"].shape
+    if len(row_shape) != 1 or any(
+        records[column].shape != row_shape for column in POTENTIAL_CSV_COLUMNS
+    ):
+        raise ValueError(
+            f"Potential HDF5 '{path}' requires aligned one-dimensional record columns. "
+            "Recompute this analysis."
+        )
+
+
 def load_potential_records(source: str | Path) -> list[PotentialRecord]:
     """Load the raw potential-record rows from one LiNaK potential HDF5 file."""
     require_h5py()
@@ -1086,17 +1468,8 @@ def load_potential_records(source: str | Path) -> list[PotentialRecord]:
         raise FileNotFoundError(f"HDF5 file not found: {source_path}")
 
     with h5py.File(source_path, "r") as handle:
-        if str(handle.attrs.get("analysis", "")) != "potential":
-            raise ValueError(f"HDF5 analysis mismatch for '{source_path}': expected 'potential'.")
-        if "records" not in handle:
-            raise ValueError(f"Potential HDF5 '{source_path}' is missing '/records'.")
+        _validate_potential_table(handle, path=source_path)
         records_group = handle["records"]
-        missing = [column for column in POTENTIAL_CSV_COLUMNS if column not in records_group]
-        if missing:
-            joined = ", ".join(missing)
-            raise ValueError(
-                f"Potential HDF5 '{source_path}' is missing required column(s): {joined}."
-            )
         row_count = int(records_group["id"].shape[0])
         ids = np.asarray(records_group["id"], dtype=np.int64)
         sources = np.asarray(records_group["source"].asstr()[...], dtype=object)
@@ -1107,6 +1480,27 @@ def load_potential_records(source: str | Path) -> list[PotentialRecord]:
         efermi = np.asarray(records_group["efermi_ev"], dtype=float)
         water_bulk = np.asarray(records_group["water_bulk_potential_ev"], dtype=float)
         cshe = np.asarray(records_group["electrode_cshe_ev"], dtype=float)
+        side_numeric = {
+            name: (np.asarray(records_group[name], dtype=float))
+            for name in (
+                "water_bulk_potential_top_ev",
+                "water_bulk_potential_bottom_ev",
+                "electrode_cshe_top_ev",
+                "electrode_cshe_bottom_ev",
+                "water_bulk_window_top_min_A",
+                "water_bulk_window_top_max_A",
+                "water_bulk_window_bottom_min_A",
+                "water_bulk_window_bottom_max_A",
+            )
+        }
+        layout_text = {
+            name: (np.asarray(records_group[name].asstr()[...], dtype=object))
+            for name in (
+                "surface_layout_requested",
+                "surface_layout_resolved",
+                "water_bulk_provenance",
+            )
+        }
 
     loaded: list[PotentialRecord] = []
     for index in range(row_count):
@@ -1123,6 +1517,55 @@ def load_potential_records(source: str | Path) -> list[PotentialRecord]:
                 electrode_cshe_ev=None if not np.isfinite(cshe[index]) else float(cshe[index]),
                 status=str(statuses[index]),
                 error=(str(errors[index]).strip() or None),
+                water_bulk_potential_top_ev=(
+                    None
+                    if not np.isfinite(side_numeric["water_bulk_potential_top_ev"][index])
+                    else float(side_numeric["water_bulk_potential_top_ev"][index])
+                ),
+                water_bulk_potential_bottom_ev=(
+                    None
+                    if not np.isfinite(side_numeric["water_bulk_potential_bottom_ev"][index])
+                    else float(side_numeric["water_bulk_potential_bottom_ev"][index])
+                ),
+                electrode_cshe_top_ev=(
+                    None
+                    if not np.isfinite(side_numeric["electrode_cshe_top_ev"][index])
+                    else float(side_numeric["electrode_cshe_top_ev"][index])
+                ),
+                electrode_cshe_bottom_ev=(
+                    None
+                    if not np.isfinite(side_numeric["electrode_cshe_bottom_ev"][index])
+                    else float(side_numeric["electrode_cshe_bottom_ev"][index])
+                ),
+                water_bulk_window_top_min_A=(
+                    None
+                    if not np.isfinite(side_numeric["water_bulk_window_top_min_A"][index])
+                    else float(side_numeric["water_bulk_window_top_min_A"][index])
+                ),
+                water_bulk_window_top_max_A=(
+                    None
+                    if not np.isfinite(side_numeric["water_bulk_window_top_max_A"][index])
+                    else float(side_numeric["water_bulk_window_top_max_A"][index])
+                ),
+                water_bulk_window_bottom_min_A=(
+                    None
+                    if not np.isfinite(side_numeric["water_bulk_window_bottom_min_A"][index])
+                    else float(side_numeric["water_bulk_window_bottom_min_A"][index])
+                ),
+                water_bulk_window_bottom_max_A=(
+                    None
+                    if not np.isfinite(side_numeric["water_bulk_window_bottom_max_A"][index])
+                    else float(side_numeric["water_bulk_window_bottom_max_A"][index])
+                ),
+                surface_layout_requested=(
+                    str(layout_text["surface_layout_requested"][index]).strip() or None
+                ),
+                surface_layout_resolved=(
+                    str(layout_text["surface_layout_resolved"][index]).strip() or None
+                ),
+                water_bulk_provenance=(
+                    str(layout_text["water_bulk_provenance"][index]).strip() or None
+                ),
             )
         )
     return loaded
@@ -1174,11 +1617,15 @@ def _write_combined_potential_source_metadata(
         )
         group.create_dataset(
             "row_start",
-            data=np.asarray([row_start for _path, row_start, _count in source_segments], dtype=np.int64),
+            data=np.asarray(
+                [row_start for _path, row_start, _count in source_segments], dtype=np.int64
+            ),
         )
         group.create_dataset(
             "row_count",
-            data=np.asarray([row_count for _path, _start, row_count in source_segments], dtype=np.int64),
+            data=np.asarray(
+                [row_count for _path, _start, row_count in source_segments], dtype=np.int64
+            ),
         )
 
 
@@ -1244,27 +1691,9 @@ def load_potential_plot_profiles(
     if not source_path.exists():
         raise FileNotFoundError(f"HDF5 file not found: {source_path}")
 
-    required_columns = (
-        "id",
-        "efermi_ev",
-        "water_bulk_potential_ev",
-        "electrode_cshe_ev",
-        "status",
-        "source",
-        "source_dir",
-    )
     with h5py.File(source_path, "r") as handle:
-        if str(handle.attrs.get("analysis", "")) != "potential":
-            raise ValueError(f"HDF5 analysis mismatch for '{source_path}': expected 'potential'.")
-        if "records" not in handle:
-            raise ValueError(f"Potential HDF5 '{source_path}' is missing '/records'.")
+        _validate_potential_table(handle, path=source_path)
         records = handle["records"]
-        missing = [column for column in required_columns if column not in records]
-        if missing:
-            joined = ", ".join(missing)
-            raise ValueError(
-                f"Potential HDF5 '{source_path}' is missing required column(s): {joined}."
-            )
 
         total_rows = int(records["id"].shape[0])
         raw_ids = np.asarray(records["id"], dtype=np.int64)
@@ -1294,7 +1723,9 @@ def load_potential_plot_profiles(
         incomplete_rows = row_count - complete_rows
         total_complete_rows += complete_rows
         is_combined_segment = segment_source_path != source_path
-        label_prefix = segment_source_path.stem or segment_source_path.name or str(segment_source_path)
+        label_prefix = (
+            segment_source_path.stem or segment_source_path.name or str(segment_source_path)
+        )
         for series_id, default_label in _POTENTIAL_PLOT_SERIES_SPECS:
             rendered_series_id = (
                 f"{segment_source_path}::{series_id}" if is_combined_segment else series_id
@@ -1506,26 +1937,8 @@ def _read_csv_header(path: Path) -> list[str]:
 
     try:
         with h5py.File(path, "r") as handle:
-            if str(handle.attrs.get("linak_format", "")) != LINAK_HDF5_FORMAT:
-                return []
-            if str(handle.attrs.get("analysis", "")) != "potential":
-                return []
-
-            columns_raw = handle.attrs.get("columns_json")
-            columns: list[str] = []
-            if columns_raw is not None:
-                if isinstance(columns_raw, bytes):
-                    columns_raw = columns_raw.decode("utf-8", errors="replace")
-                decoded = json.loads(str(columns_raw))
-                if isinstance(decoded, list):
-                    columns = [str(item) for item in decoded]
-
-            if not columns:
-                if "records" not in handle:
-                    return []
-                columns = [str(name) for name in handle["records"].keys()]
-
-            return [column for column in columns if column in POTENTIAL_CSV_COLUMNS]
+            _validate_potential_table(handle, path=path)
+            return list(POTENTIAL_CSV_COLUMNS)
     except (OSError, ValueError, json.JSONDecodeError):
         return []
 
@@ -1587,17 +2000,9 @@ def _read_max_existing_id(path: Path) -> int:
 
 
 def _fallback_csv_path(path: Path) -> Path:
-    from .output_naming import numbered_hdf5_path, split_analysis_hdf5_name
+    from .output_naming import unique_output_path
 
-    suffix = path.suffix if path.suffix.lower() in {".h5", ".hdf5"} else ".h5"
-    split = split_analysis_hdf5_name(path.name)
-    stem = split[0] if split is not None else (path.stem if path.suffix else path.name)
-    candidate = path.with_name(f"{stem}.linak.potential{suffix}")
-    counter = 1
-    while candidate.exists():
-        candidate = numbered_hdf5_path(path.with_name(f"{stem}.linak.potential{suffix}"), counter)
-        counter += 1
-    return candidate
+    return unique_output_path(path)
 
 
 def plan_potential_csv_output(

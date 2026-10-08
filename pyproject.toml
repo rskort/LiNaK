@@ -1,26 +1,27 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=77.0.3", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "LiNaK"
-version = "0.9.9"
+version = "0.10.0"
 description = "Lightweight molecular dynamics trajectory analysis toolkit."
 readme = "README.md"
 requires-python = ">=3.9"
-license = { text = "MIT" }
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 authors = [{ name = "R.S. Kort" }]
 keywords = ["molecular-dynamics", "trajectory-analysis", "surface-science", "electrochemistry", "cp2k"]
 classifiers = [
   "Development Status :: 4 - Beta",
   "Intended Audience :: Science/Research",
-  "License :: OSI Approved :: MIT License",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.9",
   "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
   "Topic :: Scientific/Engineering :: Chemistry",
   "Topic :: Scientific/Engineering :: Physics",
 ]
@@ -38,7 +39,7 @@ dependencies = [
 dev = [
   "pytest>=7.0",
   "ruff>=0.6.0",
-  "mypy>=1.8.0",
+  "mypy>=1.8.0,<2",
 ]
 
 [project.scripts]
@@ -46,7 +47,6 @@ linak = "linak.cli:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
-license-files = ["LICENSE"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -82,8 +82,8 @@ line-ending = "lf"
 
 [tool.mypy]
 python_version = "3.9"
-files = ["src/linak", "tests"]
-check_untyped_defs = false
+files = ["src/linak", "tests", "benchmarks"]
+check_untyped_defs = true
 disallow_incomplete_defs = false
 follow_imports = "silent"
 ignore_missing_imports = true

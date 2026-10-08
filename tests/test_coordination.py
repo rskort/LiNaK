@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,6 +14,7 @@ from linak.analysis.common import RAW_SPECIES_ARRAY
 from linak.analysis.coordination import (
     CoordinationCutoffResolution,
     CoordinationProfile,
+    _coordination_profile_for_interface_view,
     compute_coordination_profiles,
     compute_coordination_profile,
     load_coordination_profiles,
@@ -462,7 +465,7 @@ def test_same_species_single_center_has_zero_coordination():
 
 
 def test_coordination_analysis_reports_progress_for_cutoff_and_values(monkeypatch):
-    events: list[tuple[str, object]] = []
+    events: list[tuple[object, ...]] = []
 
     class _DummyProgressBar:
         def __init__(self, *, desc, total=None, unit="it", **_kwargs):
@@ -507,7 +510,7 @@ def test_coordination_analysis_reports_progress_for_cutoff_and_values(monkeypatc
 
     assert profile.coordination_number.shape == (2, 1)
     entered = [event[1] for event in events if event[0] == "enter"]
-    assert any("Computing coordination" in desc for desc in entered)
+    assert any("Computing coordination" in str(desc) for desc in entered)
     updates = [event for event in events if event[0] == "update"]
     assert updates
 
@@ -759,6 +762,36 @@ def test_compute_coordination_profiles_returns_ordered_pair_collection():
     ]
 
 
+def test_compute_coordination_profiles_batches_center_position_extraction(monkeypatch):
+    frames = _coordination_test_frames()
+    calls: list[list[str]] = []
+    original = coordination_module._compute_position_profiles_for_labels
+
+    def _tracked_compute_position_profiles_for_labels(**kwargs):
+        calls.append(list(kwargs["species_labels"]))
+        return original(**kwargs)
+
+    monkeypatch.setattr(
+        coordination_module,
+        "_compute_position_profiles_for_labels",
+        _tracked_compute_position_profiles_for_labels,
+    )
+    cutoff_resolutions = {
+        pair: CoordinationCutoffResolution(1.0, 0.4, "direct")
+        for pair in (("H", "H"), ("H", "O"), ("O", "H"), ("O", "O"))
+    }
+
+    profiles = compute_coordination_profiles(
+        frames,
+        ordered_pairs=list(cutoff_resolutions),
+        surface_mode="none",
+        cutoff_resolutions=cutoff_resolutions,
+    )
+
+    assert len(profiles) == 4
+    assert calls == [["H", "O"]]
+
+
 def test_save_and_load_coordination_profiles_collection(tmp_path):
     frames = _coordination_test_frames()
     cutoff_resolutions = {
@@ -845,7 +878,14 @@ def test_save_and_load_coordination_profile(tmp_path):
     loaded = load_coordination_profile(output, species_a="O", species_b="H", axis="z")
     np.testing.assert_allclose(loaded.coordination_number, profile.coordination_number)
     np.testing.assert_allclose(loaded.distance_to_surface, profile.distance_to_surface)
+    assert loaded.axis_coordinate is not None
+    assert profile.axis_coordinate is not None
+    np.testing.assert_allclose(loaded.axis_coordinate, profile.axis_coordinate)
     np.testing.assert_allclose(loaded.time_fs, profile.time_fs)
+
+    full = _coordination_profile_for_interface_view(loaded, "full")
+    assert full.coordinate_mode == "axis"
+    np.testing.assert_allclose(full.distance_to_surface, loaded.axis_coordinate)
 
 
 def test_plot_coordination_profile_defaults_to_distance(monkeypatch):
@@ -881,6 +921,7 @@ def test_plot_coordination_profile_defaults_to_distance(monkeypatch):
     plot_coordination_profile(profile, show=False)
     assert captured["x_label"] == "Distance to the surface ($\\mathrm{\\AA}$)"
     assert captured["y_label"] == "Coordination number"
+    assert isinstance(captured["x"], np.ndarray)
     assert len(captured["x"]) > 0
 
 
@@ -920,6 +961,7 @@ def test_plot_coordination_profile_time_uses_atom_series(monkeypatch):
     plot_coordination_profile(profile, component="time", show=False)
     assert captured["x_label"] == "Time (ps)"
     assert captured["labels"] == ["O[2]", "O[3]"]
+    assert isinstance(captured["y_series"], list)
     assert len(captured["y_series"]) == 2
 
 
@@ -962,6 +1004,7 @@ def test_plot_coordination_profiles_accepts_contract_driven_trajectory_mapping(m
     )
 
     assert captured["time_axis"] == "fs"
+    assert isinstance(captured["profiles"], list)
     assert len(captured["profiles"]) == 1
 
 

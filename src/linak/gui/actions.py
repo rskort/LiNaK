@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from ..cell_geometry import cell_matrix, compact_cell
+
 from collections.abc import Callable, Sequence
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass, field as dataclass_field
@@ -27,7 +29,9 @@ class SettingField:
     group: str = "General"
     help_text: str = ""
     minimum: float | None = None
-    widget: Literal["auto", "species", "axis", "float", "int", "text", "path", "choice", "bool"] = "auto"
+    widget: Literal["auto", "species", "axis", "float", "int", "text", "path", "choice", "bool"] = (
+        "auto"
+    )
     unit: str = ""
     placeholder: str = ""
     auto_value: Any = None
@@ -57,9 +61,7 @@ class ActionContext:
     settings: dict[str, Any]
     log: Callable[[str, str], None]
     progress: Callable[[str, int | None, int | None], None]
-    cancel_requested: Callable[[], bool] = dataclass_field(
-        default_factory=lambda: (lambda: False)
-    )
+    cancel_requested: Callable[[], bool] = dataclass_field(default_factory=lambda: lambda: False)
 
 
 ActionBackend = Callable[[ActionContext], ActionExecutionResult]
@@ -125,11 +127,19 @@ def _trajectory_settings() -> list[SettingField]:
     return [
         SettingField("input", "Simulation input", "path", group="Cell / Metadata", widget="path"),
         SettingField(
+            "cell_angles",
+            "Cell alpha beta gamma",
+            "text",
+            group="Cell / Metadata",
+            help_text="Angles in degrees; requires explicit A B C. Default: 90 90 90.",
+            placeholder="90 90 90",
+        ),
+        SettingField(
             "cell",
             "Cell A B C",
             "text",
             group="Cell / Metadata",
-            help_text="Optional explicit orthorhombic cell lengths in Angstrom.",
+            help_text="Optional explicit cell lengths in Angstrom.",
             placeholder="auto from .out.h5 when available",
         ),
         SettingField(
@@ -145,10 +155,51 @@ def _trajectory_settings() -> list[SettingField]:
 
 def _surface_settings() -> list[SettingField]:
     return [
-        SettingField("surface_mode", "Surface mode", "choice", "auto", ("auto", "layered", "rough"), group="Surface", widget="choice"),
-        SettingField("surface_elements", "Surface elements", "text", group="Surface", help_text="Space-separated element symbols. Leave blank for automatic detection.", widget="species", multi=True),
-        SettingField("include_fixed_surface_atoms", "Include fixed surface atoms", "bool", False, group="Surface"),
-        SettingField("rough_surface_envelope", "Rough surface envelope", "float", None, group="Surface", minimum=0.0, widget="float", unit="A"),
+        SettingField(
+            "surface_layout",
+            "Surface layout",
+            "choice",
+            "auto",
+            ("auto", "single-top", "single-bottom", "symmetric"),
+            group="Surface",
+            widget="choice",
+            help_text="Choose the physical one- or two-interface cell layout.",
+        ),
+        SettingField(
+            "surface_mode",
+            "Surface mode",
+            "choice",
+            "auto",
+            ("auto", "layered", "rough"),
+            group="Surface",
+            widget="choice",
+        ),
+        SettingField(
+            "surface_elements",
+            "Surface elements",
+            "text",
+            group="Surface",
+            help_text="Space-separated element symbols. Leave blank for automatic detection.",
+            widget="species",
+            multi=True,
+        ),
+        SettingField(
+            "include_fixed_surface_atoms",
+            "Include fixed surface atoms",
+            "bool",
+            False,
+            group="Surface",
+        ),
+        SettingField(
+            "rough_surface_envelope",
+            "Rough surface envelope",
+            "float",
+            None,
+            group="Surface",
+            minimum=0.0,
+            widget="float",
+            unit="A",
+        ),
     ]
 
 
@@ -159,12 +210,45 @@ def _convert_settings(item: ProjectItem) -> list[SettingField]:
         "cube_file": "cube.h5",
         "cube_hdf5": "cube",
     }.get(item.item_type, "traj.h5")
-    choices = ("traj.h5", "xyz") if item.item_type in {"raw_trajectory", "trajectory_hdf5"} else ("cube.h5", "cube")
+    choices = (
+        ("traj.h5", "xyz")
+        if item.item_type in {"raw_trajectory", "trajectory_hdf5"}
+        else ("cube.h5", "cube")
+    )
     return [
-        SettingField("target_file_type", "Target format", "choice", target_default, choices, True, "Output", widget="choice"),
-        SettingField("select", "Frame selection", "text", group="Trajectory selection", help_text="Optional selector such as first:1000f, last:5ps, or range:100f:500f."),
+        SettingField(
+            "target_file_type",
+            "Target format",
+            "choice",
+            target_default,
+            choices,
+            True,
+            "Output",
+            widget="choice",
+        ),
+        SettingField(
+            "select",
+            "Frame selection",
+            "text",
+            group="Trajectory selection",
+            help_text="Optional selector such as first:1000f, last:5ps, or range:100f:500f.",
+        ),
         SettingField("input", "Simulation input", "path", group="Cell / Metadata", widget="path"),
-        SettingField("cell", "Cell A B C", "text", group="Cell / Metadata", placeholder="auto from .out.h5 when available"),
+        SettingField(
+            "cell_angles",
+            "Cell alpha beta gamma",
+            "text",
+            group="Cell / Metadata",
+            help_text="Angles in degrees; requires explicit A B C. Default: 90 90 90.",
+            placeholder="90 90 90",
+        ),
+        SettingField(
+            "cell",
+            "Cell A B C",
+            "text",
+            group="Cell / Metadata",
+            placeholder="auto from .out.h5 when available",
+        ),
         SettingField(
             "atom_alias",
             "Atom aliases",
@@ -178,38 +262,213 @@ def _convert_settings(item: ProjectItem) -> list[SettingField]:
 
 def _pack_settings(item: ProjectItem) -> list[SettingField]:
     return [
-        SettingField("output_name", "Output name", "text", f"{item.path.name}.out.h5", True, "Output", placeholder="run.out.h5"),
+        SettingField(
+            "output_name",
+            "Output name",
+            "text",
+            f"{item.path.name}.out.h5",
+            required=True,
+            group="Output",
+            placeholder="run.out.h5",
+        ),
         SettingField("overwrite", "Overwrite output", "bool", False, group="Output"),
-        SettingField("include", "Include patterns", "text", group="Discovery", help_text="Optional glob patterns separated by spaces."),
-        SettingField("exclude", "Exclude patterns", "text", group="Discovery", help_text="Optional glob patterns separated by spaces."),
-        SettingField("drop", "Drop CP2K sections", "text", group="CP2K", help_text="Optional sections such as mulliken hirshfeld forces."),
+        SettingField(
+            "include",
+            "Include patterns",
+            "text",
+            group="Discovery",
+            help_text="Optional glob patterns separated by spaces.",
+        ),
+        SettingField(
+            "exclude",
+            "Exclude patterns",
+            "text",
+            group="Discovery",
+            help_text="Optional glob patterns separated by spaces.",
+        ),
+        SettingField(
+            "drop",
+            "Drop CP2K sections",
+            "text",
+            group="CP2K",
+            help_text="Optional sections such as mulliken hirshfeld forces.",
+        ),
+        *_storage_settings(),
+    ]
+
+
+def _storage_settings() -> list[SettingField]:
+    return [
+        SettingField(
+            "hdf5_compression",
+            "HDF5 compression",
+            "choice",
+            "fast",
+            ("fast", "balanced", "none"),
+            group="Advanced",
+            widget="choice",
+            advanced=True,
+            help_text="fast=LZF, balanced=gzip level 4, none=uncompressed.",
+        )
+    ]
+
+
+def _resource_settings() -> list[SettingField]:
+    return [
+        SettingField(
+            "memory_budget_mib",
+            "Memory budget",
+            "float",
+            None,
+            group="Advanced",
+            minimum=1.0,
+            widget="float",
+            unit="MiB",
+            advanced=True,
+            help_text="Leave blank to derive a safe budget from currently available RAM.",
+        )
+    ]
+
+
+def _topology_backend_settings() -> list[SettingField]:
+    return [
+        SettingField(
+            "oh_topology_backend",
+            "O/H topology backend",
+            "choice",
+            "auto",
+            ("auto", "ckdtree", "ase"),
+            group="Advanced",
+            widget="choice",
+            advanced=True,
+        )
+    ]
+
+
+def _trajectory_execution_settings() -> list[SettingField]:
+    return [
+        SettingField(
+            "trajectory_execution",
+            "Trajectory execution",
+            "choice",
+            "auto",
+            ("auto", "eager", "stream"),
+            group="Advanced",
+            widget="choice",
+            advanced=True,
+        ),
+        SettingField(
+            "stream_threshold_mib",
+            "Stream threshold",
+            "float",
+            256.0,
+            group="Advanced",
+            minimum=1.0,
+            widget="float",
+            unit="MiB",
+            advanced=True,
+        ),
+        SettingField(
+            "chunk_target_mib",
+            "Chunk target",
+            "float",
+            64.0,
+            group="Advanced",
+            minimum=1.0,
+            widget="float",
+            unit="MiB",
+            advanced=True,
+        ),
+        SettingField(
+            "temporary_directory",
+            "Temporary directory",
+            "path",
+            None,
+            group="Advanced",
+            widget="path",
+            advanced=True,
+        ),
     ]
 
 
 def _density_settings(_item: ProjectItem) -> list[SettingField]:
     return [
-        SettingField("species", "Species", "text", "all", True, group="Selection", widget="species", multi=True, help_text="Use elements, elements/molecules/all, or molecule selectors mol:H, mol:O, mol:OH, mol:H2O, mol:H3O."),
-        SettingField("axis", "Axis", "choice", "z", ("x", "y", "z"), True, "Binning", widget="axis"),
-        SettingField("bin_width", "Bin width", "float", 0.05, True, "Binning", minimum=0.0, widget="float", unit="A"),
-        SettingField("oh_cutoff", "O-H cutoff", "float", 1.27, required=False, group="Binning", minimum=0.0, widget="float", unit="A"),
-        SettingField("min_molecule_frames", "Min molecule frames", "int", 5, required=False, group="Binning", minimum=1, widget="int"),
-        SettingField("outputs", "Outputs", "choice", "all", ("1d", "3d", "all"), True, "Binning", widget="choice"),
+        SettingField(
+            "species",
+            "Species",
+            "text",
+            "all",
+            required=True,
+            group="Selection",
+            widget="species",
+            multi=True,
+            help_text="Use elements, elements/molecules/all, or molecule selectors mol:H, mol:O, mol:OH, mol:H2O, mol:H3O.",
+        ),
+        SettingField(
+            "axis", "Axis", "choice", "z", ("x", "y", "z"), True, "Binning", widget="axis"
+        ),
+        SettingField(
+            "bin_width",
+            "Bin width",
+            "float",
+            0.05,
+            required=True,
+            group="Binning",
+            minimum=0.0,
+            widget="float",
+            unit="A",
+        ),
+        SettingField(
+            "oh_cutoff",
+            "O-H cutoff",
+            "float",
+            1.27,
+            required=False,
+            group="Binning",
+            minimum=0.0,
+            widget="float",
+            unit="A",
+        ),
+        SettingField(
+            "min_molecule_frames",
+            "Min molecule frames",
+            "int",
+            5,
+            required=False,
+            group="Binning",
+            minimum=1,
+            widget="int",
+        ),
+        SettingField(
+            "outputs",
+            "Outputs",
+            "choice",
+            "all",
+            ("1d", "3d", "all"),
+            True,
+            "Binning",
+            widget="choice",
+        ),
         *_surface_settings(),
         *_trajectory_settings(),
-    ]
-
-
-def _msd_settings(_item: ProjectItem) -> list[SettingField]:
-    return [
-        SettingField("species", "Species", "text", "all", True, group="Selection", widget="species", multi=True),
-        SettingField("timestep_fs", "Timestep fs", "float", None, group="Time", minimum=0.0, widget="float", unit="fs"),
-        *_trajectory_settings(),
+        *_storage_settings(),
+        *_topology_backend_settings(),
+        *_trajectory_execution_settings(),
     ]
 
 
 def _temperature_settings(_item: ProjectItem) -> list[SettingField]:
     return [
-        SettingField("group_by", "Group by", "choice", "auto", ("auto", "elements", "regions", "both"), True, "Selection", widget="choice"),
+        SettingField(
+            "group_by",
+            "Group by",
+            "choice",
+            "auto",
+            ("auto", "elements", "regions", "both"),
+            True,
+            "Selection",
+            widget="choice",
+        ),
         SettingField("input", "CP2K input", "path", group="Metadata", widget="path"),
         SettingField(
             "atom_alias",
@@ -219,65 +478,245 @@ def _temperature_settings(_item: ProjectItem) -> list[SettingField]:
             help_text="Optional RAW=ELEMENT aliases for trajectory labels such as Ow=O or Pt_top=Pt.",
             placeholder="Ow=O Pt_top=Pt",
         ),
-        SettingField("velocity_unit", "Velocity unit", "choice", "auto", ("auto", "atomic", "angstrom/fs"), True, "Velocity", widget="choice"),
+        SettingField(
+            "velocity_unit",
+            "Velocity unit",
+            "choice",
+            "auto",
+            ("auto", "atomic", "angstrom/fs"),
+            True,
+            "Velocity",
+            widget="choice",
+        ),
         SettingField("remove_com", "Remove COM velocity", "bool", False, group="Velocity"),
+        *_storage_settings(),
     ]
 
 
 def _rdf_settings(_item: ProjectItem) -> list[SettingField]:
     return [
-        SettingField("species_a", "Species A", "text", "all", True, group="Selection", widget="species"),
+        SettingField(
+            "species_a",
+            "Species A",
+            "text",
+            "all",
+            required=True,
+            group="Selection",
+            widget="species",
+        ),
         SettingField("species_b", "Species B", "text", group="Selection", widget="species"),
-        SettingField("r_max", "R max", "float", None, group="Binning", minimum=0.0, widget="float", unit="A"),
-        SettingField("bin_width", "Bin width", "float", 0.05, True, "Binning", minimum=0.0, widget="float", unit="A"),
-        SettingField("threads", "Threads", "int", None, group="Execution", minimum=1.0, widget="int"),
+        SettingField(
+            "r_max", "R max", "float", None, group="Binning", minimum=0.0, widget="float", unit="A"
+        ),
+        SettingField(
+            "bin_width",
+            "Bin width",
+            "float",
+            0.05,
+            required=True,
+            group="Binning",
+            minimum=0.0,
+            widget="float",
+            unit="A",
+        ),
+        SettingField(
+            "threads", "Threads", "int", None, group="Execution", minimum=1.0, widget="int"
+        ),
+        *_resource_settings(),
         *_surface_settings(),
         *_trajectory_settings(),
+        *_storage_settings(),
     ]
 
 
 def _position_settings(_item: ProjectItem) -> list[SettingField]:
     return [
-        SettingField("species", "Species", "text", "all", True, group="Selection", widget="species", multi=True, help_text="Use elements/molecules/all, elements like O/H, or molecule selectors mol:H, mol:O, mol:OH, mol:H2O, mol:H3O."),
-        SettingField("axis", "Axis", "choice", "z", ("x", "y", "z"), True, "Geometry", widget="axis"),
-        SettingField("timestep_fs", "Timestep fs", "float", None, group="Time", minimum=0.0, widget="float", unit="fs"),
-        SettingField("oh_cutoff", "O-H cutoff", "float", 1.27, required=False, group="O/H molecules", minimum=0.0, widget="float", unit="A"),
-        SettingField("min_molecule_frames", "Min molecule frames", "int", 5, required=False, group="O/H molecules", minimum=1, widget="int"),
-        SettingField("oh_topology_stride", "O/H topology stride", "int", 100, required=False, group="O/H molecules", minimum=1, widget="int"),
+        SettingField(
+            "species",
+            "Species",
+            "text",
+            "all",
+            required=True,
+            group="Selection",
+            widget="species",
+            multi=True,
+            help_text="Use elements/molecules/all, elements like O/H, or molecule selectors mol:H, mol:O, mol:OH, mol:H2O, mol:H3O.",
+        ),
+        SettingField(
+            "axis", "Axis", "choice", "z", ("x", "y", "z"), True, "Geometry", widget="axis"
+        ),
+        SettingField(
+            "timestep_fs",
+            "Timestep fs",
+            "float",
+            None,
+            group="Time",
+            minimum=0.0,
+            widget="float",
+            unit="fs",
+        ),
+        SettingField(
+            "oh_cutoff",
+            "O-H cutoff",
+            "float",
+            1.27,
+            required=False,
+            group="O/H molecules",
+            minimum=0.0,
+            widget="float",
+            unit="A",
+        ),
+        SettingField(
+            "min_molecule_frames",
+            "Min molecule frames",
+            "int",
+            5,
+            required=False,
+            group="O/H molecules",
+            minimum=1,
+            widget="int",
+        ),
+        SettingField(
+            "oh_topology_stride",
+            "O/H topology stride",
+            "int",
+            100,
+            required=False,
+            group="O/H molecules",
+            minimum=1,
+            widget="int",
+        ),
         *_surface_settings(),
         *_trajectory_settings(),
+        *_storage_settings(),
+        *_topology_backend_settings(),
+        *_trajectory_execution_settings(),
     ]
 
 
 def _coordination_settings(_item: ProjectItem) -> list[SettingField]:
     return [
-        SettingField("species_a", "Species A", "text", "", True, group="Selection", widget="species"),
-        SettingField("species_b", "Species B", "text", "", True, group="Selection", widget="species"),
-        SettingField("axis", "Axis", "choice", "z", ("x", "y", "z"), True, "Geometry", widget="axis"),
-        SettingField("timestep_fs", "Timestep fs", "float", None, group="Time", minimum=0.0, widget="float", unit="fs"),
-        SettingField("cutoff", "Direct cutoff", "float", None, group="Cutoff", minimum=0.0, widget="float", unit="A"),
+        SettingField(
+            "species_a", "Species A", "text", "", required=True, group="Selection", widget="species"
+        ),
+        SettingField(
+            "species_b", "Species B", "text", "", required=True, group="Selection", widget="species"
+        ),
+        SettingField(
+            "axis", "Axis", "choice", "z", ("x", "y", "z"), True, "Geometry", widget="axis"
+        ),
+        SettingField(
+            "timestep_fs",
+            "Timestep fs",
+            "float",
+            None,
+            group="Time",
+            minimum=0.0,
+            widget="float",
+            unit="fs",
+        ),
+        SettingField(
+            "cutoff",
+            "Direct cutoff",
+            "float",
+            None,
+            group="Cutoff",
+            minimum=0.0,
+            widget="float",
+            unit="A",
+        ),
         SettingField("cutoff_rdf", "Cutoff RDF file", "path", group="Cutoff", widget="path"),
-        SettingField("cutoff_smoothing_width", "Smoothing width", "float", 0.20, True, "Cutoff", minimum=0.0, widget="float", unit="A"),
+        SettingField(
+            "cutoff_smoothing_width",
+            "Smoothing width",
+            "float",
+            0.20,
+            required=True,
+            group="Cutoff",
+            minimum=0.0,
+            widget="float",
+            unit="A",
+        ),
         *_surface_settings(),
         *_trajectory_settings(),
+        *_storage_settings(),
+        *_trajectory_execution_settings(),
     ]
 
 
 def _orientation_settings(_item: ProjectItem) -> list[SettingField]:
     return [
-        SettingField("axis", "Distance axis", "choice", "z", ("x", "y", "z"), True, "Geometry", widget="axis"),
-        SettingField("reference_axis", "Reference axis", "choice", "z", ("x", "y", "z"), True, "Geometry", widget="axis"),
-        SettingField("bin_width", "Bin width", "float", 0.01, True, "Binning", minimum=0.0, widget="float", unit="A"),
-        SettingField("angle_bins", "Angle bins", "int", 100, True, "Binning", minimum=1.0, widget="int"),
-        SettingField("oh_cutoff", "O-H cutoff", "float", 1.27, True, "Water detection", minimum=0.0, widget="float", unit="A"),
+        SettingField(
+            "axis", "Distance axis", "choice", "z", ("x", "y", "z"), True, "Geometry", widget="axis"
+        ),
+        SettingField(
+            "reference_axis",
+            "Reference axis",
+            "choice",
+            "z",
+            ("x", "y", "z"),
+            True,
+            "Geometry",
+            widget="axis",
+        ),
+        SettingField(
+            "bin_width",
+            "Bin width",
+            "float",
+            0.01,
+            required=True,
+            group="Binning",
+            minimum=0.0,
+            widget="float",
+            unit="A",
+        ),
+        SettingField(
+            "angle_bins",
+            "Angle bins",
+            "int",
+            100,
+            required=True,
+            group="Binning",
+            minimum=1.0,
+            widget="int",
+        ),
+        SettingField(
+            "oh_cutoff",
+            "O-H cutoff",
+            "float",
+            1.27,
+            required=True,
+            group="Water detection",
+            minimum=0.0,
+            widget="float",
+            unit="A",
+        ),
         *_surface_settings(),
         *_trajectory_settings(),
+        *_storage_settings(),
+        *_topology_backend_settings(),
+        *_resource_settings(),
     ]
 
 
 def _pbc_settings(_item: ProjectItem) -> list[SettingField]:
     return [
-        SettingField("cell", "Cell A B C", "text", group="Cell", help_text="Optional explicit orthorhombic cell lengths in Angstrom.", placeholder="auto from .out.h5 when available"),
+        SettingField(
+            "cell_angles",
+            "Cell alpha beta gamma",
+            "text",
+            group="Cell / Metadata",
+            help_text="Angles in degrees; requires explicit A B C. Default: 90 90 90.",
+            placeholder="90 90 90",
+        ),
+        SettingField(
+            "cell",
+            "Cell A B C",
+            "text",
+            group="Cell",
+            help_text="Optional explicit cell lengths in Angstrom.",
+            placeholder="auto from .out.h5 when available",
+        ),
         SettingField("input", "Simulation input", "path", group="Cell", widget="path"),
         SettingField(
             "atom_alias",
@@ -287,38 +726,64 @@ def _pbc_settings(_item: ProjectItem) -> list[SettingField]:
             help_text="Optional RAW=ELEMENT aliases for trajectory labels such as Ow=O or Pt_top=Pt.",
             placeholder="Ow=O Pt_top=Pt",
         ),
+        *_storage_settings(),
     ]
 
 
 def _potential_settings(_item: ProjectItem) -> list[SettingField]:
     return [
-        SettingField("water_padding_ang", "Water padding", "float", 5.0, True, "Analysis", minimum=0.0, widget="float", unit="A"),
-        SettingField("cshe_offset_ev", "cSHE offset", "float", 0.81, True, "Analysis", widget="float", unit="eV"),
-        SettingField("threads", "Threads", "int", None, group="Execution", minimum=1.0, widget="int"),
+        SettingField(
+            "water_padding_ang",
+            "Water padding",
+            "float",
+            5.0,
+            required=True,
+            group="Analysis",
+            minimum=0.0,
+            widget="float",
+            unit="A",
+        ),
+        SettingField(
+            "cshe_offset_ev",
+            "cSHE offset",
+            "float",
+            0.81,
+            required=True,
+            group="Analysis",
+            widget="float",
+            unit="eV",
+        ),
+        SettingField(
+            "threads", "Threads", "int", None, group="Execution", minimum=1.0, widget="int"
+        ),
+        *_resource_settings(),
         SettingField("include_failures", "Include failures", "bool", True, group="Execution"),
+        *_storage_settings(),
     ]
 
 
 def _stem(path: Path) -> str:
     name = path.name
     lower = name.lower()
-    for suffix in (".out.hdf5", ".out.h5", ".traj.hdf5", ".traj.h5", ".cube.hdf5", ".cube.h5", ".hdf5", ".h5"):
+    for suffix in (
+        ".out.hdf5",
+        ".out.h5",
+        ".traj.hdf5",
+        ".traj.h5",
+        ".cube.hdf5",
+        ".cube.h5",
+        ".hdf5",
+        ".h5",
+    ):
         if lower.endswith(suffix):
             return name[: -len(suffix)] or "linak"
     return path.stem or "linak"
 
 
 def _unique_path(path: Path) -> Path:
-    from ..analysis.output_naming import numbered_hdf5_path
+    from ..analysis.output_naming import unique_output_path
 
-    if not path.exists():
-        return path
-    counter = 1
-    while True:
-        candidate = numbered_hdf5_path(path, counter)
-        if not candidate.exists():
-            return candidate
-        counter += 1
+    return unique_output_path(path)
 
 
 def _project_output(ctx: ActionContext, suffix: str) -> Path:
@@ -332,7 +797,9 @@ def _planned_output(project_dir: Path, item: ProjectItem, suffix: str) -> Path:
 def _analysis_output(project_dir: Path, source: Path, analysis: str) -> Path:
     from ..analysis.output_naming import analysis_hdf5_filename
 
-    return _unique_path(Path(project_dir).expanduser().resolve() / analysis_hdf5_filename(source, analysis))
+    return _unique_path(
+        Path(project_dir).expanduser().resolve() / analysis_hdf5_filename(source, analysis)
+    )
 
 
 def _project_analysis_output(ctx: ActionContext, analysis: str) -> Path:
@@ -355,13 +822,17 @@ def _add_optional(argv: list[str], flag: str, value: Any) -> None:
     argv.extend([flag, str(value)])
 
 
-def _add_cell(argv: list[str], value: Any) -> None:
+def _add_cell(argv: list[str], value: Any, angles: Any = None) -> None:
     tokens = _split_words(value)
     if not tokens:
+        if _split_words(angles):
+            raise ValueError("Cell angles require explicit cell lengths.")
         return
     if len(tokens) != 3:
         raise ValueError("Cell must contain exactly three numbers: A B C.")
     argv.extend(["--cell", *tokens])
+    if _split_words(angles):
+        argv.extend(["--cell-angles", *_split_words(angles)])
 
 
 def _add_atom_aliases(argv: list[str], settings: dict[str, Any]) -> None:
@@ -388,26 +859,28 @@ def validate_action_settings(action: Action, item: ProjectItem, settings: dict[s
                 raise ValueError(f"{field.label} must be >= {int(field.minimum)}.")
         elif field.kind == "choice":
             if str(value) not in field.choices:
-                raise ValueError(
-                    f"{field.label} must be one of: {', '.join(field.choices)}."
-                )
+                raise ValueError(f"{field.label} must be one of: {', '.join(field.choices)}.")
         elif field.kind == "path" and value:
             path = Path(str(value)).expanduser()
             if not path.exists():
                 raise ValueError(f"{field.label} does not exist: {path}.")
 
+    angles = _split_words(settings.get("cell_angles"))
     cell_value = settings.get("cell")
+    if angles and not _split_words(cell_value):
+        raise ValueError("Cell angles require explicit cell lengths.")
     if cell_value not in (None, ""):
         tokens = _split_words(cell_value)
         if len(tokens) != 3:
             raise ValueError("Cell must contain exactly three numbers: A B C.")
-        for token in tokens:
-            value = float(token)
-            if value <= 0:
-                raise ValueError("Cell lengths must be positive.")
+        cell_matrix(
+            [float(token) for token in tokens],
+            [float(token) for token in angles] if angles else None,
+        )
 
 
 def _add_surface(argv: list[str], settings: dict[str, Any]) -> None:
+    _add_optional(argv, "--surface-layout", settings.get("surface_layout"))
     _add_optional(argv, "--surface-mode", settings.get("surface_mode"))
     elements = _split_words(settings.get("surface_elements"))
     if elements:
@@ -415,6 +888,13 @@ def _add_surface(argv: list[str], settings: dict[str, Any]) -> None:
     if bool(settings.get("include_fixed_surface_atoms")):
         argv.append("--include-fixed-surface-atoms")
     _add_optional(argv, "--rough-surface-envelope", settings.get("rough_surface_envelope"))
+
+
+def _add_trajectory_execution(argv: list[str], settings: dict[str, Any]) -> None:
+    _add_optional(argv, "--trajectory-execution", settings.get("trajectory_execution"))
+    _add_optional(argv, "--stream-threshold-mib", settings.get("stream_threshold_mib"))
+    _add_optional(argv, "--chunk-target-mib", settings.get("chunk_target_mib"))
+    _add_optional(argv, "--temporary-directory", settings.get("temporary_directory"))
 
 
 def _run_cli(argv: Sequence[str], log: Callable[[str, str], None]) -> int:
@@ -490,12 +970,23 @@ def _convert_backend(ctx: ActionContext) -> ActionExecutionResult:
         options: Any = TrajectoryConversionOptions(
             input_path=ctx.settings.get("input") or None,
             select=ctx.settings.get("select") or None,
-            cell=tuple(float(token) for token in cell_tokens) if cell_tokens else None,
+            cell=compact_cell(
+                cell_matrix(
+                    [float(token) for token in cell_tokens],
+                    [float(token) for token in _split_words(ctx.settings.get("cell_angles"))]
+                    or None,
+                )
+            )
+            if cell_tokens
+            else None,
             atom_aliases=tuple(_split_words(ctx.settings.get("atom_alias"))),
             output_was_default=False,
+            compression_profile=str(ctx.settings.get("hdf5_compression") or "fast"),
         )
     else:
-        options = CubeConversionOptions()
+        options = CubeConversionOptions(
+            compression_profile=str(ctx.settings.get("hdf5_compression") or "fast")
+        )
     ctx.log("INFO", f"Converting {request.source_path.name} to {request.target_file_type}.")
     ctx.progress("Converting file", 1, 2)
     result = CONVERSION_REGISTRY.execute(request, options=options)
@@ -517,6 +1008,7 @@ def _pack_backend(ctx: ActionContext) -> ActionExecutionResult:
         exclude=tuple(_split_words(ctx.settings.get("exclude"))),
         overwrite=bool(ctx.settings.get("overwrite")),
         drop_sections=tuple(_split_words(ctx.settings.get("drop"))),
+        compression_profile=str(ctx.settings.get("hdf5_compression") or "fast"),
     )
     if ctx.cancel_requested():
         raise ActionCanceled("Task canceled before packing started.")
@@ -545,19 +1037,11 @@ def _compute_density_backend(ctx: ActionContext) -> ActionExecutionResult:
     _add_optional(argv, "--outputs", ctx.settings.get("outputs"))
     _add_surface(argv, ctx.settings)
     _add_optional(argv, "--input", ctx.settings.get("input"))
-    _add_cell(argv, ctx.settings.get("cell"))
+    _add_cell(argv, ctx.settings.get("cell"), ctx.settings.get("cell_angles"))
     _add_atom_aliases(argv, ctx.settings)
-    return _run_cli_with_expected_outputs(ctx, argv, (output,))
-
-
-def _compute_msd_backend(ctx: ActionContext) -> ActionExecutionResult:
-    output = _project_analysis_output(ctx, "msd")
-    argv = ["compute", "msd", str(ctx.item.path), "--output", str(output)]
-    _add_optional(argv, "--species", ctx.settings.get("species"))
-    _add_optional(argv, "--timestep-fs", ctx.settings.get("timestep_fs"))
-    _add_optional(argv, "--input", ctx.settings.get("input"))
-    _add_cell(argv, ctx.settings.get("cell"))
-    _add_atom_aliases(argv, ctx.settings)
+    _add_optional(argv, "--hdf5-compression", ctx.settings.get("hdf5_compression"))
+    _add_optional(argv, "--oh-topology-backend", ctx.settings.get("oh_topology_backend"))
+    _add_trajectory_execution(argv, ctx.settings)
     return _run_cli_with_expected_outputs(ctx, argv, (output,))
 
 
@@ -568,6 +1052,7 @@ def _compute_temperature_backend(ctx: ActionContext) -> ActionExecutionResult:
     _add_optional(argv, "--input", ctx.settings.get("input"))
     _add_optional(argv, "--velocity-unit", ctx.settings.get("velocity_unit"))
     _add_atom_aliases(argv, ctx.settings)
+    _add_optional(argv, "--hdf5-compression", ctx.settings.get("hdf5_compression"))
     if bool(ctx.settings.get("remove_com", False)):
         argv.append("--remove-com")
     return _run_cli_with_expected_outputs(ctx, argv, (output,))
@@ -576,15 +1061,19 @@ def _compute_temperature_backend(ctx: ActionContext) -> ActionExecutionResult:
 def _compute_rdf_backend(ctx: ActionContext) -> ActionExecutionResult:
     output = _project_analysis_output(ctx, "rdf")
     argv = ["compute", "rdf", str(ctx.item.path), "--output", str(output)]
-    _add_optional(argv, "--species-a", ctx.settings.get("species_a"))
-    _add_optional(argv, "--species-b", ctx.settings.get("species_b"))
+    species_a = str(ctx.settings.get("species_a") or "").strip()
+    species_b = str(ctx.settings.get("species_b") or "").strip()
+    if species_a or species_b:
+        argv.extend(["--species", species_a or species_b, species_b or species_a])
     _add_optional(argv, "--r-max", ctx.settings.get("r_max"))
     _add_optional(argv, "--bin-width", ctx.settings.get("bin_width"))
     _add_optional(argv, "--threads", ctx.settings.get("threads"))
+    _add_optional(argv, "--memory-budget-mib", ctx.settings.get("memory_budget_mib"))
     _add_surface(argv, ctx.settings)
     _add_optional(argv, "--input", ctx.settings.get("input"))
-    _add_cell(argv, ctx.settings.get("cell"))
+    _add_cell(argv, ctx.settings.get("cell"), ctx.settings.get("cell_angles"))
     _add_atom_aliases(argv, ctx.settings)
+    _add_optional(argv, "--hdf5-compression", ctx.settings.get("hdf5_compression"))
     return _run_cli_with_expected_outputs(ctx, argv, (output,))
 
 
@@ -599,16 +1088,21 @@ def _compute_position_backend(ctx: ActionContext) -> ActionExecutionResult:
     _add_optional(argv, "--oh-topology-stride", ctx.settings.get("oh_topology_stride"))
     _add_surface(argv, ctx.settings)
     _add_optional(argv, "--input", ctx.settings.get("input"))
-    _add_cell(argv, ctx.settings.get("cell"))
+    _add_cell(argv, ctx.settings.get("cell"), ctx.settings.get("cell_angles"))
     _add_atom_aliases(argv, ctx.settings)
+    _add_optional(argv, "--hdf5-compression", ctx.settings.get("hdf5_compression"))
+    _add_optional(argv, "--oh-topology-backend", ctx.settings.get("oh_topology_backend"))
+    _add_trajectory_execution(argv, ctx.settings)
     return _run_cli_with_expected_outputs(ctx, argv, (output,))
 
 
 def _compute_coordination_backend(ctx: ActionContext) -> ActionExecutionResult:
     output = _project_analysis_output(ctx, "coordination")
     argv = ["compute", "coordination", str(ctx.item.path), "--output", str(output)]
-    _add_optional(argv, "--species-a", ctx.settings.get("species_a"))
-    _add_optional(argv, "--species-b", ctx.settings.get("species_b"))
+    species_a = str(ctx.settings.get("species_a") or "").strip()
+    species_b = str(ctx.settings.get("species_b") or "").strip()
+    if species_a or species_b:
+        argv.extend(["--species", species_a or species_b, species_b or species_a])
     _add_optional(argv, "--axis", ctx.settings.get("axis"))
     _add_optional(argv, "--timestep-fs", ctx.settings.get("timestep_fs"))
     _add_optional(argv, "--cutoff", ctx.settings.get("cutoff"))
@@ -616,8 +1110,10 @@ def _compute_coordination_backend(ctx: ActionContext) -> ActionExecutionResult:
     _add_optional(argv, "--cutoff-smoothing-width", ctx.settings.get("cutoff_smoothing_width"))
     _add_surface(argv, ctx.settings)
     _add_optional(argv, "--input", ctx.settings.get("input"))
-    _add_cell(argv, ctx.settings.get("cell"))
+    _add_cell(argv, ctx.settings.get("cell"), ctx.settings.get("cell_angles"))
     _add_atom_aliases(argv, ctx.settings)
+    _add_optional(argv, "--hdf5-compression", ctx.settings.get("hdf5_compression"))
+    _add_trajectory_execution(argv, ctx.settings)
     return _run_cli_with_expected_outputs(ctx, argv, (output,))
 
 
@@ -631,8 +1127,11 @@ def _compute_orientation_backend(ctx: ActionContext) -> ActionExecutionResult:
     _add_optional(argv, "--oh-cutoff", ctx.settings.get("oh_cutoff"))
     _add_surface(argv, ctx.settings)
     _add_optional(argv, "--input", ctx.settings.get("input"))
-    _add_cell(argv, ctx.settings.get("cell"))
+    _add_cell(argv, ctx.settings.get("cell"), ctx.settings.get("cell_angles"))
     _add_atom_aliases(argv, ctx.settings)
+    _add_optional(argv, "--hdf5-compression", ctx.settings.get("hdf5_compression"))
+    _add_optional(argv, "--oh-topology-backend", ctx.settings.get("oh_topology_backend"))
+    _add_optional(argv, "--memory-budget-mib", ctx.settings.get("memory_budget_mib"))
     return _run_cli_with_expected_outputs(ctx, argv, (output,))
 
 
@@ -640,8 +1139,9 @@ def _apply_pbc_backend(ctx: ActionContext) -> ActionExecutionResult:
     output = _project_output(ctx, "_pbc.xyz")
     argv = ["apply", "pbc", str(ctx.item.path), "--output", str(output)]
     _add_optional(argv, "--input", ctx.settings.get("input"))
-    _add_cell(argv, ctx.settings.get("cell"))
+    _add_cell(argv, ctx.settings.get("cell"), ctx.settings.get("cell_angles"))
     _add_atom_aliases(argv, ctx.settings)
+    _add_optional(argv, "--hdf5-compression", ctx.settings.get("hdf5_compression"))
     return _run_cli_with_expected_outputs(ctx, argv, (output,))
 
 
@@ -651,6 +1151,8 @@ def _compute_potential_backend(ctx: ActionContext) -> ActionExecutionResult:
     _add_optional(argv, "--water-padding-ang", ctx.settings.get("water_padding_ang"))
     _add_optional(argv, "--cshe-offset-ev", ctx.settings.get("cshe_offset_ev"))
     _add_optional(argv, "--threads", ctx.settings.get("threads"))
+    _add_optional(argv, "--memory-budget-mib", ctx.settings.get("memory_budget_mib"))
+    _add_optional(argv, "--hdf5-compression", ctx.settings.get("hdf5_compression"))
     if not bool(ctx.settings.get("include_failures", True)):
         argv.append("--no-include-failures")
     return _run_cli_with_expected_outputs(ctx, argv, (output,))
@@ -718,14 +1220,18 @@ def _expected_convert_outputs(
 
 
 def _expected_suffix(suffix: str) -> ExpectedOutputsFactory:
-    def _factory(project_dir: Path, item: ProjectItem, _settings: dict[str, Any]) -> tuple[Path, ...]:
+    def _factory(
+        project_dir: Path, item: ProjectItem, _settings: dict[str, Any]
+    ) -> tuple[Path, ...]:
         return (_planned_output(project_dir, item, suffix),)
 
     return _factory
 
 
 def _expected_analysis(analysis: str) -> ExpectedOutputsFactory:
-    def _factory(project_dir: Path, item: ProjectItem, _settings: dict[str, Any]) -> tuple[Path, ...]:
+    def _factory(
+        project_dir: Path, item: ProjectItem, _settings: dict[str, Any]
+    ) -> tuple[Path, ...]:
         return (_analysis_output(project_dir, item.path, analysis),)
 
     return _factory
@@ -759,20 +1265,160 @@ def build_action_registry() -> list[Action]:
     convertible_inputs = frozenset({"raw_trajectory", "trajectory_hdf5", "cube_file", "cube_hdf5"})
     analysis_outputs = frozenset({"analysis_hdf5", "cube_hdf5"})
     return [
-        Action("pack_out_h5", "Convert", "Convert directory to .out.h5", "Pack a simulation output directory into one LiNaK output container.", frozenset({"simulation_directory"}), "out_hdf5", _pack_settings, _pack_backend, _expected_pack_outputs, _summary("Directory pack", _expected_pack_outputs)),
-        Action("convert", "Convert", "Convert file", "Convert to another LiNaK-compatible working format.", convertible_inputs, None, _convert_settings, _convert_backend, _expected_convert_outputs, _summary("Conversion", _expected_convert_outputs)),
-        Action("export_out_trajectory", "Convert", "Export trajectory", "Export trajectory data from this output container as .traj.h5.", frozenset({"out_hdf5"}), "trajectory_hdf5", _no_settings, _export_out_trajectory_backend, _expected_suffix(".traj.h5"), _summary("Trajectory export", _expected_suffix(".traj.h5"))),
-        Action("export_out_cube", "Convert", "Export cubes", "Export cube data from this output container as .cube.h5.", frozenset({"out_hdf5"}), "cube_hdf5", _no_settings, _export_out_cube_backend, _expected_suffix(".cube.h5"), _summary("Cube export", _expected_suffix(".cube.h5"))),
-        Action("density", "Compute", "Density", "Compute density profiles and heatmaps from a trajectory.", trajectory_inputs, "analysis_hdf5", _density_settings, _compute_density_backend, _expected_analysis("density"), _summary("Density", _expected_analysis("density"))),
-        Action("msd", "Compute", "MSD", "Compute mean-squared displacement from a trajectory.", trajectory_inputs, "analysis_hdf5", _msd_settings, _compute_msd_backend, _expected_analysis("msd"), _summary("MSD", _expected_analysis("msd"))),
-        Action("temperature", "Compute", "Temperature", "Compute temperature profiles from .temp, .tregion, or velocity XYZ.", temperature_inputs, "analysis_hdf5", _temperature_settings, _compute_temperature_backend, _expected_analysis("temperature"), _summary("Temperature", _expected_analysis("temperature"))),
-        Action("rdf", "Compute", "RDF", "Compute radial distribution functions from a trajectory.", trajectory_inputs, "analysis_hdf5", _rdf_settings, _compute_rdf_backend, _expected_analysis("rdf"), _summary("RDF", _expected_analysis("rdf"))),
-        Action("position", "Compute", "Position", "Compute atom-resolved positions and distance-to-surface profiles.", trajectory_inputs, "analysis_hdf5", _position_settings, _compute_position_backend, _expected_analysis("position"), _summary("Position", _expected_analysis("position"))),
-        Action("coordination", "Compute", "Coordination", "Compute continuous coordination numbers.", trajectory_inputs, "analysis_hdf5", _coordination_settings, _compute_coordination_backend, _expected_analysis("coordination"), _summary("Coordination", _expected_analysis("coordination"))),
-        Action("orientation", "Compute", "Orientation", "Compute water orientation versus distance to surface.", trajectory_inputs, "analysis_hdf5", _orientation_settings, _compute_orientation_backend, _expected_analysis("orientation"), _summary("Orientation", _expected_analysis("orientation"))),
-        Action("pbc", "Apply", "Apply PBC", "Wrap trajectory atoms into the resolved periodic cell.", trajectory_inputs, "raw_trajectory", _pbc_settings, _apply_pbc_backend, _expected_suffix("_pbc.xyz"), _summary("PBC", _expected_suffix("_pbc.xyz"))),
-        Action("potential", "Compute", "Potential", "Compute CP2K electrode cSHE potential from cube data.", frozenset({"cube_file", "cube_hdf5", "out_hdf5"}), "analysis_hdf5", _potential_settings, _compute_potential_backend, _expected_analysis("potential"), _summary("Potential", _expected_analysis("potential"))),
-        Action("open_plot", "Open", "Open plot viewer", "Open this output in the LiNaK plotting GUI.", analysis_outputs, None, _no_settings, None),
+        Action(
+            "pack_out_h5",
+            "Convert",
+            "Convert directory to .out.h5",
+            "Pack a simulation output directory into one LiNaK output container.",
+            frozenset({"simulation_directory"}),
+            "out_hdf5",
+            _pack_settings,
+            _pack_backend,
+            _expected_pack_outputs,
+            _summary("Directory pack", _expected_pack_outputs),
+        ),
+        Action(
+            "convert",
+            "Convert",
+            "Convert file",
+            "Convert to another LiNaK-compatible working format.",
+            convertible_inputs,
+            None,
+            _convert_settings,
+            _convert_backend,
+            _expected_convert_outputs,
+            _summary("Conversion", _expected_convert_outputs),
+        ),
+        Action(
+            "export_out_trajectory",
+            "Convert",
+            "Export trajectory",
+            "Export trajectory data from this output container as .traj.h5.",
+            frozenset({"out_hdf5"}),
+            "trajectory_hdf5",
+            _no_settings,
+            _export_out_trajectory_backend,
+            _expected_suffix(".traj.h5"),
+            _summary("Trajectory export", _expected_suffix(".traj.h5")),
+        ),
+        Action(
+            "export_out_cube",
+            "Convert",
+            "Export cubes",
+            "Export cube data from this output container as .cube.h5.",
+            frozenset({"out_hdf5"}),
+            "cube_hdf5",
+            _no_settings,
+            _export_out_cube_backend,
+            _expected_suffix(".cube.h5"),
+            _summary("Cube export", _expected_suffix(".cube.h5")),
+        ),
+        Action(
+            "density",
+            "Compute",
+            "Density",
+            "Compute density profiles and heatmaps from a trajectory.",
+            trajectory_inputs,
+            "analysis_hdf5",
+            _density_settings,
+            _compute_density_backend,
+            _expected_analysis("density"),
+            _summary("Density", _expected_analysis("density")),
+        ),
+        Action(
+            "temperature",
+            "Compute",
+            "Temperature",
+            "Compute temperature profiles from .temp, .tregion, or velocity XYZ.",
+            temperature_inputs,
+            "analysis_hdf5",
+            _temperature_settings,
+            _compute_temperature_backend,
+            _expected_analysis("temperature"),
+            _summary("Temperature", _expected_analysis("temperature")),
+        ),
+        Action(
+            "rdf",
+            "Compute",
+            "RDF",
+            "Compute radial distribution functions from a trajectory.",
+            trajectory_inputs,
+            "analysis_hdf5",
+            _rdf_settings,
+            _compute_rdf_backend,
+            _expected_analysis("rdf"),
+            _summary("RDF", _expected_analysis("rdf")),
+        ),
+        Action(
+            "position",
+            "Compute",
+            "Position",
+            "Compute atom-resolved positions and distance-to-surface profiles.",
+            trajectory_inputs,
+            "analysis_hdf5",
+            _position_settings,
+            _compute_position_backend,
+            _expected_analysis("position"),
+            _summary("Position", _expected_analysis("position")),
+        ),
+        Action(
+            "coordination",
+            "Compute",
+            "Coordination",
+            "Compute continuous coordination numbers.",
+            trajectory_inputs,
+            "analysis_hdf5",
+            _coordination_settings,
+            _compute_coordination_backend,
+            _expected_analysis("coordination"),
+            _summary("Coordination", _expected_analysis("coordination")),
+        ),
+        Action(
+            "orientation",
+            "Compute",
+            "Orientation",
+            "Compute water orientation versus distance to surface.",
+            trajectory_inputs,
+            "analysis_hdf5",
+            _orientation_settings,
+            _compute_orientation_backend,
+            _expected_analysis("orientation"),
+            _summary("Orientation", _expected_analysis("orientation")),
+        ),
+        Action(
+            "pbc",
+            "Apply",
+            "Apply PBC",
+            "Wrap trajectory atoms into the resolved periodic cell.",
+            trajectory_inputs,
+            "raw_trajectory",
+            _pbc_settings,
+            _apply_pbc_backend,
+            _expected_suffix("_pbc.xyz"),
+            _summary("PBC", _expected_suffix("_pbc.xyz")),
+        ),
+        Action(
+            "potential",
+            "Compute",
+            "Potential",
+            "Compute CP2K electrode cSHE potential from cube data.",
+            frozenset({"cube_file", "cube_hdf5", "out_hdf5"}),
+            "analysis_hdf5",
+            _potential_settings,
+            _compute_potential_backend,
+            _expected_analysis("potential"),
+            _summary("Potential", _expected_analysis("potential")),
+        ),
+        Action(
+            "open_plot",
+            "Open",
+            "Open plot viewer",
+            "Open this output in the LiNaK plotting GUI.",
+            analysis_outputs,
+            None,
+            _no_settings,
+            None,
+        ),
     ]
 
 

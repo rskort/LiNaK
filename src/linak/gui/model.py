@@ -179,12 +179,10 @@ class Task:
             progress_current=(
                 None
                 if payload.get("progress_current") is None
-                else int(payload.get("progress_current"))
+                else int(payload["progress_current"])
             ),
             progress_total=(
-                None
-                if payload.get("progress_total") is None
-                else int(payload.get("progress_total"))
+                None if payload.get("progress_total") is None else int(payload["progress_total"])
             ),
             task_id=str(payload.get("task_id") or uuid4().hex),
             created_utc=str(payload.get("created_utc", "")),

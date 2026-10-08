@@ -3,6 +3,32 @@
 `linak compute rdf` computes the radial distribution function `g(r)` for a pair
 of species, averaged over all frames.
 
+Select pairs with repeatable `--species A B` arguments:
+
+```bash
+linak compute rdf trajectory.traj.h5 --species O H --species Pt O
+linak plot trajectory.rdf.h5 --species O H --species Pt O
+```
+
+Each occurrence requires two selectors. Omitting `--species` computes all unique
+element/raw-species pairs. Repeated or reversed RDF pairs are computed once;
+`O H` and `H O` describe the same RDF. All requested pairs share one loaded
+trajectory and are stored in one RDF collection.
+
+Selectors support element symbols, `element:O`, stored raw labels such as
+`species:Ow`, and `all` (all atoms). Fixed atom selections can be mixed with
+species selections, for example `--species 'atoms[0,2..4]' Pt`. The separate
+`--atoms-a`/`--atoms-b` options remain available for an atom-index pair and cannot
+be combined with `--species`.
+
+RDF currently does **not** classify free H or OH dynamically. The `mol:H` and
+`mol:OH` selectors available in density/position are unsupported here. If the
+trajectory already stores suitable per-atom labels, use
+`--species species:freeH Pt` or `--species species:OH element:O`. These select
+stored labels, not molecular centers of mass or newly detected molecules.
+`--species H Pt` includes every hydrogen, including bound hydrogen. Fixed atom
+indices keep selecting those atoms even if their bonding changes.
+
 ## What Is Being Computed
 
 LiNaK estimates how often species `B` appears at distance `r` from species `A`,

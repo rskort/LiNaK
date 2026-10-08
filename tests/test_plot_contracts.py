@@ -1,14 +1,14 @@
+from __future__ import annotations
+
 import numpy as np
 
 from linak.analysis.density import DensityProfile
-from linak.analysis.msd import MSDProfile
 from linak.analysis.potential import PotentialPlotSeries
 from linak.analysis.rdf import RDFProfile
 from linak.analysis.coordination import CoordinationProfile
 from linak.analysis.orientation import OrientationProfile, OrientationSparseGrid
 from linak.analysis.position import PositionProfile
 from linak.plot.contracts.density_contract import density_profile_to_plot_data_contract
-from linak.plot.contracts.msd_contract import msd_profile_to_plot_data_contract
 from linak.plot.contracts.potential_contract import potential_profiles_to_plot_data_contract
 from linak.plot.contracts.rdf_contract import rdf_profile_to_plot_data_contract
 from linak.plot.contracts.coordination_contract import coordination_profile_to_plot_data_contract
@@ -36,11 +36,6 @@ from linak.plot.mappings.density_mapping import (
     density_plot_options_to_view_mapping,
     density_view_mapping_to_plot_options,
     resolve_density_plot_mapping,
-)
-from linak.plot.mappings.msd_mapping import (
-    msd_plot_options_to_view_mapping,
-    msd_view_mapping_to_plot_options,
-    resolve_msd_plot_mapping,
 )
 from linak.plot.mappings.potential_mapping import (
     potential_plot_options_to_view_mapping,
@@ -310,12 +305,12 @@ def test_canonical_view_tokens_validate_against_canonical_only_contracts():
         == "valid_nonpreferred"
     )
 
-    assert rdf_view_mapping_to_plot_options(
-        PlotViewMapping(view_type_id="plot_1d_line", x="radius", y="g_r")
-    ) == {}
-    assert msd_view_mapping_to_plot_options(
-        PlotViewMapping(view_type_id="plot_1d_line", x="time_ps", y="msd")
-    ) == {"time_axis": "ps"}
+    assert (
+        rdf_view_mapping_to_plot_options(
+            PlotViewMapping(view_type_id="plot_1d_line", x="radius", y="g_r")
+        )
+        == {}
+    )
     assert coordination_view_mapping_to_plot_options(
         PlotViewMapping(
             view_type_id="plot_1d_line",
@@ -323,9 +318,12 @@ def test_canonical_view_tokens_validate_against_canonical_only_contracts():
             y="coordination_number",
         )
     ) == {"component": "distance", "time_axis": "ps"}
-    assert potential_view_mapping_to_plot_options(
-        PlotViewMapping(view_type_id="plot_1d_line", x="record_id", y="efermi")
-    )["view_type"] == "line_1d"
+    assert (
+        potential_view_mapping_to_plot_options(
+            PlotViewMapping(view_type_id="plot_1d_line", x="record_id", y="efermi")
+        )["view_type"]
+        == "line_1d"
+    )
 
 
 def test_position_mapping_preset_distance_vs_time_uses_generic_roles():
@@ -695,45 +693,6 @@ def test_resolve_density_plot_mapping_validates_loaded_profile_contract():
     }
     assert resolved.x_mode == "z"
     assert resolved.quantity == "mass"
-
-
-def test_msd_profile_to_plot_data_contract_exposes_time_and_msd_quantities():
-    profile = MSDProfile(
-        species="O",
-        time_fs=np.array([0.0, 2.0]),
-        time_ps=np.array([0.0, 0.002]),
-        msd=np.array([0.0, 1.0]),
-        n_frames=2,
-    )
-
-    contract = msd_profile_to_plot_data_contract(profile)
-
-    assert [dimension.id for dimension in contract.dimensions] == ["frame"]
-    assert [quantity.id for quantity in contract.quantities] == ["time_fs", "time_ps", "msd"]
-
-
-def test_msd_view_mapping_round_trips_time_axis():
-    mapping = msd_plot_options_to_view_mapping(time_axis="fs")
-
-    options = msd_view_mapping_to_plot_options(mapping)
-
-    assert options == {"time_axis": "fs"}
-
-
-def test_resolve_msd_plot_mapping_validates_loaded_profile_contract():
-    profile = MSDProfile(
-        species="O",
-        time_fs=np.array([0.0, 2.0]),
-        time_ps=np.array([0.0, 0.002]),
-        msd=np.array([0.0, 1.0]),
-        n_frames=2,
-    )
-
-    resolved = resolve_msd_plot_mapping(profile=profile, time_axis="ps")
-
-    assert resolved.compatibility == "valid_preferred"
-    assert resolved.mapping.x == "time_ps"
-    assert resolved.renderer_options == {"time_axis": "ps"}
 
 
 def test_rdf_profile_to_plot_data_contract_exposes_radius_and_distribution():

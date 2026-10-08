@@ -6,11 +6,12 @@ on:
 
 jobs:
   quality:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]
 
     steps:
       - name: Checkout
@@ -24,7 +25,8 @@ jobs:
       - name: Install package and dev tools
         run: |
           python -m pip install --upgrade pip
-          pip install -e .[dev]
+          python -m pip install -e ".[dev]" build twine
+          python -m pip check
 
       - name: Lint
         run: ruff check .
@@ -33,9 +35,24 @@ jobs:
         run: ruff format --check .
 
       - name: Type check
-        run: mypy src tests
+        run: mypy src tests benchmarks
 
       - name: Tests
         env:
           MPLBACKEND: Agg
+          QT_QPA_PLATFORM: offscreen
         run: pytest -q
+
+      - name: Build distributions
+        run: python -m build
+
+      - name: Validate distribution metadata
+        run: python -m twine check dist/*
+
+      - name: Verify installed wheel and GUI assets outside checkout
+        run: |
+          python -c "import glob, subprocess, sys; subprocess.run([sys.executable, '-m', 'pip', 'install', '--no-deps', '--target', '.smoke_wheel_install', glob.glob('dist/*.whl')[0]], check=True)"
+          python benchmarks/verify_distribution.py dist .smoke_wheel_install
+
+      - name: Compile package
+        run: python -m compileall -q src

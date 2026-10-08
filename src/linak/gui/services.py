@@ -27,7 +27,9 @@ def descriptor_for_action(action: Action) -> ActionServiceDescriptor:
     return ActionServiceDescriptor(
         action_id=action.action_id,
         cancel_capability="cooperative" if action.action_id in cooperative else "limited",
-        backend_label="GUI service" if action.action_id in cooperative else "CLI-compatible service",
+        backend_label="GUI service"
+        if action.action_id in cooperative
+        else "CLI-compatible service",
     )
 
 

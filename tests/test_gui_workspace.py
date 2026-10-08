@@ -80,9 +80,13 @@ def _write_minimal_out_h5(path: Path, *, trajectory: bool = True, cubes: int = 0
         md_steps.create_dataset("step", data=[1, 2, 3])
         system = handle.create_group("system")
         system.create_dataset("species", data=[b"Li", b"O"])
-        system.create_dataset("cell_angstrom", data=[[10.0, 0.0, 0.0], [0.0, 11.0, 0.0], [0.0, 0.0, 12.0]])
+        system.create_dataset(
+            "cell_angstrom", data=[[10.0, 0.0, 0.0], [0.0, 11.0, 0.0], [0.0, 0.0, 12.0]]
+        )
         provenance = handle.create_group("provenance")
-        provenance.attrs["discovery_summary_json"] = '{"trajectories": ["traj.xyz"], "cubes": ["density.cube"], "cp2k_outputs": ["output.out"], "skipped": []}'
+        provenance.attrs["discovery_summary_json"] = (
+            '{"trajectories": ["traj.xyz"], "cubes": ["density.cube"], "cp2k_outputs": ["output.out"], "skipped": []}'
+        )
         provenance.create_dataset("messages", data=[b"Skipped optional cube"])
 
 
@@ -140,8 +144,8 @@ def test_generated_project_scan_detects_linak_outputs(tmp_path):
     project.mkdir()
     write_linak_hdf5(
         project / "result.h5",
-        analysis="msd",
-        datasets={"time_fs": [0.0], "msd": [0.0]},
+        analysis="rdf",
+        datasets={"r_A": [0.0], "g_r": [0.0]},
         metadata={"species": "O"},
     )
     with h5py.File(project / "ordinary.h5", "w") as handle:
@@ -159,8 +163,8 @@ def test_workspace_index_reuses_unchanged_detection_and_revalidates_changed_file
     output = project / "result.h5"
     write_linak_hdf5(
         output,
-        analysis="msd",
-        datasets={"time_fs": [0.0], "msd": [0.0]},
+        analysis="rdf",
+        datasets={"r_A": [0.0], "g_r": [0.0]},
         metadata={"species": "O"},
     )
     index = WorkspaceIndex()
@@ -169,9 +173,9 @@ def test_workspace_index_reuses_unchanged_detection_and_revalidates_changed_file
     cached = index.cached_item(output)
     second = discover_generated_items_cached(project, index=index)
 
-    assert first[0].metadata["analysis"] == "msd"
+    assert first[0].metadata["analysis"] == "rdf"
     assert cached is not None
-    assert second[0].metadata["analysis"] == "msd"
+    assert second[0].metadata["analysis"] == "rdf"
 
     write_linak_hdf5(
         output,
@@ -191,7 +195,15 @@ def test_action_registry_filters_by_project_item_type(tmp_path):
 
     action_ids = {action.action_id for action in ActionRegistry().available_for(item)}
 
-    assert {"convert", "density", "msd", "rdf", "position", "coordination", "orientation", "pbc"} <= action_ids
+    assert {
+        "convert",
+        "density",
+        "rdf",
+        "position",
+        "coordination",
+        "orientation",
+        "pbc",
+    } <= action_ids
     assert "open_plot" not in action_ids
 
 
@@ -323,7 +335,7 @@ def test_project_workspace_uses_plot_gui_theme_switch_pattern():
 
     assert 'self._theme_switch = QCheckBox("Dark mode")' in source
     assert 'self._theme_switch.setObjectName("themeSwitch")' in source
-    assert 'self._theme_mode = "system"' in source
+    assert 'self._theme_mode: ThemeMode = "system"' in source
     assert '"dark" if checked else "light"' in source
     assert "_gui_theme_mode" not in source
 
@@ -402,7 +414,8 @@ def test_out_h5_gui_summary_and_defaults_are_metadata_driven(tmp_path):
     assert summary.discovery_summary["trajectories"] == ["traj.xyz"]
     assert defaults["species_a"] == "Li"
     assert defaults["species_b"] == "O"
-    assert defaults["cell"] == "10 11 12"
+    assert defaults["cell"] is None
+    assert defaults["cell_angles"] is None
     assert defaults["timestep_fs"] == 0.5
 
 
@@ -441,6 +454,7 @@ def test_position_gui_backend_forwards_oh_molecule_options(tmp_path, monkeypatch
 
     monkeypatch.setattr(actions_mod, "_run_cli_with_expected_outputs", _fake_run)
 
+    assert action.backend is not None
     result = action.backend(
         ActionContext(
             project_dir=project,
@@ -494,6 +508,7 @@ def test_density_gui_backend_forwards_atom_aliases(tmp_path, monkeypatch):
 
     monkeypatch.setattr(actions_mod, "_run_cli_with_expected_outputs", _fake_run)
 
+    assert action.backend is not None
     action.backend(
         ActionContext(
             project_dir=project,
@@ -511,6 +526,7 @@ def test_density_gui_backend_forwards_atom_aliases(tmp_path, monkeypatch):
     )
 
     argv = captured["argv"]
+    assert isinstance(argv, (list, tuple))
     assert "--atom-alias" in argv
     assert argv.count("--atom-alias") == 2
     assert "Ow=O" in argv
@@ -747,6 +763,7 @@ def test_conversion_action_writes_output_inside_project_dir(tmp_path):
     action = ActionRegistry().by_id("convert")
     logs: list[tuple[str, str]] = []
 
+    assert action.backend is not None
     result = action.backend(
         ActionContext(
             project_dir=project,

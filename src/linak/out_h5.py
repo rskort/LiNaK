@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from .cell_geometry import frame_origin, cell_angles, cell_matrix
+
+from collections.abc import Generator, Callable, Iterable, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field as dataclass_field
 from datetime import datetime, timezone
 import csv
@@ -12,6 +15,7 @@ import logging
 from pathlib import Path
 import tempfile
 from typing import Any, Literal, Optional
+from uuid import uuid4
 
 import numpy as np
 from ase import Atoms
@@ -29,6 +33,11 @@ from .storage.compress import (
     build_parser_options_from_drop_sections,
 )
 from .storage.hdf5_utils import require_h5py
+from .storage.policies import (
+    STORAGE_PRECISION_POLICY,
+    dataset_create_options,
+    normalize_compression_profile,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -41,6 +50,18 @@ LogCallback = Callable[[str, str], None]
 CancelCallback = Callable[[], bool]
 
 _RAW_TRAJECTORY_SUFFIXES = (".xyz", ".extxyz", ".dump", ".lmp")
+
+
+@contextmanager
+def _atomic_out_h5_target(target: Path):
+    working = target.with_name(f".{target.name}.{uuid4().hex}.tmp.h5")
+    try:
+        yield working
+        working.replace(target)
+    finally:
+        working.unlink(missing_ok=True)
+
+
 _CUBE_SUFFIXES = (".cube", ".cube.h5", ".cube.hdf5")
 _CP2K_OUTPUT_SUFFIXES = (".out",)
 
@@ -53,6 +74,7 @@ class OutH5PackOptions:
     exclude: tuple[str, ...] = ()
     overwrite: bool = False
     drop_sections: tuple[str, ...] = ()
+    compression_profile: str = "fast"
 
 
 @dataclass(frozen=True)
@@ -193,19 +215,10 @@ def default_out_h5_output_path(source_dir: str | Path) -> Path:
 
 
 def unique_out_h5_output_path(path: str | Path) -> Path:
-    """Return a non-existing `.out.h5` path by appending `_N` before the suffix."""
+    """Return an unused output path without changing its compound extension."""
+    from .analysis.output_naming import unique_output_path
 
-    target = Path(path).expanduser().resolve()
-    if not target.exists():
-        return target
-    suffix = ".out.h5" if target.name.lower().endswith(".out.h5") else target.suffix
-    base = target.with_name(target.name[: -len(suffix)] if suffix else target.stem)
-    counter = 1
-    while True:
-        candidate = Path(f"{base}_{counter}{suffix}")
-        if not candidate.exists():
-            return candidate
-        counter += 1
+    return unique_output_path(Path(path).expanduser().resolve())
 
 
 def discover_simulation_directory(
@@ -305,28 +318,53 @@ def _read_csv_rows(path: Path) -> list[dict[str, Any]]:
         return [dict(row) for row in csv.DictReader(handle)]
 
 
-def _copy_dataset(source_group: Any, target_group: Any, name: str) -> bool:
+def _copy_dataset(
+    source_group: Any,
+    target_group: Any,
+    name: str,
+    *,
+    compression_profile: str,
+    dtype: Any | None = None,
+) -> bool:
     if name not in source_group:
         return False
     dataset = source_group[name]
-    kwargs: dict[str, Any] = {}
-    if getattr(dataset, "ndim", 0) > 0 and getattr(dataset, "size", 0) > 0:
-        kwargs["compression"] = "lzf"
-        if dataset.dtype.kind in {"i", "u", "f", "b"}:
-            kwargs["shuffle"] = True
-    target_group.create_dataset(name, data=dataset[...], **kwargs)
+    values = np.asarray(dataset[...], dtype=dtype)
+    target_group.create_dataset(
+        name,
+        data=values,
+        **dataset_create_options(values, compression_profile=compression_profile),
+    )
     return True
 
 
-def _write_existing_trajectory_hdf5(source: Path, group: Any) -> None:
+def _write_existing_trajectory_hdf5(source: Path, group: Any, *, compression_profile: str) -> None:
     h5py = _h5py()
     with h5py.File(source, "r") as handle:
-        for name in ("positions", "cell", "pbc", "atomic_numbers", "atom_counts"):
-            _copy_dataset(handle, group, name)
+        for name in (
+            "positions",
+            "cell",
+            "cell_origin_angstrom",
+            "pbc",
+            "atomic_numbers",
+            "atom_counts",
+        ):
+            _copy_dataset(
+                handle,
+                group,
+                name,
+                compression_profile=compression_profile,
+                dtype=np.float32 if name == "positions" else None,
+            )
         if "frame_info" in handle:
             info_target = group.create_group("frame_info")
             for name in handle["frame_info"].keys():
-                _copy_dataset(handle["frame_info"], info_target, name)
+                _copy_dataset(
+                    handle["frame_info"],
+                    info_target,
+                    name,
+                    compression_profile=compression_profile,
+                )
         for key, value in handle.attrs.items():
             if key in {"frame_count", "atom_count", "topology_mode"}:
                 group.attrs[key] = value
@@ -342,18 +380,31 @@ def _topology_is_fixed(frames: Sequence[Atoms]) -> bool:
     return all(frame.get_atomic_numbers().tolist() == atomic_numbers for frame in frames)
 
 
-def _write_frames_trajectory(source: Path, group: Any) -> None:
+def _write_frames_trajectory(source: Path, group: Any, *, compression_profile: str) -> None:
     from .trajectory.io import read_trajectory
 
     frames = read_trajectory(source)
     if not frames:
         raise ValueError(f"No trajectory frames were read from {source}.")
+    if any(abs(np.linalg.det(frame.cell)) == 0 for frame in frames):
+        from .pbc import find_unique_simulation_input, extract_cell_from_simulation_input
+
+        try:
+            simulation_input = find_unique_simulation_input(source.parent)
+        except FileNotFoundError:
+            simulation_input = None
+        if simulation_input is not None:
+            resolved = cell_matrix(extract_cell_from_simulation_input(simulation_input))
+            for frame in frames:
+                if abs(np.linalg.det(frame.cell)) == 0:
+                    frame.set_cell(resolved)
+                    frame.set_pbc(True)
     frame_count = len(frames)
     atom_counts = np.asarray([len(frame) for frame in frames], dtype=np.int64)
     max_atoms = int(np.max(atom_counts))
     fixed = _topology_is_fixed(frames)
 
-    positions = np.zeros((frame_count, max_atoms, 3), dtype=np.float64)
+    positions = np.zeros((frame_count, max_atoms, 3), dtype=np.float32)
     cells = np.empty((frame_count, 3, 3), dtype=np.float64)
     pbc = np.empty((frame_count, 3), dtype=bool)
     atomic_numbers = (
@@ -371,7 +422,7 @@ def _write_frames_trajectory(source: Path, group: Any) -> None:
     )
     for index, frame in enumerate(frames):
         count = len(frame)
-        positions[index, :count] = np.asarray(frame.get_positions(), dtype=np.float64)
+        positions[index, :count] = np.asarray(frame.get_positions(), dtype=np.float32)
         cells[index] = np.asarray(frame.cell.array, dtype=np.float64)
         pbc[index] = np.asarray(frame.get_pbc(), dtype=bool)
         if not fixed:
@@ -382,33 +433,45 @@ def _write_frames_trajectory(source: Path, group: Any) -> None:
                 frame_info.setdefault(key, [np.nan] * frame_count)
                 frame_info[key][index] = float(value)
 
-    chunk_frames = max(1, min(frame_count, 64))
     group.create_dataset(
         "positions",
         data=positions,
-        chunks=(chunk_frames, max_atoms, 3),
-        compression="lzf",
-        shuffle=True,
+        **dataset_create_options(positions, compression_profile=compression_profile),
+    )
+    origins = np.asarray([frame_origin(frame) for frame in frames], dtype=np.float64)
+    group.create_dataset(
+        "cell_origin_angstrom",
+        data=origins,
+        **dataset_create_options(origins, compression_profile=compression_profile),
     )
     group.create_dataset(
-        "cell", data=cells, chunks=(chunk_frames, 3, 3), compression="lzf", shuffle=True
+        "cell", data=cells, **dataset_create_options(cells, compression_profile=compression_profile)
     )
-    group.create_dataset("pbc", data=pbc, chunks=(chunk_frames, 3), compression="lzf")
+    group.create_dataset(
+        "pbc", data=pbc, **dataset_create_options(pbc, compression_profile=compression_profile)
+    )
     group.create_dataset(
         "atomic_numbers",
         data=atomic_numbers,
-        compression="lzf" if not fixed else None,
-        shuffle=not fixed,
+        **dataset_create_options(atomic_numbers, compression_profile=compression_profile),
     )
     if not fixed:
         group.create_dataset(
-            "atom_counts", data=atom_counts, chunks=(chunk_frames,), compression="lzf", shuffle=True
+            "atom_counts",
+            data=atom_counts,
+            **dataset_create_options(atom_counts, compression_profile=compression_profile),
         )
     if frame_info:
         info_group = group.create_group("frame_info")
         for key, values in frame_info.items():
+            info_values = np.asarray(values, dtype=np.float64)
             info_group.create_dataset(
-                key, data=np.asarray(values, dtype=np.float64), compression="lzf", shuffle=True
+                key,
+                data=info_values,
+                **dataset_create_options(
+                    info_values,
+                    compression_profile=compression_profile,
+                ),
             )
     group.attrs["present"] = True
     group.attrs["source_path"] = str(source)
@@ -418,16 +481,22 @@ def _write_frames_trajectory(source: Path, group: Any) -> None:
     group.attrs["topology_mode"] = "fixed" if fixed else "variable"
 
 
-def _write_trajectory(source: Path | None, group: Any, messages: list[str]) -> None:
+def _write_trajectory(
+    source: Path | None,
+    group: Any,
+    messages: list[str],
+    *,
+    compression_profile: str,
+) -> None:
     if source is None:
         group.attrs["present"] = False
         messages.append("No trajectory source was detected.")
         return
     try:
         if _is_existing_trajectory_hdf5(source):
-            _write_existing_trajectory_hdf5(source, group)
+            _write_existing_trajectory_hdf5(source, group, compression_profile=compression_profile)
         else:
-            _write_frames_trajectory(source, group)
+            _write_frames_trajectory(source, group, compression_profile=compression_profile)
         messages.append(f"Packed trajectory: {source}")
     except Exception as exc:
         group.attrs["present"] = False
@@ -435,7 +504,14 @@ def _write_trajectory(source: Path | None, group: Any, messages: list[str]) -> N
         messages.append(f"Skipped trajectory {source}: {exc}")
 
 
-def _write_cube_dataset(group: Any, dataset: CubeDataset, source: Path, index: int) -> None:
+def _write_cube_dataset(
+    group: Any,
+    dataset: CubeDataset,
+    source: Path,
+    index: int,
+    *,
+    compression_profile: str,
+) -> None:
     cube_group = group.create_group(_safe_id(source, index))
     cube_group.create_dataset("origin_bohr", data=np.asarray(dataset.origin_bohr, dtype=float))
     cube_group.create_dataset(
@@ -449,8 +525,11 @@ def _write_cube_dataset(group: Any, dataset: CubeDataset, source: Path, index: i
     cube_group.create_dataset(
         "atom_positions_bohr", data=np.asarray(dataset.atom_positions_bohr, dtype=float)
     )
+    values = np.asarray(dataset.values, dtype=np.float32)
     cube_group.create_dataset(
-        "values", data=np.asarray(dataset.values, dtype=float), compression="lzf", shuffle=True
+        "values",
+        data=values,
+        **dataset_create_options(values, compression_profile=compression_profile),
     )
     cube_group.attrs["comment_1"] = dataset.comment_1
     cube_group.attrs["comment_2"] = dataset.comment_2
@@ -466,13 +545,25 @@ def _write_cube_dataset(group: Any, dataset: CubeDataset, source: Path, index: i
     cube_group.attrs["parse_status"] = "ok"
 
 
-def _write_cubes(sources: Sequence[Path], group: Any, messages: list[str]) -> int:
+def _write_cubes(
+    sources: Sequence[Path],
+    group: Any,
+    messages: list[str],
+    *,
+    compression_profile: str,
+) -> int:
     count = 0
     for source in sources:
         try:
             datasets = read_cube_sources(source)
             for dataset in datasets:
-                _write_cube_dataset(group, dataset, source, count)
+                _write_cube_dataset(
+                    group,
+                    dataset,
+                    source,
+                    count,
+                    compression_profile=compression_profile,
+                )
                 count += 1
             messages.append(f"Packed {len(datasets)} cube dataset(s): {source}")
         except Exception as exc:
@@ -610,6 +701,8 @@ def _write_system_group(handle: Any) -> None:
         if "cell" in trajectory:
             cell = np.asarray(trajectory["cell"][0], dtype=float)
             group.create_dataset("cell_angstrom", data=cell)
+            if abs(np.linalg.det(cell)) > 0:
+                group.create_dataset("cell_angles_deg", data=cell_angles(cell))
     group.attrs["units_json"] = _json_attr(
         {
             "trajectory_positions": "angstrom",
@@ -663,6 +756,7 @@ def pack_simulation_directory(
     """Pack one simulation output directory into a schema-versioned `.out.h5` file."""
 
     resolved_options = options or OutH5PackOptions()
+    compression_profile = normalize_compression_profile(resolved_options.compression_profile)
     if progress:
         progress("Discovering files", 0, 6)
     _check_canceled(cancel_requested)
@@ -687,12 +781,14 @@ def pack_simulation_directory(
     log("INFO", f"Output container: {target}")
 
     h5py = _h5py()
-    with h5py.File(target, "w") as handle:
+    with _atomic_out_h5_target(target) as working_target, h5py.File(working_target, "w") as handle:
         handle.attrs["linak_format"] = LINAK_OUT_HDF5_FORMAT
         handle.attrs["linak_out_schema_version"] = LINAK_OUT_HDF5_SCHEMA_VERSION
         handle.attrs["linak_version"] = __version__
         handle.attrs["created_utc"] = _now_utc()
         handle.attrs["source_directory"] = str(discovery.source_dir)
+        handle.attrs["compression_profile"] = compression_profile
+        handle.attrs["storage_precision_policy"] = STORAGE_PRECISION_POLICY
         handle.attrs["schema_capabilities_json"] = _json_attr(
             {
                 "trajectory": True,
@@ -707,7 +803,12 @@ def pack_simulation_directory(
         _check_canceled(cancel_requested)
         trajectory_group = handle.create_group("trajectory")
         primary_trajectory = discovery.trajectories[0] if discovery.trajectories else None
-        _write_trajectory(primary_trajectory, trajectory_group, messages)
+        _write_trajectory(
+            primary_trajectory,
+            trajectory_group,
+            messages,
+            compression_profile=compression_profile,
+        )
         for extra in discovery.trajectories[1:]:
             messages.append(f"Additional trajectory source not packed in v1: {extra}")
         if progress:
@@ -717,7 +818,12 @@ def pack_simulation_directory(
             progress("Packing cubes", 2, 6)
         _check_canceled(cancel_requested)
         cubes_group = handle.create_group("cubes")
-        cube_count = _write_cubes(discovery.cubes, cubes_group, messages)
+        cube_count = _write_cubes(
+            discovery.cubes,
+            cubes_group,
+            messages,
+            compression_profile=compression_profile,
+        )
         log("INFO", f"Packed cube dataset count: {cube_count}")
         if progress:
             progress("Cubes packed", 3, 6)
@@ -812,10 +918,10 @@ def inspect_out_h5(path: str | Path) -> OutH5Summary:
             )
             trajectory_source_path = str(_decode_attr(trajectory.attrs.get("source_path", "")))
             trajectory_source_format = str(_decode_attr(trajectory.attrs.get("source_format", "")))
-            if "pbc" in trajectory and getattr(trajectory["pbc"], "shape", ()):
+            if "pbc" in trajectory and len(trajectory["pbc"].shape) > 0:
                 first_pbc = np.asarray(trajectory["pbc"][0], dtype=bool).reshape(-1)
                 if first_pbc.size >= 3:
-                    pbc = tuple(bool(value) for value in first_pbc[:3])
+                    pbc = (bool(first_pbc[0]), bool(first_pbc[1]), bool(first_pbc[2]))
             if frame_count and frame_count > 0:
                 frame_range = (0, int(frame_count) - 1)
         cubes = handle.get("cubes")
@@ -856,11 +962,13 @@ def inspect_out_h5(path: str | Path) -> OutH5Summary:
             raw_cell = np.asarray(handle["system/cell_angstrom"][...], dtype=float)
             if raw_cell.shape == (3, 3):
                 cell_matrix_angstrom = tuple(
-                    tuple(float(value) for value in row) for row in raw_cell
+                    (float(row[0]), float(row[1]), float(row[2])) for row in raw_cell
                 )
-                cell_angstrom = tuple(float(np.linalg.norm(row)) for row in raw_cell)
+                norms = np.linalg.norm(raw_cell, axis=1)
+                cell_angstrom = (float(norms[0]), float(norms[1]), float(norms[2]))
             elif raw_cell.size >= 3:
-                cell_angstrom = tuple(float(value) for value in raw_cell.reshape(-1)[:3])
+                flat_cell = raw_cell.reshape(-1)
+                cell_angstrom = (float(flat_cell[0]), float(flat_cell[1]), float(flat_cell[2]))
         timestep_fs: float | None = None
         timestep_candidates: list[float] = []
         if trajectory is not None and "frame_info" in trajectory:
@@ -934,6 +1042,7 @@ def _build_atoms_from_group(
     *,
     positions_chunk: np.ndarray,
     cell_chunk: np.ndarray,
+    origin_chunk: np.ndarray | None = None,
     pbc_chunk: np.ndarray,
     atomic_numbers: np.ndarray,
     atom_counts_chunk: np.ndarray | None,
@@ -952,6 +1061,7 @@ def _build_atoms_from_group(
             numbers=numbers,
             positions=positions,
             cell=cell_chunk[offset],
+            celldisp=None if origin_chunk is None else origin_chunk[offset],
             pbc=tuple(bool(value) for value in pbc_chunk[offset]),
         )
         for key, values in frame_info_chunks.items():
@@ -964,7 +1074,9 @@ def _build_atoms_from_group(
     return frames
 
 
-def read_out_h5_trajectory_chunks(path: str | Path, *, chunk_size: int) -> Iterator[list[Atoms]]:
+def read_out_h5_trajectory_chunks(
+    path: str | Path, *, chunk_size: int, start_frame: int = 0, stop_frame: int | None = None
+) -> Generator[list[Atoms], None, None]:
     """Yield trajectory frames stored in `.out.h5`."""
 
     if chunk_size <= 0:
@@ -980,13 +1092,16 @@ def read_out_h5_trajectory_chunks(path: str | Path, *, chunk_size: int) -> Itera
         positions = trajectory["positions"]
         cells = trajectory["cell"]
         pbc = trajectory["pbc"]
-        atomic_numbers = np.asarray(trajectory["atomic_numbers"], dtype=np.int64)
+        atomic_numbers = trajectory["atomic_numbers"]
         atom_counts_dataset = trajectory.get("atom_counts")
         frame_count = int(trajectory.attrs.get("frame_count", positions.shape[0]))
+        stop_frame = frame_count if stop_frame is None else min(stop_frame, frame_count)
+        if not 0 <= start_frame <= stop_frame:
+            raise ValueError("Invalid trajectory frame range.")
         info_group = trajectory.get("frame_info")
         info_names = list(info_group.keys()) if info_group is not None else []
-        for start in range(0, frame_count, chunk_size):
-            stop = min(start + chunk_size, frame_count)
+        for start in range(start_frame, stop_frame, chunk_size):
+            stop = min(start + chunk_size, stop_frame)
             atom_counts_chunk = (
                 None
                 if atom_counts_dataset is None
@@ -1000,9 +1115,14 @@ def read_out_h5_trajectory_chunks(path: str | Path, *, chunk_size: int) -> Itera
             yield _build_atoms_from_group(
                 positions_chunk=np.asarray(positions[start:stop], dtype=np.float64),
                 cell_chunk=np.asarray(cells[start:stop], dtype=np.float64),
+                origin_chunk=(
+                    np.asarray(trajectory["cell_origin_angstrom"][start:stop])
+                    if "cell_origin_angstrom" in trajectory
+                    else None
+                ),
                 pbc_chunk=np.asarray(pbc[start:stop], dtype=bool),
                 atomic_numbers=(
-                    atomic_numbers
+                    np.asarray(atomic_numbers, dtype=np.int64)
                     if atom_counts_chunk is None
                     else np.asarray(atomic_numbers[start:stop], dtype=np.int64)
                 ),

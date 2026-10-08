@@ -5,6 +5,7 @@ from pathlib import Path
 
 import numpy as np
 
+import linak.analysis.temperature as temperature_module
 from linak.analysis.temperature import (
     AMU_TO_KG,
     ATOMIC_VELOCITY_TO_M_PER_S,
@@ -64,9 +65,10 @@ def _write_cp2k_input(path: Path) -> None:
 def _write_velocity_xyz(path: Path, *, k_temperature: float = 320.0) -> None:
     # One K atom with only vx set gives exactly the target 3N kinetic temperature.
     k_mass_amu = 39.0983
-    velocity_au = math.sqrt(
-        3.0 * BOLTZMANN_J_PER_K * k_temperature / (k_mass_amu * AMU_TO_KG)
-    ) / ATOMIC_VELOCITY_TO_M_PER_S
+    velocity_au = (
+        math.sqrt(3.0 * BOLTZMANN_J_PER_K * k_temperature / (k_mass_amu * AMU_TO_KG))
+        / ATOMIC_VELOCITY_TO_M_PER_S
+    )
     path.write_text(
         "5\n"
         " i =        10, time =        5.000, E = -1.0\n"
@@ -82,9 +84,7 @@ def _write_velocity_xyz(path: Path, *, k_temperature: float = 320.0) -> None:
 def _write_labeled_velocity_xyz(path: Path, labels: list[str]) -> None:
     rows = "\n".join(f"{label} 0.0000000000 0.0000000000 0.0000000000" for label in labels)
     path.write_text(
-        f"{len(labels)}\n"
-        " i =        10, time =        5.000, E = -1.0\n"
-        f"{rows}\n",
+        f"{len(labels)}\n i =        10, time =        5.000, E = -1.0\n{rows}\n",
         encoding="utf-8",
     )
 
@@ -124,11 +124,13 @@ def test_tregion_table_tracks_regions_and_atom_indices(tmp_path: Path) -> None:
     assert profiles[0].region_elements == ("Au",)
     assert profiles[0].region_formula == "Au1"
     assert profiles[0].cp2k_list_expression == "4"
+    assert profiles[0].atom_indices is not None
     assert profiles[0].atom_indices.tolist() == [3]
     assert profiles[1].region_name == "Region 1"
     assert profiles[1].region_elements == ("K",)
     assert profiles[1].region_formula == "K1"
     assert profiles[2].cp2k_list_expression == "1..2"
+    assert profiles[2].atom_indices is not None
     assert profiles[2].atom_indices.tolist() == [0, 1]
     assert profiles[2].region_elements == ("O", "H")
     assert profiles[2].region_formula == "O1 H1"
@@ -178,6 +180,30 @@ def test_velocity_temperature_uses_atomic_velocity_units_and_regions(tmp_path: P
     assert by_label["Region 1 [K1]"].dof_mode == "3N"
 
 
+def test_velocity_temperature_reuses_cached_atomic_masses(monkeypatch, tmp_path: Path) -> None:
+    velocity = tmp_path / "run-vel-1.xyz"
+    _write_velocity_xyz(velocity)
+    cached_mass_flags: list[bool] = []
+    original = temperature_module._temperature_for_selection
+
+    def _tracked_temperature_for_selection(**kwargs):
+        cached_mass_flags.append(kwargs.get("selected_masses_kg") is not None)
+        return original(**kwargs)
+
+    monkeypatch.setattr(
+        temperature_module,
+        "_temperature_for_selection",
+        _tracked_temperature_for_selection,
+    )
+
+    profiles = compute_temperature_profiles(velocity, group_by="elements")
+
+    assert len(profiles) == 4
+    assert cached_mass_flags == [True, True, True, True]
+    assert all(profile.frame_index is profiles[0].frame_index for profile in profiles[1:])
+    assert all(profile.time_fs is profiles[0].time_fs for profile in profiles[1:])
+
+
 def test_velocity_temperature_infers_pt_top_as_pt_without_alias(tmp_path: Path) -> None:
     velocity = tmp_path / "run-vel-1.xyz"
     _write_labeled_velocity_xyz(velocity, ["Pt_top", "Pt"])
@@ -186,6 +212,7 @@ def test_velocity_temperature_infers_pt_top_as_pt_without_alias(tmp_path: Path) 
 
     assert [profile.default_label for profile in profiles] == ["Pt"]
     assert profiles[0].atom_count == 2
+    assert profiles[0].atom_indices is not None
     assert profiles[0].atom_indices.tolist() == [0, 1]
 
 
@@ -201,6 +228,7 @@ def test_velocity_temperature_accepts_explicit_atom_aliases(tmp_path: Path) -> N
 
     assert [profile.default_label for profile in profiles] == ["O"]
     assert profiles[0].atom_count == 1
+    assert profiles[0].atom_indices is not None
     assert profiles[0].atom_indices.tolist() == [0]
 
 
@@ -262,7 +290,20 @@ def test_temperature_cli_velocity_accepts_pt_top_labels(tmp_path: Path) -> None:
     output = tmp_path / "temperature.temperature.h5"
     _write_labeled_velocity_xyz(velocity, ["Pt_top", "Pt"])
 
-    assert main(["compute", "temperature", str(velocity), "--group-by", "elements", "--output", str(output)]) == 0
+    assert (
+        main(
+            [
+                "compute",
+                "temperature",
+                str(velocity),
+                "--group-by",
+                "elements",
+                "--output",
+                str(output),
+            ]
+        )
+        == 0
+    )
     assert output.exists()
 
 

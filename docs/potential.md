@@ -1,5 +1,20 @@
 # Potential
 
+## Two-Sided Water References
+
+Potential analysis reconstructs an ASE-compatible periodic structure from the
+cube origin, grid vectors, counts, atomic numbers, and coordinates. Only atoms
+in detected H2O topology define side windows; slab atoms, ions, adsorbates,
+incomplete H/O fragments, and other contaminants are excluded from clean
+averaging slices.
+
+Resolved symmetric records store top/bottom bulk-water potentials, cSHE
+potentials, window bounds, layout, and provenance. Unsuffixed values are the
+equal arithmetic mean of two valid sides. If either symmetric side is invalid,
+the combined value is unavailable and the row is incomplete. Without complete
+H2O topology, water-bulk and cSHE values remain unavailable for every layout;
+isolated hydrogen and oxygen atoms are never substituted for water molecules.
+
 `linak compute potential` extracts electrode-potential summary quantities from
 CP2K Hartree-potential cube files and stores the result as a row-oriented HDF5
 table.
@@ -44,13 +59,10 @@ If `V(x, y, z_k)` is the cube value on one `z` slice, LiNaK computes:
 
 ## Step 2: Infer The Water Region From The Cube Header
 
-LiNaK inspects the atoms listed in the cube header and identifies water atoms by
-atomic number:
-
-- hydrogen
-- oxygen
-
-From those atoms, LiNaK determines the water-region bounds along `z`.
+LiNaK reconstructs the periodic cell and atom coordinates from the cube header.
+O/H topology detection identifies complete H2O molecules. Only their atom
+indices determine the water-region bounds along `z`; ions, adsorbed H/O, and
+incomplete fragments are excluded.
 
 If the water-like atom coordinates are `z_i`, LiNaK defines:
 
@@ -64,7 +76,7 @@ potential cannot be resolved and remains unavailable.
 
 LiNaK takes the water-region interval and shrinks it inward by the configured
 padding. It then removes any `z` slices whose slice bin contains a non-water
-atom, using H/O as the water definition, and averages the `xy`-averaged
+atom outside the detected H2O topology, and averages the `xy`-averaged
 potential within the widest remaining contiguous clean window.
 
 This is intended to avoid using interfacial edge regions directly.
@@ -163,6 +175,15 @@ Potential results are stored as a row-oriented HDF5 table with columns such as:
 
 At the file level, LiNaK also stores format metadata and column metadata so the
 table can be inspected and plotted consistently later.
+
+Current potential tables require analysis schema v2, including the top/bottom
+potential, cSHE, averaging-window, layout, and provenance columns. Unavailable
+values are represented by missing-value entries, not by dropping columns.
+Dedicated plotting and combining validate the schema and aligned column shapes
+before reading numerical payloads. Unsupported or incomplete files receive a
+recomputation message; append planning selects a separate output rather than
+modifying an incompatible existing table. Generic HDF5 inspection remains
+available.
 
 ## Important Assumptions And Limitations
 

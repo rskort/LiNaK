@@ -1,5 +1,26 @@
 # Orientation
 
+## Symmetric Cells
+
+The top outward normal is `+axis` and the bottom outward normal is `-axis`.
+LiNaK flips the bottom polar cosine before pooling while retaining the existing
+in-plane azimuthal convention. Folded density, averages, and heatmaps are equal
+side means; top/bottom arrays and sparse-grid accumulators are stored.
+
+`interface_view=all` overlays the three labeled 1D views. Orientation heatmaps
+select exactly one of `full`, `folded`, `top`, or `bottom`.
+`interface_view=full` uses the raw periodic surface-axis coordinate and one
+laboratory `+axis` polar reference across the complete cell; it does not flip
+the negative-axis half. The analysis stores separate full-cell 1D averages,
+density, heatmaps, counts, uncertainty statistics, and laboratory-frame sparse
+polar accumulators. Older files without these additive datasets remain readable,
+but Full cell is disabled with a recomputation message.
+
+The Studio names the five representations **Full cell (unfolded)**,
+**Positive-axis interface**, **Negative-axis interface**, **Combined interfaces
+(folded mean)**, and **Compare interface curves**. The displayed `+X/+Y/+Z`
+and `−X/−Y/−Z` labels follow the selected surface axis.
+
 `linak compute orientation` computes water-orientation observables as a function
 of distance to a trusted shared surface reference or, when no trusted surface
 reference is available, along a raw Cartesian axis.
@@ -45,12 +66,14 @@ its oxygen.
 Each water molecule is assigned a distance-bin coordinate using its center of
 mass along the selected axis.
 
-If the shared surface estimator returns a complete and sufficiently trustworthy
-frame-wise surface reference, LiNaK uses:
-
-`distance_t = COM_axis,t - s_t`
-
-where `s_t` is the scalar surface reference coordinate for frame `t`.
+For a trustworthy reference, let `q` be the molecule COM coordinate in the
+canonical periodic slab image. The positive-interface distance is
+`d_top = q - q_top`, and the negative-interface distance is
+`d_bottom = q_bottom - q`. Symmetric folding uses `max(d_top, d_bottom)`;
+single-interface layouts use the distance for their selected side. Periodic
+canonicalization keeps solvent in the outward region instead of wrapping a
+water/vacuum boundary into negative distances. Full-cell plots instead use the
+stored raw Cartesian COM coordinate, with its original origin.
 
 If the surface estimate is incomplete or below the trust threshold, orientation
 does not silently use it anyway. Instead, LiNaK bins the raw center-of-mass
@@ -58,8 +81,8 @@ axis coordinate and stores:
 
 `coordinate_mode = "axis"`
 
-Surface estimation shifts only the distance coordinate. It does not redefine the
-sign of the orientation observables.
+Interface-relative polar orientation is expressed in the assigned outward
+frame. Full-cell polar orientation retains the laboratory reference frame.
 
 ## Polar Orientation
 
@@ -83,9 +106,13 @@ Interpretation:
 - `-1`: hydrogens point in the negative reference-axis direction
 - `0`: the water bisector is perpendicular to the reference axis
 
-This sign convention is tied to `reference_axis`. It is not automatically
-re-labeled as "toward" or "away from" the surface, because that would be
-ambiguous for different surface sides and symmetric slabs.
+These are laboratory-frame signs, used by Full cell and raw-axis fallback
+views. With a trusted interface reference, negative-side polar cosines change
+sign before side-resolved/folded accumulation. For the usual choice
+`reference_axis == axis`, positive values then mean hydrogens pointing outward
+from the selected interface. If a different reference axis is selected, do not
+interpret that component as the surface-normal orientation. The in-plane
+azimuthal convention is unchanged.
 
 If either O-H vector is degenerate or if the bisector norm is too small, that
 sample is marked invalid for polar statistics.
@@ -200,6 +227,11 @@ linak plot traj.orientation.h5 --view-type 2d-heatmap \
   --heatmap-value-mode conditional_probability_density
 ```
 
+Python plotting calls use `heatmap_value_mode` with the same four values.
+Removed `heatmap_normalize` and `heatmap_normalization_mode` options are not
+accepted. Saved profiles containing them must be recreated; LiNaK does not
+silently select a replacement scientific normalization.
+
 Values exactly equal to `-1` and `+1` are handled deterministically and are
 assigned to the first and last cosine bins respectively.
 
@@ -240,8 +272,9 @@ surface datasets and metadata described in
 
 - The analysis only applies to water molecules.
 - Water identification depends on the O-H cutoff and topology-validation logic.
-- Polar sign follows the chosen Cartesian `reference_axis`.
-- Surface estimation affects the distance coordinate only.
+- Full-cell polar sign follows the chosen Cartesian `reference_axis`;
+  interface-relative views apply the negative-side outward sign transformation.
+- Trusted surfaces determine both the distance coordinate and interface assignment.
 - Azimuthal orientation depends on the chosen in-plane Cartesian reference axis.
 - Azimuthal sign also depends on the stable `H1`, `H2` ordering inherited from
   the shared water triplet builder.

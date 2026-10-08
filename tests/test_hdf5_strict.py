@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 
 import h5py
@@ -16,7 +18,7 @@ from linak.storage.hdf5_utils import (
 def _write_minimal_density_hdf5(path, *, linak_version=LINAK_VERSION, metadata=None):
     payload = {
         "analysis": "density",
-        "analysis_schema_version": 1,
+        "analysis_schema_version": 2,
         "profile_uid": "density-profile",
         "axis": "z",
         "species": "O",

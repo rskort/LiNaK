@@ -16,6 +16,7 @@ def _size_label(size_bytes: int) -> str:
         if value < 1024.0 or unit == "TB":
             return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
         value /= 1024.0
+    raise AssertionError("Unreachable size unit")
 
 
 def _stat_metadata(path: Path) -> dict[str, Any]:
@@ -36,7 +37,16 @@ def _decode_attr(value: Any) -> Any:
 
 def _strip_known_suffix(name: str) -> str:
     lower = name.lower()
-    for suffix in (".out.hdf5", ".out.h5", ".traj.hdf5", ".traj.h5", ".cube.hdf5", ".cube.h5", ".hdf5", ".h5"):
+    for suffix in (
+        ".out.hdf5",
+        ".out.h5",
+        ".traj.hdf5",
+        ".traj.h5",
+        ".cube.hdf5",
+        ".cube.h5",
+        ".hdf5",
+        ".h5",
+    ):
         if lower.endswith(suffix):
             return name[: -len(suffix)]
     return Path(name).stem or name
@@ -104,9 +114,7 @@ def _hdf5_metadata(path: Path) -> tuple[str, dict[str, Any], ValidationResult] |
                             "cell_matrix_angstrom": [
                                 list(row) for row in summary.cell_matrix_angstrom
                             ],
-                            "pbc": list(summary.pbc)
-                            if summary.pbc is not None
-                            else None,
+                            "pbc": list(summary.pbc) if summary.pbc is not None else None,
                             "timestep_candidates_fs": list(summary.timestep_candidates_fs),
                             "frame_range": list(summary.frame_range)
                             if summary.frame_range is not None
@@ -129,13 +137,19 @@ def _hdf5_metadata(path: Path) -> tuple[str, dict[str, Any], ValidationResult] |
                     metadata["frames_shape"] = tuple(int(v) for v in frames.shape)
                     if len(frames.shape) >= 1:
                         metadata["frame_count"] = int(frames.shape[0])
-                return "trajectory_hdf5", metadata, ValidationResult("valid", "LiNaK trajectory HDF5")
+                return (
+                    "trajectory_hdf5",
+                    metadata,
+                    ValidationResult("valid", "LiNaK trajectory HDF5"),
+                )
 
             if linak_format == "linak-hdf5" and analysis:
                 profile_count = 1
                 profiles = handle.get("profiles")
                 if profiles is not None and hasattr(profiles, "items"):
-                    profile_count = len([node for node in profiles.values() if hasattr(node, "items")])
+                    profile_count = len(
+                        [node for node in profiles.values() if hasattr(node, "items")]
+                    )
                 metadata["analysis"] = analysis
                 metadata["profile_count"] = int(profile_count)
                 item_type = "cube_hdf5" if analysis == "cube" else "analysis_hdf5"
@@ -143,14 +157,22 @@ def _hdf5_metadata(path: Path) -> tuple[str, dict[str, Any], ValidationResult] |
 
             if analysis:
                 metadata["analysis"] = analysis
-                return "analysis_hdf5", metadata, ValidationResult(
-                    "warning",
-                    "HDF5 declares an analysis but lacks the current LiNaK format marker",
+                return (
+                    "analysis_hdf5",
+                    metadata,
+                    ValidationResult(
+                        "warning",
+                        "HDF5 declares an analysis but lacks the current LiNaK format marker",
+                    ),
                 )
 
-            return "table_hdf5", metadata, ValidationResult(
-                "warning",
-                "HDF5 file is readable but is not a recognized LiNaK analysis output",
+            return (
+                "table_hdf5",
+                metadata,
+                ValidationResult(
+                    "warning",
+                    "HDF5 file is readable but is not a recognized LiNaK analysis output",
+                ),
             )
     except OSError as exc:
         return "unsupported", {}, ValidationResult("invalid", f"Unreadable HDF5 file: {exc}")
@@ -221,7 +243,9 @@ def detect_project_item(path: str | Path, *, origin: ProjectItemOrigin) -> Proje
 
     if lower_name.endswith((".temp", ".tregion")):
         metadata["stem"] = _strip_known_suffix(resolved.name)
-        metadata["temperature_source_type"] = "tregion" if lower_name.endswith(".tregion") else "temp"
+        metadata["temperature_source_type"] = (
+            "tregion" if lower_name.endswith(".tregion") else "temp"
+        )
         return ProjectItem(
             path=resolved,
             item_type="temperature_file",
@@ -262,13 +286,28 @@ def discover_generated_items(project_dir: str | Path) -> list[ProjectItem]:
         if path.name == ".linak_project.json" or not path.is_file():
             continue
         lower_name = path.name.lower()
-        if not lower_name.endswith((".h5", ".hdf5", ".out.h5", ".out.hdf5", ".traj.h5", ".traj.hdf5", ".cube.h5", ".cube.hdf5", ".xyz", ".cube", ".temp", ".tregion")):
+        if not lower_name.endswith(
+            (
+                ".h5",
+                ".hdf5",
+                ".out.h5",
+                ".out.hdf5",
+                ".traj.h5",
+                ".traj.hdf5",
+                ".cube.h5",
+                ".cube.hdf5",
+                ".xyz",
+                ".cube",
+                ".temp",
+                ".tregion",
+            )
+        ):
             continue
         item = detect_project_item(path, origin="generated")
-        if (
-            item.validation.state != "invalid"
-            and item.item_type not in {"unsupported", "table_hdf5"}
-        ):
+        if item.validation.state != "invalid" and item.item_type not in {
+            "unsupported",
+            "table_hdf5",
+        }:
             candidates.append(item)
     return candidates
 
@@ -288,23 +327,25 @@ def discover_generated_items_cached(
         if path.name == ".linak_project.json" or not path.is_file():
             continue
         lower_name = path.name.lower()
-        if not lower_name.endswith((
-            ".h5",
-            ".hdf5",
-            ".out.h5",
-            ".out.hdf5",
-            ".traj.h5",
-            ".traj.hdf5",
-            ".cube.h5",
-            ".cube.hdf5",
-            ".xyz",
-            ".cube",
-        )):
+        if not lower_name.endswith(
+            (
+                ".h5",
+                ".hdf5",
+                ".out.h5",
+                ".out.hdf5",
+                ".traj.h5",
+                ".traj.hdf5",
+                ".cube.h5",
+                ".cube.hdf5",
+                ".xyz",
+                ".cube",
+            )
+        ):
             continue
         item = index.detect_or_reuse(path, origin="generated", detector=detect_project_item)
-        if (
-            item.validation.state != "invalid"
-            and item.item_type not in {"unsupported", "table_hdf5"}
-        ):
+        if item.validation.state != "invalid" and item.item_type not in {
+            "unsupported",
+            "table_hdf5",
+        }:
             candidates.append(item)
     return candidates

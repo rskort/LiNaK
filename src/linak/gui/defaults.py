@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from ..cell_geometry import cell_angles
+
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -61,16 +63,19 @@ class OutH5GuiSummary:
             lines.append(f"Atoms: {self.atom_count}")
         if self.species:
             lines.append("Species: " + ", ".join(self.species))
+        if self.cell_matrix_angstrom:
+            lines.append(
+                "Cell angles: "
+                + " ".join(f"{v:.6g}" for v in cell_angles(self.cell_matrix_angstrom))
+                + " deg"
+            )
         if self.cell_angstrom is not None:
             lines.append(
-                "Cell A B C: "
-                + " ".join(f"{value:.6g}" for value in self.cell_angstrom)
-                + " A"
+                "Cell A B C: " + " ".join(f"{value:.6g}" for value in self.cell_angstrom) + " A"
             )
         if self.cell_matrix_angstrom:
             matrix = "; ".join(
-                " ".join(f"{value:.6g}" for value in row)
-                for row in self.cell_matrix_angstrom
+                " ".join(f"{value:.6g}" for value in row) for row in self.cell_matrix_angstrom
             )
             lines.append(f"Cell matrix: {matrix} A")
         if self.pbc is not None:
@@ -93,7 +98,9 @@ class OutH5GuiSummary:
         if self.cp2k_table_counts:
             lines.append(
                 "CP2K rows: "
-                + ", ".join(f"{key}={value}" for key, value in sorted(self.cp2k_table_counts.items())[:4])
+                + ", ".join(
+                    f"{key}={value}" for key, value in sorted(self.cp2k_table_counts.items())[:4]
+                )
             )
         if self.warnings:
             lines.append(f"Warnings: {len(self.warnings)}")
@@ -192,7 +199,9 @@ def default_settings_for_action(
 
     settings = {field.key: field.default for field in action.settings_schema(item)}
     summary = out_h5_gui_summary_for_item(item)
-    species = tuple(summary.species if summary is not None else item.metadata.get("species", ()) or ())
+    species = tuple(
+        summary.species if summary is not None else item.metadata.get("species", ()) or ()
+    )
     if item.item_type == "simulation_directory" and action.action_id == "pack_out_h5":
         settings["output_name"] = _unique_name(Path(project_dir) / f"{item.path.name}.out.h5").name
     if species:
@@ -205,8 +214,6 @@ def default_settings_for_action(
         if "surface_elements" in settings and not settings.get("surface_elements"):
             settings["surface_elements"] = " ".join(species)
     if summary is not None:
-        if summary.cell_angstrom is not None and "cell" in settings:
-            settings["cell"] = " ".join(f"{value:.8g}" for value in summary.cell_angstrom)
         timestep = summary.timestep_fs
         if timestep is None and summary.timestep_candidates_fs:
             timestep = summary.timestep_candidates_fs[0]
@@ -226,7 +233,6 @@ def readiness_for_action(action: Action, item: ProjectItem) -> ActionReadiness:
     if item.item_type == "out_hdf5" and summary is not None:
         trajectory_actions = {
             "density",
-            "msd",
             "temperature",
             "rdf",
             "position",
@@ -241,13 +247,17 @@ def readiness_for_action(action: Action, item: ProjectItem) -> ActionReadiness:
             return ActionReadiness(False, "Missing cube data in .out.h5")
     if action.action_id == "temperature" and item.item_type == "raw_trajectory":
         if item.metadata.get("trajectory_role") != "velocity":
-            return ActionReadiness(False, "Temperature requires a .temp, .tregion, or *-vel-*.xyz source")
+            return ActionReadiness(
+                False, "Temperature requires a .temp, .tregion, or *-vel-*.xyz source"
+            )
     return ActionReadiness(True)
 
 
 def defaults_validate(action: Action, item: ProjectItem, project_dir: str | Path) -> bool:
     try:
-        validate_action_settings(action, item, default_settings_for_action(action, item, project_dir))
+        validate_action_settings(
+            action, item, default_settings_for_action(action, item, project_dir)
+        )
     except Exception:
         return False
     return True
@@ -280,7 +290,7 @@ def _coerce_cell(value: Any) -> tuple[float, float, float] | None:
         return None
     if len(values) != 3:
         return None
-    return values  # type: ignore[return-value]
+    return values
 
 
 def _coerce_cell_matrix(value: Any) -> tuple[tuple[float, float, float], ...]:
@@ -291,7 +301,7 @@ def _coerce_cell_matrix(value: Any) -> tuple[tuple[float, float, float], ...]:
         for row in value:
             converted = tuple(float(item) for item in row)
             if len(converted) == 3:
-                rows.append(converted)  # type: ignore[arg-type]
+                rows.append(converted)
     except (TypeError, ValueError):
         return ()
     return tuple(rows)
@@ -316,25 +326,10 @@ def _coerce_pbc(value: Any) -> tuple[bool, bool, bool] | None:
         return None
     if len(converted) != 3:
         return None
-    return converted  # type: ignore[return-value]
+    return converted
 
 
 def _unique_name(path: Path) -> Path:
-    if not path.exists():
-        return path
-    lower = path.name.lower()
-    for suffix in (".out.hdf5", ".out.h5", ".traj.hdf5", ".traj.h5", ".cube.hdf5", ".cube.h5"):
-        if lower.endswith(suffix):
-            base = path.name[: -len(suffix)]
-            counter = 1
-            while True:
-                candidate = path.with_name(f"{base}_{counter}{path.name[-len(suffix):]}")
-                if not candidate.exists():
-                    return candidate
-                counter += 1
-    counter = 1
-    while True:
-        candidate = path.with_name(f"{path.stem}_{counter}{path.suffix}")
-        if not candidate.exists():
-            return candidate
-        counter += 1
+    from ..analysis.output_naming import unique_output_path
+
+    return unique_output_path(path)

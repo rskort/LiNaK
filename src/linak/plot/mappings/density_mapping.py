@@ -118,9 +118,7 @@ def density_view_mapping_to_plot_options(mapping: PlotViewMapping) -> dict[str, 
             )
         return {"view_type": "heatmap_2d", "quantity": quantity}
     if view_type_id != "line_1d":
-        raise ValueError(
-            "Current density plotting only supports 1D Line and 2D Heatmap mappings."
-        )
+        raise ValueError("Current density plotting only supports 1D Line and 2D Heatmap mappings.")
     x_quantity = str(mapping.x or "").strip()
     y_quantity = str(mapping.y or "").strip()
     if x_quantity == "distance_to_surface":

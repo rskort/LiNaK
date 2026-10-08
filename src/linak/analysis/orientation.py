@@ -18,8 +18,18 @@ system itself defines a preferred in-plane direction.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
+from ..cell_geometry import (
+    bin_volumes,
+    frame_origin,
+    cartesian_bounds,
+    needs_general_geometry,
+    wrapped_frame_positions,
+)
+
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import logging
 import os
 from pathlib import Path
@@ -32,6 +42,7 @@ from ase import Atoms
 from ..plot.data_contract import PlotDataContract, PlotViewMapping
 from ..plot.mappings.orientation_mapping import resolve_orientation_plot_mapping
 from ..storage.hdf5_utils import write_linak_hdf5
+from ..runtime_resources import resolve_resource_policy
 from .common import (
     frame_has_usable_cell as _frame_has_usable_cell,
     read_profile_payloads,
@@ -54,8 +65,14 @@ from .surface import (
     _surface_estimate_supports_distance_mode,
     _surface_metadata_payload,
     _surface_metadata_view,
+    _surface_reference_datasets,
+    _surface_reference_from_payload,
+    _surface_reference_metadata,
+    estimate_surface_layout_reference,
+    surface_distance_components,
     SurfaceEstimate,
     SurfaceEstimatorOptions,
+    SurfaceReference,
 )
 from .water import (
     H2O_OH_CUTOFF_A,
@@ -121,6 +138,18 @@ class OrientationSparseGrid:
     count_polar_valid: np.ndarray
     cos_azimuthal_sum: np.ndarray
     count_azimuthal_valid: np.ndarray
+    lab_cos_polar_sum: np.ndarray | None = None
+    lab_count_polar_valid: np.ndarray | None = None
+    top_entity_sum: np.ndarray | None = None
+    bottom_entity_sum: np.ndarray | None = None
+    top_cos_polar_sum: np.ndarray | None = None
+    bottom_cos_polar_sum: np.ndarray | None = None
+    top_count_polar_valid: np.ndarray | None = None
+    bottom_count_polar_valid: np.ndarray | None = None
+    top_cos_azimuthal_sum: np.ndarray | None = None
+    bottom_cos_azimuthal_sum: np.ndarray | None = None
+    top_count_azimuthal_valid: np.ndarray | None = None
+    bottom_count_azimuthal_valid: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -165,6 +194,28 @@ class OrientationProfile:
     surface_position: float | None = None
     surface_position_std: float | None = None
     surface_estimate: SurfaceEstimate | None = None
+    surface_reference: SurfaceReference | None = None
+    top_cos_polar_mean: np.ndarray | None = None
+    bottom_cos_polar_mean: np.ndarray | None = None
+    top_cos_azimuthal_mean: np.ndarray | None = None
+    bottom_cos_azimuthal_mean: np.ndarray | None = None
+    top_density: np.ndarray | None = None
+    bottom_density: np.ndarray | None = None
+    top_heatmap_polar: np.ndarray | None = None
+    bottom_heatmap_polar: np.ndarray | None = None
+    top_heatmap_azimuthal: np.ndarray | None = None
+    bottom_heatmap_azimuthal: np.ndarray | None = None
+    full_bin_edges: np.ndarray | None = None
+    full_bin_centers: np.ndarray | None = None
+    full_cos_polar_mean: np.ndarray | None = None
+    full_cos_azimuthal_mean: np.ndarray | None = None
+    full_density: np.ndarray | None = None
+    full_heatmap_polar: np.ndarray | None = None
+    full_heatmap_azimuthal: np.ndarray | None = None
+    full_count_total: np.ndarray | None = None
+    full_count_polar_valid: np.ndarray | None = None
+    full_count_azimuthal_valid: np.ndarray | None = None
+    full_series_statistics: dict[str, SeriesStatistics] | None = None
     cell_lengths_angstrom: tuple[float, float, float] | None = None
     series_statistics: dict[str, SeriesStatistics] | None = None
     sparse_grid: OrientationSparseGrid | None = None
@@ -175,9 +226,11 @@ class _OrientationFrameData:
     positions: np.ndarray
     distances: np.ndarray
     cos_polar: np.ndarray
+    cos_polar_lab: np.ndarray
     polar_valid: np.ndarray
     cos_azimuthal: np.ndarray
     azimuthal_valid: np.ndarray
+    interface_side: np.ndarray
 
 
 # HDF5 save/load
@@ -198,12 +251,22 @@ def _build_orientation_frame_data(
     *,
     axis_index: int,
     surface_position: float | None,
+    surface_reference: SurfaceReference | None = None,
+    frame_index: int = 0,
     ref_vec: np.ndarray,
     in_plane_ref_vec: np.ndarray,
     oh_cutoff: float,
 ) -> _OrientationFrameData:
-    distances = np.asarray(geom.com_positions[:, axis_index], dtype=float)
-    if surface_position is not None and np.isfinite(surface_position):
+    raw_axis_values = np.asarray(geom.com_positions[:, axis_index], dtype=float)
+    distances = np.array(raw_axis_values, copy=True)
+    interface_side = np.zeros(distances.shape, dtype=np.int8)
+    if surface_reference is not None:
+        distances, _top_distance, _bottom_distance, interface_side = surface_distance_components(
+            surface_reference,
+            raw_axis_values,
+            frame_index=frame_index,
+        )
+    elif surface_position is not None and np.isfinite(surface_position):
         distances = distances - float(surface_position)
 
     count = geom.com_positions.shape[0]
@@ -214,9 +277,11 @@ def _build_orientation_frame_data(
             positions=np.empty((0, 3), dtype=float),
             distances=empty_float,
             cos_polar=empty_float,
+            cos_polar_lab=empty_float,
             polar_valid=empty_bool,
             cos_azimuthal=empty_float,
             azimuthal_valid=empty_bool,
+            interface_side=np.array([], dtype=np.int8),
         )
 
     oh1 = np.asarray(geom.hydrogen1_positions - geom.oxygen_positions, dtype=float)
@@ -248,6 +313,12 @@ def _build_orientation_frame_data(
             bisector_raw[polar_valid] / bisector_norm[polar_valid, np.newaxis]
         )
         cos_polar[polar_valid] = bisector_unit[polar_valid] @ ref_vec
+        cos_polar_lab = np.array(cos_polar, copy=True)
+        if surface_reference is not None:
+            normal_sign = np.asarray(interface_side, dtype=float)
+            cos_polar[polar_valid] *= normal_sign[polar_valid]
+    else:
+        cos_polar_lab = np.array(cos_polar, copy=True)
 
     plane_normal = np.cross(oh1, oh2)
     plane_normal_norm = np.linalg.norm(plane_normal, axis=1)
@@ -284,9 +355,11 @@ def _build_orientation_frame_data(
         positions=np.asarray(geom.com_positions, dtype=float),
         distances=distances,
         cos_polar=cos_polar,
+        cos_polar_lab=cos_polar_lab,
         polar_valid=np.asarray(polar_valid, dtype=bool),
         cos_azimuthal=cos_azimuthal,
         azimuthal_valid=np.asarray(azimuthal_valid, dtype=bool),
+        interface_side=np.asarray(interface_side, dtype=np.int8),
     )
 
 
@@ -302,7 +375,7 @@ def _build_uniform_bin_edges(lower: float, upper: float, *, bin_width: float) ->
     return edges
 
 
-def _representative_cell_lengths(frames: list[Atoms]) -> tuple[float, float, float] | None:
+def _representative_cell_lengths(frames: Sequence[Atoms]) -> tuple[float, float, float] | None:
     if not frames:
         return None
     lengths: list[tuple[float, float, float]] = []
@@ -328,7 +401,7 @@ def _representative_cell_lengths(frames: list[Atoms]) -> tuple[float, float, flo
 
 
 def _per_frame_slab_volumes(
-    frames: list[Atoms],
+    frames: Sequence[Atoms],
     *,
     axis_index: int,
     bin_width: float,
@@ -372,9 +445,268 @@ def _mean_with_nan(sum_values: np.ndarray, count_values: np.ndarray) -> np.ndarr
     return mean
 
 
+def _equal_nan_mean(first: np.ndarray, second: np.ndarray) -> np.ndarray:
+    """Average two interface observables without favoring the populated side."""
+    values = np.stack(
+        [np.asarray(first, dtype=float), np.asarray(second, dtype=float)],
+        axis=0,
+    )
+    valid = np.isfinite(values)
+    count = np.sum(valid, axis=0)
+    total = np.nansum(values, axis=0)
+    return np.divide(
+        total,
+        count,
+        out=np.full(total.shape, np.nan, dtype=float),
+        where=count > 0,
+    )
+
+
+def _aggregate_orientation_side(
+    frame_data: list[_OrientationFrameData],
+    *,
+    side: int,
+    distance_edges: np.ndarray,
+    angle_edges: np.ndarray,
+    bin_width: float,
+    slab_volume_per_frame: np.ndarray | None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Aggregate one outward-facing interface on the shared folded grid."""
+    n_bins = int(distance_edges.size - 1)
+    n_angle_bins = int(angle_edges.size - 1)
+    polar_sum = np.zeros(n_bins, dtype=float)
+    polar_count = np.zeros(n_bins, dtype=float)
+    azimuthal_sum = np.zeros(n_bins, dtype=float)
+    azimuthal_count = np.zeros(n_bins, dtype=float)
+    polar_heatmap = np.zeros((n_bins, n_angle_bins), dtype=float)
+    azimuthal_heatmap = np.zeros((n_bins, n_angle_bins), dtype=float)
+    density_sum = np.zeros(n_bins, dtype=float)
+
+    for frame_index, data in enumerate(frame_data):
+        side_values = np.asarray(data.interface_side, dtype=np.int8)
+        weights = np.where(side_values == side, 1.0, np.where(side_values == 0, 0.5, 0.0))
+        membership = _distance_bin_membership_mask(data.distances, distance_edges)
+        selected = membership & (weights > 0.0)
+        frame_total = np.zeros(n_bins, dtype=float)
+        if np.any(selected):
+            bins = _distance_bin_indices(data.distances[selected], distance_edges)
+            frame_total = np.bincount(
+                bins,
+                weights=weights[selected],
+                minlength=n_bins,
+            )
+        if slab_volume_per_frame is None:
+            density_sum += frame_total / float(bin_width)
+        else:
+            volume = float(slab_volume_per_frame[frame_index])
+            if np.isfinite(volume) and volume > 0.0:
+                density_sum += frame_total / volume
+
+        polar_mask = selected & np.asarray(data.polar_valid, dtype=bool)
+        if np.any(polar_mask):
+            bins = _distance_bin_indices(data.distances[polar_mask], distance_edges)
+            values = np.asarray(data.cos_polar[polar_mask], dtype=float)
+            selected_weights = weights[polar_mask]
+            polar_count += np.bincount(bins, weights=selected_weights, minlength=n_bins)
+            polar_sum += np.bincount(
+                bins,
+                weights=selected_weights * values,
+                minlength=n_bins,
+            )
+            angle_bins = _angle_bin_indices(values, angle_edges)
+            np.add.at(polar_heatmap, (bins, angle_bins), selected_weights)
+
+        azimuthal_mask = selected & np.asarray(data.azimuthal_valid, dtype=bool)
+        if np.any(azimuthal_mask):
+            bins = _distance_bin_indices(data.distances[azimuthal_mask], distance_edges)
+            values = np.asarray(data.cos_azimuthal[azimuthal_mask], dtype=float)
+            selected_weights = weights[azimuthal_mask]
+            azimuthal_count += np.bincount(
+                bins,
+                weights=selected_weights,
+                minlength=n_bins,
+            )
+            azimuthal_sum += np.bincount(
+                bins,
+                weights=selected_weights * values,
+                minlength=n_bins,
+            )
+            angle_bins = _angle_bin_indices(values, angle_edges)
+            np.add.at(azimuthal_heatmap, (bins, angle_bins), selected_weights)
+
+    n_frames = max(1, len(frame_data))
+    return (
+        _mean_with_nan(polar_sum, polar_count),
+        _mean_with_nan(azimuthal_sum, azimuthal_count),
+        density_sum / float(n_frames),
+        polar_heatmap,
+        azimuthal_heatmap,
+    )
+
+
+def _aggregate_orientation_full_axis(
+    frames: Sequence[Atoms],
+    frame_data: list[_OrientationFrameData],
+    *,
+    axis_index: int,
+    axis_edges: np.ndarray,
+    angle_edges: np.ndarray,
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    dict[str, SeriesStatistics],
+]:
+    """Aggregate the unfolded cell in the laboratory ``+axis`` frame."""
+    n_bins = int(axis_edges.size - 1)
+    n_angle_bins = int(angle_edges.size - 1)
+    polar_sum = np.zeros(n_bins, dtype=float)
+    polar_count = np.zeros(n_bins, dtype=float)
+    azimuthal_sum = np.zeros(n_bins, dtype=float)
+    azimuthal_count = np.zeros(n_bins, dtype=float)
+    polar_heatmap = np.zeros((n_bins, n_angle_bins), dtype=float)
+    azimuthal_heatmap = np.zeros((n_bins, n_angle_bins), dtype=float)
+    density_sum = np.zeros(n_bins, dtype=float)
+    density_coverage = np.zeros(n_bins, dtype=float)
+    count_total = np.zeros(n_bins, dtype=int)
+    sample_cos_polar_mean = np.full((len(frames), n_bins), np.nan, dtype=float)
+    sample_cos_azimuthal_mean = np.full((len(frames), n_bins), np.nan, dtype=float)
+    sample_density = np.full((len(frames), n_bins), np.nan, dtype=float)
+    sample_cos_polar_density = np.full((len(frames), n_bins), np.nan, dtype=float)
+    sample_cos_azimuthal_density = np.full((len(frames), n_bins), np.nan, dtype=float)
+
+    for frame_index, data in enumerate(frame_data):
+        coordinates = np.asarray(data.positions[:, axis_index], dtype=float)
+        membership = _distance_bin_membership_mask(coordinates, axis_edges)
+        if np.any(membership):
+            bins = _distance_bin_indices(coordinates[membership], axis_edges)
+            frame_total = np.bincount(bins, minlength=n_bins).astype(float)
+        else:
+            frame_total = np.zeros(n_bins, dtype=float)
+        count_total += frame_total.astype(int)
+        volumes = np.asarray(
+            bin_volumes(
+                frames[frame_index].cell,
+                axis_edges,
+                axis_index,
+                origin=frame_origin(frames[frame_index]),
+                shift=0.0,
+            ),
+            dtype=float,
+        )
+        valid_volume = np.isfinite(volumes) & (volumes > 0.0)
+        frame_density = np.full(n_bins, np.nan, dtype=float)
+        frame_density[valid_volume] = frame_total[valid_volume] / volumes[valid_volume]
+        density_sum[valid_volume] += frame_density[valid_volume]
+        density_coverage[valid_volume] += 1.0
+
+        frame_polar_count = np.zeros(n_bins, dtype=int)
+        frame_polar_sum = np.zeros(n_bins, dtype=float)
+        polar_mask = membership & np.asarray(data.polar_valid, dtype=bool)
+        if np.any(polar_mask):
+            bins = _distance_bin_indices(coordinates[polar_mask], axis_edges)
+            values = np.asarray(data.cos_polar_lab[polar_mask], dtype=float)
+            frame_polar_count = np.bincount(bins, minlength=n_bins).astype(int)
+            frame_polar_sum = np.bincount(bins, weights=values, minlength=n_bins)
+            polar_count += frame_polar_count
+            polar_sum += frame_polar_sum
+            np.add.at(polar_heatmap, (bins, _angle_bin_indices(values, angle_edges)), 1.0)
+
+        frame_azimuthal_count = np.zeros(n_bins, dtype=int)
+        frame_azimuthal_sum = np.zeros(n_bins, dtype=float)
+        azimuthal_mask = membership & np.asarray(data.azimuthal_valid, dtype=bool)
+        if np.any(azimuthal_mask):
+            bins = _distance_bin_indices(coordinates[azimuthal_mask], axis_edges)
+            values = np.asarray(data.cos_azimuthal[azimuthal_mask], dtype=float)
+            frame_azimuthal_count = np.bincount(bins, minlength=n_bins).astype(int)
+            frame_azimuthal_sum = np.bincount(bins, weights=values, minlength=n_bins)
+            azimuthal_count += frame_azimuthal_count
+            azimuthal_sum += frame_azimuthal_sum
+            np.add.at(
+                azimuthal_heatmap,
+                (bins, _angle_bin_indices(values, angle_edges)),
+                1.0,
+            )
+
+        frame_polar_mean = _mean_with_nan(frame_polar_sum, frame_polar_count)
+        frame_azimuthal_mean = _mean_with_nan(
+            frame_azimuthal_sum,
+            frame_azimuthal_count,
+        )
+        sample_cos_polar_mean[frame_index] = frame_polar_mean
+        sample_cos_azimuthal_mean[frame_index] = frame_azimuthal_mean
+        sample_density[frame_index] = frame_density
+        sample_cos_polar_density[frame_index] = frame_polar_mean * frame_density
+        sample_cos_azimuthal_density[frame_index] = frame_azimuthal_mean * frame_density
+
+    density = np.divide(
+        density_sum,
+        density_coverage,
+        out=np.full(n_bins, np.nan, dtype=float),
+        where=density_coverage > 0.0,
+    )
+    block_resolution = resolve_block_slices(len(frames))
+    block_slices = None if block_resolution is None else block_resolution[0]
+    statistics = {
+        "cos_polar_mean": build_series_statistics(
+            point_count=polar_count,
+            sample_values=sample_cos_polar_mean,
+            block_values=block_mean_matrix(
+                sample_cos_polar_mean,
+                block_slices=block_slices,
+            ),
+        ),
+        "cos_azimuthal_mean": build_series_statistics(
+            point_count=azimuthal_count,
+            sample_values=sample_cos_azimuthal_mean,
+            block_values=block_mean_matrix(
+                sample_cos_azimuthal_mean,
+                block_slices=block_slices,
+            ),
+        ),
+        "density": build_series_statistics(
+            point_count=count_total,
+            sample_values=sample_density,
+            block_values=block_mean_matrix(sample_density, block_slices=block_slices),
+        ),
+        "cos_polar_density": build_series_statistics(
+            point_count=polar_count,
+            sample_values=sample_cos_polar_density,
+            block_values=block_mean_matrix(
+                sample_cos_polar_density,
+                block_slices=block_slices,
+            ),
+        ),
+        "cos_azimuthal_density": build_series_statistics(
+            point_count=azimuthal_count,
+            sample_values=sample_cos_azimuthal_density,
+            block_values=block_mean_matrix(
+                sample_cos_azimuthal_density,
+                block_slices=block_slices,
+            ),
+        ),
+    }
+    return (
+        _mean_with_nan(polar_sum, polar_count),
+        _mean_with_nan(azimuthal_sum, azimuthal_count),
+        density,
+        polar_heatmap,
+        azimuthal_heatmap,
+        count_total,
+        polar_count.astype(int),
+        azimuthal_count.astype(int),
+        statistics,
+    )
+
+
 def _determine_distance_bounds(
     *,
-    frames: list[Atoms],
+    frames: Sequence[Atoms],
     axis_index: int,
     frame_data: list[_OrientationFrameData],
     binning: str,
@@ -425,23 +757,34 @@ def _compute_number_density(
     """Convert raw water counts into volumetric or linear molecular density."""
     if slab_volumes is not None:
         if framewise_density_sum is not None:
-            return framewise_density_sum / float(n_frames)
+            coverage = np.sum(slab_volumes > 0, axis=0) if slab_volumes.ndim == 2 else n_frames
+            return framewise_density_sum / np.where(np.asarray(coverage) > 0, coverage, np.nan)
         return np.asarray(count_total, dtype=float) / (float(n_frames) * float(slab_volumes[0]))
     return np.asarray(count_total, dtype=float) / (float(n_frames) * float(bin_width))
 
 
 def _cartesian_grid_edges_for_orientation(
     *,
-    frames: list[Atoms],
+    frames: Sequence[Atoms],
     frame_data: list[_OrientationFrameData],
     bin_width: float,
     cell_lengths: tuple[float, float, float] | None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if cell_lengths is not None and needs_general_geometry(frames):
+        bounds = np.asarray([cartesian_bounds(frame.cell, frame_origin(frame)) for frame in frames])
+        return tuple(
+            _build_uniform_bin_edges(
+                float(bounds[:, axis, 0].min()),
+                float(bounds[:, axis, 1].max()),
+                bin_width=bin_width,
+            )
+            for axis in range(3)
+        )
     if cell_lengths is not None:
         return tuple(
             _build_uniform_bin_edges(0.0, float(length), bin_width=bin_width)
             for length in cell_lengths
-        )  # type: ignore[return-value]
+        )
 
     positions = [
         np.asarray(data.positions, dtype=float)
@@ -514,13 +857,63 @@ def _align_sparse_values(
     return out
 
 
+class _AdaptiveSparseReducer:
+    """Exact float64 sparse reducer with a bounded input buffer."""
+
+    def __init__(self, *, buffer_limit_bytes: int) -> None:
+        self.buffer_limit_bytes = max(1024, int(buffer_limit_bytes))
+        self.index_blocks: list[np.ndarray] = []
+        self.weight_blocks: list[np.ndarray] = []
+        self.buffered_bytes = 0
+        self.indices = np.array([], dtype=np.int64)
+        self.values = np.array([], dtype=np.float64)
+
+    def add(self, indices: np.ndarray, weights: np.ndarray | None = None) -> None:
+        index_values = np.asarray(indices, dtype=np.int64)
+        if index_values.size == 0:
+            return
+        weight_values = (
+            np.ones(index_values.shape, dtype=np.float64)
+            if weights is None
+            else np.asarray(weights, dtype=np.float64)
+        )
+        self.index_blocks.append(index_values)
+        self.weight_blocks.append(weight_values)
+        self.buffered_bytes += int(index_values.nbytes + weight_values.nbytes)
+        if self.buffered_bytes >= self.buffer_limit_bytes:
+            self.flush()
+
+    def flush(self) -> None:
+        if not self.index_blocks:
+            return
+        new_indices, new_values = _sparse_sum_by_flat_index(
+            np.concatenate(self.index_blocks),
+            weights=np.concatenate(self.weight_blocks),
+        )
+        if self.indices.size:
+            new_indices, new_values = _sparse_sum_by_flat_index(
+                np.concatenate((self.indices, new_indices)),
+                weights=np.concatenate((self.values, new_values)),
+            )
+        self.indices = new_indices
+        self.values = np.asarray(new_values, dtype=np.float64)
+        self.index_blocks.clear()
+        self.weight_blocks.clear()
+        self.buffered_bytes = 0
+
+    def finish(self) -> tuple[np.ndarray, np.ndarray]:
+        self.flush()
+        return self.indices, self.values
+
+
 def _build_orientation_sparse_grid(
     *,
-    frames: list[Atoms],
+    frames: Sequence[Atoms],
     frame_data: list[_OrientationFrameData],
     distance_edges: np.ndarray,
     bin_width: float,
     cell_lengths: tuple[float, float, float] | None,
+    buffer_limit_bytes: int = 128 * 1024 * 1024,
 ) -> OrientationSparseGrid:
     x_edges, y_edges, z_edges = _cartesian_grid_edges_for_orientation(
         frames=frames,
@@ -535,11 +928,28 @@ def _build_orientation_sparse_grid(
         max(0, z_edges.size - 1),
         max(0, d_edges.size - 1),
     )
-    entity_blocks: list[np.ndarray] = []
-    polar_blocks: list[np.ndarray] = []
-    polar_value_blocks: list[np.ndarray] = []
-    azimuthal_blocks: list[np.ndarray] = []
-    azimuthal_value_blocks: list[np.ndarray] = []
+    reducer_names = (
+        "entity",
+        "polar",
+        "lab_polar",
+        "polar_count",
+        "azimuthal",
+        "azimuthal_count",
+        "top_entity",
+        "top_polar",
+        "top_polar_count",
+        "top_azimuthal",
+        "top_azimuthal_count",
+        "bottom_entity",
+        "bottom_polar",
+        "bottom_polar_count",
+        "bottom_azimuthal",
+        "bottom_azimuthal_count",
+    )
+    per_reducer_limit = max(1024, int(buffer_limit_bytes) // len(reducer_names))
+    reducers = {
+        name: _AdaptiveSparseReducer(buffer_limit_bytes=per_reducer_limit) for name in reducer_names
+    }
 
     nx, ny, nz, nd = shape
     if min(shape) <= 0:
@@ -572,7 +982,17 @@ def _build_orientation_sparse_grid(
             np.int64,
             copy=False,
         )
-        entity_blocks.append(flat)
+        reducers["entity"].add(flat)
+        selected_sides = np.asarray(data.interface_side, dtype=np.int8)[mask]
+        for side_name, side_value in (("top", 1), ("bottom", -1)):
+            weights = np.where(
+                selected_sides == side_value,
+                1.0,
+                np.where(selected_sides == 0, 0.5, 0.0),
+            )
+            use = weights > 0.0
+            if np.any(use):
+                reducers[f"{side_name}_entity"].add(flat[use], weights[use])
 
         polar_mask = mask & np.asarray(data.polar_valid, dtype=bool)
         if np.any(polar_mask):
@@ -580,8 +1000,25 @@ def _build_orientation_sparse_grid(
                 ((ix[polar_mask] * ny + iy[polar_mask]) * nz + iz[polar_mask]) * nd
                 + idist[polar_mask]
             ).astype(np.int64, copy=False)
-            polar_blocks.append(polar_flat)
-            polar_value_blocks.append(np.asarray(data.cos_polar[polar_mask], dtype=float))
+            polar_values_frame = np.asarray(data.cos_polar[polar_mask], dtype=float)
+            reducers["polar"].add(polar_flat, polar_values_frame)
+            reducers["lab_polar"].add(
+                polar_flat, np.asarray(data.cos_polar_lab[polar_mask], dtype=float)
+            )
+            reducers["polar_count"].add(polar_flat)
+            polar_sides = np.asarray(data.interface_side, dtype=np.int8)[polar_mask]
+            for side_name, side_value in (("top", 1), ("bottom", -1)):
+                weights = np.where(
+                    polar_sides == side_value,
+                    1.0,
+                    np.where(polar_sides == 0, 0.5, 0.0),
+                )
+                use = weights > 0.0
+                if np.any(use):
+                    reducers[f"{side_name}_polar"].add(
+                        polar_flat[use], weights[use] * polar_values_frame[use]
+                    )
+                    reducers[f"{side_name}_polar_count"].add(polar_flat[use], weights[use])
 
         azimuthal_mask = mask & np.asarray(data.azimuthal_valid, dtype=bool)
         if np.any(azimuthal_mask):
@@ -589,35 +1026,46 @@ def _build_orientation_sparse_grid(
                 ((ix[azimuthal_mask] * ny + iy[azimuthal_mask]) * nz + iz[azimuthal_mask]) * nd
                 + idist[azimuthal_mask]
             ).astype(np.int64, copy=False)
-            azimuthal_blocks.append(azimuthal_flat)
-            azimuthal_value_blocks.append(np.asarray(data.cos_azimuthal[azimuthal_mask], dtype=float))
+            azimuthal_values_frame = np.asarray(data.cos_azimuthal[azimuthal_mask], dtype=float)
+            reducers["azimuthal"].add(azimuthal_flat, azimuthal_values_frame)
+            reducers["azimuthal_count"].add(azimuthal_flat)
+            azimuthal_sides = np.asarray(data.interface_side, dtype=np.int8)[azimuthal_mask]
+            for side_name, side_value in (("top", 1), ("bottom", -1)):
+                weights = np.where(
+                    azimuthal_sides == side_value,
+                    1.0,
+                    np.where(azimuthal_sides == 0, 0.5, 0.0),
+                )
+                use = weights > 0.0
+                if np.any(use):
+                    reducers[f"{side_name}_azimuthal"].add(
+                        azimuthal_flat[use], weights[use] * azimuthal_values_frame[use]
+                    )
+                    reducers[f"{side_name}_azimuthal_count"].add(azimuthal_flat[use], weights[use])
 
-    if not entity_blocks:
-        flat_indices = np.array([], dtype=np.int64)
-        entity_sum = np.array([], dtype=float)
-    else:
-        flat_indices, entity_sum = _sparse_sum_by_flat_index(np.concatenate(entity_blocks))
+    flat_indices, entity_sum = reducers["entity"].finish()
+    polar_indices, polar_sum = reducers["polar"].finish()
+    lab_polar_indices, lab_polar_sum = reducers["lab_polar"].finish()
+    polar_count_indices, polar_count = reducers["polar_count"].finish()
+    azimuthal_indices, azimuthal_sum = reducers["azimuthal"].finish()
+    azimuthal_count_indices, azimuthal_count = reducers["azimuthal_count"].finish()
 
-    polar_flat = np.concatenate(polar_blocks) if polar_blocks else np.array([], dtype=np.int64)
-    polar_values = (
-        np.concatenate(polar_value_blocks) if polar_value_blocks else np.array([], dtype=float)
-    )
-    polar_indices, polar_sum = _sparse_sum_by_flat_index(polar_flat, weights=polar_values)
-    polar_count_indices, polar_count = _sparse_sum_by_flat_index(polar_flat)
+    def side_values(side_name: str) -> tuple[np.ndarray, ...]:
+        entity_idx, entity_value = reducers[f"{side_name}_entity"].finish()
+        polar_idx, polar_value = reducers[f"{side_name}_polar"].finish()
+        polar_count_idx, polar_count_value = reducers[f"{side_name}_polar_count"].finish()
+        az_idx, az_value = reducers[f"{side_name}_azimuthal"].finish()
+        az_count_idx, az_count_value = reducers[f"{side_name}_azimuthal_count"].finish()
+        return (
+            _align_sparse_values(flat_indices, entity_idx, entity_value),
+            _align_sparse_values(flat_indices, polar_idx, polar_value),
+            _align_sparse_values(flat_indices, polar_count_idx, polar_count_value),
+            _align_sparse_values(flat_indices, az_idx, az_value),
+            _align_sparse_values(flat_indices, az_count_idx, az_count_value),
+        )
 
-    azimuthal_flat = (
-        np.concatenate(azimuthal_blocks) if azimuthal_blocks else np.array([], dtype=np.int64)
-    )
-    azimuthal_values = (
-        np.concatenate(azimuthal_value_blocks)
-        if azimuthal_value_blocks
-        else np.array([], dtype=float)
-    )
-    azimuthal_indices, azimuthal_sum = _sparse_sum_by_flat_index(
-        azimuthal_flat,
-        weights=azimuthal_values,
-    )
-    azimuthal_count_indices, azimuthal_count = _sparse_sum_by_flat_index(azimuthal_flat)
+    top_side = side_values("top")
+    bottom_side = side_values("bottom")
 
     return OrientationSparseGrid(
         x_edges=x_edges,
@@ -627,8 +1075,20 @@ def _build_orientation_sparse_grid(
         shape=shape,
         flat_indices=flat_indices,
         entity_sum=entity_sum.astype(np.float32),
-        cos_polar_sum=_align_sparse_values(flat_indices, polar_indices, polar_sum).astype(np.float32),
+        cos_polar_sum=_align_sparse_values(flat_indices, polar_indices, polar_sum).astype(
+            np.float32
+        ),
         count_polar_valid=_align_sparse_values(
+            flat_indices,
+            polar_count_indices,
+            polar_count,
+        ).astype(np.float32),
+        lab_cos_polar_sum=_align_sparse_values(
+            flat_indices,
+            lab_polar_indices,
+            lab_polar_sum,
+        ).astype(np.float32),
+        lab_count_polar_valid=_align_sparse_values(
             flat_indices,
             polar_count_indices,
             polar_count,
@@ -643,11 +1103,21 @@ def _build_orientation_sparse_grid(
             azimuthal_count_indices,
             azimuthal_count,
         ).astype(np.float32),
+        top_entity_sum=top_side[0].astype(np.float32),
+        bottom_entity_sum=bottom_side[0].astype(np.float32),
+        top_cos_polar_sum=top_side[1].astype(np.float32),
+        bottom_cos_polar_sum=bottom_side[1].astype(np.float32),
+        top_count_polar_valid=top_side[2].astype(np.float32),
+        bottom_count_polar_valid=bottom_side[2].astype(np.float32),
+        top_cos_azimuthal_sum=top_side[3].astype(np.float32),
+        bottom_cos_azimuthal_sum=bottom_side[3].astype(np.float32),
+        top_count_azimuthal_valid=top_side[4].astype(np.float32),
+        bottom_count_azimuthal_valid=bottom_side[4].astype(np.float32),
     )
 
 
 def compute_orientation_profile(
-    frames: list[Atoms],
+    frames: Sequence[Atoms],
     *,
     axis: str = "z",
     reference_axis: str = "z",
@@ -657,9 +1127,12 @@ def compute_orientation_profile(
     surface_elements: list[str] | None = None,
     include_fixed_surface_atoms: bool = False,
     surface_options: SurfaceEstimatorOptions | None = None,
-    precomputed_surface_estimate: SurfaceEstimate | None = None,
+    surface_layout: str | None = None,
+    precomputed_surface_estimate: SurfaceEstimate | SurfaceReference | None = None,
     binning: str = "cell",
     oh_cutoff: float = H2O_OH_CUTOFF_A,
+    oh_topology_backend: str = "auto",
+    memory_budget_mib: float | None = None,
 ) -> OrientationProfile:
     """Compute water-orientation profiles from a trajectory."""
     if not frames:
@@ -671,13 +1144,26 @@ def compute_orientation_profile(
     ref_vec[ref_index] = 1.0
     in_plane_ref_vec = _in_plane_reference_vector(ref_index)
 
-    surface_estimate: SurfaceEstimate | None
-    if precomputed_surface_estimate is not None:
+    surface_estimate: SurfaceEstimate | None = None
+    surface_reference: SurfaceReference | None = None
+    if isinstance(precomputed_surface_estimate, SurfaceReference):
+        surface_reference = precomputed_surface_estimate
+    elif precomputed_surface_estimate is not None:
         if precomputed_surface_estimate.frame_values.shape != (len(frames),):
             raise ValueError(
                 "precomputed_surface_estimate frame count does not match the trajectory."
             )
         surface_estimate = precomputed_surface_estimate
+    elif surface_layout is not None:
+        surface_reference = estimate_surface_layout_reference(
+            frames,
+            axis,
+            surface_layout=surface_layout,
+            mode=surface_mode,
+            surface_elements=surface_elements,
+            include_fixed_surface_atoms=include_fixed_surface_atoms,
+            surface_options=surface_options,
+        )
     else:
         from .density import _select_surface_estimate
 
@@ -689,21 +1175,39 @@ def compute_orientation_profile(
             include_fixed_surface_atoms=include_fixed_surface_atoms,
             surface_options=surface_options,
         )
+    if surface_reference is not None:
+        surface_estimate = surface_reference.primary
     surface_position: float | None = None
     surface_position_std: float | None = None
     surface_per_frame: np.ndarray | None = None
-    if surface_estimate is not None:
+    if surface_reference is not None and surface_reference.uses_distance:
+        if surface_reference.resolved_layout != "symmetric" and surface_estimate is not None:
+            surface_position = surface_estimate.position
+            surface_position_std = surface_estimate.std
+            surface_per_frame = surface_estimate.per_frame
+    elif surface_reference is None and surface_estimate is not None:
         surface_position = surface_estimate.position
         surface_position_std = surface_estimate.std
         surface_per_frame = surface_estimate.per_frame
         if not _surface_estimate_supports_distance_mode(surface_estimate, frame_count=len(frames)):
             surface_per_frame = None
 
-    coordinate_mode = "distance" if surface_per_frame is not None else "axis"
+    coordinate_mode = (
+        "distance"
+        if (surface_reference is not None and surface_reference.uses_distance)
+        or surface_per_frame is not None
+        else "axis"
+    )
+    active_surface_reference = (
+        surface_reference
+        if surface_reference is not None and surface_reference.uses_distance
+        else None
+    )
     topology_cache = OHTopologyCache(
         oh_cutoff=oh_cutoff,
         logger=LOGGER,
         context="H2O topology",
+        backend=oh_topology_backend,
     )
     n_molecules_per_frame = 0
     frame_data: list[_OrientationFrameData] = []
@@ -715,6 +1219,10 @@ def compute_orientation_profile(
                 frame_index=frame_idx,
             ).indices_for("mol:H2O")
             geom = water_triplet_geometry(frame, cached_triplets)
+            if needs_general_geometry([frame]):
+                geom = geom._replace(
+                    com_positions=wrapped_frame_positions(frame, geom.com_positions)
+                )
             n_mol = geom.com_positions.shape[0]
             if frame_idx == 0 or (n_molecules_per_frame == 0 and n_mol > 0):
                 n_molecules_per_frame = n_mol
@@ -725,6 +1233,8 @@ def compute_orientation_profile(
                     surface_position=None
                     if surface_per_frame is None
                     else surface_per_frame[frame_idx],
+                    surface_reference=active_surface_reference,
+                    frame_index=frame_idx,
                     ref_vec=ref_vec,
                     in_plane_ref_vec=in_plane_ref_vec,
                     oh_cutoff=oh_cutoff,
@@ -732,7 +1242,7 @@ def compute_orientation_profile(
             )
             progress.update()
 
-    LOGGER.info(
+    LOGGER.debug(
         "Orientation frame analysis complete: %d frames, %d H2O/frame. "
         "Aggregating cached frame data into distance and angle bins.",
         len(frame_data),
@@ -743,9 +1253,19 @@ def compute_orientation_profile(
         frames=frames,
         axis_index=axis_index,
         frame_data=frame_data,
-        binning=binning,
+        binning=(
+            "observed"
+            if active_surface_reference is not None
+            and active_surface_reference.resolved_layout == "symmetric"
+            else binning
+        ),
         coordinate_mode=coordinate_mode,
-        surface_per_frame=surface_per_frame,
+        surface_per_frame=(
+            None
+            if active_surface_reference is not None
+            and active_surface_reference.resolved_layout == "symmetric"
+            else surface_per_frame
+        ),
         bin_width=bin_width,
     )
     dist_bin_edges = _build_uniform_bin_edges(
@@ -773,11 +1293,30 @@ def compute_orientation_profile(
     heatmap_polar = np.zeros((n_dist_bins, angle_bin_count), dtype=float)
     heatmap_azimuthal = np.zeros((n_dist_bins, angle_bin_count), dtype=float)
 
-    slab_volumes = _per_frame_slab_volumes(frames, axis_index=axis_index, bin_width=bin_width)
+    slab_volume_per_frame = _per_frame_slab_volumes(
+        frames,
+        axis_index=axis_index,
+        bin_width=bin_width,
+    )
+    slab_volumes = slab_volume_per_frame
+    if slab_volumes is not None and not (
+        active_surface_reference is not None
+        and active_surface_reference.resolved_layout == "symmetric"
+    ):
+        slab_volumes = np.asarray(
+            [
+                bin_volumes(
+                    frame.cell,
+                    dist_bin_edges,
+                    axis_index,
+                    origin=frame_origin(frame),
+                    shift=0.0 if surface_per_frame is None else float(surface_per_frame[i]),
+                )
+                for i, frame in enumerate(frames)
+            ]
+        )
     variable_slab_volume = (
-        slab_volumes is not None
-        and slab_volumes.size > 1
-        and not np.allclose(slab_volumes, slab_volumes[0], rtol=0.0, atol=1.0e-12)
+        slab_volumes is not None and slab_volumes.size > 1 and slab_volumes.ndim == 2
     )
     framewise_density_sum = (
         np.zeros(n_dist_bins, dtype=float)
@@ -791,10 +1330,14 @@ def compute_orientation_profile(
         distance_edges=dist_bin_edges,
         bin_width=bin_width,
         cell_lengths=cell_lengths,
+        buffer_limit_bytes=min(
+            128 * 1024 * 1024,
+            max(1024, resolve_resource_policy(memory_budget_mib).memory_budget_bytes // 4),
+        ),
     )
     dense_grid_cells = int(np.prod(np.asarray(sparse_grid.shape, dtype=np.int64)))
     sparse_nonzero = int(sparse_grid.flat_indices.size)
-    LOGGER.info(
+    LOGGER.debug(
         "Orientation sparse grid: dense=%d cells, sparse=%d nonzero bins.",
         dense_grid_cells,
         sparse_nonzero,
@@ -822,7 +1365,9 @@ def compute_orientation_profile(
                 frame_total_hist = np.bincount(dist_idx_total, minlength=n_dist_bins).astype(int)
                 count_total += frame_total_hist
                 if framewise_density_sum is not None and slab_volumes is not None:
-                    framewise_density_sum += frame_total_hist / float(slab_volumes[frame_idx])
+                    framewise_density_sum += frame_total_hist / np.where(
+                        slab_volumes[frame_idx] > 0, slab_volumes[frame_idx], np.inf
+                    )
 
             polar_mask = total_mask & data.polar_valid
             if np.any(polar_mask):
@@ -861,7 +1406,8 @@ def compute_orientation_profile(
                 np.add.at(heatmap_azimuthal, (dist_idx_azimuthal, angle_idx_azimuthal), 1.0)
 
             frame_density = (
-                np.asarray(frame_total_hist, dtype=float) / float(slab_volumes[frame_idx])
+                np.asarray(frame_total_hist, dtype=float)
+                / np.where(slab_volumes[frame_idx] > 0, slab_volumes[frame_idx], np.inf)
                 if slab_volumes is not None
                 else np.asarray(frame_total_hist, dtype=float) / float(bin_width)
             )
@@ -883,6 +1429,78 @@ def compute_orientation_profile(
         bin_width=bin_width,
         slab_volumes=slab_volumes,
         framewise_density_sum=framewise_density_sum,
+    )
+    top_cos_polar_mean: np.ndarray | None = None
+    bottom_cos_polar_mean: np.ndarray | None = None
+    top_cos_azimuthal_mean: np.ndarray | None = None
+    bottom_cos_azimuthal_mean: np.ndarray | None = None
+    top_density: np.ndarray | None = None
+    bottom_density: np.ndarray | None = None
+    top_heatmap_polar: np.ndarray | None = None
+    bottom_heatmap_polar: np.ndarray | None = None
+    top_heatmap_azimuthal: np.ndarray | None = None
+    bottom_heatmap_azimuthal: np.ndarray | None = None
+    if (
+        active_surface_reference is not None
+        and active_surface_reference.resolved_layout == "symmetric"
+    ):
+        (
+            top_cos_polar_mean,
+            top_cos_azimuthal_mean,
+            top_density,
+            top_heatmap_polar,
+            top_heatmap_azimuthal,
+        ) = _aggregate_orientation_side(
+            frame_data,
+            side=1,
+            distance_edges=dist_bin_edges,
+            angle_edges=angle_bin_edges,
+            bin_width=bin_width,
+            slab_volume_per_frame=slab_volume_per_frame,
+        )
+        (
+            bottom_cos_polar_mean,
+            bottom_cos_azimuthal_mean,
+            bottom_density,
+            bottom_heatmap_polar,
+            bottom_heatmap_azimuthal,
+        ) = _aggregate_orientation_side(
+            frame_data,
+            side=-1,
+            distance_edges=dist_bin_edges,
+            angle_edges=angle_bin_edges,
+            bin_width=bin_width,
+            slab_volume_per_frame=slab_volume_per_frame,
+        )
+        cos_polar_mean = _equal_nan_mean(top_cos_polar_mean, bottom_cos_polar_mean)
+        cos_azimuthal_mean = _equal_nan_mean(
+            top_cos_azimuthal_mean,
+            bottom_cos_azimuthal_mean,
+        )
+        density = 0.5 * (top_density + bottom_density)
+        heatmap_polar = 0.5 * (top_heatmap_polar + bottom_heatmap_polar)
+        heatmap_azimuthal = 0.5 * (top_heatmap_azimuthal + bottom_heatmap_azimuthal)
+    full_bin_edges = np.asarray(
+        (sparse_grid.x_edges, sparse_grid.y_edges, sparse_grid.z_edges)[axis_index],
+        dtype=float,
+    )
+    full_bin_centers = 0.5 * (full_bin_edges[:-1] + full_bin_edges[1:])
+    (
+        full_cos_polar_mean,
+        full_cos_azimuthal_mean,
+        full_density,
+        full_heatmap_polar,
+        full_heatmap_azimuthal,
+        full_count_total,
+        full_count_polar_valid,
+        full_count_azimuthal_valid,
+        full_series_statistics,
+    ) = _aggregate_orientation_full_axis(
+        frames,
+        frame_data,
+        axis_index=axis_index,
+        axis_edges=full_bin_edges,
+        angle_edges=angle_bin_edges,
     )
     block_resolution = resolve_block_slices(n_frames)
     block_slices = None if block_resolution is None else block_resolution[0]
@@ -937,6 +1555,28 @@ def compute_orientation_profile(
         surface_position=surface_position,
         surface_position_std=surface_position_std,
         surface_estimate=surface_estimate,
+        surface_reference=surface_reference,
+        top_cos_polar_mean=top_cos_polar_mean,
+        bottom_cos_polar_mean=bottom_cos_polar_mean,
+        top_cos_azimuthal_mean=top_cos_azimuthal_mean,
+        bottom_cos_azimuthal_mean=bottom_cos_azimuthal_mean,
+        top_density=top_density,
+        bottom_density=bottom_density,
+        top_heatmap_polar=top_heatmap_polar,
+        bottom_heatmap_polar=bottom_heatmap_polar,
+        top_heatmap_azimuthal=top_heatmap_azimuthal,
+        bottom_heatmap_azimuthal=bottom_heatmap_azimuthal,
+        full_bin_edges=full_bin_edges,
+        full_bin_centers=full_bin_centers,
+        full_cos_polar_mean=full_cos_polar_mean,
+        full_cos_azimuthal_mean=full_cos_azimuthal_mean,
+        full_density=full_density,
+        full_heatmap_polar=full_heatmap_polar,
+        full_heatmap_azimuthal=full_heatmap_azimuthal,
+        full_count_total=full_count_total,
+        full_count_polar_valid=full_count_polar_valid,
+        full_count_azimuthal_valid=full_count_azimuthal_valid,
+        full_series_statistics=full_series_statistics,
         cell_lengths_angstrom=cell_lengths,
         series_statistics=series_statistics,
         sparse_grid=sparse_grid,
@@ -961,10 +1601,18 @@ def _orientation_profile_hdf5_payload(
             if profile.cell_lengths_angstrom is None
             else [float(v) for v in profile.cell_lengths_angstrom]
         ),
-        **_surface_metadata_payload(
-            surface_position=profile.surface_position,
-            surface_position_std=profile.surface_position_std,
-            estimate=profile.surface_estimate,
+        **(
+            _surface_reference_metadata(
+                profile.surface_reference,
+                surface_position=profile.surface_position,
+                surface_position_std=profile.surface_position_std,
+            )
+            if profile.surface_reference is not None
+            else _surface_metadata_payload(
+                surface_position=profile.surface_position,
+                surface_position_std=profile.surface_position_std,
+                estimate=profile.surface_estimate,
+            )
         ),
     }
     if profile.sparse_grid is not None:
@@ -998,38 +1646,95 @@ def _orientation_profile_hdf5_payload(
         "heatmap_azimuthal": profile.heatmap_azimuthal,
         "heatmap_angle_bin_edges": profile.heatmap_angle_bin_edges,
         "heatmap_angle_bin_centers": profile.heatmap_angle_bin_centers,
-        "grid_x_edges_A": None
-        if profile.sparse_grid is None
-        else profile.sparse_grid.x_edges,
-        "grid_y_edges_A": None
-        if profile.sparse_grid is None
-        else profile.sparse_grid.y_edges,
-        "grid_z_edges_A": None
-        if profile.sparse_grid is None
-        else profile.sparse_grid.z_edges,
+        "top_cos_polar_mean": profile.top_cos_polar_mean,
+        "bottom_cos_polar_mean": profile.bottom_cos_polar_mean,
+        "top_cos_azimuthal_mean": profile.top_cos_azimuthal_mean,
+        "bottom_cos_azimuthal_mean": profile.bottom_cos_azimuthal_mean,
+        "top_density": profile.top_density,
+        "bottom_density": profile.bottom_density,
+        "top_heatmap_polar": profile.top_heatmap_polar,
+        "bottom_heatmap_polar": profile.bottom_heatmap_polar,
+        "top_heatmap_azimuthal": profile.top_heatmap_azimuthal,
+        "bottom_heatmap_azimuthal": profile.bottom_heatmap_azimuthal,
+        "full_bin_edges_A": profile.full_bin_edges,
+        "full_bin_centers_A": profile.full_bin_centers,
+        "full_cos_polar_mean": profile.full_cos_polar_mean,
+        "full_cos_azimuthal_mean": profile.full_cos_azimuthal_mean,
+        "full_density": profile.full_density,
+        "full_heatmap_polar": profile.full_heatmap_polar,
+        "full_heatmap_azimuthal": profile.full_heatmap_azimuthal,
+        "full_count_total": profile.full_count_total,
+        "full_count_polar_valid": profile.full_count_polar_valid,
+        "full_count_azimuthal_valid": profile.full_count_azimuthal_valid,
+        "grid_x_edges_A": None if profile.sparse_grid is None else profile.sparse_grid.x_edges,
+        "grid_y_edges_A": None if profile.sparse_grid is None else profile.sparse_grid.y_edges,
+        "grid_z_edges_A": None if profile.sparse_grid is None else profile.sparse_grid.z_edges,
         "grid_distance_edges_A": None
         if profile.sparse_grid is None
         else profile.sparse_grid.distance_edges,
         "grid_flat_indices": None
         if profile.sparse_grid is None
         else profile.sparse_grid.flat_indices,
-        "grid_entity_sum": None
-        if profile.sparse_grid is None
-        else profile.sparse_grid.entity_sum,
+        "grid_entity_sum": None if profile.sparse_grid is None else profile.sparse_grid.entity_sum,
         "grid_cos_polar_sum": None
         if profile.sparse_grid is None
         else profile.sparse_grid.cos_polar_sum,
         "grid_count_polar_valid": None
         if profile.sparse_grid is None
         else profile.sparse_grid.count_polar_valid,
+        "grid_lab_cos_polar_sum": None
+        if profile.sparse_grid is None
+        else profile.sparse_grid.lab_cos_polar_sum,
+        "grid_lab_count_polar_valid": None
+        if profile.sparse_grid is None
+        else profile.sparse_grid.lab_count_polar_valid,
         "grid_cos_azimuthal_sum": None
         if profile.sparse_grid is None
         else profile.sparse_grid.cos_azimuthal_sum,
         "grid_count_azimuthal_valid": None
         if profile.sparse_grid is None
         else profile.sparse_grid.count_azimuthal_valid,
-        **_surface_estimate_datasets(profile.surface_estimate),
+        "grid_top_entity_sum": None
+        if profile.sparse_grid is None
+        else profile.sparse_grid.top_entity_sum,
+        "grid_bottom_entity_sum": None
+        if profile.sparse_grid is None
+        else profile.sparse_grid.bottom_entity_sum,
+        "grid_top_cos_polar_sum": None
+        if profile.sparse_grid is None
+        else profile.sparse_grid.top_cos_polar_sum,
+        "grid_bottom_cos_polar_sum": None
+        if profile.sparse_grid is None
+        else profile.sparse_grid.bottom_cos_polar_sum,
+        "grid_top_count_polar_valid": None
+        if profile.sparse_grid is None
+        else profile.sparse_grid.top_count_polar_valid,
+        "grid_bottom_count_polar_valid": None
+        if profile.sparse_grid is None
+        else profile.sparse_grid.bottom_count_polar_valid,
+        "grid_top_cos_azimuthal_sum": None
+        if profile.sparse_grid is None
+        else profile.sparse_grid.top_cos_azimuthal_sum,
+        "grid_bottom_cos_azimuthal_sum": None
+        if profile.sparse_grid is None
+        else profile.sparse_grid.bottom_cos_azimuthal_sum,
+        "grid_top_count_azimuthal_valid": None
+        if profile.sparse_grid is None
+        else profile.sparse_grid.top_count_azimuthal_valid,
+        "grid_bottom_count_azimuthal_valid": None
+        if profile.sparse_grid is None
+        else profile.sparse_grid.bottom_count_azimuthal_valid,
+        **(
+            _surface_reference_datasets(profile.surface_reference)
+            if profile.surface_reference is not None
+            else _surface_estimate_datasets(profile.surface_estimate)
+        ),
         **statistics_payload_from_series_map(profile.series_statistics),
+        **statistics_payload_from_series_map(
+            None
+            if profile.full_series_statistics is None
+            else {f"full_{name}": stats for name, stats in profile.full_series_statistics.items()}
+        ),
     }
     return {"datasets": datasets, "metadata": metadata}
 
@@ -1039,6 +1744,7 @@ def save_orientation_profile(
     output: str | Path,
     *,
     additional_metadata: Mapping[str, Any] | None = None,
+    compression_profile: str = "fast",
 ) -> Path:
     """Save an orientation profile to LiNaK HDF5."""
     payload = _orientation_profile_hdf5_payload(profile)
@@ -1050,6 +1756,7 @@ def save_orientation_profile(
         analysis=_ANALYSIS_NAME,
         datasets=payload["datasets"],
         metadata=metadata,
+        compression_profile=compression_profile,
     )
     try:
         _display = os.path.relpath(output_path)
@@ -1062,10 +1769,24 @@ def save_orientation_profile(
 def _build_orientation_profile_from_hdf5(
     datasets: dict[str, np.ndarray],
     metadata: dict[str, Any],
+    *,
+    allow_partial: bool = False,
 ) -> OrientationProfile:
     def _get(name: str) -> np.ndarray:
         arr = datasets.get(name)
         if arr is None:
+            if allow_partial:
+                distance_size = int(np.asarray(datasets.get("bin_centers_A", [])).size)
+                angle_size = int(np.asarray(datasets.get("heatmap_angle_bin_centers", [])).size)
+                if name in {"heatmap_polar", "heatmap_azimuthal"}:
+                    return np.broadcast_to(np.nan, (distance_size, angle_size))
+                if name in {"count_total", "count_polar_valid", "count_azimuthal_valid"}:
+                    return np.zeros(distance_size, dtype=float)
+                if name.endswith("bin_edges_A"):
+                    return np.asarray(datasets.get("bin_edges_A", []), dtype=float)
+                if name.endswith("bin_centers_A"):
+                    return np.asarray(datasets.get("bin_centers_A", []), dtype=float)
+                return np.broadcast_to(np.nan, (distance_size,))
             raise ValueError(f"Missing dataset '{name}' in orientation HDF5.")
         return np.asarray(arr, dtype=float)
 
@@ -1076,7 +1797,15 @@ def _build_orientation_profile_from_hdf5(
             cell_lengths = (float(cell_raw[0]), float(cell_raw[1]), float(cell_raw[2]))
         except (TypeError, IndexError, ValueError):
             cell_lengths = None
-    surface_estimate = _surface_estimate_from_payload(datasets=datasets, metadata=metadata)
+    surface_reference = _surface_reference_from_payload(
+        datasets=datasets,
+        metadata=metadata,
+    )
+    surface_estimate = (
+        surface_reference.primary
+        if surface_reference is not None
+        else _surface_estimate_from_payload(datasets=datasets, metadata=metadata)
+    )
     surface_metadata = _surface_metadata_view(metadata)
     heatmap_polar = _get("heatmap_polar")
     heatmap_azimuthal = _get("heatmap_azimuthal")
@@ -1092,6 +1821,23 @@ def _build_orientation_profile_from_hdf5(
             "cos_polar_density",
             "cos_azimuthal_density",
         ),
+    )
+    full_series_statistics_raw = statistics_series_map_from_datasets(
+        datasets,
+        dataset_names=(
+            "full_cos_polar_mean",
+            "full_cos_azimuthal_mean",
+            "full_density",
+            "full_cos_polar_density",
+            "full_cos_azimuthal_density",
+        ),
+    )
+    full_series_statistics = (
+        None
+        if full_series_statistics_raw is None
+        else {
+            name.removeprefix("full_"): stats for name, stats in full_series_statistics_raw.items()
+        }
     )
     grid_dataset_names = (
         "grid_x_edges_A",
@@ -1137,10 +1883,70 @@ def _build_orientation_profile_from_hdf5(
             entity_sum=np.asarray(datasets["grid_entity_sum"], dtype=float),
             cos_polar_sum=np.asarray(datasets["grid_cos_polar_sum"], dtype=float),
             count_polar_valid=np.asarray(datasets["grid_count_polar_valid"], dtype=float),
+            lab_cos_polar_sum=(
+                None
+                if "grid_lab_cos_polar_sum" not in datasets
+                else np.asarray(datasets["grid_lab_cos_polar_sum"], dtype=float)
+            ),
+            lab_count_polar_valid=(
+                None
+                if "grid_lab_count_polar_valid" not in datasets
+                else np.asarray(datasets["grid_lab_count_polar_valid"], dtype=float)
+            ),
             cos_azimuthal_sum=np.asarray(datasets["grid_cos_azimuthal_sum"], dtype=float),
             count_azimuthal_valid=np.asarray(
                 datasets["grid_count_azimuthal_valid"],
                 dtype=float,
+            ),
+            top_entity_sum=(
+                None
+                if "grid_top_entity_sum" not in datasets
+                else np.asarray(datasets["grid_top_entity_sum"], dtype=float)
+            ),
+            bottom_entity_sum=(
+                None
+                if "grid_bottom_entity_sum" not in datasets
+                else np.asarray(datasets["grid_bottom_entity_sum"], dtype=float)
+            ),
+            top_cos_polar_sum=(
+                None
+                if "grid_top_cos_polar_sum" not in datasets
+                else np.asarray(datasets["grid_top_cos_polar_sum"], dtype=float)
+            ),
+            bottom_cos_polar_sum=(
+                None
+                if "grid_bottom_cos_polar_sum" not in datasets
+                else np.asarray(datasets["grid_bottom_cos_polar_sum"], dtype=float)
+            ),
+            top_count_polar_valid=(
+                None
+                if "grid_top_count_polar_valid" not in datasets
+                else np.asarray(datasets["grid_top_count_polar_valid"], dtype=float)
+            ),
+            bottom_count_polar_valid=(
+                None
+                if "grid_bottom_count_polar_valid" not in datasets
+                else np.asarray(datasets["grid_bottom_count_polar_valid"], dtype=float)
+            ),
+            top_cos_azimuthal_sum=(
+                None
+                if "grid_top_cos_azimuthal_sum" not in datasets
+                else np.asarray(datasets["grid_top_cos_azimuthal_sum"], dtype=float)
+            ),
+            bottom_cos_azimuthal_sum=(
+                None
+                if "grid_bottom_cos_azimuthal_sum" not in datasets
+                else np.asarray(datasets["grid_bottom_cos_azimuthal_sum"], dtype=float)
+            ),
+            top_count_azimuthal_valid=(
+                None
+                if "grid_top_count_azimuthal_valid" not in datasets
+                else np.asarray(datasets["grid_top_count_azimuthal_valid"], dtype=float)
+            ),
+            bottom_count_azimuthal_valid=(
+                None
+                if "grid_bottom_count_azimuthal_valid" not in datasets
+                else np.asarray(datasets["grid_bottom_count_azimuthal_valid"], dtype=float)
             ),
         )
 
@@ -1169,6 +1975,66 @@ def _build_orientation_profile_from_hdf5(
             "position_std", metadata.get("surface_position_std")
         ),
         surface_estimate=surface_estimate,
+        surface_reference=surface_reference,
+        top_cos_polar_mean=(
+            None if "top_cos_polar_mean" not in datasets else _get("top_cos_polar_mean")
+        ),
+        bottom_cos_polar_mean=(
+            None if "bottom_cos_polar_mean" not in datasets else _get("bottom_cos_polar_mean")
+        ),
+        top_cos_azimuthal_mean=(
+            None if "top_cos_azimuthal_mean" not in datasets else _get("top_cos_azimuthal_mean")
+        ),
+        bottom_cos_azimuthal_mean=(
+            None
+            if "bottom_cos_azimuthal_mean" not in datasets
+            else _get("bottom_cos_azimuthal_mean")
+        ),
+        top_density=None if "top_density" not in datasets else _get("top_density"),
+        bottom_density=(None if "bottom_density" not in datasets else _get("bottom_density")),
+        top_heatmap_polar=(
+            None if "top_heatmap_polar" not in datasets else _get("top_heatmap_polar")
+        ),
+        bottom_heatmap_polar=(
+            None if "bottom_heatmap_polar" not in datasets else _get("bottom_heatmap_polar")
+        ),
+        top_heatmap_azimuthal=(
+            None if "top_heatmap_azimuthal" not in datasets else _get("top_heatmap_azimuthal")
+        ),
+        bottom_heatmap_azimuthal=(
+            None if "bottom_heatmap_azimuthal" not in datasets else _get("bottom_heatmap_azimuthal")
+        ),
+        full_bin_edges=(None if "full_bin_edges_A" not in datasets else _get("full_bin_edges_A")),
+        full_bin_centers=(
+            None if "full_bin_centers_A" not in datasets else _get("full_bin_centers_A")
+        ),
+        full_cos_polar_mean=(
+            None if "full_cos_polar_mean" not in datasets else _get("full_cos_polar_mean")
+        ),
+        full_cos_azimuthal_mean=(
+            None if "full_cos_azimuthal_mean" not in datasets else _get("full_cos_azimuthal_mean")
+        ),
+        full_density=None if "full_density" not in datasets else _get("full_density"),
+        full_heatmap_polar=(
+            None if "full_heatmap_polar" not in datasets else _get("full_heatmap_polar")
+        ),
+        full_heatmap_azimuthal=(
+            None if "full_heatmap_azimuthal" not in datasets else _get("full_heatmap_azimuthal")
+        ),
+        full_count_total=(
+            None if "full_count_total" not in datasets else _get("full_count_total").astype(int)
+        ),
+        full_count_polar_valid=(
+            None
+            if "full_count_polar_valid" not in datasets
+            else _get("full_count_polar_valid").astype(int)
+        ),
+        full_count_azimuthal_valid=(
+            None
+            if "full_count_azimuthal_valid" not in datasets
+            else _get("full_count_azimuthal_valid").astype(int)
+        ),
+        full_series_statistics=full_series_statistics,
         cell_lengths_angstrom=cell_lengths,
         series_statistics=series_statistics,
         sparse_grid=sparse_grid,
@@ -1199,6 +2065,8 @@ def load_orientation_profiles(path: str | Path) -> list[OrientationProfile]:
 def load_orientation_profiles_by_index(
     path: str | Path,
     indices: list[int],
+    *,
+    dataset_names: list[str] | tuple[str, ...] | None = None,
 ) -> list[OrientationProfile]:
     """Load selected orientation profiles by index."""
     _source_path, raw = read_profile_payloads_by_index(
@@ -1206,8 +2074,16 @@ def load_orientation_profiles_by_index(
         indices,
         analysis=_ANALYSIS_NAME,
         label="Orientation",
+        dataset_names=dataset_names,
     )
-    return [_build_orientation_profile_from_hdf5(datasets, metadata) for datasets, metadata in raw]
+    return [
+        _build_orientation_profile_from_hdf5(
+            datasets,
+            metadata,
+            allow_partial=dataset_names is not None,
+        )
+        for datasets, metadata in raw
+    ]
 
 
 # Plotting helpers
@@ -1276,11 +2152,7 @@ def _orientation_filter_bounds(
         lower, upper = bounds
         lower_value = None if lower is None else float(lower)
         upper_value = None if upper is None else float(upper)
-        if (
-            lower_value is not None
-            and upper_value is not None
-            and lower_value > upper_value
-        ):
+        if lower_value is not None and upper_value is not None and lower_value > upper_value:
             raise ValueError(f"{normalized_axis} filter minimum must not exceed maximum.")
         resolved[normalized_axis] = (lower_value, upper_value)
     return resolved
@@ -1536,6 +2408,116 @@ def _select_heatmap_data(
 # Public plot functions
 
 
+def _orientation_profile_for_interface_view(
+    profile: OrientationProfile,
+    interface_view: str,
+) -> OrientationProfile:
+    view = str(interface_view).strip().lower()
+    if view not in {"full", "folded", "top", "bottom", "all"}:
+        raise ValueError("interface_view must be full, folded, top, bottom, or all.")
+    if view == "full":
+        required = (
+            profile.full_bin_edges,
+            profile.full_bin_centers,
+            profile.full_cos_polar_mean,
+            profile.full_cos_azimuthal_mean,
+            profile.full_density,
+            profile.full_heatmap_polar,
+            profile.full_heatmap_azimuthal,
+            profile.full_count_total,
+            profile.full_count_polar_valid,
+            profile.full_count_azimuthal_valid,
+        )
+        if any(value is None for value in required):
+            raise ValueError(
+                "This orientation profile has no unfolded laboratory-frame data. "
+                "Recompute the orientation analysis before plotting the full cell."
+            )
+        full_polar = np.asarray(profile.full_cos_polar_mean, dtype=float)
+        full_azimuthal = np.asarray(profile.full_cos_azimuthal_mean, dtype=float)
+        full_density = np.asarray(profile.full_density, dtype=float)
+        full_polar_heatmap = np.asarray(profile.full_heatmap_polar, dtype=float)
+        full_azimuthal_heatmap = np.asarray(profile.full_heatmap_azimuthal, dtype=float)
+        full_grid = profile.sparse_grid
+        if full_grid is not None:
+            if full_grid.lab_cos_polar_sum is None or full_grid.lab_count_polar_valid is None:
+                full_grid = None
+            else:
+                full_grid = replace(
+                    full_grid,
+                    cos_polar_sum=np.asarray(full_grid.lab_cos_polar_sum, dtype=float),
+                    count_polar_valid=np.asarray(full_grid.lab_count_polar_valid, dtype=float),
+                )
+        return replace(
+            profile,
+            bin_edges=np.asarray(profile.full_bin_edges, dtype=float),
+            bin_centers=np.asarray(profile.full_bin_centers, dtype=float),
+            cos_polar_mean=full_polar,
+            cos_azimuthal_mean=full_azimuthal,
+            count_total=np.asarray(profile.full_count_total, dtype=int),
+            count_polar_valid=np.asarray(profile.full_count_polar_valid, dtype=int),
+            count_azimuthal_valid=np.asarray(
+                profile.full_count_azimuthal_valid,
+                dtype=int,
+            ),
+            cos_polar_density=full_polar * full_density,
+            cos_azimuthal_density=full_azimuthal * full_density,
+            density=full_density,
+            heatmap_polar=full_polar_heatmap,
+            heatmap_azimuthal=full_azimuthal_heatmap,
+            coordinate_mode="axis",
+            series_statistics=profile.full_series_statistics,
+            sparse_grid=full_grid,
+        )
+    if view not in {"top", "bottom"}:
+        return profile
+    prefix = "top" if view == "top" else "bottom"
+    polar = getattr(profile, f"{prefix}_cos_polar_mean")
+    azimuthal = getattr(profile, f"{prefix}_cos_azimuthal_mean")
+    density = getattr(profile, f"{prefix}_density")
+    polar_heatmap = getattr(profile, f"{prefix}_heatmap_polar")
+    azimuthal_heatmap = getattr(profile, f"{prefix}_heatmap_azimuthal")
+    if any(
+        value is None for value in (polar, azimuthal, density, polar_heatmap, azimuthal_heatmap)
+    ):
+        raise ValueError(f"The profile does not contain a {view} view.")
+    density_values = np.asarray(density, dtype=float)
+    polar_values = np.asarray(polar, dtype=float)
+    azimuthal_values = np.asarray(azimuthal, dtype=float)
+    side_grid = profile.sparse_grid
+    if side_grid is not None:
+        side_values = (
+            getattr(side_grid, f"{prefix}_entity_sum"),
+            getattr(side_grid, f"{prefix}_cos_polar_sum"),
+            getattr(side_grid, f"{prefix}_count_polar_valid"),
+            getattr(side_grid, f"{prefix}_cos_azimuthal_sum"),
+            getattr(side_grid, f"{prefix}_count_azimuthal_valid"),
+        )
+        if any(value is None for value in side_values):
+            side_grid = None
+        else:
+            side_grid = replace(
+                side_grid,
+                entity_sum=np.asarray(side_values[0], dtype=float),
+                cos_polar_sum=np.asarray(side_values[1], dtype=float),
+                count_polar_valid=np.asarray(side_values[2], dtype=float),
+                cos_azimuthal_sum=np.asarray(side_values[3], dtype=float),
+                count_azimuthal_valid=np.asarray(side_values[4], dtype=float),
+            )
+    return replace(
+        profile,
+        cos_polar_mean=polar_values,
+        cos_azimuthal_mean=azimuthal_values,
+        density=density_values,
+        cos_polar_density=polar_values * density_values,
+        cos_azimuthal_density=azimuthal_values * density_values,
+        heatmap_polar=np.asarray(polar_heatmap, dtype=float),
+        heatmap_azimuthal=np.asarray(azimuthal_heatmap, dtype=float),
+        series_statistics=None,
+        sparse_grid=side_grid,
+    )
+
+
 def plot_orientation_profile(
     profile: OrientationProfile,
     output: str | Path | None = None,
@@ -1547,6 +2529,7 @@ def plot_orientation_profile(
     view_mapping: PlotViewMapping | None = None,
     component: str = "average",
     angle: str = "polar",
+    interface_view: str = "folded",
     title: str | None = None,
     x_label: str | None = None,
     y_label: str | None = None,
@@ -1607,8 +2590,6 @@ def plot_orientation_profile(
     heatmap_bulk_reference_mode: str = "auto",
     heatmap_bulk_min: float | None = None,
     heatmap_bulk_max: float | None = None,
-    heatmap_normalize: bool = False,
-    heatmap_normalization_mode: str | None = None,
     heatmap_log_scale: bool = False,
     heatmap_colorbar_label: str | None = None,
     heatmap_colorbar_label_size: int | None = None,
@@ -1632,6 +2613,11 @@ def plot_orientation_profile(
     tight_layout_kwargs: dict[str, Any] | None = None,
     savefig_kwargs: dict[str, Any] | None = None,
 ) -> Path | None:
+    if str(interface_view).strip().lower() == "all":
+        raise ValueError(
+            "interface_view='all' requires plot_orientation_profiles so the three views can be overlaid."
+        )
+    profile = _orientation_profile_for_interface_view(profile, interface_view)
     """Plot a single orientation profile."""
     resolved_mapping = resolve_orientation_plot_mapping(
         contract=data_contract,
@@ -1704,8 +2690,12 @@ def plot_orientation_profile(
             x_bin_reducer=x_bin_reducer,
             y_bin_width=y_bin_width,
             y_bin_reducer=y_bin_reducer,
-            orientation_heatmap_x_axis=resolved_heatmap_x_axis if heatmap_axes_are_explicit else None,
-            orientation_heatmap_y_axis=resolved_heatmap_y_axis if heatmap_axes_are_explicit else None,
+            orientation_heatmap_x_axis=resolved_heatmap_x_axis
+            if heatmap_axes_are_explicit
+            else None,
+            orientation_heatmap_y_axis=resolved_heatmap_y_axis
+            if heatmap_axes_are_explicit
+            else None,
             orientation_grid_filters=orientation_grid_filters,
             orientation_filter_x_min=orientation_filter_x_min,
             orientation_filter_x_max=orientation_filter_x_max,
@@ -1719,8 +2709,6 @@ def plot_orientation_profile(
             heatmap_bulk_reference_mode=heatmap_bulk_reference_mode,
             heatmap_bulk_min=heatmap_bulk_min,
             heatmap_bulk_max=heatmap_bulk_max,
-            heatmap_normalize=heatmap_normalize,
-            heatmap_normalization_mode=heatmap_normalization_mode,
             heatmap_log_scale=heatmap_log_scale,
             heatmap_colorbar_enabled=heatmap_colorbar_enabled,
             heatmap_colorbar_label=heatmap_colorbar_label,
@@ -1769,6 +2757,12 @@ def plot_orientation_profile(
         None if profile.series_statistics is None else profile.series_statistics.get(stats_key)
     )
     grid_x_axis = resolved_line_x_axis.strip().lower() or "distance"
+    if (
+        str(interface_view).strip().lower() == "full"
+        and grid_x_axis == profile.axis
+        and not grid_filters
+    ):
+        grid_x_axis = "distance"
     use_grid_line = bool(grid_filters) or grid_x_axis != "distance"
     if use_grid_line:
         if norm_component != "average":
@@ -1873,6 +2867,7 @@ def plot_orientation_profiles(
     view_mapping: PlotViewMapping | None = None,
     component: str = "average",
     angle: str = "polar",
+    interface_view: str = "folded",
     title: str | None = None,
     x_label: str | None = None,
     y_label: str | None = None,
@@ -1936,8 +2931,6 @@ def plot_orientation_profiles(
     heatmap_bulk_reference_mode: str = "auto",
     heatmap_bulk_min: float | None = None,
     heatmap_bulk_max: float | None = None,
-    heatmap_normalize: bool = False,
-    heatmap_normalization_mode: str | None = None,
     heatmap_log_scale: bool = False,
     heatmap_colorbar_label: str | None = None,
     heatmap_colorbar_label_size: int | None = None,
@@ -1962,6 +2955,43 @@ def plot_orientation_profiles(
     tight_layout_kwargs: dict[str, Any] | None = None,
     savefig_kwargs: dict[str, Any] | None = None,
 ) -> Path | None:
+    normalized_interface_view = str(interface_view).strip().lower()
+    if normalized_interface_view not in {"full", "folded", "top", "bottom", "all"}:
+        raise ValueError("interface_view must be full, folded, top, bottom, or all.")
+    profile_view_names: list[str | None]
+    if normalized_interface_view == "all":
+        expanded_profiles: list[OrientationProfile] = []
+        expanded_views: list[str | None] = []
+        for profile in profiles:
+            for view in ("folded", "top", "bottom"):
+                expanded_profiles.append(_orientation_profile_for_interface_view(profile, view))
+                axis_label = str(profile.axis).upper()
+                expanded_views.append(
+                    "Combined interfaces (folded mean)"
+                    if view == "folded"
+                    else f"Positive-axis (+{axis_label})"
+                    if view == "top"
+                    else f"Negative-axis (-{axis_label})"
+                )
+        profiles = expanded_profiles
+        profile_view_names = expanded_views
+    else:
+        profiles = [
+            _orientation_profile_for_interface_view(profile, normalized_interface_view)
+            for profile in profiles
+        ]
+        profile_view_names = (
+            [None] * len(profiles)
+            if normalized_interface_view == "folded"
+            else [
+                "Full cell (unfolded)"
+                if normalized_interface_view == "full"
+                else f"Positive-axis (+{str(profile.axis).upper()})"
+                if normalized_interface_view == "top"
+                else f"Negative-axis (-{str(profile.axis).upper()})"
+                for profile in profiles
+            ]
+        )
     """Plot one or more orientation profiles overlaid."""
     if not profiles:
         raise ValueError("At least one orientation profile is required.")
@@ -1985,6 +3015,11 @@ def plot_orientation_profiles(
     )
 
     if resolved_mapping.is_heatmap:
+        if normalized_interface_view == "all":
+            raise ValueError(
+                "interface_view='all' is only available for orientation line plots; "
+                "select full, folded, top, or bottom for heatmaps."
+            )
         heatmap_axes_are_explicit = (
             orientation_heatmap_x_axis is not None
             or orientation_heatmap_y_axis is not None
@@ -2037,8 +3072,12 @@ def plot_orientation_profiles(
             x_bin_reducer=x_bin_reducer,
             y_bin_width=y_bin_width,
             y_bin_reducer=y_bin_reducer,
-            orientation_heatmap_x_axis=resolved_heatmap_x_axis if heatmap_axes_are_explicit else None,
-            orientation_heatmap_y_axis=resolved_heatmap_y_axis if heatmap_axes_are_explicit else None,
+            orientation_heatmap_x_axis=resolved_heatmap_x_axis
+            if heatmap_axes_are_explicit
+            else None,
+            orientation_heatmap_y_axis=resolved_heatmap_y_axis
+            if heatmap_axes_are_explicit
+            else None,
             orientation_grid_filters=orientation_grid_filters,
             orientation_filter_x_min=orientation_filter_x_min,
             orientation_filter_x_max=orientation_filter_x_max,
@@ -2052,8 +3091,6 @@ def plot_orientation_profiles(
             heatmap_bulk_reference_mode=heatmap_bulk_reference_mode,
             heatmap_bulk_min=heatmap_bulk_min,
             heatmap_bulk_max=heatmap_bulk_max,
-            heatmap_normalize=heatmap_normalize,
-            heatmap_normalization_mode=heatmap_normalization_mode,
             heatmap_log_scale=heatmap_log_scale,
             heatmap_colorbar_enabled=heatmap_colorbar_enabled,
             heatmap_colorbar_label=heatmap_colorbar_label,
@@ -2094,6 +3131,12 @@ def plot_orientation_profiles(
         orientation_filter_distance_max=orientation_filter_distance_max,
     )
     grid_x_axis = resolved_line_x_axis.strip().lower() or "distance"
+    if (
+        normalized_interface_view == "full"
+        and grid_x_axis == first_profile.axis
+        and not grid_filters
+    ):
+        grid_x_axis = "distance"
     use_grid_line = bool(grid_filters) or grid_x_axis != "distance"
     stats_key = {
         "average": "cos_polar_mean" if norm_angle == "polar" else "cos_azimuthal_mean",
@@ -2121,7 +3164,7 @@ def plot_orientation_profiles(
             "orientation_grid_x_axis": grid_x_axis,
             "orientation_grid_filters": dict(grid_filters),
         }
-    for i, profile in enumerate(profiles):
+    for i, (profile, view_name) in enumerate(zip(profiles, profile_view_names)):
         if use_grid_line:
             _x_edges, x, y = orientation_sparse_grid_to_line(
                 profile,
@@ -2133,13 +3176,13 @@ def plot_orientation_profiles(
             x, y = _select_1d_data(profile, norm_component, norm_angle)
         x_arrays.append(x)
         y_arrays.append(y)
-        labels.append(f"cos({norm_angle}) [{i}]" if len(profiles) > 1 else f"cos({norm_angle})")
+        label = f"cos({norm_angle}) [{i}]" if len(profiles) > 1 else f"cos({norm_angle})"
+        labels.append(label if view_name is None else f"{label} ({view_name})")
 
     if series_labels is not None:
         labels = list(series_labels) + labels[len(series_labels) :]
 
     default_title = f"H2O orientation ({norm_angle})"
-    ref_profile = profiles[0]
     default_y = _y_label_for_component(norm_component, norm_angle)
     result = plot_multi_line_series(
         x_arrays,
@@ -2269,46 +3312,15 @@ def _rebin_heatmap_axis(
     return rebinned, np.array(new_edges)
 
 
-def _resolve_heatmap_value_mode(
-    *,
-    heatmap_value_mode: str | None,
-    heatmap_normalization_mode: str | None,
-    heatmap_normalize: bool,
-) -> str:
-    if heatmap_value_mode is not None:
-        candidate_mode = str(heatmap_value_mode).strip().lower()
-        if candidate_mode not in _HEATMAP_VALUE_MODES:
-            raise ValueError(
-                "heatmap_value_mode must be one of: " + ", ".join(_HEATMAP_VALUE_MODES) + "."
-            )
-        return candidate_mode
-
-    legacy_mode = (
-        str(heatmap_normalization_mode).strip().lower()
-        if heatmap_normalization_mode is not None
-        else "global_probability"
-        if heatmap_normalize
-        else "counts"
+def _resolve_heatmap_value_mode(*, heatmap_value_mode: str | None) -> str:
+    candidate = (
+        "raw_counts" if heatmap_value_mode is None else str(heatmap_value_mode).strip().lower()
     )
-    legacy_mapping = {
-        "counts": "raw_counts",
-        "global_probability": "joint_probability_density",
-        "bulk_water_reference": "bulk_relative_enrichment",
-    }
-    if legacy_mode not in legacy_mapping:
+    if candidate not in _HEATMAP_VALUE_MODES:
         raise ValueError(
-            "heatmap_normalization_mode must be one of: "
-            "counts, global_probability, bulk_water_reference."
+            "heatmap_value_mode must be one of: " + ", ".join(_HEATMAP_VALUE_MODES) + "."
         )
-    if heatmap_normalization_mode is not None or heatmap_normalize:
-        warnings.warn(
-            "heatmap_normalize and heatmap_normalization_mode are deprecated; "
-            "use heatmap_value_mode instead. Legacy modes now map to the closest "
-            "scientific value representation.",
-            FutureWarning,
-            stacklevel=3,
-        )
-    return legacy_mapping[legacy_mode]
+    return candidate
 
 
 def _transform_orientation_frequency_heatmap(
@@ -2324,16 +3336,17 @@ def _transform_orientation_frequency_heatmap(
     y_bins = np.asarray(y_edges, dtype=float)
     if count_values.ndim != 2:
         raise ValueError("Orientation heatmap counts must be a two-dimensional matrix.")
-    if x_bins.shape != (count_values.shape[0] + 1,) or y_bins.shape != (
-        count_values.shape[1] + 1,
-    ):
+    if x_bins.shape != (count_values.shape[0] + 1,) or y_bins.shape != (count_values.shape[1] + 1,):
         raise ValueError("Orientation heatmap edges do not match the count matrix.")
     if np.any(~np.isfinite(count_values)) or np.any(count_values < 0.0):
         raise ValueError("Orientation heatmap counts must be finite and non-negative.")
     dx = np.diff(x_bins)
     dy = np.diff(y_bins)
-    if np.any(~np.isfinite(dx)) or np.any(dx <= 0.0) or np.any(~np.isfinite(dy)) or np.any(
-        dy <= 0.0
+    if (
+        np.any(~np.isfinite(dx))
+        or np.any(dx <= 0.0)
+        or np.any(~np.isfinite(dy))
+        or np.any(dy <= 0.0)
     ):
         raise ValueError("Orientation heatmap bin edges must be finite and strictly increasing.")
 
@@ -2379,8 +3392,11 @@ def _transform_orientation_frequency_heatmap(
     if bulk_rows is None:
         raise ValueError("Bulk-relative enrichment requires resolved bulk-reference rows.")
     rows = np.asarray(bulk_rows, dtype=int)
-    if rows.ndim != 1 or rows.size == 0 or np.any(rows < 0) or np.any(
-        rows >= count_values.shape[0]
+    if (
+        rows.ndim != 1
+        or rows.size == 0
+        or np.any(rows < 0)
+        or np.any(rows >= count_values.shape[0])
     ):
         raise ValueError("Bulk-relative enrichment requires valid bulk-reference rows.")
     bulk_counts = np.sum(count_values[rows, :], axis=0, dtype=float)
@@ -2518,9 +3534,7 @@ def _resolve_bulk_water_reference_rows(
         "resolved_min": resolved_lower,
         "resolved_max": resolved_upper,
         "row_count": int(rows.size),
-        "density_threshold_fraction": (
-            _HEATMAP_BULK_DENSITY_FRACTION if mode == "auto" else None
-        ),
+        "density_threshold_fraction": (_HEATMAP_BULK_DENSITY_FRACTION if mode == "auto" else None),
     }
 
 
@@ -2571,8 +3585,6 @@ def _plot_orientation_heatmap(
     heatmap_bulk_reference_mode: str,
     heatmap_bulk_min: float | None,
     heatmap_bulk_max: float | None,
-    heatmap_normalize: bool,
-    heatmap_normalization_mode: str | None,
     heatmap_log_scale: bool,
     heatmap_colorbar_label: str | None,
     heatmap_colorbar_label_size: int | None,
@@ -2599,8 +3611,6 @@ def _plot_orientation_heatmap(
     """Render a 2-D heatmap of orientation frequency vs distance."""
     value_mode = _resolve_heatmap_value_mode(
         heatmap_value_mode=heatmap_value_mode,
-        heatmap_normalization_mode=heatmap_normalization_mode,
-        heatmap_normalize=heatmap_normalize,
     )
     grid_filters = _orientation_grid_filters_from_plot_kwargs(
         orientation_grid_filters=orientation_grid_filters,
@@ -2660,7 +3670,7 @@ def _plot_orientation_heatmap(
                 raise ValueError(
                     "Orientation sparse-grid heatmaps require compatible grid edges across "
                     "all enabled profiles."
-            )
+                )
             heatmap_sum += extra_sum
             heatmap_count += extra_count
 

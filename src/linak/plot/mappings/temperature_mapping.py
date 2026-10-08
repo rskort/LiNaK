@@ -70,7 +70,9 @@ def resolve_temperature_plot_mapping(
         else temperature_profile_to_plot_data_contract(profile)
     )
     resolved_mapping = (
-        mapping if mapping is not None else temperature_plot_options_to_view_mapping(time_axis=time_axis)
+        mapping
+        if mapping is not None
+        else temperature_plot_options_to_view_mapping(time_axis=time_axis)
     )
     resolved_mapping = replace(
         resolved_mapping,

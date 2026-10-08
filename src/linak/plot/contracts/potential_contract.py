@@ -95,9 +95,7 @@ def potential_profiles_to_plot_data_contract(profiles: Sequence[object]) -> Plot
 
     first_profile = profiles[0] if profiles else None
     source_path = (
-        ""
-        if first_profile is None
-        else str(getattr(first_profile, "source_path", "")).strip()
+        "" if first_profile is None else str(getattr(first_profile, "source_path", "")).strip()
     )
     record_length = (
         None

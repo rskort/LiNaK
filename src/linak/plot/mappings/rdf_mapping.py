@@ -5,7 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Any
 
-from ..contracts.rdf_contract import default_rdf_plot_data_contract, rdf_profile_to_plot_data_contract
+from ..contracts.rdf_contract import (
+    default_rdf_plot_data_contract,
+    rdf_profile_to_plot_data_contract,
+)
 from ..data_contract import (
     PLOT_VIEW_1D_LINE,
     PlotDataContract,
@@ -54,7 +57,9 @@ def resolve_rdf_plot_mapping(
     resolved_contract = (
         contract
         if contract is not None
-        else default_rdf_plot_data_contract() if profile is None else rdf_profile_to_plot_data_contract(profile)
+        else default_rdf_plot_data_contract()
+        if profile is None
+        else rdf_profile_to_plot_data_contract(profile)
     )
     resolved_mapping = mapping if mapping is not None else rdf_plot_options_to_view_mapping()
     resolved_mapping = replace(

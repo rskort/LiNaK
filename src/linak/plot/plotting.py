@@ -12,6 +12,7 @@ import sys
 from typing import Any
 
 import matplotlib
+import matplotlib.colors as mcolors
 import numpy as np
 
 from ..analysis.statistics import (
@@ -199,7 +200,13 @@ def default_series_colors(count: int) -> list[str]:
     if prop_cycle is not None:
         by_key = prop_cycle.by_key()
         raw_colors = by_key.get("color", [])
-        colors = [str(item).strip() for item in raw_colors if str(item).strip()]
+        # A style's color cycle may contain RGB(A) tuples, not only strings.
+        # Stringifying tuples produces invalid Matplotlib color specifications.
+        colors = [
+            item.strip() if isinstance(item, str) else mcolors.to_hex(item)
+            for item in raw_colors
+            if not isinstance(item, str) or item.strip()
+        ]
 
     if not colors:
         colors = [DEFAULT_PLOT_STYLE.line_color]
@@ -587,11 +594,6 @@ def _describe_error_provenance(
         return (
             "Computed from saved per-frame g(r) values in bins with finite expected counts. "
             "It measures frame-to-frame variation in the RDF."
-        )
-    if normalized_analysis == "msd":
-        return (
-            "Computed from saved per-lag squared-displacement samples across the selected atoms. "
-            "Only sample-based uncertainty is available for MSD."
         )
     if normalized_analysis == "orientation":
         if family == "block":
@@ -3992,14 +3994,10 @@ def plot_multi_line_series(
             legend_obj.get_title().set_color(style.font_color)
         auto_x_lim, auto_y_lim = _axes_artist_auto_limits(ax)
         requested_x_window = (
-            x_lim
-            if x_lim is not None and any(bound is not None for bound in x_lim[:2])
-            else None
+            x_lim if x_lim is not None and any(bound is not None for bound in x_lim[:2]) else None
         )
         requested_y_window = (
-            y_lim
-            if y_lim is not None and any(bound is not None for bound in y_lim[:2])
-            else None
+            y_lim if y_lim is not None and any(bound is not None for bound in y_lim[:2]) else None
         )
         constrain_auto_x = requested_y_window is not None and (
             x_lim is None or any(bound is None for bound in x_lim[:2])

@@ -1,3 +1,6 @@
+from __future__ import annotations
+from matplotlib.axes import Axes
+
 import json
 import inspect
 import logging
@@ -23,7 +26,6 @@ from linak.analysis.density import (
     estimate_surface_position,
     load_density_profile,
     load_density_grid_profiles,
-    load_density_heatmap_profiles,
     load_density_profiles,
     normalize_backend_name,
     save_density_profile,
@@ -65,9 +67,15 @@ def _split_raw_species_density_frame() -> Atoms:
 
 def _mixed_oh_frame() -> Atoms:
     symbols = [
-        "O", "H", "H", "H",
-        "O", "H", "H",
-        "O", "H",
+        "O",
+        "H",
+        "H",
+        "H",
+        "O",
+        "H",
+        "H",
+        "O",
+        "H",
         "O",
         "H",
     ]
@@ -176,7 +184,9 @@ def test_compute_all_density_profiles_default_is_all_outputs():
         pbc=True,
     )
 
-    profiles = compute_all_density_profiles([frame], species="O", bin_width=1.0, surface_mode="none")
+    profiles = compute_all_density_profiles(
+        [frame], species="O", bin_width=1.0, surface_mode="none"
+    )
 
     line_profiles = [profile for profile in profiles if isinstance(profile, DensityProfile)]
     grid_profiles = [profile for profile in profiles if isinstance(profile, DensityGridProfile)]
@@ -227,7 +237,9 @@ def test_compute_all_density_profiles_3d_scope_selects_sparse_grid_only():
     )
 
     assert not any(isinstance(profile, DensityProfile) for profile in profiles)
-    assert [profile.species for profile in profiles if isinstance(profile, DensityGridProfile)] == ["O"]
+    assert [profile.species for profile in profiles if isinstance(profile, DensityGridProfile)] == [
+        "O"
+    ]
 
 
 def test_compute_all_density_profiles_heatmap_output_is_migration_error():
@@ -276,9 +288,7 @@ def test_compute_all_density_profiles_matches_single_profile_results_for_one_spe
         if isinstance(profile, DensityProfile)
     }
     heatmap_profiles = {
-        profile.plane: profile
-        for profile in profiles
-        if isinstance(profile, DensityHeatmapProfile)
+        profile.plane: profile for profile in profiles if isinstance(profile, DensityHeatmapProfile)
     }
     grid_profiles = [profile for profile in profiles if isinstance(profile, DensityGridProfile)]
 
@@ -295,7 +305,13 @@ def test_compute_all_density_profiles_matches_single_profile_results_for_one_spe
         np.testing.assert_allclose(actual.bin_edges, expected.bin_edges)
         np.testing.assert_allclose(actual.density, expected.density)
         np.testing.assert_allclose(actual.number_density, expected.number_density)
-        np.testing.assert_allclose(actual.series_statistics["density"].sample_sem, expected.series_statistics["density"].sample_sem, equal_nan=True)
+        assert actual.series_statistics is not None
+        assert expected.series_statistics is not None
+        np.testing.assert_allclose(
+            actual.series_statistics["density"].sample_sem,
+            expected.series_statistics["density"].sample_sem,
+            equal_nan=True,
+        )
 
     z_distance = line_profiles[("z", "axis")]
     np.testing.assert_allclose(z_distance.density, line_profiles[("z", "axis")].density)
@@ -318,7 +334,9 @@ def test_compute_all_density_profiles_supports_h2o_selection():
         pbc=True,
     )
 
-    profiles = compute_all_density_profiles([frame], species="H2O", surface_mode="none", bin_width=1.0)
+    profiles = compute_all_density_profiles(
+        [frame], species="H2O", surface_mode="none", bin_width=1.0
+    )
 
     assert len(profiles) == 5
     assert all(profile.species == "mol:H2O" for profile in profiles)
@@ -429,7 +447,16 @@ def test_compute_all_density_profiles_all_deduplicates_unsplit_raw_species():
         and profile.coordinate_mode == "axis"
     }
 
-    assert {"H", "Na", "O", "Pt", "species:Pt", "species:Pt_top", "mol:H", "mol:H2O"} <= z_line_species
+    assert {
+        "H",
+        "Na",
+        "O",
+        "Pt",
+        "species:Pt",
+        "species:Pt_top",
+        "mol:H",
+        "mol:H2O",
+    } <= z_line_species
     assert "species:H" not in z_line_species
     assert "species:Na" not in z_line_species
     assert "species:O" not in z_line_species
@@ -574,6 +601,7 @@ def test_density_grid_to_line_profile_filters_plotted_z_without_cropping_bins():
     assert filtered_line.bin_edges[0] == pytest.approx(0.0)
     assert filtered_line.bin_edges[-1] == pytest.approx(10.0)
     assert float(np.nansum(filtered_line.entities_per_frame)) == pytest.approx(1.0)
+    assert filtered_line.entities_per_frame is not None
     assert np.all(filtered_line.entities_per_frame[5:] == pytest.approx(0.0))
 
 
@@ -608,6 +636,7 @@ def test_density_grid_to_heatmap_profile_filters_distance_before_xy_projection()
     assert filtered_map.y_bin_edges[0] == pytest.approx(0.0)
     assert filtered_map.y_bin_edges[-1] == pytest.approx(10.0)
     assert float(np.nansum(filtered_map.number_density)) == pytest.approx(200.0)
+    assert filtered_map.number_density is not None
     assert filtered_map.number_density[0, 0] == pytest.approx(200.0)
     assert filtered_map.number_density[6, 6] == pytest.approx(0.0)
 
@@ -643,7 +672,9 @@ def test_density_grid_to_heatmap_profile_normalizes_by_selected_distance_width()
         filters={"distance": (0.0, 5.0)},
     )
 
+    assert full_map.number_density is not None
     assert full_map.number_density[0, 0] == pytest.approx(100.0)
+    assert filtered_map.number_density is not None
     assert filtered_map.number_density[0, 0] == pytest.approx(200.0)
 
 
@@ -683,6 +714,7 @@ def test_density_grids_to_averaged_heatmap_profile_uses_total_frame_weighting():
 
     assert averaged.n_frames == 4
     assert averaged.species == "Na averaged X/Y"
+    assert averaged.number_density is not None
     assert averaged.number_density[0, 0] == pytest.approx(2000.0)
 
 
@@ -1557,10 +1589,12 @@ def test_save_density_profile_writes_nested_surface_metadata(tmp_path):
     assert "surface_position" not in metadata
     assert "surface_position_std" not in metadata
     assert metadata["surface"]["position"] == pytest.approx(profile.surface_position)
+    assert profile.surface_estimate is not None
     assert metadata["surface"]["mode"] == profile.surface_estimate.mode
 
     loaded = load_density_profile(out, axis="z", species="H")
     assert loaded.surface_position == pytest.approx(profile.surface_position)
+    assert loaded.surface_estimate is not None
     assert loaded.surface_estimate is not None
     assert loaded.surface_estimate.mode == profile.surface_estimate.mode
 
@@ -1654,7 +1688,7 @@ def test_save_density_profiles_writes_hdf5_collection(tmp_path):
     assert [profile.species for profile in loaded] == ["H", "O", "mol:H2O"]
 
 
-def test_load_density_profile_rejects_missing_v1_bin_width_metadata(tmp_path):
+def test_load_density_profile_rejects_obsolete_schema_before_loading_payload(tmp_path):
     out = tmp_path / "old_density.h5"
     with h5py.File(out, "w") as handle:
         handle.attrs["linak_format"] = "linak-hdf5"
@@ -1678,7 +1712,7 @@ def test_load_density_profile_rejects_missing_v1_bin_width_metadata(tmp_path):
         handle.create_dataset("counts_per_frame", data=np.array([1.0, 2.0], dtype=float))
         handle.create_dataset("density", data=np.array([0.1, 0.2], dtype=float))
 
-    with pytest.raises(ValueError, match="missing required v1 metadata bin_width_A"):
+    with pytest.raises(ValueError, match="Recompute"):
         load_density_profile(out, axis="z", species="O")
 
 
@@ -1839,12 +1873,17 @@ def test_density_surface_logging_explains_reference_estimator_and_fill(caplog):
         surface_elements=["Pt"],
     )
 
-    assert "Surface reference along Z: user-selected Pt reference atoms." in caplog.text
-    assert (
-        "Surface estimator along Z: layered top-layer median on Z using Pt reference atoms"
-        in caplog.text
-    )
-    assert "frame-wise surface alignment was unavailable" in caplog.text
+    summaries = [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("Surface layout:")
+    ]
+    assert len(summaries) == 1
+    assert "requested=auto, resolved=axis" in summaries[0]
+    assert "coordinate=raw Z axis" in summaries[0]
+    assert "reason=auto_default_top_untrusted" in summaries[0]
+    assert "top_method=layered_top_layer_median" in caplog.text
+    assert "frame-wise surface alignment was unavailable" not in caplog.text
 
 
 def test_estimate_surface_reference_exposes_provenance_and_confidence():
@@ -1927,7 +1966,7 @@ def test_normalize_backend_name_suggests_on_typo():
 def test_plot_density_profile_defaults_to_distance_axis(monkeypatch):
     from linak.analysis.density import DensityProfile, plot_density_profile
 
-    captured = {}
+    captured: dict[str, object] = {}
 
     def _fake_plot_line_series(x, y, **kwargs):
         captured["x"] = x
@@ -1960,7 +1999,7 @@ def test_plot_density_profile_defaults_to_distance_axis(monkeypatch):
 def test_plot_density_profile_preserves_explicit_blank_axis_labels(monkeypatch):
     from linak.analysis.density import DensityProfile, plot_density_profile
 
-    captured = {}
+    captured: dict[str, object] = {}
 
     def _fake_plot_line_series(_x, _y, **kwargs):
         captured["x_label"] = kwargs["x_label"]
@@ -2022,10 +2061,12 @@ def test_plot_density_profile_renders_uncertainty_from_saved_statistics(tmp_path
         capture_state=capture_state,
     )
 
+    assert isinstance(capture_state["series_error_summaries"], dict)
     summary = capture_state["series_error_summaries"]["series"]
     assert summary["status"] == "ok"
     assert summary["stat"] == "sample_sem"
     assert summary["statistics_mode"] == "direct"
+    assert isinstance(capture_state["series_available_error_stats"], dict)
     assert capture_state["series_available_error_stats"]["series"] == [
         "sample_std",
         "sample_sem",
@@ -2037,7 +2078,7 @@ def test_plot_density_profile_renders_uncertainty_from_saved_statistics(tmp_path
 def test_plot_density_profiles_use_g_per_cm3_without_si_scaling(monkeypatch):
     from linak.analysis.density import DensityProfile, plot_density_profiles
 
-    captured = {}
+    captured: dict[str, object] = {}
 
     def _fake_plot_multi_line_series(x_series, y_series, _labels, **kwargs):
         captured["x_series"] = x_series
@@ -2074,7 +2115,9 @@ def test_plot_density_profiles_use_g_per_cm3_without_si_scaling(monkeypatch):
     )
 
     plot_density_profiles([profile_a, profile_b], show=False)
+    assert isinstance(captured["x_series"], list)
     np.testing.assert_allclose(captured["x_series"][0], np.array([0.25]))
+    assert isinstance(captured["y_series"], list)
     np.testing.assert_allclose(captured["y_series"][0], np.array([1.0e15]))
     np.testing.assert_allclose(captured["y_series"][1], np.array([2.0e15]))
     assert captured["x_label"] == "Distance to the surface ($\\mathrm{\\AA}$)"
@@ -2084,7 +2127,7 @@ def test_plot_density_profiles_use_g_per_cm3_without_si_scaling(monkeypatch):
 def test_plot_density_profiles_auto_limits_ignore_all_zero_tails(monkeypatch):
     from linak.analysis.density import DensityProfile, plot_density_profiles
 
-    captured = {}
+    captured: dict[str, object] = {}
 
     def _fake_plot_multi_line_series(_x_series, _y_series, _labels, **kwargs):
         captured["x_lim"] = kwargs["x_lim"]
@@ -2125,9 +2168,11 @@ def test_plot_density_profiles_auto_limits_ignore_all_zero_tails(monkeypatch):
     plot_density_profiles([profile_a, profile_b], show=False, x_mode="axis")
 
     assert captured["x_lim"] is not None
+    assert isinstance(captured["x_lim"], (list, tuple))
     assert captured["x_lim"][1] > 40.0
     assert captured["x_lim"][1] < 43.0
     assert captured["y_lim"] is not None
+    assert isinstance(captured["y_lim"], (list, tuple))
     assert captured["y_lim"][0] == pytest.approx(0.0)
     assert captured["y_lim"][1] > 2.0
 
@@ -2135,7 +2180,7 @@ def test_plot_density_profiles_auto_limits_ignore_all_zero_tails(monkeypatch):
 def test_plot_density_profile_supports_number_density(monkeypatch):
     from linak.analysis.density import DensityProfile, plot_density_profile
 
-    captured = {}
+    captured: dict[str, object] = {}
 
     def _fake_plot_line_series(x, y, **kwargs):
         captured["x"] = x
@@ -2167,7 +2212,7 @@ def test_plot_density_profile_supports_number_density(monkeypatch):
 def test_plot_density_profile_supports_explicit_cartesian_x_modes(monkeypatch):
     from linak.analysis.density import DensityProfile, plot_density_profile
 
-    captured = {}
+    captured: dict[str, object] = {}
 
     def _fake_plot_line_series(x, _y, **kwargs):
         captured["x"] = x
@@ -2196,14 +2241,16 @@ def test_plot_density_profile_supports_explicit_cartesian_x_modes(monkeypatch):
 def test_plot_density_profiles_explicit_cartesian_x_mode_filters_to_matching_axis(monkeypatch):
     from linak.analysis.density import DensityProfile, plot_density_profiles
 
-    captured = {}
+    captured: dict[str, object] = {}
 
     def _fake_plot_multi_line_series(x_series, y_series, labels, **kwargs):
         captured["series_count"] = len(x_series)
         captured["labels"] = labels
         return None
 
-    monkeypatch.setattr("linak.analysis.density.plot_multi_line_series", _fake_plot_multi_line_series)
+    monkeypatch.setattr(
+        "linak.analysis.density.plot_multi_line_series", _fake_plot_multi_line_series
+    )
 
     profiles = [
         DensityProfile(
@@ -2237,7 +2284,7 @@ def test_plot_density_profiles_explicit_cartesian_x_mode_filters_to_matching_axi
 def test_plot_line_series_keeps_explicit_y_limits_when_ticks_are_outside_range():
     from linak.plot.plotting import plot_line_series
 
-    captured = {}
+    captured: dict[str, object] = {}
     plot_line_series(
         np.array([0.0, 1.0, 2.0], dtype=float),
         np.array([0.2, 0.6, 1.0], dtype=float),
@@ -2250,6 +2297,7 @@ def test_plot_line_series_keeps_explicit_y_limits_when_ticks_are_outside_range()
         capture_state=captured,
     )
 
+    assert isinstance(captured["y_lim"], (list, tuple))
     assert captured["y_lim"][0] == pytest.approx(0.0)
 
 
@@ -2429,13 +2477,15 @@ def test_plot_line_series_capture_state_includes_line_artists(monkeypatch):
     )
 
     assert captured.get("line_artists")
+    assert isinstance(captured["axes"], Axes)
+    assert isinstance(captured["line_artists"], list)
     assert captured["line_artists"][0] in captured["axes"].lines
 
 
 def test_plot_multi_line_series_hides_disabled_series_in_capture_state():
     from linak.plot.plotting import plot_multi_line_series
 
-    captured = {}
+    captured: dict[str, object] = {}
     plot_multi_line_series(
         [np.array([0.0, 1.0], dtype=float), np.array([0.0, 1.0], dtype=float)],
         [np.array([1.0, 2.0], dtype=float), np.array([2.0, 3.0], dtype=float)],
@@ -2449,13 +2499,14 @@ def test_plot_multi_line_series_hides_disabled_series_in_capture_state():
     )
 
     assert captured["series_labels"] == ["run-b"]
+    assert isinstance(captured["line_colors"], list)
     assert len(captured["line_colors"]) == 1
 
 
 def test_plot_multi_line_series_accepts_advanced_line_kwargs():
     from linak.plot.plotting import plot_multi_line_series
 
-    captured = {}
+    captured: dict[str, object] = {}
     plot_multi_line_series(
         [np.array([0.0, 1.0], dtype=float), np.array([0.0, 1.0], dtype=float)],
         [np.array([1.0, 2.0], dtype=float), np.array([2.0, 3.0], dtype=float)],
@@ -2475,7 +2526,7 @@ def test_plot_multi_line_series_accepts_advanced_line_kwargs():
 def test_plot_multi_line_series_preserves_explicit_labels_and_legend_font_size():
     from linak.plot.plotting import plot_multi_line_series, with_style_overrides
 
-    captured = {}
+    captured: dict[str, object] = {}
     plot_multi_line_series(
         [np.array([0.0, 1.0], dtype=float), np.array([0.0, 1.0], dtype=float)],
         [np.array([1.0, 2.0], dtype=float), np.array([2.0, 3.0], dtype=float)],
@@ -2496,7 +2547,7 @@ def test_plot_multi_line_series_preserves_explicit_labels_and_legend_font_size()
 def test_plot_multi_line_series_applies_axis_label_padding():
     from linak.plot.plotting import plot_multi_line_series
 
-    captured = {}
+    captured: dict[str, object] = {}
     plot_multi_line_series(
         [np.array([0.0, 1.0], dtype=float)],
         [np.array([1.0, 2.0], dtype=float)],
@@ -2731,6 +2782,7 @@ def test_plot_density_profiles_autoscale_to_visible_normalized_data(tmp_path):
     )
 
     ax = capture_state["axes"]
+    assert isinstance(ax, Axes)
     bottom, top = ax.get_ylim()
     assert bottom >= -0.2
     assert top <= 1.2
@@ -2786,18 +2838,14 @@ def test_fixed_slab_no_fallback_with_explicit_surface_options():
         mode="auto",
         include_fixed_surface_atoms=False,
     )
-    estimate = estimate_surface_reference(
-        frames, "z", surface_options=explicit_opts
-    )
+    estimate = estimate_surface_reference(frames, "z", surface_options=explicit_opts)
     assert estimate is None
 
 
 def test_fixed_slab_direct_include_fixed_no_fallback_tag():
     """When user directly sets include_fixed_surface_atoms=True, it works without fallback tag."""
     frames = _make_fixed_slab_frames()
-    estimate = estimate_surface_reference(
-        frames, "z", include_fixed_surface_atoms=True
-    )
+    estimate = estimate_surface_reference(frames, "z", include_fixed_surface_atoms=True)
     assert estimate is not None
     assert estimate.position is not None
     assert estimate.diagnostics.effective_options["include_fixed_surface_atoms"] is True
@@ -2956,7 +3004,7 @@ def test_compute_density_profiles_logs_one_compact_info_summary(caplog):
     ]
     assert len(summary_messages) == 1
     assert "3 profile(s): H, O, mol:H2O;" in summary_messages[0]
-    assert any("Binning 3 density profiles." in message for message in info_messages)
+    assert not any("Binning 3 density profiles." in message for message in info_messages)
     assert not any("Selected " in message for message in info_messages)
     assert not any("Density mode:" in message for message in info_messages)
     assert not any("Density normalization path" in message for message in info_messages)
@@ -2986,12 +3034,10 @@ def test_compute_all_density_profiles_logs_single_pass_and_aggregate_binning(cap
     info_messages = [
         record.getMessage() for record in caplog.records if record.levelno == logging.INFO
     ]
-    assert any("Single-pass selection complete:" in message for message in info_messages)
-    assert any(
-        "Binning 15 density outputs (4 1D profiles + 1 sparse grid profiles per species selection)."
-        in message
-        for message in info_messages
-    )
+    assert not any("Single-pass selection complete:" in message for message in info_messages)
+    assert sum("Density compute summary:" in message for message in info_messages) == 1
+    assert sum("Density binning summary:" in message for message in info_messages) == 1
+    assert not any("Density sparse grid for" in message for message in info_messages)
 
 
 def test_compute_all_density_profiles_skips_bounds_progress_for_cell_line_outputs(monkeypatch):
@@ -3012,7 +3058,12 @@ def test_compute_all_density_profiles_skips_bounds_progress_for_cell_line_output
             unit: str = "it",
             **_kwargs: object,
         ) -> None:
-            self.record = {"desc": desc, "total": total, "unit": unit, "count": 0}
+            self.record: dict[str, object] = {
+                "desc": desc,
+                "total": total,
+                "unit": unit,
+                "count": 0,
+            }
             progress_records.append(self.record)
 
         def __enter__(self):
@@ -3022,7 +3073,8 @@ def test_compute_all_density_profiles_skips_bounds_progress_for_cell_line_output
             return None
 
         def update(self, n: int = 1) -> None:
-            self.record["count"] = int(self.record["count"]) + n
+            assert isinstance(self.record["count"], int)
+            self.record["count"] += n
 
     monkeypatch.setattr(density_module, "ProgressBar", RecordingProgressBar)
 
@@ -3059,7 +3111,12 @@ def test_compute_all_density_profiles_grids_prepare_bounds_before_binning(monkey
             unit: str = "it",
             **_kwargs: object,
         ) -> None:
-            self.record = {"desc": desc, "total": total, "unit": unit, "count": 0}
+            self.record: dict[str, object] = {
+                "desc": desc,
+                "total": total,
+                "unit": unit,
+                "count": 0,
+            }
             progress_records.append(self.record)
 
         def __enter__(self):
@@ -3069,7 +3126,8 @@ def test_compute_all_density_profiles_grids_prepare_bounds_before_binning(monkey
             return None
 
         def update(self, n: int = 1) -> None:
-            self.record["count"] = int(self.record["count"]) + n
+            assert isinstance(self.record["count"], int)
+            self.record["count"] += n
 
     monkeypatch.setattr(density_module, "ProgressBar", RecordingProgressBar)
 
@@ -3135,8 +3193,12 @@ def test_density_grid_nonzero_limit_rejects_oversized_sparse_output():
 
 
 def test_density_profile_fast_statistics_match_reference_moments():
-    frame1 = Atoms("OO", positions=[[0.0, 0.0, 0.10], [0.0, 0.0, 1.10]], cell=[10.0, 10.0, 10.0], pbc=True)
-    frame2 = Atoms("OO", positions=[[0.0, 0.0, 0.20], [0.0, 0.0, 1.20]], cell=[20.0, 10.0, 10.0], pbc=True)
+    frame1 = Atoms(
+        "OO", positions=[[0.0, 0.0, 0.10], [0.0, 0.0, 1.10]], cell=[10.0, 10.0, 10.0], pbc=True
+    )
+    frame2 = Atoms(
+        "OO", positions=[[0.0, 0.0, 0.20], [0.0, 0.0, 1.20]], cell=[20.0, 10.0, 10.0], pbc=True
+    )
     frames = [frame1, frame2]
     oxygen_mass_g = float(frame1.get_masses()[0]) * 1.66053906660e-24
     selected_per_frame = [
@@ -3173,6 +3235,7 @@ def test_density_profile_fast_statistics_match_reference_moments():
     sample_matrix = np.vstack(sample_rows)
     number_matrix = np.vstack(number_rows)
 
+    assert profile.series_statistics is not None
     np.testing.assert_allclose(profile.series_statistics["density"].sample_n, np.array([2, 2]))
     np.testing.assert_allclose(
         profile.series_statistics["density"].sample_sem,
@@ -3187,8 +3250,12 @@ def test_density_profile_fast_statistics_match_reference_moments():
 
 
 def test_density_heatmap_fast_accumulation_matches_reference_histogram2d():
-    frame1 = Atoms("OO", positions=[[0.1, 0.2, 0.0], [1.1, 1.2, 0.0]], cell=[5.0, 5.0, 5.0], pbc=True)
-    frame2 = Atoms("OO", positions=[[0.2, 0.1, 0.0], [1.2, 1.1, 0.0]], cell=[5.0, 5.0, 5.0], pbc=True)
+    frame1 = Atoms(
+        "OO", positions=[[0.1, 0.2, 0.0], [1.1, 1.2, 0.0]], cell=[5.0, 5.0, 5.0], pbc=True
+    )
+    frame2 = Atoms(
+        "OO", positions=[[0.2, 0.1, 0.0], [1.2, 1.1, 0.0]], cell=[5.0, 5.0, 5.0], pbc=True
+    )
     frames = [frame1, frame2]
     oxygen_mass_g = float(frame1.get_masses()[0]) * 1.66053906660e-24
     selected_xy_per_frame = [
@@ -3215,11 +3282,15 @@ def test_density_heatmap_fast_accumulation_matches_reference_histogram2d():
     mass_sum = np.zeros_like(profile.density)
     entity_sum = np.zeros_like(profile.number_density)
     for points, masses in zip(selected_xy_per_frame, selected_masses_per_frame):
-        mass_hist, _, _ = np.histogram2d(points[:, 0], points[:, 1], bins=(x_edges, y_edges), weights=masses)
+        mass_hist, _, _ = np.histogram2d(
+            points[:, 0], points[:, 1], bins=(x_edges, y_edges), weights=masses
+        )
         entity_hist, _, _ = np.histogram2d(points[:, 0], points[:, 1], bins=(x_edges, y_edges))
         mass_sum += mass_hist
         entity_sum += entity_hist
-    slice_volume = (125.0 / 5.0) * (1.0 * 1.0)
+    # Each Cartesian x/y bin is a 1 Å² column through the 5 Å z extent.
+    # The former cross-section-times-bin-area expression had units of Å⁴.
+    slice_volume = 1.0 * 1.0 * 5.0
     reference_density = ((mass_sum / slice_volume) / len(frames)) / 1.0e-24
     reference_number_density = ((entity_sum / slice_volume) / len(frames)) / 1.0e-3
 
@@ -3255,7 +3326,7 @@ def test_unify_number_density_units_single_unit():
 def test_plot_density_profiles_filters_by_axis_in_x_mode(monkeypatch):
     from linak.analysis.density import DensityProfile, plot_density_profiles
 
-    captured = {}
+    captured: dict[str, object] = {}
 
     def _fake_plot_multi(x_series, y_series, labels, **kwargs):
         captured["labels"] = labels
@@ -3298,14 +3369,151 @@ def test_plot_density_profiles_filters_by_axis_in_x_mode(monkeypatch):
     ]
 
     plot_density_profiles(profiles, show=False, x_mode="z", quantity="mass")
+    assert isinstance(captured["labels"], list)
     assert len(captured["labels"]) == 1
     assert captured["labels"][0] == "O"
+
+
+def test_plot_density_profiles_compare_interfaces_expands_series_state(monkeypatch):
+    from linak.analysis.density import DensityProfile, plot_density_profiles
+
+    captured: dict[str, object] = {}
+
+    def _fake_plot_multi(x_series, y_series, labels, **kwargs):
+        captured["x_series"] = x_series
+        captured["y_series"] = y_series
+        captured["labels"] = labels
+        captured.update(kwargs)
+        return None
+
+    monkeypatch.setattr("linak.analysis.density.plot_multi_line_series", _fake_plot_multi)
+    profile = DensityProfile(
+        axis="z",
+        species="O",
+        bin_edges=np.array([0.0, 1.0, 2.0]),
+        bin_centers=np.array([0.5, 1.5]),
+        counts_per_frame=np.array([2.0, 4.0]),
+        density=np.array([2.0, 4.0]),
+        units="g/cm^3",
+        n_frames=1,
+        coordinate_mode="distance",
+        surface_position=0.0,
+        interface_view="folded",
+        top_density=np.array([1.0, 3.0]),
+        bottom_density=np.array([3.0, 5.0]),
+        top_counts_per_frame=np.array([1.0, 3.0]),
+        bottom_counts_per_frame=np.array([3.0, 5.0]),
+    )
+
+    plot_density_profiles(
+        [profile],
+        show=False,
+        interface_view="all",
+        series_ids=["oxygen"],
+        series_labels=["Oxygen"],
+        line_colors=["#123456"],
+        series_enabled=[True],
+        render_series_descriptors=[{"series_id": "oxygen", "default_label": "Oxygen"}],
+        series_overrides_by_id={"oxygen": {"line_width": 2.0}},
+    )
+
+    assert isinstance(captured["y_series"], list)
+    assert [values.tolist() for values in captured["y_series"]] == [
+        [2.0, 4.0],
+        [1.0, 3.0],
+        [3.0, 5.0],
+    ]
+    assert captured["series_ids"] == [
+        "oxygen::interface:folded",
+        "oxygen::interface:top",
+        "oxygen::interface:bottom",
+    ]
+    assert isinstance(captured["labels"], list)
+    assert len(set(captured["labels"])) == 3
+    assert captured["line_colors"] == ["#123456"] * 3
+    assert isinstance(captured["series_line_kwargs"], list)
+    assert [entry["linestyle"] for entry in captured["series_line_kwargs"]] == [
+        "-",
+        "--",
+        ":",
+    ]
+    assert isinstance(captured["render_series_descriptors"], list)
+    assert [item["interface_view"] for item in captured["render_series_descriptors"]] == [
+        "folded",
+        "top",
+        "bottom",
+    ]
+    assert [item["source_series_id"] for item in captured["render_series_descriptors"]] == captured[
+        "series_ids"
+    ]
+    assert [item["parent_series_id"] for item in captured["render_series_descriptors"]] == [
+        "oxygen"
+    ] * 3
+
+
+def test_plot_density_profiles_compare_interfaces_renders_expanded_curves(tmp_path):
+    from linak.analysis.density import DensityProfile, plot_density_profiles
+
+    profile = DensityProfile(
+        axis="z",
+        species="O",
+        bin_edges=np.asarray([0.0, 1.0, 2.0]),
+        bin_centers=np.asarray([0.5, 1.5]),
+        counts_per_frame=np.asarray([2.0, 4.0]),
+        density=np.asarray([2.0, 4.0]),
+        units="g/cm^3",
+        n_frames=1,
+        coordinate_mode="distance",
+        interface_view="folded",
+        top_density=np.asarray([1.0, 3.0]),
+        bottom_density=np.asarray([3.0, 5.0]),
+    )
+    capture: dict[str, object] = {}
+
+    plot_density_profiles(
+        [profile],
+        output=tmp_path / "interfaces.png",
+        show=False,
+        interface_view="all",
+        series_ids=["oxygen"],
+        render_series_descriptors=[
+            {
+                "series_id": "oxygen",
+                "source_series_id": "oxygen",
+                "default_label": "Oxygen",
+            }
+        ],
+        series_overrides_by_id={"oxygen": {"enabled": True}},
+        capture_state=capture,
+    )
+
+    assert isinstance(capture["axes"], Axes)
+    assert len(capture["axes"].lines) == 3
+
+
+def test_plot_density_profiles_side_view_rejects_raw_axis_profile():
+    from linak.analysis.density import DensityProfile, plot_density_profiles
+
+    profile = DensityProfile(
+        axis="z",
+        species="O",
+        bin_edges=np.asarray([0.0, 1.0]),
+        bin_centers=np.asarray([0.5]),
+        counts_per_frame=np.asarray([1.0]),
+        density=np.asarray([1.0]),
+        units="g/cm^3",
+        n_frames=1,
+        coordinate_mode="axis",
+    )
+
+    with pytest.raises(ValueError, match="requires a surface-distance profile"):
+        plot_density_profiles([profile], show=False, interface_view="top")
 
 
 def test_plot_density_profiles_unifies_number_density_units_across_atom_and_molecule(monkeypatch):
     from linak.analysis.density import DensityProfile, plot_density_profiles
 
-    captured = {}
+    captured: dict[str, object] = {}
 
     def _fake_plot_multi(x_series, y_series, labels, **kwargs):
         captured["y_label"] = kwargs["y_label"]
@@ -3344,4 +3552,5 @@ def test_plot_density_profiles_unifies_number_density_units_across_atom_and_mole
     ]
 
     plot_density_profiles(profiles, show=False, x_mode="distance", quantity="number")
+    assert isinstance(captured["y_label"], str)
     assert "entities" in captured["y_label"]

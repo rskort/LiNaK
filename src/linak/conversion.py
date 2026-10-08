@@ -7,6 +7,16 @@ file type, and the family-specific reader/writer path needed for execution.
 
 from __future__ import annotations
 
+from .cell_geometry import (
+    cell_angles,
+    cell_lengths,
+    cell_matrix,
+    compact_cell,
+    log_cell_geometry_summary,
+    same_cell,
+    wrap_trajectory_frames,
+)
+
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -26,7 +36,7 @@ from .cube_io import (
     save_cube_datasets,
     write_cube_file,
 )
-from .progress import ProgressBar
+from .progress import ProgressBar, progress_stage
 
 LOGGER = logging.getLogger(__name__)
 
@@ -79,6 +89,9 @@ class ConversionResult:
 
     output_path: Path
     metadata_notes: tuple[str, ...] = ()
+    frame_count: int | None = None
+    min_atoms_per_frame: int | None = None
+    max_atoms_per_frame: int | None = None
 
 
 @dataclass(frozen=True)
@@ -105,7 +118,7 @@ class TrajectoryConversionOptions:
     """Trajectory-specific conversion options currently used by `apply convert`."""
 
     input_path: str | Path | None = None
-    cell: tuple[float, float, float] | None = None
+    cell: Any | None = None
     select: str | None = None
     x_range: str | None = None
     y_range: str | None = None
@@ -114,6 +127,7 @@ class TrajectoryConversionOptions:
     keep_molecules_intact: bool = False
     output_was_default: bool = False
     atom_aliases: tuple[str, ...] = ()
+    compression_profile: str = "fast"
 
 
 @dataclass(frozen=True)
@@ -144,9 +158,9 @@ class TrajectorySelectionResolution:
 
 @dataclass(frozen=True)
 class CubeConversionOptions:
-    """Placeholder for future cube-specific conversion controls."""
+    """Cube-specific conversion controls."""
 
-    pass
+    compression_profile: str = "fast"
 
 
 @dataclass(frozen=True)
@@ -395,11 +409,7 @@ class ConversionRegistry:
                 target_file_type=request.target_file_type,
                 family=request.family,
             )
-        if (
-            uniquify_default_output
-            and output_path is None
-            and request.target_path.exists()
-        ):
+        if uniquify_default_output and output_path is None and request.target_path.exists():
             return ConversionRequest(
                 source_path=request.source_path,
                 target_path=_unique_path_with_numeric_suffix(request.target_path),
@@ -457,7 +467,9 @@ class ConversionRegistry:
                 target_selector=None,
             )
         else:
-            target_id = handler.raw_target_file_type if no_convert else handler.default_target_file_type
+            target_id = (
+                handler.raw_target_file_type if no_convert else handler.default_target_file_type
+            )
             if target_id is None:
                 raise ValueError(
                     f"--no-convert is not supported for the '{family}' file family because "
@@ -465,9 +477,7 @@ class ConversionRegistry:
                 )
             target_type = self._file_types_by_id[target_id]
         if target_type.family != family:
-            raise ValueError(
-                f"Cannot combine {family} sources into a {target_type.family} target."
-            )
+            raise ValueError(f"Cannot combine {family} sources into a {target_type.family} target.")
         target_path = (
             Path(output_path).expanduser().resolve()
             if output_path is not None
@@ -532,6 +542,8 @@ class ConversionRegistry:
         """Execute one combine request through the family handler."""
 
         return self._combine_handlers[request.family].combine(request, options)
+
+
 def _default_cube_hdf5_output_path(source: str | Path) -> Path:
     source_path = Path(source).expanduser().resolve()
     source_text = str(source_path).lower()
@@ -696,7 +708,7 @@ def _trajectory_step_values(frames: list[Any], *, stride_md: int | None) -> np.n
 def _resolve_selection_time_and_step_metadata(
     frames: list[Any],
     *,
-    source_path: Path,
+    stored_metadata: Any,
 ) -> tuple[float | None, int | None]:
     """Resolve trajectory selection time/step metadata from frames and stored source metadata."""
 
@@ -713,12 +725,6 @@ def _resolve_selection_time_and_step_metadata(
     if frame_timestep_fs is not None and trajectory_stride_md is not None:
         return frame_timestep_fs, trajectory_stride_md
 
-    from .trajectory.io import is_linak_trajectory_hdf5, read_trajectory_hdf5_metadata
-
-    if not is_linak_trajectory_hdf5(source_path):
-        return frame_timestep_fs, trajectory_stride_md
-
-    stored_metadata = read_trajectory_hdf5_metadata(source_path)
     if stored_metadata is None:
         return frame_timestep_fs, trajectory_stride_md
 
@@ -729,9 +735,8 @@ def _resolve_selection_time_and_step_metadata(
             stored_metadata.md_timestep_fs is not None
             and stored_metadata.trajectory_stride_md is not None
         ):
-            frame_timestep_fs = (
-                float(stored_metadata.md_timestep_fs)
-                * float(stored_metadata.trajectory_stride_md)
+            frame_timestep_fs = float(stored_metadata.md_timestep_fs) * float(
+                stored_metadata.trajectory_stride_md
             )
 
     if trajectory_stride_md is None and stored_metadata.trajectory_stride_md is not None:
@@ -818,7 +823,9 @@ def resolve_trajectory_selection(
             if start_pct < 0.0 or end_pct <= start_pct or end_pct > 100.0:
                 raise ValueError("Percentage range selection must satisfy 0 <= start < end <= 100.")
             start_frame = min(total - 1, max(0, int(np.floor(total * (start_pct / 100.0)))))
-            stop_frame_exclusive = min(total, max(start_frame + 1, int(np.floor(total * (end_pct / 100.0)))))
+            stop_frame_exclusive = min(
+                total, max(start_frame + 1, int(np.floor(total * (end_pct / 100.0))))
+            )
         elif unit == "ps":
             assert time_values_fs is not None
             start_time_fs = float(_parse_selection_token(request.start_token)[0]) * 1000.0
@@ -862,15 +869,9 @@ def resolve_trajectory_selection(
 
 
 def _unique_path_with_numeric_suffix(path: Path) -> Path:
-    stem = path.stem
-    suffix = path.suffix
-    parent = path.parent
-    counter = 2
-    candidate = path
-    while candidate.exists():
-        candidate = parent / f"{stem}_{counter}{suffix}"
-        counter += 1
-    return candidate
+    from .analysis.output_naming import unique_output_path
+
+    return unique_output_path(path)
 
 
 def _raw_trajectory_detector(path: Path) -> bool:
@@ -902,9 +903,17 @@ def _collect_trajectory_conversion_metadata(
         extract_frame_timestep_fs_from_simulation_input,
         find_unique_simulation_input,
     )
-    from .trajectory.io import TrajectoryStoredMetadata
+    from .trajectory.io import (
+        TrajectoryStoredMetadata,
+        is_linak_trajectory_hdf5,
+        read_trajectory_hdf5_metadata,
+    )
 
     trajectory_path = Path(trajectory).expanduser().resolve()
+    if input_path is None and is_linak_trajectory_hdf5(trajectory_path):
+        metadata = read_trajectory_hdf5_metadata(trajectory_path)
+        if metadata is not None:
+            return metadata, ["input metadata source: stored trajectory metadata"]
     resolved_input: Path | None = None
     metadata_notes: list[str] = []
     if input_path is not None:
@@ -928,7 +937,7 @@ def _collect_trajectory_conversion_metadata(
         return None, metadata_notes
 
     input_format = resolved_input.suffix.lower().lstrip(".") or None
-    cell_angstrom: tuple[float, float, float] | None = None
+    cell_angstrom: Any | None = None
     frame_timestep_fs: float | None = None
     md_timestep_fs: float | None = None
     trajectory_stride_md: int | None = None
@@ -938,7 +947,7 @@ def _collect_trajectory_conversion_metadata(
         cell_angstrom = extract_cell_from_simulation_input(resolved_input)
         metadata_notes.append(
             "cell metadata: found "
-            f"({cell_angstrom[0]:.6g} {cell_angstrom[1]:.6g} {cell_angstrom[2]:.6g} Angstrom)"
+            f"({cell_lengths(cell_angstrom)[0]:.6g} {cell_lengths(cell_angstrom)[1]:.6g} {cell_lengths(cell_angstrom)[2]:.6g} Angstrom)"
         )
     except Exception as exc:
         metadata_notes.append(f"cell metadata: not found ({exc})")
@@ -979,7 +988,7 @@ def _collect_trajectory_conversion_metadata(
         fixed_atoms_source="simulation input" if fixed_atom_indices else None,
     )
     if (
-        metadata.cell_angstrom is None
+        metadata.cell_geometry is None
         and metadata.frame_timestep_fs is None
         and not metadata.fixed_atom_indices
     ):
@@ -990,13 +999,17 @@ def _collect_trajectory_conversion_metadata(
 def _frames_have_usable_periodic_cell(frames: list[Any]) -> bool:
     if not frames:
         return False
-    lengths = np.asarray(frames[0].cell.lengths(), dtype=float)
-    return lengths.shape == (3,) and np.all(np.isfinite(lengths)) and np.all(lengths > 0.0)
+    for frame in frames:
+        matrix = np.asarray(frame.cell, dtype=float)
+        if matrix.shape != (3, 3) or not np.all(np.isfinite(matrix)):
+            return False
+        if abs(float(np.linalg.det(matrix))) <= 0.0:
+            return False
+    return True
 
 
 def _cell_lengths_from_frame(frame: Any) -> tuple[float, float, float]:
-    lengths = np.asarray(frame.cell.lengths(), dtype=float)
-    return (float(lengths[0]), float(lengths[1]), float(lengths[2]))
+    return compact_cell(frame.cell)
 
 
 def _conversion_metadata_with_frame_cell_fallback(
@@ -1004,9 +1017,19 @@ def _conversion_metadata_with_frame_cell_fallback(
     frames: list[Any],
     metadata_notes: list[str],
 ) -> Any | None:
-    if metadata is not None and metadata.cell_angstrom is not None:
+    if metadata is not None and metadata.cell_geometry is not None:
         return metadata
     if not _frames_have_usable_periodic_cell(frames):
+        return metadata
+
+    reference_cell = np.asarray(frames[0].cell, dtype=float)
+    if any(
+        not np.allclose(np.asarray(frame.cell), reference_cell, rtol=0.0, atol=1e-9)
+        for frame in frames[1:]
+    ):
+        metadata_notes.append(
+            "cell metadata: frame cells vary; preserving the authoritative per-frame matrices"
+        )
         return metadata
 
     from .trajectory.io import TrajectoryStoredMetadata
@@ -1015,12 +1038,14 @@ def _conversion_metadata_with_frame_cell_fallback(
     frame_cell = _cell_lengths_from_frame(frames[0])
     metadata_notes.append(
         "cell metadata: using periodic cell embedded in trajectory "
-        f"({frame_cell[0]:.6g} {frame_cell[1]:.6g} {frame_cell[2]:.6g} Angstrom)"
+        f"({cell_lengths(frame_cell)[0]:.6g} {cell_lengths(frame_cell)[1]:.6g} {cell_lengths(frame_cell)[2]:.6g} Angstrom)"
     )
     base = metadata if metadata is not None else TrajectoryStoredMetadata()
     return replace(
         base,
-        cell_angstrom=frame_cell,
+        cell_angstrom=cell_lengths(frame_cell),
+        cell_matrix_angstrom=tuple(map(tuple, cell_matrix(frame_cell))),
+        cell_angles_deg=cell_angles(frame_cell),
         cell_source=base.cell_source or "trajectory frame cell",
     )
 
@@ -1038,10 +1063,22 @@ def _apply_fixed_constraints_from_conversion_metadata(
         frame.set_constraint(FixAtoms(indices=indices))
 
 
+def _conversion_metadata_pbc(metadata: Any) -> tuple[bool, bool, bool]:
+    """Resolve boundary flags declared by a simulation input."""
+    input_path = getattr(metadata, "input_path", None)
+    if input_path is not None and Path(input_path).suffix.lower() == ".lmp":
+        from .trajectory.lammps import parse_lammps_input
+
+        boundary = parse_lammps_input(input_path).boundary
+        if boundary is not None:
+            return boundary
+    return True, True, True
+
+
 def _conversion_metadata_with_pbc_cache(
     metadata: Any | None,
     *,
-    cell: tuple[float, float, float],
+    cell: Any,
 ) -> Any:
     from dataclasses import replace
     from .trajectory.io import TrajectoryStoredMetadata
@@ -1050,7 +1087,9 @@ def _conversion_metadata_with_pbc_cache(
     return replace(
         base,
         pbc_applied=True,
-        pbc_cell_angstrom=cell,
+        pbc_cell_angstrom=cell_lengths(cell),
+        pbc_cell_matrix_angstrom=tuple(map(tuple, cell_matrix(cell))),
+        pbc_cell_angles_deg=cell_angles(cell),
         pbc_source=base.cell_source or "conversion cell",
         coordinate_basis="pbc-wrapped",
     )
@@ -1065,15 +1104,18 @@ def _conversion_metadata_with_surface_cache(
 
     base = metadata if metadata is not None else TrajectoryStoredMetadata()
     try:
-        from .analysis.density import estimate_surface_reference
+        from .analysis.surface import estimate_surface_layout_reference
 
-        estimate = estimate_surface_reference(
+        estimate = estimate_surface_layout_reference(
             frames,
             axis="z",
+            surface_layout="auto",
             mode="auto",
             surface_elements=None,
             include_fixed_surface_atoms=False,
             surface_options=None,
+            _summary_source="conversion cache build",
+            _report_progress=True,
         )
     except Exception as exc:
         LOGGER.warning("Conversion surface cache unavailable: %s", exc)
@@ -1082,6 +1124,7 @@ def _conversion_metadata_with_surface_cache(
             surface_cache_status="unavailable",
             surface_cache_axis="z",
             surface_cache_mode="auto",
+            surface_cache_layout="auto",
             surface_cache_elements=None,
             surface_cache_include_fixed_surface_atoms=False,
             surface_cache_rough_surface_envelope_A=None,
@@ -1097,6 +1140,7 @@ def _conversion_metadata_with_surface_cache(
             surface_cache_status="unavailable",
             surface_cache_axis="z",
             surface_cache_mode="auto",
+            surface_cache_layout="auto",
             surface_cache_elements=None,
             surface_cache_include_fixed_surface_atoms=False,
             surface_cache_rough_surface_envelope_A=None,
@@ -1105,12 +1149,12 @@ def _conversion_metadata_with_surface_cache(
             surface_cache_estimate=None,
         )
 
-    LOGGER.info("Cached default per-frame surface positions during conversion (axis=Z, mode=auto).")
     return replace(
         base,
         surface_cache_status="available",
         surface_cache_axis="z",
         surface_cache_mode="auto",
+        surface_cache_layout="auto",
         surface_cache_elements=None,
         surface_cache_include_fixed_surface_atoms=False,
         surface_cache_rough_surface_envelope_A=None,
@@ -1124,7 +1168,11 @@ def _describe_trajectory_conversion_plan(
     request: ConversionRequest,
     options: TrajectoryConversionOptions | None,
 ) -> list[str]:
-    selection_request = None if options is None or options.select is None else parse_trajectory_selection(options.select)
+    selection_request = (
+        None
+        if options is None or options.select is None
+        else parse_trajectory_selection(options.select)
+    )
     plan = [
         f"input trajectory: {request.source_path}",
         f"source family: {request.family}",
@@ -1145,15 +1193,15 @@ def _describe_trajectory_conversion_plan(
         if filter_parts:
             plan.append(
                 "spatial filter: "
-                + ", ".join(filter_parts)
+                + ", ".join(part for part in filter_parts if part is not None)
                 + f", keep_molecules_intact={bool(options.keep_molecules_intact)}"
             )
     if request.target_file_type == "trajectory_hdf5":
         stored_metadata, metadata_notes = _collect_trajectory_conversion_metadata(
             request.source_path,
-            input_path=None if options is None else (
-                None if options.input_path is None else str(options.input_path)
-            ),
+            input_path=None
+            if options is None
+            else (None if options.input_path is None else str(options.input_path)),
         )
         plan.extend(
             [
@@ -1183,7 +1231,6 @@ def _convert_trajectory_request(
     options: TrajectoryConversionOptions | None,
 ) -> ConversionResult:
     from dataclasses import replace
-    from .pbc import apply_pbc_to_frames
     from .trajectory.spatial_filter import (
         append_output_name_suffix,
         apply_spatial_filter,
@@ -1191,94 +1238,126 @@ def _convert_trajectory_request(
     )
     from .trajectory.io import TrajectoryStoredMetadata, read_trajectory, write_trajectory
 
-    frames = read_trajectory(
-        request.source_path,
-        atom_aliases=options.atom_aliases if options is not None else None,
-    )
-    selection_resolution: TrajectorySelectionResolution | None = None
-    if options is not None and options.select:
-        selection_request = parse_trajectory_selection(options.select)
-        frame_timestep_fs, trajectory_stride_md = _resolve_selection_time_and_step_metadata(
-            frames,
-            source_path=request.source_path,
+    LOGGER.info("Convert %s -> %s", request.source_path, request.target_path)
+    with progress_stage(LOGGER, "Read trajectory"):
+        frames = read_trajectory(
+            request.source_path,
+            atom_aliases=options.atom_aliases if options is not None else None,
         )
-        selection_resolution = resolve_trajectory_selection(
-            frames,
-            selection_request,
-            frame_timestep_fs=frame_timestep_fs,
-            trajectory_stride_md=trajectory_stride_md,
-        )
-        frames = frames[
-            selection_resolution.start_frame : selection_resolution.stop_frame_exclusive
-        ]
-    spatial_filter_result = None
-    if options is not None:
-        spatial_options = spatial_filter_options_from_mapping(
-            {
-                "x_range": options.x_range,
-                "y_range": options.y_range,
-                "z_range": options.z_range,
-                "distance_range": options.distance_range,
-                "keep_molecules_intact": options.keep_molecules_intact,
-            },
-            surface_axis="z",
-            surface_mode="auto",
-            surface_elements=None,
-            include_fixed_surface_atoms=False,
-            rough_surface_envelope_A=None,
-        )
-        if spatial_options.active:
-            spatial_filter_result = apply_spatial_filter(
-                frames,
-                options=spatial_options,
-                precomputed_surface_estimate=None,
-            )
-            frames = spatial_filter_result.frames
-            if options.output_was_default and spatial_filter_result.filename_suffix:
-                request = ConversionRequest(
-                    source_path=request.source_path,
-                    target_path=append_output_name_suffix(
-                        request.target_path,
-                        spatial_filter_result.filename_suffix,
-                    ),
-                    source_file_type=request.source_file_type,
-                    target_file_type=request.target_file_type,
-                    family=request.family,
-                )
-    if request.target_file_type == "trajectory_hdf5":
+    with progress_stage(LOGGER, "Prepare cell/selection"):
         stored_metadata, metadata_notes = _collect_trajectory_conversion_metadata(
             request.source_path,
-            input_path=None if options is None else (
-                None if options.input_path is None else str(options.input_path)
-            ),
+            input_path=None
+            if options is None or options.input_path is None
+            else str(options.input_path),
         )
-        stored_metadata = _conversion_metadata_with_frame_cell_fallback(
-            stored_metadata,
-            frames,
-            metadata_notes,
-        )
-        _apply_fixed_constraints_from_conversion_metadata(frames, stored_metadata)
-        if stored_metadata is not None and stored_metadata.cell_angstrom is not None:
-            conversion_cell = stored_metadata.cell_angstrom
-            frames = apply_pbc_to_frames(frames, conversion_cell)
-            stored_metadata = _conversion_metadata_with_pbc_cache(
+        if options is not None and options.cell is not None:
+            for frame in frames:
+                frame.set_cell(cell_matrix(options.cell))
+                frame.set_pbc(True)
+        elif any(abs(np.linalg.det(frame.cell)) == 0 for frame in frames):
+            context = stored_metadata
+            if context is not None and context.cell_geometry is not None:
+                context_pbc = _conversion_metadata_pbc(context)
+                for frame in frames:
+                    if abs(np.linalg.det(frame.cell)) == 0:
+                        frame.set_cell(cell_matrix(context.cell_geometry))
+                        frame.set_pbc(context_pbc)
+        selection_resolution: TrajectorySelectionResolution | None = None
+        if options is not None and options.select:
+            selection_request = parse_trajectory_selection(options.select)
+            frame_timestep_fs, trajectory_stride_md = _resolve_selection_time_and_step_metadata(
+                frames,
+                stored_metadata=stored_metadata,
+            )
+            selection_resolution = resolve_trajectory_selection(
+                frames,
+                selection_request,
+                frame_timestep_fs=frame_timestep_fs,
+                trajectory_stride_md=trajectory_stride_md,
+            )
+            frames = frames[
+                selection_resolution.start_frame : selection_resolution.stop_frame_exclusive
+            ]
+        spatial_filter_result = None
+        if options is not None:
+            spatial_options = spatial_filter_options_from_mapping(
+                {
+                    "x_range": options.x_range,
+                    "y_range": options.y_range,
+                    "z_range": options.z_range,
+                    "distance_range": options.distance_range,
+                    "keep_molecules_intact": options.keep_molecules_intact,
+                },
+                surface_axis="z",
+                surface_mode="auto",
+                surface_elements=None,
+                include_fixed_surface_atoms=False,
+                rough_surface_envelope_A=None,
+            )
+            if spatial_options.active:
+                spatial_filter_result = apply_spatial_filter(
+                    frames,
+                    options=spatial_options,
+                    precomputed_surface_estimate=None,
+                )
+                frames = list(spatial_filter_result.frames)
+                if options.output_was_default and spatial_filter_result.filename_suffix:
+                    request = ConversionRequest(
+                        source_path=request.source_path,
+                        target_path=append_output_name_suffix(
+                            request.target_path,
+                            spatial_filter_result.filename_suffix,
+                        ),
+                        source_file_type=request.source_file_type,
+                        target_file_type=request.target_file_type,
+                        family=request.family,
+                    )
+        if request.target_file_type == "trajectory_hdf5":
+            stored_metadata = _conversion_metadata_with_frame_cell_fallback(
                 stored_metadata,
-                cell=conversion_cell,
+                frames,
+                metadata_notes,
             )
-            LOGGER.info(
-                "Applied PBC during conversion using cell %.6g %.6g %.6g Angstrom.",
-                conversion_cell[0],
-                conversion_cell[1],
-                conversion_cell[2],
-            )
-        else:
-            LOGGER.info("PBC conversion cache unavailable: no valid cell metadata found.")
-        stored_metadata = _conversion_metadata_with_surface_cache(stored_metadata, frames)
+            if options is not None and options.cell is not None:
+                stored_metadata = replace(
+                    stored_metadata or TrajectoryStoredMetadata(),
+                    cell_angstrom=cell_lengths(options.cell),
+                    cell_matrix_angstrom=tuple(map(tuple, cell_matrix(options.cell))),
+                    cell_angles_deg=cell_angles(options.cell),
+                    cell_source="explicit --cell",
+                )
+            _apply_fixed_constraints_from_conversion_metadata(frames, stored_metadata)
+            if stored_metadata is not None and stored_metadata.cell_geometry is not None:
+                conversion_cell = stored_metadata.cell_geometry
+                frames = wrap_trajectory_frames(frames, conversion_cell)
+                stored_metadata = _conversion_metadata_with_pbc_cache(
+                    stored_metadata,
+                    cell=conversion_cell,
+                )
+            else:
+                if _frames_have_usable_periodic_cell(frames):
+                    frames = wrap_trajectory_frames(frames)
+                else:
+                    LOGGER.info("PBC conversion cache unavailable: no valid cell metadata found.")
+            if _frames_have_usable_periodic_cell(frames):
+                log_cell_geometry_summary(
+                    frames,
+                    logger=LOGGER,
+                    context="Conversion",
+                    surface_axis="z",
+                    source=(
+                        None
+                        if stored_metadata is None
+                        else stored_metadata.cell_source or "trajectory frames"
+                    ),
+                )
+    if request.target_file_type == "trajectory_hdf5":
+        with progress_stage(LOGGER, "Build surface cache"):
+            stored_metadata = _conversion_metadata_with_surface_cache(stored_metadata, frames)
         if selection_resolution is not None:
             base_metadata = (
-                stored_metadata
-                if stored_metadata is not None
-                else TrajectoryStoredMetadata()
+                stored_metadata if stored_metadata is not None else TrajectoryStoredMetadata()
             )
             stored_metadata = replace(
                 base_metadata,
@@ -1295,9 +1374,7 @@ def _convert_trajectory_request(
             )
         if spatial_filter_result is not None:
             base_metadata = (
-                stored_metadata
-                if stored_metadata is not None
-                else TrajectoryStoredMetadata()
+                stored_metadata if stored_metadata is not None else TrajectoryStoredMetadata()
             )
             stored_metadata = replace(
                 base_metadata,
@@ -1306,29 +1383,44 @@ def _convert_trajectory_request(
                 spatial_filter_metadata=spatial_filter_result.metadata,
             )
         for note in metadata_notes:
-            LOGGER.info("%s", note)
+            LOGGER.debug("%s", note)
+        with progress_stage(LOGGER, "Write HDF5"):
+            converted_path = write_trajectory(
+                frames,
+                request.target_path,
+                source_path=request.source_path,
+                source_format=request.source_path.suffix.lower().lstrip("."),
+                metadata=stored_metadata,
+                compression_profile=("fast" if options is None else options.compression_profile),
+            )
+        return ConversionResult(
+            output_path=converted_path,
+            metadata_notes=tuple(metadata_notes),
+            frame_count=len(frames),
+            min_atoms_per_frame=min(map(len, frames)),
+            max_atoms_per_frame=max(map(len, frames)),
+        )
+    with progress_stage(LOGGER, "Write trajectory"):
         converted_path = write_trajectory(
             frames,
             request.target_path,
             source_path=request.source_path,
             source_format=request.source_path.suffix.lower().lstrip("."),
-            metadata=stored_metadata,
+            metadata=(
+                None
+                if spatial_filter_result is None
+                else TrajectoryStoredMetadata(
+                    spatial_filter_metadata=spatial_filter_result.metadata,
+                )
+            ),
+            compression_profile=("fast" if options is None else options.compression_profile),
         )
-        return ConversionResult(output_path=converted_path, metadata_notes=tuple(metadata_notes))
-    converted_path = write_trajectory(
-        frames,
-        request.target_path,
-        source_path=request.source_path,
-        source_format=request.source_path.suffix.lower().lstrip("."),
-        metadata=(
-            None
-            if spatial_filter_result is None
-            else TrajectoryStoredMetadata(
-                spatial_filter_metadata=spatial_filter_result.metadata,
-            )
-        ),
+    return ConversionResult(
+        output_path=converted_path,
+        frame_count=len(frames),
+        min_atoms_per_frame=min(map(len, frames)),
+        max_atoms_per_frame=max(map(len, frames)),
     )
-    return ConversionResult(output_path=converted_path, metadata_notes=())
 
 
 def _trajectory_combine_metadata(request: CombineRequest) -> Any:
@@ -1346,26 +1438,14 @@ def _trajectory_combine_metadata(request: CombineRequest) -> Any:
     )
 
 
-def _metadata_consistent_tuple(
-    values: list[tuple[float, float, float] | None],
-    *,
-    label: str,
-) -> tuple[float, float, float] | None:
+def _metadata_consistent_tuple(values, *, label):
     present = [value for value in values if value is not None]
-    if not present:
+    if not present or len(present) != len(values):
         return None
-    reference = np.asarray(present[0], dtype=float)
-    for candidate in present[1:]:
-        if not np.allclose(np.asarray(candidate, dtype=float), reference, rtol=0.0, atol=1.0e-12):
-            raise ValueError(
-                f"Cannot combine trajectories with inconsistent {label}: "
-                f"{present[0]} vs {candidate}."
-            )
-    if len(present) != len(values):
-        raise ValueError(
-            f"Cannot combine trajectories when some sources define {label} and others do not."
-        )
-    return tuple(float(value) for value in reference)
+    if any(not same_cell(candidate, present[0]) for candidate in present[1:]):
+        LOGGER.info("Combined sources have different %s; preserving per-frame cells.", label)
+        return None
+    return compact_cell(present[0])
 
 
 def _metadata_consistent_scalar(
@@ -1425,7 +1505,9 @@ def _resolve_combined_trajectory_metadata(
     from .trajectory.io import TrajectoryStoredMetadata
 
     metadata_notes: list[str] = []
-    explicit_input = None if options is None or options.input_path is None else str(options.input_path)
+    explicit_input = (
+        None if options is None or options.input_path is None else str(options.input_path)
+    )
     explicit_cell = None if options is None else options.cell
     if explicit_input is not None:
         stored_metadata, source_notes = _collect_trajectory_conversion_metadata(
@@ -1437,28 +1519,32 @@ def _resolve_combined_trajectory_metadata(
         if explicit_cell is not None:
             base = replace(
                 base,
-                cell_angstrom=tuple(float(value) for value in explicit_cell),
+                cell_angstrom=cell_lengths(explicit_cell),
+                cell_matrix_angstrom=tuple(map(tuple, cell_matrix(explicit_cell))),
+                cell_angles_deg=cell_angles(explicit_cell),
                 cell_source="explicit --cell",
             )
             metadata_notes.append(
                 "cell metadata: explicit "
-                f"({explicit_cell[0]:.6g} {explicit_cell[1]:.6g} {explicit_cell[2]:.6g} Angstrom)"
+                f"({cell_lengths(explicit_cell)[0]:.6g} {cell_lengths(explicit_cell)[1]:.6g} {cell_lengths(explicit_cell)[2]:.6g} Angstrom)"
             )
         resolved = _conversion_metadata_with_frame_cell_fallback(base, frames, metadata_notes)
         return resolved, metadata_notes
 
     source_metadatas: list[Any | None] = []
     for source_path in request.source_paths:
-        metadata, source_notes = _collect_trajectory_conversion_metadata(source_path, input_path=None)
+        metadata, source_notes = _collect_trajectory_conversion_metadata(
+            source_path, input_path=None
+        )
         source_metadatas.append(metadata)
         for note in source_notes:
             metadata_notes.append(f"{source_path.name}: {note}")
 
     cell_angstrom = (
-        tuple(float(value) for value in explicit_cell)
+        compact_cell(explicit_cell)
         if explicit_cell is not None
         else _metadata_consistent_tuple(
-            [None if metadata is None else metadata.cell_angstrom for metadata in source_metadatas],
+            [None if metadata is None else metadata.cell_geometry for metadata in source_metadatas],
             label="cell metadata",
         )
     )
@@ -1478,16 +1564,17 @@ def _resolve_combined_trajectory_metadata(
         tolerance=1.0e-12,
     )
     trajectory_stride_md = _metadata_consistent_scalar(
-        [None if metadata is None else metadata.trajectory_stride_md for metadata in source_metadatas],
+        [
+            None if metadata is None else metadata.trajectory_stride_md
+            for metadata in source_metadatas
+        ],
         label="trajectory stride metadata",
     )
     fixed_atom_indices = _metadata_consistent_indices(
         [() if metadata is None else metadata.fixed_atom_indices for metadata in source_metadatas],
         label="fixed-atom metadata",
     )
-    fixed_atoms_source = (
-        "auto-detected per-source simulation input" if fixed_atom_indices else None
-    )
+    fixed_atoms_source = "auto-detected per-source simulation input" if fixed_atom_indices else None
     timestep_source = (
         None if frame_timestep_fs is None else "auto-detected per-source simulation input"
     )
@@ -1497,13 +1584,9 @@ def _resolve_combined_trajectory_metadata(
         input_format=None,
         cell_angstrom=cell_angstrom,
         cell_source=cell_source,
-        frame_timestep_fs=(
-            None if frame_timestep_fs is None else float(frame_timestep_fs)
-        ),
+        frame_timestep_fs=(None if frame_timestep_fs is None else float(frame_timestep_fs)),
         md_timestep_fs=None if md_timestep_fs is None else float(md_timestep_fs),
-        trajectory_stride_md=(
-            None if trajectory_stride_md is None else int(trajectory_stride_md)
-        ),
+        trajectory_stride_md=(None if trajectory_stride_md is None else int(trajectory_stride_md)),
         timestep_source=timestep_source,
         fixed_atom_indices=fixed_atom_indices,
         fixed_atoms_source=fixed_atoms_source,
@@ -1545,14 +1628,18 @@ def _describe_trajectory_combine_plan(
     ]
     if request.target_file_type == "trajectory_hdf5":
         if options is not None and options.input_path is not None:
-            plan.append(f"metadata override: explicit --input ({Path(options.input_path).expanduser().resolve()})")
+            plan.append(
+                f"metadata override: explicit --input ({Path(options.input_path).expanduser().resolve()})"
+            )
         elif options is not None and options.cell is not None:
             plan.append(
                 "metadata override: explicit --cell "
-                f"({options.cell[0]:.6g} {options.cell[1]:.6g} {options.cell[2]:.6g} Angstrom)"
+                f"({cell_lengths(options.cell)[0]:.6g} {cell_lengths(options.cell)[1]:.6g} {cell_lengths(options.cell)[2]:.6g} Angstrom)"
             )
         else:
-            plan.append("metadata policy: auto-detect one simulation input per source directory and require consistent resolved settings")
+            plan.append(
+                "metadata policy: auto-detect one simulation input per source directory and require consistent resolved settings"
+            )
     return plan
 
 
@@ -1561,7 +1648,6 @@ def _combine_trajectory_request(
     options: TrajectoryConversionOptions | None,
 ) -> CombineResult:
     from dataclasses import replace
-    from .pbc import apply_pbc_to_frames
     from .trajectory.io import read_trajectory, write_trajectory
 
     combined_frames: list[Any] = []
@@ -1571,7 +1657,25 @@ def _combine_trajectory_request(
         unit="file",
     ) as progress:
         for source_path in request.source_paths:
-            combined_frames.extend(read_trajectory(source_path))
+            source_frames = read_trajectory(source_path)
+            if options is not None and options.cell is not None:
+                for frame in source_frames:
+                    frame.set_cell(cell_matrix(options.cell))
+                    frame.set_pbc(True)
+            else:
+                context, _ = _collect_trajectory_conversion_metadata(
+                    source_path,
+                    input_path=None
+                    if options is None or options.input_path is None
+                    else str(options.input_path),
+                )
+                if context is not None and context.cell_geometry is not None:
+                    context_pbc = _conversion_metadata_pbc(context)
+                    for frame in source_frames:
+                        if abs(np.linalg.det(frame.cell)) == 0:
+                            frame.set_cell(cell_matrix(context.cell_geometry))
+                            frame.set_pbc(context_pbc)
+            combined_frames.extend(source_frames)
             progress.update()
     if not combined_frames:
         raise ValueError("No frames were read from the requested trajectory sources.")
@@ -1584,21 +1688,30 @@ def _combine_trajectory_request(
             frames=combined_frames,
         )
         _apply_fixed_constraints_from_conversion_metadata(combined_frames, resolved_metadata)
-        if resolved_metadata is not None and resolved_metadata.cell_angstrom is not None:
-            combine_cell = resolved_metadata.cell_angstrom
-            combined_frames = apply_pbc_to_frames(combined_frames, combine_cell)
+        if resolved_metadata is not None and resolved_metadata.cell_geometry is not None:
+            combine_cell = resolved_metadata.cell_geometry
+            combined_frames = wrap_trajectory_frames(combined_frames, combine_cell)
             resolved_metadata = _conversion_metadata_with_pbc_cache(
                 resolved_metadata,
                 cell=combine_cell,
             )
-            LOGGER.info(
-                "Applied PBC during combine using cell %.6g %.6g %.6g Angstrom.",
-                combine_cell[0],
-                combine_cell[1],
-                combine_cell[2],
-            )
         else:
-            LOGGER.info("PBC combine cache unavailable: no valid cell metadata found.")
+            if _frames_have_usable_periodic_cell(combined_frames):
+                combined_frames = wrap_trajectory_frames(combined_frames)
+            else:
+                LOGGER.info("PBC combine cache unavailable: no valid cell metadata found.")
+        if _frames_have_usable_periodic_cell(combined_frames):
+            log_cell_geometry_summary(
+                combined_frames,
+                logger=LOGGER,
+                context="Combine",
+                surface_axis="z",
+                source=(
+                    None
+                    if resolved_metadata is None
+                    else resolved_metadata.cell_source or "trajectory frames"
+                ),
+            )
         resolved_metadata = _conversion_metadata_with_surface_cache(
             resolved_metadata,
             combined_frames,
@@ -1609,7 +1722,7 @@ def _combine_trajectory_request(
             _trajectory_combine_metadata(request),
             input_path=None if resolved_metadata is None else resolved_metadata.input_path,
             input_format=None if resolved_metadata is None else resolved_metadata.input_format,
-            cell_angstrom=None if resolved_metadata is None else resolved_metadata.cell_angstrom,
+            cell_angstrom=None if resolved_metadata is None else resolved_metadata.cell_geometry,
             cell_source=None if resolved_metadata is None else resolved_metadata.cell_source,
             frame_timestep_fs=(
                 None if resolved_metadata is None else resolved_metadata.frame_timestep_fs
@@ -1618,7 +1731,9 @@ def _combine_trajectory_request(
             trajectory_stride_md=(
                 None if resolved_metadata is None else resolved_metadata.trajectory_stride_md
             ),
-            timestep_source=None if resolved_metadata is None else resolved_metadata.timestep_source,
+            timestep_source=None
+            if resolved_metadata is None
+            else resolved_metadata.timestep_source,
             fixed_atom_indices=(
                 () if resolved_metadata is None else resolved_metadata.fixed_atom_indices
             ),
@@ -1627,7 +1742,7 @@ def _combine_trajectory_request(
             ),
             pbc_applied=False if resolved_metadata is None else resolved_metadata.pbc_applied,
             pbc_cell_angstrom=(
-                None if resolved_metadata is None else resolved_metadata.pbc_cell_angstrom
+                None if resolved_metadata is None else resolved_metadata.pbc_cell_geometry
             ),
             pbc_source=None if resolved_metadata is None else resolved_metadata.pbc_source,
             coordinate_basis=(
@@ -1641,6 +1756,9 @@ def _combine_trajectory_request(
             ),
             surface_cache_mode=(
                 None if resolved_metadata is None else resolved_metadata.surface_cache_mode
+            ),
+            surface_cache_layout=(
+                None if resolved_metadata is None else resolved_metadata.surface_cache_layout
             ),
             surface_cache_elements=(
                 None if resolved_metadata is None else resolved_metadata.surface_cache_elements
@@ -1674,6 +1792,7 @@ def _combine_trajectory_request(
             source_path=request.source_paths[0],
             source_format=request.target_file_type,
             metadata=metadata,
+            compression_profile=("fast" if options is None else options.compression_profile),
         )
     elif request.target_file_type == "trajectory_xyz":
         _annotate_raw_combined_frames(
@@ -1686,6 +1805,7 @@ def _combine_trajectory_request(
             request.target_path,
             source_path=request.source_paths[0],
             source_format="xyz",
+            compression_profile=("fast" if options is None else options.compression_profile),
         )
     else:
         raise ValueError(
@@ -1718,7 +1838,6 @@ def _combine_cube_request(
     request: CombineRequest,
     options: CubeConversionOptions | None,
 ) -> CombineResult:
-    del options
     if request.target_file_type != "cube_hdf5":
         raise ValueError(
             "LiNaK does not support a clean lossless non-HDF5 combined cube format. "
@@ -1747,6 +1866,7 @@ def _combine_cube_request(
             "combine_linak_version": __version__,
             "combine_total_fields": len(datasets),
         },
+        compression_profile=("fast" if options is None else options.compression_profile),
     )
     return CombineResult(output_path=output_path)
 
@@ -1774,30 +1894,34 @@ def _convert_cube_request(
     request: ConversionRequest,
     options: CubeConversionOptions | None,
 ) -> ConversionResult:
-    del options
-    datasets = (
-        [parse_cube_file(request.source_path)]
-        if request.source_file_type == "cube_file"
-        else load_cube_datasets(request.source_path)
-    )
-    if request.target_file_type == "cube_hdf5":
-        output_path = save_cube_datasets(
-            datasets,
-            request.target_path,
-            additional_metadata={
-                "source_path": str(request.source_path),
-                "source_file_type": request.source_file_type,
-            },
+    with progress_stage(LOGGER, "Read cube"):
+        datasets = (
+            [parse_cube_file(request.source_path)]
+            if request.source_file_type == "cube_file"
+            else load_cube_datasets(request.source_path)
         )
-    elif request.target_file_type == "cube_file":
-        if len(datasets) != 1:
-            raise ValueError(
-                "Cannot reconstruct multiple cube fields into one raw `.cube` file. "
-                "Select one profile or keep the `.cube.h5` container."
+    with progress_stage(
+        LOGGER, "Write HDF5" if request.target_file_type == "cube_hdf5" else "Write cube"
+    ):
+        if request.target_file_type == "cube_hdf5":
+            output_path = save_cube_datasets(
+                datasets,
+                request.target_path,
+                additional_metadata={
+                    "source_path": str(request.source_path),
+                    "source_file_type": request.source_file_type,
+                },
+                compression_profile=("fast" if options is None else options.compression_profile),
             )
-        output_path = write_cube_file(datasets[0], request.target_path)
-    else:
-        raise ValueError(f"Unsupported cube target file type '{request.target_file_type}'.")
+        elif request.target_file_type == "cube_file":
+            if len(datasets) != 1:
+                raise ValueError(
+                    "Cannot reconstruct multiple cube fields into one raw `.cube` file. "
+                    "Select one profile or keep the `.cube.h5` container."
+                )
+            output_path = write_cube_file(datasets[0], request.target_path)
+        else:
+            raise ValueError(f"Unsupported cube target file type '{request.target_file_type}'.")
     return ConversionResult(output_path=output_path)
 
 

@@ -9,7 +9,7 @@ authors:
     orcid: "https://orcid.org/0009-0003-0541-9521"
     affiliation: "Leiden Institute of Chemistry, Leiden University"
 
-version: "0.9.5"
+version: "0.10.0"
 url: "https://github.com/rskort/LiNaK/"
 repository-code: "https://github.com/rskort/LiNaK/"
 license: "Apache-2.0"
@@ -18,7 +18,7 @@ abstract: >
   LiNaK is a Python package for molecular dynamics trajectory analysis,
   visualization, and workflow-oriented data handling. It provides command-line
   and Python interfaces for computing and plotting density profiles,
-  mean-squared displacement, atom-resolved positions, radial distribution
+  atom-resolved positions, radial distribution
   functions, coordination metrics, electrostatic-potential-related quantities,
   and water orientation analyses. LiNaK is designed with particular emphasis on
   electrochemical and interfacial simulation workflows, while remaining
@@ -37,5 +37,4 @@ keywords:
   - CP2K
   - LAMMPS
   - radial distribution function
-  - mean-squared displacement
   - water orientation

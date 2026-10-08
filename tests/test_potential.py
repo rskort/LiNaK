@@ -1,4 +1,5 @@
 from __future__ import annotations
+from matplotlib.axes import Axes
 
 from pathlib import Path
 
@@ -119,51 +120,23 @@ def _write_potential_summary_hdf5(
     cshe: list[float | None],
     status: list[str],
 ) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with h5py.File(path, "w") as handle:
-        handle.attrs["analysis"] = "potential"
-        records = handle.create_group("records")
-        records.create_dataset("id", data=np.asarray(ids, dtype=np.int64))
-        records.create_dataset(
-            "source",
-            data=np.asarray([f"source_{index}" for index in range(len(ids))], dtype=object),
-            dtype=h5py.string_dtype(encoding="utf-8"),
+    from linak.analysis.potential import write_potential_records_csv
+
+    rows = [
+        PotentialRecord(
+            id=identifier,
+            source=f"source_{index}",
+            source_dir=f"dir_{index}",
+            output_out="output.out",
+            efermi_ev=efermi[index],
+            water_bulk_potential_ev=water_bulk[index],
+            electrode_cshe_ev=cshe[index],
+            status=status[index],
+            error=None,
         )
-        records.create_dataset(
-            "source_dir",
-            data=np.asarray([f"dir_{index}" for index in range(len(ids))], dtype=object),
-            dtype=h5py.string_dtype(encoding="utf-8"),
-        )
-        records.create_dataset(
-            "output_out",
-            data=np.asarray(["output.out" for _index in range(len(ids))], dtype=object),
-            dtype=h5py.string_dtype(encoding="utf-8"),
-        )
-        records.create_dataset(
-            "status",
-            data=np.asarray(status, dtype=object),
-            dtype=h5py.string_dtype(encoding="utf-8"),
-        )
-        records.create_dataset(
-            "error",
-            data=np.asarray(["" for _index in range(len(ids))], dtype=object),
-            dtype=h5py.string_dtype(encoding="utf-8"),
-        )
-        records.create_dataset(
-            "efermi_ev",
-            data=np.asarray([np.nan if value is None else value for value in efermi], dtype=float),
-        )
-        records.create_dataset(
-            "water_bulk_potential_ev",
-            data=np.asarray(
-                [np.nan if value is None else value for value in water_bulk],
-                dtype=float,
-            ),
-        )
-        records.create_dataset(
-            "electrode_cshe_ev",
-            data=np.asarray([np.nan if value is None else value for value in cshe], dtype=float),
-        )
+        for index, identifier in enumerate(ids)
+    ]
+    write_potential_records_csv(rows, path, append=False)
 
 
 def _test_cube_header(atom_specs_ang: list[tuple[int, float]], *, nz: int) -> CubeHeader:
@@ -182,6 +155,39 @@ def _test_cube_header(atom_specs_ang: list[tuple[int, float]], *, nz: int) -> Cu
             dtype=float,
         ),
     )
+
+
+@pytest.mark.parametrize("invalid", ["old_schema", "missing_schema", "missing_side", "unaligned"])
+def test_potential_current_schema_rejected_before_payload_read(tmp_path, monkeypatch, invalid):
+    from linak.analysis.potential import load_potential_records, plan_potential_csv_output
+
+    path = tmp_path / "potential.h5"
+    _write_potential_summary_hdf5(
+        path, ids=[1], efermi=[1.0], water_bulk=[2.0], cshe=[0.5], status=["ok"]
+    )
+    with h5py.File(path, "a") as handle:
+        if invalid == "old_schema":
+            handle.attrs["analysis_schema_version"] = 1
+        elif invalid == "missing_schema":
+            del handle.attrs["analysis_schema_version"]
+        elif invalid == "missing_side":
+            del handle["records/water_bulk_potential_bottom_ev"]
+        else:
+            handle["records/electrode_cshe_ev"].resize((2,))
+    original = path.read_bytes()
+
+    def unexpected_read(*args, **kwargs):
+        pytest.fail("Invalid potential table payload must not be read")
+
+    monkeypatch.setattr(h5py.Dataset, "__getitem__", unexpected_read)
+    monkeypatch.setattr(h5py.Dataset, "__array__", unexpected_read)
+    for load in (load_potential_records, load_potential_plot_profiles):
+        with pytest.raises(ValueError, match="Recompute this analysis"):
+            load(path)
+    plan = plan_potential_csv_output(path)
+    assert plan.used_fallback_path
+    assert plan.target_path != path
+    assert path.read_bytes() == original
 
 
 def test_water_bulk_potential_excludes_non_water_z_slice_from_widest_span():
@@ -435,6 +441,7 @@ def test_plot_potential_profiles_rescales_record_id_axis(tmp_path):
     )
 
     assert result is not None
+    assert isinstance(capture_state["axes"], Axes)
     line = capture_state["axes"].lines[0]
     np.testing.assert_allclose(line.get_xdata(), np.array([1.2, 1.4, 1.6]))
     assert capture_state["x_axis_scale"] == pytest.approx(0.2)
@@ -475,7 +482,9 @@ def test_plot_potential_profiles_accepts_generic_single_series_mapping(monkeypat
 
     assert captured["labels"] == ["Fermi"]
     assert captured["series_ids"] == ["efermi_ev"]
+    assert isinstance(captured["x_series"], list)
     np.testing.assert_allclose(captured["x_series"][0], np.array([1.0, 2.0]))
+    assert isinstance(captured["y_series"], list)
     np.testing.assert_allclose(captured["y_series"][0], np.array([1.0, 1.1]))
 
 
@@ -546,7 +555,7 @@ def test_plot_potential_hdf5_non_gui_renders_png(tmp_path):
     assert output.exists()
 
 
-def test_compute_potential_water_bulk_uses_clean_span_when_ion_is_in_water_region(tmp_path):
+def test_compute_potential_rejects_non_topological_water_with_ion(tmp_path):
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     cube = run_dir / "ion-in-water-v_hartree-1_0.cube"
@@ -583,8 +592,9 @@ def test_compute_potential_water_bulk_uses_clean_span_when_ion_is_in_water_regio
     assert rc == 0
     rows = _read_hdf5_rows(output)
     assert len(rows) == 1
-    assert float(rows[0]["water_bulk_potential_ev"]) == pytest.approx(2.0, abs=1e-6)
-    assert float(rows[0]["electrode_cshe_ev"]) == pytest.approx(0.19, abs=1e-3)
+    assert rows[0]["water_bulk_potential_ev"] == ""
+    assert rows[0]["electrode_cshe_ev"] == ""
+    assert rows[0]["status"] != "ok"
 
 
 def test_apply_convert_cube_to_cube_hdf5_and_back(tmp_path):
@@ -886,8 +896,10 @@ def test_compute_potential_writes_and_appends_hdf5(tmp_path):
     assert row_2["output_out"] == "output.out"
 
     assert float(row_1["efermi_ev"]) == pytest.approx(1.0, abs=1e-3)
-    assert float(row_1["water_bulk_potential_ev"]) == pytest.approx(2.0, abs=1e-6)
-    assert float(row_1["electrode_cshe_ev"]) == pytest.approx(0.19, abs=1e-3)
+    # This fixture contains isolated H/O atoms, not complete H2O molecules.
+    assert row_1["water_bulk_potential_ev"] == ""
+    assert row_1["electrode_cshe_ev"] == ""
+    assert row_1["status"] != "ok"
     assert float(row_2["efermi_ev"]) == pytest.approx(2.0, abs=1e-3)
 
     rc_append = main(
@@ -916,7 +928,7 @@ def test_compute_potential_shows_loading_progress_for_raw_inputs(tmp_path, monke
     output_h5 = tmp_path / "potentials.potential.h5"
 
     class RecordingProgressBar:
-        instances: list["RecordingProgressBar"] = []
+        instances: list[RecordingProgressBar] = []
 
         def __init__(self, *, desc, total=None, unit="it", **_kwargs):
             self.desc = desc
@@ -1000,7 +1012,7 @@ def test_compute_potential_incompatible_hdf5_schema_uses_fallback_file(tmp_path)
     with h5py.File(output_h5, "r") as handle:
         assert handle.attrs["analysis"] == "unexpected"
 
-    fallback_path = tmp_path / "potentials.linak.potential.h5"
+    fallback_path = tmp_path / "potentials_1.potential.h5"
     assert fallback_path.exists()
     assert not (tmp_path / "potentials.linak.potential_1.h5").exists()
     fallback_rows = _read_hdf5_rows(fallback_path)
@@ -1014,7 +1026,7 @@ def test_compute_potential_incompatible_hdf5_schema_versions_fallback_before_ana
     cube = _write_potential_case(run_dir, fermi_au=0.0367493036)
 
     output_h5 = tmp_path / "potentials.potential.h5"
-    fallback_path = tmp_path / "potentials.linak.potential.h5"
+    fallback_path = tmp_path / "potentials_1.potential.h5"
     with h5py.File(output_h5, "w") as handle:
         handle.attrs["linak_format"] = "linak-hdf5"
         handle.attrs["analysis"] = "unexpected"
@@ -1034,7 +1046,7 @@ def test_compute_potential_incompatible_hdf5_schema_versions_fallback_before_ana
         ]
     )
 
-    versioned_fallback = tmp_path / "potentials.linak_1.potential.h5"
+    versioned_fallback = tmp_path / "potentials_2.potential.h5"
     assert rc == 0
     assert versioned_fallback.exists()
     assert not (tmp_path / "potentials.linak.potential_1.h5").exists()

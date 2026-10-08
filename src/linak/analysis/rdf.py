@@ -51,6 +51,7 @@ from ..plot.plotting import (
     resolve_single_series_options,
 )
 from ..progress import ProgressBar
+from ..runtime_resources import MIB, resolve_resource_policy, resolve_worker_count
 from ..utils import ensure_positive
 from .common import (
     available_element_species as _available_element_species,
@@ -542,7 +543,7 @@ def _frame_has_axis_aligned_orthorhombic_cell(frame: Atoms) -> bool:
 
 
 def _resolve_rdf_orthorhombic_geometry(
-    frames: list[Atoms],
+    frames: Sequence[Atoms],
 ) -> tuple[np.ndarray, np.ndarray] | None:
     """Return per-frame orthorhombic cell lengths/volumes when available."""
     if not frames:
@@ -605,7 +606,7 @@ def _resolve_rdf_self_pair_coordinates(
 
 
 def _resolve_rdf_orthorhombic_selection_cache(
-    frames: list[Atoms],
+    frames: Sequence[Atoms],
     *,
     label_a: str,
     label_b: str,
@@ -713,7 +714,13 @@ def _sample_distances_full_matrix(
     ]
 
 
-def _resolve_rdf_worker_count(threads: int | None, n_frames: int) -> int:
+def _resolve_rdf_worker_count(
+    threads: int | None,
+    n_frames: int,
+    *,
+    estimated_bytes_per_worker: int = 64 * MIB,
+    memory_budget_mib: float | None = None,
+) -> int:
     """Resolve requested RDF worker count."""
     if threads is None:
         env_threads = os.getenv("LINAK_RDF_THREADS")
@@ -727,12 +734,28 @@ def _resolve_rdf_worker_count(threads: int | None, n_frames: int) -> int:
                 )
                 threads = None
 
-    if threads is None:
-        threads = min(_DEFAULT_RDF_THREAD_CAP, os.cpu_count() or 1)
-
-    if threads < 1:
+    if threads is not None and threads < 1:
         raise ValueError("RDF threads must be >= 1.")
-    return min(threads, max(1, n_frames))
+    policy = resolve_resource_policy(memory_budget_mib)
+    requested = threads
+    automatic_cpu_count = min(_DEFAULT_RDF_THREAD_CAP, os.cpu_count() or 1)
+    return resolve_worker_count(
+        task_count=max(1, n_frames),
+        estimated_bytes_per_worker=estimated_bytes_per_worker,
+        requested_threads=requested,
+        policy=policy,
+        cpu_count=automatic_cpu_count,
+        logger=LOGGER,
+        context="RDF",
+    )
+
+
+def _estimate_rdf_worker_bytes(frames: Sequence[Atoms]) -> int:
+    """Conservatively estimate one RDF worker's peak scratch allocation."""
+
+    max_atoms = max((len(frame) for frame in frames), default=1)
+    pair_matrix_bytes = max_atoms * max_atoms * np.dtype(np.float64).itemsize
+    return max(64 * MIB, 3 * pair_matrix_bytes)
 
 
 def _build_uniform_rdf_bins(
@@ -761,7 +784,7 @@ def _shell_volumes_from_edges(bin_edges: np.ndarray) -> np.ndarray:
     return (4.0 / 3.0) * np.pi * (edges[1:] ** 3 - edges[:-1] ** 3)
 
 
-def _auto_r_max_from_frames(frames: list[Atoms]) -> float:
+def _auto_r_max_from_frames(frames: Sequence[Atoms]) -> float:
     """Return a safe default RDF cutoff from the minimum periodic cell height."""
     if not frames:
         raise ValueError("At least one trajectory frame is required.")
@@ -820,7 +843,7 @@ def _should_parallelize_rdf(n_frames: int, worker_count: int) -> bool:
 
 
 def _resolve_rdf_backend(
-    frames: list[Atoms],
+    frames: Sequence[Atoms],
     *,
     label_a: str,
     label_b: str,
@@ -904,7 +927,7 @@ def _resolve_rdf_backend(
 
 
 def _iter_rdf_frame_chunks(
-    frames: list[Atoms],
+    frames: Sequence[Atoms],
     chunk_size: int,
 ) -> list[list[tuple[int, Atoms]]]:
     return [
@@ -914,7 +937,7 @@ def _iter_rdf_frame_chunks(
 
 
 def _iter_rdf_orthorhombic_chunks(
-    frames: list[Atoms],
+    frames: Sequence[Atoms],
     *,
     selection_cache: _RDFSelectionCache,
     cell_lengths: np.ndarray,
@@ -949,7 +972,7 @@ def _iter_rdf_orthorhombic_chunks(
 
 
 def _iter_rdf_orthorhombic_multi_chunks(
-    frames: list[Atoms],
+    frames: Sequence[Atoms],
     *,
     selection_caches_by_species: Mapping[str, _RDFSelectionCache],
     cell_lengths: np.ndarray,
@@ -1248,7 +1271,7 @@ def _resolve_rdf_pair_selection_caches(
 
 
 def _accumulate_rdf_pair_collection(
-    frames: list[Atoms],
+    frames: Sequence[Atoms],
     *,
     pairs: Sequence[tuple[str, str]],
     r_max: float | None,
@@ -1256,6 +1279,7 @@ def _accumulate_rdf_pair_collection(
     threads: int | None = None,
     progress_desc: str | None = None,
     collect_statistics: bool = False,
+    memory_budget_mib: float | None = None,
 ) -> tuple[
     list[tuple[str, str]],
     np.ndarray,
@@ -1302,7 +1326,12 @@ def _accumulate_rdf_pair_collection(
         )
 
     shell_volumes = _shell_volumes_from_edges(bin_edges)
-    worker_count = _resolve_rdf_worker_count(threads, len(frames))
+    worker_count = _resolve_rdf_worker_count(
+        threads,
+        len(frames),
+        estimated_bytes_per_worker=_estimate_rdf_worker_bytes(frames),
+        memory_budget_mib=memory_budget_mib,
+    )
     species_labels = sorted({label for pair in unique_pairs for label in pair})
     orthorhombic_geometry = _resolve_rdf_orthorhombic_geometry(frames)
     selection_caches_by_species = _resolve_rdf_selection_caches_by_species(
@@ -1533,7 +1562,7 @@ def _compute_rdf_pairwise_orthorhombic_chunk_contributions(
 
 
 def _resolve_rdf_selection_cache(
-    frames: list[Atoms],
+    frames: Sequence[Atoms],
     *,
     label_a: str,
     label_b: str,
@@ -1623,7 +1652,7 @@ def _resolve_rdf_selection_cache(
 
 
 def _resolve_rdf_selection_caches_by_species(
-    frames: list[Atoms],
+    frames: Sequence[Atoms],
     *,
     species_labels: list[str],
 ) -> dict[str, _RDFSelectionCache] | None:
@@ -1860,7 +1889,7 @@ def _compute_rdf_chunk_contributions(
 
 
 def _compute_rdf_generic_backend(
-    frames: list[Atoms],
+    frames: Sequence[Atoms],
     *,
     config: _RDFWorkerConfig,
     worker_count: int,
@@ -1925,7 +1954,7 @@ def _compute_rdf_generic_backend(
 
 
 def _compute_rdf_orthorhombic_backend(
-    frames: list[Atoms],
+    frames: Sequence[Atoms],
     *,
     config: _RDFOrthorhombicConfig,
     backend: str,
@@ -1986,7 +2015,7 @@ def _compute_rdf_orthorhombic_backend(
 
 
 def _compute_rdf_statistics_profile(
-    frames: list[Atoms],
+    frames: Sequence[Atoms],
     *,
     label_a: str,
     label_b: str,
@@ -2031,7 +2060,7 @@ def _compute_rdf_statistics_profile(
 
 
 def compute_rdf(
-    frames: list[Atoms],
+    frames: Sequence[Atoms],
     species_a: str | None = "all",
     species_b: str | None = None,
     atom_indices_a: Sequence[int] | np.ndarray | None = None,
@@ -2039,6 +2068,7 @@ def compute_rdf(
     r_max: float | None = None,
     bin_width: float = 0.05,
     threads: int | None = None,
+    memory_budget_mib: float | None = None,
     _strategy_override: str | None = None,
 ) -> RDFProfile:
     """Compute a radial distribution function averaged across frames."""
@@ -2092,7 +2122,12 @@ def compute_rdf(
     )
 
     max_sphere_volume = (4.0 / 3.0) * np.pi * (r_max**3)
-    worker_count = _resolve_rdf_worker_count(threads, len(frames))
+    worker_count = _resolve_rdf_worker_count(
+        threads,
+        len(frames),
+        estimated_bytes_per_worker=_estimate_rdf_worker_bytes(frames),
+        memory_budget_mib=memory_budget_mib,
+    )
     block_index_by_frame = _resolve_rdf_block_index_by_frame(len(frames))
     selection_cache = _resolve_rdf_selection_cache(
         frames,
@@ -2252,23 +2287,31 @@ def compute_rdf(
 
 
 def compute_rdf_profiles(
-    frames: list[Atoms],
+    frames: Sequence[Atoms],
     *,
+    pairs: Sequence[tuple[str, str]] | None = None,
     r_max: float | None = None,
     bin_width: float = 0.05,
     threads: int | None = None,
+    memory_budget_mib: float | None = None,
 ) -> list[RDFProfile]:
-    """Compute RDFs for all unique unordered element-species pairs in a trajectory."""
+    """Compute requested RDF pairs, or all unique element/raw-species pairs."""
     if not frames:
         raise ValueError("At least one trajectory frame is required.")
 
-    species_labels = [
-        *_available_element_species(frames),
-        *(f"species:{label}" for label in grouped_raw_species_for_split_elements(frames)),
-    ]
-    if not species_labels:
-        raise ValueError("No elements found in trajectory.")
-    pairs = list(combinations_with_replacement(species_labels, 2))
+    if pairs is None:
+        species_labels = [
+            *_available_element_species(frames),
+            *(f"species:{label}" for label in grouped_raw_species_for_split_elements(frames)),
+        ]
+        if not species_labels:
+            raise ValueError("No elements found in trajectory.")
+        pairs = list(combinations_with_replacement(species_labels, 2))
+    else:
+        pairs = _ordered_unique_unordered_rdf_pairs(pairs)
+        if not pairs:
+            raise ValueError("At least one RDF pair is required.")
+        species_labels = list(dict.fromkeys(label for pair in pairs for label in pair))
     requested_bin_width = float(bin_width)
     LOGGER.debug(
         "Computing pairwise RDF collection (%d profile(s), species=%s, r_max=%s, bin_width=%.6g).",
@@ -2293,6 +2336,7 @@ def compute_rdf_profiles(
         threads=threads,
         progress_desc="Computing RDF pair collection",
         collect_statistics=True,
+        memory_budget_mib=memory_budget_mib,
     )
 
     bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
@@ -2395,7 +2439,8 @@ def _rdf_profile_hdf5_payload(profile: RDFProfile) -> dict[str, Any]:
 def _rdf_pair_storage_key(species_a: str, species_b: str) -> tuple[str, str]:
     normalized_a = _normalize_species(species_a)
     normalized_b = _normalize_species(species_b)
-    return tuple(sorted((normalized_a, normalized_b)))
+    first, second = sorted((normalized_a, normalized_b))
+    return first, second
 
 
 def _rdf_payload_pair_key(payload: Mapping[str, Any]) -> tuple[str, str]:
@@ -2406,18 +2451,9 @@ def _rdf_payload_pair_key(payload: Mapping[str, Any]) -> tuple[str, str]:
 
 
 def _resolve_non_overwriting_rdf_output_path(path: str | Path) -> Path:
-    resolved = resolve_hdf5_output_path(path)
-    if not resolved.exists():
-        return resolved
-    stem = resolved.stem
-    suffix = resolved.suffix
-    parent = resolved.parent
-    counter = 1
-    while True:
-        candidate = parent / f"{stem}_{counter}{suffix}"
-        if not candidate.exists():
-            return candidate
-        counter += 1
+    from .output_naming import unique_output_path
+
+    return unique_output_path(resolve_hdf5_output_path(path))
 
 
 def _rdf_collection_compatibility_error(
@@ -2505,6 +2541,7 @@ def _save_rdf_profile_collection(
     *,
     additional_metadata: Mapping[str, Any] | None = None,
     merge_existing: bool,
+    compression_profile: str = "fast",
 ) -> Path:
     payloads = [_rdf_profile_hdf5_payload(profile) for profile in profiles]
     root_metadata = dict(additional_metadata or {})
@@ -2515,6 +2552,7 @@ def _save_rdf_profile_collection(
             analysis="rdf",
             profiles=payloads,
             metadata=root_metadata,
+            compression_profile=compression_profile,
         )
         LOGGER.info("Saved %d RDF profile(s) to '%s'.", len(payloads), written_path)
         return written_path
@@ -2538,6 +2576,7 @@ def _save_rdf_profile_collection(
             analysis="rdf",
             profiles=payloads,
             metadata=root_metadata,
+            compression_profile=compression_profile,
         )
         LOGGER.info("Saved %d RDF profile(s) to fallback '%s'.", len(payloads), written_path)
         return written_path
@@ -2560,6 +2599,7 @@ def _save_rdf_profile_collection(
             analysis="rdf",
             profiles=payloads,
             metadata=root_metadata,
+            compression_profile=compression_profile,
         )
         LOGGER.info("Saved %d RDF profile(s) to fallback '%s'.", len(payloads), written_path)
         return written_path
@@ -2598,6 +2638,7 @@ def _save_rdf_profile_collection(
         analysis="rdf",
         profiles=merged_payloads,
         metadata=root_metadata,
+        compression_profile=compression_profile,
     )
     if appended_labels:
         LOGGER.info(
@@ -2627,6 +2668,7 @@ def save_rdf_profile(
     output: str | Path,
     *,
     additional_metadata: Mapping[str, Any] | None = None,
+    compression_profile: str = "fast",
 ) -> Path:
     """Save RDF profile to LiNaK HDF5 and return written path."""
     payload = _rdf_profile_hdf5_payload(profile)
@@ -2639,6 +2681,7 @@ def save_rdf_profile(
         analysis="rdf",
         datasets=payload["datasets"],
         metadata=metadata,
+        compression_profile=compression_profile,
     )
     LOGGER.info("Saved RDF data to '%s'.", output_path)
     return output_path
@@ -2651,6 +2694,7 @@ def save_rdf_profiles(
     additional_metadata: Mapping[str, Any] | None = None,
     force_collection: bool = False,
     merge_existing: bool = False,
+    compression_profile: str = "fast",
 ) -> Path:
     """Save one or more RDF profiles to LiNaK HDF5 and return the written path."""
     if not profiles:
@@ -2660,12 +2704,14 @@ def save_rdf_profiles(
             profiles[0],
             output,
             additional_metadata=additional_metadata,
+            compression_profile=compression_profile,
         )
     return _save_rdf_profile_collection(
         profiles,
         output,
         additional_metadata=additional_metadata,
         merge_existing=merge_existing,
+        compression_profile=compression_profile,
     )
 
 
@@ -2741,13 +2787,14 @@ def _load_rdf_profiles_from_payloads(
         ):
             continue
 
-        bin_centers = np.asarray(datasets["bin_centers_A"], dtype=float)
+        stored_bin_centers = np.asarray(datasets["bin_centers_A"])
         bin_width = resolve_uniform_bin_width_for_load(
             metadata=metadata,
-            bin_centers=bin_centers,
+            bin_centers=stored_bin_centers,
             source_path=source_path,
             analysis_name="RDF",
         )
+        bin_centers = np.asarray(stored_bin_centers, dtype=float)
         bin_edges = reconstruct_uniform_bin_edges_from_centers(
             bin_centers,
             bin_width=bin_width,
@@ -2825,6 +2872,7 @@ def load_rdf_profiles_by_index(
     *,
     species_a: str | None = None,
     species_b: str | None = None,
+    dataset_names: list[str] | tuple[str, ...] | None = None,
 ) -> list[RDFProfile]:
     """Load selected RDF profiles by profile index from LiNaK HDF5."""
     source_path, payloads = read_profile_payloads_by_index(
@@ -2832,6 +2880,7 @@ def load_rdf_profiles_by_index(
         profile_indices,
         analysis="rdf",
         label="RDF",
+        dataset_names=dataset_names,
     )
     return _load_rdf_profiles_from_payloads(
         source_path,

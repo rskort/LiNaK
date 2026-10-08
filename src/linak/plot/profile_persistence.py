@@ -13,9 +13,9 @@ from copy import deepcopy
 from typing import Any
 
 from .data_contract import PlotViewMapping, canonical_plot_view_id
+from .settings_validation import validate_current_plot_settings
 
 _PLOT_PROFILE_DENSITY = "plot:density"
-_PLOT_PROFILE_MSD = "plot:msd"
 _PLOT_PROFILE_RDF = "plot:rdf"
 _PLOT_PROFILE_POSITION = "plot:position"
 _PLOT_PROFILE_COORDINATION = "plot:coordination"
@@ -28,10 +28,9 @@ _PLOT_PROFILE_VERSION = 2
 
 _SOURCE_SELECTION_FIELDS_BY_PROFILE_KEY: dict[str, tuple[str, ...]] = {
     _PLOT_PROFILE_DENSITY: ("species", "axis"),
-    _PLOT_PROFILE_MSD: ("species",),
-    _PLOT_PROFILE_RDF: ("species_a", "species_b"),
+    _PLOT_PROFILE_RDF: ("species_pairs",),
     _PLOT_PROFILE_POSITION: ("species", "axis"),
-    _PLOT_PROFILE_COORDINATION: ("species_a", "species_b", "axis"),
+    _PLOT_PROFILE_COORDINATION: ("species_pairs", "axis"),
     _PLOT_PROFILE_POTENTIAL: (),
     _PLOT_PROFILE_ORIENTATION: (),
     _PLOT_PROFILE_TEMPERATURE: (),
@@ -40,7 +39,6 @@ _SOURCE_SELECTION_FIELDS_BY_PROFILE_KEY: dict[str, tuple[str, ...]] = {
 
 _LEGACY_MAPPING_FIELDS_BY_PROFILE_KEY: dict[str, tuple[str, ...]] = {
     _PLOT_PROFILE_DENSITY: ("x_mode", "quantity"),
-    _PLOT_PROFILE_MSD: ("time_axis",),
     _PLOT_PROFILE_RDF: (),
     _PLOT_PROFILE_POSITION: (
         "component",
@@ -134,6 +132,7 @@ def build_plot_profile_payload(profile_key: str, settings: dict[str, Any]) -> di
 
     if not isinstance(settings, dict):
         raise ValueError("Plot profile settings must be an object.")
+    validate_current_plot_settings(settings)
     source_fields = _SOURCE_SELECTION_FIELDS_BY_PROFILE_KEY.get(str(profile_key), ())
     mapping_fields = _LEGACY_MAPPING_FIELDS_BY_PROFILE_KEY.get(str(profile_key), ())
     source_selection = {key: deepcopy(settings[key]) for key in source_fields if key in settings}
@@ -161,6 +160,7 @@ def flatten_plot_profile_payload(profile_key: str, payload: dict[str, Any]) -> d
 
     if not isinstance(payload, dict):
         raise ValueError("Saved plot profile payload must be an object.")
+    validate_current_plot_settings(payload)
     source_selection = payload.get("source_selection")
     view_mapping_payload = payload.get("view_mapping")
     style = payload.get("style")
@@ -169,6 +169,8 @@ def flatten_plot_profile_payload(profile_key: str, payload: dict[str, Any]) -> d
     if not isinstance(style, dict):
         raise ValueError("Saved plot profile style must be an object.")
     style = _canonicalize_plot_view_state_style(style)
+    if not isinstance(view_mapping_payload, dict):
+        raise ValueError("Saved plot profile view_mapping must be an object.")
     mapping = deserialize_plot_view_mapping(view_mapping_payload)
     flattened = {str(key): deepcopy(value) for key, value in source_selection.items()}
     mapping_settings = _flatten_view_mapping(str(profile_key), mapping)
@@ -202,8 +204,11 @@ def select_plot_profile_settings(
 ) -> dict[str, Any]:
     """Return either a structured settings subset or one legacy-flattened compatibility view."""
 
+    validate_current_plot_settings(payload)
     if plot_profile_requires_legacy_mapping_flatten(profile_key=profile_key, keys=keys):
         return flatten_plot_profile_payload(profile_key, payload)
+
+    assert keys is not None
 
     if not isinstance(payload, dict):
         raise ValueError("Saved plot profile payload must be an object.")
@@ -236,12 +241,6 @@ def _build_view_mapping(profile_key: str, settings: dict[str, Any]) -> PlotViewM
         return density_plot_options_to_view_mapping(
             x_mode=str(settings.get("x_mode") or "distance"),
             quantity=str(settings.get("quantity") or "mass"),
-        )
-    if profile_key == _PLOT_PROFILE_MSD:
-        from .mappings.msd_mapping import msd_plot_options_to_view_mapping
-
-        return msd_plot_options_to_view_mapping(
-            time_axis=str(settings.get("time_axis") or "ps"),
         )
     if profile_key == _PLOT_PROFILE_RDF:
         from .mappings.rdf_mapping import rdf_plot_options_to_view_mapping
@@ -310,10 +309,6 @@ def _flatten_view_mapping(profile_key: str, mapping: PlotViewMapping) -> dict[st
         from .mappings.density_mapping import density_view_mapping_to_plot_options
 
         return density_view_mapping_to_plot_options(mapping)
-    if profile_key == _PLOT_PROFILE_MSD:
-        from .mappings.msd_mapping import msd_view_mapping_to_plot_options
-
-        return msd_view_mapping_to_plot_options(mapping)
     if profile_key == _PLOT_PROFILE_RDF:
         from .mappings.rdf_mapping import rdf_view_mapping_to_plot_options
 
@@ -321,7 +316,7 @@ def _flatten_view_mapping(profile_key: str, mapping: PlotViewMapping) -> dict[st
     if profile_key == _PLOT_PROFILE_POSITION:
         from .mappings.position_mapping import position_view_mapping_to_plot_options
 
-        return position_view_mapping_to_plot_options(mapping)
+        return dict(position_view_mapping_to_plot_options(mapping))
     if profile_key == _PLOT_PROFILE_COORDINATION:
         from .mappings.coordination_mapping import coordination_view_mapping_to_plot_options
 
@@ -391,7 +386,9 @@ def _canonicalize_plot_view_state_style(style: dict[str, Any]) -> dict[str, Any]
                 normalized_state = deepcopy(state_value)
                 for nested_key, nested_value in list(normalized_state.items()):
                     if str(nested_key).endswith("_active_view_type") and nested_value is not None:
-                        normalized_state[str(nested_key)] = canonical_plot_view_id(str(nested_value))
+                        normalized_state[str(nested_key)] = canonical_plot_view_id(
+                            str(nested_value)
+                        )
                     elif str(nested_key) == "view_mapping" and isinstance(nested_value, dict):
                         normalized_state[str(nested_key)] = serialize_plot_view_mapping(
                             deserialize_plot_view_mapping(nested_value)

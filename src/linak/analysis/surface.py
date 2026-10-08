@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from ..cell_geometry import unwrap_positions, cartesian_bounds, frame_origin
+
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass
+from contextlib import nullcontext
+from dataclasses import asdict, dataclass, replace
 import logging
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -13,6 +16,7 @@ from ase import Atoms
 from ase.data import atomic_masses, atomic_numbers
 
 from ..utils import axis_to_index, ensure_positive
+from ..progress import ProgressBar, progress_stage
 from .common import (
     frame_has_usable_cell as _common_frame_has_usable_cell,
     optional_finite_float as _common_optional_finite_float,
@@ -121,9 +125,118 @@ class SurfaceEstimate:
         return self.frame_values
 
 
+SurfaceLayout = Literal["auto", "single-top", "single-bottom", "symmetric"]
+ResolvedSurfaceLayout = Literal["single-top", "single-bottom", "symmetric", "axis"]
+
+
+@dataclass(frozen=True)
+class SurfaceReference:
+    """Resolved one- or two-interface reference for a periodic slab.
+
+    Surface estimates are expressed in a canonical periodic image where the
+    substrate is contiguous. ``axis_cut_per_frame_A`` and the cell bounds map
+    ordinary wrapped Cartesian coordinates into that image.
+    """
+
+    requested_layout: SurfaceLayout
+    resolved_layout: ResolvedSurfaceLayout
+    axis: str
+    top: SurfaceEstimate | None
+    bottom: SurfaceEstimate | None
+    axis_cut_per_frame_A: np.ndarray
+    axis_lower_per_frame_A: np.ndarray
+    axis_period_per_frame_A: np.ndarray
+    top_population_per_frame: np.ndarray
+    bottom_population_per_frame: np.ndarray
+    auto_reason: str
+    population_imbalance: float | None = None
+    population_imbalance_threshold: float = 0.20
+    slab_thickness_per_frame_A: np.ndarray | None = None
+    validation_diagnostics: Mapping[str, Any] | None = None
+
+    @property
+    def is_symmetric(self) -> bool:
+        return self.resolved_layout == "symmetric"
+
+    @property
+    def uses_distance(self) -> bool:
+        return self.resolved_layout != "axis"
+
+    @property
+    def primary(self) -> SurfaceEstimate | None:
+        if self.resolved_layout == "single-bottom":
+            return self.bottom
+        return self.top
+
+
+def log_surface_reference_summary(
+    reference: SurfaceReference,
+    *,
+    logger: logging.Logger | None = None,
+    source: str = "computed",
+) -> None:
+    """Log one concise paired-surface decision plus DEBUG side details."""
+
+    active_logger = LOGGER if logger is None else logger
+    validation = dict(reference.validation_diagnostics or {})
+    top = reference.top
+    bottom = reference.bottom
+
+    def side_value(estimate: SurfaceEstimate | None, attribute: str) -> float:
+        if estimate is None:
+            return 0.0
+        return float(getattr(estimate.summary, attribute))
+
+    top_mean = float(np.mean(reference.top_population_per_frame))
+    bottom_mean = float(np.mean(reference.bottom_population_per_frame))
+    coordinate_label = (
+        "folded outward distance"
+        if reference.resolved_layout == "symmetric"
+        else "outward distance"
+        if reference.uses_distance
+        else f"raw {reference.axis.upper()} axis"
+    )
+    message = (
+        "Surface layout: requested=%s, resolved=%s, axis=%s, coordinate=%s, "
+        "reason=%s, source=%s; top/bottom valid=%.1f%%/%.1f%%, "
+        "confidence=%.3f/%.3f, mean H2O=%.2f/%.2f."
+    )
+    arguments = (
+        reference.requested_layout,
+        reference.resolved_layout,
+        reference.axis.upper(),
+        coordinate_label,
+        reference.auto_reason,
+        source,
+        100.0 * side_value(top, "valid_fraction"),
+        100.0 * side_value(bottom, "valid_fraction"),
+        side_value(top, "median_confidence"),
+        side_value(bottom, "median_confidence"),
+        top_mean,
+        bottom_mean,
+    )
+    if reference.uses_distance:
+        active_logger.info(message, *arguments)
+    else:
+        active_logger.warning(message, *arguments)
+    active_logger.debug(
+        "Surface layout diagnostics: periodic_axis_supported=%s, top_trusted=%s, "
+        "bottom_trusted=%s, ordering=%s, continuity=%s, top_method=%s, "
+        "bottom_method=%s, population_imbalance=%s.",
+        validation.get("periodic_axis_supported"),
+        validation.get("top_trusted"),
+        validation.get("bottom_trusted"),
+        validation.get("surface_order_and_thickness_valid"),
+        validation.get("frame_continuity_valid"),
+        None if top is None else top.method,
+        None if bottom is None else bottom.method,
+        reference.population_imbalance,
+    )
+
+
 @dataclass(frozen=True)
 class _SurfaceAnalysisContext:
-    frames: list[Atoms]
+    frames: Sequence[Atoms]
     axis_index: int
     axis: str
     options: SurfaceEstimatorOptions
@@ -242,7 +355,7 @@ def _frame_has_usable_cell(frame: Atoms, axis_index: int) -> bool:
     return _common_frame_has_usable_cell(frame, axis_index=axis_index)
 
 
-def _frames_share_consistent_atom_layout(frames: list[Atoms]) -> bool:
+def _frames_share_consistent_atom_layout(frames: Sequence[Atoms]) -> bool:
     """Return whether all frames have equal atom counts and symbol ordering."""
     if not frames:
         return False
@@ -280,7 +393,7 @@ def _unwrap_axis_positions(axis_matrix: np.ndarray, axis_lengths: np.ndarray | N
     return unwrapped
 
 
-def _axis_lengths_if_periodic(frames: list[Atoms], axis_index: int) -> np.ndarray | None:
+def _axis_lengths_if_periodic(frames: Sequence[Atoms], axis_index: int) -> np.ndarray | None:
     """Return per-frame axis lengths when all frames are periodic with a usable cell."""
     if not frames:
         return None
@@ -450,7 +563,7 @@ def _validate_surface_options(
 
 def _resolve_surface_options(
     *,
-    frames: list[Atoms],
+    frames: Sequence[Atoms],
     mode: str,
     surface_elements: list[str] | tuple[str, ...] | None,
     include_fixed_surface_atoms: bool,
@@ -592,7 +705,7 @@ def _normalize_surface_elements_argument(
 
 
 def _resolve_surface_elements(
-    frames: list[Atoms],
+    frames: Sequence[Atoms],
     surface_elements: list[str] | tuple[str, ...] | None,
     *,
     axis_index: int,
@@ -638,7 +751,15 @@ def _resolve_surface_elements(
             axis=0,
         )
         axis_lengths = _axis_lengths_if_periodic(frames, axis_index)
-        unwrapped_axis = _unwrap_axis_positions(axis_matrix, axis_lengths)
+        unwrapped_axis = (
+            unwrap_positions(
+                np.stack([frame.positions[source_mask] for frame in frames]),
+                [frame.cell for frame in frames],
+                [frame.pbc for frame in frames],
+            )[:, :, axis_index]
+            if axis_lengths is not None
+            else axis_matrix
+        )
         medians = np.median(unwrapped_axis, axis=0)
         mobility = np.median(np.abs(unwrapped_axis - medians), axis=0)
         if not np.all(np.isfinite(mobility)):
@@ -746,7 +867,7 @@ def _nearest_valid_layer_indices(
     return np.asarray(previous, dtype=int)
 
 
-def _cell_lengths_if_periodic_all(frames: list[Atoms]) -> np.ndarray | None:
+def _cell_lengths_if_periodic_all(frames: Sequence[Atoms]) -> np.ndarray | None:
     if not frames:
         return None
     lengths: list[np.ndarray] = []
@@ -761,7 +882,7 @@ def _cell_lengths_if_periodic_all(frames: list[Atoms]) -> np.ndarray | None:
             or np.any(cell_lengths <= 0.0)
         ):
             return None
-        lengths.append(cell_lengths)
+        lengths.append(np.diff(cartesian_bounds(frame.cell, frame_origin(frame)), axis=1).ravel())
     return np.asarray(lengths, dtype=float)
 
 
@@ -808,7 +929,7 @@ def _candidate_mask_for_frame(
 
 
 def _build_surface_context(
-    frames: list[Atoms],
+    frames: Sequence[Atoms],
     axis: str,
     *,
     options: SurfaceEstimatorOptions,
@@ -884,7 +1005,15 @@ def _build_surface_context(
         )
         candidate_axis_values = np.asarray(candidate_positions[:, :, axis_index], dtype=float)
         candidate_masses = np.asarray(frames[0].get_masses(), dtype=float)[candidate_indices]
-        unwrapped = _unwrap_positions_matrix(candidate_positions, cell_lengths)
+        unwrapped = (
+            unwrap_positions(
+                candidate_positions,
+                [frame.cell for frame in frames],
+                [frame.pbc for frame in frames],
+            )
+            if cell_lengths is not None
+            else candidate_positions
+        )
         translated_candidate_positions = unwrapped - np.median(unwrapped, axis=1, keepdims=True)
 
     return _SurfaceAnalysisContext(
@@ -1780,7 +1909,7 @@ def _select_surface_estimate_object(
     return candidates[0]
 
 
-def _any_frame_has_fixed_atoms(frames: list[Atoms]) -> bool:
+def _any_frame_has_fixed_atoms(frames: Sequence[Atoms]) -> bool:
     """Return True if any frame contains index-based ASE constraints."""
     for frame in frames:
         if np.any(_fixed_atom_mask(frame)):
@@ -1821,7 +1950,7 @@ def _inject_effective_option(
 
 
 def estimate_surface_reference(
-    frames: list[Atoms],
+    frames: Sequence[Atoms],
     axis: str = "z",
     *,
     mode: str = "auto",
@@ -1830,6 +1959,8 @@ def estimate_surface_reference(
     surface_options: SurfaceEstimatorOptions | None = None,
     logger: logging.Logger | None = None,
     _fixed_atom_fallback_retry: bool = False,
+    _emit_summary: bool = True,
+    _context: _SurfaceAnalysisContext | None = None,
 ) -> SurfaceEstimate | None:
     if not frames:
         return None
@@ -1843,7 +1974,11 @@ def estimate_surface_reference(
         surface_options=surface_options,
     )
     active_logger = LOGGER if logger is None else logger
-    context = _build_surface_context(frames, axis, options=options)
+    context = (
+        _build_surface_context(frames, axis, options=options)
+        if _context is None
+        else replace(_context, options=options)
+    )
     if context is None:
         # --- fixed-atom fallback: context failed ---
         if (
@@ -1851,11 +1986,12 @@ def estimate_surface_reference(
             and surface_options is None
             and _any_frame_has_fixed_atoms(frames)
         ):
-            active_logger.info(
-                "Surface estimation along %s found no candidates with fixed atoms excluded; "
-                "retrying with include_fixed_surface_atoms=True.",
-                axis.upper(),
-            )
+            if _emit_summary:
+                active_logger.info(
+                    "Surface estimation along %s found no candidates with fixed atoms excluded; "
+                    "retrying with include_fixed_surface_atoms=True.",
+                    axis.upper(),
+                )
             return estimate_surface_reference(
                 frames,
                 axis,
@@ -1865,6 +2001,7 @@ def estimate_surface_reference(
                 surface_options=None,
                 logger=logger,
                 _fixed_atom_fallback_retry=True,
+                _emit_summary=_emit_summary,
             )
         return None
     reference_source = "automatic"
@@ -1872,12 +2009,13 @@ def estimate_surface_reference(
         reference_source = "explicit atom-mask"
     elif options.surface_elements is not None:
         reference_source = "user-selected"
-    active_logger.info(
-        "Surface reference along %s: %s %s.",
-        axis.upper(),
-        reference_source,
-        _surface_reference_atoms_label(list(context.selected_elements)),
-    )
+    if _emit_summary:
+        active_logger.info(
+            "Surface reference along %s: %s %s.",
+            axis.upper(),
+            reference_source,
+            _surface_reference_atoms_label(list(context.selected_elements)),
+        )
     estimate = _select_surface_estimate_object(context)
     if estimate is None:
         # --- fixed-atom fallback: estimate selection failed ---
@@ -1886,11 +2024,12 @@ def estimate_surface_reference(
             and surface_options is None
             and _any_frame_has_fixed_atoms(frames)
         ):
-            active_logger.info(
-                "Surface estimation along %s produced no usable estimate with fixed atoms "
-                "excluded; retrying with include_fixed_surface_atoms=True.",
-                axis.upper(),
-            )
+            if _emit_summary:
+                active_logger.info(
+                    "Surface estimation along %s produced no usable estimate with fixed atoms "
+                    "excluded; retrying with include_fixed_surface_atoms=True.",
+                    axis.upper(),
+                )
             return estimate_surface_reference(
                 frames,
                 axis,
@@ -1900,31 +2039,577 @@ def estimate_surface_reference(
                 surface_options=None,
                 logger=logger,
                 _fixed_atom_fallback_retry=True,
+                _emit_summary=_emit_summary,
             )
         return None
     # Tag the estimate when the fixed-atom fallback path was used.
     if _fixed_atom_fallback_retry:
         estimate = _inject_effective_option(estimate, "fixed_atom_fallback", True)
-    active_logger.info(
-        "Surface estimator along %s: %s.",
-        axis.upper(),
-        _describe_surface_estimator(
-            estimate.method,
-            axis=axis,
-            reference_elements=list(estimate.selected_elements),
-        ),
-    )
-    active_logger.debug(
-        "Surface estimator along %s chose %s using %s.",
-        axis.upper(),
-        estimate.mode,
-        _surface_reference_atoms_label(list(estimate.selected_elements)),
-    )
+    if _emit_summary:
+        active_logger.info(
+            "Surface estimator along %s: %s.",
+            axis.upper(),
+            _describe_surface_estimator(
+                estimate.method,
+                axis=axis,
+                reference_elements=list(estimate.selected_elements),
+            ),
+        )
+        active_logger.debug(
+            "Surface estimator along %s chose %s using %s.",
+            axis.upper(),
+            estimate.mode,
+            _surface_reference_atoms_label(list(estimate.selected_elements)),
+        )
     return estimate
 
 
+def normalize_surface_layout(layout: str | None) -> SurfaceLayout:
+    normalized = "auto" if layout is None else str(layout).strip().lower()
+    aliases = {
+        "top": "single-top",
+        "bottom": "single-bottom",
+        "single": "single-top",
+        "both": "symmetric",
+    }
+    normalized = aliases.get(normalized, normalized)
+    if normalized not in {"auto", "single-top", "single-bottom", "symmetric"}:
+        raise ValueError(
+            "surface layout must be one of: auto, single-top, single-bottom, symmetric"
+        )
+    return cast(SurfaceLayout, normalized)
+
+
+def _surface_axis_periodic_geometry(
+    frames: Sequence[Atoms],
+    axis_index: int,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Return Cartesian lower bounds and periods for a decoupled periodic axis."""
+
+    lower = np.empty(len(frames), dtype=float)
+    period = np.empty(len(frames), dtype=float)
+    for frame_index, frame in enumerate(frames):
+        pbc = np.asarray(frame.pbc, dtype=bool)
+        cell = np.asarray(frame.cell.array, dtype=float)
+        if pbc.shape != (3,) or not bool(pbc[axis_index]) or cell.shape != (3, 3):
+            return None
+        axis_components = np.asarray(cell[:, axis_index], dtype=float)
+        scale = max(1.0, float(np.max(np.abs(cell))))
+        tolerance = 1.0e-9 * scale
+        other = np.delete(axis_components, axis_index)
+        selected = float(axis_components[axis_index])
+        if abs(selected) <= tolerance or np.any(np.abs(other) > tolerance):
+            return None
+        bounds = cartesian_bounds(cell, frame_origin(frame))
+        lower[frame_index] = float(bounds[axis_index, 0])
+        period[frame_index] = abs(selected)
+    if np.any(~np.isfinite(period)) or np.any(period <= 0.0):
+        return None
+    return lower, period
+
+
+def _largest_circular_gap_cut(values: np.ndarray, *, lower: float, period: float) -> float:
+    phase = np.mod(np.asarray(values, dtype=float) - float(lower), float(period))
+    phase = np.sort(phase[np.isfinite(phase)])
+    if phase.size < 2:
+        return 0.0
+    following = np.roll(phase, -1)
+    gaps = np.mod(following - phase, float(period))
+    gap_index = int(np.argmax(gaps))
+    return float(np.mod(phase[gap_index] + 0.5 * gaps[gap_index], float(period)))
+
+
+def _canonical_axis_values(
+    values: np.ndarray,
+    *,
+    lower: float,
+    period: float,
+    cut: float,
+) -> np.ndarray:
+    phase = np.mod(np.asarray(values, dtype=float) - float(lower), float(period))
+    return np.mod(phase - float(cut), float(period))
+
+
+def canonical_surface_axis_values(
+    reference: SurfaceReference,
+    values: np.ndarray,
+    *,
+    frame_index: int,
+) -> np.ndarray:
+    """Map wrapped Cartesian axis coordinates into the reference's slab image."""
+
+    period = float(reference.axis_period_per_frame_A[frame_index])
+    if not np.isfinite(period) or period <= 0.0:
+        return np.asarray(values, dtype=float)
+    return _canonical_axis_values(
+        values,
+        lower=float(reference.axis_lower_per_frame_A[frame_index]),
+        period=period,
+        cut=float(reference.axis_cut_per_frame_A[frame_index]),
+    )
+
+
+def wrapped_surface_positions(
+    reference: SurfaceReference,
+    estimate: SurfaceEstimate,
+) -> np.ndarray:
+    """Map a canonical plane estimate back to wrapped Cartesian coordinates."""
+    values = np.asarray(estimate.frame_values, dtype=float)
+    periods = np.asarray(reference.axis_period_per_frame_A, dtype=float)
+    cuts = np.asarray(reference.axis_cut_per_frame_A, dtype=float)
+    lower = np.asarray(reference.axis_lower_per_frame_A, dtype=float)
+    if not (
+        values.shape == periods.shape == cuts.shape == lower.shape
+        and np.all(np.isfinite(periods))
+        and np.all(periods > 0.0)
+    ):
+        return np.array(values, copy=True)
+    return lower + np.mod(values + cuts, periods)
+
+
+def surface_distance_components(
+    reference: SurfaceReference,
+    values: np.ndarray,
+    *,
+    frame_index: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Return folded, top, bottom distances and side assignments.
+
+    Side assignments use ``+1`` for top, ``-1`` for bottom and ``0`` for an
+    exact mid-plane tie or unavailable two-interface geometry.
+    """
+
+    canonical = canonical_surface_axis_values(reference, values, frame_index=frame_index)
+    count = canonical.size
+    top_distance = np.full(count, np.nan, dtype=float)
+    bottom_distance = np.full(count, np.nan, dtype=float)
+    side = np.zeros(count, dtype=np.int8)
+    if reference.top is not None and reference.top.frame_values.shape[0] > frame_index:
+        top_distance = canonical - float(reference.top.frame_values[frame_index])
+    if reference.bottom is not None and reference.bottom.frame_values.shape[0] > frame_index:
+        bottom_distance = float(reference.bottom.frame_values[frame_index]) - canonical
+
+    if reference.resolved_layout == "single-top":
+        # Keep the one-sided fluid region continuous across the periodic cut.
+        # The canonical cut lies in the non-substrate gap, so values before
+        # the bottom plane are the continuation of the region above the top
+        # plane, not negative-distance fluid behind the interface.  Preserve
+        # signed negative distances only inside the slab itself.
+        if reference.bottom is not None and reference.bottom.frame_values.shape[0] > frame_index:
+            bottom_plane = float(reference.bottom.frame_values[frame_index])
+            period = float(reference.axis_period_per_frame_A[frame_index])
+            threshold = _single_interface_wrap_threshold(reference, frame_index)
+            if threshold is None:
+                threshold = bottom_plane
+            wrap_fluid = (
+                np.isfinite(canonical)
+                & np.isfinite(bottom_plane)
+                & np.isfinite(period)
+                & (period > 0.0)
+                & (canonical < threshold)
+            )
+            top_distance = np.where(wrap_fluid, top_distance + period, top_distance)
+        side.fill(1)
+        return top_distance, top_distance, bottom_distance, side
+    if reference.resolved_layout == "single-bottom":
+        if reference.top is not None and reference.top.frame_values.shape[0] > frame_index:
+            top_plane = float(reference.top.frame_values[frame_index])
+            period = float(reference.axis_period_per_frame_A[frame_index])
+            threshold = _single_interface_wrap_threshold(reference, frame_index)
+            if threshold is None:
+                threshold = top_plane
+            wrap_fluid = (
+                np.isfinite(canonical)
+                & np.isfinite(top_plane)
+                & np.isfinite(period)
+                & (period > 0.0)
+                & (canonical > threshold)
+            )
+            bottom_distance = np.where(
+                wrap_fluid,
+                bottom_distance + period,
+                bottom_distance,
+            )
+        side.fill(-1)
+        return bottom_distance, top_distance, bottom_distance, side
+    if reference.resolved_layout != "symmetric":
+        raw = np.asarray(values, dtype=float)
+        return np.array(raw, copy=True), top_distance, bottom_distance, side
+
+    finite = np.isfinite(top_distance) & np.isfinite(bottom_distance)
+    difference = top_distance - bottom_distance
+    tolerance = 1.0e-10
+    side[finite & (difference > tolerance)] = 1
+    side[finite & (difference < -tolerance)] = -1
+    folded = np.maximum(top_distance, bottom_distance)
+    return folded, top_distance, bottom_distance, side
+
+
+def _single_interface_wrap_threshold(
+    reference: SurfaceReference,
+    frame_index: int,
+) -> float | None:
+    """Return the canonical slab-envelope boundary for a one-sided layout."""
+
+    period = float(reference.axis_period_per_frame_A[frame_index])
+    tolerance = 1.0e-10 * max(1.0, abs(period))
+    if reference.resolved_layout == "single-top" and reference.bottom is not None:
+        estimate = reference.bottom
+        direction = -1.0
+    elif reference.resolved_layout == "single-bottom" and reference.top is not None:
+        estimate = reference.top
+        direction = 1.0
+    else:
+        return None
+    if estimate.frame_values.shape[0] <= frame_index:
+        return None
+    spread = np.asarray(estimate.diagnostics.reference_spread_A_per_frame, dtype=float)
+    if spread.shape[0] > frame_index and np.isfinite(spread[frame_index]):
+        tolerance = max(tolerance, float(spread[frame_index]))
+    return float(estimate.frame_values[frame_index]) + direction * tolerance
+
+
+def _canonical_surface_frames(
+    frames: Sequence[Atoms],
+    *,
+    axis: str,
+    options: SurfaceEstimatorOptions,
+) -> tuple[list[Atoms], np.ndarray, np.ndarray, np.ndarray, bool]:
+    axis_index = axis_to_index(axis)
+    geometry = _surface_axis_periodic_geometry(frames, axis_index)
+    if geometry is None:
+        zeros = np.zeros(len(frames), dtype=float)
+        nan_period = np.full(len(frames), np.nan, dtype=float)
+        return list(frames), zeros, zeros, nan_period, False
+    lower, period = geometry
+    context = _build_surface_context(frames, axis, options=options)
+    if context is None:
+        zeros = np.zeros(len(frames), dtype=float)
+        return list(frames), zeros, lower, period, False
+
+    cuts = np.zeros(len(frames), dtype=float)
+    canonical_frames: list[Atoms] = []
+    for frame_index, frame in enumerate(frames):
+        candidates, _indices = _candidate_axis_values_and_indices(context, frame_index)
+        if candidates.size < 2:
+            return list(frames), np.zeros(len(frames)), lower, period, False
+        cuts[frame_index] = _largest_circular_gap_cut(
+            candidates,
+            lower=float(lower[frame_index]),
+            period=float(period[frame_index]),
+        )
+        copied = frame.copy()
+        positions = np.asarray(copied.positions, dtype=float).copy()
+        positions[:, axis_index] = _canonical_axis_values(
+            positions[:, axis_index],
+            lower=float(lower[frame_index]),
+            period=float(period[frame_index]),
+            cut=float(cuts[frame_index]),
+        )
+        copied.positions = positions
+        canonical_frames.append(copied)
+    return canonical_frames, cuts, lower, period, True
+
+
+def _surface_reference_water_populations(
+    frames: Sequence[Atoms],
+    reference: SurfaceReference,
+    *,
+    report_progress: bool = False,
+) -> tuple[np.ndarray, np.ndarray]:
+    from .water import OHTopologyCache, water_molecule_triplets, water_triplet_geometry
+
+    axis_index = axis_to_index(reference.axis)
+    top_counts = np.zeros(len(frames), dtype=int)
+    bottom_counts = np.zeros(len(frames), dtype=int)
+    topology_cache = OHTopologyCache(
+        context="surface-layout water topology",
+    )
+    reference_symbols = tuple(frames[0].get_chemical_symbols()) if frames else tuple()
+    with ProgressBar(
+        desc="Surface populations",
+        total=len(frames),
+        unit="frame",
+        enabled=report_progress,
+    ) as progress:
+        for frame_index, frame in enumerate(frames):
+            if tuple(frame.get_chemical_symbols()) == reference_symbols:
+                triplets = topology_cache.select(frame, frame_index=frame_index).indices_for(
+                    "mol:H2O"
+                )
+            else:
+                # A cached atom-index topology cannot be transferred to a frame
+                # with a different composition/order. Variable-topology frames are
+                # uncommon and intentionally take the safe direct path.
+                triplets = water_molecule_triplets(frame)
+            if triplets.size == 0:
+                progress.update()
+                continue
+            geometry = water_triplet_geometry(frame, triplets)
+            _folded, top_distance, bottom_distance, side = surface_distance_components(
+                replace(reference, resolved_layout="symmetric"),
+                np.asarray(geometry.com_positions[:, axis_index], dtype=float),
+                frame_index=frame_index,
+            )
+            top_counts[frame_index] = int(np.count_nonzero((side == 1) & (top_distance >= 0.0)))
+            bottom_counts[frame_index] = int(
+                np.count_nonzero((side == -1) & (bottom_distance >= 0.0))
+            )
+            progress.update()
+    return top_counts, bottom_counts
+
+
+def estimate_surface_layout_reference(
+    frames: Sequence[Atoms],
+    axis: str = "z",
+    *,
+    surface_layout: str | None = None,
+    mode: str = "auto",
+    surface_elements: list[str] | tuple[str, ...] | None = None,
+    include_fixed_surface_atoms: bool = False,
+    surface_options: SurfaceEstimatorOptions | None = None,
+    logger: logging.Logger | None = None,
+    _summary_source: str = "computed",
+    _report_progress: bool = False,
+) -> SurfaceReference:
+    """Resolve a single- or double-sided slab reference."""
+
+    requested = normalize_surface_layout(surface_layout)
+    if requested == "auto" and surface_options is not None and surface_options.side == "bottom":
+        requested = "single-bottom"
+    if surface_layout is not None and surface_options is not None:
+        if requested == "single-top" and surface_options.side != "top":
+            raise ValueError("surface_layout=single-top conflicts with surface_options.side.")
+        if requested == "single-bottom" and surface_options.side != "bottom":
+            raise ValueError("surface_layout=single-bottom conflicts with surface_options.side.")
+
+    if not frames:
+        empty = np.array([], dtype=float)
+        return SurfaceReference(
+            requested,
+            "axis",
+            axis.lower(),
+            None,
+            None,
+            empty,
+            empty,
+            empty,
+            empty,
+            empty,
+            "no_frames",
+        )
+
+    base_options = _resolve_surface_options(
+        frames=frames,
+        mode=mode,
+        surface_elements=surface_elements,
+        include_fixed_surface_atoms=include_fixed_surface_atoms,
+        surface_options=surface_options,
+    )
+    active_logger = LOGGER if logger is None else logger
+    with (
+        progress_stage(active_logger, "Surface preparation") if _report_progress else nullcontext()
+    ):
+        canonical_frames, cuts, lower, period, periodic_supported = _canonical_surface_frames(
+            frames,
+            axis=axis,
+            options=base_options,
+        )
+        # Only canonical coordinates and identical candidate options are shared.
+        # Raw-coordinate checks and fixed-atom retries build their own context.
+        shared_context = _build_surface_context(canonical_frames, axis, options=base_options)
+
+    def estimate_side(side: Literal["top", "bottom"]) -> SurfaceEstimate | None:
+        side_options = replace(base_options, side=side)
+        return estimate_surface_reference(
+            canonical_frames,
+            axis,
+            mode=side_options.mode,
+            surface_elements=None
+            if side_options.surface_elements is None
+            else list(side_options.surface_elements),
+            include_fixed_surface_atoms=side_options.include_fixed_surface_atoms,
+            surface_options=side_options,
+            logger=logger,
+            _emit_summary=False,
+            _context=shared_context,
+        )
+
+    with (
+        progress_stage(active_logger, "Surface top estimate") if _report_progress else nullcontext()
+    ):
+        top = estimate_side("top")
+    with (
+        progress_stage(active_logger, "Surface bottom estimate")
+        if _report_progress
+        else nullcontext()
+    ):
+        bottom = estimate_side("bottom")
+    # Avoid retaining large candidate arrays throughout population analysis.
+    shared_context = None
+    top_trusted = _surface_estimate_supports_distance_mode(top, frame_count=len(frames))
+    bottom_trusted = _surface_estimate_supports_distance_mode(bottom, frame_count=len(frames))
+    slab_thickness = (
+        np.asarray(top.frame_values, dtype=float) - np.asarray(bottom.frame_values, dtype=float)
+        if top is not None and bottom is not None
+        else np.full(len(frames), np.nan, dtype=float)
+    )
+    thickness_valid = bool(
+        periodic_supported
+        and np.all(np.isfinite(slab_thickness))
+        and np.all(slab_thickness > 1.0e-8)
+        and np.all(slab_thickness < np.asarray(period, dtype=float) - 1.0e-8)
+    )
+    normalized_midplane = (
+        0.5
+        * (np.asarray(top.frame_values, dtype=float) + np.asarray(bottom.frame_values, dtype=float))
+        / np.asarray(period, dtype=float)
+        if top is not None and bottom is not None and periodic_supported
+        else np.full(len(frames), np.nan, dtype=float)
+    )
+    continuity_valid = bool(
+        len(frames) < 2
+        or (
+            np.all(np.isfinite(normalized_midplane))
+            and np.all(np.abs(np.diff(normalized_midplane)) <= 0.25)
+        )
+    )
+    pair_ordered = bool(
+        top_trusted
+        and bottom_trusted
+        and top is not None
+        and bottom is not None
+        and thickness_valid
+        and continuity_valid
+    )
+
+    provisional = SurfaceReference(
+        requested_layout=requested,
+        resolved_layout="symmetric" if pair_ordered and periodic_supported else "axis",
+        axis=axis.lower(),
+        top=top,
+        bottom=bottom,
+        axis_cut_per_frame_A=np.asarray(cuts, dtype=float),
+        axis_lower_per_frame_A=np.asarray(lower, dtype=float),
+        axis_period_per_frame_A=np.asarray(period, dtype=float),
+        top_population_per_frame=np.zeros(len(frames), dtype=int),
+        bottom_population_per_frame=np.zeros(len(frames), dtype=int),
+        auto_reason="pending",
+        slab_thickness_per_frame_A=slab_thickness,
+        validation_diagnostics={
+            "periodic_axis_supported": periodic_supported,
+            "top_trusted": top_trusted,
+            "bottom_trusted": bottom_trusted,
+            "surface_order_and_thickness_valid": thickness_valid,
+            "frame_continuity_valid": continuity_valid,
+        },
+    )
+    if pair_ordered and periodic_supported:
+        with (
+            progress_stage(active_logger, "Surface population analysis")
+            if _report_progress
+            else nullcontext()
+        ):
+            top_population, bottom_population = _surface_reference_water_populations(
+                frames,
+                provisional,
+                report_progress=_report_progress,
+            )
+    else:
+        top_population = np.zeros(len(frames), dtype=int)
+        bottom_population = np.zeros(len(frames), dtype=int)
+    total_population = top_population + bottom_population
+    thresholds = np.maximum(1, np.ceil(0.10 * total_population).astype(int))
+    frames_with_water = total_population > 0
+    denominator = max(1, len(frames))
+    top_occupancy = float(np.count_nonzero(top_population >= thresholds) / denominator)
+    bottom_occupancy = float(np.count_nonzero(bottom_population >= thresholds) / denominator)
+    have_water = bool(np.any(frames_with_water))
+    top_populated = have_water and top_occupancy >= 0.90
+    bottom_populated = have_water and bottom_occupancy >= 0.90
+
+    resolved: ResolvedSurfaceLayout = "axis"
+    reason = "surface_reference_unavailable"
+    if requested == "symmetric":
+        if pair_ordered and periodic_supported:
+            resolved, reason = "symmetric", "explicit_symmetric"
+        else:
+            reason = "explicit_symmetric_pair_untrusted"
+    elif requested == "single-top":
+        if top_trusted:
+            resolved, reason = "single-top", "explicit_single_top"
+    elif requested == "single-bottom":
+        if bottom_trusted:
+            resolved, reason = "single-bottom", "explicit_single_bottom"
+    else:
+        if pair_ordered and periodic_supported and top_populated and bottom_populated:
+            resolved, reason = "symmetric", "auto_two_sided_water"
+        elif top_trusted and top_populated and not bottom_populated:
+            resolved, reason = "single-top", "auto_top_water_only"
+        elif bottom_trusted and bottom_populated and not top_populated:
+            resolved, reason = "single-bottom", "auto_bottom_water_only"
+        elif top_trusted:
+            # When solvent occupancy cannot identify a side, retain the
+            # established single-top trust/fallback behavior on the original
+            # trajectory.  Canonicalization must not turn an unstable rough
+            # reference into an apparently stable one merely by moving the
+            # periodic image from frame to frame.
+            raw_top_options = replace(base_options, side="top")
+            raw_top = estimate_surface_reference(
+                frames,
+                axis,
+                mode=raw_top_options.mode,
+                surface_elements=(
+                    None
+                    if raw_top_options.surface_elements is None
+                    else list(raw_top_options.surface_elements)
+                ),
+                include_fixed_surface_atoms=raw_top_options.include_fixed_surface_atoms,
+                surface_options=raw_top_options,
+                logger=logger,
+                _emit_summary=False,
+            )
+            if _surface_estimate_supports_distance_mode(raw_top, frame_count=len(frames)):
+                resolved, reason = "single-top", "auto_default_top"
+            else:
+                top = raw_top
+                resolved, reason = "axis", "auto_default_top_untrusted"
+        elif bottom_trusted:
+            resolved, reason = "single-bottom", "auto_bottom_only_surface"
+
+    mean_top = float(np.mean(top_population))
+    mean_bottom = float(np.mean(bottom_population))
+    population_imbalance = None
+    if mean_top + mean_bottom > 0.0:
+        population_imbalance = abs(mean_top - mean_bottom) / (0.5 * (mean_top + mean_bottom))
+    active_logger = LOGGER if logger is None else logger
+    if resolved == "symmetric" and population_imbalance is not None and population_imbalance > 0.20:
+        active_logger.warning(
+            "Symmetric surface pooling has a %.1f%% mean water-population imbalance "
+            "between top and bottom interfaces.",
+            100.0 * population_imbalance,
+        )
+
+    resolved_reference = replace(
+        provisional,
+        resolved_layout=resolved,
+        top=top,
+        bottom=bottom,
+        top_population_per_frame=np.asarray(top_population, dtype=int),
+        bottom_population_per_frame=np.asarray(bottom_population, dtype=int),
+        auto_reason=reason,
+        population_imbalance=population_imbalance,
+    )
+    log_surface_reference_summary(
+        resolved_reference,
+        logger=active_logger,
+        source=_summary_source,
+    )
+    return resolved_reference
+
+
 def _select_surface_estimate(
-    frames: list[Atoms],
+    frames: Sequence[Atoms],
     axis: str,
     *,
     mode: str = "auto",
@@ -1948,7 +2633,7 @@ def _select_surface_estimate(
 
 
 def estimate_surface_position(
-    frames: list[Atoms],
+    frames: Sequence[Atoms],
     axis: str = "z",
     *,
     mode: str = "auto",
@@ -2107,6 +2792,85 @@ def _surface_estimate_datasets(estimate: SurfaceEstimate | None) -> dict[str, np
     }
 
 
+def _prefixed_surface_estimate_datasets(
+    estimate: SurfaceEstimate | None,
+    *,
+    prefix: str,
+) -> dict[str, np.ndarray | None]:
+    return {
+        f"{prefix}{key.removeprefix('surface_')}": value
+        for key, value in _surface_estimate_datasets(estimate).items()
+    }
+
+
+def _surface_reference_metadata(
+    reference: SurfaceReference | None,
+    *,
+    surface_position: float | None = None,
+    surface_position_std: float | None = None,
+) -> dict[str, Any]:
+    if reference is None:
+        return {}
+    nested: dict[str, Any] = {
+        "layout_requested": reference.requested_layout,
+        "layout_resolved": reference.resolved_layout,
+        "axis": reference.axis,
+        "auto_reason": reference.auto_reason,
+        "population_imbalance": reference.population_imbalance,
+        "population_imbalance_threshold": reference.population_imbalance_threshold,
+        "validation": _json_ready(reference.validation_diagnostics or {}),
+    }
+    if surface_position is not None and np.isfinite(surface_position):
+        nested["position"] = float(surface_position)
+    if surface_position_std is not None and np.isfinite(surface_position_std):
+        nested["position_std"] = float(surface_position_std)
+    for side, estimate in (("top", reference.top), ("bottom", reference.bottom)):
+        side_payload = _surface_metadata_payload(
+            surface_position=None if estimate is None else estimate.position,
+            surface_position_std=None if estimate is None else estimate.std,
+            estimate=estimate,
+        ).get("surface", {})
+        if side_payload:
+            nested[side] = side_payload
+    primary = reference.primary
+    if primary is not None:
+        compatibility_payload = _surface_metadata_payload(
+            surface_position=surface_position,
+            surface_position_std=surface_position_std,
+            estimate=primary,
+        ).get("surface", {})
+        for key, value in compatibility_payload.items():
+            nested.setdefault(key, value)
+    return {"surface": nested}
+
+
+def _surface_reference_datasets(
+    reference: SurfaceReference | None,
+) -> dict[str, np.ndarray | None]:
+    if reference is None:
+        return {}
+    return {
+        **_prefixed_surface_estimate_datasets(reference.top, prefix="surface_top_"),
+        **_prefixed_surface_estimate_datasets(reference.bottom, prefix="surface_bottom_"),
+        "surface_axis_cut_per_frame_A": np.asarray(reference.axis_cut_per_frame_A, dtype=float),
+        "surface_axis_lower_per_frame_A": np.asarray(reference.axis_lower_per_frame_A, dtype=float),
+        "surface_axis_period_per_frame_A": np.asarray(
+            reference.axis_period_per_frame_A, dtype=float
+        ),
+        "surface_top_population_per_frame": np.asarray(
+            reference.top_population_per_frame, dtype=int
+        ),
+        "surface_bottom_population_per_frame": np.asarray(
+            reference.bottom_population_per_frame, dtype=int
+        ),
+        "surface_slab_thickness_per_frame_A": (
+            None
+            if reference.slab_thickness_per_frame_A is None
+            else np.asarray(reference.slab_thickness_per_frame_A, dtype=float)
+        ),
+    }
+
+
 def _surface_estimate_from_payload(
     *,
     datasets: Mapping[str, np.ndarray],
@@ -2235,9 +2999,88 @@ def _surface_estimate_from_payload(
     )
 
 
+def _surface_reference_from_payload(
+    *,
+    datasets: Mapping[str, np.ndarray],
+    metadata: Mapping[str, Any],
+) -> SurfaceReference | None:
+    surface_metadata = metadata.get("surface")
+    if not isinstance(surface_metadata, Mapping) or "layout_requested" not in surface_metadata:
+        return None
+
+    def side_estimate(side: str) -> SurfaceEstimate | None:
+        prefix = f"surface_{side}_"
+        side_datasets = {
+            f"surface_{key[len(prefix) :]}": value
+            for key, value in datasets.items()
+            if str(key).startswith(prefix)
+        }
+        side_meta = surface_metadata.get(side)
+        if not isinstance(side_meta, Mapping):
+            side_meta = {}
+        return _surface_estimate_from_payload(
+            datasets=side_datasets,
+            metadata={"surface": dict(side_meta)},
+        )
+
+    top = side_estimate("top")
+    bottom = side_estimate("bottom")
+    requested = normalize_surface_layout(str(surface_metadata.get("layout_requested", "auto")))
+    resolved_raw = str(surface_metadata.get("layout_resolved", "axis")).strip().lower()
+    if resolved_raw not in {"single-top", "single-bottom", "symmetric", "axis"}:
+        raise ValueError(f"Invalid stored surface layout: {resolved_raw!r}.")
+    resolved = cast(ResolvedSurfaceLayout, resolved_raw)
+    if resolved == "symmetric" and (top is None or bottom is None):
+        raise ValueError("Symmetric surface metadata is missing a top or bottom estimate.")
+
+    frame_count = 0
+    for estimate in (top, bottom):
+        if estimate is not None:
+            frame_count = int(estimate.frame_values.shape[0])
+            break
+
+    def vector(name: str, *, dtype: Any, default: float | int) -> np.ndarray:
+        if name not in datasets:
+            return np.full(frame_count, default, dtype=dtype)
+        value = np.asarray(datasets[name], dtype=dtype)
+        if value.shape != (frame_count,):
+            raise ValueError(f"Stored symmetric surface dataset '{name}' has invalid shape.")
+        return value
+
+    return SurfaceReference(
+        requested_layout=requested,
+        resolved_layout=resolved,
+        axis=str(surface_metadata.get("axis", "z")).strip().lower() or "z",
+        top=top,
+        bottom=bottom,
+        axis_cut_per_frame_A=vector("surface_axis_cut_per_frame_A", dtype=float, default=0.0),
+        axis_lower_per_frame_A=vector("surface_axis_lower_per_frame_A", dtype=float, default=0.0),
+        axis_period_per_frame_A=vector(
+            "surface_axis_period_per_frame_A", dtype=float, default=np.nan
+        ),
+        top_population_per_frame=vector("surface_top_population_per_frame", dtype=int, default=0),
+        bottom_population_per_frame=vector(
+            "surface_bottom_population_per_frame", dtype=int, default=0
+        ),
+        auto_reason=str(surface_metadata.get("auto_reason", "loaded")),
+        population_imbalance=_optional_finite_float(surface_metadata.get("population_imbalance")),
+        population_imbalance_threshold=float(
+            surface_metadata.get("population_imbalance_threshold", 0.20)
+        ),
+        slab_thickness_per_frame_A=vector(
+            "surface_slab_thickness_per_frame_A", dtype=float, default=np.nan
+        ),
+        validation_diagnostics=(
+            dict(surface_metadata.get("validation", {}))
+            if isinstance(surface_metadata.get("validation"), Mapping)
+            else {}
+        ),
+    )
+
+
 def _cell_histogram_bounds(
     *,
-    frames: list[Atoms],
+    frames: Sequence[Atoms],
     axis_index: int,
     coordinate_mode: str,
     surface_per_frame: np.ndarray | None,
@@ -2251,9 +3094,7 @@ def _cell_histogram_bounds(
     upper = float("-inf")
     for frame_index, frame in enumerate(frames):
         cell = np.asarray(frame.cell.array, dtype=float)
-        axis_length = float(np.linalg.norm(cell[axis_index]))
-        frame_min = 0.0
-        frame_max = axis_length
+        frame_min, frame_max = cartesian_bounds(cell, frame_origin(frame))[axis_index]
         if coordinate_mode == "distance" and surface_per_frame is not None:
             frame_surface = float(surface_per_frame[frame_index])
             frame_min -= frame_surface

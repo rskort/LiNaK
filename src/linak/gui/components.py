@@ -72,7 +72,9 @@ def grouped_item_rows(
             group = Path(source_dir).name if source_dir else "Unassigned"
         else:
             group = "Project"
-        raw_source = str(item.path.parent) if item.item_type in {"raw_trajectory", "cube_file"} else ""
+        raw_source = (
+            str(item.path.parent) if item.item_type in {"raw_trajectory", "cube_file"} else ""
+        )
         rows.append(
             GroupedItemRow(
                 item=item,

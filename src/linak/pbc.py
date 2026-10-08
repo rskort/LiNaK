@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import logging
-import os
 from pathlib import Path
+from typing import Any
 import re
 
 from ase import Atoms
@@ -17,6 +17,7 @@ from .trajectory.lammps import (
 )
 from .progress import ProgressBar
 from .utils import ensure_positive
+from .cell_geometry import cell_matrix, compact_cell, cell_description, wrapped_frame_positions
 
 LOGGER = logging.getLogger(__name__)
 SUPPORTED_SIM_INPUT_SUFFIXES = (".inp", ".lmp")
@@ -116,7 +117,7 @@ def find_unique_cp2k_input(search_dir: str | Path) -> Path:
 
 
 def extract_cell_from_simulation_input(path: str | Path) -> tuple[float, float, float]:
-    """Extract orthorhombic cell dimensions from a CP2K or LAMMPS input file."""
+    """Extract full cell geometry from a CP2K or LAMMPS input file."""
     input_path = _normalize_input_path(path)
     suffix = input_path.suffix.lower()
     if suffix == ".lmp":
@@ -130,71 +131,97 @@ def extract_cell_from_simulation_input(path: str | Path) -> tuple[float, float, 
     )
 
 
-def extract_cell_from_cp2k_input(path: str | Path) -> tuple[float, float, float]:
-    """Extract orthorhombic `ABC` cell dimensions from a CP2K input file."""
-    input_path = Path(path).expanduser().resolve()
-    if not input_path.exists():
-        raise FileNotFoundError(f"CP2K input file not found: {input_path}")
-    if not input_path.is_file():
-        raise ValueError(f"CP2K input path is not a file: {input_path}")
+def extract_cell_from_cp2k_input(path: str | Path):
+    """Read a CP2K cell without discarding angles or vector orientation."""
+    from ase.units import Bohr
 
-    cell: tuple[float, float, float] | None = None
-    angles: tuple[float, float, float] | None = None
-    angle_line_number: int | None = None
-    with input_path.open("r", encoding="utf-8") as handle:
-        for line_number, line in enumerate(handle, start=1):
-            no_comment = _strip_cp2k_comment(line)
-            if not no_comment:
-                continue
-            abc_match = _ABC_PATTERN.match(no_comment)
-            if abc_match:
-                cell = (
-                    float(abc_match.group(1)),
-                    float(abc_match.group(2)),
-                    float(abc_match.group(3)),
-                )
-                continue
-
-            angle_match = _ALPHA_BETA_GAMMA_PATTERN.match(no_comment)
-            if angle_match:
-                angles = (
-                    float(angle_match.group(1)),
-                    float(angle_match.group(2)),
-                    float(angle_match.group(3)),
-                )
-                angle_line_number = line_number
-
-    if cell is None:
-        raise ValueError(
-            f"No valid 'ABC ...' line found in CP2K input file '{input_path}'. "
-            "Provide --input with a valid file or --cell A B C."
-        )
-
-    ensure_positive("cell_a", cell[0])
-    ensure_positive("cell_b", cell[1])
-    ensure_positive("cell_c", cell[2])
-
-    if angles is not None:
-        if not all(abs(angle - 90.0) <= 1e-6 for angle in angles):
-            raise ValueError(
-                f"CP2K input '{input_path}' defines ALPHA_BETA_GAMMA "
-                f"{angles[0]:.6g} {angles[1]:.6g} {angles[2]:.6g} on line "
-                f"{angle_line_number}, but LiNaK PBC handling currently supports "
-                "orthorhombic cells only (90 90 90)."
-            )
-
-    try:
-        display = os.path.relpath(input_path)
-    except ValueError:
-        display = str(input_path)
-    LOGGER.debug(
-        "Parsed CP2K cell from '%s': %.6g \u00d7 %.6g \u00d7 %.6g \u00c5 (90\u00b0 90\u00b0 90\u00b0).",
-        display,
-        cell[0],
-        cell[1],
-        cell[2],
+    input_path = _normalize_input_path(path)
+    sections: list[str] = []
+    candidates: list[dict[str, Any]] = []
+    active: dict[str, Any] | None = None
+    value_pattern = re.compile(
+        r"^(ABC|ALPHA_BETA_GAMMA|ANGLES|A|B|C)(?:\s+\[([^\]]+)\])?\s+(.+)$", re.I
     )
-    return cell
+    for line_number, line in enumerate(input_path.read_text(encoding="utf-8").splitlines(), 1):
+        text = _strip_cp2k_comment(line)
+        if not text:
+            continue
+        if _SECTION_END_PATTERN.match(text):
+            if sections and sections[-1] == "CELL" and active is not None:
+                candidates.append(active)
+                active = None
+            if sections:
+                sections.pop()
+            continue
+        start = _SECTION_START_PATTERN.match(text)
+        if start:
+            sections.append(start.group(1).upper())
+            if sections[-1] == "CELL":
+                active = {"scope": tuple(sections), "values": {}}
+            continue
+        match = value_pattern.match(text)
+        if match is None:
+            continue
+        # Keep compatibility with historical bare ABC snippets.
+        if active is None:
+            if sections:
+                continue
+            active = {"scope": (), "values": {}}
+        keyword, unit, raw = match.groups()
+        keyword = keyword.upper()
+        unit = (
+            unit or ("deg" if keyword in {"ANGLES", "ALPHA_BETA_GAMMA"} else "angstrom")
+        ).lower()
+        is_angle = keyword in {"ANGLES", "ALPHA_BETA_GAMMA"}
+        factors = (
+            {"deg": 1.0, "degree": 1.0, "rad": 180.0 / np.pi}
+            if is_angle
+            else {"angstrom": 1.0, "bohr": Bohr, "au": Bohr}
+        )
+        if unit not in factors:
+            raise ValueError(
+                f"Unsupported cell unit [{unit}] in '{input_path}' line {line_number}."
+            )
+        try:
+            values = tuple(
+                float(x.replace("D", "E").replace("d", "e")) * factors[unit] for x in raw.split()
+            )
+        except ValueError as exc:
+            raise ValueError(f"Invalid cell value in '{input_path}' line {line_number}.") from exc
+        if len(values) != 3:
+            raise ValueError(f"Cell {keyword} requires three numbers on line {line_number}.")
+        storage_key = "ALPHA_BETA_GAMMA" if is_angle else keyword
+        previous = active["values"].get(storage_key)
+        if previous is not None and not np.allclose(previous, values, rtol=0.0, atol=1e-12):
+            raise ValueError(
+                f"Conflicting {storage_key} definitions in '{input_path}' line {line_number}."
+            )
+        active["values"][storage_key] = values
+    if active is not None:
+        candidates.append(active)
+    preferred = [c for c in candidates if c["scope"][-3:] == ("FORCE_EVAL", "SUBSYS", "CELL")]
+    matrices = []
+    for candidate in preferred or candidates:
+        cell_values = candidate["values"]
+        if "ABC" in cell_values and any(key in cell_values for key in ("A", "B", "C")):
+            raise ValueError(f"Ambiguous ABC and A/B/C definitions in '{input_path}'.")
+        if "ABC" in cell_values:
+            matrix = cell_matrix(
+                cell_values["ABC"], cell_values.get("ALPHA_BETA_GAMMA", (90.0, 90.0, 90.0))
+            )
+        elif all(key in cell_values for key in ("A", "B", "C")):
+            matrix = cell_matrix([cell_values[key] for key in ("A", "B", "C")])
+        else:
+            continue
+        matrices.append(matrix)
+    if not matrices:
+        raise ValueError(
+            f"No valid 'ABC ...' line or A/B/C vectors found in CP2K input file '{input_path}'."
+        )
+    if any(not np.allclose(matrix, matrices[0], rtol=0.0, atol=1e-8) for matrix in matrices[1:]):
+        raise ValueError(f"Ambiguous conflicting CELL sections in '{input_path}'.")
+    LOGGER.debug("Parsed CP2K cell from '%s': %s", input_path, cell_description(matrices[0]))
+    return compact_cell(matrices[0])
 
 
 def extract_timestep_fs_from_cp2k_input(path: str | Path) -> float:
@@ -423,17 +450,14 @@ def resolve_cell_dimensions(
     *,
     output_path: str | Path,
     input_path: str | Path | None = None,
-    cell: tuple[float, float, float] | None = None,
-) -> tuple[float, float, float]:
-    """Resolve cell dimensions from explicit arguments or simulation input discovery."""
+    cell: Any = None,
+):
+    """Resolve full cell geometry from explicit arguments or input discovery."""
     if input_path is not None and cell is not None:
         raise ValueError("Use either --input or --cell, not both.")
 
     if cell is not None:
-        ensure_positive("cell_a", cell[0])
-        ensure_positive("cell_b", cell[1])
-        ensure_positive("cell_c", cell[2])
-        return cell
+        return compact_cell(cell)
 
     if input_path is not None:
         return extract_cell_from_simulation_input(input_path)
@@ -445,24 +469,24 @@ def resolve_cell_dimensions(
 
 def apply_pbc_to_frames(
     frames: list[Atoms],
-    cell: tuple[float, float, float],
+    cell: Any | None,
 ) -> list[Atoms]:
-    """Apply orthorhombic PBC and wrap atom positions into the unit cell."""
+    """Apply PBC and wrap positions into one cell or each frame's own cell.
+
+    Passing ``cell=None`` preserves variable-cell trajectories without forcing
+    callers to invoke this batch operation once per frame.
+    """
     if not frames:
         raise ValueError("At least one trajectory frame is required.")
 
-    ensure_positive("cell_a", cell[0])
-    ensure_positive("cell_b", cell[1])
-    ensure_positive("cell_c", cell[2])
-
-    cell_array = np.asarray(cell, dtype=float)
+    cell_array = None if cell is None else cell_matrix(cell)
     wrapped_frames: list[Atoms] = []
     with ProgressBar(desc="Applying PBC", total=len(frames), unit="frame") as progress:
         for frame in frames:
             wrapped = frame.copy()
-            wrapped.set_cell(cell)
+            wrapped.set_cell(cell_matrix(frame.cell) if cell_array is None else cell_array)
             wrapped.set_pbc((True, True, True))
-            wrapped.positions[:] = np.mod(np.asarray(wrapped.positions, dtype=float), cell_array)
+            wrapped.positions[:] = wrapped_frame_positions(wrapped)
             wrapped_frames.append(wrapped)
             progress.update()
 

@@ -6,6 +6,8 @@ water-molecule identification and PBC-aware geometry without duplicating logic.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 from dataclasses import dataclass
 import logging
 from typing import NamedTuple
@@ -14,6 +16,7 @@ import numpy as np
 from ase import Atoms
 from ase.geometry import find_mic
 from ase.neighborlist import neighbor_list
+from scipy.spatial import cKDTree
 
 from ..progress import ProgressBar
 from .common import MOLECULE_SPECIES_LABELS, normalize_molecule_label
@@ -36,6 +39,10 @@ _MOLECULE_ATOM_COUNTS = {
     "mol:H2O": 3,
     "mol:H3O": 4,
 }
+
+OH_TOPOLOGY_BACKENDS = ("auto", "ckdtree", "ase")
+_MAX_CKDTREE_IMAGE_POINTS = 2_000_000
+_MAX_CKDTREE_CELL_CONDITION = 1.0e10
 
 
 @dataclass(frozen=True)
@@ -76,22 +83,60 @@ class OHTopologyCache:
         validation_stride: int = H2O_VALIDATION_STRIDE,
         logger: logging.Logger | None = None,
         context: str = "O/H molecule topology",
+        backend: str = "auto",
     ) -> None:
         self.oh_cutoff = float(oh_cutoff)
         self.validation_stride = max(1, int(validation_stride))
         self.logger = LOGGER if logger is None else logger
         self.context = str(context)
+        self.backend = _normalize_topology_backend(backend)
         self.topology: OHTopology | None = None
         self.per_frame = False
+        self._selection_signature: tuple[int, tuple[str, ...]] | None = None
+        self._oxygen_indices: np.ndarray | None = None
+        self._hydrogen_indices: np.ndarray | None = None
+        self._logged_backend: str | None = None
+
+    def _stable_indices(self, frame: Atoms) -> tuple[np.ndarray, np.ndarray]:
+        symbols = tuple(str(value) for value in frame.get_chemical_symbols())
+        signature = (len(frame), symbols)
+        if signature != self._selection_signature:
+            symbol_array = np.asarray(symbols, dtype=object)
+            self._oxygen_indices = np.where(symbol_array == "O")[0].astype(int, copy=False)
+            self._hydrogen_indices = np.where(symbol_array == "H")[0].astype(int, copy=False)
+            self._selection_signature = signature
+            self.topology = None
+            self.per_frame = False
+        assert self._oxygen_indices is not None
+        assert self._hydrogen_indices is not None
+        return self._oxygen_indices, self._hydrogen_indices
+
+    def _detect(self, frame: Atoms) -> OHTopology:
+        oxygen_indices, hydrogen_indices = self._stable_indices(frame)
+        resolved: list[str] = []
+        topology = oh_molecule_topology(
+            frame,
+            oh_cutoff=self.oh_cutoff,
+            backend=self.backend,
+            _oxygen_indices=oxygen_indices,
+            _hydrogen_indices=hydrogen_indices,
+            _backend_callback=resolved.append,
+        )
+        resolved_backend = resolved[0] if resolved else self.backend
+        if resolved_backend != self._logged_backend:
+            self.logger.debug("%s backend: %s.", self.context, resolved_backend)
+            self._logged_backend = resolved_backend
+        return topology
 
     def select(self, frame: Atoms, *, frame_index: int) -> OHTopology:
         if self.topology is None or self.per_frame:
-            self.topology = oh_molecule_topology(frame, oh_cutoff=self.oh_cutoff)
+            self.topology = self._detect(frame)
             return self.topology
 
         if int(frame_index) % self.validation_stride == 0:
-            validated = oh_molecule_topology(frame, oh_cutoff=self.oh_cutoff)
-            if validated.signature() != self.topology.signature():
+            previous = self.topology
+            validated = self._detect(frame)
+            if previous is None or validated.signature() != previous.signature():
                 self.logger.warning(
                     "Detected %s change at frame %d; this likely indicates H-jumping, so LiNaK is switching to slower per-frame O/H molecule detection to keep molecule labels correct.",
                     self.context,
@@ -115,39 +160,217 @@ def _rows_to_array(rows: list[tuple[int, ...]], *, width: int) -> np.ndarray:
     return np.asarray(rows, dtype=int)
 
 
+def _normalize_topology_backend(value: str | None) -> str:
+    backend = "auto" if value is None else str(value).strip().lower()
+    if backend not in OH_TOPOLOGY_BACKENDS:
+        raise ValueError(
+            f"Unknown O/H topology backend '{value}'. Choose from: {', '.join(OH_TOPOLOGY_BACKENDS)}."
+        )
+    return backend
+
+
+def _ase_oh_pairs(
+    frame: Atoms,
+    *,
+    oh_cutoff: float,
+    oxygen_indices: np.ndarray,
+    hydrogen_indices: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    del oxygen_indices, hydrogen_indices
+    oxygen, hydrogen = neighbor_list("ij", frame, {("O", "H"): oh_cutoff})
+    return oxygen.astype(int, copy=False), hydrogen.astype(int, copy=False)
+
+
+def _axis_aligned_orthorhombic(cell: np.ndarray) -> bool:
+    diagonal = np.diag(np.diag(cell))
+    return bool(np.allclose(cell, diagonal, rtol=0.0, atol=1.0e-12))
+
+
+def _ckdtree_orthorhombic_pairs(
+    frame: Atoms,
+    *,
+    oh_cutoff: float,
+    oxygen_indices: np.ndarray,
+    hydrogen_indices: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    cell = np.asarray(frame.cell.array, dtype=np.float64)
+    lengths = np.abs(np.diag(cell))
+    if not np.all(np.asarray(frame.pbc, dtype=bool)) or not _axis_aligned_orthorhombic(cell):
+        raise ValueError("fully periodic axis-aligned orthorhombic cell required")
+    if np.any(lengths <= 0.0):
+        raise ValueError("positive orthorhombic cell lengths required")
+    positions = np.asarray(frame.positions, dtype=np.float64)
+    oxygen_positions = np.mod(positions[oxygen_indices], lengths)
+    hydrogen_positions = np.mod(positions[hydrogen_indices], lengths)
+    tree = cKDTree(hydrogen_positions, boxsize=lengths)
+    neighbors = tree.query_ball_point(oxygen_positions, r=float(oh_cutoff))
+    oxygen_rows: list[int] = []
+    hydrogen_rows: list[int] = []
+    cutoff_sq = float(oh_cutoff) ** 2
+    for local_oxygen, local_hydrogens in enumerate(neighbors):
+        if not local_hydrogens:
+            continue
+        delta = (
+            hydrogen_positions[np.asarray(local_hydrogens, dtype=int)]
+            - oxygen_positions[local_oxygen]
+        )
+        delta -= np.rint(delta / lengths) * lengths
+        for local_hydrogen, vector in zip(local_hydrogens, delta):
+            if float(np.dot(vector, vector)) <= cutoff_sq:
+                oxygen_rows.append(int(oxygen_indices[local_oxygen]))
+                hydrogen_rows.append(int(hydrogen_indices[int(local_hydrogen)]))
+    return np.asarray(oxygen_rows, dtype=int), np.asarray(hydrogen_rows, dtype=int)
+
+
+def _ckdtree_image_pairs(
+    frame: Atoms,
+    *,
+    oh_cutoff: float,
+    oxygen_indices: np.ndarray,
+    hydrogen_indices: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    cell = np.asarray(frame.cell.array, dtype=np.float64)
+    determinant = float(np.linalg.det(cell))
+    condition = float(np.linalg.cond(cell)) if np.isfinite(cell).all() else np.inf
+    if abs(determinant) <= 1.0e-14 or condition > _MAX_CKDTREE_CELL_CONDITION:
+        raise ValueError("invalid or ill-conditioned periodic cell")
+    pbc = np.asarray(frame.pbc, dtype=bool)
+    inverse = np.linalg.inv(cell)
+    reciprocal_norms = np.linalg.norm(inverse, axis=0)
+    image_radius = np.ceil(float(oh_cutoff) * reciprocal_norms).astype(int) + 1
+    shift_axes = [
+        range(-int(image_radius[index]), int(image_radius[index]) + 1)
+        if pbc[index]
+        else range(0, 1)
+        for index in range(3)
+    ]
+    shifts = np.asarray(
+        [(i, j, k) for i in shift_axes[0] for j in shift_axes[1] for k in shift_axes[2]],
+        dtype=np.float64,
+    )
+    image_count = int(hydrogen_indices.size) * int(shifts.shape[0])
+    if image_count > _MAX_CKDTREE_IMAGE_POINTS:
+        raise ValueError("replicated O/H image set exceeds safety limit")
+    positions = np.asarray(frame.positions, dtype=np.float64)
+    image_offsets = shifts @ cell
+    hydrogen_images = (positions[hydrogen_indices][None, :, :] + image_offsets[:, None, :]).reshape(
+        -1, 3
+    )
+    original_local = np.tile(np.arange(hydrogen_indices.size, dtype=int), shifts.shape[0])
+    tree = cKDTree(hydrogen_images)
+    candidates = tree.query_ball_point(positions[oxygen_indices], r=float(oh_cutoff))
+    cutoff_sq = float(oh_cutoff) ** 2
+    pairs: set[tuple[int, int]] = set()
+    for local_oxygen, image_candidates in enumerate(candidates):
+        oxygen_position = positions[oxygen_indices[local_oxygen]]
+        for image_index in image_candidates:
+            vector = hydrogen_images[int(image_index)] - oxygen_position
+            if float(np.dot(vector, vector)) <= cutoff_sq:
+                pairs.add(
+                    (
+                        int(oxygen_indices[local_oxygen]),
+                        int(hydrogen_indices[original_local[int(image_index)]]),
+                    )
+                )
+    ordered = sorted(pairs)
+    return (
+        np.asarray([pair[0] for pair in ordered], dtype=int),
+        np.asarray([pair[1] for pair in ordered], dtype=int),
+    )
+
+
+def _find_oh_pairs(
+    frame: Atoms,
+    *,
+    oh_cutoff: float,
+    backend: str,
+    oxygen_indices: np.ndarray,
+    hydrogen_indices: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, str]:
+    normalized = _normalize_topology_backend(backend)
+    if normalized != "ase":
+        try:
+            cell = np.asarray(frame.cell.array, dtype=np.float64)
+            if np.all(np.asarray(frame.pbc, dtype=bool)) and _axis_aligned_orthorhombic(cell):
+                oxygen, hydrogen = _ckdtree_orthorhombic_pairs(
+                    frame,
+                    oh_cutoff=oh_cutoff,
+                    oxygen_indices=oxygen_indices,
+                    hydrogen_indices=hydrogen_indices,
+                )
+                return oxygen, hydrogen, "ckdtree-orthorhombic"
+            oxygen, hydrogen = _ckdtree_image_pairs(
+                frame,
+                oh_cutoff=oh_cutoff,
+                oxygen_indices=oxygen_indices,
+                hydrogen_indices=hydrogen_indices,
+            )
+            return oxygen, hydrogen, "ckdtree-images"
+        except Exception as exc:
+            LOGGER.debug("cKDTree O/H topology backend unavailable (%s); using ASE.", exc)
+    oxygen, hydrogen = _ase_oh_pairs(
+        frame,
+        oh_cutoff=oh_cutoff,
+        oxygen_indices=oxygen_indices,
+        hydrogen_indices=hydrogen_indices,
+    )
+    return oxygen, hydrogen, "ase"
+
+
 # ---------------------------------------------------------------------------
 # O/H molecule detection
 # ---------------------------------------------------------------------------
 
 
-def oh_molecule_topology(
+def _oh_molecule_topology_with_backend(
     frame: Atoms,
-    oh_cutoff: float = H2O_OH_CUTOFF_A,
-) -> OHTopology:
+    *,
+    oh_cutoff: float,
+    backend: str,
+    oxygen_indices: np.ndarray | None = None,
+    hydrogen_indices: np.ndarray | None = None,
+) -> tuple[OHTopology, str]:
     """Classify O/H entities into free H/O, OH, H2O, and H3O molecule groups."""
 
     symbols = np.asarray(frame.get_chemical_symbols(), dtype=object)
-    oxygen_all = np.where(symbols == "O")[0].astype(int, copy=False)
-    hydrogen_all = np.where(symbols == "H")[0].astype(int, copy=False)
+    oxygen_all = (
+        np.where(symbols == "O")[0].astype(int, copy=False)
+        if oxygen_indices is None
+        else np.asarray(oxygen_indices, dtype=int)
+    )
+    hydrogen_all = (
+        np.where(symbols == "H")[0].astype(int, copy=False)
+        if hydrogen_indices is None
+        else np.asarray(hydrogen_indices, dtype=int)
+    )
     rows: dict[str, list[tuple[int, ...]]] = {label: [] for label in MOLECULE_SPECIES_LABELS}
     ambiguous_hydrogens: set[int] = set()
     ambiguous_oxygens: set[int] = set()
     overcoordinated_oxygens: set[int] = set()
 
     if oxygen_all.size == 0 and hydrogen_all.size == 0:
-        return OHTopology(
-            groups=_empty_groups(),
-            ambiguous_hydrogen_indices=np.empty((0,), dtype=int),
-            ambiguous_oxygen_indices=np.empty((0,), dtype=int),
-            overcoordinated_oxygen_indices=np.empty((0,), dtype=int),
+        return (
+            OHTopology(
+                groups=_empty_groups(),
+                ambiguous_hydrogen_indices=np.empty((0,), dtype=int),
+                ambiguous_oxygen_indices=np.empty((0,), dtype=int),
+                overcoordinated_oxygen_indices=np.empty((0,), dtype=int),
+            ),
+            "empty",
         )
 
-    oxygen_indices, hydrogen_indices = neighbor_list("ij", frame, {("O", "H"): oh_cutoff})
+    pair_oxygen_indices, pair_hydrogen_indices, resolved_backend = _find_oh_pairs(
+        frame,
+        oh_cutoff=oh_cutoff,
+        backend=backend,
+        oxygen_indices=oxygen_all,
+        hydrogen_indices=hydrogen_all,
+    )
     oxygen_to_hydrogen: dict[int, set[int]] = {int(index): set() for index in oxygen_all}
     hydrogen_to_oxygen: dict[int, set[int]] = {int(index): set() for index in hydrogen_all}
     for oxygen_index, hydrogen_index in zip(
-        oxygen_indices.astype(int, copy=False),
-        hydrogen_indices.astype(int, copy=False),
+        pair_oxygen_indices.astype(int, copy=False),
+        pair_hydrogen_indices.astype(int, copy=False),
     ):
         oxygen_key = int(oxygen_index)
         hydrogen_key = int(hydrogen_index)
@@ -206,6 +429,29 @@ def oh_molecule_topology(
             topology.ambiguous_oxygen_indices.tolist(),
             topology.overcoordinated_oxygen_indices.tolist(),
         )
+    return topology, resolved_backend
+
+
+def oh_molecule_topology(
+    frame: Atoms,
+    oh_cutoff: float = H2O_OH_CUTOFF_A,
+    *,
+    backend: str = "auto",
+    _oxygen_indices: np.ndarray | None = None,
+    _hydrogen_indices: np.ndarray | None = None,
+    _backend_callback: object | None = None,
+) -> OHTopology:
+    """Classify O/H entities using an automatic cKDTree or ASE pair backend."""
+
+    topology, _resolved_backend = _oh_molecule_topology_with_backend(
+        frame,
+        oh_cutoff=float(oh_cutoff),
+        backend=backend,
+        oxygen_indices=_oxygen_indices,
+        hydrogen_indices=_hydrogen_indices,
+    )
+    if callable(_backend_callback):
+        _backend_callback(_resolved_backend)
     return topology
 
 
@@ -214,10 +460,13 @@ def oh_molecule_indices(
     molecule_label: str,
     *,
     oh_cutoff: float = H2O_OH_CUTOFF_A,
+    backend: str = "auto",
 ) -> np.ndarray:
     """Return atom-index rows for one supported O/H molecule selector."""
 
-    return oh_molecule_topology(frame, oh_cutoff=oh_cutoff).indices_for(molecule_label)
+    return oh_molecule_topology(frame, oh_cutoff=oh_cutoff, backend=backend).indices_for(
+        molecule_label
+    )
 
 
 def water_molecule_triplets(
@@ -402,7 +651,7 @@ def water_triplet_axis_values_with_masses(
 
 
 def water_axis_values_per_frame(
-    frames: list[Atoms],
+    frames: Sequence[Atoms],
     axis_index: int,
     *,
     oh_cutoff: float = H2O_OH_CUTOFF_A,

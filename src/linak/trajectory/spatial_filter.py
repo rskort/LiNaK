@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from ..cell_geometry import wrapped_frame_positions
+
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,7 +12,13 @@ from typing import Any
 import numpy as np
 from ase import Atoms
 
-from ..analysis.surface import _surface_estimate_metadata, estimate_surface_reference
+from ..analysis.surface import (
+    _surface_estimate_metadata,
+    _surface_reference_metadata,
+    estimate_surface_layout_reference,
+    surface_distance_components,
+    SurfaceReference,
+)
 from ..analysis.water import water_molecule_triplets, water_triplet_geometry
 from ..utils import axis_to_index
 
@@ -50,6 +58,7 @@ class SpatialFilterOptions:
     keep_molecules_intact: bool = False
     surface_axis: str = "z"
     surface_mode: str = "auto"
+    surface_layout: str = "auto"
     surface_elements: tuple[str, ...] | None = None
     include_fixed_surface_atoms: bool = False
     rough_surface_envelope_A: float | None = None
@@ -64,7 +73,7 @@ class SpatialFilterOptions:
 
 @dataclass(frozen=True)
 class SpatialFilterResult:
-    frames: list[Atoms]
+    frames: Sequence[Atoms]
     metadata: dict[str, Any]
     filename_suffix: str
     resolved_ranges: dict[str, ResolvedSpatialRange]
@@ -111,6 +120,7 @@ def spatial_filter_options_from_mapping(
     *,
     surface_axis: str = "z",
     surface_mode: str = "auto",
+    surface_layout: str = "auto",
     surface_elements: Sequence[str] | None = None,
     include_fixed_surface_atoms: bool = False,
     rough_surface_envelope_A: float | None = None,
@@ -125,6 +135,7 @@ def spatial_filter_options_from_mapping(
         keep_molecules_intact=bool(values.get("keep_molecules_intact", False)),
         surface_axis=str(surface_axis).strip().lower() or "z",
         surface_mode=str(surface_mode).strip().lower() or "auto",
+        surface_layout=str(surface_layout).strip().lower() or "auto",
         surface_elements=(
             None
             if surface_elements is None
@@ -150,7 +161,7 @@ def _wrapped_positions_for_frame(frame: Atoms) -> np.ndarray:
     if len(frame) == 0:
         return np.empty((0, 3), dtype=float)
     try:
-        wrapped = frame.get_positions(wrap=True)
+        wrapped = wrapped_frame_positions(frame)
     except Exception:
         wrapped = frame.get_positions()
     return np.asarray(wrapped, dtype=float)
@@ -160,18 +171,10 @@ def _wrap_points(points: np.ndarray, frame: Atoms) -> np.ndarray:
     data = np.asarray(points, dtype=float)
     if data.size == 0:
         return np.empty((0, 3), dtype=float)
-    cell = np.asarray(frame.cell.array, dtype=float)
-    if cell.shape != (3, 3):
-        return data.copy()
     try:
-        fractional = np.linalg.solve(cell.T, data.T).T
-    except np.linalg.LinAlgError:
+        return wrapped_frame_positions(frame, data)
+    except ValueError:
         return data.copy()
-    pbc = np.asarray(frame.get_pbc(), dtype=bool)
-    for axis_index in range(3):
-        if pbc[axis_index]:
-            fractional[:, axis_index] = np.mod(fractional[:, axis_index], 1.0)
-    return fractional @ cell
 
 
 def _resolve_bound(token: str, *, full_lower: float, full_upper: float) -> float:
@@ -183,18 +186,23 @@ def _resolve_bound(token: str, *, full_lower: float, full_upper: float) -> float
 
 
 def _resolve_range(spec: SpatialRangeSpec, values: list[np.ndarray]) -> ResolvedSpatialRange:
-    finite_segments = [
-        np.asarray(segment, dtype=float)[np.isfinite(np.asarray(segment, dtype=float))]
-        for segment in values
-        if np.asarray(segment, dtype=float).size > 0
-    ]
-    if not finite_segments:
+    full_lower = np.inf
+    full_upper = -np.inf
+    found_finite = False
+    for segment in values:
+        array = np.asarray(segment, dtype=float)
+        if array.size == 0:
+            continue
+        finite = array[np.isfinite(array)]
+        if finite.size == 0:
+            continue
+        full_lower = min(full_lower, float(np.min(finite)))
+        full_upper = max(full_upper, float(np.max(finite)))
+        found_finite = True
+    if not found_finite:
         raise ValueError(
             f"Cannot resolve {spec.axis_id}-range because no finite coordinates are available."
         )
-    all_values = np.concatenate(finite_segments)
-    full_lower = float(np.min(all_values))
-    full_upper = float(np.max(all_values))
     lower = _resolve_bound(spec.lower_token, full_lower=full_lower, full_upper=full_upper)
     upper = _resolve_bound(spec.upper_token, full_lower=full_lower, full_upper=full_upper)
     if not np.isfinite(lower) or not np.isfinite(upper) or upper < lower:
@@ -242,22 +250,33 @@ def _surface_distance_values_for_atoms(
     estimate = precomputed_surface_estimate
     provenance = "precomputed"
     if estimate is None:
-        estimate = estimate_surface_reference(
+        estimate = estimate_surface_layout_reference(
             frames,
             axis=axis,
+            surface_layout=options.surface_layout,
             mode=options.surface_mode,
-            surface_elements=None
-            if options.surface_elements is None
-            else list(options.surface_elements),
+            surface_elements=(
+                None if options.surface_elements is None else list(options.surface_elements)
+            ),
             include_fixed_surface_atoms=bool(options.include_fixed_surface_atoms),
             surface_options=None,
         )
         provenance = "computed"
-    if estimate is None or estimate.per_frame is None:
+    if estimate is None:
         raise ValueError(
             "Distance-based spatial filtering requires a usable distance-to-surface reference."
         )
-    if estimate.per_frame.shape[0] != len(frames):
+    if isinstance(estimate, SurfaceReference):
+        values = [
+            surface_distance_components(
+                estimate,
+                np.asarray(frame.positions[:, axis_index], dtype=float),
+                frame_index=frame_index,
+            )[0]
+            for frame_index, frame in enumerate(frames)
+        ]
+        return values, estimate, provenance
+    if estimate.per_frame is None or estimate.per_frame.shape[0] != len(frames):
         raise ValueError(
             "Distance-based spatial filtering failed because the cached surface reference does not match the trajectory."
         )
@@ -336,7 +355,14 @@ def apply_spatial_filter(
             surface_estimate=None,
         )
 
-    wrapped_positions_by_frame = [_wrapped_positions_for_frame(frame) for frame in frames]
+    needs_atom_cartesian_coordinates = not options.keep_molecules_intact and any(
+        axis_id != "distance" for axis_id in active_specs
+    )
+    wrapped_positions_by_frame = (
+        [_wrapped_positions_for_frame(frame) for frame in frames]
+        if needs_atom_cartesian_coordinates
+        else None
+    )
     distance_values_by_atoms: list[np.ndarray] | None = None
     surface_estimate = None
     distance_provenance = None
@@ -372,15 +398,26 @@ def apply_spatial_filter(
             for axis_id, spec in active_specs.items():
                 del spec
                 if axis_id == "distance":
-                    group_distances = np.asarray(
-                        group_centers[:, axis_to_index(options.surface_axis)]
-                        - (
-                            0.0
-                            if surface_estimate is None
-                            else float(surface_estimate.per_frame[frame_index])
-                        ),
+                    group_axis_values = np.asarray(
+                        group_centers[:, axis_to_index(options.surface_axis)],
                         dtype=float,
                     )
+                    if isinstance(surface_estimate, SurfaceReference):
+                        group_distances = surface_distance_components(
+                            surface_estimate,
+                            group_axis_values,
+                            frame_index=frame_index,
+                        )[0]
+                    else:
+                        group_distances = np.asarray(
+                            group_axis_values
+                            - (
+                                0.0
+                                if surface_estimate is None
+                                else float(surface_estimate.per_frame[frame_index])
+                            ),
+                            dtype=float,
+                        )
                     distance_values_by_groups.append(group_distances)
                     axis_values_by_groups[axis_id].append(group_distances)
                 else:
@@ -424,7 +461,11 @@ def apply_spatial_filter(
             axis_id: [] for axis_id in active_specs
         }
         for frame_index, frame in enumerate(frames):
-            wrapped_positions = wrapped_positions_by_frame[frame_index]
+            wrapped_positions = (
+                None
+                if wrapped_positions_by_frame is None
+                else wrapped_positions_by_frame[frame_index]
+            )
             original_atom_counts.append(len(frame))
             retained_group_counts.append(0)
             original_group_counts.append(0)
@@ -435,6 +476,7 @@ def apply_spatial_filter(
                         np.asarray(distance_values_by_atoms[frame_index], dtype=float)
                     )
                 else:
+                    assert wrapped_positions is not None
                     axis_values_by_atoms[axis_id].append(
                         np.asarray(wrapped_positions[:, axis_to_index(axis_id)], dtype=float)
                     )
@@ -443,13 +485,21 @@ def apply_spatial_filter(
 
         for frame_index, frame in enumerate(frames):
             keep_mask = np.ones(len(frame), dtype=bool)
-            wrapped_positions = wrapped_positions_by_frame[frame_index]
+            wrapped_positions = (
+                None
+                if wrapped_positions_by_frame is None
+                else wrapped_positions_by_frame[frame_index]
+            )
             for axis_id, resolved in resolved_ranges.items():
-                values = (
-                    np.asarray(distance_values_by_atoms[frame_index], dtype=float)
-                    if axis_id == "distance"
-                    else np.asarray(wrapped_positions[:, axis_to_index(axis_id)], dtype=float)
-                )
+                if axis_id == "distance":
+                    assert distance_values_by_atoms is not None
+                    values = np.asarray(distance_values_by_atoms[frame_index], dtype=float)
+                else:
+                    assert wrapped_positions is not None
+                    values = np.asarray(
+                        wrapped_positions[:, axis_to_index(axis_id)],
+                        dtype=float,
+                    )
                 keep_mask &= values >= (resolved.resolved_lower - _FILTER_TOL)
                 keep_mask &= values <= (resolved.resolved_upper + _FILTER_TOL)
             retained_indices = np.where(keep_mask)[0].astype(int)
@@ -471,7 +521,12 @@ def apply_spatial_filter(
             "provenance": distance_provenance,
             "surface_axis": str(options.surface_axis).strip().lower() or "z",
             "surface_mode": str(options.surface_mode).strip().lower() or "auto",
-            **_surface_estimate_metadata(surface_estimate),
+            "surface_layout": str(options.surface_layout).strip().lower() or "auto",
+            **(
+                _surface_reference_metadata(surface_estimate)
+                if isinstance(surface_estimate, SurfaceReference)
+                else _surface_estimate_metadata(surface_estimate)
+            ),
         }
     metadata: dict[str, Any] = {
         "used": True,
@@ -506,6 +561,214 @@ def apply_spatial_filter(
         metadata["distance"] = distance_metadata
     return SpatialFilterResult(
         frames=filtered_frames,
+        metadata=metadata,
+        filename_suffix=filename_suffix,
+        resolved_ranges=resolved_ranges,
+        surface_estimate=surface_estimate,
+    )
+
+
+def apply_spatial_filter_streaming(
+    frames: Sequence[Atoms],
+    *,
+    options: SpatialFilterOptions,
+    precomputed_surface_estimate: Any | None = None,
+    temporary_directory: str | Path | None = None,
+    chunk_frames: int = 64,
+) -> SpatialFilterResult:
+    """Filter a seekable trajectory in bounded memory and spool the transformed result."""
+
+    from .execution import spool_trajectory_chunks
+
+    if not options.active:
+        return SpatialFilterResult(
+            frames=frames,
+            metadata={"used": False, "keep_molecules_intact": options.keep_molecules_intact},
+            filename_suffix="",
+            resolved_ranges={},
+            surface_estimate=None,
+        )
+    if not frames:
+        raise ValueError("Spatial filtering requires at least one trajectory frame.")
+    range_specs = {
+        axis_id: parse_spatial_range(axis_id, raw)
+        for axis_id, raw in (
+            ("x", options.x_range),
+            ("y", options.y_range),
+            ("z", options.z_range),
+            ("distance", options.distance_range),
+        )
+    }
+    active_specs = {axis_id: spec for axis_id, spec in range_specs.items() if spec is not None}
+    axis_index = axis_to_index(options.surface_axis)
+    surface_estimate = precomputed_surface_estimate
+    distance_provenance = "precomputed"
+    if "distance" in active_specs and surface_estimate is None:
+        surface_estimate = estimate_surface_layout_reference(
+            frames,
+            axis=options.surface_axis,
+            mode=options.surface_mode,
+            surface_layout=options.surface_layout,
+            surface_elements=(
+                None if options.surface_elements is None else list(options.surface_elements)
+            ),
+            include_fixed_surface_atoms=options.include_fixed_surface_atoms,
+            surface_options=None,
+        )
+        distance_provenance = "computed"
+    if "distance" in active_specs and surface_estimate is None:
+        raise ValueError(
+            "Distance-based spatial filtering requires a usable distance-to-surface reference."
+        )
+
+    def _distances(values: np.ndarray, frame_index: int) -> np.ndarray:
+        if isinstance(surface_estimate, SurfaceReference):
+            return surface_distance_components(
+                surface_estimate,
+                np.asarray(values, dtype=float),
+                frame_index=frame_index,
+            )[0]
+        assert surface_estimate is not None
+        if surface_estimate.per_frame is None or len(surface_estimate.per_frame) != len(frames):
+            raise ValueError(
+                "Distance-based spatial filtering surface reference does not match the trajectory."
+            )
+        return np.asarray(values, dtype=float) - float(surface_estimate.per_frame[frame_index])
+
+    observed: dict[str, list[float]] = {axis_id: [np.inf, -np.inf] for axis_id in active_specs}
+    molecule_selection_mode = "atoms"
+    estimated_spool_bytes = 0
+    for frame_index, frame in enumerate(frames):
+        estimated_spool_bytes += len(frame) * 64 + 512
+        if options.keep_molecules_intact:
+            _indices, centers, molecule_selection_mode = _group_centers_and_indices(frame)
+            coordinate_source = centers
+        else:
+            coordinate_source = _wrapped_positions_for_frame(frame)
+        for axis_id in active_specs:
+            values = (
+                _distances(coordinate_source[:, axis_index], frame_index)
+                if axis_id == "distance"
+                else coordinate_source[:, axis_to_index(axis_id)]
+            )
+            finite = np.asarray(values, dtype=float)
+            finite = finite[np.isfinite(finite)]
+            if finite.size:
+                observed[axis_id][0] = min(observed[axis_id][0], float(np.min(finite)))
+                observed[axis_id][1] = max(observed[axis_id][1], float(np.max(finite)))
+    resolved_ranges = {
+        axis_id: _resolve_range(spec, [np.asarray(observed[axis_id], dtype=float)])
+        for axis_id, spec in active_specs.items()
+    }
+
+    original_atom_counts: list[int] = []
+    retained_atom_counts: list[int] = []
+    original_group_counts: list[int] = []
+    retained_group_counts: list[int] = []
+
+    def _filtered_chunks() -> Any:
+        pending: list[Atoms] = []
+        for frame_index, frame in enumerate(frames):
+            original_atom_counts.append(len(frame))
+            if options.keep_molecules_intact:
+                group_indices, centers, _mode = _group_centers_and_indices(frame)
+                original_group_counts.append(len(group_indices))
+                keep = np.ones(len(group_indices), dtype=bool)
+                for axis_id, resolved in resolved_ranges.items():
+                    values = (
+                        _distances(centers[:, axis_index], frame_index)
+                        if axis_id == "distance"
+                        else centers[:, axis_to_index(axis_id)]
+                    )
+                    keep &= values >= resolved.resolved_lower - _FILTER_TOL
+                    keep &= values <= resolved.resolved_upper + _FILTER_TOL
+                retained = (
+                    np.unique(
+                        np.concatenate([group_indices[index] for index in np.where(keep)[0]])
+                    ).astype(int)
+                    if np.any(keep)
+                    else np.empty(0, dtype=int)
+                )
+                retained_group_counts.append(int(np.count_nonzero(keep)))
+            else:
+                positions = _wrapped_positions_for_frame(frame)
+                keep = np.ones(len(frame), dtype=bool)
+                for axis_id, resolved in resolved_ranges.items():
+                    values = (
+                        _distances(positions[:, axis_index], frame_index)
+                        if axis_id == "distance"
+                        else positions[:, axis_to_index(axis_id)]
+                    )
+                    keep &= values >= resolved.resolved_lower - _FILTER_TOL
+                    keep &= values <= resolved.resolved_upper + _FILTER_TOL
+                retained = np.where(keep)[0].astype(int)
+            retained_atom_counts.append(int(retained.size))
+            pending.append(frame[retained.tolist()] if retained.size else _empty_frame_like(frame))
+            if len(pending) >= max(1, int(chunk_frames)):
+                yield pending
+                pending = []
+        if pending:
+            yield pending
+
+    filtered = spool_trajectory_chunks(
+        _filtered_chunks(),
+        temporary_directory=temporary_directory,
+        chunk_frames=chunk_frames,
+        source_fingerprint="spatial-filter",
+        estimated_bytes=estimated_spool_bytes,
+    )
+    if sum(retained_atom_counts) <= 0:
+        filtered.close()
+        raise ValueError("Spatial filtering removed all atoms from the trajectory.")
+    filename_suffix = _filter_suffix_from_ranges(list(resolved_ranges.values()))
+    metadata: dict[str, Any] = {
+        "used": True,
+        "keep_molecules_intact": bool(options.keep_molecules_intact),
+        "molecule_selection_mode": molecule_selection_mode,
+        "pbc_selection_notes": (
+            "Wrapped Cartesian coordinates were used for x/y/z bounds when a periodic cell was available."
+        ),
+        "bounds": {
+            axis_id: {
+                "requested": resolved.requested,
+                "resolved_lower": resolved.resolved_lower,
+                "resolved_upper": resolved.resolved_upper,
+                "full_lower": resolved.full_lower,
+                "full_upper": resolved.full_upper,
+                "is_full_range": resolved.is_full_range,
+            }
+            for axis_id, resolved in resolved_ranges.items()
+        },
+        "original_atom_counts": original_atom_counts,
+        "retained_atom_counts": retained_atom_counts,
+        "original_atom_count_total": int(sum(original_atom_counts)),
+        "retained_atom_count_total": int(sum(retained_atom_counts)),
+        "filename_suffix": filename_suffix,
+    }
+    if options.keep_molecules_intact:
+        metadata.update(
+            {
+                "original_molecule_counts": original_group_counts,
+                "retained_molecule_counts": retained_group_counts,
+                "original_molecule_count_total": int(sum(original_group_counts)),
+                "retained_molecule_count_total": int(sum(retained_group_counts)),
+            }
+        )
+    if "distance" in resolved_ranges:
+        assert surface_estimate is not None
+        metadata["distance"] = {
+            "provenance": distance_provenance,
+            "surface_axis": options.surface_axis,
+            "surface_mode": options.surface_mode,
+            "surface_layout": options.surface_layout,
+            **(
+                _surface_reference_metadata(surface_estimate)
+                if isinstance(surface_estimate, SurfaceReference)
+                else _surface_estimate_metadata(surface_estimate)
+            ),
+        }
+    return SpatialFilterResult(
+        frames=filtered,
         metadata=metadata,
         filename_suffix=filename_suffix,
         resolved_ranges=resolved_ranges,

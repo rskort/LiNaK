@@ -200,9 +200,7 @@ def generic_view_type_compatibility(
         z_quantity_id = role_assignments.get("z")
         color_quantity_id = role_assignments.get("color")
         categorical_split = (
-            str(mapping.fixed_values.get("projection_render_mode") or "")
-            .strip()
-            .lower()
+            str(mapping.fixed_values.get("projection_render_mode") or "").strip().lower()
             == "line-colors"
             and split_by is not None
         )
@@ -242,7 +240,9 @@ def _contract_supports_view_type(contract: PlotDataContract, view_type_id: str) 
     if not available or view_type_id in available:
         return True
     canonical_target = canonical_plot_view_id(view_type_id)
-    return any(canonical_plot_view_id(available_id) == canonical_target for available_id in available)
+    return any(
+        canonical_plot_view_id(available_id) == canonical_target for available_id in available
+    )
 
 
 def _validation_view_type_id(contract: PlotDataContract, view_type_id: str | None) -> str:

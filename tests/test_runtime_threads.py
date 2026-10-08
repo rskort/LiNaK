@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from pathlib import Path
 
 from linak.runtime_threads import configure_native_thread_env

@@ -1,3 +1,8 @@
+from __future__ import annotations
+from matplotlib.axes import Axes
+from matplotlib.colorbar import Colorbar
+from matplotlib.figure import Figure
+
 import numpy as np
 import pytest
 
@@ -108,6 +113,7 @@ def test_plot_line_series_hides_all_spines_when_axes_border_disabled(tmp_path):
 
     assert result is not None
     ax = capture_state["axes"]
+    assert isinstance(ax, Axes)
     assert capture_state["axes_border"] is False
     assert all(not spine.get_visible() for spine in ax.spines.values())
 
@@ -136,6 +142,7 @@ def test_plot_multi_line_series_preserves_spines_when_axes_border_enabled(tmp_pa
 
     assert result is not None
     ax = capture_state["axes"]
+    assert isinstance(ax, Axes)
     assert capture_state["axes_border"] is True
     assert all(spine.get_visible() for spine in ax.spines.values())
 
@@ -158,6 +165,7 @@ def test_plot_heatmap_series_hides_all_spines_when_axes_border_disabled(tmp_path
 
     assert result is not None
     ax = capture_state["axes"]
+    assert isinstance(ax, Axes)
     assert capture_state["axes_border"] is False
     assert all(not spine.get_visible() for spine in ax.spines.values())
 
@@ -194,6 +202,7 @@ def test_plot_multi_line_series_applies_per_axis_tick_and_font_color_settings(tm
 
     assert result is not None
     ax = capture_state["axes"]
+    assert isinstance(ax, Axes)
     assert ax.title.get_color() == "#123456"
     assert ax.xaxis.label.get_color() == "#123456"
     assert ax.yaxis.label.get_color() == "#123456"
@@ -229,6 +238,7 @@ def test_plot_multi_line_series_applies_axis_specific_tick_visibility(tmp_path):
 
     assert result is not None
     ax = capture_state["axes"]
+    assert isinstance(ax, Axes)
     assert ax.xaxis.get_major_ticks()[0].tick1line.get_visible() is False
     assert ax.xaxis.get_major_ticks()[0].label1.get_visible() is False
     assert ax.yaxis.get_major_ticks()[0].tick1line.get_visible() is True
@@ -270,7 +280,9 @@ def test_plot_multi_line_series_applies_axis_specific_grid_visibility(tmp_path):
     assert result_y is not None
 
     ax_x = capture_state_x["axes"]
+    assert isinstance(ax_x, Axes)
     ax_y = capture_state_y["axes"]
+    assert isinstance(ax_y, Axes)
     assert capture_state_x["grid_kwargs"] == {"axis": "x", "which": "major"}
     assert capture_state_y["grid_kwargs"] == {"axis": "y", "which": "major"}
     assert any(line.get_visible() for line in ax_x.get_xgridlines())
@@ -298,6 +310,7 @@ def test_plot_multi_line_series_preserves_legend_title_fontsize_in_capture_state
     )
 
     assert result is not None
+    assert isinstance(capture_state["legend_kwargs"], dict)
     assert capture_state["legend_kwargs"]["title_fontsize"] == 17
     assert capture_state["legend_kwargs"]["ncols"] == 2
     assert capture_state["legend_kwargs"]["frameon"] is False
@@ -333,6 +346,7 @@ def test_plot_multi_line_series_integrates_plotted_data_with_boundary_interpolat
 
     assert result is not None
     summaries = capture_state["integration_summaries"]
+    assert isinstance(summaries, list)
     assert summaries[0]["status"] == "ok"
     assert summaries[0]["signed_area"] == pytest.approx(2.0)
     assert summaries[0]["absolute_area"] == pytest.approx(2.0)
@@ -381,7 +395,9 @@ def test_plot_multi_line_series_integrates_raw_profile_data_before_normalization
         },
     )
 
+    assert isinstance(raw_state["integration_summaries"], list)
     assert raw_state["integration_summaries"][0]["signed_area"] == pytest.approx(4.0)
+    assert isinstance(plotted_state["integration_summaries"], list)
     assert plotted_state["integration_summaries"][0]["signed_area"] == pytest.approx(2.0)
 
 
@@ -403,6 +419,7 @@ def test_plot_multi_line_series_applies_x_axis_scale_and_offset(tmp_path):
     )
 
     assert result is not None
+    assert isinstance(capture_state["axes"], Axes)
     line = capture_state["axes"].lines[0]
     np.testing.assert_allclose(line.get_xdata(), np.array([1.0, 11.0, 21.0]))
     assert capture_state["x_axis_scale"] == pytest.approx(0.2)
@@ -427,6 +444,7 @@ def test_plot_multi_line_series_falls_back_to_count_axis_before_mapping(tmp_path
     )
 
     assert result is not None
+    assert isinstance(capture_state["axes"], Axes)
     line = capture_state["axes"].lines[0]
     np.testing.assert_allclose(line.get_xdata(), np.array([1.2, 1.4, 1.6]))
 
@@ -468,7 +486,9 @@ def test_x_axis_mapping_affects_plotted_integration_but_not_raw_integration(tmp_
         },
     )
 
+    assert isinstance(raw_state["integration_summaries"], list)
     assert raw_state["integration_summaries"][0]["signed_area"] == pytest.approx(4.0)
+    assert isinstance(plotted_state["integration_summaries"], list)
     assert plotted_state["integration_summaries"][0]["signed_area"] == pytest.approx(2.0)
 
 
@@ -549,8 +569,11 @@ def test_plot_heatmap_series_applies_figure_alpha_and_font_color_settings(tmp_pa
 
     assert result is not None
     fig = capture_state["figure"]
+    assert isinstance(fig, Figure)
     ax = capture_state["axes"]
+    assert isinstance(ax, Axes)
     colorbar = capture_state["heatmap_colorbar"]
+    assert isinstance(colorbar, Colorbar)
     assert fig.patch.get_alpha() == pytest.approx(0.35)
     assert ax.patch.get_alpha() == pytest.approx(0.35)
     assert ax.title.get_color() == "#654321"
@@ -581,7 +604,9 @@ def test_plot_multi_line_series_applies_figure_alpha_to_axes_face(tmp_path):
 
     assert result is not None
     fig = capture_state["figure"]
+    assert isinstance(fig, Figure)
     ax = capture_state["axes"]
+    assert isinstance(ax, Axes)
     assert fig.patch.get_alpha() == pytest.approx(0.35)
     assert ax.patch.get_alpha() == pytest.approx(0.35)
 
@@ -612,6 +637,7 @@ def test_plot_line_series_applies_dict_border_selectively(tmp_path):
 
     assert result is not None
     ax = capture_state["axes"]
+    assert isinstance(ax, Axes)
     assert ax.spines["left"].get_visible() is True
     assert ax.spines["right"].get_visible() is False
     assert ax.spines["top"].get_visible() is False
@@ -681,11 +707,13 @@ def test_plot_line_series_renders_error_band_and_reports_summary(tmp_path):
     )
 
     assert result is not None
+    assert isinstance(capture_state["series_error_summaries"], dict)
     error_summary = capture_state["series_error_summaries"]["series"]
     assert error_summary["status"] == "ok"
     assert error_summary["stat"] == "block_sem"
     assert error_summary["style"] == "band"
     assert error_summary["color"] == "#cc5500"
+    assert isinstance(capture_state["series_available_error_stats"], dict)
     assert capture_state["series_available_error_stats"]["series"] == [
         "sample_std",
         "sample_sem",
@@ -751,8 +779,10 @@ def test_plot_line_series_min_bin_points_masks_sparse_raw_groups(tmp_path):
     )
 
     assert result is not None
+    assert isinstance(capture_state["series_statistics"], dict)
     stats = capture_state["series_statistics"]["series"]
     assert stats["point_count"] == 2
+    assert isinstance(capture_state["series_masked_bin_counts"], dict)
     assert capture_state["series_masked_bin_counts"]["series"] == 1
 
 
@@ -780,10 +810,12 @@ def test_plot_line_series_disables_saved_profile_error_overlay_after_rebinning(t
     )
 
     assert result is not None
+    assert isinstance(capture_state["series_error_summaries"], dict)
     error_summary = capture_state["series_error_summaries"]["series"]
     assert error_summary["status"] == "ok"
     assert error_summary["stat"] == "sample_sem"
     assert error_summary["statistics_mode"] == "saved_rebinned_sample"
+    assert isinstance(capture_state["series_available_error_stats"], dict)
     assert capture_state["series_available_error_stats"]["series"] == [
         "sample_std",
         "sample_sem",
@@ -815,11 +847,14 @@ def test_plot_line_series_min_bin_points_masks_rebinned_saved_profile(tmp_path):
     )
 
     assert result is not None
+    assert isinstance(capture_state["series_error_summaries"], dict)
     error_summary = capture_state["series_error_summaries"]["series"]
     assert error_summary["status"] == "ok"
     assert error_summary["statistics_mode"] == "saved_rebinned_sample"
     assert error_summary["point_count"] == 1
+    assert isinstance(capture_state["series_masked_bin_counts"], dict)
     assert capture_state["series_masked_bin_counts"]["series"] == 1
+    assert isinstance(capture_state["series_statistics"], dict)
     stats = capture_state["series_statistics"]["series"]
     assert stats["point_count"] == 1
 
@@ -851,6 +886,7 @@ def test_plot_line_series_rebinned_saved_profile_falls_back_from_block_to_sample
     )
 
     assert result is not None
+    assert isinstance(capture_state["series_error_summaries"], dict)
     error_summary = capture_state["series_error_summaries"]["series"]
     assert error_summary["status"] == "ok"
     assert error_summary["stat"] == "sample_sem"
@@ -959,8 +995,11 @@ def test_plot_line_series_renders_annotations_and_reports_summary(tmp_path):
 
     assert result is not None
     summaries = capture_state["annotations_summary"]
+    assert isinstance(summaries, list)
     assert [entry["status"] for entry in summaries] == ["ok", "ok", "ok", "disabled"]
     ax = capture_state["axes"]
+    assert isinstance(ax, Axes)
+    assert isinstance(capture_state["axes"], Axes)
     assert any(text.get_text() == "Peak" for text in ax.texts)
     assert len(ax.lines) >= 2
     assert any(getattr(text, "arrow_patch", None) is not None for text in ax.texts)
@@ -1004,9 +1043,12 @@ def test_plot_heatmap_series_renders_annotations(tmp_path):
 
     assert result is not None
     summaries = capture_state["annotations_summary"]
+    assert isinstance(summaries, list)
     assert [entry["type"] for entry in summaries] == ["text", "arrow"]
     assert all(entry["status"] == "ok" for entry in summaries)
     ax = capture_state["axes"]
+    assert isinstance(ax, Axes)
+    assert isinstance(capture_state["axes"], Axes)
     assert any(text.get_text() == "Surface" for text in ax.texts)
     assert any(getattr(text, "arrow_patch", None) is not None for text in ax.texts)
 
@@ -1052,8 +1094,11 @@ def test_plot_rdf_profile_forwards_annotations_and_reports_rdf_provenance(tmp_pa
     )
 
     assert result is not None
+    assert isinstance(capture_state["annotations_summary"], list)
     assert capture_state["annotations_summary"][0]["status"] == "ok"
+    assert isinstance(capture_state["axes"], Axes)
     assert any(text.get_text() == "RDF peak" for text in capture_state["axes"].texts)
+    assert isinstance(capture_state["series_error_summaries"], dict)
     summary = capture_state["series_error_summaries"]["series"]
     assert summary["provenance_family"] == "block"
     assert "g(r)" in summary["provenance"]
@@ -1124,7 +1169,9 @@ def test_plot_orientation_heatmap_profile_forwards_annotations(tmp_path):
     )
 
     assert result is not None
+    assert isinstance(capture_state["annotations_summary"], list)
     assert capture_state["annotations_summary"][0]["status"] == "ok"
+    assert isinstance(capture_state["axes"], Axes)
     assert any(text.get_text() == "Heatmap annotation" for text in capture_state["axes"].texts)
 
 
@@ -1147,8 +1194,10 @@ def test_plot_multi_line_series_renders_cumulative_when_base_line_is_hidden(tmp_
     )
 
     assert result is not None
+    assert isinstance(capture_state["series_cumulative_summaries"], dict)
     assert capture_state["series_cumulative_summaries"]["series:a"]["status"] == "ok"
     ax = capture_state["axes"]
+    assert isinstance(ax, Axes)
     assert len(ax.lines) == 1
     assert ax.lines[0].get_label() == "base cumulative average"
 
@@ -1172,8 +1221,10 @@ def test_plot_multi_line_series_renders_fit_when_base_line_is_hidden(tmp_path):
     )
 
     assert result is not None
+    assert isinstance(capture_state["series_fit_summaries"], dict)
     assert capture_state["series_fit_summaries"]["series:a"]["status"] == "ok"
     ax = capture_state["axes"]
+    assert isinstance(ax, Axes)
     assert len(ax.lines) == 1
     assert ax.lines[0].get_label() == "base fit"
 
@@ -1255,7 +1306,9 @@ def test_plot_multi_line_series_hides_group_raw_line_when_show_raw_line_is_off(t
     )
 
     assert result is not None
+    assert isinstance(capture_state["series_group_summaries"], dict)
     assert capture_state["series_group_summaries"]["group:1"]["status"] == "ok"
+    assert isinstance(capture_state["axes"], Axes)
     assert len(capture_state["axes"].lines) == 0
 
 
@@ -1297,6 +1350,7 @@ def test_plot_multi_line_series_applies_nested_fit_style_overrides(tmp_path):
 
     assert result is not None
     ax = capture_state["axes"]
+    assert isinstance(ax, Axes)
     assert len(ax.lines) == 2
     fit_line = ax.lines[1]
     assert fit_line.get_color() == "#ff0000"
@@ -1329,6 +1383,7 @@ def test_plot_multi_line_series_autoscales_to_visible_normalized_fit_when_base_l
 
     assert result is not None
     ax = capture_state["axes"]
+    assert isinstance(ax, Axes)
     line = ax.lines[0]
     assert np.nanmin(np.asarray(line.get_ydata(), dtype=float)) < 5.0
     assert np.nanmax(np.asarray(line.get_ydata(), dtype=float)) < 5.0
@@ -1485,6 +1540,7 @@ def test_plot_multi_line_series_autoscales_to_visible_errorbars(tmp_path):
     )
 
     assert result is not None
+    assert isinstance(capture_state["axes"], Axes)
     bottom, top = capture_state["axes"].get_ylim()
     assert bottom < 1.0
     assert top > 10.0
@@ -1526,8 +1582,10 @@ def test_plot_multi_line_series_renders_error_when_base_line_is_hidden(tmp_path)
     )
 
     assert result is not None
+    assert isinstance(capture_state["series_error_summaries"], dict)
     assert capture_state["series_error_summaries"]["series:a"]["status"] == "ok"
     ax = capture_state["axes"]
+    assert isinstance(ax, Axes)
     assert len(ax.lines) == 0
     assert len(ax.collections) == 1
 
@@ -1564,9 +1622,11 @@ def test_plot_multi_line_series_renders_grouped_mean_series(tmp_path):
     )
 
     assert result is not None
+    assert isinstance(capture_state["series_group_summaries"], dict)
     summary = capture_state["series_group_summaries"]["group:1"]
     assert summary["status"] == "ok"
     ax = capture_state["axes"]
+    assert isinstance(ax, Axes)
     assert len(ax.lines) == 1
     np.testing.assert_allclose(ax.lines[0].get_ydata(), np.array([1.5, 3.5, 6.5], dtype=float))
 
@@ -1610,6 +1670,7 @@ def test_plot_multi_line_series_groups_currently_normalized_member_layers(tmp_pa
 
     assert result is not None
     ax = capture_state["axes"]
+    assert isinstance(ax, Axes)
     assert len(ax.lines) == 1
     np.testing.assert_allclose(
         ax.lines[0].get_ydata(),
@@ -1665,6 +1726,7 @@ def test_plot_multi_line_series_group_excludes_hidden_member_layers(tmp_path):
 
     assert result is not None
     ax = capture_state["axes"]
+    assert isinstance(ax, Axes)
     assert [line.get_label() for line in ax.lines] == ["B", "Grouped"]
     np.testing.assert_allclose(ax.lines[1].get_ydata(), np.array([2.0, 4.0, 6.0], dtype=float))
 
@@ -1715,6 +1777,7 @@ def test_plot_multi_line_series_group_includes_raw_hidden_member_layers(tmp_path
 
     assert result is not None
     ax = capture_state["axes"]
+    assert isinstance(ax, Axes)
     assert [line.get_label() for line in ax.lines] == ["B", "Grouped"]
     np.testing.assert_allclose(ax.lines[1].get_ydata(), np.array([1.5, 3.5, 5.5], dtype=float))
 
@@ -1753,6 +1816,7 @@ def test_plot_multi_line_series_renders_generated_copy_from_source_series_id(tmp
 
     assert result is not None
     ax = capture_state["axes"]
+    assert isinstance(ax, Axes)
     assert [line.get_label() for line in ax.lines] == ["Original", "Copy"]
     assert ax.lines[0].get_color() == ax.lines[1].get_color()
     np.testing.assert_allclose(ax.lines[1].get_ydata(), np.array([1.0, 3.0, 5.0], dtype=float))
@@ -1797,6 +1861,7 @@ def test_plot_multi_line_series_hides_disabled_source_render_descriptor(tmp_path
 
     assert result is not None
     ax = capture_state["axes"]
+    assert isinstance(ax, Axes)
     assert [line.get_label() for line in ax.lines] == ["B"]
 
 
@@ -1849,6 +1914,7 @@ def test_plot_multi_line_series_keeps_hidden_source_members_out_of_visible_outpu
 
     assert result is not None
     ax = capture_state["axes"]
+    assert isinstance(ax, Axes)
     assert [line.get_label() for line in ax.lines] == ["B", "Grouped"]
 
 
@@ -1887,6 +1953,7 @@ def test_plot_multi_line_series_rebinned_grouped_path_succeeds_without_strict_zi
 
     assert result is not None
     assert (tmp_path / "grouped_rebinned.png").exists()
+    assert isinstance(capture_state["series_group_summaries"], dict)
     summary = capture_state["series_group_summaries"]["group:1"]
     assert summary["status"] == "ok"
 
@@ -1944,6 +2011,7 @@ def test_plot_multi_line_series_marks_group_unavailable_for_mismatched_x_without
     )
 
     assert result is not None
+    assert isinstance(capture_state["series_group_summaries"], dict)
     summary = capture_state["series_group_summaries"]["group:1"]
     assert summary["status"] == "unavailable"
     assert "matching x grid" in summary["reason"]

@@ -2,15 +2,27 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from ..cell_geometry import (
+    CellMetadata,
+    cell_angles,
+    cell_lengths,
+    cell_matrix,
+    compact_cell,
+    frame_origin,
+)
+
+from collections.abc import Generator, Iterator
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
 import logging
+import warnings
+import re
 import os
 from pathlib import Path
 import shlex
 from typing import TYPE_CHECKING, Any, cast
+from uuid import uuid4
 
 import h5py
 import numpy as np
@@ -25,16 +37,23 @@ from ase.io import lammpsrun as ase_lammpsrun
 from .lammps import (
     extract_cell_from_lammps_input,
     extract_frame_timestep_fs_from_lammps_input,
+    parse_lammps_input,
     resolve_dump_path_from_lammps_input,
 )
 
 from ..progress import ProgressBar
 from ..analysis.common import ATOM_ALIAS_INFO_KEY, RAW_SPECIES_ARRAY
+from ..storage.policies import (
+    STORAGE_PRECISION_POLICY,
+    dataset_create_options,
+    dataset_create_options_for_shape,
+    normalize_compression_profile,
+)
 
 LOGGER = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from ..analysis.density import SurfaceEstimate
+    from ..analysis.surface import SurfaceReference
 
 _ASE_LAMMPS_DATA_TO_ASE_ATOMS = getattr(ase_lammpsrun, "lammps_data_to_ase_atoms", None)
 
@@ -64,7 +83,7 @@ def parse_atom_aliases(atom_aliases: Any = None) -> dict[str, str]:
     if atom_aliases is None:
         return {}
     if isinstance(atom_aliases, dict):
-        items = atom_aliases.items()
+        items = list(atom_aliases.items())
     else:
         items = []
         for alias in atom_aliases:
@@ -134,7 +153,8 @@ def _xyz_comment_for_frame(frame: Atoms) -> str:
     if has_cell:
         lattice = " ".join(_format_xyz_float(value) for value in cell.reshape(-1))
         pbc = " ".join("T" if bool(value) else "F" for value in frame.get_pbc())
-        return f'Lattice="{lattice}" pbc="{pbc}"'
+        origin = " ".join(_format_xyz_float(value) for value in frame_origin(frame))
+        return f'Lattice="{lattice}" pbc="{pbc}" cell_origin="{origin}"'
     return str(frame.info.get("comment", "")).strip()
 
 
@@ -157,20 +177,17 @@ def _write_xyz_like_frames(frames: list[Atoms], output_path: Path) -> None:
                 )
 
 
-def _decode_hdf5_string_array(values: np.ndarray) -> np.ndarray:
-    array = np.asarray(values)
-    if array.dtype.kind == "S":
-        return array.astype(str)
-    return array.astype(object).astype(str)
-
-
 @dataclass(frozen=True)
-class TrajectoryStoredMetadata:
+class TrajectoryStoredMetadata(CellMetadata):
     """Optional simulation-context metadata stored alongside trajectory arrays."""
 
     input_path: Path | None = None
     input_format: str | None = None
     cell_angstrom: tuple[float, float, float] | None = None
+    cell_matrix_angstrom: tuple | None = None
+    cell_angles_deg: tuple | None = None
+    pbc_cell_matrix_angstrom: tuple | None = None
+    pbc_cell_angles_deg: tuple | None = None
     cell_source: str | None = None
     frame_timestep_fs: float | None = None
     md_timestep_fs: float | None = None
@@ -185,12 +202,13 @@ class TrajectoryStoredMetadata:
     surface_cache_status: str | None = None
     surface_cache_axis: str | None = None
     surface_cache_mode: str | None = None
+    surface_cache_layout: str | None = None
     surface_cache_elements: tuple[str, ...] | None = None
     surface_cache_include_fixed_surface_atoms: bool = False
     surface_cache_rough_surface_envelope_A: float | None = None
     surface_cache_source: str | None = None
     surface_cache_unavailable_reason: str | None = None
-    surface_cache_estimate: SurfaceEstimate | None = None
+    surface_cache_estimate: SurfaceReference | None = None
     combine_source_paths: tuple[str, ...] = ()
     combine_source_file_types: tuple[str, ...] = ()
     combine_timestamp_utc: str | None = None
@@ -250,9 +268,9 @@ def _normalize_stored_metadata(
     cell_angstrom = (
         cast(
             tuple[float, float, float],
-            tuple(float(value) for value in metadata.cell_angstrom),
+            compact_cell(metadata.cell_geometry),
         )
-        if metadata.cell_angstrom is not None
+        if metadata.cell_geometry is not None
         else None
     )
     cell_source = str(metadata.cell_source).strip() or None if metadata.cell_source else None
@@ -275,9 +293,9 @@ def _normalize_stored_metadata(
     pbc_cell_angstrom = (
         cast(
             tuple[float, float, float],
-            tuple(float(value) for value in metadata.pbc_cell_angstrom),
+            compact_cell(metadata.pbc_cell_geometry),
         )
-        if metadata.pbc_cell_angstrom is not None
+        if metadata.pbc_cell_geometry is not None
         else None
     )
     pbc_source = str(metadata.pbc_source).strip() or None if metadata.pbc_source else None
@@ -297,6 +315,11 @@ def _normalize_stored_metadata(
     surface_cache_mode = (
         str(metadata.surface_cache_mode).strip().lower() or None
         if metadata.surface_cache_mode
+        else None
+    )
+    surface_cache_layout = (
+        str(metadata.surface_cache_layout).strip().lower() or None
+        if metadata.surface_cache_layout
         else None
     )
     surface_cache_elements = (
@@ -406,6 +429,7 @@ def _normalize_stored_metadata(
         surface_cache_status=surface_cache_status,
         surface_cache_axis=surface_cache_axis,
         surface_cache_mode=surface_cache_mode,
+        surface_cache_layout=surface_cache_layout,
         surface_cache_elements=surface_cache_elements,
         surface_cache_include_fixed_surface_atoms=bool(
             metadata.surface_cache_include_fixed_surface_atoms
@@ -478,7 +502,7 @@ def _resolve_write_metadata(
     return TrajectoryStoredMetadata(
         input_path=resolved.input_path,
         input_format=resolved.input_format,
-        cell_angstrom=resolved.cell_angstrom,
+        cell_angstrom=resolved.cell_geometry,
         cell_source=resolved.cell_source,
         frame_timestep_fs=resolved.frame_timestep_fs,
         md_timestep_fs=resolved.md_timestep_fs,
@@ -487,12 +511,13 @@ def _resolve_write_metadata(
         fixed_atom_indices=fixed_atom_indices,
         fixed_atoms_source=fixed_atoms_source,
         pbc_applied=resolved.pbc_applied,
-        pbc_cell_angstrom=resolved.pbc_cell_angstrom,
+        pbc_cell_angstrom=resolved.pbc_cell_geometry,
         pbc_source=resolved.pbc_source,
         coordinate_basis=resolved.coordinate_basis,
         surface_cache_status=resolved.surface_cache_status,
         surface_cache_axis=resolved.surface_cache_axis,
         surface_cache_mode=resolved.surface_cache_mode,
+        surface_cache_layout=resolved.surface_cache_layout,
         surface_cache_elements=resolved.surface_cache_elements,
         surface_cache_include_fixed_surface_atoms=resolved.surface_cache_include_fixed_surface_atoms,
         surface_cache_rough_surface_envelope_A=resolved.surface_cache_rough_surface_envelope_A,
@@ -567,17 +592,32 @@ def read_trajectory_hdf5_metadata(path: str | Path) -> TrajectoryStoredMetadata 
             else None
         )
 
-        cell_dataset = metadata_group.get("cell_angstrom")
+        cell_dataset = metadata_group.get("cell_matrix_angstrom")
+        if cell_dataset is None:
+            cell_dataset = metadata_group.get("cell_angstrom")
         cell_angstrom = (
-            cast(
-                tuple[float, float, float],
-                tuple(
-                    float(value) for value in np.asarray(cell_dataset, dtype=np.float64).tolist()
-                ),
-            )
+            compact_cell(np.asarray(cell_dataset))
             if isinstance(cell_dataset, h5py.Dataset)
             else None
         )
+        if (
+            cell_angstrom is not None
+            and np.asarray(cell_angstrom).shape == (3,)
+            and "cell_angles_deg" in metadata_group
+        ):
+            cell_angstrom = compact_cell(
+                cell_matrix(cell_angstrom, np.asarray(metadata_group["cell_angles_deg"]))
+            )
+        if (
+            "cell_matrix_angstrom" not in metadata_group
+            and "cell" in handle
+            and len(handle["cell"])
+        ):
+            candidate = np.asarray(handle["cell"][0])
+            try:
+                cell_angstrom = compact_cell(candidate)
+            except ValueError:
+                pass
         fixed_atom_indices_dataset = metadata_group.get("fixed_atom_indices")
         fixed_atom_indices = (
             tuple(
@@ -591,18 +631,15 @@ def read_trajectory_hdf5_metadata(path: str | Path) -> TrajectoryStoredMetadata 
         md_timestep_fs_raw = metadata_group.attrs.get("md_timestep_fs")
         trajectory_stride_md_raw = metadata_group.attrs.get("trajectory_stride_md")
         pbc_applied_raw = metadata_group.attrs.get("pbc_applied")
-        pbc_cell_dataset = metadata_group.get("pbc_cell_angstrom")
+        pbc_cell_dataset = metadata_group.get("pbc_cell_matrix_angstrom")
+        if pbc_cell_dataset is None:
+            pbc_cell_dataset = metadata_group.get("pbc_cell_angstrom")
         pbc_cell_angstrom = (
-            cast(
-                tuple[float, float, float],
-                tuple(
-                    float(value)
-                    for value in np.asarray(pbc_cell_dataset, dtype=np.float64).tolist()
-                ),
-            )
+            compact_cell(np.asarray(pbc_cell_dataset))
             if isinstance(pbc_cell_dataset, h5py.Dataset)
             else None
         )
+
         pbc_source_raw = metadata_group.attrs.get("pbc_source")
         coordinate_basis_raw = metadata_group.attrs.get("coordinate_basis")
 
@@ -610,6 +647,7 @@ def read_trajectory_hdf5_metadata(path: str | Path) -> TrajectoryStoredMetadata 
         surface_cache_status: str | None = None
         surface_cache_axis: str | None = None
         surface_cache_mode: str | None = None
+        surface_cache_layout: str | None = None
         surface_cache_elements: tuple[str, ...] | None = None
         surface_cache_include_fixed_surface_atoms = False
         surface_cache_rough_surface_envelope_A: float | None = None
@@ -627,6 +665,7 @@ def read_trajectory_hdf5_metadata(path: str | Path) -> TrajectoryStoredMetadata 
             surface_cache_status = _optional_attr_str(surface_group.attrs.get("status"))
             surface_cache_axis = _optional_attr_str(surface_group.attrs.get("axis"))
             surface_cache_mode = _optional_attr_str(surface_group.attrs.get("surface_mode"))
+            surface_cache_layout = _optional_attr_str(surface_group.attrs.get("surface_layout"))
             surface_elements_dataset = surface_group.get("surface_elements")
             if isinstance(surface_elements_dataset, h5py.Dataset):
                 surface_cache_elements = tuple(
@@ -724,6 +763,7 @@ def read_trajectory_hdf5_metadata(path: str | Path) -> TrajectoryStoredMetadata 
                 surface_cache_status=surface_cache_status,
                 surface_cache_axis=surface_cache_axis,
                 surface_cache_mode=surface_cache_mode,
+                surface_cache_layout=surface_cache_layout,
                 surface_cache_elements=surface_cache_elements,
                 surface_cache_include_fixed_surface_atoms=surface_cache_include_fixed_surface_atoms,
                 surface_cache_rough_surface_envelope_A=surface_cache_rough_surface_envelope_A,
@@ -800,6 +840,7 @@ def _surface_cache_settings_match(
     *,
     axis: str,
     surface_mode: str,
+    surface_layout: str | None,
     surface_elements: list[str] | tuple[str, ...] | None,
     include_fixed_surface_atoms: bool,
     rough_surface_envelope_A: float | None,
@@ -809,6 +850,10 @@ def _surface_cache_settings_match(
     if cached_axis is None or cached_axis.lower() != axis.lower():
         return False
     if cached_mode is None or cached_mode.lower() != surface_mode.lower():
+        return False
+    cached_layout = _optional_attr_str(group.attrs.get("surface_layout"))
+    requested_layout = (surface_layout or "auto").strip().lower()
+    if cached_layout is None or cached_layout.lower() != requested_layout:
         return False
     if bool(group.attrs.get("include_fixed_surface_atoms", False)) != bool(
         include_fixed_surface_atoms
@@ -832,40 +877,26 @@ def _surface_cache_settings_match(
 
 
 def _surface_cache_metadata_from_group(group: h5py.Group) -> dict[str, Any]:
-    metadata: dict[str, Any] = {}
-    attr_to_metadata = {
-        "surface_position": "surface_position",
-        "surface_position_std": "surface_position_std",
-        "surface_estimate_mode": "surface_mode",
-        "surface_side": "surface_side",
-        "surface_method_label": "surface_method_label",
-        "surface_valid_fraction": "surface_valid_fraction",
-        "surface_median_confidence": "surface_median_confidence",
-        "surface_composite_score": "surface_composite_score",
-        "surface_low_confidence_threshold": "surface_low_confidence_threshold",
-    }
-    for attr_name, metadata_name in attr_to_metadata.items():
-        if attr_name in group.attrs:
-            metadata[metadata_name] = group.attrs[attr_name]
-    selected_elements = group.get("surface_selected_elements")
-    if isinstance(selected_elements, h5py.Dataset):
-        metadata["surface_selected_elements"] = tuple(
-            str(value)
-            for value in _decode_hdf5_string_array(np.asarray(selected_elements))
-            if str(value)
-        )
-    candidate_indices = group.get("surface_candidate_indices")
-    if isinstance(candidate_indices, h5py.Dataset):
-        metadata["surface_candidate_indices"] = np.asarray(candidate_indices, dtype=np.int64)
+    raw = group.attrs.get("surface_reference_metadata_json")
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8")
+    try:
+        metadata = json.loads(str(raw))
+    except (ValueError, TypeError) as exc:
+        raise ValueError(
+            "Trajectory HDF5 surface cache is malformed: invalid reference metadata. "
+            "Reconvert the source trajectory."
+        ) from exc
+    if not isinstance(metadata, dict):
+        raise ValueError("Trajectory HDF5 surface cache is malformed: expected reference metadata.")
     return metadata
 
 
 def _read_surface_cache_datasets(group: h5py.Group) -> dict[str, np.ndarray]:
     required = (
-        "surface_position_per_frame_A",
-        "surface_valid_mask",
-        "surface_confidence",
-        "surface_provenance",
+        "surface_axis_cut_per_frame_A",
+        "surface_axis_lower_per_frame_A",
+        "surface_axis_period_per_frame_A",
     )
     missing = [name for name in required if not isinstance(group.get(name), h5py.Dataset)]
     if missing:
@@ -884,12 +915,13 @@ def read_trajectory_hdf5_surface_cache(
     *,
     axis: str,
     surface_mode: str,
+    surface_layout: str | None = None,
     surface_elements: list[str] | tuple[str, ...] | None,
     include_fixed_surface_atoms: bool,
     rough_surface_envelope_A: float | None,
     frame_count: int,
-) -> SurfaceEstimate | None:
-    """Return a matching conversion-time surface cache from a trajectory HDF5."""
+) -> SurfaceReference | None:
+    """Read a matching current surface reference; obsolete caches are recomputed."""
     trajectory_path = Path(path).expanduser().resolve()
     if not is_linak_trajectory_hdf5(trajectory_path):
         return None
@@ -908,6 +940,7 @@ def read_trajectory_hdf5_surface_cache(
             surface_group,
             axis=axis,
             surface_mode=surface_mode,
+            surface_layout=surface_layout,
             surface_elements=surface_elements,
             include_fixed_surface_atoms=include_fixed_surface_atoms,
             rough_surface_envelope_A=rough_surface_envelope_A,
@@ -920,29 +953,19 @@ def read_trajectory_hdf5_surface_cache(
         datasets = _read_surface_cache_datasets(surface_group)
         metadata = _surface_cache_metadata_from_group(surface_group)
 
-    from ..analysis.density import _surface_estimate_from_payload
+    from ..analysis.surface import _surface_reference_from_payload
 
-    estimate = _surface_estimate_from_payload(datasets=datasets, metadata=metadata)
-    if estimate is None:
-        raise ValueError("Trajectory HDF5 surface cache is malformed: no surface estimate data.")
-    if estimate.frame_values.shape != (int(frame_count),):
+    reference = _surface_reference_from_payload(datasets=datasets, metadata=metadata)
+    if reference is None:
         raise ValueError(
-            "Trajectory HDF5 surface cache is malformed: "
-            f"surface_position_per_frame_A has shape {estimate.frame_values.shape}, "
-            f"expected ({int(frame_count)},)."
+            "Trajectory HDF5 surface cache is malformed: no paired surface reference. "
+            "Reconvert the source trajectory."
         )
-    for label, values in (
-        ("surface_valid_mask", estimate.valid_mask),
-        ("surface_confidence", estimate.confidence),
-        ("surface_provenance", estimate.provenance),
-    ):
-        if np.asarray(values).shape != estimate.frame_values.shape:
-            raise ValueError(
-                "Trajectory HDF5 surface cache is malformed: "
-                f"{label} shape {np.asarray(values).shape} does not match "
-                f"surface_position_per_frame_A shape {estimate.frame_values.shape}."
-            )
-    return estimate
+    if reference.axis_cut_per_frame_A.shape != (int(frame_count),):
+        raise ValueError(
+            "Trajectory HDF5 paired surface cache frame count does not match the trajectory."
+        )
+    return reference
 
 
 def _collect_frame_info_values(
@@ -1000,6 +1023,8 @@ def _write_trajectory_surface_cache(
         surface_group.attrs["axis"] = metadata.surface_cache_axis
     if metadata.surface_cache_mode:
         surface_group.attrs["surface_mode"] = metadata.surface_cache_mode
+    if metadata.surface_cache_layout:
+        surface_group.attrs["surface_layout"] = metadata.surface_cache_layout
     surface_group.attrs["include_fixed_surface_atoms"] = bool(
         metadata.surface_cache_include_fixed_surface_atoms
     )
@@ -1018,42 +1043,17 @@ def _write_trajectory_surface_cache(
     if metadata.surface_cache_status != "available" or estimate is None:
         return
 
-    from ..analysis.density import _surface_estimate_datasets, _surface_metadata_payload
+    from ..analysis.surface import (
+        _surface_reference_datasets,
+        _surface_reference_metadata,
+    )
 
-    nested_metadata = _surface_metadata_payload(
-        surface_position=estimate.position,
-        surface_position_std=estimate.std,
-        estimate=estimate,
-    ).get("surface", {})
-    if "position" in nested_metadata:
-        surface_group.attrs["surface_position"] = float(nested_metadata["position"])
-    if "position_std" in nested_metadata:
-        surface_group.attrs["surface_position_std"] = float(nested_metadata["position_std"])
-    if "mode" in nested_metadata:
-        surface_group.attrs["surface_estimate_mode"] = str(nested_metadata["mode"])
-    if "side" in nested_metadata:
-        surface_group.attrs["surface_side"] = str(nested_metadata["side"])
-    if "method_label" in nested_metadata:
-        surface_group.attrs["surface_method_label"] = str(nested_metadata["method_label"])
-    for key in (
-        "valid_fraction",
-        "median_confidence",
-        "composite_score",
-        "low_confidence_threshold",
-    ):
-        if key in nested_metadata and nested_metadata[key] is not None:
-            surface_group.attrs[f"surface_{key}"] = float(nested_metadata[key])
-    selected_elements = tuple(str(value) for value in nested_metadata.get("selected_elements", ()))
-    if selected_elements:
-        _write_string_dataset(surface_group, "surface_selected_elements", selected_elements)
-    candidate_indices = nested_metadata.get("candidate_indices")
-    if candidate_indices is not None:
-        surface_group.create_dataset(
-            "surface_candidate_indices",
-            data=np.asarray(candidate_indices, dtype=np.int64),
-        )
-
-    for name, values in _surface_estimate_datasets(estimate).items():
+    surface_group.attrs["surface_layout"] = estimate.requested_layout
+    surface_group.attrs["surface_reference_metadata_json"] = json.dumps(
+        _surface_reference_metadata(estimate),
+        sort_keys=True,
+    )
+    for name, values in _surface_reference_datasets(estimate).items():
         if values is None:
             continue
         array = np.asarray(values)
@@ -1068,6 +1068,7 @@ def _write_trajectory_hdf5(
     source_path: str | Path | None = None,
     source_format: str | None = None,
     metadata: TrajectoryStoredMetadata | None = None,
+    compression_profile: str = "fast",
 ) -> Path:
     frame_count = len(frames)
     atom_counts = np.asarray([len(frame) for frame in frames], dtype=np.int64)
@@ -1083,37 +1084,26 @@ def _write_trajectory_hdf5(
             "produced variable per-frame atom counts."
         )
     max_atom_count = int(np.max(atom_counts))
-    chunk_frames = max(1, min(frame_count, 64))
+    resolved_compression = normalize_compression_profile(compression_profile)
     raw_species_is_fixed = _raw_species_topology_is_fixed(frames)
-    raw_species_dtype = f"S{max(1, max(len(label.encode('utf-8')) for frame in frames for label in _raw_species_labels_for_frame(frame)))}"
+    label_frames = frames[:1] if raw_species_is_fixed else frames
+    max_label_bytes = max(
+        (
+            len(label.encode("utf-8"))
+            for frame in label_frames
+            for label in _raw_species_labels_for_frame(frame)
+        ),
+        default=1,
+    )
+    raw_species_dtype = np.dtype(f"S{max(1, max_label_bytes)}")
+    cells = np.asarray([frame.cell.array for frame in frames], dtype=np.float64)
+    pbc = np.asarray([frame.pbc for frame in frames], dtype=bool)
 
-    positions = np.zeros((frame_count, max_atom_count, 3), dtype=np.float64)
-    cells = np.empty((frame_count, 3, 3), dtype=np.float64)
-    pbc = np.empty((frame_count, 3), dtype=bool)
-    if topology_is_fixed:
-        atomic_numbers: np.ndarray = np.asarray(frames[0].get_atomic_numbers(), dtype=np.int64)
-    else:
-        atomic_numbers = np.zeros((frame_count, max_atom_count), dtype=np.int64)
-    if raw_species_is_fixed:
-        raw_species_labels: np.ndarray = _raw_species_labels_for_frame(frames[0]).astype(
-            raw_species_dtype
+    def encoded_labels(frame: Atoms) -> np.ndarray:
+        return np.asarray(
+            [str(label).encode("utf-8") for label in _raw_species_labels_for_frame(frame)],
+            dtype=raw_species_dtype,
         )
-    else:
-        raw_species_labels = np.full((frame_count, max_atom_count), b"", dtype=raw_species_dtype)
-    for index, frame in enumerate(frames):
-        atom_count = len(frame)
-        if atom_count > 0:
-            positions[index, :atom_count] = np.asarray(frame.get_positions(), dtype=np.float64)
-        if not topology_is_fixed and atom_count > 0:
-            atomic_numbers[index, :atom_count] = np.asarray(
-                frame.get_atomic_numbers(),
-                dtype=np.int64,
-            )
-        raw_labels = _raw_species_labels_for_frame(frame)
-        if not raw_species_is_fixed and atom_count > 0:
-            raw_species_labels[index, :atom_count] = raw_labels.astype(raw_species_dtype)
-        cells[index] = np.asarray(frame.cell.array, dtype=np.float64)
-        pbc[index] = np.asarray(frame.get_pbc(), dtype=bool)
 
     info_arrays: dict[str, np.ndarray] = {}
     for key in _TRAJECTORY_INFO_INT_KEYS:
@@ -1133,53 +1123,111 @@ def _write_trajectory_hdf5(
             handle.attrs["atom_count"] = max_atom_count
             handle.attrs["topology_mode"] = "fixed" if topology_is_fixed else "variable"
             handle.attrs["created_utc"] = datetime.now(timezone.utc).isoformat()
+            handle.attrs["compression_profile"] = resolved_compression
+            handle.attrs["storage_precision_policy"] = STORAGE_PRECISION_POLICY
             if source_path is not None:
                 handle.attrs["source_path"] = str(Path(source_path).expanduser().resolve())
             if source_format:
                 handle.attrs["source_format"] = str(source_format)
 
-            handle.create_dataset(
+            position_shape = (frame_count, max_atom_count, 3)
+            position_dataset = handle.create_dataset(
                 "positions",
-                data=positions,
-                chunks=(chunk_frames, max_atom_count, 3),
-                compression="lzf",
-                shuffle=True,
+                shape=position_shape,
+                dtype=np.float32,
+                **dataset_create_options_for_shape(
+                    position_shape,
+                    dtype=np.float32,
+                    compression_profile=resolved_compression,
+                ),
+            )
+            handle.create_dataset(
+                "cell_origin_angstrom", data=np.asarray([frame_origin(frame) for frame in frames])
             )
             handle.create_dataset(
                 "cell",
                 data=cells,
-                chunks=(chunk_frames, 3, 3),
-                compression="lzf",
-                shuffle=True,
+                **dataset_create_options(
+                    cells,
+                    compression_profile=resolved_compression,
+                ),
             )
             handle.create_dataset(
                 "pbc",
                 data=pbc,
-                chunks=(chunk_frames, 3),
-                compression="lzf",
+                **dataset_create_options(
+                    pbc,
+                    compression_profile=resolved_compression,
+                ),
             )
-            handle.create_dataset(
-                "atomic_numbers",
-                data=atomic_numbers.astype(np.int64),
-                compression="lzf" if not topology_is_fixed else None,
-                shuffle=not topology_is_fixed,
-            )
-            handle.create_dataset(
-                "raw_species_labels",
-                data=raw_species_labels,
-                compression="lzf" if not raw_species_is_fixed else None,
-                shuffle=not raw_species_is_fixed,
-            )
+            numbers_dataset = None
+            if topology_is_fixed:
+                handle.create_dataset(
+                    "atomic_numbers", data=np.asarray(frames[0].numbers, dtype=np.int64)
+                )
+            else:
+                shape = (frame_count, max_atom_count)
+                numbers_dataset = handle.create_dataset(
+                    "atomic_numbers",
+                    shape=shape,
+                    dtype=np.int64,
+                    **dataset_create_options_for_shape(
+                        shape,
+                        dtype=np.int64,
+                        compression_profile=resolved_compression,
+                    ),
+                )
+            labels_dataset = None
+            if raw_species_is_fixed:
+                handle.create_dataset("raw_species_labels", data=encoded_labels(frames[0]))
+            else:
+                shape = (frame_count, max_atom_count)
+                labels_dataset = handle.create_dataset(
+                    "raw_species_labels",
+                    shape=shape,
+                    dtype=raw_species_dtype,
+                    **dataset_create_options_for_shape(
+                        shape,
+                        dtype=raw_species_dtype,
+                        compression_profile=resolved_compression,
+                    ),
+                )
             handle.attrs["raw_species_labels_mode"] = (
                 "fixed" if raw_species_is_fixed else "variable"
             )
+            chunk_frames = (position_dataset.chunks or (1,))[0]
+            for start in range(0, frame_count, chunk_frames):
+                stop = min(start + chunk_frames, frame_count)
+                count = stop - start
+                positions = np.zeros((count, max_atom_count, 3), dtype=np.float32)
+                numbers = (
+                    None
+                    if numbers_dataset is None
+                    else np.zeros((count, max_atom_count), dtype=np.int64)
+                )
+                labels = (
+                    None
+                    if labels_dataset is None
+                    else np.full((count, max_atom_count), b"", dtype=raw_species_dtype)
+                )
+                for index, frame in enumerate(frames[start:stop]):
+                    atom_count = len(frame)
+                    positions[index, :atom_count] = frame.positions
+                    if numbers is not None:
+                        numbers[index, :atom_count] = frame.numbers
+                    if labels is not None:
+                        labels[index, :atom_count] = encoded_labels(frame)
+                position_dataset[start:stop] = positions
+                if numbers_dataset is not None:
+                    numbers_dataset[start:stop] = numbers
+                if labels_dataset is not None:
+                    labels_dataset[start:stop] = labels
+                progress.update(count)
             if not topology_is_fixed:
                 handle.create_dataset(
                     "atom_counts",
                     data=atom_counts,
-                    chunks=(chunk_frames,),
-                    compression="lzf",
-                    shuffle=True,
+                    **dataset_create_options(atom_counts, compression_profile=resolved_compression),
                 )
             if info_arrays:
                 info_group = handle.create_group("frame_info")
@@ -1187,9 +1235,7 @@ def _write_trajectory_hdf5(
                     info_group.create_dataset(
                         key,
                         data=values,
-                        chunks=(chunk_frames,),
-                        compression="lzf",
-                        shuffle=values.dtype.kind in {"i", "u", "f"},
+                        **dataset_create_options(values, compression_profile=resolved_compression),
                     )
             if stored_metadata is not None:
                 metadata_group = handle.create_group("metadata")
@@ -1217,15 +1263,32 @@ def _write_trajectory_hdf5(
                     metadata_group.attrs["trajectory_stride_md"] = (
                         stored_metadata.trajectory_stride_md
                     )
-                if stored_metadata.cell_angstrom is not None:
+                if stored_metadata.cell_geometry is not None:
+                    metadata_group.create_dataset(
+                        "cell_matrix_angstrom", data=cell_matrix(stored_metadata.cell_geometry)
+                    )
+                    metadata_group.create_dataset(
+                        "cell_angles_deg", data=cell_angles(stored_metadata.cell_geometry)
+                    )
                     metadata_group.create_dataset(
                         "cell_angstrom",
-                        data=np.asarray(stored_metadata.cell_angstrom, dtype=np.float64),
+                        data=np.asarray(
+                            cell_lengths(stored_metadata.cell_geometry), dtype=np.float64
+                        ),
                     )
-                if stored_metadata.pbc_cell_angstrom is not None:
+                if stored_metadata.pbc_cell_geometry is not None:
+                    metadata_group.create_dataset(
+                        "pbc_cell_matrix_angstrom",
+                        data=cell_matrix(stored_metadata.pbc_cell_geometry),
+                    )
+                    metadata_group.create_dataset(
+                        "pbc_cell_angles_deg", data=cell_angles(stored_metadata.pbc_cell_geometry)
+                    )
                     metadata_group.create_dataset(
                         "pbc_cell_angstrom",
-                        data=np.asarray(stored_metadata.pbc_cell_angstrom, dtype=np.float64),
+                        data=np.asarray(
+                            cell_lengths(stored_metadata.pbc_cell_geometry), dtype=np.float64
+                        ),
                     )
                 if stored_metadata.fixed_atom_indices:
                     metadata_group.create_dataset(
@@ -1300,7 +1363,6 @@ def _write_trajectory_hdf5(
                         sort_keys=True,
                     )
                 _write_trajectory_surface_cache(metadata_group, stored_metadata)
-            progress.update(frame_count)
 
     return output_path
 
@@ -1311,6 +1373,7 @@ def _build_atoms_from_hdf5_chunk(
     raw_species_labels: np.ndarray | None,
     positions_chunk: np.ndarray,
     cell_chunk: np.ndarray,
+    origin_chunk: np.ndarray | None = None,
     pbc_chunk: np.ndarray,
     frame_info_chunks: dict[str, np.ndarray],
     fixed_atom_indices: tuple[int, ...],
@@ -1340,6 +1403,7 @@ def _build_atoms_from_hdf5_chunk(
             numbers=frame_atomic_numbers,
             positions=frame_positions,
             cell=cell_chunk[offset],
+            celldisp=None if origin_chunk is None else origin_chunk[offset],
             pbc=tuple(bool(value) for value in pbc_chunk[offset]),
         )
         if frame_raw_species_labels is not None:
@@ -1358,7 +1422,9 @@ def _build_atoms_from_hdf5_chunk(
     return chunk
 
 
-def _read_trajectory_hdf5_chunks(path: Path, *, chunk_size: int) -> Iterator[list[Atoms]]:
+def _read_trajectory_hdf5_chunks(
+    path: Path, *, chunk_size: int, start_frame: int = 0, stop_frame: int | None = None
+) -> Generator[list[Atoms], None, None]:
     with h5py.File(path, "r") as handle:
         if (
             str(handle.attrs.get("linak_format", "")).strip() != LINAK_TRAJECTORY_HDF5_FORMAT
@@ -1368,11 +1434,15 @@ def _read_trajectory_hdf5_chunks(path: Path, *, chunk_size: int) -> Iterator[lis
 
         positions = handle["positions"]
         cells = handle["cell"]
+        origins = handle.get("cell_origin_angstrom")
         pbc = handle["pbc"]
-        atomic_numbers = np.asarray(handle["atomic_numbers"], dtype=np.int64)
+        atomic_numbers = handle["atomic_numbers"]
         raw_species_dataset = handle.get("raw_species_labels")
         atom_counts_dataset = handle.get("atom_counts")
         frame_count = int(handle.attrs.get("frame_count", positions.shape[0]))
+        stop_frame = frame_count if stop_frame is None else min(stop_frame, frame_count)
+        if chunk_size <= 0 or not 0 <= start_frame <= stop_frame:
+            raise ValueError("Invalid trajectory frame range or chunk size.")
         info_group = handle.get("frame_info")
         info_names = list(info_group.keys()) if isinstance(info_group, h5py.Group) else []
         stored_metadata = read_trajectory_hdf5_metadata(path)
@@ -1382,9 +1452,11 @@ def _read_trajectory_hdf5_chunks(path: Path, *, chunk_size: int) -> Iterator[lis
         if isinstance(atom_counts_dataset, h5py.Dataset):
             fixed_atom_indices = ()
 
-        with ProgressBar(desc="Reading trajectory", total=frame_count, unit="frame") as progress:
-            for start in range(0, frame_count, chunk_size):
-                stop = min(start + chunk_size, frame_count)
+        with ProgressBar(
+            desc="Reading trajectory", total=stop_frame - start_frame, unit="frame"
+        ) as progress:
+            for start in range(start_frame, stop_frame, chunk_size):
+                stop = min(start + chunk_size, stop_frame)
                 positions_chunk = np.asarray(positions[start:stop], dtype=np.float64)
                 cell_chunk = np.asarray(cells[start:stop], dtype=np.float64)
                 pbc_chunk = np.asarray(pbc[start:stop], dtype=bool)
@@ -1400,7 +1472,7 @@ def _read_trajectory_hdf5_chunks(path: Path, *, chunk_size: int) -> Iterator[lis
                 )
                 chunk = _build_atoms_from_hdf5_chunk(
                     atomic_numbers=(
-                        atomic_numbers
+                        np.asarray(atomic_numbers, dtype=np.int64)
                         if atom_counts_chunk is None
                         else np.asarray(atomic_numbers[start:stop], dtype=np.int64)
                     ),
@@ -1415,6 +1487,7 @@ def _read_trajectory_hdf5_chunks(path: Path, *, chunk_size: int) -> Iterator[lis
                     ),
                     positions_chunk=positions_chunk,
                     cell_chunk=cell_chunk,
+                    origin_chunk=None if origins is None else np.asarray(origins[start:stop]),
                     pbc_chunk=pbc_chunk,
                     frame_info_chunks=frame_info_chunks,
                     fixed_atom_indices=fixed_atom_indices,
@@ -1445,7 +1518,7 @@ def _lammps_data_to_ase_atoms(
 ) -> Atoms:
     """Compatibility wrapper for ASE's removed ``lammps_data_to_ase_atoms`` helper."""
     if _ASE_LAMMPS_DATA_TO_ASE_ATOMS is not None:
-        return _ASE_LAMMPS_DATA_TO_ASE_ATOMS(
+        result = _ASE_LAMMPS_DATA_TO_ASE_ATOMS(
             data=data,
             colnames=colnames,
             cell=cell,
@@ -1456,6 +1529,13 @@ def _lammps_data_to_ase_atoms(
             specorder=specorder,
             units=units,
         )
+        if "xs" in colnames or "xsu" in colnames:
+            origin = np.asarray(celldisp).reshape(3)
+            unit_converter = getattr(ase_lammpsrun, "convert", None)
+            if unit_converter is not None:
+                origin = unit_converter(origin, "distance", units, "ASE")
+            result.positions += origin
+        return result
 
     if len(data.shape) == 1:
         data = data[np.newaxis, :]
@@ -1531,6 +1611,8 @@ def _lammps_data_to_ase_atoms(
     else:  # pragma: no cover - guarded by position checks above.
         raise ValueError("No usable coordinates found in LAMMPS dump.")
 
+    if scaled_positions is not None:
+        out_atoms.positions += np.asarray(celldisp).reshape(3)
     if velocities is not None:
         out_atoms.set_velocities(velocities)
     if charges is not None:
@@ -1548,6 +1630,21 @@ def _parse_box_bound(
     line: str, box_rows: list[str]
 ) -> tuple[np.ndarray, np.ndarray, tuple[bool, bool, bool]]:
     """Parse a LAMMPS ``ITEM: BOX BOUNDS`` block."""
+    if "abc origin" in line.lower():
+        data = np.loadtxt(box_rows, dtype=float, ndmin=2)
+        if data.shape != (3, 4):
+            raise ValueError("General triclinic BOX BOUNDS requires three vector/origin rows.")
+        flags = line.split()[5:8]
+        pbc = (
+            tuple("p" in flag.lower() for flag in flags)
+            if len(flags) == 3
+            else (False, False, False)
+        )
+        return (
+            cell_matrix(data[:, :3]),
+            data[:, 3],
+            cast(tuple[bool, bool, bool], pbc),
+        )
     tilt_items = line.split()[3:]
     celldata = np.loadtxt(box_rows, dtype=float, ndmin=2)
     diagdisp = celldata[:, :2].reshape(6, 1).flatten()
@@ -1596,7 +1693,7 @@ def _read_frames(
     total_frames: int | None = None,
 ) -> list[Atoms]:
     frames: list[Atoms] = []
-    with ProgressBar(desc="Reading trajectory", total=total_frames, unit="frame") as progress:
+    with ProgressBar(desc="Reading trajectory", total=None, unit="frame") as progress:
         for frame in iread(str(path), index=":", format=format):
             frames.append(frame)
             progress.update()
@@ -1635,75 +1732,112 @@ def _parse_extxyz_comment(comment: str) -> tuple[np.ndarray | None, tuple[bool, 
     return cell, pbc
 
 
-def _read_xyz_like_frames(
+def _iter_xyz_like_frames(
     path: Path,
     *,
     atom_aliases: Any = None,
-) -> list[Atoms]:
+) -> Iterator[Atoms]:
     aliases = parse_atom_aliases(atom_aliases)
-    frames: list[Atoms] = []
     alias_summary: dict[str, str] = {}
-    total_frames = _count_xyz_like_frames(path)
-    with path.open("r", encoding="utf-8") as handle:
-        with ProgressBar(desc="Reading trajectory", total=total_frames, unit="frame") as progress:
+    resolved_labels: dict[str, str] = {}
+    frame_count = 0
+    # Binary reads give exact consumed byte counts without a preliminary scan
+    # or TextIOWrapper's read-ahead position being mistaken for completed work.
+    with path.open("rb") as handle:
+        with ProgressBar(desc="Reading XYZ", total=path.stat().st_size, unit="B") as progress:
             while True:
+                frame_start = handle.tell()
                 natoms_line = handle.readline()
                 if not natoms_line:
                     break
                 stripped = natoms_line.strip()
                 if not stripped:
+                    progress.update(len(natoms_line))
                     continue
                 try:
                     atom_count = int(stripped)
                 except ValueError:
                     raise ValueError(
                         f"Could not parse XYZ trajectory '{path}': expected atom count line, "
-                        f"got {stripped!r}."
+                        f"got {stripped.decode('utf-8')!r}."
                     ) from None
-                comment = handle.readline()
-                if comment == "":
+                if atom_count < 0:
+                    raise ValueError(f"Invalid XYZ atom count in '{path}': {atom_count}.")
+                comment_bytes = handle.readline()
+                if not comment_bytes:
                     raise ValueError(f"Incomplete XYZ trajectory '{path}': missing comment line.")
+                comment = comment_bytes.decode("utf-8")
                 raw_labels: list[str] = []
                 symbols: list[str] = []
-                positions = np.empty((atom_count, 3), dtype=float)
-                for atom_index in range(atom_count):
+                coordinate_rows: list[str] = []
+                for _atom_index in range(atom_count):
                     line = handle.readline()
-                    if line == "":
+                    if not line:
                         raise ValueError(
                             f"Incomplete XYZ trajectory '{path}': truncated atom block."
                         )
-                    parts = line.split()
+                    parts = line.decode("utf-8").split()
                     if len(parts) < 4:
                         raise ValueError(
                             f"Invalid XYZ atom line in '{path}': expected label and xyz columns."
                         )
                     raw_label = parts[0]
-                    element_label = _resolve_raw_atom_label(raw_label, aliases)
-                    try:
-                        positions[atom_index] = [float(parts[1]), float(parts[2]), float(parts[3])]
-                    except ValueError:
-                        raise ValueError(
-                            f"Invalid XYZ coordinates for atom label '{raw_label}' in '{path}'."
-                        ) from None
+                    element_label = resolved_labels.get(raw_label)
+                    if element_label is None:
+                        element_label = _resolve_raw_atom_label(raw_label, aliases)
+                        resolved_labels[raw_label] = element_label
+                        if raw_label != element_label or raw_label in aliases:
+                            alias_summary[raw_label] = element_label
                     raw_labels.append(raw_label)
                     symbols.append(element_label)
-                    if raw_label != element_label or raw_label in aliases:
-                        alias_summary[raw_label] = element_label
+                    coordinate_rows.append(" ".join(parts[1:4]))
+                try:
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("error", DeprecationWarning)
+                        positions = np.fromstring(" ".join(coordinate_rows), sep=" ", dtype=float)
+                    if positions.size != atom_count * 3:
+                        raise ValueError("Incomplete numeric parse")
+                    positions = positions.reshape(atom_count, 3)
+                except (ValueError, DeprecationWarning):
+                    # Preserve Python float syntax and the original label-specific
+                    # diagnostics for unusual or malformed coordinate tokens.
+                    positions = np.empty((atom_count, 3), dtype=float)
+                    for index, row in enumerate(coordinate_rows):
+                        try:
+                            positions[index] = [float(value) for value in row.split()]
+                        except ValueError:
+                            raise ValueError(
+                                f"Invalid XYZ coordinates for atom label '{raw_labels[index]}' in '{path}'."
+                            ) from None
                 cell, pbc = _parse_extxyz_comment(comment)
                 frame = Atoms(symbols=symbols, positions=positions)
                 if cell is not None:
                     frame.set_cell(cell)
+                    origin_match = re.search(r'cell_origin="([^"]+)"', comment)
+                    if origin_match:
+                        frame.set_celldisp(
+                            np.asarray([float(v) for v in origin_match.group(1).split()])
+                        )
                     frame.set_pbc(pbc if pbc is not None else (True, True, True))
                 elif pbc is not None:
                     frame.set_pbc(pbc)
                 frame.info["comment"] = comment.strip()
                 _set_raw_species_labels(frame, raw_labels, aliases)
-                frames.append(frame)
-                progress.update()
+                frame_count += 1
+                progress.detail = f"{frame_count} frames"
+                progress.update(handle.tell() - frame_start)
+                yield frame
     if alias_summary:
         summary = ", ".join(f"{raw}->{element}" for raw, element in sorted(alias_summary.items()))
         LOGGER.info("Atom labels: %s.", summary)
-    return frames
+
+
+def _read_xyz_like_frames(
+    path: Path,
+    *,
+    atom_aliases: Any = None,
+) -> list[Atoms]:
+    return list(_iter_xyz_like_frames(path, atom_aliases=atom_aliases))
 
 
 def _count_lammps_dump_frames(path: Path) -> int:
@@ -1716,38 +1850,8 @@ def _count_lammps_dump_frames(path: Path) -> int:
     return frame_count
 
 
-def _count_xyz_like_frames(path: Path) -> int:
-    """Count frames in XYZ-like text trajectories without parsing Atoms objects."""
-    frame_count = 0
-    with path.open("r", encoding="utf-8") as handle:
-        while True:
-            natoms_line = handle.readline()
-            if not natoms_line:
-                break
-            stripped = natoms_line.strip()
-            if not stripped:
-                continue
-            try:
-                atom_count = int(stripped)
-            except ValueError:
-                raise ValueError(
-                    f"Could not resolve XYZ-style frame count from '{path}': "
-                    f"expected atom count line, got {stripped!r}."
-                ) from None
-            comment_line = handle.readline()
-            if comment_line == "":
-                raise ValueError(f"Incomplete XYZ trajectory '{path}': missing comment line.")
-            for _ in range(atom_count):
-                atom_line = handle.readline()
-                if atom_line == "":
-                    raise ValueError(f"Incomplete XYZ trajectory '{path}': truncated atom block.")
-            frame_count += 1
-    return frame_count
-
-
-def _read_lammps_dump_frames(path: Path) -> list[Atoms]:
+def _iter_lammps_dump_frames(path: Path) -> Iterator[Atoms]:
     """Read a LAMMPS text dump frame-by-frame to keep progress responsive."""
-    frames: list[Atoms] = []
     total_frames = _count_lammps_dump_frames(path)
     n_atoms = 0
     cell = None
@@ -1809,10 +1913,12 @@ def _read_lammps_dump_frames(path: Path) -> list[Atoms]:
                     pbc=pbc,
                 )
                 frame.info.update(info)
-                frames.append(frame)
+                yield frame
                 progress.update()
 
-    return frames
+
+def _read_lammps_dump_frames(path: Path) -> list[Atoms]:
+    return list(_iter_lammps_dump_frames(path))
 
 
 def read_trajectory_chunks(
@@ -1844,34 +1950,46 @@ def read_trajectory_chunks(
 
     suffix = trajectory_path.suffix.lower()
     if suffix in _XYZ_LIKE_SUFFIXES:
-        frames = _read_xyz_like_frames(trajectory_path, atom_aliases=atom_aliases)
-        for start in range(0, len(frames), chunk_size):
-            yield frames[start : start + chunk_size]
+        xyz_chunk: list[Atoms] = []
+        for frame in _iter_xyz_like_frames(trajectory_path, atom_aliases=atom_aliases):
+            xyz_chunk.append(frame)
+            if len(xyz_chunk) >= chunk_size:
+                yield xyz_chunk
+                xyz_chunk = []
+        if xyz_chunk:
+            yield xyz_chunk
         return
 
     if suffix == ".lmp":
-        frames = _read_lammps_input_trajectory(trajectory_path)
-        for start in range(0, len(frames), chunk_size):
-            yield frames[start : start + chunk_size]
+        dump_path, _ = resolve_dump_path_from_lammps_input(trajectory_path)
+        LOGGER.info("Resolved LAMMPS dump '%s' from input '%s'.", dump_path, trajectory_path)
+        for chunk in read_trajectory_chunks(dump_path, chunk_size=chunk_size):
+            _set_lammps_timestep_metadata(chunk, input_path=trajectory_path)
+            _set_lammps_cell_from_input_if_missing(chunk, input_path=trajectory_path)
+            yield chunk
         return
 
     if suffix == ".dump":
-        frames = _read_lammps_dump_frames(trajectory_path)
-        for start in range(0, len(frames), chunk_size):
-            yield frames[start : start + chunk_size]
+        dump_chunk: list[Atoms] = []
+        for frame in _iter_lammps_dump_frames(trajectory_path):
+            dump_chunk.append(frame)
+            if len(dump_chunk) >= chunk_size:
+                yield dump_chunk
+                dump_chunk = []
+        if dump_chunk:
+            yield dump_chunk
         return
 
-    total_frames = _count_xyz_like_frames(trajectory_path) if suffix in _XYZ_LIKE_SUFFIXES else None
-    with ProgressBar(desc="Reading trajectory", total=total_frames, unit="frame") as progress:
-        chunk: list[Atoms] = []
+    with ProgressBar(desc="Reading trajectory", total=None, unit="frame") as progress:
+        generic_chunk: list[Atoms] = []
         for frame in iread(str(trajectory_path), index=":"):
-            chunk.append(frame)
+            generic_chunk.append(frame)
             progress.update()
-            if len(chunk) >= chunk_size:
-                yield chunk
-                chunk = []
-        if chunk:
-            yield chunk
+            if len(generic_chunk) >= chunk_size:
+                yield generic_chunk
+                generic_chunk = []
+        if generic_chunk:
+            yield generic_chunk
 
 
 def _frame_has_usable_cell(frame: Atoms) -> bool:
@@ -1909,24 +2027,27 @@ def _set_lammps_timestep_metadata(frames: list[Atoms], *, input_path: Path) -> N
 def _set_lammps_cell_from_input_if_missing(frames: list[Atoms], *, input_path: Path) -> None:
     if not frames:
         return
-    if all(_frame_has_usable_cell(frame) for frame in frames):
+    if all(abs(np.linalg.det(frame.cell)) > 0 for frame in frames):
         return
 
     try:
         cell = extract_cell_from_lammps_input(input_path)
+        boundary = parse_lammps_input(input_path).boundary
     except Exception as exc:
         LOGGER.debug("Could not extract cell from LAMMPS input '%s': %s", input_path, exc)
         return
 
     for frame in frames:
-        frame.set_cell(cell)
-        frame.set_pbc((True, True, True))
+        if abs(np.linalg.det(frame.cell)) == 0:
+            frame.set_cell(cell)
+            if boundary is not None:
+                frame.set_pbc(boundary)
     LOGGER.info(
-        "Applied orthorhombic cell from LAMMPS input '%s': A=%.6g, B=%.6g, C=%.6g Angstrom.",
+        "Applied cell from LAMMPS input '%s': A=%.6g, B=%.6g, C=%.6g Angstrom.",
         input_path,
-        cell[0],
-        cell[1],
-        cell[2],
+        cell_lengths(cell)[0],
+        cell_lengths(cell)[1],
+        cell_lengths(cell)[2],
     )
 
 
@@ -1967,7 +2088,7 @@ def read_trajectory(path: str | Path, *, atom_aliases: Any = None) -> list[Atoms
         _display = os.path.relpath(trajectory_path)
     except ValueError:
         _display = str(trajectory_path)
-    LOGGER.info("Loading trajectory from '%s'.", _display)
+    LOGGER.debug("Loading trajectory from '%s'.", _display)
     if not trajectory_path.exists():
         raise FileNotFoundError(f"Trajectory file not found: {trajectory_path}")
 
@@ -1991,7 +2112,7 @@ def read_trajectory(path: str | Path, *, atom_aliases: Any = None) -> list[Atoms
     if not frames:
         raise ValueError(f"No frames were read from: {trajectory_path}")
 
-    LOGGER.info("Loaded %d frame(s) from '%s'.", len(frames), _display)
+    LOGGER.debug("Loaded %d frame(s) from '%s'.", len(frames), _display)
     if frames:
         LOGGER.debug("Atoms per frame (frame 0): %d", len(frames[0]))
 
@@ -2006,6 +2127,7 @@ def write_trajectory(
     source_format: str | None = None,
     metadata: TrajectoryStoredMetadata | None = None,
     raw_species_as_symbols: bool = False,
+    compression_profile: str = "fast",
 ) -> Path:
     """Write trajectory frames to disk and return the written path."""
     if not frames:
@@ -2014,14 +2136,23 @@ def write_trajectory(
     output_path = Path(path).expanduser().resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     if output_path.suffix.lower() in {".h5", ".hdf5"}:
-        written = _write_trajectory_hdf5(
-            frames,
-            output_path,
-            source_path=source_path,
-            source_format=source_format,
-            metadata=metadata,
+        temporary_path = output_path.with_name(
+            f".{output_path.name}.{uuid4().hex}.tmp{output_path.suffix}"
         )
-        LOGGER.info("Wrote %d frame(s) to '%s'.", len(frames), output_path)
+        try:
+            _write_trajectory_hdf5(
+                frames,
+                temporary_path,
+                source_path=source_path,
+                source_format=source_format,
+                metadata=metadata,
+                compression_profile=compression_profile,
+            )
+            os.replace(temporary_path, output_path)
+        finally:
+            temporary_path.unlink(missing_ok=True)
+        written = output_path
+        LOGGER.debug("Wrote %d frame(s) to '%s'.", len(frames), output_path)
         return written
 
     with ProgressBar(desc="Writing trajectory", total=1, unit="step") as progress:
@@ -2036,5 +2167,5 @@ def write_trajectory(
                     "Use a writable extension such as .xyz or .traj.h5."
                 ) from exc
         progress.update()
-    LOGGER.info("Wrote %d frame(s) to '%s'.", len(frames), output_path)
+    LOGGER.debug("Wrote %d frame(s) to '%s'.", len(frames), output_path)
     return output_path

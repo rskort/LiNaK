@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from contextlib import closing
 from dataclasses import dataclass
 import logging
 from pathlib import Path
@@ -23,8 +24,13 @@ from ..plot.plotting import (
     resolve_series_labels,
     resolve_single_series_options,
 )
-from ..trajectory.io import read_trajectory
-from .common import read_profile_payloads, read_profile_payloads_by_index, use_multi_series_plot, write_profile_collection
+from ..trajectory.io import read_trajectory, read_trajectory_chunks
+from .common import (
+    read_profile_payloads,
+    read_profile_payloads_by_index,
+    use_multi_series_plot,
+    write_profile_collection,
+)
 from .schema import build_profile_metadata, default_plot_labels
 
 LOGGER = logging.getLogger(__name__)
@@ -156,7 +162,9 @@ def _extract_block(lines: list[str], start_index: int) -> tuple[list[str], int]:
     return block_lines, len(lines) - 1
 
 
-def _parse_cp2k_input(path: str | Path) -> tuple[list[str], list[TemperatureRegion], tuple[int, ...]]:
+def _parse_cp2k_input(
+    path: str | Path,
+) -> tuple[list[str], list[TemperatureRegion], tuple[int, ...]]:
     input_path = Path(path).expanduser().resolve()
     lines = input_path.read_text(encoding="utf-8", errors="replace").splitlines()
     kinds: list[str] = []
@@ -281,7 +289,10 @@ def _resolved_xyz_atom_symbols(
     atom_aliases: Any = None,
 ) -> tuple[str, ...]:
     try:
-        frames = read_trajectory(path, atom_aliases=atom_aliases)
+        with closing(
+            read_trajectory_chunks(path, chunk_size=1, atom_aliases=atom_aliases)
+        ) as chunks:
+            frames = next(chunks, [])
     except (FileNotFoundError, OSError, ValueError) as exc:
         LOGGER.warning("Could not resolve atom symbols from XYZ '%s': %s", path, exc)
         return ()
@@ -326,11 +337,14 @@ def discover_temperature_metadata(
     *,
     input_path: str | Path | None = None,
     atom_aliases: Any = None,
+    atom_symbols: Sequence[str] | None = None,
 ) -> TemperatureMetadata:
     """Discover element and region labels for a temperature source."""
 
     source_path = Path(source).expanduser().resolve()
-    resolved_input = Path(input_path).expanduser().resolve() if input_path else _sibling_input_path(source_path)
+    resolved_input = (
+        Path(input_path).expanduser().resolve() if input_path else _sibling_input_path(source_path)
+    )
     input_elements: tuple[str, ...] = ()
     regions: tuple[TemperatureRegion, ...] = ()
     fixed_indices: tuple[int, ...] = ()
@@ -345,9 +359,11 @@ def discover_temperature_metadata(
             LOGGER.warning("Could not read CP2K input '%s': %s", resolved_input, exc)
             resolved_input = None
 
-    atom_symbols = _sibling_xyz_atom_symbols(source_path, atom_aliases=atom_aliases)
-    if source_path.suffix.lower() == ".xyz":
-        atom_symbols = _resolved_xyz_atom_symbols(source_path, atom_aliases=atom_aliases)
+    if atom_symbols is None:
+        if source_path.suffix.lower() == ".xyz":
+            atom_symbols = _resolved_xyz_atom_symbols(source_path, atom_aliases=atom_aliases)
+        else:
+            atom_symbols = _sibling_xyz_atom_symbols(source_path, atom_aliases=atom_aliases)
     elements = _ordered_unique(atom_symbols) or input_elements
 
     if fixed_indices:
@@ -418,7 +434,9 @@ def _profile_from_table_column(
 ) -> TemperatureProfile:
     frame_index, step, time_fs, time_ps = _table_time_arrays(table)
     atom_indices = (
-        None if region is None or not region.atom_indices else np.asarray(region.atom_indices, dtype=int)
+        None
+        if region is None or not region.atom_indices
+        else np.asarray(region.atom_indices, dtype=int)
     )
     return TemperatureProfile(
         default_label=label,
@@ -467,7 +485,9 @@ def compute_temperature_from_temp(
             selection_kind="element",
             source_type="temp",
             element=labels[index] if not labels[index].startswith("kind ") else None,
-            status=metadata.label_resolution_status if index < len(metadata.elements) else "generic",
+            status=metadata.label_resolution_status
+            if index < len(metadata.elements)
+            else "generic",
         )
         for index in range(value_count)
     ]
@@ -552,19 +572,25 @@ def _temperature_for_selection(
     indices: Sequence[int],
     velocity_factor: float,
     remove_com: bool,
+    selected_masses_kg: np.ndarray | None = None,
 ) -> float:
     selected = np.asarray(indices, dtype=int)
     if selected.size == 0:
         return np.nan
     selected_velocities = np.asarray(velocities[selected], dtype=float) * velocity_factor
-    masses_amu: list[float] = []
-    for index in selected:
-        symbol = str(symbols[int(index)])
-        atomic_number = atomic_numbers.get(symbol)
-        if atomic_number is None:
-            raise ValueError(f"Unknown element symbol '{symbol}' in velocity trajectory.")
-        masses_amu.append(float(atomic_masses[atomic_number]))
-    masses = np.asarray(masses_amu, dtype=float) * AMU_TO_KG
+    if selected_masses_kg is None:
+        masses_amu: list[float] = []
+        for index in selected:
+            symbol = str(symbols[int(index)])
+            atomic_number = atomic_numbers.get(symbol)
+            if atomic_number is None:
+                raise ValueError(f"Unknown element symbol '{symbol}' in velocity trajectory.")
+            masses_amu.append(float(atomic_masses[atomic_number]))
+        masses = np.asarray(masses_amu, dtype=float) * AMU_TO_KG
+    else:
+        masses = np.asarray(selected_masses_kg, dtype=float)
+        if masses.shape != (selected.size,):
+            raise ValueError("Cached velocity masses do not match the atom selection.")
     dof = 3 * selected.size
     if remove_com:
         if selected.size <= 1:
@@ -582,6 +608,7 @@ def compute_temperature_from_velocity_xyz(
     source: str | Path,
     *,
     metadata: TemperatureMetadata | None = None,
+    input_path: str | Path | None = None,
     group_by: str = "auto",
     velocity_unit: str = "auto",
     remove_com: bool = False,
@@ -591,7 +618,12 @@ def compute_temperature_from_velocity_xyz(
 
     source_path = Path(source).expanduser().resolve()
     frames = _iter_velocity_xyz(source_path, atom_aliases=atom_aliases)
-    metadata = metadata or discover_temperature_metadata(source_path, atom_aliases=atom_aliases)
+    metadata = metadata or discover_temperature_metadata(
+        source_path,
+        input_path=input_path,
+        atom_aliases=atom_aliases,
+        atom_symbols=frames[0][2],
+    )
     normalized_group = str(group_by or "auto").strip().lower()
     if normalized_group == "auto":
         normalized_group = "both" if metadata.regions else "elements"
@@ -629,45 +661,71 @@ def compute_temperature_from_velocity_xyz(
     frame_index = np.arange(len(frames), dtype=int)
     step = np.asarray([frame[0] for frame in frames], dtype=np.int64)
     time_fs = np.asarray([frame[1] for frame in frames], dtype=float)
+    time_ps = time_fs / 1000.0
+    masses_by_symbol_layout: dict[tuple[str, ...], np.ndarray] = {}
+    symbol_layout_by_frame: list[tuple[str, ...]] = []
+    for _step, _time_fs, symbols, _velocities in frames:
+        if len(symbols) != len(first_symbols):
+            raise ValueError("Velocity temperature requires stable atom count across frames.")
+        layout = tuple(str(symbol) for symbol in symbols)
+        symbol_layout_by_frame.append(layout)
+        if layout in masses_by_symbol_layout:
+            continue
+        masses_amu: list[float] = []
+        for symbol in layout:
+            atomic_number = atomic_numbers.get(symbol)
+            if atomic_number is None:
+                raise ValueError(f"Unknown element symbol '{symbol}' in velocity trajectory.")
+            masses_amu.append(float(atomic_masses[atomic_number]))
+        masses_by_symbol_layout[layout] = np.asarray(masses_amu, dtype=float) * AMU_TO_KG
+
     profiles: list[TemperatureProfile] = []
-    for selection_kind, label, element, region, indices in selections:
+    for selection_kind, label, profile_element, profile_region, indices in selections:
         values = np.zeros(len(frames), dtype=float)
+        selected_masses_by_layout = {
+            layout: masses[indices] for layout, masses in masses_by_symbol_layout.items()
+        }
         for index, (_step, _time_fs, symbols, velocities) in enumerate(frames):
-            if len(symbols) != len(first_symbols):
-                raise ValueError("Velocity temperature requires stable atom count across frames.")
             values[index] = _temperature_for_selection(
                 symbols=symbols,
                 velocities=velocities,
                 indices=indices,
                 velocity_factor=factor,
                 remove_com=remove_com,
+                selected_masses_kg=selected_masses_by_layout[symbol_layout_by_frame[index]],
             )
         profiles.append(
             TemperatureProfile(
                 default_label=label,
                 selection_kind=selection_kind,
-                frame_index=frame_index.copy(),
-                step=step.copy(),
-                time_fs=time_fs.copy(),
-                time_ps=time_fs / 1000.0,
+                frame_index=frame_index,
+                step=step,
+                time_fs=time_fs,
+                time_ps=time_ps,
                 temperature_K=values,
                 n_frames=len(frames),
                 source_type="velocity_xyz",
-                element=element,
-                region_index=None if region is None else region.region_index,
-                region_name=None if region is None else region.region_name,
-                cp2k_list_expression=None if region is None else region.cp2k_list_expression,
-                region_elements=() if region is None else region.region_elements,
-                region_formula=None if region is None else region.region_formula,
+                element=profile_element,
+                region_index=None if profile_region is None else profile_region.region_index,
+                region_name=None if profile_region is None else profile_region.region_name,
+                cp2k_list_expression=(
+                    None if profile_region is None else profile_region.cp2k_list_expression
+                ),
+                region_elements=() if profile_region is None else profile_region.region_elements,
+                region_formula=None if profile_region is None else profile_region.region_formula,
                 atom_count=int(indices.size),
                 atom_indices=indices.copy(),
                 atom_index_base=0,
-                target_temperature_K=None if region is None else region.target_temperature_K,
+                target_temperature_K=(
+                    None if profile_region is None else profile_region.target_temperature_K
+                ),
                 velocity_unit=resolved_unit,
                 dof_mode="3N-3COM" if remove_com else "3N",
-                label_resolution_status=metadata.label_resolution_status
-                if region is None
-                else region.label_resolution_status,
+                label_resolution_status=(
+                    metadata.label_resolution_status
+                    if profile_region is None
+                    else profile_region.label_resolution_status
+                ),
             )
         )
     if not profiles:
@@ -687,26 +745,26 @@ def compute_temperature_profiles(
     """Compute or load temperature profiles from a supported source file."""
 
     source_path = Path(source).expanduser().resolve()
-    metadata = discover_temperature_metadata(
-        source_path,
-        input_path=input_path,
-        atom_aliases=atom_aliases,
-    )
     suffix = source_path.suffix.lower()
     name = source_path.name.lower()
-    if suffix == ".temp":
-        return compute_temperature_from_temp(source_path, metadata=metadata)
-    if suffix == ".tregion":
-        return compute_temperature_from_tregion(source_path, metadata=metadata)
     if suffix == ".xyz" and "-vel-" in name:
         return compute_temperature_from_velocity_xyz(
             source_path,
-            metadata=metadata,
+            input_path=input_path,
             group_by=group_by,
             velocity_unit=velocity_unit,
             remove_com=remove_com,
             atom_aliases=atom_aliases,
         )
+    metadata = discover_temperature_metadata(
+        source_path,
+        input_path=input_path,
+        atom_aliases=atom_aliases,
+    )
+    if suffix == ".temp":
+        return compute_temperature_from_temp(source_path, metadata=metadata)
+    if suffix == ".tregion":
+        return compute_temperature_from_tregion(source_path, metadata=metadata)
     raise ValueError(
         f"Unsupported temperature source '{source_path.name}'. Use .temp, .tregion, or *-vel-*.xyz."
     )
@@ -752,6 +810,7 @@ def save_temperature_profiles(
     output: str | Path,
     *,
     additional_metadata: Mapping[str, Any] | None = None,
+    compression_profile: str = "fast",
 ) -> Path:
     """Save one or more temperature profiles to LiNaK HDF5 and return the path."""
 
@@ -762,6 +821,7 @@ def save_temperature_profiles(
         analysis="temperature",
         profiles=[_temperature_profile_hdf5_payload(profile) for profile in profiles],
         metadata=dict(additional_metadata or {}),
+        compression_profile=compression_profile,
     )
     LOGGER.info("Saved %d temperature profiles to '%s'.", len(profiles), output_path)
     return output_path
@@ -781,11 +841,11 @@ def _load_temperature_profiles_from_payloads(
             )
         default_label = str(metadata.get("default_label") or "").strip()
         if not default_label:
-            default_label = str(metadata.get("element") or metadata.get("region_name") or "temperature")
+            default_label = str(
+                metadata.get("element") or metadata.get("region_name") or "temperature"
+            )
         atom_indices = (
-            np.asarray(datasets["atom_indices"], dtype=int)
-            if "atom_indices" in datasets
-            else None
+            np.asarray(datasets["atom_indices"], dtype=int) if "atom_indices" in datasets else None
         )
         raw_region_elements = metadata.get("region_elements")
         if isinstance(raw_region_elements, (list, tuple)):
@@ -806,27 +866,25 @@ def _load_temperature_profiles_from_payloads(
                 source_type=str(metadata.get("source_type") or ""),
                 element=str(metadata.get("element") or "") or None,
                 region_index=(
-                    None
-                    if metadata.get("region_index") is None
-                    else int(metadata.get("region_index"))
+                    None if metadata.get("region_index") is None else int(metadata["region_index"])
                 ),
                 region_name=str(metadata.get("region_name") or "") or None,
                 cp2k_list_expression=str(metadata.get("cp2k_list_expression") or "") or None,
                 region_elements=region_elements,
                 region_formula=str(metadata.get("region_formula") or "") or None,
                 atom_count=(
-                    None if metadata.get("atom_count") is None else int(metadata.get("atom_count"))
+                    None if metadata.get("atom_count") is None else int(metadata["atom_count"])
                 ),
                 atom_indices=atom_indices,
                 atom_index_base=(
                     None
                     if metadata.get("atom_index_base") is None
-                    else int(metadata.get("atom_index_base"))
+                    else int(metadata["atom_index_base"])
                 ),
                 target_temperature_K=(
                     None
                     if metadata.get("target_temperature_K") is None
-                    else float(metadata.get("target_temperature_K"))
+                    else float(metadata["target_temperature_K"])
                 ),
                 velocity_unit=str(metadata.get("velocity_unit") or "") or None,
                 dof_mode=str(metadata.get("dof_mode") or "") or None,
@@ -850,6 +908,8 @@ def load_temperature_profiles(path: str | Path) -> list[TemperatureProfile]:
 def load_temperature_profiles_by_index(
     path: str | Path,
     profile_indices: list[int] | tuple[int, ...],
+    *,
+    dataset_names: list[str] | tuple[str, ...] | None = None,
 ) -> list[TemperatureProfile]:
     """Load selected temperature profiles by profile index from LiNaK HDF5."""
 
@@ -858,6 +918,7 @@ def load_temperature_profiles_by_index(
         profile_indices,
         analysis="temperature",
         label="Temperature",
+        dataset_names=dataset_names,
     )
     return _load_temperature_profiles_from_payloads(source_path, payloads)
 
@@ -958,7 +1019,11 @@ def plot_temperature_profile(
         show_blocking=show_blocking,
         preferred_backend=preferred_backend,
         series_id=series_id,
-        line_label=line_label if line_label is not None else profile.default_label if legend else None,
+        line_label=line_label
+        if line_label is not None
+        else profile.default_label
+        if legend
+        else None,
         line_color=single_series.line_color,
         line_width_override=single_series.line_width_override,
         line_marker=single_series.line_marker,
@@ -1142,7 +1207,9 @@ def plot_temperature_profiles(
             series_line_widths=series_line_widths,
             series_markers=series_markers,
             series_fit_configs=series_fit_configs,
-            cumulative_config=None if not series_cumulative_configs else series_cumulative_configs[0],
+            cumulative_config=None
+            if not series_cumulative_configs
+            else series_cumulative_configs[0],
             series_normalization_modes=series_normalization_modes,
             series_normalization_values=series_normalization_values,
             series_normalization_x_refs=series_normalization_x_refs,
@@ -1164,10 +1231,7 @@ def plot_temperature_profiles(
             savefig_kwargs=savefig_kwargs,
         )
     return plot_multi_line_series(
-        [
-            profile.time_fs if runtime_time_axis == "fs" else profile.time_ps
-            for profile in profiles
-        ],
+        [profile.time_fs if runtime_time_axis == "fs" else profile.time_ps for profile in profiles],
         [profile.temperature_K for profile in profiles],
         labels,
         title=title or "Temperature",

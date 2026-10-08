@@ -12,6 +12,7 @@ from typing import Any
 import numpy as np
 
 from ..storage.hdf5_utils import decode_hdf5_string, hdf5_string_dtype, require_h5py
+from .settings_validation import validate_current_plot_settings
 
 _PRIVATE_GROUP = "_linak"
 _SETTINGS_GROUP = "plot_settings"
@@ -134,12 +135,15 @@ def unsupported_saved_plot_profile_message(profile_key: str | None = None) -> st
     )
 
 
-def _coerce_saved_plot_profile(value: Any, *, profile_key: str | None = None) -> dict[str, Any] | None:
+def _coerce_saved_plot_profile(
+    value: Any, *, profile_key: str | None = None
+) -> dict[str, Any] | None:
     settings = _coerce_settings_dict(value)
     if settings is None:
         return None
     if settings.get(_PLOT_PROFILE_SENTINEL) != _PLOT_PROFILE_VERSION:
         raise ValueError(unsupported_saved_plot_profile_message(profile_key))
+    validate_current_plot_settings(settings)
     source_selection = _coerce_settings_dict(settings.get(_PLOT_PROFILE_SOURCE_SELECTION))
     view_mapping = _coerce_settings_dict(settings.get(_PLOT_PROFILE_VIEW_MAPPING))
     style = _coerce_settings_dict(settings.get(_PLOT_PROFILE_STYLE))
@@ -524,7 +528,9 @@ def rename_named_plot_profile(
         updated_profiles = dict(store.profiles)
         profile_payload = updated_profiles.pop(current)
         updated_profiles[renamed] = profile_payload
-        active_profile = renamed if store.active_profile == current else (store.active_profile or renamed)
+        active_profile = (
+            renamed if store.active_profile == current else (store.active_profile or renamed)
+        )
         profiles[key] = _serialize_profile_store(
             PlotProfileStore(active_profile=active_profile, profiles=updated_profiles)
         )

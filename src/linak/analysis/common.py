@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 from pathlib import Path
 from typing import Any
 
@@ -96,9 +98,9 @@ def normalize_species_label(species: str | None) -> str:
         return molecule_label
     if token.upper() == "H2O":
         return "H2O"
-    element_label = _try_normalize_element_symbol(token)
-    if element_label is not None:
-        return element_label
+    inferred_element = _try_normalize_element_symbol(token)
+    if inferred_element is not None:
+        return inferred_element
     return f"species:{token}"
 
 
@@ -157,7 +159,9 @@ def normalize_species_query(
     if token.lower().startswith("element:"):
         return "element", _normalize_element_symbol(token.split(":", 1)[1])
     molecule_label = normalize_molecule_label(token)
-    if molecule_label is not None and (allow_molecules or (allow_h2o and molecule_label == "mol:H2O")):
+    if molecule_label is not None and (
+        allow_molecules or (allow_h2o and molecule_label == "mol:H2O")
+    ):
         return "molecule", molecule_label
     element_label = _try_normalize_element_symbol(token)
     if element_label is not None:
@@ -165,7 +169,7 @@ def normalize_species_query(
     return "species", f"species:{token}"
 
 
-def available_element_species(frames: list[Atoms]) -> list[str]:
+def available_element_species(frames: Sequence[Atoms]) -> list[str]:
     """Return sorted unique element symbols found across all frames."""
     species_set: set[str] = set()
     for frame in frames:
@@ -182,7 +186,7 @@ def raw_species_labels(frame: Atoms) -> np.ndarray:
     return np.asarray(labels, dtype=object).astype(str)
 
 
-def available_raw_species(frames: list[Atoms]) -> list[str]:
+def available_raw_species(frames: Sequence[Atoms]) -> list[str]:
     """Return sorted unique raw atom labels found across all frames."""
 
     species_set: set[str] = set()
@@ -191,7 +195,7 @@ def available_raw_species(frames: list[Atoms]) -> list[str]:
     return sorted(species_set)
 
 
-def available_distinct_raw_species(frames: list[Atoms]) -> list[str]:
+def available_distinct_raw_species(frames: Sequence[Atoms]) -> list[str]:
     """Return raw labels to expose as exact species selections."""
 
     has_distinct_raw_labels = False
@@ -211,7 +215,7 @@ def available_distinct_raw_species(frames: list[Atoms]) -> list[str]:
     return sorted(species_set)
 
 
-def grouped_raw_species_for_split_elements(frames: list[Atoms]) -> list[str]:
+def grouped_raw_species_for_split_elements(frames: Sequence[Atoms]) -> list[str]:
     """Return raw labels worth exposing in grouped outputs.
 
     A raw label is exposed for grouped ``all`` selections only when its resolved
@@ -348,7 +352,7 @@ def optional_cell_lengths(value: Any) -> tuple[float, float, float] | None:
 
 
 def validate_stable_atom_layout(
-    frames: list[Atoms],
+    frames: Sequence[Atoms],
     *,
     description: str,
 ) -> np.ndarray:
@@ -402,6 +406,7 @@ def read_profile_payloads_by_index(
     *,
     analysis: str,
     label: str,
+    dataset_names: list[str] | tuple[str, ...] | None = None,
 ) -> tuple[Path, list[tuple[dict[str, np.ndarray], dict[str, Any]]]]:
     """Load selected LiNaK HDF5 profile payloads for one analysis type."""
     source_path = resolve_profile_source_path(path, label=label)
@@ -409,6 +414,7 @@ def read_profile_payloads_by_index(
         source_path,
         profile_indices,
         expected_analysis=analysis,
+        dataset_names=dataset_names,
     )
     return source_path, payloads
 
@@ -419,6 +425,7 @@ def write_profile_collection(
     analysis: str,
     profiles: list[dict[str, Any]],
     metadata: dict[str, Any] | None = None,
+    compression_profile: str = "fast",
 ) -> Path:
     """Write a LiNaK multi-profile HDF5 collection."""
     return write_linak_hdf5_profile_collection(
@@ -426,6 +433,7 @@ def write_profile_collection(
         analysis=analysis,
         profiles=profiles,
         metadata=dict(metadata or {}),
+        compression_profile=compression_profile,
     )
 
 

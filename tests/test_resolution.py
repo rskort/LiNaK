@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from ase import Atoms
 import pytest
 

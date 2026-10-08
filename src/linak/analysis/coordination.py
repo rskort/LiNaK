@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from ..cell_geometry import ProfileCellGeometry, profile_geometry_datasets
+
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from itertools import islice
 import logging
 from pathlib import Path
 from typing import Any
@@ -40,6 +43,7 @@ from .common import (
     available_element_species,
     frame_has_usable_cell as _common_frame_has_usable_cell,
     grouped_raw_species_for_split_elements,
+    is_molecule_species_label,
     normalize_species_label as _normalize_species,
     optional_cell_lengths as _optional_cell_lengths,
     optional_finite_float as _optional_finite_float,
@@ -53,6 +57,7 @@ from .common import (
 from ..utils import ensure_positive
 from .position import (
     _build_xy_segments,
+    _compute_position_profiles_for_labels,
     compute_position_profile,
 )
 from .surface import (
@@ -60,9 +65,14 @@ from .surface import (
     _surface_estimate_from_payload,
     _surface_metadata_payload,
     _surface_metadata_view,
+    _surface_reference_datasets,
+    _surface_reference_from_payload,
+    _surface_reference_metadata,
     SurfaceEstimate,
     SurfaceEstimatorOptions,
+    SurfaceReference,
 )
+from ..working_arrays import working_array
 from .rdf import (
     _accumulate_rdf_pair_collection,
     _auto_r_max_from_frames,
@@ -102,7 +112,7 @@ class CoordinationCutoffResolution:
 
 
 @dataclass(frozen=True)
-class CoordinationProfile:
+class CoordinationProfile(ProfileCellGeometry):
     """Container for a continuous coordination-number trajectory."""
 
     species_a: str
@@ -122,7 +132,16 @@ class CoordinationProfile:
     surface_position_std: float | None = None
     surface_position_per_frame: np.ndarray | None = None
     surface_estimate: SurfaceEstimate | None = None
+    surface_reference: SurfaceReference | None = None
+    distance_to_top_surface: np.ndarray | None = None
+    distance_to_bottom_surface: np.ndarray | None = None
+    interface_side: np.ndarray | None = None
+    axis_coordinate: np.ndarray | None = None
     cell_lengths_angstrom: tuple[float, float, float] | None = None
+    cell_matrices_angstrom: np.ndarray | None = None
+    cell_origins_angstrom: np.ndarray | None = None
+    cell_pbc: np.ndarray | None = None
+    periodic_crossings: np.ndarray | None = None
     cutoff_A: float | None = None
     cutoff_smoothing_width_A: float | None = None
     cutoff_mode: str = "direct"
@@ -156,7 +175,7 @@ class _CoordinationSelectionCache:
     pair_count: int
 
 
-def _ordered_coordination_pairs_from_frames(frames: list[Atoms]) -> list[tuple[str, str]]:
+def _ordered_coordination_pairs_from_frames(frames: Sequence[Atoms]) -> list[tuple[str, str]]:
     """Return the ordered center->neighbor species pairs for bare collection mode."""
     species_labels = [
         *available_element_species(frames),
@@ -390,7 +409,11 @@ def _fit_local_raw_minimum(
         upper_bound = float(x[min(center_index + 1, x.size - 1)])
         lower_bound = max(lower_bound, float(x_window[0]))
         upper_bound = min(upper_bound, float(x_window[-1]))
-        if not np.isfinite(lower_bound) or not np.isfinite(upper_bound) or lower_bound >= upper_bound:
+        if (
+            not np.isfinite(lower_bound)
+            or not np.isfinite(upper_bound)
+            or lower_bound >= upper_bound
+        ):
             lower_bound = max(center_x, float(x_window[0]))
             upper_bound = float(x_window[-1])
         x_dense = np.linspace(lower_bound, upper_bound, sample_count, dtype=float)
@@ -408,7 +431,7 @@ def _fit_local_raw_minimum(
 
 
 def _compute_reference_rdf_pairs(
-    frames: list[Atoms],
+    frames: Sequence[Atoms],
     *,
     pairs: Sequence[tuple[str, str]],
     r_max: float | None,
@@ -455,7 +478,7 @@ def _compute_reference_rdf_pairs(
 
 
 def _resolve_reference_rdf_r_max(
-    frames: list[Atoms],
+    frames: Sequence[Atoms],
     *,
     r_max: float | None,
 ) -> float:
@@ -547,7 +570,7 @@ def _accumulate_reference_rdf_contributions(
 
 
 def _compute_reference_rdf(
-    frames: list[Atoms],
+    frames: Sequence[Atoms],
     *,
     species_a: str,
     species_b: str,
@@ -694,7 +717,7 @@ def _save_cutoff_diagnostic_plot(
 
 def resolve_coordination_cutoff(
     *,
-    frames: list[Atoms],
+    frames: Sequence[Atoms],
     species_a: str | None,
     species_b: str | None,
     cutoff_A: float | None,
@@ -721,7 +744,7 @@ def resolve_coordination_cutoff(
 
 def resolve_coordination_cutoffs(
     *,
-    frames: list[Atoms],
+    frames: Sequence[Atoms],
     ordered_pairs: Sequence[tuple[str, str]],
     cutoff_A: float | None,
     cutoff_rdf_path: str | Path | None,
@@ -869,7 +892,7 @@ def resolve_coordination_cutoffs(
             rdf_minimum_A=float(minimum_A),
             diagnostic_plot_path=None if diagnostic_path is None else str(diagnostic_path),
         )
-        LOGGER.info(
+        LOGGER.debug(
             "Resolved coordination cutoff for %s-%s from full RDF: cutoff=%.6g A (peak=%.6g A).",
             pair[0],
             pair[1],
@@ -1157,7 +1180,7 @@ def _resolve_coordination_chunk_size(
 
 
 def _can_vectorize_coordination_kernel(
-    frames: list[Atoms],
+    frames: Sequence[Atoms],
     *,
     pair_count: int,
 ) -> bool:
@@ -1201,7 +1224,7 @@ def _validate_coordination_matrix(
 
 
 def _compute_coordination_values_chunked(
-    frames: list[Atoms],
+    frames: Sequence[Atoms],
     *,
     selection_cache: _CoordinationSelectionCache | None = None,
     center_indices: np.ndarray | None = None,
@@ -1256,35 +1279,33 @@ def _compute_coordination_values_chunked(
     chunk_size = _resolve_coordination_chunk_size(frame_count=frame_count, pair_count=pair_count)
     use_mic = bool(frames) and all(_frame_has_usable_cell(frame) for frame in frames)
 
-    coordination = np.zeros((frame_count, center_count), dtype=np.float32)
+    coordination = working_array((frame_count, center_count), dtype=np.float32, fill=0)
     with ProgressBar(
         desc=f"Computing coordination ({center_count}x{neighbor_count})",
         total=frame_count,
         unit="frame",
     ) as progress:
+        frame_iterator = iter(frames)
         for start in range(0, frame_count, chunk_size):
             stop = min(frame_count, start + chunk_size)
+            frame_chunk = list(islice(frame_iterator, stop - start))
+            if len(frame_chunk) != stop - start:
+                raise ValueError("Trajectory ended while computing chunked coordination values.")
             center_positions = np.stack(
-                [
-                    np.asarray(frame.positions[center_indices], dtype=float)
-                    for frame in frames[start:stop]
-                ],
+                [np.asarray(frame.positions[center_indices], dtype=float) for frame in frame_chunk],
                 axis=0,
             )
             neighbor_positions = np.stack(
                 [
                     np.asarray(frame.positions[neighbor_indices], dtype=float)
-                    for frame in frames[start:stop]
+                    for frame in frame_chunk
                 ],
                 axis=0,
             )
             deltas = center_positions[:, :, np.newaxis, :] - neighbor_positions[:, np.newaxis, :, :]
             if use_mic:
                 cell_lengths = np.stack(
-                    [
-                        np.asarray(np.diag(frame.cell.array), dtype=float)
-                        for frame in frames[start:stop]
-                    ],
+                    [np.asarray(np.diag(frame.cell.array), dtype=float) for frame in frame_chunk],
                     axis=0,
                 )
                 deltas -= cell_lengths[:, np.newaxis, np.newaxis, :] * np.round(
@@ -1308,7 +1329,7 @@ def _compute_coordination_values_chunked(
 
 
 def _compute_coordination_profile_from_position_profile(
-    frames: list[Atoms],
+    frames: Sequence[Atoms],
     *,
     position_profile: Any,
     species_b: str,
@@ -1342,9 +1363,10 @@ def _compute_coordination_profile_from_position_profile(
             if bool(frames) and all(_frame_has_usable_cell(frame) for frame in frames)
             else _COORD_BACKEND_GENERIC
         )
-        coordination = np.zeros(
+        coordination = working_array(
             (len(frames), center_count),
             dtype=np.float32,
+            fill=0,
         )
         with ProgressBar(
             desc=f"Computing coordination ({center_count}x{neighbor_count})",
@@ -1360,7 +1382,7 @@ def _compute_coordination_profile_from_position_profile(
                 )
                 progress.update()
 
-    LOGGER.info(
+    LOGGER.debug(
         "Computed coordination for %s-%s over %d frame(s) using %s (pair_count=%d, cutoff=%.6g A).",
         label_a,
         label_b,
@@ -1408,7 +1430,19 @@ def _compute_coordination_profile_from_position_profile(
             else np.asarray(position_profile.surface_position_per_frame, dtype=float)
         ),
         surface_estimate=position_profile.surface_estimate,
+        surface_reference=position_profile.surface_reference,
+        distance_to_top_surface=position_profile.distance_to_top_surface,
+        distance_to_bottom_surface=position_profile.distance_to_bottom_surface,
+        interface_side=position_profile.interface_side,
+        axis_coordinate=np.asarray(
+            getattr(position_profile, str(position_profile.axis).lower()),
+            dtype=np.float32,
+        ),
         cell_lengths_angstrom=position_profile.cell_lengths_angstrom,
+        cell_matrices_angstrom=position_profile.cell_matrices_angstrom,
+        cell_origins_angstrom=position_profile.cell_origins_angstrom,
+        cell_pbc=position_profile.cell_pbc,
+        periodic_crossings=position_profile.periodic_crossings,
         cutoff_A=float(cutoff_resolution.cutoff_A),
         cutoff_smoothing_width_A=float(cutoff_resolution.smoothing_width_A),
         cutoff_mode=str(cutoff_resolution.mode),
@@ -1440,17 +1474,18 @@ def _compute_coordination_profile_from_position_profile(
 
 
 def compute_coordination_profile(
-    frames: list[Atoms],
+    frames: Sequence[Atoms],
     *,
     species_a: str | None = "all",
     species_b: str | None = None,
     axis: str = "z",
     timestep_fs: float = 1.0,
     surface_mode: str = "auto",
+    surface_layout: str | None = "auto",
     surface_elements: list[str] | tuple[str, ...] | None = None,
     include_fixed_surface_atoms: bool = False,
     surface_options: SurfaceEstimatorOptions | None = None,
-    precomputed_surface_estimate: SurfaceEstimate | None = None,
+    precomputed_surface_estimate: SurfaceEstimate | SurfaceReference | None = None,
     cutoff_resolution: CoordinationCutoffResolution,
 ) -> CoordinationProfile:
     if not frames:
@@ -1476,6 +1511,7 @@ def compute_coordination_profile(
         axis=axis_label,
         timestep_fs=float(timestep_fs),
         surface_mode=surface_mode,
+        surface_layout=surface_layout,
         surface_elements=surface_elements,
         include_fixed_surface_atoms=include_fixed_surface_atoms,
         surface_options=surface_options,
@@ -1490,16 +1526,17 @@ def compute_coordination_profile(
 
 
 def compute_coordination_profiles(
-    frames: list[Atoms],
+    frames: Sequence[Atoms],
     *,
     ordered_pairs: Sequence[tuple[str, str]] | None = None,
     axis: str = "z",
     timestep_fs: float = 1.0,
     surface_mode: str = "auto",
+    surface_layout: str | None = "auto",
     surface_elements: list[str] | tuple[str, ...] | None = None,
     include_fixed_surface_atoms: bool = False,
     surface_options: SurfaceEstimatorOptions | None = None,
-    precomputed_surface_estimate: SurfaceEstimate | None = None,
+    precomputed_surface_estimate: SurfaceEstimate | SurfaceReference | None = None,
     cutoff_resolutions: Mapping[tuple[str, str], CoordinationCutoffResolution],
 ) -> list[CoordinationProfile]:
     """Compute ordered coordination profiles while reusing center trajectories."""
@@ -1528,19 +1565,43 @@ def compute_coordination_profiles(
         if species_a not in center_species_in_order:
             center_species_in_order.append(species_a)
 
-    position_profiles_by_species: dict[str, Any] = {}
-    for species_a in center_species_in_order:
-        LOGGER.info(
-            "Resolving coordination center trajectories for %d frame(s) using species_a=%s.",
-            len(frames),
-            species_a,
+    LOGGER.info(
+        "Resolving coordination center trajectories for %d frame(s) using species_a=%s.",
+        len(frames),
+        ",".join(center_species_in_order),
+    )
+    atomic_center_species = [
+        species for species in center_species_in_order if not is_molecule_species_label(species)
+    ]
+    center_profiles = (
+        _compute_position_profiles_for_labels(
+            frames=frames,
+            species_labels=atomic_center_species,
+            axis=axis_label,
+            timestep_fs=float(timestep_fs),
+            surface_mode=surface_mode,
+            surface_layout=surface_layout,
+            surface_elements=surface_elements,
+            include_fixed_surface_atoms=include_fixed_surface_atoms,
+            surface_options=surface_options,
+            precomputed_surface_estimate=precomputed_surface_estimate,
         )
+        if atomic_center_species
+        else []
+    )
+    position_profiles_by_species: dict[str, Any] = {
+        profile.species: profile for profile in center_profiles
+    }
+    for species_a in center_species_in_order:
+        if not is_molecule_species_label(species_a):
+            continue
         position_profiles_by_species[species_a] = compute_position_profile(
             frames,
             species=species_a,
             axis=axis_label,
             timestep_fs=float(timestep_fs),
             surface_mode=surface_mode,
+            surface_layout=surface_layout,
             surface_elements=surface_elements,
             include_fixed_surface_atoms=include_fixed_surface_atoms,
             surface_options=surface_options,
@@ -1569,6 +1630,7 @@ def save_coordination_profile(
     output: str | Path,
     *,
     additional_metadata: Mapping[str, Any] | None = None,
+    compression_profile: str = "fast",
 ) -> Path:
     metadata = build_profile_metadata(
         analysis="coordination",
@@ -1591,10 +1653,18 @@ def save_coordination_profile(
             "cutoff_rdf_minimum_A": profile.cutoff_rdf_minimum_A,
             "cutoff_rdf_source_path": profile.cutoff_rdf_source_path,
             "cutoff_diagnostic_plot_path": profile.cutoff_diagnostic_plot_path,
-            **_surface_metadata_payload(
-                surface_position=profile.surface_position,
-                surface_position_std=profile.surface_position_std,
-                estimate=profile.surface_estimate,
+            **(
+                _surface_reference_metadata(
+                    profile.surface_reference,
+                    surface_position=profile.surface_position,
+                    surface_position_std=profile.surface_position_std,
+                )
+                if profile.surface_reference is not None
+                else _surface_metadata_payload(
+                    surface_position=profile.surface_position,
+                    surface_position_std=profile.surface_position_std,
+                    estimate=profile.surface_estimate,
+                )
             ),
         },
     )
@@ -1605,18 +1675,28 @@ def save_coordination_profile(
         output,
         analysis="coordination",
         datasets={
+            **profile_geometry_datasets(profile),
             "frame_index": profile.frame_index,
             "step": profile.step,
             "time_fs": profile.time_fs,
             "time_ps": profile.time_ps,
             "atom_indices": profile.atom_indices,
             "distance_to_surface_A": profile.distance_to_surface,
+            "distance_to_top_surface_A": profile.distance_to_top_surface,
+            "distance_to_bottom_surface_A": profile.distance_to_bottom_surface,
+            "interface_side": profile.interface_side,
+            "axis_coordinate_A": profile.axis_coordinate,
             "coordination_number": profile.coordination_number,
             "surface_position_per_frame_A": profile.surface_position_per_frame,
             "cutoff_rdf_bin_centers_A": profile.cutoff_rdf_bin_centers_A,
             "cutoff_rdf_g_r": profile.cutoff_rdf_g_r,
             "cutoff_rdf_g_r_smoothed": profile.cutoff_rdf_g_r_smoothed,
-            **_surface_estimate_datasets(profile.surface_estimate),
+            **(
+                {}
+                if profile.surface_reference is not None
+                else _surface_estimate_datasets(profile.surface_estimate)
+            ),
+            **_surface_reference_datasets(profile.surface_reference),
         }
         | (
             {}
@@ -1626,6 +1706,7 @@ def save_coordination_profile(
             }
         ),
         metadata=metadata,
+        compression_profile=compression_profile,
     )
     LOGGER.info("Saved coordination data to '%s'.", output_path)
     return output_path
@@ -1635,18 +1716,28 @@ def _coordination_profile_hdf5_payload(profile: CoordinationProfile) -> dict[str
     """Return LiNaK HDF5 payload pieces for one coordination profile."""
     return {
         "datasets": {
+            **profile_geometry_datasets(profile),
             "frame_index": profile.frame_index,
             "step": profile.step,
             "time_fs": profile.time_fs,
             "time_ps": profile.time_ps,
             "atom_indices": profile.atom_indices,
             "distance_to_surface_A": profile.distance_to_surface,
+            "distance_to_top_surface_A": profile.distance_to_top_surface,
+            "distance_to_bottom_surface_A": profile.distance_to_bottom_surface,
+            "interface_side": profile.interface_side,
+            "axis_coordinate_A": profile.axis_coordinate,
             "coordination_number": profile.coordination_number,
             "surface_position_per_frame_A": profile.surface_position_per_frame,
             "cutoff_rdf_bin_centers_A": profile.cutoff_rdf_bin_centers_A,
             "cutoff_rdf_g_r": profile.cutoff_rdf_g_r,
             "cutoff_rdf_g_r_smoothed": profile.cutoff_rdf_g_r_smoothed,
-            **_surface_estimate_datasets(profile.surface_estimate),
+            **(
+                {}
+                if profile.surface_reference is not None
+                else _surface_estimate_datasets(profile.surface_estimate)
+            ),
+            **_surface_reference_datasets(profile.surface_reference),
         }
         | (
             {}
@@ -1676,10 +1767,18 @@ def _coordination_profile_hdf5_payload(profile: CoordinationProfile) -> dict[str
                 "cutoff_rdf_minimum_A": profile.cutoff_rdf_minimum_A,
                 "cutoff_rdf_source_path": profile.cutoff_rdf_source_path,
                 "cutoff_diagnostic_plot_path": profile.cutoff_diagnostic_plot_path,
-                **_surface_metadata_payload(
-                    surface_position=profile.surface_position,
-                    surface_position_std=profile.surface_position_std,
-                    estimate=profile.surface_estimate,
+                **(
+                    _surface_reference_metadata(
+                        profile.surface_reference,
+                        surface_position=profile.surface_position,
+                        surface_position_std=profile.surface_position_std,
+                    )
+                    if profile.surface_reference is not None
+                    else _surface_metadata_payload(
+                        surface_position=profile.surface_position,
+                        surface_position_std=profile.surface_position_std,
+                        estimate=profile.surface_estimate,
+                    )
                 ),
             },
         ),
@@ -1691,6 +1790,7 @@ def save_coordination_profiles(
     output: str | Path,
     *,
     additional_metadata: Mapping[str, Any] | None = None,
+    compression_profile: str = "fast",
 ) -> Path:
     """Save one or more coordination profiles to LiNaK HDF5 and return the written path."""
     if not profiles:
@@ -1700,6 +1800,7 @@ def save_coordination_profiles(
             profiles[0],
             output,
             additional_metadata=additional_metadata,
+            compression_profile=compression_profile,
         )
 
     output_path = write_profile_collection(
@@ -1707,6 +1808,7 @@ def save_coordination_profiles(
         analysis="coordination",
         profiles=[_coordination_profile_hdf5_payload(profile) for profile in profiles],
         metadata=dict(additional_metadata or {}),
+        compression_profile=compression_profile,
     )
     LOGGER.info("Saved %d coordination profiles to '%s'.", len(profiles), output_path)
     return output_path
@@ -1756,6 +1858,7 @@ def _load_coordination_profiles_from_payloads(
     species_a: str | None = None,
     species_b: str | None = None,
     axis: str | None = None,
+    allow_partial: bool = False,
 ) -> list[CoordinationProfile]:
     wanted_species_a = (
         None if species_a is None or not str(species_a).strip() else _normalize_species(species_a)
@@ -1776,6 +1879,10 @@ def _load_coordination_profiles_from_payloads(
             "coordination_number",
         )
         missing = [name for name in required if name not in datasets]
+        if allow_partial:
+            missing = [
+                name for name in ("atom_indices", "coordination_number") if name not in datasets
+            ]
         if missing:
             raise ValueError(
                 f"Coordination HDF5 '{source_path}' is missing required dataset(s): {', '.join(missing)}."
@@ -1800,13 +1907,28 @@ def _load_coordination_profiles_from_payloads(
         if wanted_axis is not None and resolved_axis != wanted_axis:
             continue
 
-        frame_index = np.asarray(datasets["frame_index"], dtype=int)
-        step = np.asarray(datasets["step"], dtype=float)
-        time_fs = np.asarray(datasets["time_fs"], dtype=float)
-        time_ps = np.asarray(datasets["time_ps"], dtype=float)
         atom_indices = np.asarray(datasets["atom_indices"], dtype=int)
-        distance_values = np.asarray(datasets["distance_to_surface_A"], dtype=float)
         coordination_values = np.asarray(datasets["coordination_number"], dtype=float)
+        expected_shape = coordination_values.shape
+        if "distance_to_surface_A" in datasets:
+            distance_values = np.asarray(datasets["distance_to_surface_A"], dtype=float)
+        elif allow_partial:
+            distance_values = np.broadcast_to(np.nan, expected_shape)
+        else:
+            raise ValueError(
+                f"Coordination HDF5 '{source_path}' is missing required dataset "
+                "'distance_to_surface_A'."
+            )
+        n_frame_rows = int(expected_shape[0]) if len(expected_shape) == 2 else 0
+        frame_index = np.asarray(datasets.get("frame_index", np.arange(n_frame_rows)), dtype=int)
+        step = np.asarray(datasets.get("step", frame_index), dtype=float)
+        if "time_fs" in datasets:
+            time_fs = np.asarray(datasets["time_fs"], dtype=float)
+        elif "time_ps" in datasets:
+            time_fs = np.asarray(datasets["time_ps"], dtype=float) * 1000.0
+        else:
+            time_fs = np.asarray(frame_index, dtype=float)
+        time_ps = np.asarray(datasets.get("time_ps", time_fs / 1000.0), dtype=float)
         if distance_values.ndim != 2:
             raise ValueError(
                 f"Coordination HDF5 '{source_path}' dataset 'distance_to_surface_A' must be 2D."
@@ -1836,6 +1958,26 @@ def _load_coordination_profiles_from_payloads(
             datasets=datasets,
             metadata=metadata,
         )
+        surface_reference = _surface_reference_from_payload(
+            datasets=datasets,
+            metadata=metadata,
+        )
+
+        def optional_matrix(
+            name: str,
+            *,
+            dtype: Any = float,
+            _datasets: Mapping[str, np.ndarray] = datasets,
+            _expected_shape: tuple[int, ...] = distance_values.shape,
+        ) -> np.ndarray | None:
+            if name not in _datasets:
+                return None
+            candidate = np.asarray(_datasets[name], dtype=dtype)
+            if candidate.shape != _expected_shape:
+                raise ValueError(
+                    f"Coordination HDF5 '{source_path}' dataset '{name}' shape mismatch."
+                )
+            return candidate
 
         cutoff_rdf_bin_centers = (
             np.asarray(datasets["cutoff_rdf_bin_centers_A"], dtype=float)
@@ -1882,6 +2024,15 @@ def _load_coordination_profiles_from_payloads(
                 ),
                 surface_position_per_frame=surface_per_frame,
                 surface_estimate=surface_estimate,
+                surface_reference=surface_reference,
+                distance_to_top_surface=optional_matrix("distance_to_top_surface_A"),
+                distance_to_bottom_surface=optional_matrix("distance_to_bottom_surface_A"),
+                interface_side=optional_matrix("interface_side", dtype=np.int8),
+                axis_coordinate=optional_matrix("axis_coordinate_A"),
+                cell_matrices_angstrom=datasets.get("cell_matrices_angstrom"),
+                cell_origins_angstrom=datasets.get("cell_origins_angstrom"),
+                cell_pbc=datasets.get("cell_pbc"),
+                periodic_crossings=datasets.get("periodic_crossings"),
                 cell_lengths_angstrom=(
                     _optional_cell_lengths(metadata.get("cell_lengths_angstrom"))
                     or _optional_cell_lengths(metadata.get("pbc_cell_angstrom"))
@@ -1916,6 +2067,7 @@ def load_coordination_profiles_by_index(
     species_a: str | None = None,
     species_b: str | None = None,
     axis: str | None = None,
+    dataset_names: list[str] | tuple[str, ...] | None = None,
 ) -> list[CoordinationProfile]:
     """Load selected coordination profiles by profile index from LiNaK HDF5."""
     source_path, payloads = read_profile_payloads_by_index(
@@ -1923,6 +2075,7 @@ def load_coordination_profiles_by_index(
         profile_indices,
         analysis="coordination",
         label="Coordination",
+        dataset_names=dataset_names,
     )
     return _load_coordination_profiles_from_payloads(
         source_path,
@@ -1930,6 +2083,7 @@ def load_coordination_profiles_by_index(
         species_a=species_a,
         species_b=species_b,
         axis=axis,
+        allow_partial=dataset_names is not None,
     )
 
 
@@ -2049,9 +2203,7 @@ def _plot_coordination_time_distance_projection(
     if series_markers is not None:
         LOGGER.warning("Coordination 2D Heatmap ignores per-series markers.")
     if series_normalization_modes is not None:
-        LOGGER.warning(
-            "Coordination 2D Heatmap ignores per-series normalization settings."
-        )
+        LOGGER.warning("Coordination 2D Heatmap ignores per-series normalization settings.")
     if x_bin_width is not None:
         LOGGER.warning(
             "Coordination 2D Heatmap ignores x-bin settings (received %.6g; reducer=%s).",
@@ -2306,6 +2458,42 @@ def _plot_coordination_time_distance_projection(
         return output_path
 
 
+def _coordination_profile_for_interface_view(
+    profile: CoordinationProfile,
+    interface_view: str,
+) -> CoordinationProfile:
+    view = str(interface_view).strip().lower()
+    if view not in {"full", "folded", "top", "bottom"}:
+        raise ValueError("interface_view must be full, folded, top, or bottom.")
+    if view == "full":
+        if profile.axis_coordinate is None:
+            raise ValueError(
+                "This coordination profile has no raw surface-axis coordinates. "
+                "Recompute the coordination analysis before plotting the full cell."
+            )
+        return replace(
+            profile,
+            distance_to_surface=np.asarray(profile.axis_coordinate, dtype=float),
+            coordinate_mode="axis",
+        )
+    if view == "folded":
+        return profile
+    distances = (
+        profile.distance_to_top_surface if view == "top" else profile.distance_to_bottom_surface
+    )
+    if distances is None or profile.interface_side is None:
+        raise ValueError(f"The profile does not contain a {view} view.")
+    side_value = 1 if view == "top" else -1
+    mask = np.asarray(profile.interface_side) == side_value
+    return replace(
+        profile,
+        distance_to_surface=np.where(mask, np.asarray(distances, dtype=float), np.nan),
+        coordination_number=np.where(
+            mask, np.asarray(profile.coordination_number, dtype=float), np.nan
+        ),
+    )
+
+
 def plot_coordination_profile(
     profile: CoordinationProfile,
     output: str | Path | None = None,
@@ -2318,6 +2506,7 @@ def plot_coordination_profile(
     view_mapping: PlotViewMapping | None = None,
     component: str = "distance",
     time_axis: str = "ps",
+    interface_view: str = "folded",
     title: str | None = None,
     x_label: str | None = None,
     y_label: str | None = None,
@@ -2374,6 +2563,12 @@ def plot_coordination_profile(
     tight_layout_kwargs: dict[str, Any] | None = None,
     savefig_kwargs: dict[str, Any] | None = None,
 ) -> Path | None:
+    normalized_interface_view = str(interface_view).strip().lower()
+    if normalized_interface_view == "all":
+        raise ValueError(
+            "interface_view='all' requires plot_coordination_profiles so the three views can be overlaid."
+        )
+    profile = _coordination_profile_for_interface_view(profile, normalized_interface_view)
     resolved_mapping = resolve_coordination_plot_mapping(
         contract=data_contract,
         profile=profile,
@@ -2592,6 +2787,7 @@ def plot_coordination_profiles(
     view_mapping: PlotViewMapping | None = None,
     component: str = "distance",
     time_axis: str = "ps",
+    interface_view: str = "folded",
     title: str | None = None,
     x_label: str | None = None,
     y_label: str | None = None,
@@ -2649,6 +2845,40 @@ def plot_coordination_profiles(
     tight_layout_kwargs: dict[str, Any] | None = None,
     savefig_kwargs: dict[str, Any] | None = None,
 ) -> Path | None:
+    normalized_interface_view = str(interface_view).strip().lower()
+    if normalized_interface_view not in {"full", "folded", "top", "bottom", "all"}:
+        raise ValueError("interface_view must be full, folded, top, bottom, or all.")
+    profile_view_names: list[str | None] = [None] * len(profiles)
+    if normalized_interface_view in {"full", "top", "bottom"}:
+        profiles = [
+            _coordination_profile_for_interface_view(profile, normalized_interface_view)
+            for profile in profiles
+        ]
+        axis_label = str(profiles[0].axis).upper() if profiles else "Z"
+        view_label = (
+            "Full cell (unfolded)"
+            if normalized_interface_view == "full"
+            else f"Positive-axis (+{axis_label})"
+            if normalized_interface_view == "top"
+            else f"Negative-axis (-{axis_label})"
+        )
+        profile_view_names = [view_label] * len(profiles)
+    elif normalized_interface_view == "all":
+        expanded_profiles: list[CoordinationProfile] = []
+        expanded_views: list[str | None] = []
+        for profile in profiles:
+            for view in ("folded", "top", "bottom"):
+                expanded_profiles.append(_coordination_profile_for_interface_view(profile, view))
+                axis_label = str(profile.axis).upper()
+                expanded_views.append(
+                    "Combined interfaces (folded mean)"
+                    if view == "folded"
+                    else f"Positive-axis (+{axis_label})"
+                    if view == "top"
+                    else f"Negative-axis (-{axis_label})"
+                )
+        profiles = expanded_profiles
+        profile_view_names = expanded_views
     if not profiles:
         raise ValueError("At least one coordination profile is required.")
     first_profile = profiles[0]
@@ -2802,7 +3032,7 @@ def plot_coordination_profiles(
         x_series: list[np.ndarray] = []
         y_series: list[np.ndarray] = []
         default_x_label = "Time (ps)"
-        for profile in profiles:
+        for profile, view_name in zip(profiles, profile_view_names):
             x_values, default_x_label = _coordination_time_data(
                 profile,
                 time_axis=runtime_time_axis,
@@ -2811,7 +3041,8 @@ def plot_coordination_profiles(
                 x_series.append(np.asarray(x_values, dtype=float))
                 y_series.append(np.asarray(profile.coordination_number[:, column], dtype=float))
                 prefix = profile.species_a if profile.species_a != "ALL" else "A"
-                default_labels.append(f"{prefix}[{int(atom_index)}]")
+                label = f"{prefix}[{int(atom_index)}]"
+                default_labels.append(label if view_name is None else f"{label} ({view_name})")
         labels = resolve_series_labels(default_labels, series_labels, series_kind="coordination")
         effective_legend = (len(labels) <= 12) if legend is None else legend
         return plot_multi_line_series(
@@ -2887,10 +3118,11 @@ def plot_coordination_profiles(
     y_series = []
     default_labels = []
     default_x_label = _coordination_distance_label(profiles[0])
-    for profile in profiles:
+    for profile, view_name in zip(profiles, profile_view_names):
         x_series.append(np.asarray(profile.distance_to_surface, dtype=float).reshape(-1))
         y_series.append(np.asarray(profile.coordination_number, dtype=float).reshape(-1))
-        default_labels.append(f"{profile.species_a}-{profile.species_b}")
+        label = f"{profile.species_a}-{profile.species_b}"
+        default_labels.append(label if view_name is None else f"{label} ({view_name})")
         default_x_label = _coordination_distance_label(profile)
     labels = resolve_series_labels(default_labels, series_labels, series_kind="coordination")
     effective_legend = True if legend is None else legend

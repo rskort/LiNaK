@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import pytest
 from ase import Atoms
 import numpy as np
@@ -43,15 +45,17 @@ def test_extract_cell_from_cp2k_input_accepts_orthorhombic_alpha_beta_gamma(tmp_
     assert cell == pytest.approx((14.25, 14.81, 54.48))
 
 
-def test_extract_cell_from_cp2k_input_rejects_non_orthorhombic_alpha_beta_gamma(tmp_path):
+def test_extract_cell_from_cp2k_input_accepts_non_orthorhombic_alpha_beta_gamma(tmp_path):
     cp2k_input = tmp_path / "input.inp"
     cp2k_input.write_text(
         "&CELL\n  ABC [angstrom] 14.25 14.81 54.48\n  ALPHA_BETA_GAMMA [deg] 90 91 90\n&END CELL\n",
         encoding="utf-8",
     )
 
-    with pytest.raises(ValueError, match="orthorhombic cells only"):
-        extract_cell_from_cp2k_input(cp2k_input)
+    from ase.cell import Cell
+
+    cell = Cell(extract_cell_from_cp2k_input(cp2k_input))
+    assert cell.angles() == pytest.approx([90, 91, 90])
 
 
 def test_extract_cell_from_cp2k_input_raises_without_abc(tmp_path):
@@ -343,3 +347,15 @@ def test_apply_pbc_to_frames_wraps_positions_for_non_cubic_orthorhombic_cell():
         np.array([[1.7, 2.9, 1.2], [0.9, 1.6, 3.8]]),
         atol=1e-12,
     )
+
+
+def test_apply_pbc_to_frames_preserves_per_frame_cells_when_cell_is_none():
+    first = Atoms("H", positions=[[2.2, -0.1, 0.5]], cell=[2.0, 3.0, 4.0], pbc=True)
+    second = Atoms("H", positions=[[3.2, 4.1, -0.5]], cell=[3.0, 4.0, 5.0], pbc=True)
+
+    wrapped = apply_pbc_to_frames([first, second], None)
+
+    np.testing.assert_allclose(wrapped[0].cell.array, first.cell.array)
+    np.testing.assert_allclose(wrapped[1].cell.array, second.cell.array)
+    np.testing.assert_allclose(wrapped[0].positions, [[0.2, 2.9, 0.5]], atol=1e-12)
+    np.testing.assert_allclose(wrapped[1].positions, [[0.2, 0.1, 4.5]], atol=1e-12)

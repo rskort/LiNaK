@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from pathlib import Path
 
 from ase import Atoms
@@ -51,7 +53,9 @@ def test_conversion_registry_detects_supported_file_families(tmp_path):
     cube_h5_path = tmp_path / "field.cube.h5"
     _write_xyz(xyz_path)
     write_trajectory(read_trajectory(xyz_path), traj_h5_path)
-    cube_path.write_text("CPMD CUBE FILE\nOUTER LOOP: X, MIDDLE LOOP: Y, INNER LOOP: Z\n", encoding="utf-8")
+    cube_path.write_text(
+        "CPMD CUBE FILE\nOUTER LOOP: X, MIDDLE LOOP: Y, INNER LOOP: Z\n", encoding="utf-8"
+    )
 
     assert CONVERSION_REGISTRY.detect_file_family(xyz_path) == "trajectory"
     assert CONVERSION_REGISTRY.detect_file_family(traj_h5_path) == "trajectory"
@@ -63,7 +67,9 @@ def test_conversion_registry_exposes_allowed_targets_by_family(tmp_path):
     xyz_path = tmp_path / "traj.xyz"
     cube_path = tmp_path / "field.cube"
     _write_xyz(xyz_path)
-    cube_path.write_text("CPMD CUBE FILE\nOUTER LOOP: X, MIDDLE LOOP: Y, INNER LOOP: Z\n", encoding="utf-8")
+    cube_path.write_text(
+        "CPMD CUBE FILE\nOUTER LOOP: X, MIDDLE LOOP: Y, INNER LOOP: Z\n", encoding="utf-8"
+    )
 
     trajectory_targets = {
         file_type.id for file_type in CONVERSION_REGISTRY.allowed_target_file_types(xyz_path)
@@ -93,7 +99,7 @@ def test_conversion_registry_default_request_uses_traj_hdf5_and_uniquifies(tmp_p
     assert request.family == "trajectory"
     assert request.source_file_type == "trajectory_xyz"
     assert request.target_file_type == "trajectory_hdf5"
-    assert request.target_path == output_dir / "traj.traj_2.h5"
+    assert request.target_path == output_dir / "traj_1.traj.h5"
 
 
 def test_conversion_registry_default_request_uses_cube_hdf5(tmp_path):
@@ -113,11 +119,7 @@ def test_conversion_registry_executes_current_trajectory_conversion(tmp_path):
     input_path = tmp_path / "input.inp"
     _write_xyz(xyz_path)
     input_path.write_text(
-        "&SUBSYS\n"
-        "  &CELL\n"
-        "    ABC 10.0 11.0 12.0\n"
-        "  &END CELL\n"
-        "&END SUBSYS\n",
+        "&SUBSYS\n  &CELL\n    ABC 10.0 11.0 12.0\n  &END CELL\n&END SUBSYS\n",
         encoding="utf-8",
     )
     request = CONVERSION_REGISTRY.build_default_request(xyz_path, target_selector="hdf5")

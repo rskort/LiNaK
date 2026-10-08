@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+from ..cell_geometry import cell_angles
+
 from collections import defaultdict
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from .actions import Action, ActionRegistry, SettingField, validate_action_settings
-from .components import grouped_item_rows, task_detail_display
+from .components import ItemGroupingMode, grouped_item_rows, task_detail_display
 from .detection import detect_project_item, discover_generated_items_cached
 from .defaults import (
     default_settings_for_action,
@@ -20,7 +22,7 @@ from .model import ProjectItem, ProjectStore, Task
 from .services import descriptor_for_action
 from .styles import badge_style
 from .tasks import TaskManager
-from .theme import is_dark_theme, workspace_stylesheet
+from .theme import ThemeMode, is_dark_theme, workspace_stylesheet
 from .viewers import open_project_item
 from .viewmodels import (
     Badge,
@@ -84,6 +86,12 @@ def _field_auto_source(field: SettingField, summary: Any | None) -> str:
 
     if summary is None:
         return ""
+    if field.key == "cell_angles" and summary.cell_matrix_angstrom:
+        return (
+            "Auto from .out.h5: "
+            + " ".join(f"{v:.6g}" for v in cell_angles(summary.cell_matrix_angstrom))
+            + " deg"
+        )
     if field.key == "cell" and summary.cell_angstrom is not None:
         return (
             "Auto from .out.h5: "
@@ -161,7 +169,9 @@ class SettingsDialog:
         intro.setWordWrap(True)
         intro.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         root.addWidget(intro)
-        self._summary_label = QLabel(action.summary(project_dir=project_dir, item=item, settings=defaults))
+        self._summary_label = QLabel(
+            action.summary(project_dir=project_dir, item=item, settings=defaults)
+        )
         self._summary_label.setWordWrap(True)
         self._summary_label.setObjectName("MutedText")
         root.addWidget(self._summary_label)
@@ -174,7 +184,25 @@ class SettingsDialog:
         for field in self._fields:
             grouped[field.group].append(field)
 
-        ordered_groups = ("Input", "Selection", "Geometry", "Time", "Binning", "Output", "Surface", "Cell / Metadata", "Cell", "Cutoff", "Water detection", "Analysis", "Discovery", "CP2K", "Execution", "Advanced", "General")
+        ordered_groups = (
+            "Input",
+            "Selection",
+            "Geometry",
+            "Time",
+            "Binning",
+            "Output",
+            "Surface",
+            "Cell / Metadata",
+            "Cell",
+            "Cutoff",
+            "Water detection",
+            "Analysis",
+            "Discovery",
+            "CP2K",
+            "Execution",
+            "Advanced",
+            "General",
+        )
         group_names = [name for name in ordered_groups if name in grouped]
         group_names.extend(name for name in grouped if name not in group_names)
         for group_name in group_names:
@@ -224,7 +252,9 @@ class SettingsDialog:
                     else:
                         widget.setProperty("linak_empty", False)
                         widget.setValue(float(field.default))
-                    widget.valueChanged.connect(lambda _value, target=widget: target.setProperty("linak_empty", False))
+                    widget.valueChanged.connect(
+                        lambda _value, target=widget: target.setProperty("linak_empty", False)
+                    )
                 elif field.kind == "int":
                     widget = QSpinBox()
                     widget.setRange(int(field.minimum or 0), 2_147_483_647)
@@ -235,7 +265,9 @@ class SettingsDialog:
                     else:
                         widget.setProperty("linak_empty", False)
                         widget.setValue(int(field.default))
-                    widget.valueChanged.connect(lambda _value, target=widget: target.setProperty("linak_empty", False))
+                    widget.valueChanged.connect(
+                        lambda _value, target=widget: target.setProperty("linak_empty", False)
+                    )
                 else:
                     line = QLineEdit("" if field.default is None else str(field.default))
                     if field.placeholder:
@@ -437,7 +469,7 @@ class ProjectWorkspaceWindow:
         self.store = store
         self.registry = ActionRegistry()
         self.task_manager = TaskManager(store)
-        self._theme_mode = "system"
+        self._theme_mode: ThemeMode = "system"
         self._theme_switch: Any | None = None
         self._theme_colors: dict[str, str] = {}
         self._tooltips: dict[int, str] = {}
@@ -513,10 +545,19 @@ class ProjectWorkspaceWindow:
         remove_button = QPushButton("Remove")
         remove_button.setObjectName("SecondaryButton")
         remove_button.clicked.connect(self._remove_selected_item)
-        self._register_tooltip(import_button, "Reference an external input file without copying it.")
-        self._register_tooltip(import_dir_button, "Select a simulation directory and queue a .out.h5 packing task.")
-        self._register_tooltip(rescan_button, "Refresh generated outputs and cached metadata in this project.")
-        self._register_tooltip(remove_button, "Remove the selected item reference or generated output after confirmation.")
+        self._register_tooltip(
+            import_button, "Reference an external input file without copying it."
+        )
+        self._register_tooltip(
+            import_dir_button, "Select a simulation directory and queue a .out.h5 packing task."
+        )
+        self._register_tooltip(
+            rescan_button, "Refresh generated outputs and cached metadata in this project."
+        )
+        self._register_tooltip(
+            remove_button,
+            "Remove the selected item reference or generated output after confirmation.",
+        )
         left_layout.addWidget(header)
         left_layout.addWidget(self.item_search)
         filters = QHBoxLayout()
@@ -709,6 +750,8 @@ class ProjectWorkspaceWindow:
         origin = self.origin_filter.currentText() if hasattr(self, "origin_filter") else "all"
         item_type = self.type_filter.currentText() if hasattr(self, "type_filter") else "all"
         grouping = self.group_filter.currentText() if hasattr(self, "group_filter") else "Workflow"
+        if grouping not in {"Workflow", "Type", "Source run", "Flat"}:
+            raise ValueError(f"Unknown workspace grouping: {grouping!r}")
         sorted_items = filter_items(
             self.store.items,
             query=query,
@@ -718,7 +761,7 @@ class ProjectWorkspaceWindow:
         visible_ids = {item.item_id for item in sorted_items}
         grouped_rows = [
             row
-            for row in grouped_item_rows(self.store, mode=grouping)
+            for row in grouped_item_rows(self.store, mode=cast(ItemGroupingMode, grouping))
             if row.item.item_id in visible_ids
         ]
         for row in grouped_rows:
@@ -737,7 +780,9 @@ class ProjectWorkspaceWindow:
             if item.item_id == selected_id:
                 self.item_list.setCurrentItem(list_item)
         if self.item_list.count() == 0:
-            self._render_empty_actions("Import an input file or generate outputs into this project directory.")
+            self._render_empty_actions(
+                "Import an input file or generate outputs into this project directory."
+            )
         elif self.item_list.currentItem() is None:
             self.item_list.setCurrentRow(0)
 
@@ -819,7 +864,9 @@ class ProjectWorkspaceWindow:
             self.move_task_down_button.setEnabled(False)
             self.retry_task_button.setEnabled(False)
             return
-        self.cancel_task_button.setEnabled(task.status in {"queued", "pending", "running", "canceling"})
+        self.cancel_task_button.setEnabled(
+            task.status in {"queued", "pending", "running", "canceling"}
+        )
         self.remove_task_button.setEnabled(task.status in {"finished", "failed", "canceled"})
         self.move_task_up_button.setEnabled(task.status == "queued")
         self.move_task_down_button.setEnabled(task.status == "queued")
@@ -899,7 +946,9 @@ class ProjectWorkspaceWindow:
             for line in lines:
                 label = QLabel(line)
                 label.setWordWrap(True)
-                label.setTextInteractionFlags(self._qt["Qt"].TextInteractionFlag.TextSelectableByMouse)
+                label.setTextInteractionFlags(
+                    self._qt["Qt"].TextInteractionFlag.TextSelectableByMouse
+                )
                 layout.addWidget(label)
         else:
             empty = QLabel("None")
@@ -993,7 +1042,9 @@ class ProjectWorkspaceWindow:
                 description = action.description
                 descriptor = descriptor_for_action(action)
                 try:
-                    preview_settings = default_settings_for_action(action, item, self.store.project_dir)
+                    preview_settings = default_settings_for_action(
+                        action, item, self.store.project_dir
+                    )
                     preview_outputs = action.expected_outputs(
                         project_dir=self.store.project_dir,
                         item=item,
@@ -1007,9 +1058,7 @@ class ProjectWorkspaceWindow:
                         + ", ".join(path.name for path in preview_outputs)
                         + "</span>"
                     )
-                description += (
-                    f"<br><span>Cancel: {descriptor.cancel_capability}</span>"
-                )
+                description += f"<br><span>Cancel: {descriptor.cancel_capability}</span>"
                 if not readiness.available:
                     description = f"{description}<br><span>Blocked: {readiness.reason}</span>"
                 text = QLabel(f"<b>{action.name}</b><br>{description}")
@@ -1032,7 +1081,9 @@ class ProjectWorkspaceWindow:
                     open_button.setEnabled(readiness.available)
                     if not readiness.available:
                         self._register_tooltip(open_button, readiness.reason)
-                    open_button.clicked.connect(lambda _checked=False, selected=item: self._open_item(selected))
+                    open_button.clicked.connect(
+                        lambda _checked=False, selected=item: self._open_item(selected)
+                    )
                     row_layout.addWidget(open_button)
                 else:
                     run_default_button = QPushButton("Run defaults")
@@ -1045,7 +1096,9 @@ class ProjectWorkspaceWindow:
                     if not can_run_defaults:
                         self._register_tooltip(run_default_button, readiness.reason)
                     run_default_button.clicked.connect(
-                        lambda _checked=False, selected_action=action, selected=item: self._run_with_defaults(selected_action, selected)
+                        lambda _checked=False, selected_action=action, selected=item: (
+                            self._run_with_defaults(selected_action, selected)
+                        )
                     )
                     row_layout.addWidget(run_default_button)
                     batch_items = [
@@ -1058,7 +1111,11 @@ class ProjectWorkspaceWindow:
                         batch_button = QPushButton(f"Run batch ({len(batch_items)})")
                         batch_button.setEnabled(can_run_defaults)
                         batch_button.clicked.connect(
-                            lambda _checked=False, selected_action=action: self._run_defaults_for_items(selected_action, self._selected_items())
+                            lambda _checked=False, selected_action=action: (
+                                self._run_defaults_for_items(
+                                    selected_action, self._selected_items()
+                                )
+                            )
                         )
                         row_layout.addWidget(batch_button)
                     settings_button = QPushButton("Configure")
@@ -1066,13 +1123,17 @@ class ProjectWorkspaceWindow:
                     if not readiness.available:
                         self._register_tooltip(settings_button, readiness.reason)
                     settings_button.clicked.connect(
-                        lambda _checked=False, selected_action=action, selected=item: self._configure_and_run(selected_action, selected)
+                        lambda _checked=False, selected_action=action, selected=item: (
+                            self._configure_and_run(selected_action, selected)
+                        )
                     )
                     row_layout.addWidget(settings_button)
                     output = self._latest_output_for(action, item)
                     if output is not None:
                         open_button = QPushButton("Open")
-                        open_button.clicked.connect(lambda _checked=False, path=output: open_project_item(path))
+                        open_button.clicked.connect(
+                            lambda _checked=False, path=output: open_project_item(path)
+                        )
                         row_layout.addWidget(open_button)
                 group_layout.addWidget(row)
             section = CollapsibleSection(
@@ -1301,15 +1362,23 @@ class ProjectWorkspaceWindow:
             message.setInformativeText(
                 "Generated outputs can also be deleted from disk. External references are never deleted."
             )
-            remove_only = message.addButton("Remove from project", QMessageBox.ButtonRole.AcceptRole)
-            delete_file = message.addButton("Delete file and remove", QMessageBox.ButtonRole.DestructiveRole)
+            remove_only = message.addButton(
+                "Remove from project", QMessageBox.ButtonRole.AcceptRole
+            )
+            delete_file = message.addButton(
+                "Delete file and remove", QMessageBox.ButtonRole.DestructiveRole
+            )
             message.addButton(QMessageBox.StandardButton.Cancel)
             message.exec()
             clicked = message.clickedButton()
             if clicked == delete_file:
                 deleted = self.store.delete_generated_item_file(item.item_id)
                 if deleted is None:
-                    QMessageBox.warning(self.window, "Remove failed", "The generated file could not be deleted safely.")
+                    QMessageBox.warning(
+                        self.window,
+                        "Remove failed",
+                        "The generated file could not be deleted safely.",
+                    )
                     return
             elif clicked == remove_only:
                 self.store.remove_item(item.item_id)
@@ -1418,9 +1487,11 @@ def launch_project_workspace(project_dir: str | Path) -> None:
     window = ProjectWorkspaceWindow(store, created_project_dir=created)
     _OPEN_PROJECT_WORKSPACES.append(window)
     window.window.destroyed.connect(
-        lambda _obj=None, workspace=window: _OPEN_PROJECT_WORKSPACES.remove(workspace)
-        if workspace in _OPEN_PROJECT_WORKSPACES
-        else None
+        lambda _obj=None, workspace=window: (
+            _OPEN_PROJECT_WORKSPACES.remove(workspace)
+            if workspace in _OPEN_PROJECT_WORKSPACES
+            else None
+        )
     )
     window.show()
     window.window.showNormal()

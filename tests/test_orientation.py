@@ -1,6 +1,9 @@
 """Tests for ``linak.analysis.orientation``."""
 
 from __future__ import annotations
+from matplotlib.cm import ScalarMappable
+from matplotlib.axes import Axes
+from matplotlib.colorbar import Colorbar
 
 import logging
 from dataclasses import replace
@@ -121,7 +124,9 @@ def test_compute_orientation_basic():
 
 
 def test_orientation_sparse_grid_to_line_filters_data_without_cropping_axis():
-    profile = compute_orientation_profile(frames=_multi_frame_trajectory(3), axis="z", bin_width=1.0)
+    profile = compute_orientation_profile(
+        frames=_multi_frame_trajectory(3), axis="z", bin_width=1.0
+    )
 
     x_edges, x_centers, values = orientation_sparse_grid_to_line(
         profile,
@@ -147,7 +152,9 @@ def test_orientation_sparse_grid_to_line_filters_data_without_cropping_axis():
 
 
 def test_orientation_sparse_grid_to_heatmap_filters_before_projection():
-    profile = compute_orientation_profile(frames=_multi_frame_trajectory(3), axis="z", bin_width=1.0)
+    profile = compute_orientation_profile(
+        frames=_multi_frame_trajectory(3), axis="z", bin_width=1.0
+    )
     occupied_distance = float(profile.bin_centers[_single_occupied_bin(profile)])
 
     x_edges, y_edges, heatmap = orientation_sparse_grid_to_heatmap(
@@ -175,7 +182,7 @@ def test_orientation_sparse_grid_to_heatmap_filters_before_projection():
 
 
 def test_compute_orientation_reports_frame_and_aggregation_progress(monkeypatch, caplog):
-    events: list[tuple[str, object]] = []
+    events: list[tuple[object, ...]] = []
 
     class _DummyProgressBar:
         def __init__(self, *, desc, total=None, unit="it", **_kwargs):
@@ -197,7 +204,7 @@ def test_compute_orientation_reports_frame_and_aggregation_progress(monkeypatch,
             self.close()
 
     monkeypatch.setattr(orientation_mod, "ProgressBar", _DummyProgressBar)
-    caplog.set_level(logging.INFO, logger=orientation_mod.LOGGER.name)
+    caplog.set_level(logging.DEBUG, logger=orientation_mod.LOGGER.name)
 
     profile = compute_orientation_profile(
         frames=_multi_frame_trajectory(3), axis="z", bin_width=1.0
@@ -486,6 +493,17 @@ def test_save_load_round_trip(tmp_path):
     np.testing.assert_allclose(loaded.density, profile.density)
     np.testing.assert_allclose(loaded.heatmap_polar, profile.heatmap_polar)
     np.testing.assert_allclose(loaded.heatmap_azimuthal, profile.heatmap_azimuthal)
+    assert loaded.full_bin_edges is not None
+    assert profile.full_bin_edges is not None
+    np.testing.assert_allclose(loaded.full_bin_edges, profile.full_bin_edges)
+    assert loaded.full_count_total is not None
+    assert profile.full_count_total is not None
+    np.testing.assert_array_equal(loaded.full_count_total, profile.full_count_total)
+    assert loaded.full_series_statistics is not None
+    np.testing.assert_array_equal(
+        loaded.full_series_statistics["density"].point_count,
+        loaded.full_count_total,
+    )
     assert loaded.sparse_grid is not None
     assert profile.sparse_grid is not None
     assert loaded.sparse_grid.shape == profile.sparse_grid.shape
@@ -498,6 +516,12 @@ def test_save_load_round_trip(tmp_path):
     np.testing.assert_allclose(
         loaded.sparse_grid.count_polar_valid,
         profile.sparse_grid.count_polar_valid,
+    )
+    assert loaded.sparse_grid.lab_cos_polar_sum is not None
+    assert profile.sparse_grid.lab_cos_polar_sum is not None
+    np.testing.assert_allclose(
+        loaded.sparse_grid.lab_cos_polar_sum,
+        profile.sparse_grid.lab_cos_polar_sum,
     )
 
 
@@ -645,7 +669,9 @@ def test_plot_orientation_profile_heatmap(tmp_path):
 def test_plot_orientation_profile_sparse_grid_heatmap_uses_filtered_grid(tmp_path):
     from linak.analysis.orientation import plot_orientation_profile
 
-    profile = compute_orientation_profile(frames=_multi_frame_trajectory(3), axis="z", bin_width=1.0)
+    profile = compute_orientation_profile(
+        frames=_multi_frame_trajectory(3), axis="z", bin_width=1.0
+    )
     occupied_distance = float(profile.bin_centers[_single_occupied_bin(profile)])
     capture_state: dict[str, object] = {}
 
@@ -657,9 +683,7 @@ def test_plot_orientation_profile_sparse_grid_heatmap_uses_filtered_grid(tmp_pat
         angle="polar",
         orientation_heatmap_x_axis="x",
         orientation_heatmap_y_axis="y",
-        orientation_grid_filters={
-            "distance": (occupied_distance - 0.25, occupied_distance + 0.25)
-        },
+        orientation_grid_filters={"distance": (occupied_distance - 0.25, occupied_distance + 0.25)},
         capture_state=capture_state,
     )
 
@@ -671,6 +695,7 @@ def test_plot_orientation_profile_sparse_grid_heatmap_uses_filtered_grid(tmp_pat
     assert capture_state["y_label"] == "Y (Angstrom)"
     assert capture_state["heatmap_value_mode"] == "mean_orientation"
     assert capture_state["heatmap_value_modes_supported"] == []
+    assert isinstance(capture_state["axes"], Axes)
     mesh = capture_state["axes"].collections[0]
     values = np.asarray(mesh.get_array(), dtype=float)
     assert np.count_nonzero(np.isfinite(values)) == 1
@@ -697,7 +722,9 @@ def test_sparse_orientation_mean_heatmap_rejects_frequency_value_modes(tmp_path)
 def test_plot_orientation_profile_sparse_grid_line_uses_filtered_grid(tmp_path):
     from linak.analysis.orientation import plot_orientation_profile
 
-    profile = compute_orientation_profile(frames=_multi_frame_trajectory(3), axis="z", bin_width=1.0)
+    profile = compute_orientation_profile(
+        frames=_multi_frame_trajectory(3), axis="z", bin_width=1.0
+    )
     occupied_distance = float(profile.bin_centers[_single_occupied_bin(profile)])
     capture_state: dict[str, object] = {}
 
@@ -707,9 +734,7 @@ def test_plot_orientation_profile_sparse_grid_line_uses_filtered_grid(tmp_path):
         show=False,
         component="average",
         angle="polar",
-        orientation_grid_filters={
-            "distance": (occupied_distance - 0.25, occupied_distance + 0.25)
-        },
+        orientation_grid_filters={"distance": (occupied_distance - 0.25, occupied_distance + 0.25)},
         capture_state=capture_state,
     )
 
@@ -717,6 +742,7 @@ def test_plot_orientation_profile_sparse_grid_line_uses_filtered_grid(tmp_path):
     assert capture_state["orientation_grid_line"] is True
     assert capture_state["orientation_grid_x_axis"] == "distance"
     assert capture_state["x_label"] == "Distance to surface (Angstrom)"
+    assert isinstance(capture_state["plotted_xy_series"], list)
     plotted = capture_state["plotted_xy_series"][0]
     y_values = np.asarray(plotted["y"], dtype=float)
     assert np.count_nonzero(np.isfinite(y_values)) == 1
@@ -725,7 +751,9 @@ def test_plot_orientation_profile_sparse_grid_line_uses_filtered_grid(tmp_path):
 def test_plot_orientation_profiles_sparse_grid_line_uses_selected_x_axis(tmp_path):
     from linak.analysis.orientation import plot_orientation_profiles
 
-    profile = compute_orientation_profile(frames=_multi_frame_trajectory(3), axis="z", bin_width=1.0)
+    profile = compute_orientation_profile(
+        frames=_multi_frame_trajectory(3), axis="z", bin_width=1.0
+    )
     capture_state: dict[str, object] = {}
 
     result = plot_orientation_profiles(
@@ -742,6 +770,7 @@ def test_plot_orientation_profiles_sparse_grid_line_uses_selected_x_axis(tmp_pat
     assert capture_state["orientation_grid_line"] is True
     assert capture_state["orientation_grid_x_axis"] == "z"
     assert capture_state["x_label"] == "Z (Angstrom)"
+    assert isinstance(capture_state["plotted_xy_series"], list)
     plotted = capture_state["plotted_xy_series"][0]
     y_values = np.asarray(plotted["y"], dtype=float)
     assert np.count_nonzero(np.isfinite(y_values)) == 1
@@ -750,7 +779,9 @@ def test_plot_orientation_profiles_sparse_grid_line_uses_selected_x_axis(tmp_pat
 def test_plot_orientation_profile_sparse_grid_line_rejects_filtered_density(tmp_path):
     from linak.analysis.orientation import plot_orientation_profile
 
-    profile = compute_orientation_profile(frames=_multi_frame_trajectory(3), axis="z", bin_width=1.0)
+    profile = compute_orientation_profile(
+        frames=_multi_frame_trajectory(3), axis="z", bin_width=1.0
+    )
 
     with pytest.raises(ValueError, match="Mean orientation"):
         plot_orientation_profile(
@@ -766,7 +797,9 @@ def test_plot_orientation_profile_sparse_grid_line_rejects_filtered_density(tmp_
 def test_plot_orientation_profile_sparse_grid_line_requires_grid(tmp_path):
     from linak.analysis.orientation import plot_orientation_profile
 
-    profile = compute_orientation_profile(frames=_multi_frame_trajectory(2), axis="z", bin_width=1.0)
+    profile = compute_orientation_profile(
+        frames=_multi_frame_trajectory(2), axis="z", bin_width=1.0
+    )
     profile_without_grid = replace(profile, sparse_grid=None)
 
     with pytest.raises(ValueError, match="orientation sparse grid"):
@@ -783,7 +816,9 @@ def test_plot_orientation_profile_sparse_grid_line_requires_grid(tmp_path):
 def test_plot_orientation_profile_sparse_grid_heatmap_requires_grid(tmp_path):
     from linak.analysis.orientation import plot_orientation_profile
 
-    profile = compute_orientation_profile(frames=_multi_frame_trajectory(2), axis="z", bin_width=1.0)
+    profile = compute_orientation_profile(
+        frames=_multi_frame_trajectory(2), axis="z", bin_width=1.0
+    )
     profile_without_grid = replace(profile, sparse_grid=None)
 
     with pytest.raises(ValueError, match="orientation sparse grid"):
@@ -846,7 +881,7 @@ def test_plot_orientation_profile_accepts_generic_heatmap_view_mapping(tmp_path)
     assert capture_state["y_label"] == "cos(φ)"
 
 
-def test_plot_orientation_profile_heatmap_normalize_uses_global_probability(tmp_path):
+def test_plot_orientation_profile_heatmap_joint_probability_density(tmp_path):
     from linak.analysis.orientation import plot_orientation_profile
 
     profile = compute_orientation_profile(
@@ -860,12 +895,13 @@ def test_plot_orientation_profile_heatmap_normalize_uses_global_probability(tmp_
         show=False,
         component="heatmap",
         angle="polar",
-        heatmap_normalize=True,
+        heatmap_value_mode="joint_probability_density",
         capture_state=capture_state,
     )
     assert result is not None
     assert out.exists()
     ax = capture_state["axes"]
+    assert isinstance(ax, Axes)
     mesh = ax.collections[0]
     values = np.asarray(mesh.get_array(), dtype=float)
     finite_values = values[np.isfinite(values)]
@@ -891,9 +927,7 @@ def test_orientation_heatmap_value_modes_use_nonuniform_bin_areas():
     joint = orientation_mod._transform_orientation_frequency_heatmap(
         counts, x_edges, y_edges, mode="joint_probability_density"
     )
-    expected_joint = counts / (
-        np.sum(counts) * dx[:, np.newaxis] * dy[np.newaxis, :]
-    )
+    expected_joint = counts / (np.sum(counts) * dx[:, np.newaxis] * dy[np.newaxis, :])
     np.testing.assert_allclose(joint.values, expected_joint)
     np.testing.assert_allclose(
         np.sum(joint.values * dx[:, np.newaxis] * dy[np.newaxis, :]),
@@ -1004,14 +1038,14 @@ def test_orientation_heatmap_combines_then_sum_rebins_before_value_transform(tmp
         )
 
     assert result is not None
-    rendered = np.asarray(
-        capture_state["heatmap_artist"].get_array(), dtype=float
-    )
+    assert isinstance(capture_state["heatmap_artist"], ScalarMappable)
+    rendered = np.asarray(capture_state["heatmap_artist"].get_array(), dtype=float)
     np.testing.assert_allclose(rendered.T, expected)
+    assert isinstance(capture_state["heatmap_value_pipeline"], str)
     assert "sum-preserving rebin" in capture_state["heatmap_value_pipeline"]
 
 
-def test_plot_orientation_profile_heatmap_rejects_unknown_normalization_mode(tmp_path):
+def test_plot_orientation_profile_heatmap_rejects_unknown_value_mode(tmp_path):
     from linak.analysis.orientation import plot_orientation_profile
 
     profile = compute_orientation_profile(
@@ -1019,14 +1053,14 @@ def test_plot_orientation_profile_heatmap_rejects_unknown_normalization_mode(tmp
     )
     capture_state: dict[str, object] = {}
     out = tmp_path / "orient_heat_shrunk.png"
-    with pytest.raises(ValueError, match="heatmap_normalization_mode must be one of"):
+    with pytest.raises(ValueError, match="heatmap_value_mode must be one of"):
         plot_orientation_profile(
             profile,
             output=str(out),
             show=False,
             component="heatmap",
             angle="polar",
-            heatmap_normalization_mode="shrunk_row_probability",
+            heatmap_value_mode="shrunk_row_probability",
             capture_state=capture_state,
         )
 
@@ -1074,15 +1108,17 @@ def test_plot_orientation_profile_heatmap_bulk_water_reference_normalizes_bulk_m
         show=False,
         component="heatmap",
         angle="polar",
-        heatmap_normalization_mode="bulk_water_reference",
+        heatmap_value_mode="bulk_relative_enrichment",
         capture_state=capture_state,
     )
     assert result is not None
     assert out.exists()
+    assert isinstance(capture_state["axes"], Axes)
     mesh = capture_state["axes"].collections[0]
     values = np.asarray(mesh.get_array(), dtype=float)
     np.testing.assert_allclose(np.mean(values[:, 3:5]), 1.0)
     np.testing.assert_allclose(np.mean(values[:, 0:2]), 1.0)
+    assert isinstance(capture_state["heatmap_bulk_reference"], dict)
     assert capture_state["heatmap_bulk_reference"]["resolved_min"] == pytest.approx(3.5)
     assert capture_state["heatmap_bulk_reference"]["resolved_max"] == pytest.approx(4.5)
 
@@ -1119,7 +1155,7 @@ def test_plot_orientation_profile_heatmap_bulk_water_reference_requires_distance
             show=False,
             component="heatmap",
             angle="polar",
-            heatmap_normalization_mode="bulk_water_reference",
+            heatmap_value_mode="bulk_relative_enrichment",
         )
 
 
@@ -1155,7 +1191,7 @@ def test_plot_orientation_profile_heatmap_bulk_water_reference_requires_bulk_pla
             show=False,
             component="heatmap",
             angle="polar",
-            heatmap_normalization_mode="bulk_water_reference",
+            heatmap_value_mode="bulk_relative_enrichment",
         )
 
 
@@ -1181,6 +1217,7 @@ def test_plot_orientation_profile_heatmap_log_scale_masks_zero_cells(tmp_path):
     assert result is not None
     assert out.exists()
     ax = capture_state["axes"]
+    assert isinstance(ax, Axes)
     assert isinstance(ax.collections[0].norm, LogNorm)
 
 
@@ -1229,7 +1266,9 @@ def test_plot_orientation_profile_heatmap_honors_shared_plot_settings(tmp_path):
 
     assert result is not None
     ax = capture_state["axes"]
+    assert isinstance(ax, Axes)
     cbar = capture_state["heatmap_colorbar"]
+    assert isinstance(cbar, Colorbar)
     assert ax.xaxis.label.get_fontfamily()[0].lower() == "serif"
     assert ax.yaxis.label.get_fontfamily()[0].lower() == "serif"
     assert cbar.ax.yaxis.label.get_fontfamily()[0].lower() == "serif"
@@ -1268,6 +1307,7 @@ def test_plot_orientation_profile_heatmap_matplotlib_rc_is_scoped(tmp_path):
 
     assert result is not None
     ax = capture_state["axes"]
+    assert isinstance(ax, Axes)
     assert mcolors.to_hex(ax.get_facecolor(), keep_alpha=False) == "#abcdef"
     assert matplotlib.rcParams["axes.facecolor"] == previous_axes_facecolor
 

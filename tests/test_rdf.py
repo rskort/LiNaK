@@ -96,7 +96,9 @@ def test_compute_rdf_profiles_exposes_only_split_raw_species_in_grouped_mode():
     frame.new_array(RAW_SPECIES_ARRAY, np.asarray(["Pt", "Pt_top", "O", "H", "Na"]))
 
     profiles = compute_rdf_profiles([frame], r_max=2.0, bin_width=1.0)
-    labels = {profile.species_a for profile in profiles} | {profile.species_b for profile in profiles}
+    labels = {profile.species_a for profile in profiles} | {
+        profile.species_b for profile in profiles
+    }
 
     assert {"H", "Na", "O", "Pt", "species:Pt", "species:Pt_top"} <= labels
     assert "species:H" not in labels
@@ -860,6 +862,7 @@ def test_compute_rdf_inline_statistics_match_reference_helper():
         strategy_override=None,
     )
 
+    assert profile.series_statistics is not None
     stats = profile.series_statistics["g_r"]
     np.testing.assert_array_equal(stats.point_count, expected.point_count)
     np.testing.assert_array_equal(stats.sample_n, expected.sample_n)
@@ -894,7 +897,9 @@ def test_compute_rdf_profiles_inline_statistics_match_single_pair_results():
         threads=1,
     )
 
+    assert collection_profile.series_statistics is not None
     collection_stats = collection_profile.series_statistics["g_r"]
+    assert single_profile.series_statistics is not None
     single_stats = single_profile.series_statistics["g_r"]
     np.testing.assert_array_equal(collection_stats.point_count, single_stats.point_count)
     np.testing.assert_array_equal(collection_stats.sample_n, single_stats.sample_n)
@@ -1001,15 +1006,26 @@ def test_save_rdf_profiles_merge_replaces_existing_pair_without_duplicate(tmp_pa
         ("H", "O"),
         ("H", "H"),
     }
-    replaced = {
-        (profile.species_a, profile.species_b): profile for profile in loaded
-    }[("H", "O")]
+    replaced = {(profile.species_a, profile.species_b): profile for profile in loaded}[("H", "O")]
     np.testing.assert_allclose(replaced.g_r, np.array([0.9, 1.2], dtype=float))
     assert "Replaced existing RDF profile(s)" in caplog.text
 
 
-def test_save_rdf_profiles_merge_uses_fallback_on_incompatible_existing_file(tmp_path, caplog):
-    out = tmp_path / "rdf_collection.h5"
+@pytest.mark.parametrize(
+    "name,expected",
+    [
+        ("rdf_collection.h5", "rdf_collection_1.h5"),
+        ("run.rdf.h5", "run_1.rdf.h5"),
+        ("run.part.rdf.h5", "run_1.part.rdf.h5"),
+    ],
+)
+def test_save_rdf_profiles_merge_uses_fallback_on_incompatible_existing_file(
+    tmp_path,
+    caplog,
+    name,
+    expected,
+):
+    out = tmp_path / name
     source_path = tmp_path / "traj.xyz"
 
     save_rdf_profiles(
@@ -1046,7 +1062,7 @@ def test_save_rdf_profiles_merge_uses_fallback_on_incompatible_existing_file(tmp
         merge_existing=True,
     )
 
-    assert written == tmp_path / "rdf_collection_1.h5"
+    assert written == tmp_path / expected
     assert out.exists()
     assert written.exists()
     assert "Writing fallback file" in caplog.text

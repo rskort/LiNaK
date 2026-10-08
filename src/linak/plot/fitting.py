@@ -509,9 +509,7 @@ def execute_series_fit(
                 np.asarray(coefficients, dtype=float),
                 np.asarray(values, dtype=float),
             )
-            equation = _polynomial_equation_from_coefficients(
-                np.asarray(coefficients, dtype=float)
-            )
+            equation = _polynomial_equation_from_coefficients(np.asarray(coefficients, dtype=float))
             if degree == 2:
                 a, b, _c = np.asarray(coefficients, dtype=float)
                 if np.isfinite(a) and abs(a) > 1.0e-15:
@@ -520,7 +518,9 @@ def execute_series_fit(
                         "label": "Vertex",
                         "x": vertex_x,
                         "y": float(
-                            np.polyval(np.asarray(coefficients, dtype=float), np.asarray([vertex_x]))[0]
+                            np.polyval(
+                                np.asarray(coefficients, dtype=float), np.asarray([vertex_x])
+                            )[0]
                         ),
                     }
         else:
@@ -576,7 +576,9 @@ def execute_series_fit(
             characteristic_point = {
                 "label": str(characteristic_point["label"]),
                 "x": point_x,
-                "y": float(np.asarray(predictor(np.asarray([point_x], dtype=float)), dtype=float)[0]),
+                "y": float(
+                    np.asarray(predictor(np.asarray([point_x], dtype=float)), dtype=float)[0]
+                ),
             }
         return _build_fit_summary(
             status="ok",

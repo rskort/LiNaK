@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Any, NoReturn
 from uuid import uuid4
@@ -13,6 +15,15 @@ from uuid import uuid4
 import numpy as np
 
 from .. import __version__
+from .policies import (
+    DEFAULT_COMPRESSION_PROFILE,
+    STORAGE_PRECISION_POLICY,
+    dataset_create_options,
+    normalize_compression_profile,
+    policy_metadata,
+    storage_array,
+    storage_dtype,
+)
 
 try:  # pragma: no cover - exercised in environments missing optional dependency.
     _H5PY_IMPORT_ERROR: ModuleNotFoundError | None = None
@@ -99,6 +110,58 @@ def _decode_metadata_json(raw: Any, *, path: str | Path, location: str) -> dict[
 
 def _now_utc_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+@contextmanager
+def _atomic_hdf5_target(output_path: Path):
+    """Yield a sibling temporary path and publish it only after a clean close."""
+
+    temporary_path = output_path.with_name(
+        f".{output_path.name}.{uuid4().hex}.tmp{output_path.suffix}"
+    )
+    try:
+        yield temporary_path
+        os.replace(temporary_path, output_path)
+    finally:
+        try:
+            temporary_path.unlink(missing_ok=True)
+        except OSError:
+            LOGGER.debug("Could not remove temporary HDF5 output '%s'.", temporary_path)
+
+
+def _create_policy_dataset(
+    group: Any,
+    name: str,
+    values: Any,
+    *,
+    analysis: str,
+    compression_profile: str,
+) -> Any:
+    """Create one policy dataset without materializing a full dtype-conversion copy."""
+
+    source = np.asarray(values)
+    target_dtype = storage_dtype(analysis=analysis, name=str(name), dtype=source.dtype)
+    if source.dtype.kind in "OUSV" or source.ndim == 0 or source.size == 0:
+        array = storage_array(analysis=analysis, name=str(name), values=source)
+        return group.create_dataset(
+            name,
+            data=array,
+            **dataset_create_options(array, compression_profile=compression_profile),
+        )
+    template = np.broadcast_to(np.zeros((), dtype=target_dtype), source.shape)
+    dataset = group.create_dataset(
+        name,
+        shape=source.shape,
+        dtype=target_dtype,
+        **dataset_create_options(template, compression_profile=compression_profile),
+    )
+    rows_per_write = source.shape[0]
+    if dataset.chunks:
+        rows_per_write = max(1, int(dataset.chunks[0]))
+    for start in range(0, source.shape[0], rows_per_write):
+        stop = min(start + rows_per_write, source.shape[0])
+        dataset[start:stop] = source[start:stop]
+    return dataset
 
 
 def _decode_required_string_attr(
@@ -196,11 +259,14 @@ def _validate_profile_metadata(
             path,
             f"{location} metadata has invalid analysis_schema_version.",
         )
-    if schema_version != LINAK_ANALYSIS_SCHEMA_VERSION:
+    from ..analysis.schema import get_analysis_schema
+
+    expected_version = get_analysis_schema(analysis).version
+    if schema_version != expected_version:
         _raise_incompatible_linak_hdf5(
             path,
-            f"{location} uses analysis schema version {schema_version}; expected "
-            f"{LINAK_ANALYSIS_SCHEMA_VERSION}.",
+            f"{location} uses unsupported analysis schema version {schema_version}; "
+            f"'{analysis}' requires schema version {expected_version}. Recompute this analysis.",
         )
 
 
@@ -210,34 +276,44 @@ def write_linak_hdf5(
     analysis: str,
     datasets: Mapping[str, np.ndarray | list[float] | tuple[float, ...] | None],
     metadata: Mapping[str, Any] | None = None,
+    compression_profile: str = DEFAULT_COMPRESSION_PROFILE,
 ) -> Path:
     """Write a LiNaK HDF5 analysis file."""
     require_h5py()
     output_path = resolve_hdf5_output_path(output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    metadata_map = dict(metadata or {})
+    resolved_compression = normalize_compression_profile(compression_profile)
+    metadata_map = policy_metadata(metadata, compression_profile=resolved_compression)
     metadata_map.setdefault("analysis", str(analysis))
-    metadata_map.setdefault("analysis_schema_version", LINAK_ANALYSIS_SCHEMA_VERSION)
+    from ..analysis.schema import get_analysis_schema
+
+    metadata_map.setdefault("analysis_schema_version", get_analysis_schema(analysis).version)
     metadata_map.setdefault("profile_uid", uuid4().hex)
     metadata_json = json.dumps(_json_ready(metadata_map), sort_keys=True)
-    with h5py.File(output_path, "w") as handle:
+    with (
+        _atomic_hdf5_target(output_path) as temporary_path,
+        h5py.File(temporary_path, "w") as handle,
+    ):
         handle.attrs["linak_format"] = LINAK_HDF5_FORMAT
         handle.attrs["linak_format_version"] = LINAK_HDF5_VERSION
         handle.attrs["analysis"] = str(analysis)
         handle.attrs["created_utc"] = _now_utc_iso()
         handle.attrs["linak_version"] = __version__
+        handle.attrs["compression_profile"] = resolved_compression
+        handle.attrs["storage_precision_policy"] = STORAGE_PRECISION_POLICY
         handle.attrs["metadata_json"] = metadata_json
 
         for name, values in datasets.items():
             if values is None:
                 continue
-            array = np.asarray(values)
-            use_compression = array.ndim > 0 and array.size > 0
-            if use_compression:
-                handle.create_dataset(name, data=array, compression="gzip", shuffle=True)
-            else:
-                handle.create_dataset(name, data=array)
+            _create_policy_dataset(
+                handle,
+                name,
+                values,
+                analysis=analysis,
+                compression_profile=resolved_compression,
+            )
     return output_path
 
 
@@ -371,6 +447,7 @@ def read_linak_hdf5_profile_headers(
                         )
                     )
                     profile_metadata.setdefault("analysis", analysis)
+                    profile_metadata["dataset_inventory"] = _dataset_inventory(group)
                     if (
                         "profile_index" in profile_metadata
                         and "source_profile_index" not in profile_metadata
@@ -387,6 +464,7 @@ def read_linak_hdf5_profile_headers(
                 return headers
 
         root_metadata.setdefault("profile_index", 0)
+        root_metadata["dataset_inventory"] = _dataset_inventory(handle)
         _validate_profile_metadata(
             root_metadata,
             path=hdf5_path,
@@ -394,6 +472,25 @@ def read_linak_hdf5_profile_headers(
             location="root profile",
         )
         return [root_metadata]
+
+
+def _dataset_inventory(group: Any) -> dict[str, dict[str, Any]]:
+    """Describe immediate datasets without materializing their payloads."""
+
+    inventory: dict[str, dict[str, Any]] = {}
+    for name, dataset in group.items():
+        if not hasattr(dataset, "shape"):
+            continue
+        shape = tuple(int(value) for value in dataset.shape)
+        dtype = np.dtype(dataset.dtype)
+        itemsize = max(1, int(dtype.itemsize))
+        inventory[str(name)] = {
+            "name": str(name),
+            "shape": list(shape),
+            "dtype": str(dtype),
+            "byte_estimate": int(np.prod(shape, dtype=np.int64)) * itemsize,
+        }
+    return inventory
 
 
 def read_linak_hdf5_profiles_by_index(
@@ -529,6 +626,7 @@ def write_linak_hdf5_profile_collection(
     analysis: str,
     profiles: Sequence[Mapping[str, Any]],
     metadata: Mapping[str, Any] | None = None,
+    compression_profile: str = DEFAULT_COMPRESSION_PROFILE,
 ) -> Path:
     """Write a LiNaK HDF5 file containing multiple analysis profiles."""
     require_h5py()
@@ -538,16 +636,22 @@ def write_linak_hdf5_profile_collection(
     output_path = resolve_hdf5_output_path(output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    root_metadata = dict(metadata or {})
+    resolved_compression = normalize_compression_profile(compression_profile)
+    root_metadata = policy_metadata(metadata, compression_profile=resolved_compression)
     root_metadata["combined"] = True
     root_metadata["profile_count"] = len(profiles)
 
-    with h5py.File(output_path, "w") as handle:
+    with (
+        _atomic_hdf5_target(output_path) as temporary_path,
+        h5py.File(temporary_path, "w") as handle,
+    ):
         handle.attrs["linak_format"] = LINAK_HDF5_FORMAT
         handle.attrs["linak_format_version"] = LINAK_HDF5_VERSION
         handle.attrs["analysis"] = str(analysis)
         handle.attrs["created_utc"] = _now_utc_iso()
         handle.attrs["linak_version"] = __version__
+        handle.attrs["compression_profile"] = resolved_compression
+        handle.attrs["storage_precision_policy"] = STORAGE_PRECISION_POLICY
         handle.attrs["metadata_json"] = json.dumps(_json_ready(root_metadata), sort_keys=True)
 
         profiles_group = handle.require_group(_COLLECTION_GROUP)
@@ -562,10 +666,12 @@ def write_linak_hdf5_profile_collection(
                 profile_metadata_map = dict(profile_metadata)
             else:
                 raise ValueError("Each profile payload metadata must be a mapping when provided.")
+            from ..analysis.schema import get_analysis_schema
+
             profile_metadata_map.setdefault("analysis", str(analysis))
             profile_metadata_map.setdefault(
                 "analysis_schema_version",
-                LINAK_ANALYSIS_SCHEMA_VERSION,
+                get_analysis_schema(analysis).version,
             )
             profile_metadata_map.setdefault("profile_uid", uuid4().hex)
             profile_group = profiles_group.require_group(f"{index:04d}")
@@ -576,12 +682,13 @@ def write_linak_hdf5_profile_collection(
             for name, values in datasets.items():
                 if values is None:
                     continue
-                array = np.asarray(values)
-                use_compression = array.ndim > 0 and array.size > 0
-                if use_compression:
-                    profile_group.create_dataset(name, data=array, compression="gzip", shuffle=True)
-                else:
-                    profile_group.create_dataset(name, data=array)
+                _create_policy_dataset(
+                    profile_group,
+                    name,
+                    values,
+                    analysis=analysis,
+                    compression_profile=resolved_compression,
+                )
     return output_path
 
 

@@ -51,9 +51,9 @@ def axis_to_index(axis: str) -> int:
 
 
 def ensure_positive(name: str, value: float) -> None:
-    """Validate that a numeric argument is strictly positive."""
-    if value <= 0:
-        raise ValueError(f"{name} must be > 0 (got {value}).")
+    """Validate finite positive scientific parameters before allocation or binning."""
+    if not np.isfinite(value) or value <= 0:
+        raise ValueError(f"{name} must be finite and > 0 (got {value}).")
 
 
 def choose_engineering_prefix_exponent(values: np.ndarray) -> int:
@@ -82,11 +82,21 @@ def scale_series_with_si_prefix(
         return [], unit, 1.0
 
     flattened = [np.asarray(values, dtype=float).ravel() for values in series]
-    non_empty = [values for values in flattened if values.size > 0]
-    if not non_empty:
+    largest_finite_magnitude = 0.0
+    for values in flattened:
+        if values.size == 0:
+            continue
+        finite = np.abs(values[np.isfinite(values)])
+        if finite.size:
+            largest_finite_magnitude = max(
+                largest_finite_magnitude,
+                float(np.max(finite)),
+            )
+    if largest_finite_magnitude == 0.0:
         return [np.asarray(values, dtype=float) for values in series], unit, 1.0
-    combined = np.concatenate(non_empty)
-    exponent = choose_engineering_prefix_exponent(combined)
+    exponent = choose_engineering_prefix_exponent(
+        np.asarray([largest_finite_magnitude], dtype=float)
+    )
     factor = 10.0 ** (-exponent)
     prefix = SI_PREFIX_SYMBOLS.get(exponent, "")
     scaled_unit = f"{prefix}{unit}"

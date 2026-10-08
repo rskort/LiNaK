@@ -1,3 +1,8 @@
+from __future__ import annotations
+from matplotlib.axes import Axes
+from matplotlib.cm import ScalarMappable
+from matplotlib.colorbar import Colorbar
+
 import colorsys
 from dataclasses import replace
 import json
@@ -8,6 +13,7 @@ import numpy as np
 import pytest
 from ase import Atoms
 
+import linak.analysis.position as position_module
 from linak.analysis.position import (
     _build_xy_segments,
     PositionProfile,
@@ -171,6 +177,37 @@ def test_compute_position_profiles_all_is_element_resolved():
     assert [profile.species for profile in profiles] == ["H", "O", "mol:OH"]
     assert [profile.n_atoms for profile in profiles] == [1, 1, 1]
     assert profiles[-1].entity_kind == "molecule"
+
+
+def test_compute_position_profiles_batches_element_and_raw_species_selection(monkeypatch):
+    frames = [_split_raw_species_position_frame() for _ in range(2)]
+    calls: list[list[str]] = []
+    original = position_module._compute_position_profiles_for_labels
+
+    def _tracked_compute_position_profiles_for_labels(**kwargs):
+        calls.append(list(kwargs["species_labels"]))
+        return original(**kwargs)
+
+    monkeypatch.setattr(
+        position_module,
+        "_compute_position_profiles_for_labels",
+        _tracked_compute_position_profiles_for_labels,
+    )
+
+    profiles = compute_position_profiles(
+        frames,
+        species="all",
+        surface_mode="none",
+        min_molecule_frames=99,
+    )
+
+    assert calls == [["H", "Na", "O", "Pt", "species:Pt", "species:Pt_top"]]
+    atomic_profiles = [profile for profile in profiles if profile.entity_kind == "atom"]
+    assert len(atomic_profiles) == 6
+    assert all(
+        profile.cell_matrices_angstrom is atomic_profiles[0].cell_matrices_angstrom
+        for profile in atomic_profiles[1:]
+    )
 
 
 def test_compute_position_profiles_elements_and_molecules_group_selectors():
@@ -476,6 +513,7 @@ def test_plot_position_profile_defaults_to_distance_vs_time(monkeypatch):
     plot_position_profile(profile, show=False)
     assert captured["x_label"] == "Time (ps)"
     assert captured["y_label"] == "Distance to the surface ($\\mathrm{\\AA}$)"
+    assert isinstance(captured["y_series"], list)
     np.testing.assert_allclose(captured["y_series"][0], np.array([0.8, 0.9]))
 
 
@@ -828,6 +866,7 @@ def test_plot_position_profile_2d_projection_line_colors_uses_same_hue_dark_to_l
 
     assert result is None
     ax = captured["axes"]
+    assert isinstance(ax, Axes)
     assert ax.get_legend() is not None
     assert len(ax.lines) == 2
     assert len(ax.collections) == 0
@@ -873,6 +912,7 @@ def test_plot_position_profile_2d_projection_filter_uses_selected_value_quantity
     )
 
     ax = captured["axes"]
+    assert isinstance(ax, Axes)
     assert len(ax.lines) == 0
     assert len(ax.collections) == 0
 
@@ -918,6 +958,7 @@ def test_plot_position_profiles_2d_projection_line_colors_honors_descriptor_over
     )
 
     ax = captured["axes"]
+    assert isinstance(ax, Axes)
     assert len(ax.lines) == 1
     rendered_hls = colorsys.rgb_to_hls(*mcolors.to_rgb(ax.lines[0].get_color()))
     expected_hls = colorsys.rgb_to_hls(1.0, 0.0, 0.0)
@@ -984,7 +1025,9 @@ def test_plot_position_profile_2d_projection_supports_time_color_and_heatmap_sty
     )
 
     artist = captured["heatmap_artist"]
+    assert isinstance(artist, ScalarMappable)
     colorbar = captured["heatmap_colorbar"]
+    assert isinstance(colorbar, Colorbar)
     assert artist is not None
     assert artist.get_cmap().name == "viridis"
     assert artist.norm.vmin == pytest.approx(0.0)
@@ -1019,6 +1062,7 @@ def test_plot_position_projection_uses_one_uniform_width_without_point_overlay()
     )
 
     artist = captured["heatmap_artist"]
+    assert isinstance(artist, ScalarMappable)
     assert artist is not None
     assert captured["heatmap_point_artist"] is None
     assert captured["projection_line_width"] == pytest.approx(0.75)
@@ -1056,6 +1100,7 @@ def test_plot_position_profiles_2d_species_color_mode_uses_profile_layers():
     )
 
     ax = captured["axes"]
+    assert isinstance(ax, Axes)
     assert {line.get_color() for line in ax.lines} == {"#ff0000", "#0000ff"}
     assert [text.get_text() for text in ax.get_legend().get_texts()] == ["O", "H"]
     assert captured["heatmap_artist"] is None
@@ -1087,6 +1132,7 @@ def test_plot_position_projection_keeps_grid_off_when_grid_style_kwargs_are_pres
     )
 
     ax = captured["axes"]
+    assert isinstance(ax, Axes)
     assert not any(line.get_visible() for line in ax.get_xgridlines())
     assert not any(line.get_visible() for line in ax.get_ygridlines())
 
@@ -1112,6 +1158,7 @@ def test_plot_position_profiles_accepts_contract_driven_trajectory_mapping():
 
     assert result is None
     ax = captured["axes"]
+    assert isinstance(ax, Axes)
     assert len(ax.collections) >= 1
     assert ax.get_xlabel()
     assert ax.get_ylabel()

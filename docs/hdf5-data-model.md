@@ -1,5 +1,62 @@
 # HDF5 Data Model And Metadata Conventions
 
+## Storage and loading policy
+
+New files record `compression_profile` (`fast`, `balanced`, or `none`) and
+`storage_precision_policy=mixed-v1` in root provenance. `mixed-v1` uses float32
+for bulk trajectory coordinates, cube grids, atom-resolved matrices, profiles,
+and plot arrays. Cell/origin/surface geometry, transforms, accumulated moments,
+fits, and potential/work-function values remain float64.
+Scientific geometry, classification, normalization, fitting, and reductions
+upcast to float64 before calculation.
+
+Numeric datasets use approximately 1 MiB chunks, with frame-major chunks
+clamped to 1–256 frames. Large dtype conversions are written by chunk and final
+files are atomically replaced only after HDF5 closes successfully.
+
+Header reads expose a payload-free `dataset_inventory` for every profile. Each
+entry contains dataset name, shape, dtype, and an uncompressed byte estimate.
+GUI plotting uses this inventory to request only view-required datasets; public
+`load_*_profiles()` functions remain eager for backward compatibility.
+
+## Surface Schema v2
+
+Density, position, coordination, and orientation profiles using the shared
+layout model write schema v2. `surface.layout_requested`,
+`surface.layout_resolved`, `surface.top`, `surface.bottom`, the automatic
+selection reason, validation flags, and population asymmetry are stored in
+metadata. Per-frame plane diagnostics use `surface_top_*` and
+`surface_bottom_*` datasets. Partially paired symmetric metadata is rejected.
+
+Surface-aware analysis readers require their current v2 schema, including for
+single-interface cells. RDF and temperature retain their current v1 schemas.
+Unsupported analysis schemas are rejected before reading numerical payloads,
+with a recomputation message. Conversion caches store paired references and
+layout diagnostics independently of analysis files.
+
+Symmetric density sparse grids additionally store
+`geometry_top_surface_offsets_A`, `geometry_bottom_surface_offsets_A`, and
+aligned `geometry_{top,bottom}_{mass_sum_g,entity_sum}` arrays. They share the
+existing geometry offsets and flat coordinate indices, so side resolution does
+not duplicate sparse coordinates. These arrays are additive to schema v2.
+New sparse grids also store `geometry_axis_cuts_A`,
+`geometry_axis_lowers_A`, and `geometry_axis_periods_A`. One-sided layouts also
+store `geometry_axis_wrap_thresholds_A`, which includes the trusted rough-plane
+envelope. These values preserve the exact canonical periodic image per geometry
+group, allowing filtered and tilted-prismatic distance projections to normalize
+boundary-crossing slabs without treating the cell cut as a physical interface.
+Legacy single-side grids and raw Cartesian projections remain readable; a
+symmetric distance projection requires the complete paired set and reports a
+recompute error if only part (or none) of it is present.
+
+Coordination v2 additionally stores `axis_coordinate_A` for an unfolded
+full-cell representation. Orientation v2 stores `full_bin_edges_A`, full-cell
+means, density, heatmaps, valid/total counts and statistics, plus
+`grid_lab_cos_polar_sum` and `grid_lab_count_polar_valid`. These datasets use a
+single laboratory `+axis` polar convention. Within v2 these are additive:
+plot capability metadata disables Full cell when the
+required arrays are absent and reports that the analysis must be recomputed.
+
 LiNaK stores analysis outputs in HDF5 together with analysis-specific metadata.
 This page explains the general storage model shared by the analysis workflows,
 including structured surface diagnostics.
@@ -64,11 +121,11 @@ LiNaK also stores:
 - `analysis`
 - `analysis_schema_version`
 
-These identify the analysis family and the intended schema revision. During
-active development, LiNaK analysis files use strict schema v1. Files written by
-an incompatible LiNaK package version, missing required v1 metadata, or missing
-required current-schema datasets are rejected; recompute the analysis with the
-current LiNaK version when that happens.
+These identify the analysis family and its schema revision, independently of
+the LiNaK package version. Readers require the current schema for that analysis
+(see [Current-Schema Loading](#current-schema-loading)). Unsupported schemas or
+missing required datasets/metadata are rejected with a recomputation message.
+A different package version alone generates a warning, not a schema migration.
 
 ## Units Map
 
@@ -205,15 +262,19 @@ This distinction matters because a file may still contain rich surface metadata
 and diagnostics even when the final analysis did not trust the surface estimate
 enough to use distance-to-surface coordinates.
 
-## Strict v1 Loading
+## Current-Schema Loading
 
-Current development HDF5 readers expect strict v1 LiNaK files. If a required
-analysis dataset or metadata field is missing, treat the file as corrupted or
-generated by the wrong LiNaK version and recompute it with the current package.
-Converted trajectory HDF5 files can be missing optional preprocessing caches;
-in that case analyses recompute the missing optional information. If an optional
-cache is present but malformed, LiNaK treats the cache as invalid file metadata
-and raises a clear error instead of silently guessing.
+Readers validate each analysis's current schema before loading its payload:
+density, position, coordination, orientation, and potential tables use v2;
+RDF and temperature use v1. A different version or missing required data produces an actionable
+recomputation error. No analysis files are automatically migrated or rewritten.
+
+Conversion-time surface caches are optional. Only matching current paired
+`SurfaceReference` caches are reused, including references resolved to a single
+interface. Missing caches and obsolete one-estimate caches are ignored, and
+the analysis recomputes the reference from the trajectory. Cache decisions are
+logged at DEBUG. Malformed current caches raise a clear error requesting
+reconversion instead of silently guessing their geometry.
 
 ## Plot Settings
 
@@ -242,7 +303,6 @@ not just say "here are some numbers." It should also say:
 ## Related Documentation
 
 - [Density](density.md)
-- [MSD](msd.md)
 - [Position](position.md)
 - [RDF](rdf.md)
 - [Coordination](coordination.md)

@@ -8,7 +8,7 @@ LiNaK is a lightweight Python toolkit for molecular dynamics trajectory analysis
 
 LiNaK's recommended path is the command-line `apply`/`compute`/`plot` workflow:
 - `linak compute`: generate LiNaK HDF5 analysis files
-- `linak plot`: plot LiNaK density, MSD, RDF, position, coordination, potential, and orientation HDF5 files by auto-detecting the analysis from the HDF5 metadata
+- `linak plot`: plot LiNaK density, RDF, position, coordination, potential, and orientation HDF5 files by auto-detecting the analysis from the HDF5 metadata
 - `linak apply`: convert trajectories, pack simulation directories, apply PBC, or compress CP2K output files
 - `linak hdf5` (`linak hd`, `linak h5`): inspect, combine, transform, and plot generic tabular HDF5 data
 
@@ -20,7 +20,10 @@ Supported inputs include:
 - LAMMPS and CP2K input scripts (`.lmp`, and `.inp`, respectively)
 - CP2K Hartree cube files for potential analysis
 
-LiNaK currently supports Python `3.9`, `3.10`, `3.11`, `3.12`, and `3.13`.
+LiNaK targets stable CPython **3.9–3.14**, including Python 3.9. See the
+[pre-publication audit](docs/pre-publication-audit.md) for executed checks and
+platforms still awaiting verification. Future versions and prereleases are not
+advertised as supported. LiNaK is licensed under **Apache-2.0**.
 
 ## Installation
 
@@ -48,18 +51,22 @@ pip install -e .[dev]
 The recommended workflow for repeated analysis is to convert a raw trajectory
 first. `linak apply convert` writes a `*.traj.h5` file that embeds cell,
 timestep, fixed-atom, and surface-cache metadata so all later `linak compute`
-commands can run faster and without re-reading the original text file. 
+commands can run faster and without re-reading the original text file.
 
-When working on **an HPC cluster**, it is recommended to convert the trajectory 
-on the cluster first and then copy the much smaller HDF5 file back to the local 
+Conversion reports elapsed times for reading, cell/selection preparation, surface-cache
+construction, and HDF5 writing. Interactive terminals show byte/frame reading progress
+and chunk-by-chunk writing progress; redirected logs contain plain stage messages.
+Only the final output path goes to stdout. Surface caching remains enabled by default.
+
+When working on **an HPC cluster**, it is recommended to convert the trajectory
+on the cluster first and then copy the much smaller HDF5 file back to the local
 machine for fast iteration with `linak compute` and `linak plot`.
 
 ```bash
 linak apply convert traj.xyz
 linak compute density LiNaK_outputs/traj.traj.h5
-linak compute msd LiNaK_outputs/traj.traj.h5 --species O
-linak compute rdf LiNaK_outputs/traj.traj.h5 --species-a O --species-b H
-linak compute coordination LiNaK_outputs/traj.traj.h5 --species-a O --species-b H --cutoff-from-rdf
+linak compute rdf LiNaK_outputs/traj.traj.h5 --species O H
+linak compute coordination LiNaK_outputs/traj.traj.h5 --species O H --cutoff-from-rdf
 linak compute position LiNaK_outputs/traj.traj.h5 --species O
 linak compute orientation LiNaK_outputs/traj.traj.h5
 linak plot LiNaK_outputs/traj.density.h5
@@ -75,13 +82,11 @@ linak plot traj.density.h5
 linak compute density traj.xyz --species H2O
 linak plot traj.density.h5
 
-linak compute msd traj.xyz --species O
-linak plot traj.msd.h5
 linak compute position traj.xyz --species O
 linak plot traj.position.h5
-linak compute rdf traj.xyz --species-a O --species-b H
+linak compute rdf traj.xyz --species O H
 linak plot traj.rdf.h5
-linak compute coordination traj.xyz --species-a O --species-b H --cutoff-from-rdf
+linak compute coordination traj.xyz --species O H --cutoff-from-rdf
 linak plot traj.coordination.h5
 linak compute orientation traj.xyz
 linak plot traj.orientation.h5
@@ -105,14 +110,11 @@ Python API example:
 ```python
 from linak.trajectory.io import read_trajectory
 from linak.analysis.density import compute_density_profile
-from linak.analysis.msd import compute_msd
 
 frames = read_trajectory("traj.xyz")
 density = compute_density_profile(frames, species="O", axis="z", bin_width=0.1)
-msd = compute_msd(frames, species="O", timestep_fs=0.5)
 
 print(density.species, density.units, density.n_frames)
-print(msd.species, msd.msd[-1], "A^2")
 ```
 
 ## CLI Overview
@@ -124,7 +126,6 @@ LiNaK HDF5 outputs.
 
 Available analyses:
 - `density`: 1D density profiles
-- `msd`: mean-squared displacement
 - `position`: atom-resolved trajectories (`x`, `y`, `z`, and distance to surface) vs time
 - `rdf`: radial distribution function
 - `coordination`: continuous coordination number vs time and/or distance to surface
@@ -137,10 +138,9 @@ Examples:
 ```bash
 linak compute density traj.xyz
 linak compute density traj.xyz --species H2O --axis z --bin-width 0.1
-linak compute msd traj.xyz --species O --timestep-fs 0.5
 linak compute position traj.xyz --species O --axis z
-linak compute rdf traj.xyz --species-a O --species-b H --bin-width 0.05
-linak compute coordination traj.xyz --species-a O --species-b H --cutoff-from-rdf
+linak compute rdf traj.xyz --species O H --bin-width 0.05
+linak compute coordination traj.xyz --species O H --cutoff-from-rdf
 linak compute orientation traj.xyz
 linak compute temperature run-1.temp
 linak compute temperature run-vel-1.xyz --input input.inp
@@ -150,16 +150,15 @@ linak compute potential -f run1/*-v_hartree-1_0.cube run2/*-v_hartree-1_0.cube -
 ### `linak plot`
 
 The `plot` command reads LiNaK analysis HDF5 files and auto-detects whether the
-file contains density, MSD, RDF, position, coordination, potential, orientation, or temperature data.
+file contains density, RDF, position, coordination, potential, orientation, or temperature data.
 
 Examples:
 
 ```bash
 linak plot traj.density.h5
 linak plot -f run1.density.h5 run2.density.h5
-linak plot traj.msd.h5 
 linak plot traj.position.h5
-linak plot traj.rdf.h5 
+linak plot traj.rdf.h5
 linak plot traj.coordination.h5
 linak plot traj.orientation.h5
 linak plot potentials.h5
@@ -170,7 +169,7 @@ When `linak plot` cannot detect a supported LiNaK analysis in the HDF5 file, it
 falls back to generic HDF5 plotting via `linak hdf5 plot`.
 
 When interactive plotting is available, `linak plot` opens the LiNaK Studio GUI
-by default. The GUI provides a live preview plus analysis-aware controls, 
+by default. The GUI provides a live preview plus analysis-aware controls,
 allowing you to control options for analysis alongside the usual figure, axis,
 legend, series, and export settings.
 
@@ -213,7 +212,7 @@ instead of requiring free-text entry.
 
 Available apply commands:
 - `convert`: convert a trajectory into LiNaK trajectory HDF5 (`*.traj.h5`)
-- `pbc`: wrap atom positions into an orthorhombic periodic cell
+- `pbc`: wrap atom positions into a periodic cell, including tilted triclinic cells
 - `compress`: extract structured files from one CP2K `.out` file
 
 Examples:
@@ -222,12 +221,14 @@ Examples:
 linak apply convert traj.xyz
 linak apply convert traj.xyz --input input.inp
 linak apply pbc pos.xyz --cell 17.887 15.491 59.671
+linak apply pbc pos.xyz --cell 13.859251 10.7354 40.7792 --cell-angles 90 90 97.4176
 linak apply compress /path/to/output.out
 ```
 
 Converted `*.traj.h5` files are LiNaK's canonical preprocessed trajectory
 format. They store exact frame counts plus any simulation metadata LiNaK can
-resolve at conversion time, including cell lengths, timestep/stride, and
+resolve at conversion time, including the full cell matrix, lengths, angles,
+origin, periodic boundary flags, timestep/stride, and
 fixed-atom constraints when the input declares them. When a valid cell is
 available, conversion also writes PBC-wrapped coordinates and marks that
 preprocessing in the trajectory metadata. Conversion always attempts to cache
@@ -239,16 +240,17 @@ settings.
 Later `compute` commands prefer explicit CLI overrides first, then stored
 trajectory-HDF5 metadata, then explicit/auto-detected simulation inputs.
 
-LiNaK analysis HDF5 files use a strict development v1 schema. If an HDF5 file
-was written by an incompatible LiNaK version or is missing required v1 metadata,
-LiNaK rejects it and asks you to recompute the analysis with the current package.
+LiNaK validates each analysis's current HDF5 schema: v2 for density, position,
+coordination, orientation, and potential tables; v1 for RDF and temperature. Unsupported schemas
+or missing required metadata produce a recomputation error before payload
+loading. Existing files are never automatically rewritten or deleted.
 
 ### `linak hdf5`
 
 The `hdf5` command group works with generic tabular HDF5 data. It supports:
 - `info`, `preview`, `get`
 - `sort`, `filter`, `dedupe`
-- `combine` for LiNaK density/MSD/RDF/position/coordination/temperature HDF5 files
+- `combine` for LiNaK density/RDF/position/coordination/temperature HDF5 files
 - `plot` for generic column-based plotting
 - `plot-settings` for persisted plot profiles stored inside HDF5 files
 
@@ -257,7 +259,7 @@ Examples:
 ```bash
 linak hdf5 info density.h5
 linak hdf5 combine -f run1.density.h5 run2.density.h5
-linak hdf5 plot table.h5 --kind line --x time_ps --y msd_A2
+linak hdf5 plot table.h5 --kind line --x time_ps --y temperature_K
 ```
 
 Many `linak hdf5` commands are semi-interactive: if required columns or options
@@ -265,10 +267,26 @@ are omitted, LiNaK can prompt with available choices.
 
 ## Analysis Notes
 
+LiNaK supports both slab/vacuum trajectories and periodic two-interface cells
+with liquid on both metal faces. Use
+`--surface-layout auto|single-top|single-bottom|symmetric`; `auto` is the CLI
+and Studio default. Symmetric plots default to the equal-weight folded mean.
+Use `--interface-view full|top|bottom|folded|all` to select the complete
+unfolded cell, the positive-axis interface, the negative-axis interface, the
+combined interfaces, or a three-curve interface comparison. The Studio exposes
+the same choices as **Full cell (unfolded)**, **Positive-axis interface (+Z)**,
+**Negative-axis interface (−Z)**, **Combined interfaces (folded mean)**, and
+**Compare interface curves**; the axis letter follows the selected surface
+axis. Comparison is a 1D-only view. The independent
+`--surface-mode auto|layered|rough` option still selects the plane estimator.
+The Studio presents this Surface representation selector only for a resolved
+symmetric layout. For a single interface, the slab interior is signed negative
+while the complete outward liquid/vacuum region remains positive across the
+periodic cell boundary.
+
 Detailed method notes:
 
 - [Density](docs/density.md)
-- [MSD](docs/msd.md)
 - [Position](docs/position.md)
 - [RDF](docs/rdf.md)
 - [Coordination](docs/coordination.md)
@@ -278,6 +296,34 @@ Detailed method notes:
 - [Surface Estimation](docs/surface-estimation.md)
 - [Water Detection And Water Geometry](docs/water-detection.md)
 - [HDF5 Data Model And Metadata Conventions](docs/hdf5-data-model.md)
+
+### Performance and storage controls
+
+Analysis and conversion HDF5 output defaults to `--hdf5-compression fast`
+(LZF + shuffle). Use `balanced` for gzip level 4 or `none` when local I/O speed
+matters more than file size. Files record both the compression choice and the
+fixed `mixed-v1` precision policy.
+
+Density, position, and coordination CLI commands support
+`--trajectory-execution {auto,eager,stream}`. The default, `eager`, loads the
+trajectory once and reuses it in memory across analysis passes. Explicit `stream`
+limits input memory but rereads trajectory data on each pass. Explicit `auto`
+selects this multi-pass streaming when estimated trajectory materialization
+reaches `--stream-threshold-mib 256`. `--chunk-target-mib 64` controls input chunks and the threshold for
+file-backed output matrices. Raw text/LAMMPS sources are incrementally spooled
+under `--temporary-directory` (or `LINAK_TEMP_DIR`) and cleaned after the run;
+only marked, current-user stale stores with dead owner processes are recovered.
+
+`--memory-budget-mib` (or `LINAK_MEMORY_BUDGET_MIB`) overrides automatic
+resource budgeting for RDF, potential, and orientation. GUI preview and exact
+geometry caches share a byte-aware 512 MiB budget, configurable through the GUI
+Advanced page or `LINAK_CACHE_BUDGET_MIB`; **Clear preview cache** releases only
+in-memory caches and never removes analysis or conversion files.
+
+O/H-aware density, position, and orientation calculations accept
+`--oh-topology-backend {auto,ckdtree,ase}`. `auto` uses exact-distance-checked
+cKDTree paths for supported orthorhombic/triclinic geometry and otherwise falls
+back to ASE.
 
 ### Density
 
@@ -306,23 +352,13 @@ In all surface-aware modes, the atom-surface distance used for the density profi
 
 Use `--surface-elements` when LiNaK should only use specific atoms for surface detection, for example the metal atoms of a slab and not mobile water or ions near the interface. Generally, the automatic detection should do this correctly, but `--surface-elements` can be used to override that if needed.
 
-### MSD
-
-For MSD, LiNaK resolves the frame timestep in this order:
-1. `--timestep-fs` if provided
-2. metadata embedded in a converted `*.traj.h5` when available
-3. trajectory metadata when available
-4. simulation input from `--input` / `--cp2k-input` / `--lammps-input` if provided
-5. auto-detected `.inp` or `.lmp` next to the trajectory
-6. fallback to `0.5 fs`
-
-When a usable periodic cell is available, MSD uses periodic minimum-image
-accumulation. Otherwise it falls back to direct displacement.
-
 ### RDF
 
-`linak compute rdf` supports `--species-a`, `--species-b`, `--r-max`,
-`--bin-width`, and `--threads`. RDF requires a usable cell volume, taken from
+`linak compute rdf` supports repeatable `--species A B`, `--r-max`,
+`--bin-width`, and `--threads`. For example, `--species O H --species Pt O`
+computes two pairs in one run. Reversed RDF pairs are deduplicated. Dynamic
+free-H/OH molecule selection is not supported; see [RDF selection](docs/rdf.md).
+RDF requires a usable cell volume, taken from
 explicit `--cell` first, then converted trajectory-HDF5 metadata, then
 simulation-input resolution, then any usable cell already embedded in the
 loaded trajectory frames.
@@ -365,22 +401,22 @@ Species selection for position:
 - `--species O`: one species
 - omitted `--species`: LiNaK warns and computes one HDF5 file per detected species
 
-Surface handling for position uses the same logic as density (`--surface-mode`, `--surface-elements`,
-`--include-fixed-surface-atoms`), and distances are computed frame-by-frame as
-`axis_coordinate - surface_position(frame)`.
+Surface handling for position uses the same logic as density (`--surface-layout`,
+`--surface-mode`, `--surface-elements`, `--include-fixed-surface-atoms`). Positive
+and negative interfaces use their respective outward distances; symmetric
+combined views fold the two sides. Full-cell views retain raw Cartesian coordinates.
 
-Position plotting components:
-- `--component distance` (default): distance to detected surface vs time
-- `--component x|y|z`: Cartesian coordinate vs time
-- `--component 2d-projection` (legacy alias: `xy-z`): configurable 2D trajectory projection
-  - choose projection axes with `--projection-x` and `--projection-y`
-  - choose the value used for colormap/filtering with `--projection-value`
-  - choose `--projection-render-mode color-scale` for one colormap-driven trajectory overlay
-  - choose `--projection-render-mode line-colors` for one normal layer per atom with per-layer styling
-  - limit the visible data with `--projection-filter-min` and `--projection-filter-max`
-  - legacy `--map-color` and `--xy-z-distance-max` still work as compatibility shims
-  - default axes limits use cell dimensions (`x: 0..A`, `y: 0..B`) for legacy `xy-z` when cell data is available
-  - PBC boundary jumps are rendered without artificial cross-box connector lines
+Position plotting views:
+
+- `--view-type 1d-line --y-quantity distance`: distance to the surface versus time.
+- `--view-type 1d-line --y-quantity x` (or `y`/`z`): Cartesian position versus time.
+- `--view-type 2d-heatmap`: configurable 2D trajectory projection.
+  - Select axes with `--heatmap-x` and `--heatmap-y`.
+  - Select the color/filter quantity with `--heatmap-value`.
+  - Use `--heatmap-render-mode color-scale` for a continuous colormap, or
+    `source-colors` for editable categorical layers.
+  - Restrict values with `--heatmap-filter-min` and `--heatmap-filter-max`.
+  - PBC boundary jumps are rendered without artificial cross-box connector lines.
 
 In the interactive GUI, the same projection is available through `View type =
 2D Heatmap`. `Color mode = Continuous quantity` can color X/Y trajectories by
@@ -396,7 +432,7 @@ multiple position sources) when comparing several species.
 - parses the Fermi level from the output file
 - computes a water-bulk potential from O/H z-bounds read from the cube header,
   excluding z slices whose slice bin contains any non-water atom
-- reports `electrode_cshe_ev = water_bulk_potential_ev - efermi_ev - 0.81` by default
+- reports `electrode_cshe_ev = water_bulk_potential_ev - efermi_ev - 0.65` by default
 
 
 Output behaviour for `compute potential`:
@@ -422,6 +458,9 @@ in each frame, LiNaK stores:
 Orientation uses the same surface estimator as density, position, and
 coordination. When a trusted frame-wise surface reference is available, distances
 are surface-relative; otherwise the raw axis coordinate is used.
+For symmetric cells, interface plots measure polar orientation against each
+side's outward normal. Full-cell plots instead retain the laboratory `+axis`
+normal, so the negative-axis half is not sign-flipped.
 
 Surface options shared with density (`--surface-mode`, `--surface-elements`,
 `--include-fixed-surface-atoms`, `--rough-surface-envelope`) and `--bin-width`,
@@ -431,7 +470,7 @@ Surface options shared with density (`--surface-mode`, `--surface-elements`,
 linak compute orientation traj.xyz
 linak compute orientation LiNaK_outputs/traj.traj.h5 --axis z --reference-axis z --bin-width 0.05
 linak plot traj.orientation.h5
-linak plot traj.orientation.h5 --component heatmap --angle polar
+linak plot traj.orientation.h5 --view-type 2d-heatmap --angle polar
 ```
 
 ### Temperature
@@ -458,8 +497,10 @@ linak compute temperature run-vel-1.xyz --input input.inp
 linak plot run.temperature.h5
 ```
 
-Analysis HDF5 endings are invariant file types. Put qualifiers and collision
-counters in the base name: use `traj-all.position.h5` or
+All file extensions are invariant when resolving name collisions. Put `_1`,
+`_2`, etc. before the **first dot**: `run.part.rdf.h5` becomes
+`run_1.part.rdf.h5`. This also applies to non-HDF5 and unknown compound extensions.
+Put qualifiers in the base name: use `traj-all.position.h5` or
 `traj_1.density.h5`, never `traj.position-all.h5` or
 `traj.density_1.h5`. Custom compute outputs are normalized to the analysis
 ending, such as `.position.h5`, `.density.h5`, or `.rdf.h5`.
@@ -486,14 +527,14 @@ rather than inheriting saved plot profiles from one input file.
 
 For position plots specifically, `--time-section-width` can be used to
 aggregate points into larger time sections for display (plot-only, source HDF5
-unchanged). This applies to time-axis components (`distance`, `x`, `y`, `z`);
-`2d-projection` ignores time sectioning.
+unchanged). This applies to 1D time-axis views; 2D projections ignore time sectioning.
 
 For very large interactive position plots, LiNaK applies a GUI complexity guard
 before opening the Studio. The most practical ways to reduce the interactive
 load are:
-- switch to `--component 2d-projection`
-- narrow the visible projection values with `--projection-filter-min` / `--projection-filter-max`
+
+- switch to `--view-type 2d-heatmap`
+- narrow the visible values with `--heatmap-filter-min` / `--heatmap-filter-max`
 - use `--no-gui` for direct non-interactive rendering
 - use `--force-gui` only when you explicitly want to bypass the guard
 
@@ -517,18 +558,28 @@ the active one.
 ### `linak apply pbc`
 
 PBC wrapping resolves the cell in this order:
-1. `--cell A B C`
+1. `--cell A B C`, optionally with `--cell-angles ALPHA BETA GAMMA` in degrees
 2. `--input` / `--cp2k-input` / `--lammps-input`
 3. auto-detect a single `.inp` or `.lmp` in the output directory
 
 If the trajectory file itself already contains a usable periodic cell, LiNaK uses that
 without requiring an external input file.
 
+Lengths without `--cell-angles` retain the historical 90°/90°/90° default. LiNaK
+uses ASE's row-vector cell convention and wraps through fractional coordinates, so
+tilted and rotated cells retain their orientation and origin. Analysis axes and
+plot coordinates remain Cartesian x/y/z; their bounds include all eight cell
+vertices and can therefore start below zero. CP2K `ABC` plus
+`ALPHA_BETA_GAMMA`, explicit CP2K A/B/C vectors, and LAMMPS triclinic boxes are
+preserved through trajectory conversion and HDF5 storage. Older files containing
+only three cell lengths continue to load as orthorhombic cells.
+
 Examples:
 
 ```bash
 linak apply pbc pos.xyz
 linak apply pbc pos.xyz --input input.inp --output wrapped.xyz
+linak apply pbc pos.xyz --cell 13.859251 10.7354 40.7792 --cell-angles 90 90 97.4176
 linak apply pbc pos.xyz --overwrite
 ```
 
@@ -560,6 +611,18 @@ Additional shared behavior:
 - use `-f/--files` when passing multiple input files; it also works for a single file
 - LiNaK records resolved cell and timestep provenance in HDF5 metadata where applicable
 - when available metadata sources disagree, LiNaK logs a warning instead of silently picking one without notice
+
+At INFO level, conversion and trajectory-analysis commands print one concise
+cell-geometry line (orthorhombic, supported tilted prism, unsupported general
+triclinic/rotated, or invalid/unavailable) and one consolidated surface-layout
+line. The latter makes `auto -> symmetric`, single-side selection, cache reuse,
+and raw-axis fallback explicit. Use `--log-level DEBUG` for full matrices,
+per-source provenance, estimator methods, and normalization backend details.
+
+Density previews are metadata-only until an enabled sparse-grid series is
+rendered. Exact tilted-prism projections reuse in-plane intersection work and
+vectorize the surface-normal overlap, so non-orthorhombic X/distance maps scale
+with unique geometry and bins rather than frames times bins.
 
 ## Development
 

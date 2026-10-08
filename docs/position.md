@@ -1,5 +1,20 @@
 # Position
 
+## Symmetric Cells
+
+Position v2 keeps `distance_to_surface_A` as folded outward distance and adds
+`distance_to_top_surface_A`, `distance_to_bottom_surface_A`, and
+`interface_side` (`-1` bottom, `0` tie, `+1` top). Plotting and filtering use
+side masks; the trajectory is not duplicated.
+
+`interface_view=all` overlays folded, top, and bottom line series. Side views
+mask every opposing-side coordinate, not only the distance column.
+`interface_view=full` maps the distance role to the stored raw coordinate on
+the selected surface axis and leaves both sides and the slab region unmasked.
+The Studio labels these representations **Full cell (unfolded)**,
+**Positive-axis interface**, **Negative-axis interface**, **Combined interfaces
+(folded mean)**, and **Compare interface curves**.
+
 `linak compute position` stores atom-resolved trajectories for selected species.
 Unlike density or RDF, this analysis preserves per-atom and per-frame structure.
 
@@ -160,7 +175,7 @@ does not change the HDF5 data model. The projection view lets the user choose:
 - which stored quantity is used on the Y axis
 - which quantity drives the colormap or value filter
 - whether rendering uses one colormap-driven overlay (`color-scale`) or one
-  normal layer per tracked atom (`line-colors`)
+  normal layer per tracked atom (`source-colors`)
 
 Projection value filters are pointwise masks on the chosen value quantity.
 Hidden points do not get bridged by artificial connector lines.

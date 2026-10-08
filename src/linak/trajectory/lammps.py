@@ -48,6 +48,7 @@ class LammpsInputMetadata:
     input_path: Path
     units: str | None
     timestep: float | None
+    boundary: tuple[bool, bool, bool] | None
     read_data_path: Path | None
     dumps: tuple[LammpsDumpCommand, ...]
 
@@ -119,6 +120,7 @@ def parse_lammps_input(path: str | Path) -> LammpsInputMetadata:
 
     units: str | None = None
     timestep: float | None = None
+    boundary: tuple[bool, bool, bool] | None = None
     read_data_path: Path | None = None
     dumps: list[LammpsDumpCommand] = []
 
@@ -142,6 +144,16 @@ def parse_lammps_input(path: str | Path) -> LammpsInputMetadata:
                     ) from exc
                 ensure_positive("lammps_timestep", parsed_timestep)
                 timestep = parsed_timestep
+                continue
+
+            if command == "boundary" and len(tokens) >= 4:
+                styles = tuple(token.strip().lower() for token in tokens[1:4])
+                allowed = {"p", "f", "s", "m"}
+                if any(style not in allowed for style in styles):
+                    raise ValueError(
+                        f"Invalid LAMMPS boundary command in '{input_path}' line {line_number}."
+                    )
+                boundary = (styles[0] == "p", styles[1] == "p", styles[2] == "p")
                 continue
 
             if command == "read_data" and len(tokens) >= 2:
@@ -169,6 +181,7 @@ def parse_lammps_input(path: str | Path) -> LammpsInputMetadata:
         input_path=input_path,
         units=units,
         timestep=timestep,
+        boundary=boundary,
         read_data_path=read_data_path,
         dumps=tuple(dumps),
     )
@@ -229,8 +242,8 @@ def resolve_dump_path_from_lammps_input(path: str | Path) -> tuple[Path, int | N
     return resolved_path, every
 
 
-def extract_cell_from_lammps_data_file(path: str | Path) -> tuple[float, float, float]:
-    """Extract orthorhombic box lengths from a LAMMPS ``read_data`` file."""
+def extract_cell_from_lammps_data_file(path: str | Path):
+    """Extract the full box geometry from a LAMMPS ``read_data`` file."""
     data_path = Path(path).expanduser().resolve()
     if not data_path.exists():
         raise FileNotFoundError(f"LAMMPS data file not found: {data_path}")
@@ -238,8 +251,10 @@ def extract_cell_from_lammps_data_file(path: str | Path) -> tuple[float, float, 
         raise ValueError(f"LAMMPS data path is not a file: {data_path}")
 
     lengths: dict[str, float] = {}
+    tilt = (0.0, 0.0, 0.0)
+    vectors = {}
     with data_path.open("r", encoding="utf-8") as handle:
-        for line_number, line in enumerate(handle, start=1):
+        for line in handle:
             no_comment = line.split("#", 1)[0].strip()
             if not no_comment:
                 continue
@@ -259,11 +274,14 @@ def extract_cell_from_lammps_data_file(path: str | Path) -> tuple[float, float, 
                 xy = float(tilt_match.group(1))
                 xz = float(tilt_match.group(2))
                 yz = float(tilt_match.group(3))
-                if any(abs(value) > 1e-12 for value in (xy, xz, yz)):
-                    raise ValueError(
-                        f"LAMMPS triclinic tilt factors are not supported in '{data_path}' line {line_number}. "
-                        "Provide --cell A B C explicitly."
-                    )
+                tilt = (xy, xz, yz)
+            tokens = no_comment.split()
+            if len(tokens) == 4 and tokens[-1] in {"avec", "bvec", "cvec"}:
+                vectors[tokens[-1]] = tuple(float(x) for x in tokens[:3])
+    from ..cell_geometry import compact_cell
+
+    if len(vectors) == 3:
+        return compact_cell([vectors[key] for key in ("avec", "bvec", "cvec")])
 
     missing_axes = [axis for axis in ("x", "y", "z") if axis not in lengths]
     if missing_axes:
@@ -273,11 +291,12 @@ def extract_cell_from_lammps_data_file(path: str | Path) -> tuple[float, float, 
             "Provide --cell A B C explicitly."
         )
 
-    return lengths["x"], lengths["y"], lengths["z"]
+    xy, xz, yz = tilt
+    return compact_cell([[lengths["x"], 0.0, 0.0], [xy, lengths["y"], 0.0], [xz, yz, lengths["z"]]])
 
 
-def extract_cell_from_lammps_input(path: str | Path) -> tuple[float, float, float]:
-    """Extract cell lengths from a LAMMPS input by following ``read_data``."""
+def extract_cell_from_lammps_input(path: str | Path):
+    """Extract cell geometry from a LAMMPS input by following ``read_data``."""
     metadata = parse_lammps_input(path)
     if metadata.read_data_path is None:
         raise ValueError(

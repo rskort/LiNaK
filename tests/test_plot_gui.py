@@ -1,3 +1,6 @@
+from __future__ import annotations
+import ast
+
 import re
 from pathlib import Path
 
@@ -14,6 +17,8 @@ from linak.plot.plot_gui import (
     _AUTO_PREVIEW_STYLE_DEBOUNCE_MS,
     _DENSITY_VIEW_TYPE_ID_BY_LABEL,
     _DENSITY_VIEW_TYPE_LABEL_BY_ID,
+    _INTERFACE_VIEW_ORDER,
+    _INTERFACE_VIEW_STATIC_LABELS,
     _POSITION_GUI_PRESET_LABEL_BY_ID,
     _POSITION_GUI_VIEW_TYPE_ID_BY_LABEL,
     _POSITION_GUI_VIEW_TYPE_LABEL_BY_ID,
@@ -45,6 +50,7 @@ from linak.plot.plot_gui import (
     _extract_dict_mode,
     _format_series_display_text,
     _orientation_backend_summary_text,
+    _normalize_full_range_bound,
     _potential_backend_summary_text,
     _partition_series_ids_for_display_order,
     _plot_family_for_view,
@@ -63,6 +69,48 @@ from linak.plot.profile_persistence import (
     flatten_plot_profile_payload,
 )
 from linak.plot.plotting import plot_heatmap_series
+
+
+def test_density_full_range_bound_accepts_gui_round_trip() -> None:
+    lower = -7.07902483917
+    upper = 13.5710479407
+
+    assert _normalize_full_range_bound(float(f"{lower:.6g}"), lower) is None
+    assert _normalize_full_range_bound(float(f"{upper:.6g}"), upper) is None
+    assert _normalize_full_range_bound(lower, lower) is None
+    assert _normalize_full_range_bound(upper - 0.5, upper) == upper - 0.5
+
+
+def test_surface_representation_selector_uses_public_view_names() -> None:
+    assert _INTERFACE_VIEW_ORDER == ("full", "top", "bottom", "folded", "all")
+    assert _INTERFACE_VIEW_STATIC_LABELS == {
+        "full": "Full cell (unfolded)",
+        "folded": "Combined interfaces (folded mean)",
+        "all": "Compare interface curves",
+    }
+    source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+    assert 'f"Positive-axis interface (+{axis})"' in source
+    assert 'f"Negative-axis interface (−{axis})"' in source
+    assert 'settings["interface_view"] = self._selected_interface_view()' in source
+    assert "and self._has_symmetric_interface_views()" in source
+    assert 'return resolved == "symmetric"' in source
+    assert "def _density_symmetric_1d_coordinate_locked(self)" in source
+    assert "def _sync_density_interface_coordinate(self)" in source
+    assert 'else "Distance"' in source
+    assert "not density_heatmap_mode and not density_coordinate_locked" in source
+    assert 'and quantity_id == "distance_to_surface"' in source
+    assert '(axis_label.lower(), "time")' not in source
+    assert '[axis_label.lower(), "time"]' in source
+
+
+def test_density_ranges_use_blank_full_range_and_preview_requests_are_deduplicated() -> None:
+    source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+
+    assert 'lower_widget.setText("" if lower is None else str(lower))' in source
+    assert 'upper_widget.setText("" if upper is None else str(upper))' in source
+    assert "if signature == self._active_preview_signature:" in source
+    assert "if self._preview_loading:" in source
+    assert 'self._preview_status.setText(f"Preview failed: {display}")' in source
 
 
 def test_without_series_specific_settings_removes_per_series_keys():
@@ -471,7 +519,7 @@ def test_plot_settings_panel_wraps_matplotlib_save_with_linak_export():
     install_start = source.index("def _install_preview_figure(")
     install_end = source.index("def _show_preview_image_fallback", install_start)
     install_body = source[install_start:install_end]
-    assert "_LiNaKNavigationToolbar(" in install_body
+    assert "navigation_toolbar_type(" in install_body
     assert "on_linak_save_figure=self._handle_save_figure" in install_body
     assert "NavigationToolbar2QT(canvas, self._preview_canvas_container)" not in install_body
 
@@ -690,7 +738,7 @@ def test_plot_settings_panel_generated_copies_start_with_independent_derivations
         '(self._series_error_styles_data, "band")',
         "(self._series_fit_enabled_data, False)",
         '(self._series_fit_label_overrides_data, "")',
-        '(self._series_fit_show_in_legend_data, True)',
+        "(self._series_fit_show_in_legend_data, True)",
         '(self._series_fit_types_data, "linear")',
         '(self._series_fit_degrees_data, "2")',
         '(self._series_fit_range_modes_data, "visible")',
@@ -726,7 +774,7 @@ def test_plot_settings_panel_saves_derivations_per_layer_override():
     assert 'entry["fit"] = fit_config_payload' in save_body
     assert 'entry["cumulative"] = cumulative_payload' in save_body
     assert 'entry["integration"] = integration_payload' in save_body
-    assert 'series_overrides[series_id] = entry' in save_body
+    assert "series_overrides[series_id] = entry" in save_body
     assert 'settings_out["fit"]' not in save_body
     assert 'settings_out["cumulative"]' not in save_body
     assert 'settings_out["integration"]' not in save_body
@@ -771,8 +819,15 @@ def test_plot_settings_panel_repartitions_layer_order_after_visibility_and_group
 
 def test_plot_settings_panel_keeps_base_series_checkbox_enabled_when_row_is_off():
     source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
-
-    assert 'self.checkbox.setEnabled(kind == "base")' in source
+    start = source.index("        def editorEvent(")
+    end = source.index("            return super().editorEvent", start)
+    end = source.index("            return super().editorEvent", end + 1)
+    toggle_body = source[start:end]
+    assert 'if kind == "base" and series_id:' in toggle_body
+    assert "self._owner._handle_series_row_widget_toggle(" in toggle_body
+    assert 'not bool(state.get("checked", True))' in toggle_body
+    assert 'state.get("enabled")' not in toggle_body
+    assert "class _SeriesRowWidget" not in source
 
 
 def test_plot_settings_panel_keeps_base_row_toggle_logic_outside_cumulative_branch():
@@ -784,7 +839,9 @@ def test_plot_settings_panel_keeps_base_row_toggle_logic_outside_cumulative_bran
     row_toggle_start = source.index("def _handle_series_row_widget_toggle")
     row_toggle_end = source.index("def _move_series_by_delta", row_toggle_start)
     row_toggle_body = source[row_toggle_start:row_toggle_end]
-    assert "self._schedule_or_apply_series_preview_update(force_full_render=True)" in row_toggle_body
+    assert (
+        "self._schedule_or_apply_series_preview_update(force_full_render=True)" in row_toggle_body
+    )
 
 
 def test_plot_settings_panel_uses_checkable_group_members_under_layer_list():
@@ -833,7 +890,7 @@ def test_plot_settings_panel_composites_preview_transparency_on_theme_matte():
     assert "painter.drawPixmap(0, 0, pixmap)" in source
     assert "self._preview_pixmap = self._preview_display_pixmap(pixmap)" in source
     assert "save_result = on_save_figure(settings, str(image_path))" in source
-    assert "settings[\"figure_alpha\"]" not in source
+    assert 'settings["figure_alpha"]' not in source
 
 
 def test_plot_settings_panel_runs_preview_in_background_worker():
@@ -887,7 +944,9 @@ def test_plot_settings_panel_sizes_interactive_canvas_from_export_aspect_ratio()
     assert "export_width, export_height = self._preview_export_figsize()" in source
     assert "export_aspect = max(1.0e-9, export_width / export_height)" in source
     assert "preview_dpi = max(target_width / export_width" in source
-    assert "self._preview_figure.set_size_inches(export_width, export_height, forward=False)" in source
+    assert (
+        "self._preview_figure.set_size_inches(export_width, export_height, forward=False)" in source
+    )
     assert "self._preview_figure.set_dpi(preview_dpi)" in source
     assert "self._preview_canvas.setFixedSize(QSize(target_width, target_height))" in source
     assert "self._resize_preview_canvas_to_figure()" in source
@@ -901,21 +960,21 @@ def test_plot_settings_panel_updates_canvas_figure_controls_and_keeps_export_dpi
     body = source[start:end]
     assert "fig.set_size_inches(float(fig_width), float(fig_height), forward=True)" not in body
     assert "fig.set_dpi(int(dpi))" not in body
-    assert "state_dpi = int(self._last_preview_state.get(\"dpi\") or DEFAULT_PLOT_STYLE.dpi)" in body
+    assert 'state_dpi = int(self._last_preview_state.get("dpi") or DEFAULT_PLOT_STYLE.dpi)' in body
     assert "fig.patch.set_facecolor(facecolor)" in source
     assert "fig.patch.set_alpha(float(alpha))" in source
     assert "artist.set_fontfamily(font_family)" in source
     assert "artist.set_color(font_color)" in source
-    assert "ax.tick_params(axis=\"x\", labelsize=x_tick_size)" in source
-    assert "self._last_preview_state[\"figsize\"] = [float(fig_width), float(fig_height)]" in body
+    assert 'ax.tick_params(axis="x", labelsize=x_tick_size)' in source
+    assert 'self._last_preview_state["figsize"] = [float(fig_width), float(fig_height)]' in body
     assert "Preview canvas updated." in source
     assert "def _propagate_base_font_size_change_to_auto_fields(self) -> None:" in source
     assert "self._propagate_base_font_size_change_to_auto_fields()" in source
     schedule_start = source.index("def _schedule_preview_update(self, *_unused: object) -> None:")
     schedule_end = source.index("def _handle_debounced_preview", schedule_start)
     schedule_body = source[schedule_start:schedule_end]
-    assert "getattr(self, \"fig_width\", None)" in schedule_body
-    assert "getattr(self, \"figure_facecolor\", None)" in schedule_body
+    assert 'getattr(self, "fig_width", None)' in schedule_body
+    assert 'getattr(self, "figure_facecolor", None)' in schedule_body
     assert "self._apply_canvas_style_fields_to_canvas()" in schedule_body
 
 
@@ -929,7 +988,10 @@ def test_plot_settings_panel_syncs_canvas_axis_limits_without_preview_rerender()
     edit_start = source.index("def _handle_synced_field_edit(self, key: str) -> None:")
     edit_end = source.index("def _handle_synced_field_mode_changed", edit_start)
     edit_body = source[edit_start:edit_end]
-    assert 'if key in {"x_lim", "y_lim"} and self._apply_axis_limit_fields_to_canvas(key):' in edit_body
+    assert (
+        'if key in {"x_lim", "y_lim"} and self._apply_axis_limit_fields_to_canvas(key):'
+        in edit_body
+    )
     assert "self._preview_timer.stop()" in edit_body
     assert "return" in edit_body
 
@@ -945,13 +1007,16 @@ def test_plot_settings_panel_updates_canvas_text_without_worker_rerender():
     edit_start = source.index("def _handle_synced_field_edit(self, key: str) -> None:")
     edit_end = source.index("def _handle_synced_field_mode_changed", edit_start)
     edit_body = source[edit_start:edit_end]
-    assert 'if key in {"title", "x_label", "y_label"} and self._apply_text_fields_to_canvas():' in edit_body
+    assert (
+        'if key in {"title", "x_label", "y_label"} and self._apply_text_fields_to_canvas():'
+        in edit_body
+    )
     schedule_start = source.index("def _schedule_preview_update(self, *_unused: object) -> None:")
     schedule_end = source.index("def _handle_debounced_preview", schedule_start)
     schedule_body = source[schedule_start:schedule_end]
     assert "sender = self.sender()" in schedule_body
-    assert "getattr(self, \"title_text\", None)" in schedule_body
-    assert "getattr(self, \"x_label_pad\", None)" in schedule_body
+    assert 'getattr(self, "title_text", None)' in schedule_body
+    assert 'getattr(self, "x_label_pad", None)' in schedule_body
     assert "self._apply_text_fields_to_canvas()" in schedule_body
 
 
@@ -969,8 +1034,8 @@ def test_plot_settings_panel_updates_canvas_axes_style_without_worker_rerender()
     schedule_start = source.index("def _schedule_preview_update(self, *_unused: object) -> None:")
     schedule_end = source.index("def _handle_debounced_preview", schedule_start)
     schedule_body = source[schedule_start:schedule_end]
-    assert "getattr(self, \"x_scale\", None)" in schedule_body
-    assert "getattr(self, \"grid_color\", None)" in schedule_body
+    assert 'getattr(self, "x_scale", None)' in schedule_body
+    assert 'getattr(self, "grid_color", None)' in schedule_body
     assert "self._apply_axis_style_fields_to_canvas()" in schedule_body
 
 
@@ -986,8 +1051,8 @@ def test_plot_settings_panel_updates_heatmap_style_without_worker_rerender():
     schedule_start = source.index("def _schedule_preview_update(self, *_unused: object) -> None:")
     schedule_end = source.index("def _handle_debounced_preview", schedule_start)
     schedule_body = source[schedule_start:schedule_end]
-    assert "getattr(self, \"heatmap_cmap\", None)" in schedule_body
-    assert "getattr(self, \"heatmap_colorbar_tick_size\", None)" in schedule_body
+    assert 'getattr(self, "heatmap_cmap", None)' in schedule_body
+    assert 'getattr(self, "heatmap_colorbar_tick_size", None)' in schedule_body
     assert "self._apply_heatmap_style_fields_to_canvas()" in schedule_body
 
 
@@ -1003,8 +1068,8 @@ def test_plot_settings_panel_updates_line_style_without_worker_rerender():
     schedule_start = source.index("def _schedule_preview_update(self, *_unused: object) -> None:")
     schedule_end = source.index("def _handle_debounced_preview", schedule_start)
     schedule_body = source[schedule_start:schedule_end]
-    assert "getattr(self, \"line_width\", None)" in schedule_body
-    assert "getattr(self, \"marker_color\", None)" in schedule_body
+    assert 'getattr(self, "line_width", None)' in schedule_body
+    assert 'getattr(self, "marker_color", None)' in schedule_body
     assert "self._apply_line_style_fields_to_canvas()" in schedule_body
 
 
@@ -1020,22 +1085,30 @@ def test_plot_settings_panel_uses_sender_aware_preview_debounce():
     assert "return _AUTO_PREVIEW_DATA_DEBOUNCE_MS" in debounce_body
     assert "return _AUTO_PREVIEW_SERIES_DEBOUNCE_MS" in debounce_body
     assert "return _AUTO_PREVIEW_STYLE_DEBOUNCE_MS" in debounce_body
-    assert "getattr(self, \"density_2d_x_axis\", None)" in debounce_body
-    assert "getattr(self, \"position_view_type\", None)" in debounce_body
-    assert "getattr(self, \"_series_fit_mode\", None)" in debounce_body
-    assert "getattr(self, \"_series_fit_x_min\", None)" in debounce_body
+    assert 'getattr(self, "density_2d_x_axis", None)' in debounce_body
+    assert 'getattr(self, "position_view_type", None)' in debounce_body
+    assert 'getattr(self, "_series_fit_mode", None)' in debounce_body
+    assert 'getattr(self, "_series_fit_x_min", None)' in debounce_body
     assert "for lower, upper in self._density_filter_widgets.values():" in debounce_body
     schedule_start = source.index("def _schedule_preview_update(self, *_unused: object) -> None:")
     schedule_end = source.index("def _handle_debounced_preview", schedule_start)
     schedule_body = source[schedule_start:schedule_end]
-    assert "self._preview_timer.start(self._preview_debounce_ms_for_sender(sender))" in schedule_body
+    assert (
+        "self._preview_timer.start(self._preview_debounce_ms_for_sender(sender))" in schedule_body
+    )
 
 
 def test_plot_settings_panel_derived_editor_changes_force_full_preview_render():
     source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
 
-    assert "def _fit_preview_requires_full_render_sender(self, sender: object | None) -> bool:" in source
-    assert "def _derived_preview_requires_full_render_sender(self, sender: object | None) -> bool:" in source
+    assert (
+        "def _fit_preview_requires_full_render_sender(self, sender: object | None) -> bool:"
+        in source
+    )
+    assert (
+        "def _derived_preview_requires_full_render_sender(self, sender: object | None) -> bool:"
+        in source
+    )
     fit_sender_start = source.index(
         "def _fit_preview_requires_full_render_sender(self, sender: object | None) -> bool:"
     )
@@ -1043,29 +1116,35 @@ def test_plot_settings_panel_derived_editor_changes_force_full_preview_render():
         "def _derived_preview_requires_full_render_sender", fit_sender_start
     )
     fit_sender_body = source[fit_sender_start:fit_sender_end]
-    assert "getattr(self, \"_series_fit_mode\", None)" in fit_sender_body
-    assert "getattr(self, \"_series_fit_type\", None)" in fit_sender_body
-    assert "getattr(self, \"_series_fit_x_min\", None)" in fit_sender_body
-    assert "getattr(self, \"_series_fit_line_style\", None)" in fit_sender_body
+    assert 'getattr(self, "_series_fit_mode", None)' in fit_sender_body
+    assert 'getattr(self, "_series_fit_type", None)' in fit_sender_body
+    assert 'getattr(self, "_series_fit_x_min", None)' in fit_sender_body
+    assert 'getattr(self, "_series_fit_line_style", None)' in fit_sender_body
     derived_sender_start = source.index("def _derived_preview_requires_full_render_sender")
-    derived_sender_end = source.index("def _handle_series_list_selection_change", derived_sender_start)
+    derived_sender_end = source.index(
+        "def _handle_series_list_selection_change", derived_sender_start
+    )
     derived_sender_body = source[derived_sender_start:derived_sender_end]
     assert "self._fit_preview_requires_full_render_sender(sender)" in derived_sender_body
-    assert "getattr(self, \"_series_error_mode\", None)" in derived_sender_body
-    assert "getattr(self, \"_series_error_stat\", None)" in derived_sender_body
-    assert "getattr(self, \"_series_cumulative_mode\", None)" in derived_sender_body
-    assert "getattr(self, \"integration_mode\", None)" in derived_sender_body
+    assert 'getattr(self, "_series_error_mode", None)' in derived_sender_body
+    assert 'getattr(self, "_series_error_stat", None)' in derived_sender_body
+    assert 'getattr(self, "_series_cumulative_mode", None)' in derived_sender_body
+    assert 'getattr(self, "integration_mode", None)' in derived_sender_body
 
     handler_start = source.index("def _on_series_editor_changed(self, *_unused: object) -> None:")
     handler_end = source.index("def _on_series_label_changed", handler_start)
     handler_body = source[handler_start:handler_end]
     assert "sender = self.sender()" in handler_body
-    assert "force_full_render=self._derived_preview_requires_full_render_sender(sender)" in handler_body
+    assert (
+        "force_full_render=self._derived_preview_requires_full_render_sender(sender)"
+        in handler_body
+    )
     assert "self._schedule_or_apply_series_preview_update(force_full_render=True)" in source
 
 
 def test_plot_settings_panel_updates_series_artists_without_worker_rerender():
     source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+    source = ast.unparse(ast.parse(source)).replace("'", '"')
 
     assert "def _apply_series_artist_updates_to_canvas(self) -> bool:" in source
     assert 'line_artists = self._last_preview_state.get("line_artists")' in source
@@ -1073,10 +1152,17 @@ def test_plot_settings_panel_updates_series_artists_without_worker_rerender():
     assert "artist.set_label(self._effective_series_label(index))" in source
     assert "artist.set_color(color)" in source
     assert "artist.set_zorder(float(index + 2))" in source
-    assert (
-        "def _schedule_or_apply_series_preview_update(self, *, force_full_render: bool = False) -> None:"
-        in source
+    method = next(
+        node
+        for node in ast.walk(
+            ast.parse(Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8"))
+        )
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_schedule_or_apply_series_preview_update"
     )
+    assert [argument.arg for argument in method.args.kwonlyargs] == ["force_full_render"]
+    assert isinstance(method.args.kw_defaults[0], ast.Constant)
+    assert method.args.kw_defaults[0].value is False
     assert "self._apply_series_artist_updates_to_canvas()" in source
     assert "self._schedule_or_apply_series_preview_update()" in source
 
@@ -1124,14 +1210,16 @@ def test_density_heatmap_layers_show_source_controls_only():
     assert 'analysis == "density" and self._is_density_heatmap_mode()' in plot_family_body
     assert 'return "heatmap"' in plot_family_body
 
-    caps_start = source.index("def _current_layer_capabilities(self) -> _LayerInspectorCapabilities:")
+    caps_start = source.index(
+        "def _current_layer_capabilities(self) -> _LayerInspectorCapabilities:"
+    )
     caps_end = source.index("def _current_figure_capabilities", caps_start)
     caps_body = source[caps_start:caps_end]
-    assert "is_heatmap_family = plot_family == \"heatmap\"" in caps_body
+    assert 'is_heatmap_family = plot_family == "heatmap"' in caps_body
     assert "show_visibility_label=is_line_family or is_heatmap_family" in caps_body
     assert "show_style=is_line_family" in caps_body
     assert "show_normalization=is_line_family" in caps_body
-    assert "active_layer_enabled = (" in caps_body
+    assert "active_layer_enabled =" in caps_body
     assert "show_integration=is_line_family and active_layer_enabled" in caps_body
     assert "show_cumulative_editor=is_line_family and active_layer_enabled" in caps_body
     assert "show_uncertainty=self._error_supported_for_current_view()" in caps_body
@@ -1140,7 +1228,7 @@ def test_density_heatmap_layers_show_source_controls_only():
     refresh_start = source.index("def _refresh_widget_states(self, *_unused: object) -> None:")
     refresh_end = source.index("def _report_error", refresh_start)
     refresh_body = source[refresh_start:refresh_end]
-    assert "heatmap_layer_mode = layer_caps.plot_family == \"heatmap\"" in refresh_body
+    assert 'heatmap_layer_mode = layer_caps.plot_family == "heatmap"' in refresh_body
     assert "self._series_show_in_legend_row" in refresh_body
     assert "self._series_show_raw_line_row" in refresh_body
     assert "layer_caps.show_visibility_label and not heatmap_layer_mode" in refresh_body
@@ -1163,21 +1251,30 @@ def test_density_2d_data_export_summary_uses_real_axis_widgets():
 
 def test_density_view_type_switch_snapshots_and_restores_view_state():
     source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+    source = ast.unparse(ast.parse(source)).replace("'", '"')
 
     assert "self._density_active_view_type = PLOT_VIEW_1D_LINE" in source
     assert "self._density_view_states: dict[str, dict[str, Any]] = {}" in source
     assert "def _density_active_view_type_id(self) -> str:" in source
     assert "def _snapshot_density_view_state(self, view_type: str) -> dict[str, Any]:" in source
-    assert "def _apply_density_view_state(self, view_type: str, state: dict[str, Any]) -> None:" in source
+    assert (
+        "def _apply_density_view_state(self, view_type: str, state: dict[str, Any]) -> None:"
+        in source
+    )
     assert "def _default_density_view_state(self, view_type: str) -> dict[str, Any]:" in source
-    assert "def _merge_density_view_state_into_settings(self, settings: dict[str, Any]) -> dict[str, Any]:" in source
+    assert (
+        "def _merge_density_view_state_into_settings(self, settings: dict[str, Any]) -> dict[str, Any]:"
+        in source
+    )
 
-    handler_start = source.index("def _handle_density_mapping_change(self, *_unused: object) -> None:")
+    handler_start = source.index(
+        "def _handle_density_mapping_change(self, *_unused: object) -> None:"
+    )
     handler_end = source.index("def _handle_density_range_change", handler_start)
     handler_body = source[handler_start:handler_end]
     assert "self.sender() is self.density_view_type" in handler_body
     assert "previous_view = self._density_active_view_type" in handler_body
-    assert "self._density_view_states[previous_view] = (" in handler_body
+    assert "self._density_view_states[previous_view] =" in handler_body
     assert "self._apply_density_view_state(next_view, target_state)" in handler_body
 
     collect_start = source.index("def _collect_settings(self) -> dict[str, Any]:")
@@ -1190,15 +1287,26 @@ def test_plot_settings_panel_resets_mapping_view_state_caches_on_settings_load()
     source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
 
     populate_start = source.index("def _populate(self, settings: dict[str, Any]) -> None:")
-    populate_end = source.index("synced_modes = _derive_synced_field_modes(settings)", populate_start)
+    populate_end = source.index(
+        "synced_modes = _derive_synced_field_modes(settings)", populate_start
+    )
     populate_body = source[populate_start:populate_end]
 
     assert 'raw_states = settings.get("density_view_states")' in populate_body
-    assert "elif not self._density_view_state_switching:\n                    self._density_view_states = {}" in populate_body
+    assert (
+        "elif not self._density_view_state_switching:\n                    self._density_view_states = {}"
+        in populate_body
+    )
     assert 'raw_states = settings.get("position_view_states")' in populate_body
-    assert "elif not self._position_view_state_switching:\n                    self._position_view_states = {}" in populate_body
+    assert (
+        "elif not self._position_view_state_switching:\n                    self._position_view_states = {}"
+        in populate_body
+    )
     assert 'raw_states = settings.get("orientation_view_states")' in populate_body
-    assert "elif not self._orientation_view_state_switching:\n                    self._orientation_view_states = {}" in populate_body
+    assert (
+        "elif not self._orientation_view_state_switching:\n                    self._orientation_view_states = {}"
+        in populate_body
+    )
 
 
 def test_density_view_state_persistence_keeps_1d_and_2d_settings_separate():
@@ -1250,20 +1358,29 @@ def test_density_view_state_persistence_keeps_1d_and_2d_settings_separate():
 
 def test_position_view_type_switch_snapshots_and_restores_view_state():
     source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+    source = ast.unparse(ast.parse(source)).replace("'", '"')
 
     assert "self._position_active_view_type = PLOT_VIEW_1D_LINE" in source
     assert "self._position_view_states: dict[str, dict[str, Any]] = {}" in source
     assert "def _position_active_view_type_id(self) -> str:" in source
     assert "def _snapshot_position_view_state(self, view_type: str) -> dict[str, Any]:" in source
-    assert "def _apply_position_view_state(self, view_type: str, state: dict[str, Any]) -> None:" in source
+    assert (
+        "def _apply_position_view_state(self, view_type: str, state: dict[str, Any]) -> None:"
+        in source
+    )
     assert "def _default_position_view_state(self, view_type: str) -> dict[str, Any]:" in source
-    assert "def _merge_position_view_state_into_settings(self, settings: dict[str, Any]) -> dict[str, Any]:" in source
+    assert (
+        "def _merge_position_view_state_into_settings(self, settings: dict[str, Any]) -> dict[str, Any]:"
+        in source
+    )
 
-    handler_start = source.index("def _handle_position_mapping_view_change(self, *_unused: object) -> None:")
+    handler_start = source.index(
+        "def _handle_position_mapping_view_change(self, *_unused: object) -> None:"
+    )
     handler_end = source.index("def _handle_position_mapping_preview_change", handler_start)
     handler_body = source[handler_start:handler_end]
     assert "previous_view = self._position_active_view_type" in handler_body
-    assert "self._position_view_states[previous_view] = (" in handler_body
+    assert "self._position_view_states[previous_view] =" in handler_body
     assert "self._apply_position_view_state(next_view, target_state)" in handler_body
 
     collect_start = source.index("def _collect_settings(self) -> dict[str, Any]:")
@@ -1336,20 +1453,29 @@ def test_position_mapping_summary_does_not_expose_backend_terms():
 
 def test_orientation_view_type_switch_snapshots_and_restores_view_state():
     source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+    source = ast.unparse(ast.parse(source)).replace("'", '"')
 
     assert "self._orientation_active_view_type = PLOT_VIEW_1D_LINE" in source
     assert "self._orientation_view_states: dict[str, dict[str, Any]] = {}" in source
     assert "def _orientation_active_view_type_id(self) -> str:" in source
     assert "def _snapshot_orientation_view_state(self, view_type: str) -> dict[str, Any]:" in source
-    assert "def _apply_orientation_view_state(self, view_type: str, state: dict[str, Any]) -> None:" in source
+    assert (
+        "def _apply_orientation_view_state(self, view_type: str, state: dict[str, Any]) -> None:"
+        in source
+    )
     assert "def _default_orientation_view_state(self, view_type: str) -> dict[str, Any]:" in source
-    assert "def _merge_orientation_view_state_into_settings(self, settings: dict[str, Any]) -> dict[str, Any]:" in source
+    assert (
+        "def _merge_orientation_view_state_into_settings(self, settings: dict[str, Any]) -> dict[str, Any]:"
+        in source
+    )
 
-    handler_start = source.index("def _handle_orientation_mapping_change(self, *_unused: object) -> None:")
+    handler_start = source.index(
+        "def _handle_orientation_mapping_change(self, *_unused: object) -> None:"
+    )
     handler_end = source.index("def _handle_potential_mapping_change", handler_start)
     handler_body = source[handler_start:handler_end]
     assert "previous_view = self._orientation_active_view_type" in handler_body
-    assert "self._orientation_view_states[previous_view] = (" in handler_body
+    assert "self._orientation_view_states[previous_view] =" in handler_body
     assert "self._apply_orientation_view_state(next_view, target_state)" in handler_body
 
     collect_start = source.index("def _collect_settings(self) -> dict[str, Any]:")
@@ -1403,7 +1529,9 @@ def test_orientation_view_state_persistence_keeps_1d_and_2d_settings_separate():
     assert flattened["orientation_active_view_type"] == PLOT_VIEW_2D_HEATMAP
     assert flattened["orientation_view_states"][PLOT_VIEW_1D_LINE]["x_lim"] == [0.0, 10.0]
     assert flattened["orientation_view_states"][PLOT_VIEW_2D_HEATMAP]["x_lim"] == [0.0, 4.0]
-    assert flattened["orientation_view_states"][PLOT_VIEW_1D_LINE]["annotations"][0]["text"] == "line"
+    assert (
+        flattened["orientation_view_states"][PLOT_VIEW_1D_LINE]["annotations"][0]["text"] == "line"
+    )
     assert (
         flattened["orientation_view_states"][PLOT_VIEW_2D_HEATMAP]["annotations"][0]["text"]
         == "heatmap"
@@ -1423,7 +1551,9 @@ def test_orientation_gui_uses_stored_distribution_heatmap_for_normal_2d_view():
     assert "heatmap_y_axis=str(defaults.get" not in default_body
 
     current_mapping_start = source.index("def _current_orientation_mapping(self)")
-    current_mapping_end = source.index("def _set_orientation_view_type_from_component", current_mapping_start)
+    current_mapping_end = source.index(
+        "def _set_orientation_view_type_from_component", current_mapping_start
+    )
     current_mapping_body = source[current_mapping_start:current_mapping_end]
     assert "heatmap_x_axis=(" not in current_mapping_body
     assert "heatmap_y_axis=(" not in current_mapping_body
@@ -1432,7 +1562,7 @@ def test_orientation_gui_uses_stored_distribution_heatmap_for_normal_2d_view():
     refresh_end = source.index("def _collect_settings(self) -> dict[str, Any]:", refresh_start)
     refresh_body = source[refresh_start:refresh_end]
     assert "self._set_rows_visible(self._orientation_mapping_2d_rows, False)" in refresh_body
-    assert "label.setText(\"Angle quantity\")" in refresh_body
+    assert 'label.setText("Angle quantity")' in refresh_body
 
 
 def test_orientation_gui_keeps_density_lines_on_stored_distance_profiles():
@@ -1443,10 +1573,12 @@ def test_orientation_gui_keeps_density_lines_on_stored_distance_profiles():
     collect_body = source[collect_start:collect_end]
 
     assert "orientation_grid_line_enabled = (" in collect_body
-    assert "not orientation_heatmap_mode and orientation_line_component == \"average\"" in collect_body
-    assert "settings[\"orientation_line_x_axis\"] = \"distance\"" in collect_body
-    assert "settings[\"orientation_heatmap_x_axis\"] = None" in collect_body
-    assert "settings[\"orientation_heatmap_y_axis\"] = None" in collect_body
+    assert (
+        'not orientation_heatmap_mode and orientation_line_component == "average"' in collect_body
+    )
+    assert 'settings["orientation_line_x_axis"] = "distance"' in collect_body
+    assert 'settings["orientation_heatmap_x_axis"] = None' in collect_body
+    assert 'settings["orientation_heatmap_y_axis"] = None' in collect_body
     assert "else:\n                            lower_value = None" in collect_body
     assert "upper_value = None" in collect_body
 
@@ -1461,7 +1593,9 @@ def test_density_figure_controls_follow_line_or_heatmap_family():
     assert "show_advanced_legend: bool" in dataclass_body
     assert "show_advanced_lines: bool" in dataclass_body
 
-    caps_start = source.index("def _current_figure_capabilities(self) -> _FigureInspectorCapabilities:")
+    caps_start = source.index(
+        "def _current_figure_capabilities(self) -> _FigureInspectorCapabilities:"
+    )
     caps_end = source.index("def _fit_child_series_id", caps_start)
     caps_body = source[caps_start:caps_end]
     assert 'is_line = plot_family == "line"' in caps_body
@@ -1530,7 +1664,9 @@ def test_density_heatmap_annotations_render_text_line_and_arrow(tmp_path):
     )
 
     assert output.exists()
-    assert len(capture_state.get("annotations_summary", [])) == 3
+    summaries = capture_state.get("annotations_summary", [])
+    assert isinstance(summaries, list)
+    assert len(summaries) == 3
 
 
 def test_plot_settings_panel_keeps_latest_preview_request():
@@ -1632,7 +1768,7 @@ def test_plot_settings_panel_builds_fit_for_every_1d_line_analysis():
     fit_supported_start = source.index("def _fit_supported_for_current_view(self) -> bool:")
     fit_supported_end = source.index("def _error_supported_for_current_view", fit_supported_start)
     fit_supported_body = source[fit_supported_start:fit_supported_end]
-    assert 'analysis in {"density", "msd", "rdf", "temperature"}' in fit_supported_body
+    assert 'analysis in {"density", "rdf", "temperature"}' in fit_supported_body
     assert 'if analysis == "potential":' in fit_supported_body
     assert 'if analysis == "position":' in fit_supported_body
     assert 'if analysis == "coordination":' in fit_supported_body
@@ -1643,7 +1779,6 @@ def test_plot_settings_panel_builds_fit_for_every_1d_line_analysis():
     fit_creation_context = source[fit_creation_start - 450 : fit_creation_start]
     for analysis in (
         "density",
-        "msd",
         "rdf",
         "potential",
         "position",
@@ -1776,8 +1911,8 @@ def test_plot_settings_panel_wires_export_data_section_and_dialog():
     assert "self._build_data_export_section(layout)" in source
     assert '"plot_data_delimiter": data_export_delimiter' in source
     assert '"plot_data_include_metadata": data_export_include_metadata' in source
-    assert 'format_map = {' in source
-    assert 'selected_filter, suffix = format_map[requested_format]' in source
+    assert "format_map = {" in source
+    assert "selected_filter, suffix = format_map[requested_format]" in source
     assert "self._save_data_button.setEnabled(on_save_data is not None)" in source
     assert "def _handle_save_data(self) -> None:" in source
     assert '"Save Data"' in source
@@ -1806,7 +1941,9 @@ def test_plot_settings_panel_supports_detachable_preview_window():
     assert "on_save_data_callback=self._handle_save_data" in source
     assert "detached_window.close_from_dock()" in source
     assert "QTimer.singleShot(0, self._on_dock_requested)" in source
-    detach_index = source.index('self._header_detach_preview_button = QPushButton("Detach Preview")')
+    detach_index = source.index(
+        'self._header_detach_preview_button = QPushButton("Detach Preview")'
+    )
     save_index = source.index('self._save_button = QPushButton("Save Profile")')
     assert detach_index < save_index
 
@@ -1855,12 +1992,14 @@ def test_plot_settings_panel_exposes_contract_driven_position_mapping_controls()
     assert "def _build_position_mapping_sections(self, layout: QVBoxLayout) -> None:" in source
     assert 'title="Mapping"' in source
     assert 'section_id="data.position.summary"' not in source
-    assert 'self._position_species_checkboxes = {}' in source
+    assert "self._position_species_checkboxes = {}" in source
     assert '"Species"' in source
-    assert 'self.position_view_type = self._combo(' in source
+    assert "self.position_view_type = self._combo(" in source
     assert 'self.position_mapping_x = self._combo(["ps", "fs", "step", "frame"])' in source
     assert 'self.position_mapping_y = self._combo(["distance", "x", "y", "z"])' in source
-    assert 'self.position_mapping_value = self._combo(list(_POSITION_PROJECTION_QUANTITIES))' in source
+    assert (
+        "self.position_mapping_value = self._combo(list(_POSITION_PROJECTION_QUANTITIES))" in source
+    )
     assert '"X-axis quantity"' in source
     assert '"Y-axis quantity"' in source
     assert '"Color mode"' in source
@@ -1871,7 +2010,6 @@ def test_plot_settings_panel_exposes_contract_driven_position_mapping_controls()
     assert "position_view_mapping_to_plot_options(mapping)" in source
     assert "generic_view_type_compatibility(" in source
     assert "self.position_component = self._combo(_POSITION_COMPONENT_LABELS)" not in source
-    assert 'if analysis in {"msd", "position"}' not in source
 
 
 def test_position_2d_trajectory_width_lives_with_heatmap_rendering_and_persists():
@@ -2090,16 +2228,17 @@ def test_position_and_coordination_2d_views_use_shared_heatmap_family():
     assert _plot_family_for_view("position", position_component="2d-projection") == "heatmap"
     assert _plot_family_for_view("position", position_component="xy-z") == "heatmap"
     assert (
-        _plot_family_for_view("coordination", coordination_component="time-distance")
-        == "heatmap"
+        _plot_family_for_view("coordination", coordination_component="time-distance") == "heatmap"
     )
 
 
 def test_temperature_is_registered_for_line_fit_controls():
     source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
 
-    assert '"density", "msd", "rdf", "temperature"' in source
-    assert '"coordination",\n                "orientation",\n                "temperature",' in source
+    assert '"density", "rdf", "temperature"' in source
+    assert (
+        '"coordination",\n                "orientation",\n                "temperature",' in source
+    )
 
 
 def test_without_new_profile_series_overrides_resets_series_customizations_only():
@@ -2494,16 +2633,22 @@ def test_derive_warning_messages_skips_heatmap_mode_when_only_view_mapping_is_pr
 
 
 def test_backend_summary_helpers_use_view_and_role_wording():
-    assert _density_backend_summary_text(
-        view_type_id="line_1d",
-        x_mode="distance",
-        quantity="mass",
-    ) == "view type=1D Line, x role=distance, y role=mass_density"
-    assert _density_backend_summary_text(
-        view_type_id="heatmap_2d",
-        x_mode="distance",
-        quantity="number",
-    ) == "view type=2D Heatmap, source field=number_density_2d"
+    assert (
+        _density_backend_summary_text(
+            view_type_id="line_1d",
+            x_mode="distance",
+            quantity="mass",
+        )
+        == "view type=1D Line, x role=distance, y role=mass_density"
+    )
+    assert (
+        _density_backend_summary_text(
+            view_type_id="heatmap_2d",
+            x_mode="distance",
+            quantity="number",
+        )
+        == "view type=2D Heatmap, source field=number_density_2d"
+    )
     assert _coordination_backend_summary_text(
         component="time-distance",
         time_axis="ps",
@@ -2511,21 +2656,30 @@ def test_backend_summary_helpers_use_view_and_role_wording():
         "view type=2D Heatmap, x role=time (ps), "
         "y role=distance_to_surface, color role=coordination_number"
     )
-    assert _orientation_backend_summary_text(
-        component="heatmap",
-        angle="azimuthal",
-        is_heatmap=True,
-    ) == "view type=2D Heatmap, color quantity=mean cos(azimuthal)"
-    assert _potential_backend_summary_text(
-        view_type="table_records",
-        y_quantity="water_bulk_potential",
-        standard_plot="summary",
-    ) == "view type=1D Line, y role=summary"
-    assert _potential_backend_summary_text(
-        view_type="line_1d",
-        y_quantity="efermi",
-        standard_plot="",
-    ) == "view type=1D Line, y role=efermi"
+    assert (
+        _orientation_backend_summary_text(
+            component="heatmap",
+            angle="azimuthal",
+            is_heatmap=True,
+        )
+        == "view type=2D Heatmap, color quantity=mean cos(azimuthal)"
+    )
+    assert (
+        _potential_backend_summary_text(
+            view_type="table_records",
+            y_quantity="water_bulk_potential",
+            standard_plot="summary",
+        )
+        == "view type=1D Line, y role=summary"
+    )
+    assert (
+        _potential_backend_summary_text(
+            view_type="line_1d",
+            y_quantity="efermi",
+            standard_plot="",
+        )
+        == "view type=1D Line, y role=efermi"
+    )
 
 
 def test_settings_use_heatmap_rendering_prefers_view_mapping_over_legacy_component():
@@ -2615,10 +2769,17 @@ def test_non_position_collect_settings_no_longer_emits_active_legacy_mapping_key
     source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
 
     assert 'settings["x_mode"] = density_x_mode' not in source
-    assert 'settings["quantity"] = self.density_quantity.currentText().strip() or "mass"' not in source
+    assert (
+        'settings["quantity"] = self.density_quantity.currentText().strip() or "mass"' not in source
+    )
     assert 'settings["component"] = (' not in source
-    assert 'settings["time_axis"] = self.coordination_time_axis.currentText().strip() or "ps"' not in source
-    assert 'settings["angle"] = self.orientation_angle.currentText().strip() or "polar"' not in source
+    assert (
+        'settings["time_axis"] = self.coordination_time_axis.currentText().strip() or "ps"'
+        not in source
+    )
+    assert (
+        'settings["angle"] = self.orientation_angle.currentText().strip() or "polar"' not in source
+    )
     assert 'settings["table_view"] = ' not in source
 
 
@@ -2637,7 +2798,9 @@ def test_current_view_capability_checks_no_longer_depend_on_position_component_t
 
 def test_settings_use_heatmap_rendering_checks_mapping_before_legacy_component():
     source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
-    helper_start = source.index("def _settings_use_heatmap_rendering(settings: dict[str, Any]) -> bool:")
+    helper_start = source.index(
+        "def _settings_use_heatmap_rendering(settings: dict[str, Any]) -> bool:"
+    )
     helper_block = source[helper_start : helper_start + 800]
 
     assert helper_block.index('mapping = settings.get("view_mapping")') < helper_block.index(

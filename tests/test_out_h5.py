@@ -171,7 +171,7 @@ def test_gui_detection_and_actions_treat_out_h5_as_primary_input(tmp_path):
 
     assert item.item_type == "out_hdf5"
     assert item.metadata["frame_count"] == 2
-    assert {"density", "msd", "rdf", "export_out_trajectory"} <= action_ids
+    assert {"density", "rdf", "export_out_trajectory"} <= action_ids
 
 
 def test_gui_pack_action_accepts_simulation_directory(tmp_path):
@@ -196,6 +196,7 @@ def test_gui_pack_action_reports_structured_progress(tmp_path):
     action = ActionRegistry().by_id("pack_out_h5")
     progress_events: list[tuple[str, int | None, int | None]] = []
 
+    assert action.backend is not None
     result = action.backend(
         ActionContext(
             project_dir=project,
@@ -208,9 +209,7 @@ def test_gui_pack_action_reports_structured_progress(tmp_path):
                 "drop": "",
             },
             log=lambda _level, _message: None,
-            progress=lambda label, current, total: progress_events.append(
-                (label, current, total)
-            ),
+            progress=lambda label, current, total: progress_events.append((label, current, total)),
         )
     )
 

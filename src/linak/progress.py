@@ -3,11 +3,35 @@
 from __future__ import annotations
 
 import math
+import logging
+from contextlib import contextmanager
+from contextvars import ContextVar
+from collections.abc import Iterator
 import shutil
 import sys
 import time
 from types import TracebackType
 from typing import TextIO
+
+
+_PROGRESS_ENABLED: ContextVar[bool] = ContextVar("linak_progress_enabled", default=True)
+
+
+@contextmanager
+def progress_stage(logger: logging.Logger, description: str) -> Iterator[None]:
+    """Time a real stage and silence its progress at quiet log levels."""
+    token = _PROGRESS_ENABLED.set(logger.isEnabledFor(logging.INFO))
+    started = time.perf_counter()
+    logger.info("%s...", description)
+    try:
+        yield
+    except BaseException:
+        logger.error("%s failed after %.2f s.", description, time.perf_counter() - started)
+        raise
+    else:
+        logger.info("%s completed in %.2f s.", description, time.perf_counter() - started)
+    finally:
+        _PROGRESS_ENABLED.reset(token)
 
 
 class ProgressBar:
@@ -46,6 +70,7 @@ class ProgressBar:
         self.width = width
         self.min_interval = min_interval
         self.count = 0
+        self.detail = ""
         self._spinner_index = 0
         self._start = time.perf_counter()
         self._last_render = 0.0
@@ -53,7 +78,7 @@ class ProgressBar:
         self._last_line_length = 0
         self._last_terminal_probe = 0.0
         self._terminal_columns = shutil.get_terminal_size(fallback=(120, 20)).columns
-        self.enabled = enabled and self._stream_is_tty(self.stream)
+        self.enabled = enabled and _PROGRESS_ENABLED.get() and self._stream_is_tty(self.stream)
         self._stream_id = id(self.stream)
 
     def __enter__(self) -> ProgressBar:
@@ -120,6 +145,8 @@ class ProgressBar:
         rate_label = (
             f"{rate:6.2f} {self.unit}/s" if rate is not None else f"{'--':>6} {self.unit}/s"
         )
+        if self.unit == "B" and rate is not None:
+            rate_label = f"{rate / 1024**2:.1f} MiB/s"
         desc = self._truncate_desc(self.desc)
 
         if self.total is not None and self.total > 0:
@@ -245,8 +272,15 @@ class ProgressBar:
     ) -> str:
         filled = int(bar_width * ratio)
         bar = "=" * filled + "." * (bar_width - filled)
+        count_label = (
+            f"{self.count / 1024**2:.1f}/{self.total / 1024**2:.1f} MiB"
+            if self.unit == "B" and self.total is not None
+            else f"{self.count}/{self.total}"
+        )
+        if self.detail:
+            count_label += f" ({self.detail})"
         return (
-            f"\r{self._BRAND} {desc}: [{bar}] {self.count}/{self.total} "
+            f"\r{self._BRAND} {desc}: [{bar}] {count_label} "
             f"{percent:6.2f}% | elapsed {elapsed_label} | left {left_label} | {rate_label}"
         )
 

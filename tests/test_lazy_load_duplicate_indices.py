@@ -6,6 +6,9 @@ The root cause was that lazy loading used source-local profile_index values inst
 of collection position indices when loading from combined files.
 """
 
+from __future__ import annotations
+
+
 import numpy as np
 
 from linak.analysis.density import load_density_profiles_by_index

@@ -27,28 +27,22 @@ class AnalysisSchema:
 _ANALYSIS_SCHEMAS: dict[str, AnalysisSchema] = {
     "density": AnalysisSchema(
         analysis="density",
-        version=1,
+        version=2,
         default_units_map={
             "bin_width_A": "Angstrom",
             "bin_centers_A": "Angstrom",
             "density": "g/cm^3",
             "number_density": "atom/nm^3",
+            "density_top": "g/cm^3",
+            "density_bottom": "g/cm^3",
+            "number_density_top": "atom/nm^3",
+            "number_density_bottom": "atom/nm^3",
             "surface_position_per_frame_A": "Angstrom",
             "surface_confidence": "dimensionless",
             "surface_largest_gap_A": "Angstrom",
             "surface_baseline_gap_A": "Angstrom",
             "surface_reference_spread_A": "Angstrom",
         },
-    ),
-    "msd": AnalysisSchema(
-        analysis="msd",
-        version=1,
-        default_units_map={
-            "time_fs": "fs",
-            "time_ps": "ps",
-            "msd_A2": "Angstrom^2",
-        },
-        default_plot_labels=("Time (ps)", "MSD (Angstrom^2)"),
     ),
     "rdf": AnalysisSchema(
         analysis="rdf",
@@ -62,7 +56,7 @@ _ANALYSIS_SCHEMAS: dict[str, AnalysisSchema] = {
     ),
     "position": AnalysisSchema(
         analysis="position",
-        version=1,
+        version=2,
         default_units_map={
             "frame_index": "index",
             "step": "step",
@@ -72,6 +66,9 @@ _ANALYSIS_SCHEMAS: dict[str, AnalysisSchema] = {
             "y_A": "Angstrom",
             "z_A": "Angstrom",
             "distance_to_surface_A": "Angstrom",
+            "distance_to_top_surface_A": "Angstrom",
+            "distance_to_bottom_surface_A": "Angstrom",
+            "interface_side": "dimensionless",
             "surface_position_per_frame_A": "Angstrom",
             "surface_confidence": "dimensionless",
             "surface_largest_gap_A": "Angstrom",
@@ -82,13 +79,16 @@ _ANALYSIS_SCHEMAS: dict[str, AnalysisSchema] = {
     ),
     "coordination": AnalysisSchema(
         analysis="coordination",
-        version=1,
+        version=2,
         default_units_map={
             "frame_index": "index",
             "step": "step",
             "time_fs": "fs",
             "time_ps": "ps",
             "distance_to_surface_A": "Angstrom",
+            "distance_to_top_surface_A": "Angstrom",
+            "distance_to_bottom_surface_A": "Angstrom",
+            "interface_side": "dimensionless",
             "coordination_number": "dimensionless",
             "surface_position_per_frame_A": "Angstrom",
             "surface_confidence": "dimensionless",
@@ -105,7 +105,7 @@ _ANALYSIS_SCHEMAS: dict[str, AnalysisSchema] = {
     ),
     "orientation": AnalysisSchema(
         analysis="orientation",
-        version=1,
+        version=2,
         default_units_map={
             "bin_centers_A": "Angstrom",
             "bin_edges_A": "Angstrom",
@@ -117,6 +117,12 @@ _ANALYSIS_SCHEMAS: dict[str, AnalysisSchema] = {
             "cos_polar_density": "1/Angstrom^3",
             "cos_azimuthal_density": "1/Angstrom^3",
             "density": "1/Angstrom^3",
+            "top_density": "1/Angstrom^3",
+            "bottom_density": "1/Angstrom^3",
+            "top_cos_polar_mean": "dimensionless",
+            "bottom_cos_polar_mean": "dimensionless",
+            "top_cos_azimuthal_mean": "dimensionless",
+            "bottom_cos_azimuthal_mean": "dimensionless",
             "heatmap_polar": "counts",
             "heatmap_azimuthal": "counts",
             "heatmap_angle_bin_centers": "dimensionless",

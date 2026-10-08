@@ -20,6 +20,8 @@ def test_package_version_matches_pyproject() -> None:
     assert linak.__version__ == _pyproject_version()
 
 
-def test_registered_analysis_schemas_are_development_v1() -> None:
-    for analysis in ("density", "msd", "rdf", "position", "coordination", "orientation", "temperature"):
+def test_registered_analysis_schema_versions() -> None:
+    for analysis in ("density", "position", "coordination", "orientation"):
+        assert get_analysis_schema(analysis).version == 2
+    for analysis in ("rdf", "temperature"):
         assert get_analysis_schema(analysis).version == 1

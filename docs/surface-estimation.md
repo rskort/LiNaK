@@ -1,5 +1,49 @@
 # Surface Estimation
 
+## Physical Surface Layout
+
+`surface_layout` describes the physical cell and is independent of
+`surface_mode`, which selects the plane-estimation algorithm. Accepted layouts
+are `auto`, `single-top`, `single-bottom`, and `symmetric`; CLI and GUI commands
+default to `auto`.
+
+For a periodic two-interface slab, LiNaK first places the substrate in one
+contiguous periodic image by cutting the selected Cartesian surface axis at the
+largest circular gap between substrate candidates. If the resulting planes are
+`q_bottom` and `q_top`, the outward coordinates are
+
+```text
+d_top    = q - q_top
+d_bottom = q_bottom - q
+d_folded = max(d_top, d_bottom)
+```
+
+Atoms are assigned to the side with the larger signed distance. Exact
+midplane ties have side `0`; aggregate profiles give each side half weight.
+The paired reference validates periodic-axis geometry, plane confidence,
+ordering, slab thickness, and frame continuity. Unsupported geometry or an
+untrusted explicit symmetric pair resolves to raw-axis coordinates with a
+stored reason instead of silently selecting one face.
+
+For a one-sided layout, LiNaK unwraps the complete non-substrate arc from the
+selected face to the periodic image of the opposite slab face. Consequently,
+the slab interior is the only negative-distance region: liquid and vacuum stay
+at positive outward distance even when they cross the raw cell boundary. The
+same convention is used by density, position, coordination, orientation, and
+spatial distance filtering.
+
+Automatic detection chooses `symmetric` only if both planes are trusted and
+each face contains at least `max(1, 10% of detected H2O)` in at least 90% of
+frames. One qualifying populated face selects its corresponding single layout;
+when occupancy cannot decide, the established single-top trust/fallback path is
+retained. Explicit `symmetric` skips only the solvent-population test. A warning
+is emitted when time-averaged relative side-population imbalance exceeds 20%;
+valid sides are still pooled with equal weight.
+
+The model assumes one planar slab normal to a selected Cartesian axis. Curved
+surfaces, multiple independent slabs, and cells whose selected Cartesian axis
+is coupled to other lattice vectors remain raw-axis analyses.
+
 Several LiNaK analyses can express coordinates relative to a surface instead of
 raw Cartesian position. This page documents the shared surface-reference
 estimator used by density, position, coordination, and orientation.
@@ -448,12 +492,19 @@ such as:
 - `surface.low_confidence_threshold`
 - `surface.effective_options`
 
-Current development analysis outputs use strict v1 structured surface metadata.
-If required surface datasets or metadata are missing from a current analysis
-file, recompute the analysis with the current LiNaK version. Converted
-trajectory HDF5 files may also carry a default conversion-time surface cache;
-surface-aware analyses reuse that cache only when their requested surface
-settings match it.
+Surface-aware analysis outputs use v2 metadata. The paired reference records
+`surface.layout_requested`, `surface.layout_resolved`, `surface.top`,
+`surface.bottom`, the auto-detection reason, and asymmetry diagnostics. Side
+diagnostic datasets use `surface_top_` and `surface_bottom_` prefixes; primary
+surface summary fields above remain available for analysis consumers.
+Missing required metadata means the analysis must be recomputed.
+
+Converted trajectory HDF5 files may also carry a paired conversion-time cache.
+Analyses reuse it only when the requested axis, layout, estimator mode,
+elements, fixed-atom policy, and rough-envelope settings match. This applies
+to both symmetric and single-interface references. Omitted layout means
+`auto`. Obsolete one-estimate caches are ignored without reading their payloads;
+the reference is recomputed, and the trajectory file is not rewritten.
 
 ## Important Limitations
 
@@ -465,6 +516,36 @@ settings match it.
   side-aware quantile is a useful surface proxy.
 - Surface-relative interpretation remains conditional on completeness and
   confidence.
+
+## Geometry And Layout Log Messages
+
+Conversion and trajectory analyses emit one INFO cell summary and one INFO
+surface-layout summary. For example, a supported tilted cell is reported as
+`tilted prismatic ... Z surface axis supported`; the layout line reports
+`requested=auto, resolved=symmetric`, the detection reason, coordinate mode,
+side validity/confidence, mean water occupancy, and whether the result was
+computed or reused from a cache. Matrix details and estimator internals remain
+at DEBUG level.
+
+LiNaK emits a single warning when a requested symmetric pair is not trustworthy
+and raw-axis coordinates are retained, when the selected axis is coupled to
+other lattice vectors, or when interface population imbalance exceeds the
+configured threshold. This keeps `linak apply convert`, compute commands,
+spatial filtering, and HDF5 plotting informative without per-frame estimator
+messages.
+
+The cell classifications are:
+
+- `axis-aligned orthorhombic`;
+- `tilted prismatic`, when the selected Cartesian surface axis is a supported
+  decoupled periodic prism axis;
+- `general triclinic/rotated`, when that axis is coupled and surface-relative
+  geometry is unsupported;
+- `invalid` or `unavailable`.
+
+The summary also records constant versus variable cell state, representative
+lengths and angles, periodic axes, zero/nonzero/variable origin state, frame
+count, and geometry source.
 
 ## Related Documentation
 

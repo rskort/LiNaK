@@ -160,8 +160,9 @@ def build_backup_name(src: Path) -> str:
     payload = f"{src.resolve()}|{st.st_size}|{st.st_mtime_ns}".encode("utf-8", errors="replace")
     digest = hashlib.sha1(payload).hexdigest()[:12]
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    stem = sanitize_filename_part(src.stem)
-    suffix = src.suffix if src.suffix else ".out"
+    base, dot, extension = src.name.partition(".")
+    stem = sanitize_filename_part(base)
+    suffix = f"{dot}{extension}"
     return f"compress_output__{stamp}__{stem}__{digest}{suffix}"
 
 
@@ -170,11 +171,13 @@ def default_backup_dir_for_input(input_path: Path) -> Path:
 
 
 def choose_backup_paths(src: Path, backup_dir: Path) -> tuple[Path, Path]:
+    from ..analysis.output_naming import numbered_hdf5_path
+
     backup_name = build_backup_name(src)
     backup_path = backup_dir / backup_name
     idx = 1
     while backup_path.exists() or (backup_dir / f"{backup_path.name}.meta.json").exists():
-        backup_path = backup_dir / f"{Path(backup_name).stem}_{idx}{Path(backup_name).suffix}"
+        backup_path = numbered_hdf5_path(backup_dir / backup_name, idx)
         idx += 1
     meta_path = backup_dir / f"{backup_path.name}.meta.json"
     return backup_path, meta_path

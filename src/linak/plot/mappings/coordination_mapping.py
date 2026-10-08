@@ -204,9 +204,7 @@ def resolve_coordination_plot_mapping(
         )
     compatibility = generic_view_type_compatibility(resolved_contract, resolved_mapping)
     if compatibility == "invalid":
-        raise ValueError(
-            "Coordination plot mapping is incompatible with the available plot data."
-        )
+        raise ValueError("Coordination plot mapping is incompatible with the available plot data.")
     renderer_options = coordination_view_mapping_to_plot_options(resolved_mapping)
     return ResolvedCoordinationPlotMapping(
         contract=resolved_contract,

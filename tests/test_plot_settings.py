@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 
 import h5py
@@ -99,9 +101,7 @@ def test_named_plot_profiles_support_active_and_named_lookup(tmp_path):
     assert read_plot_profile_names(source, "plot:density") == ["Default", "Publication"]
     assert read_active_plot_profile_name(source, "plot:density") == "Publication"
     assert _read_flat_density_profile(source) == {"title": "Publication title"}
-    assert _read_flat_density_profile(source, profile_name="Default") == {
-        "title": "Default title"
-    }
+    assert _read_flat_density_profile(source, profile_name="Default") == {"title": "Default title"}
 
 
 def test_named_plot_profiles_set_active_and_delete_fallback_to_remaining_profile(tmp_path):
@@ -166,7 +166,9 @@ def test_duplicate_named_plot_profile_copies_payload_exactly(tmp_path):
 
     assert read_plot_profile_names(source, "plot:density") == ["Paper", "Paper Copy"]
     assert read_active_plot_profile_name(source, "plot:density") == "Paper Copy"
-    assert read_plot_profile(source, "plot:density", profile_name="Paper Copy") == read_plot_profile(
+    assert read_plot_profile(
+        source, "plot:density", profile_name="Paper Copy"
+    ) == read_plot_profile(
         source,
         "plot:density",
         profile_name="Paper",
@@ -188,9 +190,7 @@ def test_combined_hdf5_plot_settings_support_named_profiles(tmp_path):
     assert read_plot_profile_names(source, "plot:density") == ["Default", "Publication"]
     assert read_active_plot_profile_name(source, "plot:density") == "Publication"
     assert _read_flat_density_profile(source) == {"title": "Publication title"}
-    assert _read_flat_density_profile(source, profile_name="Default") == {
-        "title": "Default title"
-    }
+    assert _read_flat_density_profile(source, profile_name="Default") == {"title": "Default title"}
     assert _read_flat_density_profile(source, profile_name="Publication") == {
         "title": "Publication title"
     }
@@ -301,6 +301,7 @@ def test_select_plot_profile_settings_reads_density_payload_without_flattening()
         keys=("species", "axis", "view_mapping", "title"),
     )
 
+    assert isinstance(payload["view_mapping"], dict)
     assert selected == {
         "species": "H2O",
         "axis": "y",

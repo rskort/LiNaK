@@ -1,5 +1,31 @@
 # Density
 
+## Symmetric Cells
+
+With `surface_layout=symmetric`, density stores folded, top, and bottom
+outward-distance profiles. Each side is normalized using its own per-frame
+slice volume. Folded density is the equal arithmetic mean of the two normalized
+profiles, so identical interfaces retain one-interface magnitude instead of
+doubled density. Side-resolved mass and entity accumulators are retained in the
+sparse grid without duplicating Cartesian coordinates. Raw X/Y/Z profiles
+remain available.
+
+Plotting defaults to `interface_view=folded`; `top` and `bottom` select the
+positive- and negative-axis normalized sides, while `all` overlays the three
+labeled 1D interface curves. `interface_view=full` loads the existing raw
+surface-axis profile and shows the entire periodic cell, including both liquid
+regions and the slab, without folding or side masking. In the Studio these are
+named **Combined interfaces (folded mean)**, **Positive-axis interface**,
+**Negative-axis interface**, **Compare interface curves**, and **Full cell
+(unfolded)**. Full-cell and default 1D previews use stored profiles and do not
+require a sparse-grid read.
+
+The Studio shows **Surface representation** only for profiles resolved as
+`symmetric`. Single-top, single-bottom, and raw-axis profiles have no
+two-interface selector. In **Full cell (unfolded)**, the raw surface-axis
+coordinate is enforced in the mapping controls; folded distance cannot be
+selected until an interface-relative view is restored.
+
 `linak compute density` computes a one-dimensional density profile along one
 Cartesian axis. Depending on available cell information, LiNaK stores both mass
 density and `number_density`. The latter is an entity density:
@@ -95,9 +121,10 @@ shared observed-range grid across species in the same analysis call.
 ### `cell`
 
 If a usable periodic cell is available, LiNaK can instead span the geometric
-extent of the simulation cell along the chosen axis. If surface alignment is
-active, this cell interval is shifted by the frame-wise surface reference used
-for the trusted distance-mode alignment.
+extent of the simulation cell along the chosen axis. Symmetric layouts use the
+paired folded bounds. A single-interface layout spans one signed slab interval
+and the complete positive outward fluid/vacuum arc, including any crossing of
+the raw periodic boundary.
 
 If the cell is unusable or unavailable, LiNaK falls back to observed bounds.
 
@@ -243,14 +270,14 @@ and shared surface metadata under `surface`, such as:
 - `surface.low_confidence_threshold`
 - `surface.effective_options`
 
-### Current v1 Stored Fields
+### Stored Bin Geometry
 
-Current density HDF5 files store the v1 bin geometry as:
+Current v2 density HDF5 profiles store uniform bin geometry as:
 
 - `bin_centers_A`
 - metadata `bin_width_A`
 
-LiNaK reconstructs uniform bin edges from those current v1 fields when loading.
+LiNaK reconstructs uniform bin edges from these fields when loading.
 Files that only provide older bin-edge-style metadata are rejected and should be
 recomputed with the current package.
 
@@ -267,6 +294,35 @@ Density files may also include optional current-schema arrays such as:
   surface estimator, not merely on whether some scalar surface summary exists.
 - Linear fallback should not be interpreted as a volumetric density.
 - The method averages over frames and therefore removes time ordering.
+
+## Preview Performance And Diagnostics
+
+Density GUI setup reads HDF5 profile headers only. Sparse coordinate and value
+datasets are loaded lazily for enabled species when a line or heatmap is first
+rendered, and the resulting slice is reused for style-only preview updates. An
+INFO message identifies the active species, projected axes, sparse nonzero-bin
+count, geometry-group count, and elapsed preparation time. Cache hits are
+DEBUG-only so ordinary plotting remains concise.
+
+Range fields are blank when the complete dataset range is active; their
+placeholders show the available limits. Only an explicitly narrowed bound
+activates sparse-grid filtering. This keeps the default 1D preview on the
+stored line profiles, while filtered and 2D views continue to use the exact
+sparse-grid projection.
+
+For a tilted prism whose selected surface-normal Cartesian axis is decoupled
+from the in-plane lattice vectors, normalization is still exact: LiNaK clips
+the in-plane polygon once per unique geometry and combines it with vectorized
+normal-interval overlaps. General rotated/triclinic cells retain exact
+polyhedral clipping with extent prefiltering. Neither path uses sampling or a
+rectangular-cell approximation.
+
+New symmetric sparse grids store aligned per-geometry top/bottom mass and
+entity sums plus both surface offsets. Folded distance density is the arithmetic
+mean of the two independently volume-normalized sides. A legacy symmetric grid
+without this paired normalization data cannot safely reconstruct a distance
+view; LiNaK asks for recomputation instead of silently applying one side's
+offset.
 
 ## Related Documentation
 

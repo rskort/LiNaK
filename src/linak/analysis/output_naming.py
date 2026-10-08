@@ -100,31 +100,27 @@ def split_analysis_hdf5_name(name: str | Path) -> tuple[str, str, str] | None:
     return base, analysis, path_name[-len(suffix) :]
 
 
-def numbered_hdf5_path(path: str | Path, index: int) -> Path:
-    """Return an auto-versioned HDF5 path, keeping analysis suffixes at the end."""
-
-    path_obj = Path(path)
-    split = split_analysis_hdf5_name(path_obj.name)
-    if split is not None:
-        base, analysis, suffix = split
-        return path_obj.with_name(f"{base}_{index}.{analysis}{suffix}")
-    return path_obj.with_name(f"{path_obj.stem}_{index}{path_obj.suffix}")
-
-
 def append_hdf5_name_suffix(path: str | Path, suffix: str) -> Path:
-    """Append a base-name suffix without changing a compound HDF5 file type."""
+    """Insert a name suffix before the first dot, preserving the entire extension.
 
+    Applies to any file type, including compound and unknown extensions.
+    """
     path_obj = Path(path)
-    split = split_analysis_hdf5_name(path_obj.name)
-    if split is not None:
-        base, analysis, hdf5_suffix = split
-        return path_obj.with_name(f"{base}{suffix}.{analysis}{hdf5_suffix}")
-    lower_name = path_obj.name.lower()
-    hdf5_suffix = next(
-        (item for item in _HDF5_SUFFIXES if lower_name.endswith(item)),
-        None,
-    )
-    if hdf5_suffix is not None:
-        base = path_obj.name[: -len(hdf5_suffix)]
-        return path_obj.with_name(f"{base}{suffix}{path_obj.name[-len(hdf5_suffix):]}")
-    return path_obj.with_name(f"{path_obj.stem}{suffix}{path_obj.suffix}")
+    base, dot, extension = path_obj.name.partition(".")
+    return path_obj.with_name(f"{base}{suffix}{dot}{extension}")
+
+
+def numbered_hdf5_path(path: str | Path, index: int) -> Path:
+    """Insert `_index` before the first dot without changing any extension."""
+    return append_hdf5_name_suffix(path, f"_{index}")
+
+
+def unique_output_path(path: str | Path) -> Path:
+    """Return an unused filename, numbering collisions before the first dot."""
+    target = Path(path)
+    candidate = target
+    index = 1
+    while candidate.exists():
+        candidate = numbered_hdf5_path(target, index)
+        index += 1
+    return candidate

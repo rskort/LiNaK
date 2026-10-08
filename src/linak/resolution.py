@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from .cell_geometry import CellMetadata, compact_cell, same_cell
+
 from dataclasses import dataclass
 import logging
 from pathlib import Path
+from typing import Any
 
 from ase import Atoms
 import numpy as np
@@ -21,12 +24,14 @@ LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
-class CellResolution:
+class CellResolution(CellMetadata):
     """Resolved periodic cell with provenance."""
 
     cell_angstrom: tuple[float, float, float]
     source: str
     input_path: Path | None = None
+    cell_matrix_angstrom: tuple | None = None
+    cell_angles_deg: tuple | None = None
 
 
 @dataclass(frozen=True)
@@ -40,16 +45,8 @@ class TimestepResolution:
     trajectory_stride_md: int | None = None
 
 
-def _normalize_cell(cell: tuple[float, float, float]) -> tuple[float, float, float]:
-    normalized = (
-        float(cell[0]),
-        float(cell[1]),
-        float(cell[2]),
-    )
-    ensure_positive("cell_a", normalized[0])
-    ensure_positive("cell_b", normalized[1])
-    ensure_positive("cell_c", normalized[2])
-    return normalized
+def _normalize_cell(cell: Any):
+    return compact_cell(cell)
 
 
 def _normalize_timestep_fs(timestep_fs: float) -> float:
@@ -58,7 +55,7 @@ def _normalize_timestep_fs(timestep_fs: float) -> float:
     return normalized
 
 
-def _auto_detect_cell(trajectory_path: str | Path) -> tuple[tuple[float, float, float], Path]:
+def _auto_detect_cell(trajectory_path: str | Path) -> tuple[Any, Path]:
     trajectory = Path(trajectory_path).expanduser().resolve()
     input_path = find_unique_simulation_input(trajectory.parent)
     cell = extract_cell_from_simulation_input(input_path)
@@ -76,11 +73,11 @@ def _auto_detect_frame_timestep_fs(trajectory_path: str | Path) -> tuple[float, 
 
 def _trajectory_hdf5_cell_metadata(
     trajectory_path: str | Path,
-) -> tuple[tuple[float, float, float] | None, Path | None]:
+) -> tuple[Any | None, Path | None]:
     metadata = read_trajectory_hdf5_metadata(trajectory_path)
-    if metadata is None or metadata.cell_angstrom is None:
+    if metadata is None or metadata.cell_geometry is None:
         return None, None
-    return metadata.cell_angstrom, metadata.input_path
+    return metadata.cell_geometry, metadata.input_path
 
 
 def _trajectory_hdf5_timestep_metadata(
@@ -234,7 +231,7 @@ def _warn_on_mismatched_cells(
 ) -> None:
     for i, (name_a, cell_a) in enumerate(candidates):
         for name_b, cell_b in candidates[i + 1 :]:
-            if np.allclose(cell_a, cell_b, rtol=0.0, atol=1e-6):
+            if same_cell(cell_a, cell_b):
                 continue
             LOGGER.warning(
                 "Cell sources disagree for '%s': %s=%s, %s=%s.",

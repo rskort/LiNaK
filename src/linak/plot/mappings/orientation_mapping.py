@@ -146,12 +146,13 @@ def orientation_view_mapping_to_plot_options(mapping: PlotViewMapping) -> dict[s
         }
 
     if view_type_id != "heatmap_2d":
-        raise ValueError(
-            "Current orientation plotting only supports 1D Line and 2D Heatmap views."
-        )
+        raise ValueError("Current orientation plotting only supports 1D Line and 2D Heatmap views.")
     if str(mapping.x or "").strip() != "bin_centers_A":
         raise ValueError("Orientation heatmap mappings must place bin_centers_A on the x role.")
-    if str(mapping.resolved_role_assignments().get("y") or "").strip() != "heatmap_angle_bin_centers":
+    if (
+        str(mapping.resolved_role_assignments().get("y") or "").strip()
+        != "heatmap_angle_bin_centers"
+    ):
         raise ValueError(
             "Orientation heatmap mappings must place heatmap_angle_bin_centers on the y role."
         )
@@ -221,9 +222,7 @@ def resolve_orientation_plot_mapping(
 
     compatibility = generic_view_type_compatibility(resolved_contract, resolved_mapping)
     if compatibility == "invalid":
-        raise ValueError(
-            "Orientation plot mapping is incompatible with the available plot data."
-        )
+        raise ValueError("Orientation plot mapping is incompatible with the available plot data.")
     return ResolvedOrientationPlotMapping(
         contract=resolved_contract,
         mapping=resolved_mapping,
