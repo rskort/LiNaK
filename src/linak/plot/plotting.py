@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from .settings_validation import validate_source_descriptor
+
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 import difflib
@@ -14,6 +16,7 @@ from typing import Any
 import matplotlib
 import matplotlib.colors as mcolors
 import numpy as np
+from ..cancellation import check_cancelled, register_cancel_cleanup
 
 from ..analysis.statistics import (
     SeriesStatistics,
@@ -2187,6 +2190,7 @@ def _prepare_plot_series_data(
     transformed_y: list[np.ndarray] = []
     normalized_count = 0
     for index, (x_values, y_values, label) in enumerate(zip(x_series, y_series, labels)):
+        check_cancelled()
         x_data = np.asarray(x_values, dtype=float)
         y_data = np.asarray(y_values, dtype=float)
         if x_data.shape != y_data.shape:
@@ -2275,6 +2279,7 @@ def _prepare_line_render_series(
     prepared: list[PreparedLineSeries] = []
     normalized_count = 0
     for index, (x_values, y_values, label) in enumerate(zip(x_series, y_series, labels)):
+        check_cancelled()
         x_data = np.asarray(x_values, dtype=float)
         y_data = np.asarray(y_values, dtype=float)
         if x_data.shape != y_data.shape:
@@ -2445,11 +2450,6 @@ def _series_override_entry(
     return dict(raw) if isinstance(raw, dict) else {}
 
 
-def _descriptor_source_kind(descriptor: dict[str, Any]) -> str:
-    token = str(descriptor.get("source_kind") or "source").strip().lower()
-    return "group" if token == "group" else "source"
-
-
 def _build_cumulative_series(
     x_values: np.ndarray,
     y_values: np.ndarray,
@@ -2469,132 +2469,6 @@ def _build_cumulative_series(
     running = np.cumsum(y_sorted, dtype=float)
     counts = np.arange(1, y_sorted.size + 1, dtype=float)
     return x_sorted, running / counts
-
-
-def _reduce_group_stack(values: np.ndarray, *, reducer: str) -> float:
-    if values.size == 0:
-        return float("nan")
-    if reducer == "mean":
-        return float(np.mean(values))
-    if reducer == "median":
-        return float(np.median(values))
-    if reducer == "sum":
-        return float(np.sum(values))
-    if reducer == "min":
-        return float(np.min(values))
-    if reducer == "max":
-        return float(np.max(values))
-    raise ValueError(f"Unsupported grouped-series reducer '{reducer}'.")
-
-
-def _aggregate_grouped_prepared_series(
-    prepared_members: list[PreparedLineSeries],
-    *,
-    reducer: str,
-    x_bin_width: float | None,
-    x_bin_reducer: str,
-) -> tuple[np.ndarray | None, np.ndarray | None, str | None]:
-    if not prepared_members:
-        return None, None, "Grouped series has no member series."
-
-    for prepared in prepared_members:
-        x_values = np.asarray(prepared.x, dtype=float)
-        y_values = np.asarray(prepared.y, dtype=float)
-        if x_values.shape != y_values.shape:
-            raise ValueError(
-                "Internal plotting error: grouped-series x/y point counts do not match."
-            )
-
-    first_x = np.asarray(prepared_members[0].x, dtype=float)
-    same_grid = True
-    for prepared in prepared_members[1:]:
-        candidate_x = np.asarray(prepared.x, dtype=float)
-        if candidate_x.shape != first_x.shape or not np.allclose(
-            candidate_x, first_x, equal_nan=True
-        ):
-            same_grid = False
-            break
-
-    if same_grid:
-        stack = np.vstack([np.asarray(prepared.y, dtype=float) for prepared in prepared_members])
-        aggregated = np.apply_along_axis(_reduce_group_stack, 0, stack, reducer=reducer)
-        return np.asarray(first_x, dtype=float), np.asarray(aggregated, dtype=float), None
-
-    if x_bin_width is None:
-        return (
-            None,
-            None,
-            "Grouped series requires matching x grids, or active x rebinning/sectioning.",
-        )
-
-    global_x: list[np.ndarray] = []
-    global_y: list[np.ndarray] = []
-    for prepared in prepared_members:
-        finite_mask = np.isfinite(prepared.x) & np.isfinite(prepared.y)
-        if np.any(finite_mask):
-            global_x.append(np.asarray(prepared.x[finite_mask], dtype=float))
-            global_y.append(np.asarray(prepared.y[finite_mask], dtype=float))
-    if not global_x:
-        return np.empty(0, dtype=float), np.empty(0, dtype=float), None
-
-    start = float(min(float(np.min(values)) for values in global_x))
-    per_series_bins: list[dict[int, float]] = []
-    per_series_x_bins: list[dict[int, float]] = []
-    seen_bins: set[int] = set()
-    if len(global_x) != len(global_y):
-        raise ValueError(
-            "Internal plotting error: grouped-series x/y collection counts do not match."
-        )
-    for x_values, y_values in zip(global_x, global_y):
-        if len(x_values) != len(y_values):
-            raise ValueError(
-                "Internal plotting error: grouped-series x/y point counts do not match."
-            )
-        bin_index = np.floor((x_values - start) / float(x_bin_width)).astype(np.int64)
-        bin_values: dict[int, list[float]] = {}
-        bin_positions: dict[int, list[float]] = {}
-        if len(bin_index) != len(x_values):
-            raise ValueError(
-                "Internal plotting error: grouped-series bin index count does not match x values."
-            )
-        for current_x, current_y, current_bin in zip(x_values, y_values, bin_index):
-            key = int(current_bin)
-            bin_values.setdefault(key, []).append(float(current_y))
-            bin_positions.setdefault(key, []).append(float(current_x))
-            seen_bins.add(key)
-        reduced_y = {
-            key: _reduce_values(np.asarray(values, dtype=float), reducer=x_bin_reducer)
-            for key, values in bin_values.items()
-        }
-        reduced_x = {
-            key: float(np.mean(np.asarray(values, dtype=float)))
-            for key, values in bin_positions.items()
-        }
-        per_series_bins.append(reduced_y)
-        per_series_x_bins.append(reduced_x)
-
-    if not seen_bins:
-        return np.empty(0, dtype=float), np.empty(0, dtype=float), None
-
-    ordered_bins = sorted(seen_bins)
-    x_out: list[float] = []
-    y_out: list[float] = []
-    for current_bin in ordered_bins:
-        y_candidates = [
-            values[current_bin]
-            for values in per_series_bins
-            if current_bin in values and np.isfinite(values[current_bin])
-        ]
-        if not y_candidates:
-            continue
-        x_candidates = [
-            positions[current_bin]
-            for positions in per_series_x_bins
-            if current_bin in positions and np.isfinite(positions[current_bin])
-        ]
-        x_out.append(float(np.mean(np.asarray(x_candidates, dtype=float))))
-        y_out.append(_reduce_group_stack(np.asarray(y_candidates, dtype=float), reducer=reducer))
-    return np.asarray(x_out, dtype=float), np.asarray(y_out, dtype=float), None
 
 
 def plot_line_series(
@@ -2817,6 +2691,7 @@ def plot_heatmap_series(
         rc_context_args.update(dict(matplotlib_rc))
     with plt.rc_context(rc_context_args):
         fig, ax = plt.subplots(figsize=style.figure_size)
+        register_cancel_cleanup(lambda: plt.close(fig))
         figure_alpha = _apply_figure_kwargs(fig, figure_kwargs)
 
         heatmap_array = np.asarray(z_values, dtype=float)
@@ -2999,6 +2874,16 @@ def plot_heatmap_series(
         )
         if capture_state is not None:
             capture_state["annotations_summary"] = list(annotation_summaries)
+            # Export quantitative values before color normalization/clipping.
+            capture_state["plotted_heatmap"] = {
+                "x_edges": np.asarray(x_edges, dtype=float).copy(),
+                "y_edges": np.asarray(y_edges, dtype=float).copy(),
+                "values": np.ma.asarray(z_values, dtype=float).filled(np.nan).copy(),
+                "x_label": ax.get_xlabel(),
+                "y_label": ax.get_ylabel(),
+                "value_label": heatmap_colorbar_label or "",
+            }
+            capture_state.pop("plotted_xy_series", None)
 
         output_path = None
         if output is not None:
@@ -3226,7 +3111,6 @@ def plot_multi_line_series(
         if isinstance(series_overrides_by_id, dict)
         else {}
     )
-    reducer_name = _resolve_reducer_name(x_bin_reducer) if x_bin_width is not None else "mean"
 
     def _build_source_render_item(
         *,
@@ -3346,106 +3230,25 @@ def plot_multi_line_series(
         }
 
     render_items: list[dict[str, Any]] = []
-    source_render_items: list[dict[str, Any]] = []
     for descriptor in resolved_render_descriptors:
+        validate_source_descriptor(descriptor)
         current_id = str(descriptor.get("series_id") or "").strip()
         if not current_id:
-            continue
-        current_override = _series_override_entry(overrides, current_id)
-        kind = _descriptor_source_kind(descriptor)
-        if kind == "group":
-            raw_override_line_kwargs = current_override.get("line_kwargs")
-            line_kwargs_value = (
-                dict(raw_override_line_kwargs)
-                if isinstance(raw_override_line_kwargs, dict)
-                else None
-            )
-            if current_override.get("alpha") is not None:
-                if line_kwargs_value is None:
-                    line_kwargs_value = {}
-                line_kwargs_value["alpha"] = float(current_override["alpha"])
-            fit_override = current_override.get("fit")
-            fit_config = resolve_series_fit_configs(
-                series_count=1,
-                series_fit_configs=[fit_override if isinstance(fit_override, dict) else None],
-            )[0]
-            render_items.append(
-                {
-                    "series_id": current_id,
-                    "label": (
-                        str(current_override.get("label_override") or "").strip()
-                        or str(descriptor.get("default_label") or current_id)
-                    ),
-                    "kind": "group",
-                    "member_series_ids": [
-                        str(value).strip()
-                        for value in descriptor.get("member_series_ids", [])
-                        if str(value).strip()
-                    ],
-                    "group_reducer": _resolve_reducer_name(
-                        str(descriptor.get("group_reducer") or "mean").strip().lower() or "mean"
-                    ),
-                    "series_enabled": bool(current_override.get("enabled", True)),
-                    "line_visible": bool(current_override.get("enabled", True))
-                    and bool(current_override.get("show_raw_line", True)),
-                    "show_in_legend": bool(current_override.get("show_in_legend", True)),
-                    "line_color": (
-                        None
-                        if current_override.get("color") in {None, ""}
-                        else str(current_override.get("color"))
-                    ),
-                    "line_width": current_override.get("line_width"),
-                    "marker": (
-                        None
-                        if current_override.get("marker") in {None, ""}
-                        else str(current_override.get("marker"))
-                    ),
-                    "line_kwargs": line_kwargs_value,
-                    "fit_config": fit_config,
-                    "cumulative_config": _coerce_cumulative_config(
-                        current_override.get("cumulative")
-                    ),
-                    "normalization_mode": (
-                        str(current_override.get("normalization_mode") or "").strip() or None
-                    ),
-                    "normalization_value": current_override.get("normalization_value"),
-                    "normalization_x_ref": current_override.get("normalization_x_ref"),
-                }
-            )
             continue
 
         item = _build_source_render_item(current_id=current_id, descriptor=descriptor)
         if item is None:
             continue
         render_items.append(item)
-        source_render_items.append(item)
-
-    prepared_source_ids = {
-        str(item["source_series_id"]): item
-        for item in source_render_items
-        if str(item.get("source_series_id") or "").strip()
-    }
-    for source_id, source_entry in source_entries.items():
-        if source_id in prepared_source_ids:
-            continue
-        fallback_descriptor = {
-            "series_id": source_id,
-            "default_label": source_entry["label"],
-            "source_kind": "source",
-            "source_series_id": source_id,
-        }
-        item = _build_source_render_item(current_id=source_id, descriptor=fallback_descriptor)
-        if item is not None:
-            source_render_items.append(item)
 
     prepared_series, normalized_count = _prepare_line_render_series(
-        x_series=[item["x"] for item in source_render_items],
-        y_series=[item["y"] for item in source_render_items],
-        labels=[item["label"] for item in source_render_items],
+        x_series=[item["x"] for item in render_items],
+        y_series=[item["y"] for item in render_items],
+        labels=[item["label"] for item in render_items],
         x_bin_width=x_bin_width,
         x_bin_reducer=x_bin_reducer,
-        series_statistics_data=[item["statistics"] for item in source_render_items],
-        series_raw_statistics=[item["raw_statistics"] for item in source_render_items],
+        series_statistics_data=[item["statistics"] for item in render_items],
+        series_raw_statistics=[item["raw_statistics"] for item in render_items],
         series_error_configs=[
             {
                 "enabled": item["error_config"].enabled,
@@ -3455,72 +3258,26 @@ def plot_multi_line_series(
                 "label_override": item["error_config"].label_override,
                 "show_in_legend": item["error_config"].show_in_legend,
             }
-            for item in source_render_items
+            for item in render_items
         ],
         min_bin_points=min_bin_points,
-        series_normalization_modes=[item["normalization_mode"] for item in source_render_items],
-        series_normalization_values=[item["normalization_value"] for item in source_render_items],
-        series_normalization_x_refs=[item["normalization_x_ref"] for item in source_render_items],
+        series_normalization_modes=[item["normalization_mode"] for item in render_items],
+        series_normalization_values=[item["normalization_value"] for item in render_items],
+        series_normalization_x_refs=[item["normalization_x_ref"] for item in render_items],
     )
-    if len(source_render_items) != len(prepared_series):
+    if len(render_items) != len(prepared_series):
         raise ValueError(
             "Internal plotting error: prepared series count does not match render items."
         )
-    for item, prepared in zip(source_render_items, prepared_series):
+    for item, prepared in zip(render_items, prepared_series):
+        check_cancelled()
         item["prepared"] = prepared
-    if len(source_render_items) > 1 and 0 < normalized_count < len(source_render_items):
+    if len(render_items) > 1 and 0 < normalized_count < len(render_items):
         LOGGER.warning(
             "Only %d/%d plotted series are normalized. Interpret y-axis comparisons with care.",
             normalized_count,
-            len(source_render_items),
+            len(render_items),
         )
-
-    prepared_by_id = {
-        str(item["series_id"]): item["prepared"]
-        for item in source_render_items
-        if isinstance(item.get("prepared"), PreparedLineSeries)
-        and bool(item.get("series_enabled", True))
-    }
-    for item in render_items:
-        if item["kind"] != "group":
-            continue
-        member_prepared = [
-            prepared_by_id[member_id]
-            for member_id in item["member_series_ids"]
-            if member_id in prepared_by_id
-        ]
-        x_group, y_group, group_reason = _aggregate_grouped_prepared_series(
-            member_prepared,
-            reducer=item["group_reducer"],
-            x_bin_width=x_bin_width,
-            x_bin_reducer=reducer_name,
-        )
-        item["group_reason"] = group_reason
-        if x_group is None or y_group is None:
-            item["prepared"] = PreparedLineSeries(
-                x=np.empty(0, dtype=float),
-                y=np.empty(0, dtype=float),
-                statistics=None,
-                available_error_stats=[],
-                error_config=SeriesErrorConfig(),
-                masked_bin_count=0,
-                error_status="unavailable",
-                statistics_mode="direct",
-                error_reason=group_reason,
-            )
-            continue
-        group_prepared, _ = _prepare_line_render_series(
-            x_series=[x_group],
-            y_series=[y_group],
-            labels=[item["label"]],
-            series_statistics_data=[None],
-            series_raw_statistics=[False],
-            series_error_configs=[{"enabled": False}],
-            series_normalization_modes=[item["normalization_mode"]],
-            series_normalization_values=[item["normalization_value"]],
-            series_normalization_x_refs=[item["normalization_x_ref"]],
-        )
-        item["prepared"] = group_prepared[0]
 
     active_backend = configure_matplotlib_backend(
         interactive=show,
@@ -3533,6 +3290,7 @@ def plot_multi_line_series(
         rc_context_args.update(dict(matplotlib_rc))
     with plt.rc_context(rc_context_args):
         fig, ax = plt.subplots(figsize=style.figure_size)
+        register_cancel_cleanup(lambda: plt.close(fig))
         figure_alpha = _apply_figure_kwargs(fig, figure_kwargs)
         rendered_colors: list[str] = []
         rendered_markers: list[str] = []
@@ -3545,7 +3303,6 @@ def plot_multi_line_series(
         point_counts_map: dict[str, list[int]] = {}
         source_bin_widths: dict[str, float | None] = {}
         masked_bin_counts: dict[str, int] = {}
-        grouped_summaries: dict[str, dict[str, Any]] = {}
         plotted_xy_series: list[dict[str, Any]] = []
         visible_x_series: list[np.ndarray] = []
         visible_y_series: list[np.ndarray] = []
@@ -3555,6 +3312,7 @@ def plot_multi_line_series(
         integration_summaries: list[dict[str, Any]] = []
         integration_seen_ids: set[str] = set()
         for item in render_items:
+            check_cancelled()
             prepared_item = item.get("prepared")
             if not isinstance(prepared_item, PreparedLineSeries):
                 continue
@@ -3574,16 +3332,8 @@ def plot_multi_line_series(
                     prepared_item.statistics.point_count, dtype=int
                 ).tolist()
             masked_bin_counts[fit_key] = int(prepared_item.masked_bin_count)
-            is_group = str(item.get("kind") or "source") == "group"
             layer_enabled = bool(item.get("series_enabled", True))
             line_visible = bool(item.get("line_visible", True))
-            if is_group:
-                grouped_summaries[fit_key] = {
-                    "status": "ok" if item.get("group_reason") is None else "unavailable",
-                    "reason": item.get("group_reason"),
-                    "reducer": str(item.get("group_reducer") or "mean"),
-                    "member_count": len(item.get("member_series_ids", [])),
-                }
             kwargs: dict[str, Any] = {
                 "lw": style.line_width,
                 "label": label if bool(item.get("show_in_legend", True)) else "_nolegend_",
@@ -3646,17 +3396,6 @@ def plot_multi_line_series(
                         }
                     )
                     integration_summaries.append(summary)
-                elif item_integration_config.source == "raw" and is_group:
-                    summary.update(
-                        {
-                            "status": "unavailable",
-                            "reason": (
-                                "Raw-profile integration is unavailable for grouped series; "
-                                "use plotted data instead."
-                            ),
-                        }
-                    )
-                    integration_summaries.append(summary)
                 else:
                     integration_x = (
                         np.asarray(item.get("raw_x"), dtype=float)
@@ -3704,8 +3443,7 @@ def plot_multi_line_series(
                     integration_summaries.append(summary)
             series_stats[fit_key] = _series_statistics(x_values, y_values)
             if (
-                not is_group
-                and layer_enabled
+                layer_enabled
                 and prepared_item.error_config.enabled
                 and prepared_item.error_status == "ok"
                 and prepared_item.statistics is not None
@@ -3808,10 +3546,8 @@ def plot_multi_line_series(
                     }
             else:
                 error_summaries[fit_key] = {
-                    "enabled": False if is_group else bool(prepared_item.error_config.enabled),
-                    "status": (
-                        "disabled" if is_group or not layer_enabled else prepared_item.error_status
-                    ),
+                    "enabled": bool(prepared_item.error_config.enabled),
+                    "status": ("disabled" if not layer_enabled else prepared_item.error_status),
                     "statistics_mode": prepared_item.statistics_mode,
                     "provenance_family": _error_provenance_family(
                         requested_stat=prepared_item.error_config.stat,
@@ -3823,9 +3559,7 @@ def plot_multi_line_series(
                         statistics_mode=prepared_item.statistics_mode,
                     ),
                     "reason": (
-                        "Grouped series do not render error overlays."
-                        if is_group
-                        else "Series is disabled."
+                        "Series is disabled."
                         if not layer_enabled and prepared_item.error_config.enabled
                         else prepared_item.error_reason
                     ),
@@ -4172,9 +3906,9 @@ def plot_multi_line_series(
             capture_state["series_point_counts"] = point_counts_map
             capture_state["series_source_bin_widths"] = source_bin_widths
             capture_state["series_masked_bin_counts"] = masked_bin_counts
-            capture_state["series_group_summaries"] = grouped_summaries
             capture_state["integration_summaries"] = list(integration_summaries)
             capture_state["annotations_summary"] = list(annotation_summaries)
+            capture_state.pop("plotted_heatmap", None)
             capture_state["plotted_xy_series"] = list(plotted_xy_series)
             capture_state["x_axis_scale"] = float(resolved_x_axis_scale)
             capture_state["x_axis_offset"] = float(resolved_x_axis_offset)

@@ -65,6 +65,7 @@ class ChunkedTrajectorySequence(Sequence[Atoms]):
         self.chunk_frames = max(1, int(chunk_frames))
         self._length = sum(self.counts)
         self._cell_override: np.ndarray | None = None
+        self._topology_providers: dict[Path, Any] = {}
 
     def set_cell_override(self, cell: Any) -> None:
         matrix = np.asarray(cell, dtype=float)
@@ -80,11 +81,20 @@ class ChunkedTrajectorySequence(Sequence[Atoms]):
     def __iter__(self) -> Iterator[Atoms]:
         for path in self.paths:
             for chunk in trajectory_io.read_trajectory_chunks(path, chunk_size=self.chunk_frames):
+                self._retain_topology_provider(path, chunk)
                 if self._cell_override is not None:
                     for frame in chunk:
                         frame.set_cell(self._cell_override)
                         frame.set_pbc((True, True, True))
                 yield from chunk
+
+    def _retain_topology_provider(self, path: Path, frames: Sequence[Atoms]) -> None:
+        from ..analysis.topology import FRAME_KEY, FrameTopology
+
+        if frames:
+            record = frames[0].info.get(FRAME_KEY)
+            if isinstance(record, FrameTopology) and record.provider is not None:
+                self._topology_providers[path] = record.provider
 
     @overload
     def __getitem__(self, index: int) -> Atoms: ...
@@ -125,6 +135,7 @@ class ChunkedTrajectorySequence(Sequence[Atoms]):
             finally:
                 chunks.close()
             self._cached_key = key
+            self._retain_topology_provider(path, self._cached_frames)
         frame = self._cached_frames[local_index - start].copy()
         if self._cell_override is not None:
             frame.set_cell(self._cell_override)

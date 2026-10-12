@@ -13,6 +13,8 @@ import time
 from types import TracebackType
 from typing import TextIO
 
+from .cancellation import ComputationCancelled, check_cancelled
+
 
 _PROGRESS_ENABLED: ContextVar[bool] = ContextVar("linak_progress_enabled", default=True)
 
@@ -25,6 +27,9 @@ def progress_stage(logger: logging.Logger, description: str) -> Iterator[None]:
     logger.info("%s...", description)
     try:
         yield
+    except ComputationCancelled:
+        logger.debug("%s cancelled after %.2f s.", description, time.perf_counter() - started)
+        raise
     except BaseException:
         logger.error("%s failed after %.2f s.", description, time.perf_counter() - started)
         raise
@@ -98,6 +103,7 @@ class ProgressBar:
         self.close()
 
     def update(self, n: int = 1) -> None:
+        check_cancelled()
         if self._closed:
             return
         self.count += n

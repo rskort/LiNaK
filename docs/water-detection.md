@@ -4,7 +4,8 @@ LiNaK uses shared water-specific helper logic in analyses such as density and
 orientation. This page explains how water molecules are identified and how
 water geometry is made consistent under periodic boundary conditions.
 
-The current implementation lives in `src/linak/analysis/water.py`.
+The shared geometry and classifier live in `src/linak/analysis/water.py`;
+`src/linak/analysis/topology.py` manages exact frame assignments and persistence.
 
 ## Why This Exists
 
@@ -26,7 +27,7 @@ This prevents overcounting ambiguous environments.
 
 The current default cutoff is:
 
-- `H2O_OH_CUTOFF_A = 1.25 Angstrom`
+- `H2O_OH_CUTOFF_A = 1.27 Angstrom`
 
 ## Algorithm
 
@@ -99,18 +100,32 @@ water-orientation distance binning.
 
 ## Topology Caching Across Frames
 
-For multi-frame workflows, LiNaK does not necessarily recompute the entire water
-topology from scratch in every frame.
+LiNaK now resolves O/H membership exactly for every frame. Assignments include
+free H and O, OH, H2O, H3O, and ambiguous/overcoordinated atom diagnostics.
+Short-lived proton transfers are therefore captured even between the former
+100-frame validation intervals. The existing Python stride argument remains
+accepted for compatibility but no longer samples molecular assignments.
 
-Instead, it caches the detected triplets and periodically revalidates them. The
-current validation stride is:
+`linak apply convert` builds this topology after cell/selection preparation and
+stores it in `.traj.h5`. Assignments use the coordinates at the file's actual
+storage precision. Surface populations reuse those assignments. Stable states
+are deduplicated, so an unchanged molecule layout need not be stored 8,000 times.
 
-- `H2O_VALIDATION_STRIDE = 100 frames`
+Subsequent molecular analyses read memberships without neighbor searches. Each
+frame's geometry, element/order, cell, and PBC are fingerprinted; changing them
+invalidates the assignment. Molecular centers, angles, and distances are always
+computed from the current geometry. Different cutoffs or requested detection
+backends use separate profiles.
 
-If revalidation shows that the water topology changed, LiNaK refreshes the
-cached triplets and logs a warning.
+Older `.traj.h5` files remain usable. Their first molecular analysis builds a
+full-source profile and saves it atomically after read handles close. A read-only
+file or failed save produces a warning and continues with the same topology in
+memory. Existing scientific datasets and the filename are preserved.
 
-This is a performance optimization with a correctness safeguard.
+Computing directly from `.xyz` also works: topology is collected during that
+run and shared across species and analysis passes. Conversion is not required;
+the XYZ is unchanged, and no permanent sidecar is created. Streaming uses the
+existing temporary trajectory storage and removes it when the command finishes.
 
 ## What This Means For Users
 
@@ -121,19 +136,19 @@ water for the purposes of selection and geometry. It is a good fit for:
 - interfacial water
 - solvated systems with conventional O-H connectivity
 
-It may be a poor fit for:
-
-- strong proton transfer chemistry
-- reactive trajectories with changing water identities
-- unusual hydrogen-bonding environments that violate the simple connectivity
-  model
+Changing molecular identities are supported through exact per-frame assignments.
+Environments that violate the simple O/H connectivity model are excluded through
+the ambiguity and overcoordination rules; caching does not change those rules.
 
 ## Which Analyses Use This
 
 The shared water logic is currently used by at least:
 
-- [Density](density.md), for `H2O` density
+- [Density](density.md), for molecular density
+- [Position](position.md), for molecular positions
+- [Coordination](coordination.md), for molecular coordination
 - [Orientation](orientation.md), for water orientation
+- [Surface Estimation](surface-estimation.md), for water populations
 
 ## Related Documentation
 

@@ -611,7 +611,7 @@ def test_auto_symmetric_occupancy_requirement_counts_empty_frames():
 
 
 def test_symmetric_population_detection_reuses_stable_water_topology(monkeypatch):
-    original = water_mod.oh_molecule_topology
+    original = water_mod._oh_molecule_topology_with_backend
     calls = 0
 
     def counted(*args, **kwargs):
@@ -619,9 +619,10 @@ def test_symmetric_population_detection_reuses_stable_water_topology(monkeypatch
         calls += 1
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(water_mod, "oh_molecule_topology", counted)
+    monkeypatch.setattr(water_mod, "_oh_molecule_topology_with_backend", counted)
+    frames = [_symmetric_frame() for _ in range(200)]
     reference = estimate_surface_layout_reference(
-        [_symmetric_frame() for _ in range(200)],
+        frames,
         axis="z",
         surface_layout="auto",
         mode="layered",
@@ -629,7 +630,11 @@ def test_symmetric_population_detection_reuses_stable_water_topology(monkeypatch
     )
 
     assert reference.resolved_layout == "symmetric"
-    assert calls <= 3
+    assert calls == len(frames)
+    estimate_surface_layout_reference(
+        frames, axis="z", surface_layout="auto", mode="layered", surface_elements=["Pt"]
+    )
+    assert calls == len(frames)
 
 
 def test_all_interface_plot_view_expands_and_labels_density_series(monkeypatch):

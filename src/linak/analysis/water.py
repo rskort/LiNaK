@@ -6,7 +6,7 @@ water-molecule identification and PBC-aware geometry without duplicating logic.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 
 from dataclasses import dataclass
 import logging
@@ -27,7 +27,7 @@ H2O_OH_CUTOFF_A: float = 1.27
 """Default O-H cutoff (Angstrom) used to identify water molecules."""
 
 H2O_VALIDATION_STRIDE: int = 100
-"""Re-validate cached water topology every *N* frames."""
+"""Compatibility default; topology is now resolved exactly for every frame."""
 
 AMU_TO_G: float = 1.66053906660e-24
 """Conversion factor from atomic mass units to grams."""
@@ -49,7 +49,7 @@ _MAX_CKDTREE_CELL_CONDITION = 1.0e10
 class OHTopology:
     """Classified O/H molecular entities for one frame."""
 
-    groups: dict[str, np.ndarray]
+    groups: Mapping[str, np.ndarray]
     ambiguous_hydrogen_indices: np.ndarray
     ambiguous_oxygen_indices: np.ndarray
     overcoordinated_oxygen_indices: np.ndarray
@@ -74,7 +74,7 @@ class OHTopology:
 
 
 class OHTopologyCache:
-    """Cache O/H topology and switch to per-frame detection after a detected change."""
+    """Analysis adapter to the shared, exact per-frame topology resolver."""
 
     def __init__(
         self,
@@ -91,59 +91,19 @@ class OHTopologyCache:
         self.context = str(context)
         self.backend = _normalize_topology_backend(backend)
         self.topology: OHTopology | None = None
-        self.per_frame = False
-        self._selection_signature: tuple[int, tuple[str, ...]] | None = None
-        self._oxygen_indices: np.ndarray | None = None
-        self._hydrogen_indices: np.ndarray | None = None
+        self.per_frame = True
         self._logged_backend: str | None = None
 
-    def _stable_indices(self, frame: Atoms) -> tuple[np.ndarray, np.ndarray]:
-        symbols = tuple(str(value) for value in frame.get_chemical_symbols())
-        signature = (len(frame), symbols)
-        if signature != self._selection_signature:
-            symbol_array = np.asarray(symbols, dtype=object)
-            self._oxygen_indices = np.where(symbol_array == "O")[0].astype(int, copy=False)
-            self._hydrogen_indices = np.where(symbol_array == "H")[0].astype(int, copy=False)
-            self._selection_signature = signature
-            self.topology = None
-            self.per_frame = False
-        assert self._oxygen_indices is not None
-        assert self._hydrogen_indices is not None
-        return self._oxygen_indices, self._hydrogen_indices
-
     def _detect(self, frame: Atoms) -> OHTopology:
-        oxygen_indices, hydrogen_indices = self._stable_indices(frame)
-        resolved: list[str] = []
-        topology = oh_molecule_topology(
-            frame,
-            oh_cutoff=self.oh_cutoff,
-            backend=self.backend,
-            _oxygen_indices=oxygen_indices,
-            _hydrogen_indices=hydrogen_indices,
-            _backend_callback=resolved.append,
-        )
-        resolved_backend = resolved[0] if resolved else self.backend
-        if resolved_backend != self._logged_backend:
-            self.logger.debug("%s backend: %s.", self.context, resolved_backend)
-            self._logged_backend = resolved_backend
-        return topology
+        if self._logged_backend is None:
+            self.logger.debug(
+                "%s: exact shared resolver (requested backend: %s).", self.context, self.backend
+            )
+            self._logged_backend = self.backend
+        return oh_molecule_topology(frame, oh_cutoff=self.oh_cutoff, backend=self.backend)
 
     def select(self, frame: Atoms, *, frame_index: int) -> OHTopology:
-        if self.topology is None or self.per_frame:
-            self.topology = self._detect(frame)
-            return self.topology
-
-        if int(frame_index) % self.validation_stride == 0:
-            previous = self.topology
-            validated = self._detect(frame)
-            if previous is None or validated.signature() != previous.signature():
-                self.logger.warning(
-                    "Detected %s change at frame %d; this likely indicates H-jumping, so LiNaK is switching to slower per-frame O/H molecule detection to keep molecule labels correct.",
-                    self.context,
-                    frame_index,
-                )
-                self.per_frame = True
-                self.topology = validated
+        self.topology = self._detect(frame)
         return self.topology
 
 
@@ -437,22 +397,12 @@ def oh_molecule_topology(
     oh_cutoff: float = H2O_OH_CUTOFF_A,
     *,
     backend: str = "auto",
-    _oxygen_indices: np.ndarray | None = None,
-    _hydrogen_indices: np.ndarray | None = None,
-    _backend_callback: object | None = None,
 ) -> OHTopology:
-    """Classify O/H entities using an automatic cKDTree or ASE pair backend."""
+    """Resolve exact O/H membership, detecting geometry only when no valid cache exists."""
 
-    topology, _resolved_backend = _oh_molecule_topology_with_backend(
-        frame,
-        oh_cutoff=float(oh_cutoff),
-        backend=backend,
-        oxygen_indices=_oxygen_indices,
-        hydrogen_indices=_hydrogen_indices,
-    )
-    if callable(_backend_callback):
-        _backend_callback(_resolved_backend)
-    return topology
+    from .topology import resolve_topology
+
+    return resolve_topology(frame, cutoff=float(oh_cutoff), backend=backend)
 
 
 def oh_molecule_indices(
@@ -657,7 +607,7 @@ def water_axis_values_per_frame(
     oh_cutoff: float = H2O_OH_CUTOFF_A,
     progress_desc: str = "Selecting H2O",
 ) -> tuple[list[np.ndarray], list[np.ndarray]]:
-    """Select water-molecule COM axis values with cached-topology validation.
+    """Select water-molecule COM axis values using exact shared frame topology.
 
     Returns
     -------

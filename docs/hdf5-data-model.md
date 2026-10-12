@@ -19,6 +19,26 @@ entry contains dataset name, shape, dtype, and an uncompressed byte estimate.
 GUI plotting uses this inventory to request only view-required datasets; public
 `load_*_profiles()` functions remain eager for backward compatibility.
 
+## Trajectory molecular topology
+
+Trajectory format v1 additionally supports `/molecular_topology/oh/<profile_id>`.
+This optional cache is independent of analysis schemas. A profile records its
+classifier/schema version, cutoff in Angstrom, requested backend, exact-per-frame
+policy, original frame count, creation timestamp, and completion marker.
+
+`frame_state_index` maps each original frame to one deduplicated state;
+`geometry_fingerprint` stores SHA-256 fingerprints of its positions, atomic
+numbers/order, cell, and PBC. Each molecular label (`mol:H`, `mol:O`, `mol:OH`,
+`mol:H2O`, `mol:H3O`) has integer membership rows and a companion `_offsets`
+dataset delimiting states. Ambiguous hydrogen/oxygen and overcoordinated oxygen
+indices have the same offset representation. Diagnostics participate in state
+deduplication. Membership arrays use the trajectory's compression policy.
+
+Incomplete, unsupported, or invalid profiles are ignored and rebuilt when
+needed. Missing caches never prevent analysis. Builds use actual stored
+coordinate precision, including float64 in older files. No molecular centers,
+angles, or distances are persisted in this cache.
+
 ## Surface Schema v2
 
 Density, position, coordination, and orientation profiles using the shared

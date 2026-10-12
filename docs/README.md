@@ -103,14 +103,28 @@ plot profile rather than the underlying analysis arrays. In practice this means:
 - named plot profiles round-trip through the HDF5 file
 
 Per-layer visibility, raw-line visibility, fits, uncertainty, cumulative lines,
-groups, and annotations are all previewed live and are persisted as part of the
+and annotations are all previewed live and are persisted as part of the
 plot profile. Turning a raw line off hides only that base line; other derived
 overlays for the same enabled layer can still render if they are turned on.
 
 For `position` plots, Studio exposes `2D Heatmap` as a first-class view rather
 than only the legacy `xy-z` controls. The view lets the user choose the X and Y
 quantities, color continuously by a coordinate or time quantity, or assign one
-editable categorical color per species/layer. Optional value filters and the
+editable categorical color per atom or molecule trajectory. In `Color mode:
+species / layer`, trajectories are listed under collapsible species headings;
+each has its own visibility, color, label, and line style. Search by species,
+atom ID, or source using `Filter list`, which changes the list without changing
+the plot. `Show matches` shows matching trajectories and hides all others;
+`Hide matches` hides matching trajectories only. Layer checkboxes work on the
+first click without selecting the layer. Visibility and copy actions stay above
+the list. Custom aggregation groups are no longer supported, including in saved
+profiles. Species checkboxes control
+all their trajectories; `Isolate` shows just the selected trajectory, with Undo
+restoring the previous visibility. `Apply this style to species` copies the
+selected trajectory's styling to its species without changing labels or
+visibility. Hiding layers preserves their order and colors.
+
+Optional value filters and the
 shared colormap/colorbar controls update the preview interactively. The legacy
 `xy-z` name is still accepted as a compatibility alias in the CLI and saved
 profiles.
@@ -150,3 +164,31 @@ The current implementations described in this folder are primarily defined in:
 - `src/linak/analysis/surface.py`
 - `src/linak/analysis/water.py`
 - `src/linak/analysis/schema.py`
+
+### Export plotted data
+
+In the plot settings window, use **Data ? Export Data** (or **Save Data** in the
+preview) to save line data or a 2D density/orientation heatmap as CSV, TSV, DAT,
+or TXT. Heatmap exports contain one row per grid cell with `x`, `y`, `value`,
+`x_min`, `x_max`, `y_min`, and `y_max`. The coordinates are bin centers; the
+boundaries preserve nonuniform bins. Rows run through Y bins for each X bin.
+Missing cells retain `nan` values so the grid can be reconstructed.
+
+The export uses the selected plot's processed grid. Color limits and logarithmic
+color scaling do not change the exported numeric values. Enable **Include metadata
+comments** to include grid dimensions and axis/value labels.
+
+### Plot window messages
+
+The footer shows the latest update, warning, or error on one line. Click it (or
+focus it and press Enter) to open **Advanced → Logs**, which keeps the full
+message history for that window session. The log viewer includes timestamps,
+severity, and exception details, with **Copy all** and **Clear** controls.
+Terminal logging continues to follow the selected log level.
+
+During preview rendering, the previous plot stays visible beneath a subtle
+loading overlay. The indicator appears after a short delay and disappears when
+the update finishes or fails, including when the preview is detached.
+Changing settings during an update replaces the obsolete request with the newest
+settings. Intermediate requests and late results are discarded, while the
+previous plot remains visible until the replacement preview is ready.

@@ -5,6 +5,7 @@ from __future__ import annotations
 from ..cell_geometry import unwrap_positions, cartesian_bounds, frame_origin
 
 from collections.abc import Mapping, Sequence
+from copy import copy
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass, replace
 import logging
@@ -243,10 +244,10 @@ class _SurfaceAnalysisContext:
     stable_layout: bool
     selected_elements: tuple[str, ...]
     candidate_indices: np.ndarray | None
-    candidate_positions: np.ndarray | None
     candidate_axis_values: np.ndarray | None
     candidate_masses: np.ndarray | None
-    translated_candidate_positions: np.ndarray | None
+    candidate_mobility: np.ndarray | None
+    candidate_axis_medians: np.ndarray | None
     cell_lengths: np.ndarray | None
 
 
@@ -360,13 +361,12 @@ def _frames_share_consistent_atom_layout(frames: Sequence[Atoms]) -> bool:
     if not frames:
         return False
 
-    first_symbols = np.asarray(frames[0].get_chemical_symbols())
-    atom_count = len(first_symbols)
+    first_numbers = frames[0].numbers
+    atom_count = len(first_numbers)
     for frame in frames[1:]:
-        frame_symbols = np.asarray(frame.get_chemical_symbols())
-        if len(frame_symbols) != atom_count:
+        if len(frame) != atom_count:
             return False
-        if not np.array_equal(frame_symbols, first_symbols):
+        if not np.array_equal(frame.numbers, first_numbers):
             return False
     return True
 
@@ -709,6 +709,7 @@ def _resolve_surface_elements(
     surface_elements: list[str] | tuple[str, ...] | None,
     *,
     axis_index: int,
+    _stable_layout: bool | None = None,
 ) -> tuple[list[str], str]:
     """Resolve surface reference elements from override or automatic detection."""
     if not frames:
@@ -738,27 +739,23 @@ def _resolve_surface_elements(
     abundance_floor = max(2, int(np.ceil(0.03 * total)))
 
     # Prefer low-mobility elements when atom ordering is stable across frames.
-    if len(frames) > 1 and _frames_share_consistent_atom_layout(frames):
+    stable_layout = (
+        _frames_share_consistent_atom_layout(frames) if _stable_layout is None else _stable_layout
+    )
+    if len(frames) > 1 and stable_layout:
         symbol_matrix = np.asarray(frames[0].get_chemical_symbols(), dtype=object)
         source_mask = symbol_matrix != "H"
         if not np.any(source_mask):
             source_mask = np.ones(symbol_matrix.size, dtype=bool)
-        axis_matrix = np.stack(
-            [
-                np.asarray(frame.positions[:, axis_index], dtype=float)[source_mask]
-                for frame in frames
-            ],
-            axis=0,
-        )
         axis_lengths = _axis_lengths_if_periodic(frames, axis_index)
         unwrapped_axis = (
             unwrap_positions(
                 np.stack([frame.positions[source_mask] for frame in frames]),
                 [frame.cell for frame in frames],
                 [frame.pbc for frame in frames],
-            )[:, :, axis_index]
+            )[:, :, axis_index].copy()
             if axis_lengths is not None
-            else axis_matrix
+            else np.stack([frame.positions[source_mask, axis_index] for frame in frames])
         )
         medians = np.median(unwrapped_axis, axis=0)
         mobility = np.median(np.abs(unwrapped_axis - medians), axis=0)
@@ -928,11 +925,28 @@ def _candidate_mask_for_frame(
     return mask
 
 
+def _candidate_mobility(positions: np.ndarray) -> np.ndarray:
+    """Exact temporal median mobility with bounded atom-block scratch arrays."""
+    count = positions.shape[1]
+    mobility = np.empty(count, dtype=float)
+    # Each block's temporal coordinates, differences and norms stay bounded.
+    block_atoms = max(1, (8 * 1024**2) // max(1, len(positions) * 3 * 8))
+    for start in range(0, count, block_atoms):
+        stop = min(count, start + block_atoms)
+        block = positions[:, start:stop]
+        median_positions = np.median(block, axis=0)
+        mobility[start:stop] = np.median(
+            np.linalg.norm(block - median_positions[np.newaxis, :, :], axis=2), axis=0
+        )
+    return np.nan_to_num(mobility, nan=np.inf)
+
+
 def _build_surface_context(
     frames: Sequence[Atoms],
     axis: str,
     *,
     options: SurfaceEstimatorOptions,
+    _prepare_geometry: bool = True,
 ) -> _SurfaceAnalysisContext | None:
     axis_index = axis_to_index(axis)
     if not frames:
@@ -968,6 +982,7 @@ def _build_surface_context(
             frames,
             list(options.surface_elements) if options.surface_elements is not None else None,
             axis_index=axis_index,
+            _stable_layout=stable_layout,
         )
         if not resolved_elements:
             return None
@@ -993,17 +1008,23 @@ def _build_surface_context(
     if candidate_indices is not None and candidate_indices.size == 0:
         return None
 
-    candidate_positions: np.ndarray | None = None
     candidate_axis_values: np.ndarray | None = None
     candidate_masses: np.ndarray | None = None
-    translated_candidate_positions: np.ndarray | None = None
-    cell_lengths = _cell_lengths_if_periodic_all(frames)
-    if stable_layout and candidate_indices is not None and candidate_indices.size > 0:
+    candidate_mobility: np.ndarray | None = None
+    candidate_axis_medians: np.ndarray | None = None
+    cell_lengths = _cell_lengths_if_periodic_all(frames) if _prepare_geometry else None
+    if (
+        _prepare_geometry
+        and stable_layout
+        and candidate_indices is not None
+        and candidate_indices.size > 0
+    ):
         candidate_positions = np.stack(
             [np.asarray(frame.positions[candidate_indices], dtype=float) for frame in frames],
             axis=0,
         )
-        candidate_axis_values = np.asarray(candidate_positions[:, :, axis_index], dtype=float)
+        candidate_axis_values = candidate_positions[:, :, axis_index].copy()
+        candidate_axis_medians = np.median(candidate_axis_values, axis=0)
         candidate_masses = np.asarray(frames[0].get_masses(), dtype=float)[candidate_indices]
         unwrapped = (
             unwrap_positions(
@@ -1014,7 +1035,8 @@ def _build_surface_context(
             if cell_lengths is not None
             else candidate_positions
         )
-        translated_candidate_positions = unwrapped - np.median(unwrapped, axis=1, keepdims=True)
+        unwrapped -= np.median(unwrapped, axis=1, keepdims=True)
+        candidate_mobility = _candidate_mobility(unwrapped)
 
     return _SurfaceAnalysisContext(
         frames=frames,
@@ -1026,10 +1048,10 @@ def _build_surface_context(
         candidate_indices=None
         if candidate_indices is None
         else np.asarray(candidate_indices, dtype=int),
-        candidate_positions=candidate_positions,
         candidate_axis_values=candidate_axis_values,
         candidate_masses=candidate_masses,
-        translated_candidate_positions=translated_candidate_positions,
+        candidate_mobility=candidate_mobility,
+        candidate_axis_medians=candidate_axis_medians,
         cell_lengths=cell_lengths,
     )
 
@@ -1038,9 +1060,16 @@ def _candidate_axis_values_and_indices(
     context: _SurfaceAnalysisContext,
     frame_index: int,
 ) -> tuple[np.ndarray, np.ndarray]:
-    if context.candidate_indices is not None and context.candidate_axis_values is not None:
+    if context.candidate_indices is not None:
         return (
-            np.asarray(context.candidate_axis_values[frame_index], dtype=float),
+            np.asarray(
+                context.candidate_axis_values[frame_index]
+                if context.candidate_axis_values is not None
+                else context.frames[frame_index].positions[
+                    context.candidate_indices, context.axis_index
+                ],
+                dtype=float,
+            ),
             np.asarray(context.candidate_indices, dtype=int),
         )
     frame = context.frames[frame_index]
@@ -1570,21 +1599,14 @@ def _build_rough_estimate(context: _SurfaceAnalysisContext) -> SurfaceEstimate |
     if (
         context.stable_layout
         and context.candidate_indices is not None
-        and context.translated_candidate_positions is not None
+        and context.candidate_mobility is not None
         and context.candidate_axis_values is not None
-        and context.candidate_positions is not None
+        and context.candidate_axis_medians is not None
         and context.candidate_masses is not None
     ):
         candidate_count[:] = int(context.candidate_indices.size)
-        median_positions = np.median(context.translated_candidate_positions, axis=0)
-        mobility = np.median(
-            np.linalg.norm(
-                context.translated_candidate_positions - median_positions[np.newaxis, :, :], axis=2
-            ),
-            axis=0,
-        )
-        mobility = np.nan_to_num(mobility, nan=np.inf)
-        axis_medians = np.median(context.candidate_axis_values, axis=0)
+        mobility = context.candidate_mobility
+        axis_medians = context.candidate_axis_medians
         side_anchor = _side_outer_anchor(axis_medians, side=context.options.side)
         resolved_envelope = _resolve_rough_surface_envelope_A(
             axis_medians,
@@ -2282,7 +2304,8 @@ def _canonical_surface_frames(
         nan_period = np.full(len(frames), np.nan, dtype=float)
         return list(frames), zeros, zeros, nan_period, False
     lower, period = geometry
-    context = _build_surface_context(frames, axis, options=options)
+    # Periodic cuts need candidates, not their translated 3D mobility arrays.
+    context = _build_surface_context(frames, axis, options=options, _prepare_geometry=False)
     if context is None:
         zeros = np.zeros(len(frames), dtype=float)
         return list(frames), zeros, lower, period, False
@@ -2298,15 +2321,18 @@ def _canonical_surface_frames(
             lower=float(lower[frame_index]),
             period=float(period[frame_index]),
         )
-        copied = frame.copy()
-        positions = np.asarray(copied.positions, dtype=float).copy()
+        # Analysis-only geometry views share unchanged metadata/arrays. Only
+        # positions are owned by the view; the estimator never mutates metadata.
+        copied = copy(frame)
+        copied.arrays = frame.arrays.copy()
+        positions = np.asarray(frame.positions, dtype=float).copy()
         positions[:, axis_index] = _canonical_axis_values(
             positions[:, axis_index],
             lower=float(lower[frame_index]),
             period=float(period[frame_index]),
             cut=float(cuts[frame_index]),
         )
-        copied.positions = positions
+        copied.arrays["positions"] = positions
         canonical_frames.append(copied)
     return canonical_frames, cuts, lower, period, True
 
@@ -2317,7 +2343,7 @@ def _surface_reference_water_populations(
     *,
     report_progress: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
-    from .water import OHTopologyCache, water_molecule_triplets, water_triplet_geometry
+    from .water import OHTopologyCache, water_triplet_geometry
 
     axis_index = axis_to_index(reference.axis)
     top_counts = np.zeros(len(frames), dtype=int)
@@ -2325,7 +2351,6 @@ def _surface_reference_water_populations(
     topology_cache = OHTopologyCache(
         context="surface-layout water topology",
     )
-    reference_symbols = tuple(frames[0].get_chemical_symbols()) if frames else tuple()
     with ProgressBar(
         desc="Surface populations",
         total=len(frames),
@@ -2333,15 +2358,9 @@ def _surface_reference_water_populations(
         enabled=report_progress,
     ) as progress:
         for frame_index, frame in enumerate(frames):
-            if tuple(frame.get_chemical_symbols()) == reference_symbols:
-                triplets = topology_cache.select(frame, frame_index=frame_index).indices_for(
-                    "mol:H2O"
-                )
-            else:
-                # A cached atom-index topology cannot be transferred to a frame
-                # with a different composition/order. Variable-topology frames are
-                # uncommon and intentionally take the safe direct path.
-                triplets = water_molecule_triplets(frame)
+            # The shared resolver validates geometry and order for every frame,
+            # including variable layouts; no second selection/detection path.
+            triplets = topology_cache.select(frame, frame_index=frame_index).indices_for("mol:H2O")
             if triplets.size == 0:
                 progress.update()
                 continue

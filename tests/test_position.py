@@ -407,7 +407,7 @@ def test_save_and_load_position_profiles_filters_groups_and_legacy_ho(tmp_path):
     assert [profile.species for profile in loaded_oh] == ["mol:OH"]
 
 
-def test_position_topology_cache_reuses_stable_topology_between_validation_frames(monkeypatch):
+def test_position_topology_cache_is_exact_and_reused_across_analyses(monkeypatch):
     import linak.analysis.water as water_module
 
     frames = [
@@ -420,14 +420,14 @@ def test_position_topology_cache_reuses_stable_topology_between_validation_frame
         for _ in range(5)
     ]
     calls = 0
-    original = water_module.oh_molecule_topology
+    original = water_module._oh_molecule_topology_with_backend
 
     def _counting_topology(*args, **kwargs):
         nonlocal calls
         calls += 1
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(water_module, "oh_molecule_topology", _counting_topology)
+    monkeypatch.setattr(water_module, "_oh_molecule_topology_with_backend", _counting_topology)
 
     compute_position_profiles(
         frames,
@@ -436,7 +436,9 @@ def test_position_topology_cache_reuses_stable_topology_between_validation_frame
         oh_topology_stride=3,
     )
 
-    assert calls == 2
+    assert calls == len(frames)
+    compute_position_profiles(frames, species="molecules", surface_mode="none")
+    assert calls == len(frames)
 
 
 def test_save_and_load_position_profile(tmp_path):
@@ -841,7 +843,7 @@ def test_plot_position_profile_xy_z_distance_cutoff_raises_when_all_filtered():
         )
 
 
-def test_plot_position_profile_2d_projection_line_colors_uses_same_hue_dark_to_light_ramp():
+def test_plot_position_profile_2d_projection_preserves_individual_custom_colors():
     profile = compute_position_profile(
         _surface_test_frames(),
         species="O",
@@ -872,10 +874,7 @@ def test_plot_position_profile_2d_projection_line_colors_uses_same_hue_dark_to_l
     assert len(ax.collections) == 0
     rendered_colors = [line.get_color() for line in ax.lines]
     assert rendered_colors[0] != rendered_colors[1]
-    rendered_hls = [colorsys.rgb_to_hls(*mcolors.to_rgb(line.get_color())) for line in ax.lines]
-    assert rendered_hls[0][0] == pytest.approx(rendered_hls[1][0], abs=1.0e-3)
-    assert rendered_hls[0][2] == pytest.approx(rendered_hls[1][2], abs=1.0e-3)
-    assert rendered_hls[0][1] < rendered_hls[1][1]
+    assert rendered_colors == ["#ff0000", "#00ff00"]
     assert all(line.get_marker() in {"", "None", "none", " ", "NoneType"} for line in ax.lines)
 
 

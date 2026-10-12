@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
-from .settings_validation import validate_current_plot_settings
+from .settings_validation import validate_current_plot_settings, validate_source_descriptor
 
 import json
+import logging
 import queue
 from copy import deepcopy
 from dataclasses import dataclass
+from functools import partial
 import html
 from pathlib import Path
 import re
@@ -18,6 +20,8 @@ from typing import Any, Callable
 from uuid import uuid4
 
 import numpy as np
+
+from ..cancellation import ComputationCancelled, cancellation_scope
 
 from .data_contract import (
     PLOT_VIEW_1D_LINE,
@@ -148,7 +152,6 @@ _ERROR_STYLE_DISPLAY: dict[str, str] = {
     "whiskers": "Whiskers",
 }
 _ERROR_STYLE_INTERNAL: dict[str, str] = {v: k for k, v in _ERROR_STYLE_DISPLAY.items()}
-_GROUP_REDUCERS = ("mean", "median", "sum", "min", "max")
 _INTEGRATION_SOURCES = ("Plotted data", "Raw profile data")
 _INTEGRATION_SOURCE_BY_LABEL = {
     "Plotted data": "plotted",
@@ -391,7 +394,7 @@ _TOOLTIPS: dict[str, str] = {
     "profiles.export_json": "Saves this profile to a JSON file.",
     "export.transparent": "Saves the figure with a transparent background.",
     "export.figure": "Saves the current figure to an image file.",
-    "export.data": "Saves the current preview line data to a text data file.",
+    "export.data": "Saves the current preview line or 2D heatmap data to a text data file.",
     "data.density.x_values": "Chooses which source quantity is assigned to the x role.",
     "data.interface_view": (
         "Chooses the unfolded periodic cell, one outward-facing interface, the equal-weight "
@@ -470,8 +473,7 @@ _TOOLTIPS: dict[str, str] = {
     "data.section.y_reducer": "Chooses how each y-section is summarized.",
     "series.all_on": "Turns every series on.",
     "series.all_off": "Turns every series off.",
-    "series.duplicate": "Duplicates the selected base or grouped series.",
-    "series.add_group": "Adds a grouped series that can aggregate several loaded base series.",
+    "series.duplicate": "Duplicates the selected layer.",
     "series.show_in_legend": "Shows or hides this series in the legend.",
     "series.show_raw_line": "When off, the raw data line is hidden. Trendlines and cumulative averages remain visible if enabled.",
     "series.label": "Sets the legend name for this series.",
@@ -505,8 +507,6 @@ _TOOLTIPS: dict[str, str] = {
     "series.cumulative_show_in_legend": "Shows or hides the cumulative-average line in the legend.",
     "series.cumulative_label": "Sets the legend name for the cumulative-average line.",
     "series.cumulative.summary": "Shows the current cumulative-average derived-line status for this series.",
-    "series.group.reducer": "Chooses how the selected member series are aggregated into one grouped line.",
-    "series.group.members": "Chooses which loaded non-group base series contribute to this grouped line.",
     "annotations.list": "Shows the figure-level annotations applied on top of the current plot.",
     "annotations.add_text": "Adds a new text annotation.",
     "annotations.add_line": "Adds a new line annotation.",
@@ -1012,26 +1012,6 @@ def _resolve_series_id_order(series_ids: list[str], requested_order: list[str] |
     return resolved
 
 
-def _partition_series_ids_for_display_order(
-    series_ids: list[str],
-    *,
-    enabled_by_id: dict[str, bool],
-    group_by_id: dict[str, bool],
-) -> list[str]:
-    enabled_non_group_ids = [
-        series_id
-        for series_id in series_ids
-        if enabled_by_id.get(series_id, True) and not group_by_id.get(series_id, False)
-    ]
-    enabled_group_ids = [
-        series_id
-        for series_id in series_ids
-        if enabled_by_id.get(series_id, True) and group_by_id.get(series_id, False)
-    ]
-    disabled_ids = [series_id for series_id in series_ids if not enabled_by_id.get(series_id, True)]
-    return enabled_non_group_ids + enabled_group_ids + disabled_ids
-
-
 def _capture_series_list_view_anchor(
     rows: list[tuple[str, int, int]], *, viewport_height: int, scroll_value: int
 ) -> dict[str, int | str] | None:
@@ -1087,29 +1067,16 @@ def _coerce_series_descriptors(value: Any) -> list[dict[str, Any]]:
             continue
         series_id = str(raw.get("series_id") or f"series:{index}").strip() or f"series:{index}"
         default_label = str(raw.get("default_label") or "").strip()
-        source_kind = (
-            "group" if str(raw.get("source_kind") or "").strip().lower() == "group" else "source"
-        )
+        validate_source_descriptor(raw)
         source_series_id = str(raw.get("source_series_id") or "").strip()
         descriptors.append(
             {
+                **deepcopy(raw),
                 "series_id": series_id,
                 "default_label": default_label,
-                "source_kind": source_kind,
-                "source_series_id": (
-                    None if source_kind == "group" else source_series_id or series_id
-                ),
-                "is_generated": bool(raw.get("is_generated", source_kind == "group")),
-                "member_series_ids": [
-                    str(item).strip()
-                    for item in raw.get("member_series_ids", [])
-                    if str(item).strip()
-                ]
-                if isinstance(raw.get("member_series_ids"), (list, tuple))
-                else [],
-                "group_reducer": (
-                    str(raw.get("group_reducer") or "mean").strip().lower() or "mean"
-                ),
+                "source_kind": "source",
+                "source_series_id": source_series_id or series_id,
+                "is_generated": bool(raw.get("is_generated", False)),
                 "source_name": str(raw.get("source_name") or "").strip(),
                 "source_directory": str(raw.get("source_directory") or "").strip(),
                 "source_path": str(raw.get("source_path") or "").strip(),
@@ -1493,7 +1460,6 @@ class _LayerInspectorCapabilities:
     show_uncertainty: bool
     show_normalization: bool
     show_integration: bool
-    show_group_members: bool
     show_metadata: bool
     show_fit_editor: bool
     show_cumulative_editor: bool
@@ -1930,6 +1896,9 @@ def launch_plot_settings_panel(
             "Install PySide6 or use CLI plot flags."
         ) from exc
 
+    from .session_log import SessionLog
+    from .session_widgets import PreviewLoadingOverlay, SessionDiagnostics
+
     navigation_toolbar_type = None
     if NavigationToolbar2QT is not None:
 
@@ -2136,13 +2105,43 @@ def launch_plot_settings_panel(
                     if selected
                     else theme.get("series_row_text", "#e6edf7")
                 )
+                if kind == "species":
+                    font = painter.font()
+                    font.setBold(True)
+                    painter.setFont(font)
+                    painter.setPen(QPen(QColor(text_color)))
+                    marker = "\u25b6" if state.get("collapsed") else "\u25bc"
+                    label = f"{marker}  {state.get('text') or ''}"
+                    text_rect = option.rect.adjusted(38, 0, -10, 0)
+                    painter.drawText(
+                        text_rect,
+                        Qt.AlignmentFlag.AlignVCenter,
+                        painter.fontMetrics().elidedText(
+                            label, Qt.TextElideMode.ElideRight, text_rect.width()
+                        ),
+                    )
+                    box = self._checkbox_rect(option.rect)
+                    painter.drawRect(box)
+                    if state.get("checked"):
+                        painter.fillRect(box.adjusted(4, 4, -4, -4), QColor(text_color))
+                    elif state.get("partial"):
+                        painter.drawLine(
+                            box.left() + 4, box.center().y(), box.right() - 4, box.center().y()
+                        )
+                    return
                 if not enabled:
                     text_color = theme.get("series_row_disabled_text", "#8290a3")
 
                 checkbox_rect = self._checkbox_rect(option.rect)
                 painter.setPen(QPen(QColor(theme.get("series_row_swatch_border", "#46627f"))))
                 painter.setBrush(
-                    QBrush(QColor("#2fb7c9" if bool(state.get("checked", True)) else "#0f1a2a"))
+                    QBrush(
+                        QColor(
+                            theme.get("accent", "#2fb7c9")
+                            if bool(state.get("checked", True))
+                            else row_bg
+                        )
+                    )
                 )
                 painter.drawRoundedRect(checkbox_rect, 3, 3)
                 if bool(state.get("checked", True)):
@@ -2173,7 +2172,6 @@ def launch_plot_settings_panel(
                     x_cursor = swatch_rect.right() + 10
 
                 badge_text = {
-                    "group": "Group",
                     "copy": "Copy",
                     "original": "Original",
                     "fit": "Fit",
@@ -2184,19 +2182,20 @@ def launch_plot_settings_panel(
                     badge_rect.setWidth(96)
                     badge_rect.moveLeft(option.rect.right() - 168)
                 badge_prefix = (
-                    "series_badge_group"
-                    if layer_role.strip().lower() == "group"
-                    else "series_badge_copy"
+                    "series_badge_copy"
                     if layer_role.strip().lower() == "copy"
                     else "series_badge_original"
                 )
                 painter.setPen(QPen(QColor(theme.get(f"{badge_prefix}_border", "#4e6380"))))
                 painter.setBrush(QBrush(QColor(theme.get(f"{badge_prefix}_bg", "#1d2b42"))))
-                painter.drawRoundedRect(badge_rect, 6, 6)
+                show_badge = layer_role.strip().lower() != "original"
+                if show_badge:
+                    painter.drawRoundedRect(badge_rect, 6, 6)
                 painter.setPen(QPen(QColor(theme.get(f"{badge_prefix}_text", text_color))))
-                painter.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter, badge_text)
+                if show_badge:
+                    painter.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter, badge_text)
 
-                text_right = badge_rect.left() - 8
+                text_right = badge_rect.left() - 8 if show_badge else option.rect.right() - 8
                 if kind == "base":
                     text_right = min(text_right, self._up_rect(option.rect).left() - 8)
                 text_rect = QRect(
@@ -2213,7 +2212,9 @@ def launch_plot_settings_panel(
                 painter.drawText(
                     text_rect,
                     Qt.AlignmentFlag.AlignVCenter | Qt.TextFlag.TextSingleLine,
-                    str(state.get("text") or ""),
+                    painter.fontMetrics().elidedText(
+                        str(state.get("text") or ""), Qt.TextElideMode.ElideRight, text_rect.width()
+                    ),
                 )
 
                 if kind == "base":
@@ -2246,14 +2247,15 @@ def launch_plot_settings_panel(
         ) -> bool:  # pragma: no cover - UI flow
             if event.type() != QEvent.Type.MouseButtonRelease:
                 return super().editorEvent(event, model, option, index)
+            if event.button() != Qt.MouseButton.LeftButton:
+                return False
             pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
-            row = int(index.row())
-            state = self._row_state(index)
             if self._checkbox_rect(option.rect).contains(pos):
-                self._owner._handle_series_row_widget_toggle(
-                    row,
-                    not bool(state.get("checked", True)),
-                )
+                return False  # Checkbox presses are handled by the view.
+            state = self._row_state(index)
+            if state.get("kind") == "species":
+                species = str(state.get("species") or "")
+                self._owner._toggle_layer_species(species)
                 return True
             kind = str(state.get("kind") or "base")
             series_id = str(state.get("series_id") or "")
@@ -2272,9 +2274,41 @@ def launch_plot_settings_panel(
         def __init__(self, owner: Any, parent: QWidget | None = None) -> None:
             super().__init__(parent)
             self._series_model = _SeriesListModel(self)
+            self._visibility_click = False
             self.setModel(self._series_model)
             self.setItemDelegate(_SeriesListDelegate(owner, self))
             self.selectionModel().currentChanged.connect(self._emit_current_row_changed)
+
+        def mousePressEvent(self, event: Any) -> None:
+            index = self.indexAt(event.position().toPoint())
+            delegate = self.itemDelegate()
+            if (
+                event.button() == Qt.MouseButton.LeftButton
+                and index.isValid()
+                and delegate._checkbox_rect(self.visualRect(index)).contains(
+                    event.position().toPoint()
+                )
+            ):
+                # Handle the hit before Qt changes selection or rebuilds the
+                # inspector. A checkbox acts independently of the selected row.
+                self._visibility_click = True
+                state = delegate._row_state(index)
+                enabled = not bool(state.get("checked", True))
+                if state.get("kind") == "species":
+                    delegate._owner._set_species_layers_enabled(str(state["species"]), enabled)
+                else:
+                    delegate._owner._handle_series_row_widget_toggle(index.row(), enabled)
+                event.accept()
+                return
+            self._visibility_click = False
+            super().mousePressEvent(event)
+
+        def mouseReleaseEvent(self, event: Any) -> None:
+            if self._visibility_click and event.button() == Qt.MouseButton.LeftButton:
+                self._visibility_click = False
+                event.accept()
+                return
+            super().mouseReleaseEvent(event)
 
         def _emit_current_row_changed(self, current: QModelIndex, _previous: QModelIndex) -> None:
             self.currentRowChanged.emit(int(current.row()) if current.isValid() else -1)
@@ -2322,6 +2356,39 @@ def launch_plot_settings_panel(
 
         def notifyRowChanged(self, row: int) -> None:
             self._series_model.notify_row(row)
+
+        def keyPressEvent(self, event: Any) -> None:
+            state = self.currentIndex().data(_SERIES_ROW_STATE_ROLE)
+            owner = self.itemDelegate()._owner
+            if isinstance(state, dict):
+                if state.get("kind") == "species":
+                    species = str(state.get("species") or "")
+                    if event.key() == Qt.Key.Key_Space:
+                        owner._set_species_layers_enabled(species, not bool(state.get("checked")))
+                        event.accept()
+                        return
+                    if event.key() in (
+                        Qt.Key.Key_Return,
+                        Qt.Key.Key_Enter,
+                        Qt.Key.Key_Left,
+                        Qt.Key.Key_Right,
+                    ):
+                        collapsed = bool(state.get("collapsed"))
+                        if (
+                            event.key() not in (Qt.Key.Key_Left, Qt.Key.Key_Right)
+                            or (event.key() == Qt.Key.Key_Left and not collapsed)
+                            or (event.key() == Qt.Key.Key_Right and collapsed)
+                        ):
+                            owner._toggle_layer_species(species)
+                        event.accept()
+                        return
+                elif event.key() == Qt.Key.Key_Space:
+                    owner._handle_series_row_widget_toggle(
+                        self.currentRow(), not bool(state.get("checked"))
+                    )
+                    event.accept()
+                    return
+            super().keyPressEvent(event)
 
     class _AnnotationRowWidget(QWidget):
         def __init__(
@@ -2561,6 +2628,10 @@ def launch_plot_settings_panel(
             self.preview_canvas_container.setVisible(False)
             preview_frame_layout.addWidget(self.preview_canvas_container, stretch=1)
             layout.addWidget(self.preview_frame, stretch=1)
+            self.loading_overlay = PreviewLoadingOverlay(
+                self.preview_frame,
+                event_filter_owner._is_dark_theme,
+            )
 
     class _PreviewWorkerBridge(QObject):
         finished = Signal(int, object)
@@ -3000,6 +3071,8 @@ def launch_plot_settings_panel(
             self._series_active_is_fit_child = False
             self._series_active_is_cumulative_child = False
             self._series_display_rows: list[dict[str, Any]] = []
+            self._series_collapsed_species: set[str] = set()
+            self._series_species_members: dict[str, list[int]] = {}
             self._last_preview_state: dict[str, Any] = {}
             self._synced_field_modes: dict[str, str] = {}
             self._density_active_view_type = PLOT_VIEW_1D_LINE
@@ -3153,7 +3226,6 @@ def launch_plot_settings_panel(
             self._preview_worker_bridge = _PreviewWorkerBridge(self)
             self._preview_worker_bridge.finished.connect(self._handle_preview_worker_finished)
             self._preview_worker_bridge.failed.connect(self._handle_preview_worker_failed)
-            self._preview_worker_thread.start()
             self._closing = False
             self._preview_timer = QTimer(self)
             self._preview_timer.setSingleShot(True)
@@ -3162,7 +3234,10 @@ def launch_plot_settings_panel(
             self._preview_error: str | None = None
             self._theme_mode = "system"
             self._theme_switch: QCheckBox | None = None
-            self._status_label = QLabel("Ready.")
+            self._session_diagnostics = SessionDiagnostics(session_messages, self)
+            self._status_label = self._session_diagnostics.footer
+            self._status_label.activated.connect(self._open_session_logs)
+            self._status_label.setText("Ready.")
             self._build_ui()
             self._install_undo_event_filters()
             self._bind_undo_change_signals()
@@ -3184,6 +3259,7 @@ def launch_plot_settings_panel(
             except Exception:
                 self._saved_signature = None
             self._reset_undo_history()
+            self._preview_worker_thread.start()
             # Start the first render after the maximized window has entered the
             # event loop.  Rendering during construction contends with Qt's
             # initial layout and can leave the window looking unresponsive.
@@ -4556,7 +4632,8 @@ def launch_plot_settings_panel(
             for widget in self.findChildren(QLineEdit):
                 widget.installEventFilter(self)
             for widget in self.findChildren(QPlainTextEdit):
-                widget.installEventFilter(self)
+                if not widget.isReadOnly():
+                    widget.installEventFilter(self)
 
         def _bind_undo_change_signals(self) -> None:
             for widget in self.findChildren(QComboBox):
@@ -5181,9 +5258,6 @@ def launch_plot_settings_panel(
                     "series_badge_copy_bg": "#463a16",
                     "series_badge_copy_border": "#b9973d",
                     "series_badge_copy_text": "#ffe7a3",
-                    "series_badge_group_bg": "#173f35",
-                    "series_badge_group_border": "#39b990",
-                    "series_badge_group_text": "#cffff0",
                     "selected_card_bg": "#102f3a",
                     "selected_card_border": "#34bed1",
                     "nav_hover": "#182637",
@@ -5245,9 +5319,6 @@ def launch_plot_settings_panel(
                 "series_badge_copy_bg": "#fff0bd",
                 "series_badge_copy_border": "#c6941f",
                 "series_badge_copy_text": "#4f3600",
-                "series_badge_group_bg": "#d8f3e9",
-                "series_badge_group_border": "#15946f",
-                "series_badge_group_text": "#053e31",
                 "selected_card_bg": "#d7f1f4",
                 "selected_card_border": "#087982",
                 "nav_hover": "#edf4fa",
@@ -5574,6 +5645,7 @@ def launch_plot_settings_panel(
                 f"}}"
                 f"QAbstractItemView {{"
                 f"  background-color: {colors['panel_elevated']};"
+                f"  alternate-background-color: {colors['card_bg']};"
                 f"  color: {colors['text']};"
                 f"  selection-background-color: {colors['item_selected_bg']};"
                 f"  selection-color: {colors['item_selected_text']};"
@@ -5844,6 +5916,7 @@ def launch_plot_settings_panel(
             )
             if self._detached_preview_window is not None:
                 self._detached_preview_window.setStyleSheet(self.styleSheet())
+            self._status_label.set_dark(self._is_dark_theme())
 
         def _register_workspace_page(self, label: str, page: QWidget) -> None:
             if self._page_stack is None or self._nav_list is None:
@@ -5857,7 +5930,7 @@ def launch_plot_settings_panel(
                 "Profiles": "Save, load, duplicate, import, export, or reset plot presets.",
                 "Data": "Choose which stored data and view mode are sent into the plot.",
                 "Layers": (
-                    "Edit plotted layers here. Unsupported controls stay hidden so the inspector only shows meaningful options."
+                    "Toggle visibility with the checkboxes. Select a layer to edit its appearance."
                 ),
                 "Figure": (
                     "Adjust figure-wide styling, layout, axes, and heatmap presentation. "
@@ -6249,11 +6322,15 @@ def launch_plot_settings_panel(
             if self._preview_error:
                 warnings = [f"Preview paused: {self._preview_error}"] + list(warnings)
             if self._warning_summary_label is None:
-                current_status = self._status_label.text().strip()
-                if warnings and current_status in {"Ready.", "Preview updated.", "Preview ready."}:
-                    self._status_label.setText(f"Warning: {warnings[0]}")
-                elif not warnings and current_status.startswith("Warning:"):
-                    self._status_label.setText("Ready.")
+                previous = getattr(self, "_reported_validation_warnings", ())
+                for message in warnings:
+                    if message not in previous and not (
+                        self._preview_error and message.startswith("Preview paused:")
+                    ):
+                        session_messages.publish(
+                            f"Warning: {message}", level=logging.WARNING, source="Validation"
+                        )
+                self._reported_validation_warnings = tuple(warnings)
                 return
             if warnings:
                 self._warning_summary_label.setText(
@@ -7691,6 +7768,8 @@ def launch_plot_settings_panel(
             self.series_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
             self.series_list.setSpacing(2)
             self.series_list.setUniformItemSizes(True)
+            self.series_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            self.series_list.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
             self.series_list.currentRowChanged.connect(self._handle_series_list_selection_change)
             self._selected_layer_card = QFrame()
             self._selected_layer_card.setObjectName("selectedLayerCard")
@@ -7704,13 +7783,81 @@ def launch_plot_settings_panel(
             self._selected_layer_title = QLabel("No layer selected")
             self._selected_layer_title.setObjectName("selectedLayerTitle")
             selected_card_layout.addWidget(self._selected_layer_title, stretch=1)
+            self._layer_isolate_button = QPushButton("Isolate")
+            self._layer_isolate_button.setToolTip(
+                "Show only this layer. Undo restores the previous visibility."
+            )
+            self._layer_isolate_button.clicked.connect(self._isolate_active_layer)
+            selected_card_layout.addWidget(self._layer_isolate_button)
             self._selected_layer_badge = None
             self._selected_layer_state = None
             self._selected_layer_source = None
             self._series_delete_button = QPushButton("Delete Layer")
             self._series_delete_button.clicked.connect(self._delete_selected_series)
-            selected_card_layout.addWidget(self._series_delete_button)
-            tab_layout.addWidget(self._selected_layer_card)
+            self._selected_layer_title.setSizePolicy(
+                QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
+            )
+            self._layers_splitter = QSplitter(Qt.Orientation.Vertical, self._tab_series)
+            self._layers_splitter.setChildrenCollapsible(False)
+            browser = QWidget()
+            browser_layout = QVBoxLayout(browser)
+            browser_layout.setContentsMargins(0, 0, 0, 0)
+            browser_layout.setSpacing(6)
+            selector_row = QHBoxLayout()
+            for text, enabled in (("Show all", True), ("Hide all", False)):
+                button = QPushButton(text)
+                button.clicked.connect(
+                    lambda _checked=False, value=enabled: self._set_all_series_enabled(value)
+                )
+                selector_row.addWidget(button)
+            self._series_duplicate_button = QPushButton("Duplicate")
+            self._series_duplicate_button.clicked.connect(self._duplicate_selected_series)
+            self._series_duplicate_button.setToolTip("Duplicate the selected layer.")
+            selector_row.addWidget(self._series_duplicate_button)
+            self._series_delete_button.setText("Delete")
+            self._series_delete_button.setToolTip("Delete the selected copy.")
+            selector_row.addWidget(self._series_delete_button)
+            browser_layout.addLayout(selector_row)
+            browser_layout.addWidget(self._selected_layer_card)
+            filter_row = QHBoxLayout()
+            filter_row.addWidget(QLabel("Filter list"))
+            self._layer_search = QLineEdit()
+            self._layer_search.setPlaceholderText("Name, species, atom ID or file")
+            self._layer_search.setToolTip(
+                "Filter the layer list without changing the plot. "
+                "Show matches displays only matching layers; clearing the search restores the full list."
+            )
+            self._layer_search.setClearButtonEnabled(True)
+            self._layer_search.setAccessibleName("Search plot layers")
+            self._layer_search.textChanged.connect(self._filter_layer_browser)
+            filter_row.addWidget(self._layer_search, stretch=1)
+            browser_layout.addLayout(filter_row)
+            browser_actions = QHBoxLayout()
+            self._layer_match_buttons = []
+            for text, callback in (
+                ("Show matches", lambda: self._set_matching_layers_enabled(True)),
+                ("Hide matches", lambda: self._set_matching_layers_enabled(False)),
+            ):
+                button = QPushButton(text)
+                button.setToolTip(
+                    "Show matching layers and hide every other layer."
+                    if text == "Show matches"
+                    else "Hide matching layers; leave other layers unchanged."
+                )
+                button.clicked.connect(callback)
+                browser_actions.addWidget(button)
+                self._layer_match_buttons.append(button)
+            self._layer_count_label = QLabel()
+            self._layer_count_label.setObjectName("sectionNote")
+            browser_actions.addWidget(self._layer_count_label, stretch=1)
+            browser_layout.addLayout(browser_actions)
+            browser_layout.addWidget(self.series_list, stretch=1)
+            self._layer_empty_label = QLabel("No layers match. Clear the search to see all layers.")
+            self._layer_empty_label.setWordWrap(True)
+            self._layer_empty_label.setObjectName("sectionNote")
+            browser_layout.addWidget(self._layer_empty_label)
+            self.series_list.setMinimumHeight(160)
+            self._layers_splitter.addWidget(browser)
 
             scroll = QScrollArea(self._tab_series)
             scroll.setWidgetResizable(True)
@@ -7723,66 +7870,13 @@ def launch_plot_settings_panel(
                 QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred
             )
             scroll.setWidget(self._tab_series_content)
-            tab_layout.addWidget(scroll, stretch=1)
+            self._layers_splitter.addWidget(scroll)
+            self._layers_splitter.setStretchFactor(0, 1)
+            self._layers_splitter.setStretchFactor(1, 1)
+            self._layers_splitter.setSizes([300, 260])
+            tab_layout.addWidget(self._layers_splitter, stretch=1)
 
             layout = QVBoxLayout(self._tab_series_content)
-            selector_row = QHBoxLayout()
-            selector_row.addStretch(1)
-            enable_all_button = QPushButton("All on")
-            enable_all_button.clicked.connect(lambda: self._set_all_series_enabled(True))
-            self._register_tooltip(enable_all_button, "series.all_on")
-            self._apply_widget_tooltip(enable_all_button)
-            disable_all_button = QPushButton("All off")
-            disable_all_button.clicked.connect(lambda: self._set_all_series_enabled(False))
-            self._register_tooltip(disable_all_button, "series.all_off")
-            self._apply_widget_tooltip(disable_all_button)
-            selector_row.addWidget(enable_all_button)
-            selector_row.addWidget(disable_all_button)
-            self._series_duplicate_button = QPushButton("Duplicate")
-            self._series_duplicate_button.clicked.connect(self._duplicate_selected_series)
-            self._register_tooltip(self._series_duplicate_button, "series.duplicate")
-            self._apply_widget_tooltip(self._series_duplicate_button)
-            selector_row.addWidget(self._series_duplicate_button)
-            self._series_add_group_button = QPushButton("Add Group")
-            self._series_add_group_button.clicked.connect(self._add_group_series)
-            self._register_tooltip(self._series_add_group_button, "series.add_group")
-            self._apply_widget_tooltip(self._series_add_group_button)
-            selector_row.addWidget(self._series_add_group_button)
-            layout.addLayout(selector_row)
-            layout.addWidget(self.series_list)
-
-            group_group = QGroupBox("Group Members")
-            group_layout = QVBoxLayout(group_group)
-            group_note = QLabel(
-                "Grouped series aggregate several loaded base series after their current plot transforms. Grouped lines do not show error overlays in this pass."
-            )
-            group_note.setWordWrap(True)
-            group_layout.addWidget(group_note)
-            group_form = QFormLayout()
-            self._series_group_reducer = self._combo(_GROUP_REDUCERS)
-            self._series_group_reducer.currentTextChanged.connect(self._on_series_editor_changed)
-            self._add_form_row(
-                group_form,
-                "Reducer",
-                self._series_group_reducer,
-                tooltip_id="series.group.reducer",
-            )
-            group_layout.addLayout(group_form)
-            self._series_group_members = QListWidget()
-            self._series_group_members.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
-            self._series_group_members.itemChanged.connect(self._on_series_editor_changed)
-            self._register_tooltip(self._series_group_members, "series.group.members")
-            self._apply_widget_tooltip(self._series_group_members)
-            group_layout.addWidget(self._series_group_members)
-            self._series_group_summary = QLabel("This series is not grouped.")
-            self._series_group_summary.setWordWrap(True)
-            group_layout.addWidget(self._series_group_summary)
-            self._series_group_group = self._make_collapsible_section(
-                title="Group Members",
-                section_id="layers.group_members",
-                body_widget=group_group,
-            )
-            layout.addWidget(self._series_group_group)
 
             visibility_group = QGroupBox("Visibility and Label")
             visibility_form = QFormLayout(visibility_group)
@@ -7856,6 +7950,14 @@ def launch_plot_settings_panel(
                 tooltip_id="series.line_kwargs_json",
             )
             style_layout.addLayout(style_form)
+            if self._analysis_name == "position":
+                self._layer_copy_style_button = QPushButton("Apply this style to species")
+                self._layer_copy_style_button.setToolTip(
+                    "Copy color, opacity, line width, marker and line options to all trajectories of this species. "
+                    "Labels and visibility stay individual."
+                )
+                self._layer_copy_style_button.clicked.connect(self._copy_style_to_species)
+                style_layout.addWidget(self._layer_copy_style_button)
             self._series_style_group = self._make_collapsible_section(
                 title="Style",
                 section_id="layers.style",
@@ -8382,6 +8484,8 @@ def launch_plot_settings_panel(
             )
             layout.addWidget(self._series_metadata_group)
             layout.addStretch(1)
+            for form in self._tab_series_content.findChildren(QFormLayout):
+                form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
 
         def _build_annotations_tab(self) -> None:
             layout = QVBoxLayout(self._tab_annotations_content)
@@ -10052,20 +10156,13 @@ def launch_plot_settings_panel(
                     default_label = f"Series {index + 1}"
                 descriptor["series_id"] = str(descriptor.get("series_id") or f"series:{index}")
                 descriptor["default_label"] = default_label
-                source_kind = (
-                    "group"
-                    if str(descriptor.get("source_kind") or "").strip().lower() == "group"
-                    else "source"
-                )
+                validate_source_descriptor(descriptor)
+                source_kind = "source"
                 descriptor["source_kind"] = source_kind
-                descriptor["is_generated"] = bool(
-                    descriptor.get("is_generated", source_kind == "group")
+                descriptor["is_generated"] = bool(descriptor.get("is_generated", False))
+                descriptor["source_series_id"] = (
+                    str(descriptor.get("source_series_id") or "").strip() or descriptor["series_id"]
                 )
-                if source_kind != "group":
-                    descriptor["source_series_id"] = (
-                        str(descriptor.get("source_series_id") or "").strip()
-                        or descriptor["series_id"]
-                    )
                 previous = existing_by_id.get(descriptor["series_id"], {})
 
                 new_descriptors.append(descriptor)
@@ -10195,6 +10292,7 @@ def launch_plot_settings_panel(
                 str(descriptor.get("series_id") or f"series:{index}")
                 for index, descriptor in enumerate(self._series_descriptors_data)
             ]
+            self._materialize_series_colors()
             self._apply_series_id_order(existing_order)
 
             next_series_index = min(selected_series, count - 1)
@@ -10326,27 +10424,6 @@ def launch_plot_settings_panel(
                 setattr(self, name, [values[index] for index in indices])
             self._validate_series_state_lengths()
 
-        def _enabled_partitioned_series_id_order(self) -> list[str]:
-            current_ids = self._current_series_id_order()
-            enabled_by_id = {
-                str(descriptor.get("series_id") or f"series:{index}"): bool(
-                    self._series_enabled_data[index]
-                )
-                for index, descriptor in enumerate(self._series_descriptors_data)
-                if index < len(self._series_enabled_data)
-            }
-            group_by_id = {
-                str(descriptor.get("series_id") or f"series:{index}"): (
-                    str(descriptor.get("source_kind") or "source").strip().lower() == "group"
-                )
-                for index, descriptor in enumerate(self._series_descriptors_data)
-            }
-            return _partition_series_ids_for_display_order(
-                current_ids,
-                enabled_by_id=enabled_by_id,
-                group_by_id=group_by_id,
-            )
-
         def _restore_active_series_from_id(self, selected_id: str) -> None:
             if not selected_id:
                 return
@@ -10404,8 +10481,7 @@ def launch_plot_settings_panel(
             descriptor = self._series_descriptor(index)
             series_id = str(descriptor.get("series_id") or f"series:{index}").strip()
             source_kind = str(descriptor.get("source_kind") or "source").strip().lower()
-            is_group = source_kind == "group"
-            is_generated = is_group or bool(descriptor.get("is_generated", False))
+            is_generated = bool(descriptor.get("is_generated", False))
             return {
                 "series_id": series_id,
                 "descriptor": descriptor,
@@ -10422,18 +10498,20 @@ def launch_plot_settings_panel(
                     else True
                 ),
                 "source_kind": source_kind,
-                "is_group": is_group,
                 "is_generated": is_generated,
-                "layer_role": "group" if is_group else "copy" if is_generated else "original",
+                "layer_role": "copy" if is_generated else "original",
                 "source_series_id": str(
                     descriptor.get("source_series_id") or descriptor.get("series_id") or series_id
                 ).strip(),
-                "member_series_ids": [
-                    str(member_id).strip()
-                    for member_id in descriptor.get("member_series_ids", [])
-                    if str(member_id).strip()
-                ],
             }
+
+        def _materialize_series_colors(self) -> None:
+            # Bind automatic colors to layer identities before any reordering.
+            # The same values drive swatches, previews, exports and saved profiles.
+            self._series_colors_data = [
+                self._effective_series_color(index)
+                for index in range(len(self._series_descriptors_data))
+            ]
 
         def _effective_series_color(self, index: int) -> str:
             explicit_color = ""
@@ -10467,20 +10545,12 @@ def launch_plot_settings_panel(
 
         def _series_layer_role_label(self, index: int) -> str:
             return {
-                "group": "Group",
                 "copy": "Copy",
                 "original": "Original",
             }.get(self._series_layer_role(index), "Layer")
 
         def _series_source_summary(self, index: int) -> str:
             descriptor = self._series_descriptor(index)
-            if self._series_is_group(index):
-                member_ids = [
-                    str(value).strip()
-                    for value in descriptor.get("member_series_ids", [])
-                    if str(value).strip()
-                ]
-                return f"{len(member_ids)} member(s): {', '.join(member_ids) if member_ids else 'none'}"
             if self._series_is_generated(index):
                 source_id = str(descriptor.get("source_series_id") or "").strip()
                 return f"Copy of {source_id or 'source series'}"
@@ -10500,6 +10570,7 @@ def launch_plot_settings_panel(
             label = str(state["label"])
             if self._selected_layer_title is not None:
                 self._selected_layer_title.setText(label)
+                self._selected_layer_title.setToolTip(label)
             if self._selected_layer_swatch is not None:
                 color = str(state["color"])
                 swatch_color = QColor(color)
@@ -11716,8 +11787,6 @@ def launch_plot_settings_panel(
             for index, descriptor in enumerate(self._series_descriptors_data):
                 if index >= len(self._series_enabled_data):
                     continue
-                if str(descriptor.get("source_kind") or "source").strip().lower() == "group":
-                    continue
                 target = self._density_target_for_descriptor(descriptor)
                 self._series_enabled_data[index] = show_all or target == selected
             self._refresh_series_list_widgets()
@@ -12358,8 +12427,6 @@ def launch_plot_settings_panel(
                 return "cumulative"
             if self._series_active_is_fit_child:
                 return "fit"
-            if self._series_is_group(self._series_active_index):
-                return "group"
             return "source"
 
         def _current_layer_capabilities(self) -> _LayerInspectorCapabilities:
@@ -12386,7 +12453,6 @@ def launch_plot_settings_panel(
                     show_uncertainty=False,
                     show_normalization=False,
                     show_integration=False,
-                    show_group_members=False,
                     show_metadata=True,
                     show_fit_editor=False,
                     show_cumulative_editor=False,
@@ -12402,26 +12468,9 @@ def launch_plot_settings_panel(
                     show_uncertainty=False,
                     show_normalization=False,
                     show_integration=False,
-                    show_group_members=False,
                     show_metadata=False,
                     show_fit_editor=False,
                     show_cumulative_editor=False,
-                )
-            if layer_kind == "group":
-                return _LayerInspectorCapabilities(
-                    plot_family=plot_family,
-                    layer_kind=layer_kind,
-                    show_visibility_label=True,
-                    show_style=is_line_family,
-                    show_markers=is_line_family,
-                    show_derived_lines=is_line_family and active_layer_enabled,
-                    show_uncertainty=False,
-                    show_normalization=is_line_family,
-                    show_integration=is_line_family and active_layer_enabled,
-                    show_group_members=True,
-                    show_metadata=True,
-                    show_fit_editor=is_line_family and active_layer_enabled,
-                    show_cumulative_editor=is_line_family and active_layer_enabled,
                 )
             if layer_kind == "fit":
                 return _LayerInspectorCapabilities(
@@ -12434,7 +12483,6 @@ def launch_plot_settings_panel(
                     show_uncertainty=False,
                     show_normalization=False,
                     show_integration=False,
-                    show_group_members=False,
                     show_metadata=False,
                     show_fit_editor=is_line_family and active_layer_enabled,
                     show_cumulative_editor=False,
@@ -12450,7 +12498,6 @@ def launch_plot_settings_panel(
                     show_uncertainty=False,
                     show_normalization=False,
                     show_integration=False,
-                    show_group_members=False,
                     show_metadata=False,
                     show_fit_editor=False,
                     show_cumulative_editor=is_line_family and active_layer_enabled,
@@ -12465,7 +12512,6 @@ def launch_plot_settings_panel(
                 show_uncertainty=self._error_supported_for_current_view() and active_layer_enabled,
                 show_normalization=is_line_family,
                 show_integration=is_line_family and active_layer_enabled,
-                show_group_members=False,
                 show_metadata=True,
                 show_fit_editor=is_line_family
                 and active_layer_enabled
@@ -12507,8 +12553,6 @@ def launch_plot_settings_panel(
             return f"cumulative::{self._series_descriptor(index).get('series_id') or f'series:{index}'}"
 
         def _available_error_stats_for_series(self, index: int) -> list[str]:
-            if self._series_is_group(index):
-                return []
             descriptor = self._series_descriptor(index)
             series_id = str(descriptor.get("series_id") or f"series:{index}")
             raw = self._last_preview_state.get("series_available_error_stats")
@@ -12540,8 +12584,6 @@ def launch_plot_settings_panel(
             )
 
         def _current_error_statistics_mode_for_series(self, index: int) -> str | None:
-            if self._series_is_group(index):
-                return None
             _ = index
             return _current_error_statistics_mode(
                 analysis_name=self._analysis_name,
@@ -12566,12 +12608,6 @@ def launch_plot_settings_panel(
             return summary if isinstance(summary, dict) else None
 
         def _error_availability_for_series(self, index: int) -> Any:
-            if self._series_is_group(index):
-                return resolve_series_error_availability(
-                    supported_for_view=False,
-                    available_stats=[],
-                    error_reason="Grouped series do not support uncertainty overlays.",
-                )
             summary = self._preview_error_summary_for_series(index)
             reason = summary.get("reason") if isinstance(summary, dict) else None
             if reason is None and not self._error_supported_for_current_view():
@@ -12723,37 +12759,12 @@ def launch_plot_settings_panel(
                 override = self._series_fit_label_overrides_data[index].strip()
             return override or f"{self._effective_series_label(index)} fit"
 
-        def _series_is_group(self, index: int) -> bool:
-            descriptor = self._series_descriptor(index)
-            return str(descriptor.get("source_kind") or "source").strip().lower() == "group"
-
         def _series_is_generated(self, index: int) -> bool:
             descriptor = self._series_descriptor(index)
-            return self._series_is_group(index) or bool(descriptor.get("is_generated", False))
+            return bool(descriptor.get("is_generated", False))
 
         def _series_layer_role(self, index: int) -> str:
-            if self._series_is_group(index):
-                return "group"
             return "copy" if self._series_is_generated(index) else "original"
-
-        def _group_member_candidate_indices(self) -> list[int]:
-            candidates: list[int] = []
-            for index, descriptor in enumerate(self._series_descriptors_data):
-                if str(descriptor.get("source_kind") or "source").strip().lower() != "group":
-                    candidates.append(index)
-            return candidates
-
-        def _next_group_label(self) -> str:
-            existing = {
-                self._effective_series_label(index).strip().lower()
-                for index in range(len(self._series_labels_data))
-                if self._effective_series_label(index).strip()
-            }
-            for number in range(1, 1000):
-                candidate = f"Group {number}"
-                if candidate.strip().lower() not in existing:
-                    return candidate
-            return f"Group {len(self._series_labels_data) + 1}"
 
         def _default_generated_series_color(self, index: int) -> str:
             generated_series_ids = [
@@ -12780,13 +12791,10 @@ def launch_plot_settings_panel(
             descriptor["series_id"] = f"{source_kind}:{uuid4().hex}"
             descriptor["default_label"] = f"{base_label} Copy"
             descriptor["is_generated"] = True
-            if source_kind != "group":
-                descriptor["source_kind"] = "source"
-                descriptor["source_series_id"] = str(
-                    descriptor.get("source_series_id") or ""
-                ).strip() or str(
-                    self._series_descriptor(index).get("series_id") or f"series:{index}"
-                )
+            descriptor["source_kind"] = "source"
+            descriptor["source_series_id"] = str(
+                descriptor.get("source_series_id") or ""
+            ).strip() or str(self._series_descriptor(index).get("series_id") or f"series:{index}")
             insert_at = index + 1
 
             def _insert(values: list[Any], copied: Any) -> None:
@@ -12864,113 +12872,14 @@ def launch_plot_settings_panel(
             self._set_active_series_child_kind("base")
             self._clone_series_at_index(self._series_active_index)
 
-        def _add_group_series(self) -> None:
-            self._persist_active_series_editor()
-            base_members = [
-                str(self._series_descriptor(index).get("series_id") or f"series:{index}")
-                for index in self._group_member_candidate_indices()
-            ]
-            active_series_id = str(
-                self._series_descriptor(self._series_active_index).get("series_id")
-                or f"series:{self._series_active_index}"
-            )
-            if active_series_id in base_members:
-                member_series_ids = [active_series_id]
-            else:
-                member_series_ids = base_members[:1]
-            descriptor = {
-                "series_id": f"group:{uuid4().hex}",
-                "default_label": self._next_group_label(),
-                "source_kind": "group",
-                "is_generated": True,
-                "member_series_ids": member_series_ids,
-                "group_reducer": "mean",
-                "source_name": "Grouped series",
-                "source_directory": "",
-                "source_path": "",
-            }
-            self._series_descriptors_data.append(descriptor)
-            self._series_labels_data.append(str(descriptor["default_label"]))
-            self._series_label_overrides_data.append("")
-            self._series_colors_data.append(
-                self._default_generated_series_color(len(self._series_descriptors_data) - 1)
-            )
-            self._series_enabled_data.append(True)
-            self._series_show_in_legend_data.append(True)
-            self._series_show_raw_line_data.append(True)
-            self._series_alpha_data.append("")
-            self._series_error_enabled_data.append(False)
-            self._series_error_stats_data.append("sample_sem")
-            self._series_error_styles_data.append("band")
-            self._series_error_colors_data.append("")
-            self._series_error_label_overrides_data.append("")
-            self._series_error_show_in_legend_data.append(False)
-            self._series_fit_enabled_data.append(False)
-            self._series_fit_label_overrides_data.append("")
-            self._series_fit_show_in_legend_data.append(True)
-            self._series_fit_types_data.append("linear")
-            self._series_fit_degrees_data.append("2")
-            self._series_fit_range_modes_data.append("visible")
-            self._series_fit_x_mins_data.append("")
-            self._series_fit_x_maxs_data.append("")
-            self._series_fit_color_data.append("")
-            self._series_fit_alpha_data.append("")
-            self._series_fit_line_width_data.append("")
-            self._series_fit_line_style_data.append("")
-            self._series_cumulative_enabled_data.append(False)
-            self._series_cumulative_label_overrides_data.append("")
-            self._series_cumulative_show_in_legend_data.append(True)
-            self._series_cumulative_color_data.append("")
-            self._series_cumulative_alpha_data.append("")
-            self._series_cumulative_line_width_data.append("")
-            self._series_cumulative_line_style_data.append("")
-            self._series_integration_enabled_data.append(False)
-            self._series_integration_source_data.append("Plotted data")
-            self._series_integration_x_min_data.append("")
-            self._series_integration_x_max_data.append("")
-            self._series_integration_baseline_data.append("0.0")
-            self._series_integration_color_mode_data.append("Auto")
-            self._series_integration_color_data.append("")
-            self._series_integration_alpha_data.append("0.25")
-            self._series_line_widths_data.append("")
-            self._series_markers_data.append("")
-            self._series_line_kwargs_data.append("")
-            self._series_normalization_modes_data.append("none")
-            self._series_normalization_values_data.append("")
-            self._series_normalization_x_refs_data.append("")
-            self._validate_series_state_lengths()
-            self._apply_series_id_order(self._enabled_partitioned_series_id_order())
-            self._series_active_index = self._current_series_id_order().index(
-                str(descriptor["series_id"])
-            )
-            self._set_active_series_child_kind("base")
-            self._sync_series_selection_widgets(self._series_active_index)
-            self._load_series_into_editor(self._series_active_index)
-            self._record_history_after_non_text_change()
-            self._schedule_preview_update()
-
         def _delete_series_at_index(self, index: int) -> None:
             if index < 0 or index >= len(self._series_descriptors_data):
                 return
             if not self._series_is_generated(index):
                 return
-            removed_id = str(
-                self._series_descriptors_data[index].get("series_id") or f"series:{index}"
-            )
             for _name, values in self._iter_series_state_lists():
                 if index < len(values):
                     values.pop(index)
-            for descriptor_index, descriptor in enumerate(self._series_descriptors_data):
-                if str(descriptor.get("source_kind") or "source").strip().lower() != "group":
-                    continue
-                member_ids = [
-                    str(member_id).strip()
-                    for member_id in descriptor.get("member_series_ids", [])
-                    if str(member_id).strip() and str(member_id).strip() != removed_id
-                ]
-                updated = dict(descriptor)
-                updated["member_series_ids"] = member_ids
-                self._series_descriptors_data[descriptor_index] = updated
             self._validate_series_state_lengths()
             self._series_active_index = min(index, max(0, len(self._series_descriptors_data) - 1))
             self._set_active_series_child_kind("base")
@@ -12987,9 +12896,146 @@ def launch_plot_settings_panel(
 
         def _rebuild_series_display_rows(self) -> None:
             rows: list[dict[str, Any]] = []
-            for index in range(len(self._series_labels_data)):
-                rows.append({"kind": "base", "base_index": index})
+            self._series_species_members = {}
+            if self._analysis_name == "position":
+                for index in range(len(self._series_labels_data)):
+                    species = self._layer_species(index)
+                    self._series_species_members.setdefault(species, []).append(index)
+                for species, members in self._series_species_members.items():
+                    rows.append({"kind": "species", "species": species, "base_index": -1})
+                    rows.extend(
+                        {"kind": "base", "base_index": index, "species": species}
+                        for index in members
+                    )
+            else:
+                for index in range(len(self._series_labels_data)):
+                    rows.append({"kind": "base", "base_index": index})
             self._series_display_rows = rows
+
+        def _layer_species(self, index: int) -> str:
+            descriptor = self._series_descriptor(index)
+            species = str(descriptor.get("position_species") or "").strip()
+            if species:
+                return species
+            label = str(descriptor.get("default_label") or self._series_labels_data[index])
+            token = label.split("[", 1)[0].strip()
+            match = re.search(r"(mol:(?:H3O|H2O|OH|H|O)|[A-Z][a-z]?)$", token)
+            return match.group(1) if match is not None else token or "Trajectories"
+
+        def _matching_layer_indices(self) -> list[int]:
+            query = self._layer_search.text().strip().casefold()
+            matches = []
+            for index in range(len(self._series_labels_data)):
+                descriptor = self._series_descriptor(index)
+                text = " ".join(
+                    (
+                        self._effective_series_label(index),
+                        str(descriptor.get("default_label") or ""),
+                        str(descriptor.get("source_name") or ""),
+                        Path(str(descriptor.get("source_path") or "")).name,
+                        self._layer_species(index),
+                    )
+                )
+                if all(part in text.casefold() for part in query.split()):
+                    matches.append(index)
+            return matches
+
+        def _filter_layer_browser(self, *_unused: object) -> None:
+            if not hasattr(self, "_layer_search"):
+                return
+            matches = set(self._matching_layer_indices())
+            searching = bool(self._layer_search.text().strip())
+            for row, descriptor in enumerate(self._series_display_rows):
+                species = str(descriptor.get("species") or "")
+                if descriptor.get("kind") == "species":
+                    hidden = not matches.intersection(self._series_species_members.get(species, []))
+                else:
+                    hidden = int(descriptor.get("base_index", -1)) not in matches or (
+                        species in self._series_collapsed_species and not searching
+                    )
+                self.series_list.setRowHidden(row, hidden)
+            shown = len(matches)
+            enabled = sum(bool(value) for value in self._series_enabled_data)
+            count_text = f"{shown} matches" if searching else f"{shown} layers"
+            self._layer_count_label.setText(f"{count_text} · {enabled} visible")
+            for button in self._layer_match_buttons:
+                button.setEnabled(searching)
+            self._layer_empty_label.setVisible(shown == 0)
+            self._layer_count_label.setToolTip(
+                f"{shown} matching layers of {len(self._series_labels_data)} total. "
+                f"{enabled} layers are enabled in the plot. Searching does not change the plot."
+            )
+
+        def _toggle_layer_species(self, species: str) -> None:
+            if species in self._series_collapsed_species:
+                self._series_collapsed_species.remove(species)
+            else:
+                self._series_collapsed_species.add(species)
+            self._filter_layer_browser()
+            for row, descriptor in enumerate(self._series_display_rows):
+                if descriptor.get("kind") == "species":
+                    self._apply_series_list_item_visuals(self.series_list.item(row), row)
+
+        def _set_layer_indices_enabled(
+            self, indices: list[int], enabled: bool, *, exclusive: bool = False
+        ) -> None:
+            if not indices and not exclusive:
+                return
+            self._persist_active_series_editor()
+            if exclusive:
+                self._series_enabled_data = [False] * len(self._series_enabled_data)
+            if enabled and indices and self._is_orientation_heatmap_mode():
+                # Heatmaps have one active source; never enable several incompatible sources.
+                self._series_enabled_data = [
+                    index == indices[0] for index in range(len(self._series_enabled_data))
+                ]
+            else:
+                for index in indices:
+                    self._series_enabled_data[index] = enabled
+            self._series_syncing = True
+            try:
+                self._refresh_series_list_widgets()
+            finally:
+                self._series_syncing = False
+            self._record_history_after_non_text_change()
+            self._schedule_or_apply_series_preview_update(force_full_render=True)
+
+        def _set_matching_layers_enabled(self, enabled: bool) -> None:
+            self._set_layer_indices_enabled(
+                self._matching_layer_indices(), enabled, exclusive=enabled
+            )
+
+        def _isolate_active_layer(self) -> None:
+            if not 0 <= self._series_active_index < len(self._series_enabled_data):
+                return
+            self._persist_active_series_editor()
+            self._series_enabled_data = [False] * len(self._series_enabled_data)
+            self._set_layer_indices_enabled([self._series_active_index], True)
+
+        def _copy_style_to_species(self) -> None:
+            if not 0 <= self._series_active_index < len(self._series_labels_data):
+                return
+            self._persist_active_series_editor()
+            index = self._series_active_index
+            members = self._series_species_members.get(self._layer_species(index), [index])
+            color = self._effective_series_color(index)
+            for member in members:
+                self._series_colors_data[member] = color
+            for values in (
+                self._series_alpha_data,
+                self._series_line_widths_data,
+                self._series_markers_data,
+                self._series_line_kwargs_data,
+            ):
+                for member in members:
+                    values[member] = deepcopy(values[index])
+            self._load_series_into_editor(index)
+            self._refresh_series_list_widgets()
+            self._record_history_after_non_text_change()
+            self._schedule_or_apply_series_preview_update()
+
+        def _set_species_layers_enabled(self, species: str, enabled: bool) -> None:
+            self._set_layer_indices_enabled(self._series_species_members.get(species, []), enabled)
 
         def _display_row(self, row: int) -> dict[str, Any]:
             if 0 <= row < len(self._series_display_rows):
@@ -13013,8 +13059,6 @@ def launch_plot_settings_panel(
             base_index = int(descriptor.get("base_index", 0))
             kind = str(descriptor.get("kind") or "base")
             base_label = self._effective_series_label(base_index)
-            if self._series_is_group(base_index):
-                base_label = f"{base_label} [Group]"
             if kind == "cumulative":
                 enabled = base_index < len(self._series_cumulative_enabled_data) and bool(
                     self._series_cumulative_enabled_data[base_index]
@@ -13068,10 +13112,6 @@ def launch_plot_settings_panel(
                 tooltip_lines.append("Derived series: cumulative average")
                 tooltip_lines.append(f"Series id: {self._cumulative_child_series_id(base_index)}")
             else:
-                if self._series_is_group(base_index):
-                    tooltip_lines.append(
-                        f"Grouped members: {', '.join(self._series_descriptor(base_index).get('member_series_ids', [])) or 'none'}"
-                    )
                 tooltip_lines.append(
                     f"Series id: {descriptor.get('series_id') or f'series:{base_index}'}"
                 )
@@ -13108,15 +13148,10 @@ def launch_plot_settings_panel(
                         if i != index:
                             self._series_enabled_data[i] = False
                 self._series_enabled_data[index] = checked
-                if not checked:
-                    self._series_fit_enabled_data[index] = False
-                    self._series_cumulative_enabled_data[index] = False
-                    self._series_error_enabled_data[index] = False
-                self._apply_series_id_order(self._enabled_partitioned_series_id_order())
                 self._restore_active_series_from_id(selected_id)
             self._series_syncing = True
             try:
-                self._sync_series_selection_widgets(self._series_active_index)
+                self._refresh_series_list_widgets()
             finally:
                 self._series_syncing = False
             if index == self._series_active_index:
@@ -13139,6 +13174,13 @@ def launch_plot_settings_panel(
             except ValueError:
                 return
             target_index = min(max(current_index + delta, 0), len(current_ids) - 1)
+            if self._analysis_name == "position":
+                members = self._series_species_members.get(self._layer_species(current_index), [])
+                rank = members.index(current_index)
+                target_rank = rank + delta
+                if not 0 <= target_rank < len(members):
+                    return
+                target_index = members[target_rank]
             if target_index == current_index:
                 return
             selected_id = self._active_series_row_id()
@@ -13321,6 +13363,7 @@ def launch_plot_settings_panel(
                 return
             for index in range(self.series_list.count()):
                 self._apply_series_list_item_visuals(self.series_list.item(index), index)
+            self._filter_layer_browser()
 
         def _current_series_list_view_anchor(self) -> dict[str, int | str] | None:
             if not hasattr(self, "series_list") or self.series_list is None:
@@ -13331,7 +13374,7 @@ def launch_plot_settings_panel(
             rows: list[tuple[str, int, int]] = []
             for row in range(self.series_list.count()):
                 item = self.series_list.item(row)
-                if item is None:
+                if item is None or self.series_list.isRowHidden(row):
                     continue
                 row_id = str(item.data(Qt.ItemDataRole.UserRole) or "").strip()
                 if not row_id:
@@ -13351,7 +13394,7 @@ def launch_plot_settings_panel(
             row_tops: dict[str, int] = {}
             for row in range(self.series_list.count()):
                 item = self.series_list.item(row)
-                if item is None:
+                if item is None or self.series_list.isRowHidden(row):
                     continue
                 row_id = str(item.data(Qt.ItemDataRole.UserRole) or "").strip()
                 if not row_id:
@@ -13409,6 +13452,31 @@ def launch_plot_settings_panel(
             if item is None or index < 0:
                 return
             row_descriptor = self._display_row(index)
+            if row_descriptor.get("kind") == "species":
+                species = str(row_descriptor["species"])
+                members = self._series_species_members.get(species, [])
+                enabled_count = sum(bool(self._series_enabled_data[member]) for member in members)
+                item.setData(Qt.ItemDataRole.UserRole, f"species:{species}")
+                item.setData(Qt.ItemDataRole.UserRole + 1, "species")
+                item.setToolTip(
+                    f"{species}: {len(members)} trajectories, {enabled_count} visible. "
+                    "Click the heading to collapse or expand. Click its checkbox to show or hide the species. "
+                    "Keyboard: Left/Right to collapse/expand, Space to toggle visibility."
+                )
+                item.setData(
+                    _SERIES_ROW_STATE_ROLE,
+                    {
+                        "kind": "species",
+                        "species": species,
+                        "theme": self._theme_tokens(),
+                        "text": f"{species} · {len(members)} trajectories · {enabled_count} visible",
+                        "checked": enabled_count == len(members),
+                        "partial": 0 < enabled_count < len(members),
+                        "collapsed": species in self._series_collapsed_species,
+                    },
+                )
+                self.series_list.notifyRowChanged(index)
+                return
             base_index = int(row_descriptor.get("base_index", -1))
             if base_index < 0 or base_index >= len(self._series_enabled_data):
                 return
@@ -13466,6 +13534,7 @@ def launch_plot_settings_panel(
                 else str(base_state["layer_role"])
             )
             series_id = str(item.data(Qt.ItemDataRole.UserRole) or "")
+            group_members = self._series_species_members.get(self._layer_species(base_index), [])
             item.setData(
                 _SERIES_ROW_STATE_ROLE,
                 {
@@ -13476,8 +13545,12 @@ def launch_plot_settings_panel(
                     "color_token": color_token,
                     "kind": kind,
                     "layer_role": layer_role,
-                    "can_move_up": base_index > 0,
-                    "can_move_down": base_index < len(self._series_labels_data) - 1,
+                    "can_move_up": base_index != group_members[0]
+                    if group_members
+                    else base_index > 0,
+                    "can_move_down": base_index != group_members[-1]
+                    if group_members
+                    else base_index < len(self._series_labels_data) - 1,
                     "tooltip_text": item.toolTip(),
                     "theme": self._theme_tokens(),
                     "series_id": series_id,
@@ -13505,6 +13578,7 @@ def launch_plot_settings_panel(
                     self.series_list.setCurrentRow(row)
                     self._restore_series_list_view_anchor(view_anchor)
                     self._refresh_series_list_widgets()
+                self._filter_layer_browser()
             finally:
                 self.series_list.setUpdatesEnabled(True)
                 self.series_list.blockSignals(old_signal_block)
@@ -13867,7 +13941,34 @@ def launch_plot_settings_panel(
             )
             hint.setWordWrap(True)
             layout.addWidget(hint)
+            self._logs_section = self._make_collapsible_section(
+                title="Logs",
+                section_id="advanced.logs",
+                body_widget=self._session_diagnostics.body,
+            )
+            self._logs_section.setMaximumWidth(960)
+            layout.addWidget(self._logs_section)
             layout.addStretch(1)
+
+        def _open_session_logs(self) -> None:
+            if self._nav_list is not None:
+                for index in range(self._nav_list.count()):
+                    if self._nav_list.item(index).text() == "Advanced":
+                        self._nav_list.setCurrentRow(index)
+                        break
+            self._logs_section.set_expanded(True, animate=False)
+
+            def reveal() -> None:
+                if self._closing:
+                    return
+                scroll = self._tab_advanced.findChild(QScrollArea)
+                if scroll is not None:
+                    scroll.ensureWidgetVisible(self._logs_section)
+                viewer = self._session_diagnostics.viewer
+                viewer.verticalScrollBar().setValue(viewer.verticalScrollBar().maximum())
+                viewer.setFocus(Qt.FocusReason.OtherFocusReason)
+
+            QTimer.singleShot(0, reveal)
 
         def _apply_preview_cache_budget(self) -> None:
             from ..cache import PREVIEW_CACHE
@@ -14013,20 +14114,13 @@ def launch_plot_settings_panel(
                     default_label = fallback_label
                 descriptor["series_id"] = str(descriptor.get("series_id") or f"series:{index}")
                 descriptor["default_label"] = default_label
-                source_kind = (
-                    "group"
-                    if str(descriptor.get("source_kind") or "").strip().lower() == "group"
-                    else "source"
-                )
+                validate_source_descriptor(descriptor)
+                source_kind = "source"
                 descriptor["source_kind"] = source_kind
-                descriptor["is_generated"] = bool(
-                    descriptor.get("is_generated", source_kind == "group")
+                descriptor["is_generated"] = bool(descriptor.get("is_generated", False))
+                descriptor["source_series_id"] = (
+                    str(descriptor.get("source_series_id") or "").strip() or descriptor["series_id"]
                 )
-                if source_kind != "group":
-                    descriptor["source_series_id"] = (
-                        str(descriptor.get("source_series_id") or "").strip()
-                        or descriptor["series_id"]
-                    )
                 self._series_descriptors_data.append(descriptor)
                 self._series_labels_data.append(default_label)
 
@@ -14334,6 +14428,7 @@ def launch_plot_settings_panel(
                     str(descriptor.get("series_id") or f"series:{index}")
                     for index, descriptor in enumerate(self._series_descriptors_data)
                 ]
+                self._materialize_series_colors()
                 self._apply_series_id_order(_coerce_series_order(settings.get("series_order")))
                 self._validate_series_state_lengths()
                 selected = self._series_active_index if self._series_active_index < count else 0
@@ -14477,45 +14572,6 @@ def launch_plot_settings_panel(
                     self._set_combo_value(
                         self._series_fit_line_style, self._series_fit_line_style_data[index]
                     )
-                if hasattr(self, "_series_group_reducer"):
-                    descriptor = self._series_descriptor(index)
-                    reducer = (
-                        str(descriptor.get("group_reducer") or "mean").strip().lower() or "mean"
-                    )
-                    self._set_combo_value(self._series_group_reducer, reducer)
-                if hasattr(self, "_series_group_members"):
-                    self._series_group_members.blockSignals(True)
-                    try:
-                        self._series_group_members.clear()
-                        descriptor = self._series_descriptor(index)
-                        selected_ids = {
-                            str(value).strip()
-                            for value in descriptor.get("member_series_ids", [])
-                            if str(value).strip()
-                        }
-                        for candidate_index in self._group_member_candidate_indices():
-                            candidate_descriptor = self._series_descriptor(candidate_index)
-                            candidate_id = str(
-                                candidate_descriptor.get("series_id") or f"series:{candidate_index}"
-                            )
-                            candidate_role = self._series_layer_role(candidate_index).title()
-                            item = QListWidgetItem(
-                                f"{self._effective_series_label(candidate_index)} [{candidate_role}]"
-                            )
-                            item.setData(Qt.ItemDataRole.UserRole, candidate_id)
-                            item.setFlags(
-                                item.flags()
-                                | Qt.ItemFlag.ItemIsUserCheckable
-                                | Qt.ItemFlag.ItemIsEnabled
-                            )
-                            item.setCheckState(
-                                Qt.CheckState.Checked
-                                if candidate_id in selected_ids
-                                else Qt.CheckState.Unchecked
-                            )
-                            self._series_group_members.addItem(item)
-                    finally:
-                        self._series_group_members.blockSignals(False)
                 self.series_line_kwargs_json.setPlainText(self._series_line_kwargs_data[index])
                 self._load_normalization_into_editor(index)
                 for widget in (
@@ -14560,7 +14616,6 @@ def launch_plot_settings_panel(
             finally:
                 self._series_syncing = False
             self._update_series_metadata_panel(self._series_active_index)
-            self._update_series_group_summary(self._series_active_index)
             self._update_series_error_summary(self._series_active_index)
             self._update_series_cumulative_summary(self._series_active_index)
             self._update_series_fit_summary(self._series_active_index)
@@ -14704,7 +14759,6 @@ def launch_plot_settings_panel(
             finally:
                 self._series_syncing = False
             self._update_series_metadata_panel(index)
-            self._update_series_group_summary(index)
             self._update_series_error_summary(index)
             self._update_series_cumulative_summary(index)
             self._update_series_fit_summary(index)
@@ -14860,7 +14914,6 @@ def launch_plot_settings_panel(
             finally:
                 self._series_syncing = False
             self._update_series_metadata_panel(index)
-            self._update_series_group_summary(index)
             self._update_series_error_summary(index)
             self._update_series_cumulative_summary(index)
             self._update_series_fit_summary(index)
@@ -15004,22 +15057,6 @@ def launch_plot_settings_panel(
             self._series_line_kwargs_data[index] = (
                 self.series_line_kwargs_json.toPlainText().strip()
             )
-            if self._series_is_group(index):
-                descriptor = dict(self._series_descriptors_data[index])
-                if hasattr(self, "_series_group_reducer"):
-                    descriptor["group_reducer"] = (
-                        self._series_group_reducer.currentText().strip().lower() or "mean"
-                    )
-                if hasattr(self, "_series_group_members"):
-                    descriptor["member_series_ids"] = [
-                        str(item.data(Qt.ItemDataRole.UserRole) or "").strip()
-                        for item_index in range(self._series_group_members.count())
-                        for item in [self._series_group_members.item(item_index)]
-                        if item is not None
-                        and item.checkState() == Qt.CheckState.Checked
-                        and str(item.data(Qt.ItemDataRole.UserRole) or "").strip()
-                    ]
-                self._series_descriptors_data[index] = descriptor
             self._persist_normalization_editor(index)
             self._series_syncing = True
             try:
@@ -15027,7 +15064,6 @@ def launch_plot_settings_panel(
             finally:
                 self._series_syncing = False
             self._update_series_metadata_panel(index)
-            self._update_series_group_summary(index)
             self._update_series_error_summary(index)
             self._update_series_cumulative_summary(index)
             self._update_series_fit_summary(index)
@@ -15140,7 +15176,11 @@ def launch_plot_settings_panel(
         def _schedule_or_apply_series_preview_update(
             self, *, force_full_render: bool = False
         ) -> None:
-            if not force_full_render and self._apply_series_artist_updates_to_canvas():
+            if (
+                not self._preview_loading
+                and not force_full_render
+                and self._apply_series_artist_updates_to_canvas()
+            ):
                 self._preview_timer.stop()
                 return
             self._schedule_preview_update()
@@ -15188,6 +15228,8 @@ def launch_plot_settings_panel(
             if self._series_syncing or index < 0:
                 return
             selected_descriptor = self._display_row(index)
+            if selected_descriptor.get("kind") == "species":
+                return
             target_base_index = int(selected_descriptor.get("base_index", 0))
             target_kind = str(selected_descriptor.get("kind") or "base")
             self._persist_active_series_editor()
@@ -15267,21 +15309,7 @@ def launch_plot_settings_panel(
             self._schedule_or_apply_series_preview_update()
 
         def _set_all_series_enabled(self, enabled: bool) -> None:
-            if not self._series_enabled_data:
-                return
-            self._persist_active_series_editor()
-            selected_id = self._active_series_row_id()
-            self._series_enabled_data = [enabled] * len(self._series_enabled_data)
-            self._apply_series_id_order(self._enabled_partitioned_series_id_order())
-            self._restore_active_series_from_id(selected_id)
-            self._series_syncing = True
-            try:
-                self._sync_series_selection_widgets(self._series_active_index)
-            finally:
-                self._series_syncing = False
-            self._refresh_series_list_widgets()
-            self._record_history_after_non_text_change()
-            self._schedule_or_apply_series_preview_update()
+            self._set_layer_indices_enabled(list(range(len(self._series_enabled_data))), enabled)
 
         def _on_series_editor_changed(self, *_unused: object) -> None:
             if self._series_syncing:
@@ -15653,41 +15681,6 @@ def launch_plot_settings_panel(
             summary_label.show()
             if getattr(self, "_series_cumulative_style_note", None) is not None:
                 self._series_cumulative_style_note.hide()
-
-        def _update_series_group_summary(self, index: int) -> None:
-            summary_label = getattr(self, "_series_group_summary", None)
-            if summary_label is None:
-                return
-            if index < 0 or index >= len(self._series_descriptors_data):
-                summary_label.setText("No grouped-series settings available.")
-                return
-            descriptor = self._series_descriptor(index)
-            if not self._series_is_group(index):
-                summary_label.setText("This series is not grouped.")
-                return
-            member_ids = [
-                str(value).strip()
-                for value in descriptor.get("member_series_ids", [])
-                if str(value).strip()
-            ]
-            group_map = self._last_preview_state.get("series_group_summaries")
-            series_id = str(descriptor.get("series_id") or f"series:{index}")
-            summary = group_map.get(series_id) if isinstance(group_map, dict) else None
-            reducer = str(descriptor.get("group_reducer") or "mean")
-            lines = [
-                f"Reducer: {reducer}",
-                f"Members: {len(member_ids)}",
-            ]
-            if isinstance(summary, dict):
-                reason = str(summary.get("reason") or "").strip()
-                status = str(summary.get("status") or "").strip().lower()
-                if status == "ok":
-                    lines.append("Grouped line rendered from the current member series.")
-                elif reason:
-                    lines.append(reason)
-            elif not member_ids:
-                lines.append("Select at least one member series.")
-            summary_label.setText("\n".join(lines))
 
         def _update_series_error_summary(self, index: int) -> None:
             if (
@@ -16181,6 +16174,11 @@ def launch_plot_settings_panel(
             if self._suspend_preview_events:
                 return
             sender = self.sender()
+            # A change to the retained canvas would be overwritten by the
+            # running render. Replay the complete latest settings instead.
+            if self._preview_loading:
+                self._preview_timer.start(self._preview_debounce_ms_for_sender(sender))
+                return
             if sender in {
                 getattr(self, "x_min", None),
                 getattr(self, "x_max", None),
@@ -16291,6 +16289,10 @@ def launch_plot_settings_panel(
 
         def _set_preview_loading(self, active: bool) -> None:
             self._preview_loading = bool(active)
+            if self._active_preview_pane is not None:
+                self._active_preview_pane.loading_overlay.set_active(
+                    bool(active or self._pending_preview_request is not None)
+                )
             for widget in (
                 self._preview_frame,
                 self._preview_scroll,
@@ -16491,15 +16493,32 @@ def launch_plot_settings_panel(
                 generation, settings, image_path = job
                 try:
                     if self._preview_worker_job_cancelled(generation):
-                        self._cleanup_preview_temp_path(image_path)
+                        self._emit_cancelled_preview(generation, image_path)
                         continue
-                    self._run_preview_worker(
-                        generation=generation,
-                        settings=settings,
-                        image_path=image_path,
-                    )
+                    try:
+                        with cancellation_scope(
+                            partial(self._preview_worker_job_cancelled, generation)
+                        ):
+                            self._run_preview_worker(
+                                generation=generation,
+                                settings=settings,
+                                image_path=image_path,
+                            )
+                    except ComputationCancelled:
+                        self._emit_cancelled_preview(generation, image_path)
                 finally:
                     self._preview_worker_queue.task_done()
+
+        def _emit_cancelled_preview(self, generation: int, image_path: Path | None) -> None:
+            payload = {"image_path": str(image_path) if image_path is not None else None}
+            try:
+                self._preview_worker_bridge.finished.emit(generation, payload)
+            except RuntimeError:
+                if image_path is not None:
+                    try:
+                        image_path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
 
         def _run_preview_worker(
             self,
@@ -16510,7 +16529,7 @@ def launch_plot_settings_panel(
         ) -> None:
             try:
                 if self._preview_worker_job_cancelled(generation):
-                    self._cleanup_preview_temp_path(image_path)
+                    self._emit_cancelled_preview(generation, image_path)
                     return
                 try:
                     from .plotting import configure_matplotlib_backend
@@ -16519,7 +16538,7 @@ def launch_plot_settings_panel(
                 except Exception:
                     pass
                 if self._preview_worker_job_cancelled(generation):
-                    self._cleanup_preview_temp_path(image_path)
+                    self._emit_cancelled_preview(generation, image_path)
                     return
                 if on_preview_figure is not None and FigureCanvas is not None:
                     render_state = on_preview_figure(settings)
@@ -16555,8 +16574,15 @@ def launch_plot_settings_panel(
                 try:
                     self._preview_worker_bridge.finished.emit(generation, payload)
                 except RuntimeError:
-                    pass
+                    figure = payload.get("figure")
+                    if figure is not None:
+                        from matplotlib import pyplot as plt
+
+                        plt.close(figure)
+                    self._emit_cancelled_preview(generation, image_path)
             except Exception as exc:
+                if self._preview_worker_job_cancelled(generation):
+                    raise ComputationCancelled() from None
                 try:
                     self._preview_worker_bridge.failed.emit(generation, exc)
                 except RuntimeError:
@@ -16586,6 +16612,15 @@ def launch_plot_settings_panel(
             )
             self._active_preview_image_path = image_path
             self._active_preview_interactive = bool(interactive)
+            # Keep only the newest queued job while the old worker unwinds.
+            while True:
+                try:
+                    previous_job = self._preview_worker_queue.get_nowait()
+                except queue.Empty:
+                    break
+                self._preview_worker_queue.task_done()
+                if previous_job is not None:
+                    self._cleanup_preview_temp_path(previous_job[2])
             self._set_preview_loading(True)
             if self._preview_status is not None:
                 self._preview_status.setText("Preview updating...")
@@ -16625,6 +16660,7 @@ def launch_plot_settings_panel(
             self._pending_preview_request = (deepcopy(settings), bool(interactive))
             if self._preview_status is not None:
                 self._preview_status.setText("Preview updating...")
+            self._start_pending_preview_if_available()
 
         def _start_pending_preview_if_available(self) -> bool:
             pending = self._pending_preview_request
@@ -16645,9 +16681,7 @@ def launch_plot_settings_panel(
             message = str(error).strip() or type(error).__name__
             self._preview_error = message
             if self._preview_status is not None:
-                display = message if len(message) <= 180 else f"{message[:177]}..."
-                self._preview_status.setText(f"Preview failed: {display}")
-                self._preview_status.setToolTip(message)
+                session_messages.exception(f"Preview failed: {message}", error)
             self._refresh_shell_state()
 
         def _preview_worker_job_cancelled(self, generation: int) -> bool:
@@ -16672,6 +16706,8 @@ def launch_plot_settings_panel(
                     except Exception:
                         pass
                 self._cleanup_preview_temp_path(image_path)
+                if generation != self._active_preview_generation:
+                    return
                 self._finish_active_preview_generation(generation)
                 self._set_preview_loading(False)
                 self._start_pending_preview_if_available()
@@ -16729,6 +16765,8 @@ def launch_plot_settings_panel(
             )
             if self._preview_worker_result_is_stale(generation):
                 self._cleanup_preview_temp_path(image_path)
+                if generation != self._active_preview_generation:
+                    return
                 self._finish_active_preview_generation(generation)
                 self._set_preview_loading(False)
                 self._start_pending_preview_if_available()
@@ -17009,7 +17047,6 @@ def launch_plot_settings_panel(
             pair_labels = [
                 self._effective_series_label(index)
                 for index, descriptor in enumerate(self._series_descriptors_data)
-                if str(descriptor.get("source_kind") or "source").strip().lower() != "group"
             ]
             if not pair_labels:
                 count_label.setText("No RDF layers are available.")
@@ -17998,7 +18035,6 @@ def launch_plot_settings_panel(
             figure_caps = self._current_figure_capabilities()
             fit_supported = bool(layer_caps.show_fit_editor)
             cumulative_supported = bool(layer_caps.show_cumulative_editor)
-            selected_group = layer_caps.layer_kind == "group"
             heatmap_layer_mode = layer_caps.plot_family == "heatmap"
 
             for widget in self._title_detail_widgets:
@@ -18098,8 +18134,6 @@ def launch_plot_settings_panel(
                 self._series_fit_group.setVisible(layer_caps.show_fit_editor)
             if self._series_cumulative_group is not None:
                 self._series_cumulative_group.setVisible(layer_caps.show_cumulative_editor)
-            if self._series_group_group is not None:
-                self._series_group_group.setVisible(layer_caps.show_group_members)
             if self._normalization_group is not None:
                 self._normalization_group.setVisible(layer_caps.show_normalization)
             if self._series_integration_group is not None:
@@ -18521,11 +18555,6 @@ def launch_plot_settings_panel(
             if getattr(self, "_series_duplicate_button", None) is not None:
                 self._series_duplicate_button.setVisible(not heatmap_layer_mode)
                 self._series_duplicate_button.setEnabled(series_selected and not heatmap_layer_mode)
-            if getattr(self, "_series_add_group_button", None) is not None:
-                self._series_add_group_button.setVisible(not heatmap_layer_mode)
-                self._series_add_group_button.setEnabled(
-                    bool(self._group_member_candidate_indices()) and not heatmap_layer_mode
-                )
             delete_button = getattr(self, "_series_delete_button", None)
             if delete_button is not None:
                 delete_button.setVisible(not heatmap_layer_mode)
@@ -18593,7 +18622,6 @@ def launch_plot_settings_panel(
                 error_supported
                 and not self._series_active_is_fit_child
                 and not self._series_active_is_cumulative_child
-                and not selected_group
             )
             error_active = (
                 error_controls_available
@@ -18611,8 +18639,6 @@ def launch_plot_settings_panel(
                         "Uncertainty settings are edited on the base series only."
                         if self._series_active_is_fit_child
                         or self._series_active_is_cumulative_child
-                        else "Grouped series do not support uncertainty overlays."
-                        if selected_group
                         else None
                         if error_supported
                         else "Uncertainty overlays are only available for 1-D line plots."
@@ -18630,8 +18656,6 @@ def launch_plot_settings_panel(
                         "Uncertainty settings are edited on the base series only."
                         if self._series_active_is_fit_child
                         or self._series_active_is_cumulative_child
-                        else "Grouped series do not support uncertainty overlays."
-                        if selected_group
                         else error_availability.reason
                         if error_supported and not error_availability.selector_enabled
                         else None
@@ -18647,8 +18671,6 @@ def launch_plot_settings_panel(
                         "Uncertainty settings are edited on the base series only."
                         if self._series_active_is_fit_child
                         or self._series_active_is_cumulative_child
-                        else "Grouped series do not support uncertainty overlays."
-                        if selected_group
                         else None
                         if error_supported
                         else "Uncertainty overlays are only available for 1-D line plots."
@@ -18667,8 +18689,6 @@ def launch_plot_settings_panel(
                             "Uncertainty settings are edited on the base series only."
                             if self._series_active_is_fit_child
                             or self._series_active_is_cumulative_child
-                            else "Grouped series do not support uncertainty overlays."
-                            if selected_group
                             else None
                             if error_supported
                             else "Uncertainty overlays are only available for 1-D line plots."
@@ -18816,16 +18836,6 @@ def launch_plot_settings_panel(
             ):
                 if widget is not None:
                     widget.setEnabled(cumulative_supported and cumulative_active)
-            if hasattr(self, "_series_group_group") and self._series_group_group is not None:
-                self._series_group_group.setEnabled(not self._series_active_is_fit_child)
-            if hasattr(self, "_series_group_reducer"):
-                self._series_group_reducer.setEnabled(
-                    selected_group and not self._series_active_is_fit_child
-                )
-            if hasattr(self, "_series_group_members"):
-                self._series_group_members.setEnabled(
-                    selected_group and not self._series_active_is_fit_child
-                )
             if self._preview_button is not None:
                 auto_update_enabled = (
                     self._auto_preview_checkbox is not None
@@ -19329,12 +19339,9 @@ def launch_plot_settings_panel(
                         entry["alpha"] = float(alpha_token)
                     except ValueError as exc:
                         raise ValueError(f"Series {index + 1} alpha must be a float.") from exc
-                if line_colors[index]:
-                    entry["color"] = line_colors[index]
-                elif self._series_is_generated(index):
-                    generated_color = self._effective_series_color(index).strip()
-                    if generated_color:
-                        entry["color"] = generated_color
+                effective_color = self._effective_series_color(index).strip()
+                if effective_color:
+                    entry["color"] = effective_color
                 width_token = self._series_line_widths_data[index].strip()
                 if width_token:
                     try:
@@ -20105,7 +20112,7 @@ def launch_plot_settings_panel(
             return settings
 
         def _report_error(self, title_text: str, exc: Exception) -> None:
-            self._status_label.setText(f"{title_text}: {exc}")
+            session_messages.exception(f"{title_text}: {exc}", exc)
             self._refresh_shell_state()
             QMessageBox.critical(self, title_text, str(exc))
 
@@ -20326,6 +20333,10 @@ def launch_plot_settings_panel(
 
         def _cleanup_preview_artifacts(self) -> None:
             self._closing = True
+            self._session_diagnostics.shutdown()
+            for pane in (self._embedded_preview_pane, self._detached_preview_pane):
+                if pane is not None:
+                    pane.loading_overlay.shutdown()
             self._preview_timer.stop()
             self._preview_generation += 1
             self._active_preview_generation = None
@@ -20511,14 +20522,22 @@ def launch_plot_settings_panel(
     if app is None:
         app = QApplication([])
 
-    window = _PlotSettingsWindow()
-    window.showMaximized()
+    session_messages = SessionLog()
+    session_messages.start()
+    window = None
+    try:
+        window = _PlotSettingsWindow()
+        window.showMaximized()
 
-    # Ensure window is on a visible screen (guards against stale geometry).
-    if QApplication.screenAt(window.geometry().center()) is None:
-        primary = QApplication.primaryScreen()
-        if primary is not None:
-            avail = primary.availableGeometry()
-            window.move(avail.x() + 50, avail.y() + 50)
+        # Ensure window is on a visible screen (guards against stale geometry).
+        if QApplication.screenAt(window.geometry().center()) is None:
+            primary = QApplication.primaryScreen()
+            if primary is not None:
+                avail = primary.availableGeometry()
+                window.move(avail.x() + 50, avail.y() + 50)
 
-    app.exec()
+        app.exec()
+    finally:
+        session_messages.close()
+        if window is not None and not window._closing:
+            window._cleanup_preview_artifacts()

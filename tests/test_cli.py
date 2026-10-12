@@ -35,7 +35,7 @@ from linak.cli import (
     _resolve_orientation_plotter_kwargs,
     _resolve_potential_plotter_kwargs,
     _resolve_rdf_plotter_kwargs,
-    _write_plotted_xy_data_export,
+    _write_plotted_data_export,
     _without_preview_series_state,
     _rewrite_implicit_csv_interactive,
     _rewrite_implicit_plot_csv,
@@ -4054,24 +4054,16 @@ def test_merge_gui_series_descriptors_preserves_generated_layers_only_when_sourc
             "is_generated": True,
             "default_label": "Missing Copy",
         },
-        {
-            "series_id": "group:a",
-            "source_kind": "group",
-            "is_generated": True,
-            "member_series_ids": ["source:a", "copy:a", "missing"],
-            "default_label": "Group",
-        },
     ]
 
     merged = _merge_gui_series_descriptors(current, saved)
 
-    assert [item["series_id"] for item in merged] == ["source:a", "copy:a", "group:a"]
+    assert [item["series_id"] for item in merged] == ["source:a", "copy:a"]
     assert merged[1]["source_series_id"] == "source:a"
     assert merged[1]["is_generated"] is True
-    assert merged[2]["member_series_ids"] == ["source:a", "copy:a"]
 
 
-def test_gui_render_requires_source_data_for_enabled_copies_and_groups():
+def test_gui_render_requires_source_data_for_enabled_copies():
     settings = {
         "series_descriptors": [
             {"series_id": "source:a", "source_kind": "source", "source_series_id": "source:a"},
@@ -4079,12 +4071,6 @@ def test_gui_render_requires_source_data_for_enabled_copies_and_groups():
                 "series_id": "copy:a",
                 "source_kind": "source",
                 "source_series_id": "source:a",
-                "is_generated": True,
-            },
-            {
-                "series_id": "group:a",
-                "source_kind": "group",
-                "member_series_ids": ["copy:a"],
                 "is_generated": True,
             },
         ],
@@ -4100,17 +4086,11 @@ def test_gui_render_requires_source_data_for_enabled_copies_and_groups():
     assert args.series_overrides["source:a"]["enabled"] is True
 
 
-def test_gui_render_does_not_require_hidden_group_members():
+def test_gui_render_does_not_require_hidden_sources():
     settings = {
         "series_descriptors": [
             {"series_id": "source:a", "source_kind": "source", "source_series_id": "source:a"},
             {"series_id": "source:b", "source_kind": "source", "source_series_id": "source:b"},
-            {
-                "series_id": "group:a",
-                "source_kind": "group",
-                "member_series_ids": ["source:a", "source:b"],
-                "is_generated": True,
-            },
         ],
         "series_overrides": {
             "source:a": {"enabled": False},
@@ -6122,6 +6102,49 @@ def test_density_gui_lazy_grid_species_filter_keeps_molecule_descriptors(tmp_pat
     assert {descriptor["density_species"] for descriptor in descriptors} == {"mol:OH"}
 
 
+@pytest.mark.parametrize("source_count", [1, 2])
+def test_density_gui_2d_previews_float32_fine_grid_bins(tmp_path, source_count):
+    sources = []
+    for index in range(source_count):
+        edges = 0.125 * index + np.arange(401) * 0.05
+        source = tmp_path / f"fine_{index}.density.h5"
+        save_density_profiles(
+            [
+                DensityGridProfile(
+                    species="K",
+                    x_bin_edges=edges,
+                    y_bin_edges=edges,
+                    z_bin_edges=edges,
+                    distance_bin_edges=edges,
+                    flat_indices=np.asarray([0], dtype=np.uint64),
+                    mass_sum_g=np.asarray([1.0e-23]),
+                    entity_sum=np.asarray([1.0]),
+                    n_frames=1,
+                    grid_bin_width_A=0.05,
+                )
+            ],
+            source,
+        )
+        sources.append(str(source))
+    args = build_parser().parse_args(["plot", *sources])
+    args.view_mapping = PlotViewMapping(
+        view_type_id="heatmap_2d",
+        x="x_bin_center",
+        y="y_bin_center",
+        role_assignments={"z": "number_density_2d"},
+    )
+    args.density_2d_x_axis = "x"
+    args.density_2d_y_axis = "y"
+    args.density_enabled_species = ["K"]
+    catalog = cli_mod._build_density_gui_lazy_catalog(args, sources=sources)
+    context = catalog.build_render_context(args)
+    profile = context.profile[0]
+    assert profile.n_frames == source_count
+    assert np.count_nonzero(profile.number_density) == source_count
+    assert np.diff(profile.x_bin_edges) == pytest.approx(0.05)
+    assert np.diff(profile.y_bin_edges) == pytest.approx(0.05)
+
+
 def test_density_gui_2d_averages_enabled_sparse_grid_sources(tmp_path):
     edges = np.asarray([0.0, 1.0], dtype=float)
     source_a = tmp_path / "density_grid_a.h5"
@@ -7980,10 +8003,10 @@ def test_plot_density_gui_combined_hdf5_does_not_pass_reordered_series_lists_to_
     assert "line_colors" not in initial
 
 
-def test_write_plotted_xy_data_export_single_series_csv(tmp_path):
+def test_write_plotted_data_export_single_series_csv(tmp_path):
     output_path = tmp_path / "preview.csv"
 
-    saved_path = _write_plotted_xy_data_export(
+    saved_path = _write_plotted_data_export(
         {
             "plotted_xy_series": [
                 {
@@ -8006,10 +8029,10 @@ def test_write_plotted_xy_data_export_single_series_csv(tmp_path):
     ]
 
 
-def test_write_plotted_xy_data_export_multi_series_dat(tmp_path):
+def test_write_plotted_data_export_multi_series_dat(tmp_path):
     output_path = tmp_path / "preview.dat"
 
-    _write_plotted_xy_data_export(
+    _write_plotted_data_export(
         {
             "plotted_xy_series": [
                 {
@@ -8039,9 +8062,9 @@ def test_write_plotted_xy_data_export_multi_series_dat(tmp_path):
     ]
 
 
-def test_write_plotted_xy_data_export_rejects_missing_xy_payload(tmp_path):
-    with pytest.raises(ValueError, match="No line xy data"):
-        _write_plotted_xy_data_export({}, tmp_path / "preview.csv")
+def test_write_plotted_data_export_rejects_missing_xy_payload(tmp_path):
+    with pytest.raises(ValueError, match="No plotted data"):
+        _write_plotted_data_export({}, tmp_path / "preview.csv")
 
 
 def test_open_plot_settings_gui_forwards_save_data_callback(monkeypatch):
@@ -9550,6 +9573,59 @@ def test_plot_position_gui_uses_saved_projection_filter_before_initial_guard(tmp
     )
 
 
+@pytest.mark.parametrize("lazy", [False, True])
+def test_position_categorical_gui_catalog_renders_individual_colors(tmp_path, lazy):
+    from linak.analysis.position import plot_position_profiles
+    from linak.plot.plotting import default_series_colors
+
+    source_h5 = tmp_path / "position.h5"
+    _write_large_position_hdf5(source_h5, n_atoms=3, n_frames=3)
+    args = build_parser().parse_args(
+        [
+            "plot",
+            str(source_h5),
+            "--component",
+            "2d-projection",
+            "--projection-render-mode",
+            "line-colors",
+        ]
+    )
+    args.show = False
+    if lazy:
+        catalog = cli_mod._build_position_gui_lazy_catalog(args, sources=[str(source_h5)])
+        context = catalog.build_render_context(args)
+    else:
+        context = cli_mod._build_position_gui_context(args, sources=[str(source_h5)])
+    assert context.series_count == 3
+    assert len({item["series_id"] for item in context.series_descriptors}) == 3
+    assert [item.n_atoms for item in context.profile] == [1, 1, 1]
+    _path, state = cli_mod._render_profile_plot(
+        args=args,
+        source=str(source_h5),
+        analysis_name="position",
+        profile=context.profile,
+        plotter=plot_position_profiles,
+        plotter_kwargs=context.plotter_kwargs,
+        series_descriptors=context.series_descriptors,
+    )
+    assert [line.get_color() for line in state["axes"].lines] == default_series_colors(3)
+    ids = [item["series_id"] for item in context.series_descriptors]
+    args.series_overrides = {ids[0]: {"enabled": False}, ids[2]: {"color": "#d01234"}}
+    _path, state = cli_mod._render_profile_plot(
+        args=args,
+        source=str(source_h5),
+        analysis_name="position",
+        profile=context.profile,
+        plotter=plot_position_profiles,
+        plotter_kwargs=context.plotter_kwargs,
+        series_descriptors=context.series_descriptors,
+    )
+    assert [line.get_color() for line in state["axes"].lines] == [
+        default_series_colors(3)[1],
+        "#d01234",
+    ]
+
+
 def test_position_projection_lazy_catalog_uses_filtered_point_count_in_line_colors_mode(
     tmp_path, caplog
 ):
@@ -9587,7 +9663,7 @@ def test_position_projection_lazy_catalog_uses_filtered_point_count_in_line_colo
     catalog = cli_mod._build_position_gui_lazy_catalog(args, sources=[str(source_h5)])
     context = catalog.build_initial_context()
 
-    assert context.series_count == 1
+    assert context.series_count == 80
     assert context.estimated_total_points == 80
     assert "position GUI complexity at lazy_catalog" in caplog.text
     assert "raw_points=240" in caplog.text
@@ -9628,7 +9704,7 @@ def test_position_projection_lazy_catalog_estimates_without_full_profile_load(
     catalog = cli_mod._build_position_gui_lazy_catalog(args, sources=[str(source_h5)])
     context = catalog.build_initial_context()
 
-    assert context.series_count == 1
+    assert context.series_count == 80
     assert context.estimated_total_points == 80
 
 

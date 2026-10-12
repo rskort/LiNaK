@@ -12,6 +12,7 @@ from ..cell_geometry import (
 )
 
 from collections.abc import Generator, Iterator
+from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
@@ -54,6 +55,7 @@ LOGGER = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from ..analysis.surface import SurfaceReference
+    from ..analysis.topology import TopologyProfile
 
 _ASE_LAMMPS_DATA_TO_ASE_ATOMS = getattr(ase_lammpsrun, "lammps_data_to_ase_atoms", None)
 
@@ -1069,6 +1071,7 @@ def _write_trajectory_hdf5(
     source_format: str | None = None,
     metadata: TrajectoryStoredMetadata | None = None,
     compression_profile: str = "fast",
+    topology_profile: TopologyProfile | None = None,
 ) -> Path:
     frame_count = len(frames)
     atom_counts = np.asarray([len(frame) for frame in frames], dtype=np.int64)
@@ -1084,6 +1087,10 @@ def _write_trajectory_hdf5(
             "produced variable per-frame atom counts."
         )
     max_atom_count = int(np.max(atom_counts))
+    from ..analysis.topology import build_profile, write_profile
+
+    if topology_profile is None:
+        topology_profile = build_profile(frames, count=frame_count, storage_precision=True)
     resolved_compression = normalize_compression_profile(compression_profile)
     raw_species_is_fixed = _raw_species_topology_is_fixed(frames)
     label_frames = frames[:1] if raw_species_is_fixed else frames
@@ -1364,6 +1371,8 @@ def _write_trajectory_hdf5(
                     )
                 _write_trajectory_surface_cache(metadata_group, stored_metadata)
 
+            write_profile(handle, topology_profile, resolved_compression)
+
     return output_path
 
 
@@ -1423,9 +1432,12 @@ def _build_atoms_from_hdf5_chunk(
 
 
 def _read_trajectory_hdf5_chunks(
-    path: Path, *, chunk_size: int, start_frame: int = 0, stop_frame: int | None = None
+    path: Path, *, chunk_size: int, start_frame: int = 0, stop_frame: int | None = None,
+    _attach_topology: bool = True,
 ) -> Generator[list[Atoms], None, None]:
-    with h5py.File(path, "r") as handle:
+    from ..analysis.topology import attach_frames, source_provider
+
+    with ExitStack() as stack, h5py.File(path, "r") as handle:
         if (
             str(handle.attrs.get("linak_format", "")).strip() != LINAK_TRAJECTORY_HDF5_FORMAT
             or str(handle.attrs.get("kind", "")).strip() != "trajectory"
@@ -1440,6 +1452,16 @@ def _read_trajectory_hdf5_chunks(
         raw_species_dataset = handle.get("raw_species_labels")
         atom_counts_dataset = handle.get("atom_counts")
         frame_count = int(handle.attrs.get("frame_count", positions.shape[0]))
+        provider = source_provider(path, handle, frame_count) if _attach_topology else None
+        if provider is not None:
+            provider.active_readers += 1
+
+            def release_reader() -> None:
+                assert provider is not None
+                provider.active_readers -= 1
+                provider.flush()
+
+            stack.callback(release_reader)
         stop_frame = frame_count if stop_frame is None else min(stop_frame, frame_count)
         if chunk_size <= 0 or not 0 <= start_frame <= stop_frame:
             raise ValueError("Invalid trajectory frame range or chunk size.")
@@ -1493,6 +1515,8 @@ def _read_trajectory_hdf5_chunks(
                     fixed_atom_indices=fixed_atom_indices,
                     atom_counts_chunk=atom_counts_chunk,
                 )
+                if provider is not None:
+                    attach_frames(chunk, provider, start)
                 progress.update(len(chunk))
                 yield chunk
 
@@ -1501,6 +1525,10 @@ def _read_trajectory_hdf5(path: Path) -> list[Atoms]:
     frames: list[Atoms] = []
     for chunk in _read_trajectory_hdf5_chunks(path, chunk_size=256):
         frames.extend(chunk)
+    if frames:
+        from ..analysis.topology import FRAME_KEY
+
+        frames[0].info[FRAME_KEY].provider.remember_frames(frames)
     return frames
 
 
@@ -2128,6 +2156,7 @@ def write_trajectory(
     metadata: TrajectoryStoredMetadata | None = None,
     raw_species_as_symbols: bool = False,
     compression_profile: str = "fast",
+    topology_profile: TopologyProfile | None = None,
 ) -> Path:
     """Write trajectory frames to disk and return the written path."""
     if not frames:
@@ -2147,6 +2176,7 @@ def write_trajectory(
                 source_format=source_format,
                 metadata=metadata,
                 compression_profile=compression_profile,
+                topology_profile=topology_profile,
             )
             os.replace(temporary_path, output_path)
         finally:
@@ -2160,7 +2190,18 @@ def write_trajectory(
             _write_xyz_like_frames(frames, output_path)
         else:
             try:
-                write(str(output_path), frames)
+                from ..analysis.topology import FRAME_KEY
+
+                export_frames = []
+                for frame in frames:
+                    if FRAME_KEY in frame.info:
+                        clean = frame.copy()
+                        clean.calc = frame.calc
+                        clean.info.pop(FRAME_KEY, None)
+                        export_frames.append(clean)
+                    else:
+                        export_frames.append(frame)
+                write(str(output_path), export_frames)
             except UnknownFileTypeError as exc:
                 raise ValueError(
                     f"Unsupported output trajectory format for '{output_path}'. "

@@ -83,7 +83,10 @@ class ResolvedPositionPlotMapping:
     def uses_profile_descriptors(self) -> bool:
         """Return whether the active mapping should stay at profile granularity in the GUI."""
 
-        return str(self.renderer_options.get("component") or "") == "2d-projection"
+        return (
+            str(self.renderer_options.get("component") or "") == "2d-projection"
+            and self.renderer_options.get("projection_render_mode") == "color-scale"
+        )
 
 
 def position_mapping_preset(

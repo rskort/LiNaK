@@ -18,6 +18,7 @@ from .cell_geometry import (
 )
 
 import argparse
+from .cancellation import check_cancelled
 import csv
 from copy import deepcopy
 from collections.abc import Mapping, Sequence
@@ -41,7 +42,7 @@ from typing import Any, Callable, TYPE_CHECKING
 
 from . import __version__
 from .runtime_threads import configure_native_thread_env
-from .plot.settings_validation import validate_current_plot_settings
+from .plot.settings_validation import validate_current_plot_settings, validate_source_descriptor
 from .plot.profile_loading import (
     read_analysis_profile_payloads,
     read_analysis_profile_payloads_by_source,
@@ -758,11 +759,9 @@ def _position_projection_uses_profile_descriptors(
 ) -> bool:
     if resolved_projection is None:
         resolved_projection = _resolve_position_projection_estimation_settings(args)
-    # A 2-D trajectory layer represents one selected species/profile. Keeping
-    # the GUI layer identity at that level makes visibility and categorical
-    # color styling stable even when a profile contains many tracked atoms.
-    # The renderer still iterates over the individual atoms inside each layer.
-    return resolved_projection.is_projection
+    # Continuous colors share one scale per profile. Categorical colors need
+    # independent atom/molecule identities for visibility and styling.
+    return resolved_projection.is_projection and resolved_projection.render_mode == "color-scale"
 
 
 def _coordination_plot_uses_atom_descriptors(
@@ -1802,13 +1801,19 @@ def _default_potential_hdf5_output_for_sources(sources: list[str]) -> Path:
         return _default_potential_hdf5_output_path(sources[0])
     from .analysis.output_naming import combined_analysis_hdf5_filename
 
-    return _linak_output_dir_for_sources(sources) / combined_analysis_hdf5_filename("potential")
+    return _linak_output_dir_for_parent(Path.cwd().resolve()) / combined_analysis_hdf5_filename(
+        "potential"
+    )
 
 
 def _default_combined_analysis_hdf5_path(sources: list[str], *, analysis: str) -> Path:
     from .analysis.output_naming import combined_analysis_hdf5_filename
 
-    return _linak_output_dir_for_sources(sources) / combined_analysis_hdf5_filename(analysis)
+    # Combined files always go to the working directory, never next to a source.
+    del sources
+    return _linak_output_dir_for_parent(Path.cwd().resolve()) / combined_analysis_hdf5_filename(
+        analysis
+    )
 
 
 def _unique_path_with_numeric_suffix(path: Path) -> Path:
@@ -7021,9 +7026,6 @@ def _default_series_family_colors(
     if count <= 0:
         return []
 
-    def _is_group(descriptor: dict[str, Any]) -> bool:
-        return str(descriptor.get("source_kind") or "source").strip().lower() == "group"
-
     def _family_id(descriptor: dict[str, Any], index: int) -> str:
         return str(
             descriptor.get("source_series_id") or descriptor.get("series_id") or f"series:{index}"
@@ -7032,14 +7034,14 @@ def _default_series_family_colors(
     palette_descriptors = [
         dict(descriptor)
         for descriptor in (series_descriptors or [])
-        if isinstance(descriptor, dict) and not _is_group(descriptor)
+        if isinstance(descriptor, dict)
     ]
     target_items = [
         dict(descriptor)
         for descriptor in (
             target_descriptors if isinstance(target_descriptors, list) else palette_descriptors
         )
-        if isinstance(descriptor, dict) and not _is_group(descriptor)
+        if isinstance(descriptor, dict)
     ]
 
     family_order: list[str] = []
@@ -7185,11 +7187,7 @@ def _apply_effective_series_settings(
         )
     overrides = _coerce_series_override_map(getattr(args, "series_overrides", None))
     ordered_descriptors = list(series_descriptors) if isinstance(series_descriptors, list) else []
-    source_ordered_descriptors = [
-        d
-        for d in ordered_descriptors
-        if str(d.get("source_kind") or "source").strip().lower() != "group"
-    ]
+    source_ordered_descriptors = [d for d in ordered_descriptors]
 
     if overrides and len(source_ordered_descriptors) == total_series:
         from .plot.fitting import coerce_fit_config
@@ -7332,9 +7330,7 @@ def _apply_effective_series_settings(
                 args.line_colors = None
 
     source_for_reorder = [
-        d
-        for d in (list(series_descriptors) if isinstance(series_descriptors, list) else [])
-        if str(d.get("source_kind") or "source").strip().lower() != "group"
+        d for d in (list(series_descriptors) if isinstance(series_descriptors, list) else [])
     ]
     if len(source_for_reorder) != total_series:
         return
@@ -10214,16 +10210,9 @@ def _render_profile_plot(
     ordered_profile = profile
     ordered_descriptors = list(series_descriptors or [])
     ordered_render_descriptors = list(render_series_descriptors or ordered_descriptors)
-    source_ordered_descriptors = [
-        d
-        for d in ordered_descriptors
-        if str(d.get("source_kind") or "source").strip().lower() != "group"
-    ]
-    group_ordered_descriptors = [
-        d
-        for d in ordered_descriptors
-        if str(d.get("source_kind") or "source").strip().lower() == "group"
-    ]
+    for descriptor in ordered_descriptors + ordered_render_descriptors:
+        validate_source_descriptor(descriptor)
+    source_ordered_descriptors = [d for d in ordered_descriptors]
     if (
         isinstance(profile, list)
         and source_ordered_descriptors
@@ -10239,29 +10228,7 @@ def _render_profile_plot(
             indices = [index_by_id[series_id] for series_id in resolved_order]
             ordered_profile = [profile[index] for index in indices]
             source_ordered_descriptors = [source_ordered_descriptors[index] for index in indices]
-            ordered_descriptors = source_ordered_descriptors + group_ordered_descriptors
-            render_descriptor_by_id = {
-                str(descriptor.get("series_id") or ""): dict(descriptor)
-                for descriptor in ordered_render_descriptors
-                if str(descriptor.get("series_id") or "").strip()
-            }
-            ordered_source_render_descriptors = [
-                render_descriptor_by_id.get(
-                    str(descriptor.get("series_id") or ""),
-                    dict(descriptor),
-                )
-                for descriptor in source_ordered_descriptors
-            ]
-            ordered_source_ids = {
-                str(descriptor.get("series_id") or "")
-                for descriptor in ordered_source_render_descriptors
-            }
-            ordered_render_descriptors = ordered_source_render_descriptors + [
-                dict(descriptor)
-                for descriptor in ordered_render_descriptors
-                if str(descriptor.get("series_id") or "") not in ordered_source_ids
-            ]
-
+            ordered_descriptors = source_ordered_descriptors
             def _reorder_source_list(value: Any) -> Any:
                 if isinstance(value, list) and len(value) == len(indices):
                     return [value[index] for index in indices]
@@ -10283,6 +10250,19 @@ def _render_profile_plot(
             ):
                 if hasattr(args, attr_name):
                     setattr(args, attr_name, _reorder_source_list(getattr(args, attr_name)))
+
+    # Render layers (including copies) have their own order, independent of
+    # the source arrays loaded for them.
+    render_by_id = {
+        str(descriptor.get("series_id") or f"series:{index}"): descriptor
+        for index, descriptor in enumerate(ordered_render_descriptors)
+    }
+    ordered_render_descriptors = [
+        render_by_id[series_id]
+        for series_id in _resolve_series_id_order(
+            list(render_by_id), getattr(args, "series_order", None)
+        )
+    ]
 
     # Final transition point: generic style options from argparse are merged
     # here with analysis-specific plotter kwargs and series identity metadata
@@ -10790,16 +10770,79 @@ def _format_plot_data_export_value(value: Any) -> str:
     return str(value)
 
 
-def _write_plotted_xy_data_export(
+def _write_plotted_heatmap_data_export(
+    heatmap: Mapping[str, Any],
+    output_path: str | Path,
+    *,
+    delimiter: Any = None,
+    include_metadata: bool = False,
+) -> Path:
+    """Export the plotted grid in x-major order, retaining empty cells as NaN."""
+    x_edges = np.asarray(heatmap.get("x_edges"), dtype=float)
+    y_edges = np.asarray(heatmap.get("y_edges"), dtype=float)
+    values = np.asarray(heatmap.get("values"), dtype=float)
+    if (
+        x_edges.ndim != 1
+        or y_edges.ndim != 1
+        or x_edges.size < 2
+        or y_edges.size < 2
+        or not np.all(np.isfinite(x_edges))
+        or not np.all(np.isfinite(y_edges))
+        or values.shape != (x_edges.size - 1, y_edges.size - 1)
+    ):
+        raise ValueError("Heatmap export requires bin edges and a matching 2D value array.")
+    target_path = Path(output_path).expanduser().resolve()
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    resolved_delimiter = _plot_data_export_delimiter_from_setting(delimiter, target_path)
+    with target_path.open("w", encoding="utf-8", newline="") as handle:
+        if include_metadata:
+            handle.write("# LiNaK plotted heatmap data export\n")
+            handle.write(f"# grid_shape={values.shape[0]},{values.shape[1]}\n")
+            for key in ("x_label", "y_label", "value_label"):
+                handle.write(
+                    f"# {key}={json.dumps(str(heatmap.get(key) or ''), ensure_ascii=False)}\n"
+                )
+        writer = csv.writer(handle, delimiter=resolved_delimiter, lineterminator="\n")
+        writer.writerow(["x", "y", "value", "x_min", "x_max", "y_min", "y_max"])
+        for x_index in range(values.shape[0]):
+            x_low, x_high = x_edges[x_index : x_index + 2]
+            for y_index in range(values.shape[1]):
+                y_low, y_high = y_edges[y_index : y_index + 2]
+                writer.writerow(
+                    [
+                        _format_plot_data_export_value(value)
+                        for value in (
+                            0.5 * (x_low + x_high),
+                            0.5 * (y_low + y_high),
+                            values[x_index, y_index],
+                            x_low,
+                            x_high,
+                            y_low,
+                            y_high,
+                        )
+                    ]
+                )
+    return target_path
+
+
+def _write_plotted_data_export(
     render_state: Mapping[str, Any],
     output_path: str | Path,
     *,
     delimiter: Any = None,
     include_metadata: bool = False,
 ) -> Path:
+    heatmap = render_state.get("plotted_heatmap")
+    if isinstance(heatmap, Mapping):
+        return _write_plotted_heatmap_data_export(
+            heatmap,
+            output_path,
+            delimiter=delimiter,
+            include_metadata=include_metadata,
+        )
     series_payload = render_state.get("plotted_xy_series")
     if not isinstance(series_payload, list) or not series_payload:
-        raise ValueError("No line xy data is available for this preview.")
+        raise ValueError("No plotted data is available for this preview.")
 
     normalized_series: list[dict[str, Any]] = []
     for raw_series in series_payload:
@@ -10824,7 +10867,7 @@ def _write_plotted_xy_data_export(
         )
 
     if not normalized_series:
-        raise ValueError("No line xy data is available for this preview.")
+        raise ValueError("No plotted data is available for this preview.")
 
     target_path = Path(output_path).expanduser().resolve()
     target_path.parent.mkdir(parents=True, exist_ok=True)
@@ -10865,9 +10908,7 @@ def _write_plotted_xy_data_export(
 
 
 def _descriptor_is_generated_layer(descriptor: dict[str, Any]) -> bool:
-    return str(descriptor.get("source_kind") or "source").strip().lower() == "group" or bool(
-        descriptor.get("is_generated", False)
-    )
+    return bool(descriptor.get("is_generated", False))
 
 
 def _merge_gui_series_descriptors(
@@ -10875,24 +10916,22 @@ def _merge_gui_series_descriptors(
     saved_descriptors: Any,
 ) -> list[dict[str, Any]]:
     current = [dict(descriptor) for descriptor in current_descriptors]
+    for descriptor in current:
+        validate_source_descriptor(descriptor)
     if not isinstance(saved_descriptors, list):
         return current
     current_ids = {str(item.get("series_id") or "").strip() for item in current}
     merged = list(current)
     generated_sources: list[dict[str, Any]] = []
-    generated_groups: list[dict[str, Any]] = []
     for raw_descriptor in saved_descriptors:
         if not isinstance(raw_descriptor, dict):
             continue
         descriptor = dict(raw_descriptor)
+        validate_source_descriptor(descriptor)
         if not _descriptor_is_generated_layer(descriptor):
             continue
-        source_kind = str(descriptor.get("source_kind") or "source").strip().lower()
-        descriptor["source_kind"] = "group" if source_kind == "group" else "source"
+        descriptor["source_kind"] = "source"
         descriptor["is_generated"] = True
-        if descriptor["source_kind"] == "group":
-            generated_groups.append(descriptor)
-            continue
         source_series_id = str(descriptor.get("source_series_id") or "").strip()
         if source_series_id in current_ids:
             descriptor["source_series_id"] = source_series_id
@@ -10901,17 +10940,6 @@ def _merge_gui_series_descriptors(
     for descriptor in generated_sources:
         series_id = str(descriptor.get("series_id") or "").strip()
         if series_id and series_id not in generated_ids:
-            merged.append(descriptor)
-            generated_ids.add(series_id)
-    for descriptor in generated_groups:
-        series_id = str(descriptor.get("series_id") or "").strip()
-        member_ids = [
-            str(member_id).strip()
-            for member_id in descriptor.get("member_series_ids", [])
-            if str(member_id).strip() in generated_ids
-        ]
-        if series_id and series_id not in generated_ids:
-            descriptor["member_series_ids"] = member_ids
             merged.append(descriptor)
             generated_ids.add(series_id)
     return merged
@@ -10926,6 +10954,8 @@ def _gui_series_descriptors_from_settings(
         resolved = [dict(descriptor) for descriptor in descriptors if isinstance(descriptor, dict)]
     else:
         resolved = [dict(descriptor) for descriptor in fallback_descriptors]
+    for descriptor in resolved:
+        validate_source_descriptor(descriptor)
     return _filter_density_descriptors_by_enabled_species(
         resolved,
         gui_settings.get("density_enabled_species"),
@@ -10950,32 +10980,8 @@ def _filter_density_descriptors_by_enabled_species(
     enabled_species = _density_enabled_species_set(enabled_species_value)
     if enabled_species is None:
         return [dict(descriptor) for descriptor in descriptors]
-    descriptor_by_id = {
-        str(descriptor.get("series_id") or "").strip(): dict(descriptor)
-        for descriptor in descriptors
-        if str(descriptor.get("series_id") or "").strip()
-    }
     filtered: list[dict[str, Any]] = []
     for descriptor in descriptors:
-        source_kind = str(descriptor.get("source_kind") or "source").strip().lower()
-        if source_kind == "group":
-            member_ids = [
-                str(member_id).strip()
-                for member_id in descriptor.get("member_series_ids", [])
-                if str(member_id).strip()
-            ]
-            kept_members = [
-                member_id
-                for member_id in member_ids
-                if _density_descriptor_species(descriptor_by_id.get(member_id, {}))
-                in enabled_species
-            ]
-            if not kept_members:
-                continue
-            updated = dict(descriptor)
-            updated["member_series_ids"] = kept_members
-            filtered.append(updated)
-            continue
         species = _density_descriptor_species(descriptor)
         if species and species not in enabled_species:
             continue
@@ -11052,11 +11058,6 @@ def _required_source_ids_for_gui_render(gui_settings: dict[str, Any]) -> set[str
     if not descriptors:
         return set()
     overrides = _coerce_series_override_map(gui_settings.get("series_overrides"))
-    descriptor_by_id = {
-        str(descriptor.get("series_id") or "").strip(): descriptor
-        for descriptor in descriptors
-        if str(descriptor.get("series_id") or "").strip()
-    }
 
     def _descriptor_enabled(series_id: str) -> bool:
         entry = overrides.get(series_id)
@@ -11067,26 +11068,9 @@ def _required_source_ids_for_gui_render(gui_settings: dict[str, Any]) -> set[str
         series_id = str(descriptor.get("series_id") or "").strip()
         if not series_id or not _descriptor_enabled(series_id):
             continue
-        source_kind = str(descriptor.get("source_kind") or "source").strip().lower()
-        if source_kind != "group":
-            source_id = str(descriptor.get("source_series_id") or series_id).strip()
-            if source_id:
-                required.add(source_id)
-            continue
-        for member_id in descriptor.get("member_series_ids", []):
-            member_key = str(member_id).strip()
-            member_descriptor = descriptor_by_id.get(member_key)
-            if member_descriptor is None:
-                continue
-            if not _descriptor_enabled(member_key):
-                continue
-            source_id = str(
-                member_descriptor.get("source_series_id")
-                or member_descriptor.get("series_id")
-                or ""
-            ).strip()
-            if source_id:
-                required.add(source_id)
+        source_id = str(descriptor.get("source_series_id") or series_id).strip()
+        if source_id:
+            required.add(source_id)
     return required
 
 
@@ -11256,6 +11240,7 @@ def _launch_profile_plot_gui(
         settings: dict[str, Any],
         required_source_ids: set[str],
     ) -> _GuiPlotRenderContext:
+        check_cancelled()
         cache_key = _gui_context_data_signature(
             settings,
             kind=kind,
@@ -11278,6 +11263,7 @@ def _launch_profile_plot_gui(
             cache_key[:96],
         )
         context = builder(current_args)
+        check_cancelled()
         PREVIEW_CACHE.put("preview.render_context", shared_cache_key, context)
         return context
 
@@ -11384,6 +11370,7 @@ def _launch_profile_plot_gui(
         # settings back into argparse-like state, rebuild context, and then
         # call the same renderer bridge used by non-GUI plotting.
         preview_started = perf_counter()
+        check_cancelled()
         preview_args = deepcopy(args)
         _apply_gui_settings_to_args(preview_args, gui_settings)
         preview_args.show = show
@@ -11413,6 +11400,7 @@ def _launch_profile_plot_gui(
             raise
         if context.series_count <= 0:
             raise ValueError(empty_error_message)
+        check_cancelled()
         if output is None:
             _log_plot_complexity_debug(
                 analysis_name=analysis_name,
@@ -11448,6 +11436,26 @@ def _launch_profile_plot_gui(
         )
         if isinstance(gui_settings.get("series_overrides"), dict):
             _clear_gui_positional_series_args(preview_args)
+        # Source loading may omit hidden layers. Keep the GUI catalog as the
+        # authority for layer identity, copies, colors and display order.
+        render_catalog = _gui_series_descriptors_from_settings(
+            gui_settings, list(context.series_descriptors)
+        )
+        if not render_catalog:
+            render_catalog = list(context.series_descriptors)
+        colors = _default_series_family_colors(render_catalog, len(render_catalog))
+        overrides = deepcopy(getattr(preview_args, "series_overrides", None) or {})
+        for descriptor, color in zip(render_catalog, colors):
+            series_id = str(descriptor.get("series_id") or "")
+            overrides.setdefault(series_id, {}).setdefault("color", color)
+        preview_args.series_overrides = overrides
+        loaded_ids = {str(d.get("series_id") or "") for d in context.series_descriptors}
+        render_descriptors = [
+            descriptor
+            for descriptor in render_catalog
+            if str(descriptor.get("source_series_id") or descriptor.get("series_id") or "")
+            in loaded_ids
+        ]
         try:
             saved_path, render_state = _render_profile_plot(
                 args=preview_args,
@@ -11457,7 +11465,7 @@ def _launch_profile_plot_gui(
                 plotter=plotter,
                 plotter_kwargs=context.plotter_kwargs,
                 series_descriptors=context.series_descriptors,
-                render_series_descriptors=context.series_descriptors,
+                render_series_descriptors=render_descriptors,
                 keep_figure_open=keep_figure_open,
             )
         except Exception as exc:
@@ -11469,6 +11477,7 @@ def _launch_profile_plot_gui(
             )
             raise
         render_state = dict(render_state or {})
+        check_cancelled()
         if analysis_name == "density":
             descriptor_context = _cached_gui_context(
                 kind="full",
@@ -11604,7 +11613,7 @@ def _launch_profile_plot_gui(
                 "No series are enabled. Turn on at least one series before exporting data."
             ),
         )
-        saved_path = _write_plotted_xy_data_export(
+        saved_path = _write_plotted_data_export(
             render_state,
             output_path,
             delimiter=gui_settings.get("plot_data_delimiter"),
@@ -17642,7 +17651,9 @@ def _handle_apply_convert(args: argparse.Namespace) -> int:
         "File conversion finished in %.2f s. family=%s%s size=%.1f MiB output=%s",
         perf_counter() - start,
         request.family,
-        "" if result.frame_count is None else f" frames={result.frame_count} atoms/frame={atoms_summary}",
+        ""
+        if result.frame_count is None
+        else f" frames={result.frame_count} atoms/frame={atoms_summary}",
         converted_path.stat().st_size / 1024**2,
         converted_path,
     )

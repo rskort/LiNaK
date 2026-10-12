@@ -50,6 +50,37 @@ def uniform_bin_width_from_edges(bin_edges: np.ndarray, *, source_label: str) ->
     return width
 
 
+def reconstruct_uniform_bin_edges_from_edges(
+    bin_edges: np.ndarray,
+    *,
+    bin_width: float | None,
+    source_label: str,
+) -> tuple[np.ndarray, float]:
+    """Validate stored edges at their precision and recover a uniform float64 grid."""
+
+    stored_edges = np.asarray(bin_edges)
+    uniform_bin_width_from_edges(stored_edges, source_label=source_label)
+    edges = np.asarray(stored_edges, dtype=float)
+    width = (
+        float(bin_width)
+        if bin_width is not None
+        else float((edges[-1] - edges[0]) / (edges.size - 1))
+    )
+    if not np.isfinite(width) or width <= 0.0:
+        raise ValueError(f"{source_label} has invalid bin width {bin_width!r}.")
+    # Keep the stored origin, but use the metadata width rather than one rounded
+    # adjacent difference. This avoids drift and differing widths across sources.
+    uniform_edges = float(edges[0]) + np.arange(edges.size, dtype=float) * width
+    if not np.allclose(
+        edges,
+        uniform_edges,
+        rtol=0.0,
+        atol=_coordinate_storage_atol(stored_edges),
+    ):
+        raise ValueError(f"{source_label} has bin edges inconsistent with its bin width.")
+    return uniform_edges, width
+
+
 def resolve_uniform_bin_width_for_load(
     *,
     metadata: Mapping[str, object],

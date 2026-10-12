@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from ..plot.settings_validation import validate_source_descriptor
+
 from ..cell_geometry import ProfileCellGeometry, profile_geometry_datasets
 
 from collections.abc import Mapping, Sequence
@@ -1016,8 +1018,7 @@ def _expand_time_distance_render_layers(
     source_indices: list[int] = []
     expanded_profiles: list[CoordinationProfile] = []
     for render_index, descriptor in enumerate(render_series_descriptors):
-        if str(descriptor.get("source_kind") or "source").strip().lower() == "group":
-            continue
+        validate_source_descriptor(descriptor)
         source_id = str(
             descriptor.get("source_series_id") or descriptor.get("series_id") or ""
         ).strip()

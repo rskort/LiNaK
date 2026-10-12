@@ -121,7 +121,7 @@ def test_oh_topology_excludes_ambiguous_shared_hydrogen():
     np.testing.assert_array_equal(topology.ambiguous_hydrogen_indices, np.array([2]))
 
 
-def test_oh_topology_cache_switches_to_per_frame_after_stride_change(caplog):
+def test_oh_topology_cache_is_exact_between_former_validation_frames(caplog):
     frame0 = Atoms(
         ["O", "H", "H"],
         positions=[[0.0, 0.0, 0.0], [0.9, 0.0, 0.0], [-0.9, 0.0, 0.0]],
@@ -144,11 +144,10 @@ def test_oh_topology_cache_switches_to_per_frame_after_stride_change(caplog):
 
     caplog.set_level("WARNING", logger="linak.analysis.water")
     assert cache.select(frame0, frame_index=0).indices_for("mol:H2O").shape[0] == 1
-    assert cache.select(frame_h3o, frame_index=1).indices_for("mol:H2O").shape[0] == 1
+    assert cache.select(frame_h3o, frame_index=1).indices_for("mol:H3O").shape[0] == 1
     assert cache.select(frame_h3o, frame_index=2).indices_for("mol:H3O").shape[0] == 1
     assert cache.per_frame is True
-    assert "likely indicates H-jumping" in caplog.text
-    assert "slower per-frame O/H molecule detection" in caplog.text
+    assert not caplog.text
     assert cache.select(frame_ho, frame_index=3).indices_for("mol:OH").shape[0] == 1
 
 
@@ -541,6 +540,78 @@ def test_save_and_load_density_grid_profiles_round_trip(tmp_path):
     assert loaded[0].species == "O"
     assert loaded[0].flat_indices.size > 0
     assert loaded[0].mass_sum_g.dtype == np.float32
+
+
+def _fine_density_grid() -> DensityGridProfile:
+    edges = {
+        "x": np.arange(359) * 0.05,
+        "y": np.arange(311) * 0.05,
+        "z": np.arange(1195) * 0.05,
+        "distance": -2.9716074466705322 + np.arange(1208) * 0.05,
+    }
+    shape = tuple(values.size - 1 for values in edges.values())
+    indices = np.ravel_multi_index(
+        tuple(np.asarray([0, size // 2, size - 1]) for size in shape), shape
+    ).astype(np.uint64)
+    return DensityGridProfile(
+        species="K",
+        x_bin_edges=edges["x"],
+        y_bin_edges=edges["y"],
+        z_bin_edges=edges["z"],
+        distance_bin_edges=edges["distance"],
+        flat_indices=indices,
+        mass_sum_g=np.asarray([1.0e-23, 2.0e-23, 3.0e-23]),
+        entity_sum=np.asarray([1.0, 2.0, 3.0]),
+        n_frames=2,
+        grid_bin_width_A=0.05,
+    )
+
+
+@pytest.mark.parametrize("axes", density_module.DENSITY_GRID_2D_ALLOWED_PAIRS)
+@pytest.mark.parametrize("bin_width", [None, 0.1])
+def test_stored_fine_density_grid_projects_like_original(tmp_path, axes, bin_width):
+    original = _fine_density_grid()
+    path = save_density_profiles([original], tmp_path / "fine.density.h5")
+    loaded = load_density_grid_profiles(path, species="K")
+    with h5py.File(path, "r") as handle:
+        assert handle["x_bin_edges_A"].dtype == np.float32
+    assert loaded[0].grid_shape == original.grid_shape
+    for axis in ("x", "y", "z", "distance"):
+        np.testing.assert_allclose(
+            getattr(loaded[0], f"{axis}_bin_edges"),
+            getattr(original, f"{axis}_bin_edges"),
+            rtol=0.0,
+            atol=1.0e-6,
+        )
+    options = dict(x_axis=axes[0], y_axis=axes[1], x_bin_width=bin_width, y_bin_width=bin_width)
+    expected = density_module.density_grids_to_averaged_heatmap_profile([original], **options)
+    actual = density_module.density_grids_to_averaged_heatmap_profile(loaded, **options)
+    single = density_module.density_grid_to_heatmap_profile(loaded[0], **options)
+    np.testing.assert_allclose(actual.density, expected.density, rtol=1.0e-6, atol=0.0)
+    np.testing.assert_allclose(actual.number_density, expected.number_density, rtol=1.0e-6)
+    np.testing.assert_allclose(single.density, actual.density, rtol=1.0e-6)
+
+
+@pytest.mark.parametrize("axis", ["x", "y", "z", "distance"])
+def test_stored_fine_density_grid_line_projection_and_resave(tmp_path, axis):
+    original = _fine_density_grid()
+    path = save_density_profiles([original], tmp_path / "fine.density.h5")
+    loaded = load_density_grid_profiles(path)
+    expected = density_module.density_grid_to_line_profile(original, x_mode=axis)
+    actual = density_module.density_grid_to_line_profile(loaded[0], x_mode=axis)
+    np.testing.assert_allclose(actual.density, expected.density, rtol=1.0e-6)
+    saved = save_density_profiles(loaded, tmp_path / "resaved.density.h5")
+    reloaded = load_density_grid_profiles(saved)
+    np.testing.assert_array_equal(reloaded[0].flat_indices, original.flat_indices)
+    np.testing.assert_array_equal(reloaded[0].entity_sum, original.entity_sum)
+
+
+def test_density_grid_loader_rejects_corrupted_edges(tmp_path):
+    path = save_density_profiles([_fine_density_grid()], tmp_path / "corrupted.density.h5")
+    with h5py.File(path, "r+") as handle:
+        handle["x_bin_edges_A"][300] += 0.01
+    with pytest.raises(ValueError, match="non-uniform"):
+        load_density_grid_profiles(path)
 
 
 def test_density_grid_to_line_profile_applies_coordinate_filters():
@@ -1431,7 +1502,7 @@ def test_compute_density_profiles_all_reuses_cached_h2o_topology(monkeypatch):
         ],
     )
     frames = [frame.copy() for _ in range(density_module.H2O_VALIDATION_STRIDE + 1)]
-    original = water_module.oh_molecule_topology
+    original = water_module._oh_molecule_topology_with_backend
     call_count = 0
 
     def counting_oh_molecule_topology(*args, **kwargs):
@@ -1441,7 +1512,7 @@ def test_compute_density_profiles_all_reuses_cached_h2o_topology(monkeypatch):
 
     monkeypatch.setattr(
         water_module,
-        "oh_molecule_topology",
+        "_oh_molecule_topology_with_backend",
         counting_oh_molecule_topology,
     )
 
@@ -1453,7 +1524,9 @@ def test_compute_density_profiles_all_reuses_cached_h2o_topology(monkeypatch):
     )
 
     assert [profile.species for profile in profiles] == ["H", "O", "mol:H2O"]
-    assert call_count == 2
+    assert call_count == len(frames)
+    compute_density_profiles(frames=frames, species="molecules", axis="z", bin_width=1.0)
+    assert call_count == len(frames)
 
 
 def test_available_element_species_is_sorted_unique():
@@ -3085,6 +3158,7 @@ def test_compute_all_density_profiles_skips_bounds_progress_for_cell_line_output
         surface_mode="none",
         bin_width=1.0,
         binning="cell",
+        outputs="1d",
     )
 
     assert [record["desc"] for record in progress_records] == ["Binning density frames"]
@@ -3143,14 +3217,35 @@ def test_compute_all_density_profiles_grids_prepare_bounds_before_binning(monkey
 
     assert [record["desc"] for record in progress_records] == [
         "Binning density frames",
+        "Finalize density grids",
     ]
-    assert [record["count"] for record in progress_records] == [1]
+    assert [record["count"] for record in progress_records] == [1, 1]
 
 
 def test_compute_all_density_profiles_binning_progress_is_frame_based():
-    source = inspect.getsource(density_module._compute_all_density_profiles_streaming)
+    import ast
 
-    assert 'ProgressBar(desc="Binning density frames", total=len(frames), unit="frame")' in source
+    source = inspect.getsource(density_module._compute_all_density_profiles_streaming)
+    calls = [
+        node
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "ProgressBar"
+    ]
+    frame_call = next(
+        node
+        for node in calls
+        if any(
+            keyword.arg == "desc"
+            and isinstance(keyword.value, ast.Constant)
+            and keyword.value.value == "Binning density frames"
+            for keyword in node.keywords
+        )
+    )
+    keywords = {keyword.arg: ast.unparse(keyword.value) for keyword in frame_call.keywords}
+    assert keywords["total"] == "len(frames)"
+    assert keywords["unit"] == "'frame'"
     assert 'desc="Binning density profiles", total=total_binning_jobs' not in source
 
 

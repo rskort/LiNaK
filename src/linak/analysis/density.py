@@ -20,6 +20,8 @@ from collections.abc import Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
 import logging
+import math
+from ..cancellation import check_cancelled
 from pathlib import Path
 import re
 from typing import Any, cast
@@ -35,6 +37,7 @@ from ..storage.hdf5_utils import (
 )
 from .binning import (
     reconstruct_uniform_bin_edges_from_centers,
+    reconstruct_uniform_bin_edges_from_edges,
     resolve_uniform_bin_width_for_load,
     uniform_bin_width_from_edges,
 )
@@ -65,7 +68,8 @@ from ..plot.plotting import (
     resolve_series_labels,
     resolve_single_series_options,
 )
-from ..progress import ProgressBar
+from ..progress import ProgressBar, progress_stage
+from .density_sparse import SparseReducer, SparseWorkspace, row_dtype
 from ..utils import axis_to_index, ensure_positive
 from .common import (
     MOLECULE_SPECIES_LABELS,
@@ -956,6 +960,75 @@ def _grid_visible_axis_range_from_flat_indices(
     return float(edges[lower_index]), float(edges[upper_index + 1])
 
 
+def _prepare_density_grid_geometry(
+    frames: Sequence[Atoms],
+    coordinate_mode: str,
+    estimate: SurfaceEstimate | None,
+    reference: SurfaceReference | None,
+) -> tuple[list[dict[str, Any]], np.ndarray]:
+    """Prepare exact geometry identities once, independently of selected species."""
+    groups: list[dict[str, Any]] = []
+    identities: dict[tuple, int] = {}
+    mapping = np.empty(len(frames), dtype=np.int64)
+    canonical = reference if reference is not None and reference.uses_distance else None
+    for i, frame in enumerate(frames):
+        shift = (
+            float(estimate.frame_values[i])
+            if coordinate_mode == "distance" and estimate is not None
+            else 0.0
+        )
+        top_shift = (
+            float(canonical.top.frame_values[i])
+            if coordinate_mode == "distance" and canonical is not None and canonical.top is not None
+            else shift
+        )
+        bottom_shift = (
+            float(canonical.bottom.frame_values[i])
+            if coordinate_mode == "distance"
+            and canonical is not None
+            and canonical.bottom is not None
+            else shift
+        )
+        cut = float(canonical.axis_cut_per_frame_A[i]) if canonical is not None else None
+        lower = float(canonical.axis_lower_per_frame_A[i]) if canonical is not None else None
+        period = float(canonical.axis_period_per_frame_A[i]) if canonical is not None else None
+        threshold = (
+            _single_interface_wrap_threshold(canonical, i) if canonical is not None else None
+        )
+        cell, origin = np.asarray(frame.cell), frame_origin(frame)
+        key = (
+            *cell.ravel(),
+            *origin,
+            shift,
+            top_shift,
+            bottom_shift,
+            cut,
+            lower,
+            period,
+            threshold,
+        )
+        if key not in identities:
+            identities[key] = len(groups)
+            groups.append(
+                dict(
+                    cell=cell,
+                    origin=origin,
+                    shift=shift,
+                    top_shift=top_shift,
+                    bottom_shift=bottom_shift,
+                    canonical_cut=cut,
+                    canonical_lower=lower,
+                    canonical_period=period,
+                    canonical_wrap_threshold=threshold,
+                    n_frames=0,
+                )
+            )
+        group_id = identities[key]
+        mapping[i] = group_id
+        groups[group_id]["n_frames"] += 1
+    return groups, mapping
+
+
 @dataclass
 class _DensitySparseGridAccumulator:
     """Sparse X/Y/Z/distance density-grid accumulator with no dense 4D arrays."""
@@ -976,130 +1049,80 @@ class _DensitySparseGridAccumulator:
     surface_reference: SurfaceReference | None = None
     oh_cutoff_A: float | None = None
     min_molecule_frames: int | None = None
-    _flat_chunks: list[np.ndarray] | None = None
-    _mass_chunks: list[np.ndarray] | None = None
-    _entity_chunks: list[np.ndarray] | None = None
-    _top_counts: dict[int, tuple[float, float]] | None = None
-    _bottom_counts: dict[int, tuple[float, float]] | None = None
-
     geometry_frames: Sequence[Atoms] | None = None
-    geometry_groups: dict | None = None
-    frame_group_keys: list | None = None
+    geometry_table: tuple[list[dict[str, Any]], np.ndarray] | None = None
+    workspace: SparseWorkspace | None = None
 
     def __post_init__(self) -> None:
-        if self.geometry_frames is not None:
-            self.geometry_groups = {}
-            self.frame_group_keys = []
-            for i, frame in enumerate(self.geometry_frames):
-                canonical_reference = (
-                    self.surface_reference
-                    if self.surface_reference is not None and self.surface_reference.uses_distance
-                    else None
+        self._shape = cast(
+            tuple[int, int, int, int],
+            tuple(
+                int(np.asarray(edges).size - 1)
+                for edges in (
+                    self.x_bin_edges,
+                    self.y_bin_edges,
+                    self.z_bin_edges,
+                    self.distance_bin_edges,
                 )
-                shift = (
-                    float(self.surface_estimate.frame_values[i])
-                    if self.distance_coordinate_mode == "distance"
-                    and self.surface_estimate is not None
-                    else 0.0
-                )
-                top_shift = (
-                    float(canonical_reference.top.frame_values[i])
-                    if self.distance_coordinate_mode == "distance"
-                    and canonical_reference is not None
-                    and canonical_reference.top is not None
-                    else shift
-                )
-                bottom_shift = (
-                    float(canonical_reference.bottom.frame_values[i])
-                    if self.distance_coordinate_mode == "distance"
-                    and canonical_reference is not None
-                    and canonical_reference.bottom is not None
-                    else shift
-                )
-                canonical_cut = (
-                    float(canonical_reference.axis_cut_per_frame_A[i])
-                    if canonical_reference is not None
-                    else None
-                )
-                canonical_lower = (
-                    float(canonical_reference.axis_lower_per_frame_A[i])
-                    if canonical_reference is not None
-                    else None
-                )
-                canonical_period = (
-                    float(canonical_reference.axis_period_per_frame_A[i])
-                    if canonical_reference is not None
-                    else None
-                )
-                canonical_wrap_threshold = (
-                    _single_interface_wrap_threshold(canonical_reference, i)
-                    if canonical_reference is not None
-                    else None
-                )
-                key = (
-                    *np.asarray(frame.cell).ravel(),
-                    *frame_origin(frame),
-                    shift,
-                    top_shift,
-                    bottom_shift,
-                    canonical_cut,
-                    canonical_lower,
-                    canonical_period,
-                    canonical_wrap_threshold,
-                )
-                self.frame_group_keys.append(key)
-                group = self.geometry_groups.setdefault(
-                    key,
-                    dict(
-                        cell=np.asarray(frame.cell),
-                        origin=frame_origin(frame),
-                        shift=shift,
-                        top_shift=top_shift,
-                        bottom_shift=bottom_shift,
-                        canonical_cut=canonical_cut,
-                        canonical_lower=canonical_lower,
-                        canonical_period=canonical_period,
-                        canonical_wrap_threshold=canonical_wrap_threshold,
-                        n_frames=0,
-                        counts={},
-                        top_counts={},
-                        bottom_counts={},
-                    ),
-                )
-                group["n_frames"] += 1
-        if self._flat_chunks is None:
-            self._flat_chunks = []
-        if self._mass_chunks is None:
-            self._mass_chunks = []
-        if self._entity_chunks is None:
-            self._entity_chunks = []
-        if self._top_counts is None:
-            self._top_counts = {}
-        if self._bottom_counts is None:
-            self._bottom_counts = {}
-        dense_cells = self.dense_cell_count
-        if dense_cells > np.iinfo(np.uint64).max:
+            ),
+        )
+        if self.dense_cell_count > np.iinfo(np.uint64).max:
             raise ValueError(
                 "Density sparse grid is too large to index safely: "
-                f"species='{self.species_label}', dense cells={dense_cells:,}. "
+                f"species='{self.species_label}', dense cells={self.dense_cell_count:,}. "
                 "Increase --grid-bin-width or request fewer species."
             )
-
-    @property
-    def grid_shape(self) -> tuple[int, int, int, int]:
-        return (
-            int(np.asarray(self.x_bin_edges).size - 1),
-            int(np.asarray(self.y_bin_edges).size - 1),
-            int(np.asarray(self.z_bin_edges).size - 1),
-            int(np.asarray(self.distance_bin_edges).size - 1),
+        self._edges = tuple(
+            np.asarray(edges, dtype=float)
+            for edges in (
+                self.x_bin_edges,
+                self.y_bin_edges,
+                self.z_bin_edges,
+                self.distance_bin_edges,
+            )
+        )
+        self._widths = tuple(
+            uniform_bin_width_from_edges(edges, source_label=f"density sparse grid {axis}")
+            for edges, axis in zip(self._edges, _DENSITY_GRID_AXES)
+        )
+        self._starts = tuple(float(edges[0]) for edges in self._edges)
+        self._ends = tuple(float(edges[-1]) for edges in self._edges)
+        self._tolerances = tuple(_bin_edge_tolerance(width) for width in self._widths)
+        self._strides = tuple(
+            np.uint64(math.prod(self.grid_shape[index + 1 :])) for index in range(4)
+        )
+        if self.geometry_table is None and self.geometry_frames is not None:
+            self.geometry_table = _prepare_density_grid_geometry(
+                self.geometry_frames,
+                self.distance_coordinate_mode,
+                self.surface_estimate,
+                self.surface_reference,
+            )
+        self._owns_workspace = self.workspace is None
+        if self.workspace is None:
+            self.workspace = SparseWorkspace()
+        self._symmetric = bool(
+            self.surface_reference is not None and self.surface_reference.is_symmetric
+        )
+        channels = 6 if self._symmetric else 2
+        self._dtype = row_dtype(channels)
+        self._total = SparseReducer(
+            self.workspace, channels, self.max_nonzero_bins, self.species_label
+        )
+        self._geometry = (
+            SparseReducer(self.workspace, channels) if self.geometry_table is not None else None
         )
 
     @property
+    def grid_shape(self) -> tuple[int, int, int, int]:
+        return self._shape
+
+    @property
     def dense_cell_count(self) -> int:
-        dense_cells = 1
-        for value in self.grid_shape:
-            dense_cells *= int(value)
-        return int(dense_cells)
+        result = 1
+        for size in self.grid_shape:
+            result *= size
+        return result
 
     def update(
         self,
@@ -1111,221 +1134,154 @@ class _DensitySparseGridAccumulator:
         validation_plan: _DensityValidationPlan,
         interface_side: np.ndarray | None = None,
     ) -> None:
-        positions_array = np.asarray(positions, dtype=float)
-        mass_array = np.asarray(masses, dtype=float)
-        distance_array = np.asarray(distance_values, dtype=float)
-        if positions_array.size == 0:
+        positions = np.asarray(positions, dtype=float)
+        masses = np.asarray(masses, dtype=float)
+        distances = np.asarray(distance_values, dtype=float)
+        if positions.size == 0:
             return
-        if positions_array.ndim != 2 or positions_array.shape[1] != 3:
+        if positions.ndim != 2 or positions.shape[1] != 3:
             raise ValueError("Density grid positions must have shape (n_entities, 3).")
-        if (
-            mass_array.shape[0] != positions_array.shape[0]
-            or distance_array.shape[0] != positions_array.shape[0]
-        ):
+        if masses.shape != (len(positions),) or distances.shape != (len(positions),):
             raise ValueError(
                 "Density grid positions, distances, and masses must have matching entity counts."
             )
-        flat_indices, mass_sum, entity_sum = _bincount_sparse_density_grid(
-            x_values=positions_array[:, 0],
-            y_values=positions_array[:, 1],
-            z_values=positions_array[:, 2],
-            distance_values=distance_array,
-            masses=mass_array,
-            x_bin_edges=self.x_bin_edges,
-            y_bin_edges=self.y_bin_edges,
-            z_bin_edges=self.z_bin_edges,
-            distance_bin_edges=self.distance_bin_edges,
-            grid_shape=self.grid_shape,
-        )
-        geometry_group = None
-        if self.geometry_groups is not None:
-            assert self.frame_group_keys is not None
-            geometry_group = self.geometry_groups[self.frame_group_keys[frame_index]]
+        valid = np.isfinite(masses)
+        coordinates = (*positions.T, distances)
+        for values, start, end, tolerance in zip(
+            coordinates, self._starts, self._ends, self._tolerances
+        ):
+            valid &= (
+                np.isfinite(values) & (values >= start - tolerance) & (values <= end + tolerance)
+            )
+        flat = np.zeros(int(np.count_nonzero(valid)), dtype=np.uint64)
+        for values, start, width, size, stride in zip(
+            coordinates, self._starts, self._widths, self.grid_shape, self._strides
+        ):
+            indices = _uniform_bin_indices(
+                values[valid], bin_start=start, bin_width=width, n_bins=size
+            )
+            flat += indices.astype(np.uint64) * stride
+        rows = np.zeros(flat.size, dtype=self._dtype)
+        rows["bin"] = flat
+        rows["values"][:, 0] = masses[valid]
+        rows["values"][:, 1] = 1.0
         if interface_side is not None:
-            side_array = np.asarray(interface_side, dtype=np.int8)
-            if side_array.shape != (positions_array.shape[0],):
+            sides = np.asarray(interface_side, dtype=np.int8)
+            if sides.shape != (len(positions),):
                 raise ValueError("Density grid interface-side labels must match entity count.")
-            for side_name, side_mask, destination in (
-                ("top", side_array >= 0, self._top_counts),
-                ("bottom", side_array <= 0, self._bottom_counts),
-            ):
-                if destination is None or not np.any(side_mask):
-                    continue
-                side_weights = np.where(side_array[side_mask] == 0, 0.5, 1.0)
-                side_flat, side_mass, side_entity = _bincount_sparse_density_grid(
-                    x_values=positions_array[side_mask, 0],
-                    y_values=positions_array[side_mask, 1],
-                    z_values=positions_array[side_mask, 2],
-                    distance_values=distance_array[side_mask],
-                    masses=mass_array[side_mask] * side_weights,
-                    x_bin_edges=self.x_bin_edges,
-                    y_bin_edges=self.y_bin_edges,
-                    z_bin_edges=self.z_bin_edges,
-                    distance_bin_edges=self.distance_bin_edges,
-                    grid_shape=self.grid_shape,
-                    entity_weights=side_weights,
-                )
-                for index, mass, count in zip(side_flat, side_mass, side_entity):
-                    old_mass, old_count = destination.get(int(index), (0.0, 0.0))
-                    destination[int(index)] = (
-                        old_mass + float(mass),
-                        old_count + float(count),
-                    )
-                if geometry_group is not None:
-                    side_counts = geometry_group[f"{side_name}_counts"]
-                    for index, mass, count in zip(side_flat, side_mass, side_entity):
-                        old_mass, old_count = side_counts.get(int(index), (0.0, 0.0))
-                        side_counts[int(index)] = (
-                            old_mass + float(mass),
-                            old_count + float(count),
-                        )
+            if self._symmetric:
+                for offset, mask in ((2, sides[valid] >= 0), (4, sides[valid] <= 0)):
+                    weights = mask.astype(float) * np.where(sides[valid] == 0, 0.5, 1.0)
+                    rows["values"][:, offset] = masses[valid] * weights
+                    rows["values"][:, offset + 1] = weights
         if validation_plan.strict or frame_index in validation_plan.frame_indices:
-            expected_mass = float(np.sum(mass_array))
-            observed_mass = float(np.sum(mass_sum))
+            expected_mass, observed_mass = (
+                float(np.sum(masses)),
+                float(np.sum(rows["values"][:, 0])),
+            )
             if not np.isclose(observed_mass, expected_mass, rtol=1.0e-12, atol=1.0e-30):
                 raise ValueError(
                     "Sparse density grid does not conserve selected mass in frame "
                     f"{frame_index}: grid={observed_mass:.16g}, selected={expected_mass:.16g}."
                 )
-            expected_entities = int(positions_array.shape[0])
-            observed_entities = int(np.rint(np.sum(entity_sum)))
-            if observed_entities != expected_entities:
+            if rows.size != len(positions):
                 raise ValueError(
                     "Sparse density grid does not conserve selected entity count in frame "
-                    f"{frame_index}: grid={observed_entities}, selected={expected_entities}."
+                    f"{frame_index}: grid={rows.size}, selected={len(positions)}."
                 )
-        if geometry_group is not None:
-            counts = geometry_group["counts"]
-            for index, mass, count in zip(flat_indices, mass_sum, entity_sum):
-                old_mass, old_count = counts.get(int(index), (0.0, 0.0))
-                counts[int(index)] = (old_mass + float(mass), old_count + float(count))
-        if flat_indices.size == 0:
-            return
-        assert self._flat_chunks is not None
-        assert self._mass_chunks is not None
-        assert self._entity_chunks is not None
-        self._flat_chunks.append(np.asarray(flat_indices, dtype=np.uint64))
-        self._mass_chunks.append(np.asarray(mass_sum, dtype=float))
-        self._entity_chunks.append(np.asarray(entity_sum, dtype=float))
-        if len(self._flat_chunks) >= 64:
-            self._merge_chunks()
+        if rows.size:
+            self._total.add(rows)
+            if self._geometry is not None:
+                assert self.geometry_table is not None
+                rows["group"] = self.geometry_table[1][frame_index]
+                self._geometry.add(rows)
 
-    def _merge_chunks(self) -> None:
-        assert self._flat_chunks is not None
-        assert self._mass_chunks is not None
-        assert self._entity_chunks is not None
-        if not self._flat_chunks:
-            return
-        flat = np.concatenate(self._flat_chunks).astype(np.uint64, copy=False)
-        mass = np.concatenate(self._mass_chunks).astype(float, copy=False)
-        entity = np.concatenate(self._entity_chunks).astype(float, copy=False)
-        if flat.size == 0:
-            self._flat_chunks = []
-            self._mass_chunks = []
-            self._entity_chunks = []
-            return
-        unique_flat, inverse = np.unique(flat, return_inverse=True)
-        merged_mass = np.bincount(inverse, weights=mass, minlength=unique_flat.size).astype(
-            float, copy=False
-        )
-        merged_entity = np.bincount(inverse, weights=entity, minlength=unique_flat.size).astype(
-            float, copy=False
-        )
-        if unique_flat.size > int(self.max_nonzero_bins):
-            raise ValueError(
-                "Density sparse grid exceeded the configured nonzero-bin limit: "
-                f"species='{self.species_label}', nonzero bins={unique_flat.size:,}, "
-                f"limit={int(self.max_nonzero_bins):,}. Increase --grid-bin-width or request fewer species."
+    def _finish_geometry(self) -> list[dict[str, Any]] | None:
+        if self._geometry is None:
+            return None
+        assert self.geometry_table is not None
+        run = self._geometry.finish()
+        bins, values, offsets = run.unpack(float, len(self.geometry_table[0]))
+        run.release()
+        result = []
+        assert offsets is not None
+        for group_id, descriptor in enumerate(self.geometry_table[0]):
+            start, end = offsets[group_id : group_id + 2]
+            group = {key: descriptor[key] for key in ("cell", "origin", "shift", "n_frames")}
+            group.update(
+                flat_indices=bins[start:end],
+                mass_sum_g=values[0][start:end],
+                entity_sum=values[1][start:end],
             )
-        self._flat_chunks = [unique_flat]
-        self._mass_chunks = [merged_mass]
-        self._entity_chunks = [merged_entity]
+            if descriptor["canonical_period"] is not None:
+                group.update(
+                    {
+                        key: descriptor[key]
+                        for key in (
+                            "top_shift",
+                            "bottom_shift",
+                            "canonical_cut",
+                            "canonical_lower",
+                            "canonical_period",
+                            "canonical_wrap_threshold",
+                        )
+                    }
+                )
+            if self._symmetric:
+                group.update(
+                    top_shift=descriptor["top_shift"],
+                    bottom_shift=descriptor["bottom_shift"],
+                    top_mass_sum_g=values[2][start:end],
+                    top_entity_sum=values[3][start:end],
+                    bottom_mass_sum_g=values[4][start:end],
+                    bottom_entity_sum=values[5][start:end],
+                )
+            result.append(group)
+        return result
 
     def finalize(self, *, n_frames: int) -> DensityGridProfile:
-        self._merge_chunks()
-        assert self._flat_chunks is not None
-        assert self._mass_chunks is not None
-        assert self._entity_chunks is not None
-        if self._flat_chunks:
-            flat_indices = np.asarray(self._flat_chunks[0], dtype=np.uint64)
-            mass_sum = np.asarray(self._mass_chunks[0], dtype=float)
-            entity_sum = np.asarray(self._entity_chunks[0], dtype=float)
-        else:
-            flat_indices = np.empty(0, dtype=np.uint64)
-            mass_sum = np.empty(0, dtype=float)
-            entity_sum = np.empty(0, dtype=float)
-        if flat_indices.size > int(self.max_nonzero_bins):
-            raise ValueError(
-                "Density sparse grid exceeded the configured nonzero-bin limit: "
-                f"species='{self.species_label}', nonzero bins={flat_indices.size:,}, "
-                f"limit={int(self.max_nonzero_bins):,}. Increase --grid-bin-width or request fewer species."
+        try:
+            run = self._total.finish()
+            flat_indices, values, _offsets = run.unpack(_DENSITY_GRID_STORAGE_DTYPE)
+            mass_sum, entity_sum = values[:2]
+            top_mass, top_entity = values[2:4] if self._symmetric else (None, None)
+            bottom_mass, bottom_entity = values[4:6] if self._symmetric else (None, None)
+            run.release()
+            geometry_groups = self._finish_geometry()
+            return DensityGridProfile(
+                geometry_groups=geometry_groups,
+                species=self.species_label,
+                x_bin_edges=np.asarray(self.x_bin_edges, dtype=float),
+                y_bin_edges=np.asarray(self.y_bin_edges, dtype=float),
+                z_bin_edges=np.asarray(self.z_bin_edges, dtype=float),
+                distance_bin_edges=np.asarray(self.distance_bin_edges, dtype=float),
+                flat_indices=flat_indices,
+                mass_sum_g=mass_sum,
+                entity_sum=entity_sum,
+                n_frames=int(n_frames),
+                units="g",
+                number_density_units=_entity_density_units_for_species(
+                    self.species_label, volumetric=True
+                ),
+                grid_bin_width_A=float(self.grid_bin_width),
+                grid_max_nonzero_bins=int(self.max_nonzero_bins),
+                surface_axis=self.surface_axis,
+                distance_coordinate_mode=self.distance_coordinate_mode,
+                surface_position=self.surface_position,
+                surface_position_std=self.surface_position_std,
+                surface_estimate=self.surface_estimate,
+                surface_reference=self.surface_reference,
+                top_mass_sum_g=top_mass,
+                top_entity_sum=top_entity,
+                bottom_mass_sum_g=bottom_mass,
+                bottom_entity_sum=bottom_entity,
+                oh_cutoff_A=self.oh_cutoff_A,
+                min_molecule_frames=self.min_molecule_frames,
             )
-        footprint_bytes = (
-            flat_indices.astype(np.uint64, copy=False).nbytes
-            + mass_sum.astype(_DENSITY_GRID_STORAGE_DTYPE, copy=False).nbytes
-            + entity_sum.astype(_DENSITY_GRID_STORAGE_DTYPE, copy=False).nbytes
-        )
-        LOGGER.debug(
-            "Density sparse grid for %s: dense=%s cells, sparse=%s nonzero bins, estimated HDF5 payload~%.2f MiB.",
-            _density_species_display_label(self.species_label),
-            f"{self.dense_cell_count:,}",
-            f"{flat_indices.size:,}",
-            footprint_bytes / (1024.0 * 1024.0),
-        )
-
-        def aligned_side(
-            values: dict[int, tuple[float, float]] | None,
-        ) -> tuple[np.ndarray | None, np.ndarray | None]:
-            if values is None:
-                return None, None
-            mass_values = np.zeros(flat_indices.shape, dtype=_DENSITY_GRID_STORAGE_DTYPE)
-            entity_values = np.zeros(flat_indices.shape, dtype=_DENSITY_GRID_STORAGE_DTYPE)
-            if not values or flat_indices.size == 0:
-                return mass_values, entity_values
-            lookup = {int(value): index for index, value in enumerate(flat_indices)}
-            for flat_index, (mass_value, entity_value) in values.items():
-                target = lookup.get(int(flat_index))
-                if target is not None:
-                    mass_values[target] = mass_value
-                    entity_values[target] = entity_value
-            return mass_values, entity_values
-
-        symmetric = bool(self.surface_reference is not None and self.surface_reference.is_symmetric)
-        top_mass, top_entity = aligned_side(self._top_counts if symmetric else None)
-        bottom_mass, bottom_entity = aligned_side(self._bottom_counts if symmetric else None)
-        return DensityGridProfile(
-            geometry_groups=_finish_geometry_groups(
-                self.geometry_groups,
-                include_paired=symmetric,
-            ),
-            species=self.species_label,
-            x_bin_edges=np.asarray(self.x_bin_edges, dtype=float),
-            y_bin_edges=np.asarray(self.y_bin_edges, dtype=float),
-            z_bin_edges=np.asarray(self.z_bin_edges, dtype=float),
-            distance_bin_edges=np.asarray(self.distance_bin_edges, dtype=float),
-            flat_indices=flat_indices,
-            mass_sum_g=np.asarray(mass_sum, dtype=_DENSITY_GRID_STORAGE_DTYPE),
-            entity_sum=np.asarray(entity_sum, dtype=_DENSITY_GRID_STORAGE_DTYPE),
-            n_frames=int(n_frames),
-            units="g",
-            number_density_units=_entity_density_units_for_species(
-                self.species_label, volumetric=True
-            ),
-            grid_bin_width_A=float(self.grid_bin_width),
-            grid_max_nonzero_bins=int(self.max_nonzero_bins),
-            surface_axis=self.surface_axis,
-            distance_coordinate_mode=self.distance_coordinate_mode,
-            surface_position=self.surface_position,
-            surface_position_std=self.surface_position_std,
-            surface_estimate=self.surface_estimate,
-            surface_reference=self.surface_reference,
-            top_mass_sum_g=top_mass,
-            bottom_mass_sum_g=bottom_mass,
-            top_entity_sum=top_entity,
-            bottom_entity_sum=bottom_entity,
-            oh_cutoff_A=self.oh_cutoff_A,
-            min_molecule_frames=self.min_molecule_frames,
-        )
+        finally:
+            if self._owns_workspace:
+                assert self.workspace is not None
+                self.workspace.close()
 
 
 def _frame_has_usable_cell(frame: Atoms, axis_index: int) -> bool:
@@ -1366,7 +1322,7 @@ def _select_water_axis_values_with_masses(
 def _select_water_axis_values_per_frame(
     frames: Sequence[Atoms], axis_index: int, oh_cutoff: float = H2O_OH_CUTOFF_A
 ) -> tuple[list[np.ndarray], list[np.ndarray]]:
-    """Select water-molecule COM axis values with periodic cached-topology validation."""
+    """Select water-molecule COM axis values using exact shared frame topology."""
     return _water_axis_values_per_frame_impl(
         frames,
         axis_index,
@@ -1381,7 +1337,7 @@ def _select_molecule_axis_values_per_frame(
     molecule_label: str,
     oh_cutoff: float = H2O_OH_CUTOFF_A,
 ) -> tuple[list[np.ndarray], list[np.ndarray]]:
-    """Select O/H molecule COM axis values with adaptive cached-topology validation."""
+    """Select O/H molecule COM axis values using exact shared frame topology."""
 
     selections = _select_molecule_axis_values_for_labels_per_frame(
         frames,
@@ -2388,107 +2344,6 @@ def _density_grid_axis_indices(
     if axis_index == 3:
         return (flat % np.uint64(nd)).astype(np.int64, copy=False)
     raise ValueError("Density grid axis_index must be 0, 1, 2, or 3.")
-
-
-def _bincount_sparse_density_grid(
-    *,
-    x_values: np.ndarray,
-    y_values: np.ndarray,
-    z_values: np.ndarray,
-    distance_values: np.ndarray,
-    masses: np.ndarray,
-    x_bin_edges: np.ndarray,
-    y_bin_edges: np.ndarray,
-    z_bin_edges: np.ndarray,
-    distance_bin_edges: np.ndarray,
-    grid_shape: tuple[int, int, int, int],
-    entity_weights: np.ndarray | None = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Return sparse flat grid hits and mass/entity sums for one frame."""
-
-    x_array = np.asarray(x_values, dtype=float)
-    y_array = np.asarray(y_values, dtype=float)
-    z_array = np.asarray(z_values, dtype=float)
-    distance_array = np.asarray(distance_values, dtype=float)
-    mass_values = np.asarray(masses, dtype=float)
-    entity_values = (
-        np.ones(x_array.shape, dtype=float)
-        if entity_weights is None
-        else np.asarray(entity_weights, dtype=float)
-    )
-    if entity_values.shape != x_array.shape:
-        raise ValueError("Density grid entity weights must match the selected coordinate shape.")
-    if x_array.size == 0:
-        empty_flat = np.empty(0, dtype=np.uint64)
-        empty_values = np.empty(0, dtype=float)
-        return empty_flat, empty_values, empty_values.copy()
-    nx, ny, nz, nd = (int(value) for value in grid_shape)
-    if min(nx, ny, nz, nd) <= 0:
-        raise ValueError("Density sparse grid has an invalid zero-length axis.")
-    x_edges = np.asarray(x_bin_edges, dtype=float)
-    y_edges = np.asarray(y_bin_edges, dtype=float)
-    z_edges = np.asarray(z_bin_edges, dtype=float)
-    distance_edges = np.asarray(distance_bin_edges, dtype=float)
-    x_start, x_end = float(x_edges[0]), float(x_edges[-1])
-    y_start, y_end = float(y_edges[0]), float(y_edges[-1])
-    z_start, z_end = float(z_edges[0]), float(z_edges[-1])
-    distance_start, distance_end = float(distance_edges[0]), float(distance_edges[-1])
-    x_width = uniform_bin_width_from_edges(x_edges, source_label="density sparse grid X")
-    y_width = uniform_bin_width_from_edges(y_edges, source_label="density sparse grid Y")
-    z_width = uniform_bin_width_from_edges(z_edges, source_label="density sparse grid Z")
-    distance_width = uniform_bin_width_from_edges(
-        distance_edges,
-        source_label="density sparse grid distance",
-    )
-    x_tol = _bin_edge_tolerance(x_width)
-    y_tol = _bin_edge_tolerance(y_width)
-    z_tol = _bin_edge_tolerance(z_width)
-    distance_tol = _bin_edge_tolerance(distance_width)
-    valid = (
-        np.isfinite(x_array)
-        & np.isfinite(y_array)
-        & np.isfinite(z_array)
-        & np.isfinite(distance_array)
-        & np.isfinite(mass_values)
-        & np.isfinite(entity_values)
-        & (x_array >= x_start - x_tol)
-        & (x_array <= x_end + x_tol)
-        & (y_array >= y_start - y_tol)
-        & (y_array <= y_end + y_tol)
-        & (z_array >= z_start - z_tol)
-        & (z_array <= z_end + z_tol)
-        & (distance_array >= distance_start - distance_tol)
-        & (distance_array <= distance_end + distance_tol)
-    )
-    if not np.any(valid):
-        empty_flat = np.empty(0, dtype=np.uint64)
-        empty_values = np.empty(0, dtype=float)
-        return empty_flat, empty_values, empty_values.copy()
-    ix = _uniform_bin_indices(x_array[valid], bin_start=x_start, bin_width=x_width, n_bins=nx)
-    iy = _uniform_bin_indices(y_array[valid], bin_start=y_start, bin_width=y_width, n_bins=ny)
-    iz = _uniform_bin_indices(z_array[valid], bin_start=z_start, bin_width=z_width, n_bins=nz)
-    idistance = _uniform_bin_indices(
-        distance_array[valid],
-        bin_start=distance_start,
-        bin_width=distance_width,
-        n_bins=nd,
-    )
-    flat = (
-        (ix.astype(np.uint64) * np.uint64(ny) + iy.astype(np.uint64)) * np.uint64(nz)
-        + iz.astype(np.uint64)
-    ) * np.uint64(nd) + idistance.astype(np.uint64)
-    unique_flat, inverse = np.unique(flat, return_inverse=True)
-    mass_sum = np.bincount(
-        inverse,
-        weights=mass_values[valid],
-        minlength=unique_flat.size,
-    ).astype(float, copy=False)
-    entity_sum = np.bincount(
-        inverse,
-        weights=entity_values[valid],
-        minlength=unique_flat.size,
-    ).astype(float, copy=False)
-    return unique_flat.astype(np.uint64, copy=False), mass_sum, entity_sum
 
 
 def _compute_density_heatmap_profile_from_selected(
@@ -4095,51 +3950,167 @@ def _compute_all_density_profiles_streaming(
         grid_jobs_per_species,
     )
 
-    line_accumulators_by_target: dict[str, list[tuple[str, _DensityLineAccumulator]]] = {}
-    heatmap_accumulators_by_target: dict[
-        str, list[tuple[tuple[str, str], _DensityHeatmapAccumulator]]
-    ] = {}
-    grid_accumulator_by_target: dict[str, _DensitySparseGridAccumulator] = {}
-    for target in active_targets:
-        species_lbl = target.species_label
-        observed_bounds = observed_bounds_by_target[species_lbl]
-        target_line_accumulators: list[tuple[str, _DensityLineAccumulator]] = []
-        if include_line_outputs:
-            for ax in raw_axes:
-                hist_bounds = cell_bounds_by_axis.get(ax) if normalized_binning == "cell" else None
-                if normalized_binning == "cell" and hist_bounds is None:
+    geometry_table = (
+        _prepare_density_grid_geometry(
+            frames, distance_coordinate_mode, surface_estimate, surface_reference
+        )
+        if include_grid_outputs
+        and all(_frame_has_usable_cell(frame, surface_axis_index) for frame in frames)
+        else None
+    )
+    with SparseWorkspace() if include_grid_outputs else nullcontext() as workspace:
+        line_accumulators_by_target: dict[str, list[tuple[str, _DensityLineAccumulator]]] = {}
+        heatmap_accumulators_by_target: dict[
+            str, list[tuple[tuple[str, str], _DensityHeatmapAccumulator]]
+        ] = {}
+        grid_accumulator_by_target: dict[str, _DensitySparseGridAccumulator] = {}
+        for target in active_targets:
+            species_lbl = target.species_label
+            observed_bounds = observed_bounds_by_target[species_lbl]
+            target_line_accumulators: list[tuple[str, _DensityLineAccumulator]] = []
+            if include_line_outputs:
+                for ax in raw_axes:
+                    hist_bounds = (
+                        cell_bounds_by_axis.get(ax) if normalized_binning == "cell" else None
+                    )
+                    if normalized_binning == "cell" and hist_bounds is None:
+                        LOGGER.warning(
+                            "Cell binning requested for '%s' along %s, but a usable cell was unavailable. "
+                            "Falling back to observed-data binning.",
+                            species_lbl,
+                            ax,
+                        )
+                    bin_edges = _resolve_density_line_bin_edges_from_bounds(
+                        observed_bounds=observed_bounds,
+                        axis_id=ax,
+                        species_label=species_lbl,
+                        bin_width=bin_width,
+                        histogram_bounds=hist_bounds,
+                    )
+                    target_line_accumulators.append(
+                        (
+                            ax,
+                            _DensityLineAccumulator(
+                                axis=ax,
+                                species_label=species_lbl,
+                                count_label=target.count_label,
+                                bin_edges=bin_edges,
+                                bin_width=bin_width,
+                                coordinate_mode="axis",
+                                normalization_cache=line_normalization_by_axis[ax],
+                                density_moments=_empty_density_statistics_moments(
+                                    n_bins=bin_edges.size - 1,
+                                    n_blocks=n_blocks,
+                                ),
+                                number_density_moments=_empty_density_statistics_moments(
+                                    n_bins=bin_edges.size - 1,
+                                    n_blocks=n_blocks,
+                                ),
+                                oh_cutoff_A=oh_cutoff
+                                if target.selection_kind == "molecule"
+                                else None,
+                                min_molecule_frames=(
+                                    min_molecule_frames
+                                    if target.selection_kind == "molecule"
+                                    else None
+                                ),
+                            ),
+                        )
+                    )
+                if normalized_binning == "cell" and distance_hist_bounds is None:
                     LOGGER.warning(
-                        "Cell binning requested for '%s' along %s, but a usable cell was unavailable. "
+                        "Cell binning requested for '%s' distance along %s, but a usable cell was unavailable. "
                         "Falling back to observed-data binning.",
                         species_lbl,
-                        ax,
+                        surface_axis,
                     )
-                bin_edges = _resolve_density_line_bin_edges_from_bounds(
+                distance_bin_edges = _resolve_density_line_bin_edges_from_bounds(
                     observed_bounds=observed_bounds,
-                    axis_id=ax,
+                    axis_id="distance",
                     species_label=species_lbl,
                     bin_width=bin_width,
-                    histogram_bounds=hist_bounds,
+                    histogram_bounds=distance_hist_bounds,
                 )
-                target_line_accumulators.append(
+                distance_views: tuple[tuple[str, SurfaceEstimate | None, str], ...]
+                if (
+                    surface_reference is not None
+                    and surface_reference.uses_distance
+                    and surface_reference.is_symmetric
+                ):
+                    distance_views = (
+                        ("distance-top", surface_reference.top, "top"),
+                        ("distance-bottom", surface_reference.bottom, "bottom"),
+                    )
+                else:
+                    distance_views = (("distance", surface_estimate, "single"),)
+                for distance_key, distance_surface, interface_view in distance_views:
+                    target_line_accumulators.append(
+                        (
+                            distance_key,
+                            _DensityLineAccumulator(
+                                axis=surface_axis,
+                                species_label=species_lbl,
+                                count_label=target.count_label,
+                                bin_edges=distance_bin_edges,
+                                bin_width=bin_width,
+                                coordinate_mode=distance_coordinate_mode,
+                                normalization_cache=line_normalization_by_axis[surface_axis],
+                                density_moments=_empty_density_statistics_moments(
+                                    n_bins=distance_bin_edges.size - 1,
+                                    n_blocks=n_blocks,
+                                ),
+                                number_density_moments=_empty_density_statistics_moments(
+                                    n_bins=distance_bin_edges.size - 1,
+                                    n_blocks=n_blocks,
+                                ),
+                                surface_position=surface_position,
+                                surface_position_std=surface_position_std,
+                                surface_estimate=distance_surface,
+                                surface_reference=surface_reference,
+                                interface_view=interface_view,
+                                oh_cutoff_A=(
+                                    oh_cutoff if target.selection_kind == "molecule" else None
+                                ),
+                                min_molecule_frames=(
+                                    min_molecule_frames
+                                    if target.selection_kind == "molecule"
+                                    else None
+                                ),
+                            ),
+                        )
+                    )
+            line_accumulators_by_target[species_lbl] = target_line_accumulators
+
+            target_heatmap_accumulators: list[
+                tuple[tuple[str, str], _DensityHeatmapAccumulator]
+            ] = []
+            for plane_axes in selected_heatmap_planes:
+                x_bin_edges, y_bin_edges = _resolve_density_heatmap_bin_edges_from_bounds(
+                    observed_bounds=observed_bounds,
+                    plane_axes=plane_axes,
+                    species_label=species_lbl,
+                    bin_width=bin_width,
+                    histogram_bounds=(
+                        (
+                            cell_bounds_by_axis.get(plane_axes[0]),
+                            cell_bounds_by_axis.get(plane_axes[1]),
+                        )
+                        if normalized_binning == "cell"
+                        else None
+                    ),
+                )
+                orthogonal_axis = next(axis for axis in raw_axes if axis not in plane_axes)
+                target_heatmap_accumulators.append(
                     (
-                        ax,
-                        _DensityLineAccumulator(
-                            axis=ax,
+                        plane_axes,
+                        _DensityHeatmapAccumulator(
+                            plane_axes=plane_axes,
+                            orthogonal_axis=orthogonal_axis,
                             species_label=species_lbl,
-                            count_label=target.count_label,
-                            bin_edges=bin_edges,
+                            x_bin_edges=x_bin_edges,
+                            y_bin_edges=y_bin_edges,
                             bin_width=bin_width,
-                            coordinate_mode="axis",
-                            normalization_cache=line_normalization_by_axis[ax],
-                            density_moments=_empty_density_statistics_moments(
-                                n_bins=bin_edges.size - 1,
-                                n_blocks=n_blocks,
-                            ),
-                            number_density_moments=_empty_density_statistics_moments(
-                                n_bins=bin_edges.size - 1,
-                                n_blocks=n_blocks,
-                            ),
+                            normalization_cache=heatmap_normalization_by_plane[plane_axes],
                             oh_cutoff_A=oh_cutoff if target.selection_kind == "molecule" else None,
                             min_molecule_frames=(
                                 min_molecule_frames if target.selection_kind == "molecule" else None
@@ -4147,295 +4118,237 @@ def _compute_all_density_profiles_streaming(
                         ),
                     )
                 )
-            if normalized_binning == "cell" and distance_hist_bounds is None:
-                LOGGER.warning(
-                    "Cell binning requested for '%s' distance along %s, but a usable cell was unavailable. "
-                    "Falling back to observed-data binning.",
-                    species_lbl,
-                    surface_axis,
-                )
-            distance_bin_edges = _resolve_density_line_bin_edges_from_bounds(
-                observed_bounds=observed_bounds,
-                axis_id="distance",
-                species_label=species_lbl,
-                bin_width=bin_width,
-                histogram_bounds=distance_hist_bounds,
-            )
-            distance_views: tuple[tuple[str, SurfaceEstimate | None, str], ...]
-            if (
-                surface_reference is not None
-                and surface_reference.uses_distance
-                and surface_reference.is_symmetric
-            ):
-                distance_views = (
-                    ("distance-top", surface_reference.top, "top"),
-                    ("distance-bottom", surface_reference.bottom, "bottom"),
-                )
-            else:
-                distance_views = (("distance", surface_estimate, "single"),)
-            for distance_key, distance_surface, interface_view in distance_views:
-                target_line_accumulators.append(
-                    (
-                        distance_key,
-                        _DensityLineAccumulator(
-                            axis=surface_axis,
-                            species_label=species_lbl,
-                            count_label=target.count_label,
-                            bin_edges=distance_bin_edges,
-                            bin_width=bin_width,
-                            coordinate_mode=distance_coordinate_mode,
-                            normalization_cache=line_normalization_by_axis[surface_axis],
-                            density_moments=_empty_density_statistics_moments(
-                                n_bins=distance_bin_edges.size - 1,
-                                n_blocks=n_blocks,
-                            ),
-                            number_density_moments=_empty_density_statistics_moments(
-                                n_bins=distance_bin_edges.size - 1,
-                                n_blocks=n_blocks,
-                            ),
-                            surface_position=surface_position,
-                            surface_position_std=surface_position_std,
-                            surface_estimate=distance_surface,
-                            surface_reference=surface_reference,
-                            interface_view=interface_view,
-                            oh_cutoff_A=(
-                                oh_cutoff if target.selection_kind == "molecule" else None
-                            ),
-                            min_molecule_frames=(
-                                min_molecule_frames if target.selection_kind == "molecule" else None
-                            ),
-                        ),
-                    )
-                )
-        line_accumulators_by_target[species_lbl] = target_line_accumulators
+            heatmap_accumulators_by_target[species_lbl] = target_heatmap_accumulators
 
-        target_heatmap_accumulators: list[tuple[tuple[str, str], _DensityHeatmapAccumulator]] = []
-        for plane_axes in selected_heatmap_planes:
-            x_bin_edges, y_bin_edges = _resolve_density_heatmap_bin_edges_from_bounds(
-                observed_bounds=observed_bounds,
-                plane_axes=plane_axes,
-                species_label=species_lbl,
-                bin_width=bin_width,
-                histogram_bounds=(
-                    (
-                        cell_bounds_by_axis.get(plane_axes[0]),
-                        cell_bounds_by_axis.get(plane_axes[1]),
-                    )
-                    if normalized_binning == "cell"
-                    else None
-                ),
-            )
-            orthogonal_axis = next(axis for axis in raw_axes if axis not in plane_axes)
-            target_heatmap_accumulators.append(
-                (
-                    plane_axes,
-                    _DensityHeatmapAccumulator(
-                        plane_axes=plane_axes,
-                        orthogonal_axis=orthogonal_axis,
-                        species_label=species_lbl,
-                        x_bin_edges=x_bin_edges,
-                        y_bin_edges=y_bin_edges,
-                        bin_width=bin_width,
-                        normalization_cache=heatmap_normalization_by_plane[plane_axes],
-                        oh_cutoff_A=oh_cutoff if target.selection_kind == "molecule" else None,
-                        min_molecule_frames=(
-                            min_molecule_frames if target.selection_kind == "molecule" else None
-                        ),
+            if include_grid_outputs:
+                grid_histogram_bounds = {
+                    ax: cell_bounds_by_axis.get(ax) if normalized_binning == "cell" else None
+                    for ax in raw_axes
+                }
+                distance_grid_bounds = (
+                    distance_hist_bounds if normalized_binning == "cell" else None
+                )
+                x_edges = _resolve_density_grid_bin_edges_from_bounds(
+                    observed_bounds=observed_bounds,
+                    axis_id="x",
+                    species_label=species_lbl,
+                    grid_bin_width=resolved_grid_bin_width,
+                    histogram_bounds=grid_histogram_bounds["x"],
+                )
+                y_edges = _resolve_density_grid_bin_edges_from_bounds(
+                    observed_bounds=observed_bounds,
+                    axis_id="y",
+                    species_label=species_lbl,
+                    grid_bin_width=resolved_grid_bin_width,
+                    histogram_bounds=grid_histogram_bounds["y"],
+                )
+                z_edges = _resolve_density_grid_bin_edges_from_bounds(
+                    observed_bounds=observed_bounds,
+                    axis_id="z",
+                    species_label=species_lbl,
+                    grid_bin_width=resolved_grid_bin_width,
+                    histogram_bounds=grid_histogram_bounds["z"],
+                )
+                distance_edges = _resolve_density_grid_bin_edges_from_bounds(
+                    observed_bounds=observed_bounds,
+                    axis_id="distance",
+                    species_label=species_lbl,
+                    grid_bin_width=resolved_grid_bin_width,
+                    histogram_bounds=distance_grid_bounds,
+                )
+                grid_accumulator_by_target[species_lbl] = _DensitySparseGridAccumulator(
+                    geometry_table=geometry_table,
+                    workspace=workspace,
+                    species_label=species_lbl,
+                    count_label=target.count_label,
+                    x_bin_edges=x_edges,
+                    y_bin_edges=y_edges,
+                    z_bin_edges=z_edges,
+                    distance_bin_edges=distance_edges,
+                    grid_bin_width=resolved_grid_bin_width,
+                    max_nonzero_bins=int(grid_max_nonzero_bins),
+                    surface_axis=surface_axis,
+                    distance_coordinate_mode=distance_coordinate_mode,
+                    surface_position=surface_position,
+                    surface_position_std=surface_position_std,
+                    surface_estimate=surface_estimate,
+                    surface_reference=surface_reference,
+                    oh_cutoff_A=oh_cutoff if target.selection_kind == "molecule" else None,
+                    min_molecule_frames=(
+                        min_molecule_frames if target.selection_kind == "molecule" else None
                     ),
                 )
-            )
-        heatmap_accumulators_by_target[species_lbl] = target_heatmap_accumulators
 
-        if include_grid_outputs:
-            grid_histogram_bounds = {
-                ax: cell_bounds_by_axis.get(ax) if normalized_binning == "cell" else None
-                for ax in raw_axes
-            }
-            distance_grid_bounds = distance_hist_bounds if normalized_binning == "cell" else None
-            x_edges = _resolve_density_grid_bin_edges_from_bounds(
-                observed_bounds=observed_bounds,
-                axis_id="x",
-                species_label=species_lbl,
-                grid_bin_width=resolved_grid_bin_width,
-                histogram_bounds=grid_histogram_bounds["x"],
-            )
-            y_edges = _resolve_density_grid_bin_edges_from_bounds(
-                observed_bounds=observed_bounds,
-                axis_id="y",
-                species_label=species_lbl,
-                grid_bin_width=resolved_grid_bin_width,
-                histogram_bounds=grid_histogram_bounds["y"],
-            )
-            z_edges = _resolve_density_grid_bin_edges_from_bounds(
-                observed_bounds=observed_bounds,
-                axis_id="z",
-                species_label=species_lbl,
-                grid_bin_width=resolved_grid_bin_width,
-                histogram_bounds=grid_histogram_bounds["z"],
-            )
-            distance_edges = _resolve_density_grid_bin_edges_from_bounds(
-                observed_bounds=observed_bounds,
-                axis_id="distance",
-                species_label=species_lbl,
-                grid_bin_width=resolved_grid_bin_width,
-                histogram_bounds=distance_grid_bounds,
-            )
-            grid_accumulator_by_target[species_lbl] = _DensitySparseGridAccumulator(
-                geometry_frames=frames
-                if all(_frame_has_usable_cell(f, surface_axis_index) for f in frames)
-                else None,
-                species_label=species_lbl,
-                count_label=target.count_label,
-                x_bin_edges=x_edges,
-                y_bin_edges=y_edges,
-                z_bin_edges=z_edges,
-                distance_bin_edges=distance_edges,
-                grid_bin_width=resolved_grid_bin_width,
-                max_nonzero_bins=int(grid_max_nonzero_bins),
-                surface_axis=surface_axis,
-                distance_coordinate_mode=distance_coordinate_mode,
-                surface_position=surface_position,
-                surface_position_std=surface_position_std,
-                surface_estimate=surface_estimate,
-                surface_reference=surface_reference,
-                oh_cutoff_A=oh_cutoff if target.selection_kind == "molecule" else None,
-                min_molecule_frames=(
-                    min_molecule_frames if target.selection_kind == "molecule" else None
-                ),
-            )
-
-    profiles: list[DensityProfile | DensityHeatmapProfile | DensityGridProfile] = []
-    accumulation_element_selector = _DensityElementSelector(
-        [target.species_label for target in active_targets if target.selection_kind == "element"]
-    )
-    with ProgressBar(desc="Binning density frames", total=len(frames), unit="frame") as progress:
-        for frame_index, frame in enumerate(frames):
-            frame_selections = _select_density_targets_in_frame(
-                frame,
-                frame_index=frame_index,
-                target_specs=active_targets,
-                topology_cache=run_topology_cache,
-                element_selector=accumulation_element_selector,
-                wrap_positions_to_cell=wrap_positions_to_cell,
-            )
-            for target in active_targets:
-                selection = frame_selections.get(target.species_label)
-                if selection is None:
-                    continue
-                positions, masses = selection
-                mass_array = np.asarray(masses, dtype=float)
-                raw_surface_axis_values = np.asarray(positions[:, surface_axis_index], dtype=float)
-                distance_components = (
-                    surface_distance_components(
-                        surface_reference,
-                        raw_surface_axis_values,
-                        frame_index=frame_index,
-                    )
-                    if surface_reference is not None and surface_reference.uses_distance
-                    else None
+        profiles: list[DensityProfile | DensityHeatmapProfile | DensityGridProfile] = []
+        accumulation_element_selector = _DensityElementSelector(
+            [
+                target.species_label
+                for target in active_targets
+                if target.selection_kind == "element"
+            ]
+        )
+        with (
+            progress_stage(LOGGER, "Binning density frames"),
+            ProgressBar(desc="Binning density frames", total=len(frames), unit="frame") as progress,
+        ):
+            for frame_index, frame in enumerate(frames):
+                frame_selections = _select_density_targets_in_frame(
+                    frame,
+                    frame_index=frame_index,
+                    target_specs=active_targets,
+                    topology_cache=run_topology_cache,
+                    element_selector=accumulation_element_selector,
+                    wrap_positions_to_cell=wrap_positions_to_cell,
                 )
-                for axis_key, accumulator in line_accumulators_by_target[target.species_label]:
-                    accumulator_masses = mass_array
-                    entity_weights = None
-                    if axis_key.startswith("distance"):
-                        if distance_components is not None:
-                            folded, top_distance, bottom_distance, interface_side = (
-                                distance_components
-                            )
-                            if axis_key == "distance-top":
-                                selected = interface_side >= 0
-                                entity_weights = np.where(interface_side[selected] == 0, 0.5, 1.0)
-                                axis_values = top_distance[selected]
-                                accumulator_masses = mass_array[selected] * entity_weights
-                            elif axis_key == "distance-bottom":
-                                selected = interface_side <= 0
-                                entity_weights = np.where(interface_side[selected] == 0, 0.5, 1.0)
-                                axis_values = bottom_distance[selected]
-                                accumulator_masses = mass_array[selected] * entity_weights
+                for target in active_targets:
+                    selection = frame_selections.get(target.species_label)
+                    if selection is None:
+                        continue
+                    positions, masses = selection
+                    mass_array = np.asarray(masses, dtype=float)
+                    raw_surface_axis_values = np.asarray(
+                        positions[:, surface_axis_index], dtype=float
+                    )
+                    distance_components = (
+                        surface_distance_components(
+                            surface_reference,
+                            raw_surface_axis_values,
+                            frame_index=frame_index,
+                        )
+                        if surface_reference is not None and surface_reference.uses_distance
+                        else None
+                    )
+                    for axis_key, accumulator in line_accumulators_by_target[target.species_label]:
+                        accumulator_masses = mass_array
+                        entity_weights = None
+                        if axis_key.startswith("distance"):
+                            if distance_components is not None:
+                                folded, top_distance, bottom_distance, interface_side = (
+                                    distance_components
+                                )
+                                if axis_key == "distance-top":
+                                    selected = interface_side >= 0
+                                    entity_weights = np.where(
+                                        interface_side[selected] == 0, 0.5, 1.0
+                                    )
+                                    axis_values = top_distance[selected]
+                                    accumulator_masses = mass_array[selected] * entity_weights
+                                elif axis_key == "distance-bottom":
+                                    selected = interface_side <= 0
+                                    entity_weights = np.where(
+                                        interface_side[selected] == 0, 0.5, 1.0
+                                    )
+                                    axis_values = bottom_distance[selected]
+                                    accumulator_masses = mass_array[selected] * entity_weights
+                                else:
+                                    axis_values = folded
                             else:
-                                axis_values = folded
+                                axis_values = (
+                                    raw_surface_axis_values
+                                    if per_frame_surface is None
+                                    else raw_surface_axis_values
+                                    - float(per_frame_surface[frame_index])
+                                )
                         else:
-                            axis_values = (
+                            axis_values = np.asarray(
+                                positions[:, axis_indices[axis_key]], dtype=float
+                            )
+                        accumulator.update(
+                            axis_values=axis_values,
+                            masses=accumulator_masses,
+                            frame_index=frame_index,
+                            validation_plan=validation_plan,
+                            block_index_by_frame=block_index_by_frame,
+                            entity_weights=entity_weights,
+                        )
+                    for plane_axes, heatmap_accumulator in heatmap_accumulators_by_target[
+                        target.species_label
+                    ]:
+                        heatmap_accumulator.update(
+                            x_values=np.asarray(
+                                positions[:, axis_indices[plane_axes[0]]], dtype=float
+                            ),
+                            y_values=np.asarray(
+                                positions[:, axis_indices[plane_axes[1]]], dtype=float
+                            ),
+                            masses=mass_array,
+                            frame_index=frame_index,
+                            validation_plan=validation_plan,
+                            frame=frame,
+                        )
+                    grid_accumulator = grid_accumulator_by_target.get(target.species_label)
+                    if grid_accumulator is not None:
+                        grid_interface_side = None
+                        if distance_components is not None:
+                            grid_distance_values = distance_components[0]
+                            grid_interface_side = distance_components[3]
+                        else:
+                            grid_distance_values = (
                                 raw_surface_axis_values
                                 if per_frame_surface is None
                                 else raw_surface_axis_values - float(per_frame_surface[frame_index])
                             )
-                    else:
-                        axis_values = np.asarray(positions[:, axis_indices[axis_key]], dtype=float)
-                    accumulator.update(
-                        axis_values=axis_values,
-                        masses=accumulator_masses,
-                        frame_index=frame_index,
-                        validation_plan=validation_plan,
-                        block_index_by_frame=block_index_by_frame,
-                        entity_weights=entity_weights,
-                    )
-                for plane_axes, heatmap_accumulator in heatmap_accumulators_by_target[
-                    target.species_label
-                ]:
-                    heatmap_accumulator.update(
-                        x_values=np.asarray(positions[:, axis_indices[plane_axes[0]]], dtype=float),
-                        y_values=np.asarray(positions[:, axis_indices[plane_axes[1]]], dtype=float),
-                        masses=mass_array,
-                        frame_index=frame_index,
-                        validation_plan=validation_plan,
-                        frame=frame,
-                    )
-                grid_accumulator = grid_accumulator_by_target.get(target.species_label)
-                if grid_accumulator is not None:
-                    grid_interface_side = None
-                    if distance_components is not None:
-                        grid_distance_values = distance_components[0]
-                        grid_interface_side = distance_components[3]
-                    else:
-                        grid_distance_values = (
-                            raw_surface_axis_values
-                            if per_frame_surface is None
-                            else raw_surface_axis_values - float(per_frame_surface[frame_index])
+                        grid_accumulator.update(
+                            positions=positions,
+                            distance_values=grid_distance_values,
+                            masses=mass_array,
+                            frame_index=frame_index,
+                            validation_plan=validation_plan,
+                            interface_side=grid_interface_side,
                         )
-                    grid_accumulator.update(
-                        positions=positions,
-                        distance_values=grid_distance_values,
-                        masses=mass_array,
-                        frame_index=frame_index,
-                        validation_plan=validation_plan,
-                        interface_side=grid_interface_side,
-                    )
-            progress.update()
+                progress.update()
 
-        for target in active_targets:
-            finalized_lines = {
-                key: accumulator.finalize(n_frames=len(frames))
-                for key, accumulator in line_accumulators_by_target[target.species_label]
-            }
-            if "distance-top" in finalized_lines and "distance-bottom" in finalized_lines:
-                assert surface_reference is not None
-                finalized_lines["distance"] = _fold_symmetric_density_profiles(
-                    finalized_lines.pop("distance-top"),
-                    finalized_lines.pop("distance-bottom"),
-                    surface_reference=surface_reference,
-                    surface_position=surface_position,
-                    surface_position_std=surface_position_std,
+        with (
+            progress_stage(LOGGER, "Finalize density grids")
+            if include_grid_outputs
+            else nullcontext()
+        ):
+            with (
+                ProgressBar(
+                    desc="Finalize density grids", total=len(active_targets), unit="species"
                 )
-            target_profiles: list[DensityProfile | DensityHeatmapProfile | DensityGridProfile] = [
-                *finalized_lines.values(),
-                *(
-                    accumulator.finalize(n_frames=len(frames))
-                    for _, accumulator in heatmap_accumulators_by_target[target.species_label]
-                ),
-            ]
-            grid_accumulator = grid_accumulator_by_target.get(target.species_label)
-            if grid_accumulator is not None:
-                target_profiles.append(grid_accumulator.finalize(n_frames=len(frames)))
-            profiles.extend(target_profiles)
+                if include_grid_outputs
+                else nullcontext()
+            ) as final_progress:
+                for target in active_targets:
+                    finalized_lines = {
+                        key: accumulator.finalize(n_frames=len(frames))
+                        for key, accumulator in line_accumulators_by_target[target.species_label]
+                    }
+                    if "distance-top" in finalized_lines and "distance-bottom" in finalized_lines:
+                        assert surface_reference is not None
+                        finalized_lines["distance"] = _fold_symmetric_density_profiles(
+                            finalized_lines.pop("distance-top"),
+                            finalized_lines.pop("distance-bottom"),
+                            surface_reference=surface_reference,
+                            surface_position=surface_position,
+                            surface_position_std=surface_position_std,
+                        )
+                    target_profiles: list[
+                        DensityProfile | DensityHeatmapProfile | DensityGridProfile
+                    ] = [
+                        *finalized_lines.values(),
+                        *(
+                            accumulator.finalize(n_frames=len(frames))
+                            for _, accumulator in heatmap_accumulators_by_target[
+                                target.species_label
+                            ]
+                        ),
+                    ]
+                    grid_accumulator = grid_accumulator_by_target.get(target.species_label)
+                    if grid_accumulator is not None:
+                        target_profiles.append(grid_accumulator.finalize(n_frames=len(frames)))
+                    profiles.extend(target_profiles)
+                    if final_progress is not None:
+                        final_progress.update()
 
-    LOGGER.info(
-        "Density binning summary: outputs=%d, frames=%d, saved_statistics=sample%s.",
-        len(profiles),
-        len(frames),
-        "+block" if block_index_by_frame is not None else "",
-    )
-    return profiles
+        LOGGER.info(
+            "Density binning summary: outputs=%d, frames=%d, saved_statistics=sample%s.",
+            len(profiles),
+            len(frames),
+            "+block" if block_index_by_frame is not None else "",
+        )
+        return profiles
 
 
 def compute_all_density_profiles(
@@ -5302,21 +5215,30 @@ def _load_density_grid_profiles_from_payloads(
             if np.isfinite(value):
                 surface_position_std = value
 
+        grid_bin_width = _optional_float_metadata(metadata, "grid_bin_width_A")
+        grid_edges = {
+            axis: reconstruct_uniform_bin_edges_from_edges(
+                np.asarray(datasets[f"{axis}_bin_edges_A"]),
+                bin_width=grid_bin_width,
+                source_label=f"Density HDF5 '{source_path}' sparse grid {axis}",
+            )[0]
+            for axis in _DENSITY_GRID_AXES
+        }
         profiles.append(
             DensityGridProfile(
                 geometry_groups=_load_geometry_groups(datasets),
                 species=species_label,
-                x_bin_edges=np.asarray(datasets["x_bin_edges_A"]),
-                y_bin_edges=np.asarray(datasets["y_bin_edges_A"]),
-                z_bin_edges=np.asarray(datasets["z_bin_edges_A"]),
-                distance_bin_edges=np.asarray(datasets["distance_bin_edges_A"]),
+                x_bin_edges=grid_edges["x"],
+                y_bin_edges=grid_edges["y"],
+                z_bin_edges=grid_edges["z"],
+                distance_bin_edges=grid_edges["distance"],
                 flat_indices=np.asarray(datasets["flat_indices"], dtype=np.uint64),
                 mass_sum_g=np.asarray(datasets["mass_sum_g"], dtype=_DENSITY_GRID_STORAGE_DTYPE),
                 entity_sum=np.asarray(datasets["entity_sum"], dtype=_DENSITY_GRID_STORAGE_DTYPE),
                 n_frames=int(metadata.get("n_frames", 0)),
                 units=str(metadata.get("units") or resolved_units.get("mass_sum_g") or "g"),
                 number_density_units=number_density_units,
-                grid_bin_width_A=_optional_float_metadata(metadata, "grid_bin_width_A"),
+                grid_bin_width_A=grid_bin_width,
                 grid_max_nonzero_bins=_optional_int_metadata(metadata, "grid_max_nonzero_bins"),
                 surface_axis=str(metadata.get("surface_axis", "z")).strip().lower() or "z",
                 distance_coordinate_mode=str(metadata.get("distance_coordinate_mode", "distance"))
@@ -5582,9 +5504,10 @@ def _density_grid_target_bins(
     *,
     requested_bin_width: float | None,
 ) -> tuple[np.ndarray, float]:
-    source_edges = _density_grid_edges(profile, axis_id)
-    source_width = uniform_bin_width_from_edges(
-        source_edges,
+    axis_key = _DENSITY_GRID_AXES[_density_grid_axis_position(axis_id)]
+    source_edges, source_width = reconstruct_uniform_bin_edges_from_edges(
+        np.asarray(getattr(profile, f"{axis_key}_bin_edges")),
+        bin_width=profile.grid_bin_width_A,
         source_label=f"Density sparse grid {axis_id}",
     )
     if requested_bin_width is None or float(requested_bin_width) <= source_width:
@@ -7798,45 +7721,6 @@ def plot_density_profiles(
     )
 
 
-def _finish_geometry_groups(groups, *, include_paired: bool = False):
-    if groups is None:
-        return None
-    result = []
-    for group in groups.values():
-        keys = sorted(group["counts"])
-        top_counts = group.get("top_counts", {})
-        bottom_counts = group.get("bottom_counts", {})
-        payload = dict(
-            cell=group["cell"],
-            origin=group["origin"],
-            shift=group["shift"],
-            n_frames=group["n_frames"],
-            flat_indices=np.asarray(keys, dtype=np.uint64),
-            mass_sum_g=np.asarray([group["counts"][k][0] for k in keys]),
-            entity_sum=np.asarray([group["counts"][k][1] for k in keys]),
-        )
-        if group.get("canonical_period") is not None:
-            payload.update(
-                top_shift=group["top_shift"],
-                bottom_shift=group["bottom_shift"],
-                canonical_cut=group["canonical_cut"],
-                canonical_lower=group["canonical_lower"],
-                canonical_period=group["canonical_period"],
-                canonical_wrap_threshold=group.get("canonical_wrap_threshold"),
-            )
-        if include_paired:
-            payload.update(
-                top_shift=group.get("top_shift", group["shift"]),
-                bottom_shift=group.get("bottom_shift", group["shift"]),
-                top_mass_sum_g=np.asarray([top_counts.get(k, (0.0, 0.0))[0] for k in keys]),
-                top_entity_sum=np.asarray([top_counts.get(k, (0.0, 0.0))[1] for k in keys]),
-                bottom_mass_sum_g=np.asarray([bottom_counts.get(k, (0.0, 0.0))[0] for k in keys]),
-                bottom_entity_sum=np.asarray([bottom_counts.get(k, (0.0, 0.0))[1] for k in keys]),
-            )
-        result.append(payload)
-    return result
-
-
 def _geometry_group_datasets(groups):
     if groups is None:
         return {}
@@ -7920,6 +7804,7 @@ def _load_geometry_groups(datasets):
     has_canonical_geometry = present_canonical_names == canonical_names
     groups = []
     for i, cell in enumerate(datasets["geometry_cells_A"]):
+        check_cancelled()
         start, stop = datasets["geometry_offsets"][i : i + 2]
         groups.append(
             dict(
@@ -8217,7 +8102,72 @@ def _canonical_normal_overlap(
     return float(sum(upper - lower for lower, upper in intervals))
 
 
-def _prismatic_geometry_volumes(
+def _canonical_distance_bin_overlaps(
+    profile: DensityGridProfile,
+    group: Mapping[str, Any],
+    edges: np.ndarray,
+    filters: Mapping[str, tuple[float | None, float | None]],
+    *,
+    distance_side: str,
+) -> np.ndarray:
+    """Intersect all distance bins with the canonical cell in numeric buffers."""
+    period = float(group["canonical_period"])
+    top = float(group.get("top_shift", group.get("shift", 0.0)))
+    bottom = float(group.get("bottom_shift", group.get("shift", 0.0)))
+    lower, upper = edges[:-1].copy(), edges[1:].copy()
+    limits = filters.get("distance", (None, None))
+    if limits[0] is not None:
+        lower = np.maximum(lower, float(limits[0]))
+    if limits[1] is not None:
+        upper = np.minimum(upper, float(limits[1]))
+    layout = profile.surface_reference.resolved_layout if profile.surface_reference else "axis"
+    if layout in {"single-top", "single-bottom"}:
+        threshold = group.get("canonical_wrap_threshold")
+        if layout == "single-top":
+            distance_lower = float(bottom if threshold is None else threshold) - top
+        else:
+            distance_lower = bottom - float(top if threshold is None else threshold)
+        lower = np.maximum(lower, distance_lower)
+        upper = np.minimum(upper, period + distance_lower)
+        start_coordinate = top + lower if layout == "single-top" else bottom - upper
+        stop_coordinate = top + upper if layout == "single-top" else bottom - lower
+        width = stop_coordinate - start_coordinate
+        valid = np.isfinite(start_coordinate) & np.isfinite(stop_coordinate) & (width > 0)
+        full = valid & (width >= period - 1.0e-12)
+        start = np.mod(start_coordinate, period)
+        stop = start + width
+        wraps = stop > period + 1.0e-12
+        segments: tuple[tuple[np.ndarray, np.ndarray], ...] = (
+            (np.where(full, 0.0, start), np.where(full, period, np.minimum(stop, period))),
+            (np.zeros_like(start), np.where(wraps & ~full, stop - period, 0.0)),
+        )
+    elif layout == "symmetric":
+        midplane = 0.5 * (top + bottom)
+        if distance_side == "bottom":
+            start = np.maximum(0.0, bottom - upper)
+            stop = np.minimum(midplane, bottom - lower)
+        else:
+            start = np.maximum(midplane, top + lower)
+            stop = np.minimum(period, top + upper)
+        valid = stop > start
+        segments = ((start, stop),)
+    else:
+        return np.zeros(edges.size - 1, dtype=float)
+    result = np.zeros(edges.size - 1, dtype=float)
+    raw_intervals = _canonical_raw_axis_intervals(
+        group, filters.get(str(profile.surface_axis).lower(), (None, None))
+    )
+    for raw_lower, raw_upper in raw_intervals:
+        for start, stop in segments:
+            result += np.where(
+                valid,
+                np.maximum(0.0, np.minimum(stop, raw_upper) - np.maximum(start, raw_lower)),
+                0.0,
+            )
+    return result
+
+
+def _prismatic_geometry_volume_factors(
     profile: DensityGridProfile,
     group: Mapping[str, Any],
     axes: tuple[str, ...],
@@ -8226,8 +8176,8 @@ def _prismatic_geometry_volumes(
     *,
     area_cache: dict[tuple[float, ...], np.ndarray],
     distance_side: str = "top",
-) -> np.ndarray | None:
-    """Return exact projected volumes for a decoupled surface-normal prism."""
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Return in-plane area and normal overlap without expanding their product."""
 
     normal_axis = str(profile.surface_axis).strip().lower() or "z"
     normal_index = ("x", "y", "z").index(normal_axis)
@@ -8242,7 +8192,7 @@ def _prismatic_geometry_volumes(
     normal_cell_upper = float(extent[normal_index, 1])
     normal_height = normal_cell_upper - normal_cell_lower
     if not np.isfinite(normal_height) or normal_height <= 0.0:
-        return np.zeros(shape, dtype=float)
+        return np.zeros(shape, dtype=float), np.asarray(1.0)
 
     normal_dimensions = [
         dimension
@@ -8276,6 +8226,7 @@ def _prismatic_geometry_volumes(
             dtype=float,
         )
         for index in np.ndindex(area_shape):
+            check_cancelled()
             bounds = np.asarray([[-np.inf, np.inf]] * 2, dtype=float)
             for axis, limits in filters.items():
                 if axis == "distance" or axis == normal_axis:
@@ -8316,11 +8267,18 @@ def _prismatic_geometry_volumes(
                 distance_limits=distance_filter,
                 distance_side=distance_side,
             )
-            return np.broadcast_to(area * overlap, shape).copy()
+            return area, np.asarray(overlap)
 
         dimension = normal_dimensions[0]
         axis = axes[dimension]
         edge = np.asarray(edges[dimension], dtype=float)
+        if axis == "distance":
+            overlap_1d = _canonical_distance_bin_overlaps(
+                profile, group, edge, filters, distance_side=distance_side
+            )
+            overlap_shape = [1] * len(shape)
+            overlap_shape[dimension] = overlap_1d.size
+            return area, overlap_1d.reshape(overlap_shape)
         overlap_1d = np.zeros(edge.size - 1, dtype=float)
         for index, (edge_lower, edge_upper) in enumerate(zip(edge[:-1], edge[1:])):
             bin_raw_limits = raw_filter
@@ -8359,7 +8317,7 @@ def _prismatic_geometry_volumes(
         overlap_shape = [1] * len(shape)
         overlap_shape[dimension] = overlap_1d.size
         overlap = overlap_1d.reshape(overlap_shape)
-        return np.broadcast_to(area * overlap, shape).copy()
+        return area, overlap
 
     normal_lower = normal_cell_lower
     normal_upper = normal_cell_upper
@@ -8385,7 +8343,7 @@ def _prismatic_geometry_volumes(
 
     if not normal_dimensions:
         overlap = max(0.0, normal_upper - normal_lower)
-        return np.broadcast_to(area * overlap, shape).copy()
+        return area, np.asarray(overlap)
 
     dimension = normal_dimensions[0]
     axis = axes[dimension]
@@ -8403,7 +8361,26 @@ def _prismatic_geometry_volumes(
     overlap_shape = [1] * len(shape)
     overlap_shape[dimension] = overlap_1d.size
     overlap = overlap_1d.reshape(overlap_shape)
-    return np.broadcast_to(area * overlap, shape).copy()
+    return area, overlap
+
+
+def _prismatic_geometry_volumes(
+    profile: DensityGridProfile,
+    group: Mapping[str, Any],
+    axes: tuple[str, ...],
+    edges: tuple[np.ndarray, ...],
+    filters: Mapping[str, tuple[float | None, float | None]],
+    *,
+    area_cache: dict[tuple[float, ...], np.ndarray],
+    distance_side: str = "top",
+) -> np.ndarray | None:
+    factors = _prismatic_geometry_volume_factors(
+        profile, group, axes, edges, filters, area_cache=area_cache, distance_side=distance_side
+    )
+    if factors is None:
+        return None
+    shape = tuple(len(edge) - 1 for edge in edges)
+    return np.broadcast_to(factors[0] * factors[1], shape).copy()
 
 
 def _generic_geometry_volumes(
@@ -8419,6 +8396,7 @@ def _generic_geometry_volumes(
     volumes = np.zeros(shape, dtype=float)
     extent = cartesian_bounds(group["cell"], group["origin"])
     for index in np.ndindex(shape):
+        check_cancelled()
         bounds = np.asarray([[-np.inf, np.inf]] * 3, dtype=float)
         constraints = list(filters.items()) + [
             (axis, (edge[idx], edge[idx + 1])) for axis, edge, idx in zip(axes, edges, index)
@@ -8461,6 +8439,7 @@ def _coalesced_density_projection_groups(
 
     buckets: dict[tuple[object, ...], dict[str, Any]] = {}
     for group in groups:
+        check_cancelled()
         key: tuple[object, ...] = tuple(np.asarray(group["cell"], dtype=float).ravel()) + tuple(
             np.asarray(group["origin"], dtype=float)
         )
@@ -8492,6 +8471,7 @@ def _coalesced_density_projection_groups(
 
     result: list[dict[str, Any]] = []
     for bucket in buckets.values():
+        check_cancelled()
         flat = np.concatenate(bucket.pop("projection_flat_chunks"))
         mass = np.concatenate(bucket.pop("projection_mass_chunks"))
         entity = np.concatenate(bucket.pop("projection_entity_chunks"))
@@ -8612,6 +8592,7 @@ def _geometry_project_density(
         len(projection_groups) - prism_group_count,
     )
     for group in projection_groups:
+        check_cancelled()
         source = replace(
             profile,
             flat_indices=group["projection_flat_indices"],
@@ -8632,6 +8613,42 @@ def _geometry_project_density(
             for axis, edge in zip(axes, edges)
         )
         flat = np.ravel_multi_index(target_indices, shape)
+        factors = _prismatic_geometry_volume_factors(
+            profile,
+            group,
+            normalized_axes,
+            normalized_edges,
+            filters,
+            area_cache=area_cache,
+            distance_side=distance_side,
+        )
+        if factors is not None:
+            area, overlap = factors
+            # Only occupied bins need density normalization. Coverage includes
+            # empty bins, using the broadcast factors rather than a retained
+            # full volume grid for every distinct surface position.
+            sparse_volumes = (
+                np.broadcast_to(area, shape)[target_indices]
+                * np.broadcast_to(overlap, shape)[target_indices]
+            )
+            valid_sparse = sparse_volumes > 0.0
+            np.add.at(
+                mass_density.ravel(),
+                flat[valid_sparse],
+                np.asarray(source.mass_sum_g)[mask][valid_sparse] / sparse_volumes[valid_sparse],
+            )
+            np.add.at(
+                number_density.ravel(),
+                flat[valid_sparse],
+                np.asarray(source.entity_sum)[mask][valid_sparse] / sparse_volumes[valid_sparse],
+            )
+            np.add(
+                coverage,
+                float(group["n_frames"]),
+                out=coverage,
+                where=(area > 0.0) & (overlap > 0.0),
+            )
+            continue
         masses = (
             np.bincount(
                 flat, weights=np.asarray(source.mass_sum_g)[mask], minlength=int(np.prod(shape))
@@ -8682,7 +8699,13 @@ def _geometry_project_density(
                     filters,
                     distance_side=distance_side,
                 )
-            volume_cache[geometry_key] = volumes
+            # General polyhedral projections also must not retain an
+            # unbounded dense grid for every changing geometry.
+            cache_limit = max(1, (16 * 1024 * 1024) // max(1, volumes.nbytes))
+            if len(volume_cache) >= cache_limit:
+                volume_cache.clear()
+            if volumes.nbytes <= 16 * 1024 * 1024:
+                volume_cache[geometry_key] = volumes
         valid = volumes > 0.0
         np.divide(
             masses,

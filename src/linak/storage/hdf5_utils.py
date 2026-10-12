@@ -15,6 +15,7 @@ from uuid import uuid4
 import numpy as np
 
 from .. import __version__
+from ..cancellation import check_cancelled
 from .policies import (
     DEFAULT_COMPRESSION_PROFILE,
     STORAGE_PRECISION_POLICY,
@@ -317,6 +318,13 @@ def write_linak_hdf5(
     return output_path
 
 
+def _read_profile_dataset(dataset: Any) -> np.ndarray:
+    check_cancelled()
+    result = np.asarray(dataset)
+    check_cancelled()
+    return result
+
+
 def read_linak_hdf5_profiles(
     path: str | Path,
     *,
@@ -359,7 +367,7 @@ def read_linak_hdf5_profiles(
                 profiles: list[tuple[dict[str, np.ndarray], dict[str, Any]]] = []
                 for index, (_name, group) in enumerate(sorted(member_items, key=_member_sort_key)):
                     datasets = {
-                        dataset_name: np.asarray(dataset)
+                        dataset_name: _read_profile_dataset(dataset)
                         for dataset_name, dataset in group.items()
                         if hasattr(dataset, "shape")
                     }
@@ -388,7 +396,7 @@ def read_linak_hdf5_profiles(
                 return profiles
 
         datasets = {
-            name: np.asarray(dataset)
+            name: _read_profile_dataset(dataset)
             for name, dataset in handle.items()
             if hasattr(dataset, "shape")
         }
@@ -551,7 +559,7 @@ def read_linak_hdf5_profiles_by_index(
                         )
                     group = sorted_members[requested_index]
                     datasets = {
-                        dataset_name: np.asarray(dataset)
+                        dataset_name: _read_profile_dataset(dataset)
                         for dataset_name, dataset in group.items()
                         if hasattr(dataset, "shape")
                         and (
@@ -590,7 +598,7 @@ def read_linak_hdf5_profiles_by_index(
                     f"HDF5 profile index {requested_index} is out of range for '{hdf5_path}'."
                 )
             datasets = {
-                name: np.asarray(dataset)
+                name: _read_profile_dataset(dataset)
                 for name, dataset in handle.items()
                 if hasattr(dataset, "shape")
                 and (requested_dataset_names is None or str(name) in requested_dataset_names)

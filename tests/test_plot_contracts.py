@@ -464,7 +464,7 @@ def test_resolve_position_plot_mapping_validates_and_marks_profile_descriptor_mo
     assert resolved.uses_profile_descriptors is True
 
 
-def test_resolve_position_categorical_2d_mapping_uses_profile_descriptors():
+def test_resolve_position_categorical_2d_mapping_uses_atom_descriptors():
     resolved = resolve_position_plot_mapping(
         component="2d-projection",
         projection_x="x",
@@ -476,7 +476,7 @@ def test_resolve_position_categorical_2d_mapping_uses_profile_descriptors():
     assert resolved.mapping.view_type_id == PLOT_VIEW_2D_HEATMAP
     assert resolved.mapping.color is None
     assert resolved.mapping.fixed_values["projection_render_mode"] == "line-colors"
-    assert resolved.uses_profile_descriptors is True
+    assert resolved.uses_profile_descriptors is False
 
 
 def test_coordination_profile_to_plot_data_contract_exposes_frame_atom_structure():

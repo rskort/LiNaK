@@ -1353,6 +1353,9 @@ def _convert_trajectory_request(
                     ),
                 )
     if request.target_file_type == "trajectory_hdf5":
+        from .analysis.topology import prepare_topology
+
+        topology_profile = prepare_topology(frames)
         with progress_stage(LOGGER, "Build surface cache"):
             stored_metadata = _conversion_metadata_with_surface_cache(stored_metadata, frames)
         if selection_resolution is not None:
@@ -1392,6 +1395,7 @@ def _convert_trajectory_request(
                 source_format=request.source_path.suffix.lower().lstrip("."),
                 metadata=stored_metadata,
                 compression_profile=("fast" if options is None else options.compression_profile),
+                topology_profile=topology_profile,
             )
         return ConversionResult(
             output_path=converted_path,

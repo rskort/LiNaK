@@ -52,7 +52,6 @@ from linak.plot.plot_gui import (
     _orientation_backend_summary_text,
     _normalize_full_range_bound,
     _potential_backend_summary_text,
-    _partition_series_ids_for_display_order,
     _plot_family_for_view,
     _resolve_error_stat_for_available,
     _resolve_asset_path,
@@ -110,7 +109,7 @@ def test_density_ranges_use_blank_full_range_and_preview_requests_are_deduplicat
     assert 'upper_widget.setText("" if upper is None else str(upper))' in source
     assert "if signature == self._active_preview_signature:" in source
     assert "if self._preview_loading:" in source
-    assert 'self._preview_status.setText(f"Preview failed: {display}")' in source
+    assert 'session_messages.exception(f"Preview failed: {message}", error)' in source
 
 
 def test_without_series_specific_settings_removes_per_series_keys():
@@ -440,17 +439,17 @@ def test_plot_settings_panel_shows_error_provenance_explanation_text():
     assert "What it would show:" in source
 
 
-def test_plot_settings_panel_includes_cumulative_controls_and_group_actions():
+def test_plot_settings_panel_includes_cumulative_controls_without_groups():
     source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
 
     assert '"Duplicate"' in source
-    assert '"Add Group"' in source
+    assert '"Add Group"' not in source
     assert 'QGroupBox("Cumulative Average")' in source
     assert "self._series_cumulative_mode" in source
-    assert "self._series_group_reducer" in source
-    assert "self._series_group_members" in source
-    assert '"group_reducer"' in source
-    assert '"member_series_ids"' in source
+    assert "self._series_group_reducer" not in source
+    assert "self._series_group_members" not in source
+    assert '"group_reducer"' not in source
+    assert '"member_series_ids"' not in source
 
 
 def test_plot_settings_panel_duplicates_profiles_without_reload_or_preview():
@@ -589,7 +588,6 @@ def test_plot_settings_panel_maps_collapsible_section_ids_for_layers_and_figure(
         'section_id="layers.derived.uncertainty"',
         'section_id="layers.derived.fit"',
         'section_id="layers.derived.cumulative"',
-        'section_id="layers.group_members"',
         'section_id="layers.normalization"',
         'section_id="layers.metadata"',
         'section_id="figure.canvas"',
@@ -687,7 +685,6 @@ def test_plot_settings_panel_uses_explicit_series_row_theme_tokens():
     assert '"series_row_selected_text"' in source
     assert '"series_badge_original_bg"' in source
     assert '"series_badge_copy_bg"' in source
-    assert '"series_badge_group_bg"' in source
     assert "QToolButton {" in source
     assert '"tooltip_bg"' in source
     assert '"tooltip_text"' in source
@@ -789,7 +786,6 @@ def test_plot_settings_panel_centralizes_parallel_series_state_management():
     assert "def _effective_series_state(self, index: int) -> dict[str, Any]:" in source
     assert "for name, values in self._iter_series_state_lists():" in source
     assert "Internal GUI layer state is inconsistent:" in source
-    assert "self._series_show_raw_line_data.append(True)" in source
 
 
 def test_plot_settings_panel_has_selected_layer_identity_card_and_generated_delete():
@@ -807,24 +803,12 @@ def test_plot_settings_panel_has_selected_layer_identity_card_and_generated_dele
     assert 'entry["color"] = generated_color' in source
 
 
-def test_plot_settings_panel_repartitions_layer_order_after_visibility_and_group_changes():
-    source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
-
-    assert "def _partition_series_ids_for_display_order(" in source
-    assert "enabled_non_group_ids = [" in source
-    assert "enabled_group_ids = [" in source
-    assert "disabled_ids = [" in source
-    assert "self._apply_series_id_order(self._enabled_partitioned_series_id_order())" in source
-
-
 def test_plot_settings_panel_keeps_base_series_checkbox_enabled_when_row_is_off():
     source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
-    start = source.index("        def editorEvent(")
-    end = source.index("            return super().editorEvent", start)
-    end = source.index("            return super().editorEvent", end + 1)
+    start = source.index("        def mousePressEvent(", source.index("class _SeriesListView"))
+    end = source.index("        def mouseReleaseEvent(", start)
     toggle_body = source[start:end]
-    assert 'if kind == "base" and series_id:' in toggle_body
-    assert "self._owner._handle_series_row_widget_toggle(" in toggle_body
+    assert "delegate._owner._handle_series_row_widget_toggle(" in toggle_body
     assert 'not bool(state.get("checked", True))' in toggle_body
     assert 'state.get("enabled")' not in toggle_body
     assert "class _SeriesRowWidget" not in source
@@ -842,30 +826,6 @@ def test_plot_settings_panel_keeps_base_row_toggle_logic_outside_cumulative_bran
     assert (
         "self._schedule_or_apply_series_preview_update(force_full_render=True)" in row_toggle_body
     )
-
-
-def test_plot_settings_panel_uses_checkable_group_members_under_layer_list():
-    source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
-
-    selected_card_index = source.index("tab_layout.addWidget(self._selected_layer_card)")
-    selector_row_index = source.index("layout.addLayout(selector_row)")
-    series_list_index = source.index("layout.addWidget(self.series_list)")
-    group_member_index = source.index("layout.addWidget(self._series_group_group)")
-    visibility_index = source.index(
-        "self._series_visibility_group = self._make_collapsible_section("
-    )
-
-    assert (
-        selected_card_index
-        < selector_row_index
-        < series_list_index
-        < group_member_index
-        < visibility_index
-    )
-    assert "QAbstractItemView.SelectionMode.NoSelection" in source
-    assert "self._series_group_members.itemChanged.connect" in source
-    assert "Qt.ItemFlag.ItemIsUserCheckable" in source
-    assert "item.checkState() == Qt.CheckState.Checked" in source
 
 
 def test_plot_settings_panel_busts_preview_pixmap_cache_before_reload():
@@ -1233,7 +1193,6 @@ def test_density_heatmap_layers_show_source_controls_only():
     assert "self._series_show_raw_line_row" in refresh_body
     assert "layer_caps.show_visibility_label and not heatmap_layer_mode" in refresh_body
     assert "self._series_duplicate_button.setVisible(not heatmap_layer_mode)" in refresh_body
-    assert "self._series_add_group_button.setVisible(not heatmap_layer_mode)" in refresh_body
     assert "delete_button.setVisible(not heatmap_layer_mode)" in refresh_body
 
 
@@ -1888,7 +1847,10 @@ def test_plot_settings_panel_moves_export_out_of_preview_toolbar():
     assert "preview_controls.addWidget(self.save_figure_button)" not in source
     assert "preview_controls.addWidget(self.save_data_button)" not in source
     assert "preview_controls.addWidget(self.auto_preview_checkbox)" not in source
-    assert '"export.data": "Saves the current preview line data to a text data file."' in source
+    assert (
+        '"export.data": "Saves the current preview line or 2D heatmap data to a text data file."'
+        in source
+    )
     assert "header_layout.addWidget(self._save_figure_button)" not in source
 
 
@@ -2298,8 +2260,6 @@ def test_coerce_series_descriptors_preserves_identity_and_metadata():
             "source_kind": "source",
             "source_series_id": "series:0:3",
             "is_generated": False,
-            "member_series_ids": [],
-            "group_reducer": "mean",
             "source_name": "density.h5",
             "source_directory": "runs/run_04",
             "source_path": "/tmp/runs/run_04/density.h5",
@@ -2319,20 +2279,11 @@ def test_coerce_series_descriptors_preserves_generated_copy_identity():
                 "is_generated": True,
                 "default_label": "O Copy",
             },
-            {
-                "series_id": "group:1",
-                "source_kind": "group",
-                "default_label": "Group 1",
-                "member_series_ids": ["source:original", "source:copy"],
-            },
         ]
     )
 
     assert descriptors[0]["is_generated"] is True
     assert descriptors[0]["source_series_id"] == "source:original"
-    assert descriptors[1]["is_generated"] is True
-    assert descriptors[1]["source_kind"] == "group"
-    assert descriptors[1]["member_series_ids"] == ["source:original", "source:copy"]
 
 
 def test_coerce_series_overrides_keeps_sparse_label_override_mapping():
@@ -2378,26 +2329,6 @@ def test_resolve_series_id_order_appends_new_series_after_requested_order():
         ["series-a", "series-b", "series-c"],
         ["series-c", "series-a", "missing"],
     ) == ["series-c", "series-a", "series-b"]
-
-
-def test_partition_series_ids_for_display_order_preserves_relative_order_in_partitions():
-    resolved = _partition_series_ids_for_display_order(
-        ["series-c", "series-a", "series-b", "series-d"],
-        enabled_by_id={
-            "series-c": True,
-            "series-a": False,
-            "series-b": True,
-            "series-d": True,
-        },
-        group_by_id={
-            "series-c": False,
-            "series-a": False,
-            "series-b": True,
-            "series-d": False,
-        },
-    )
-
-    assert resolved == ["series-c", "series-d", "series-b", "series-a"]
 
 
 def test_capture_series_list_view_anchor_uses_top_visible_row_and_offset():

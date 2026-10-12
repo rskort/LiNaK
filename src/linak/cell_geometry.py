@@ -339,12 +339,60 @@ def perpendicular_heights(cell: Any) -> np.ndarray:
 
 
 def unwrap_positions(positions: Any, cells: Any, pbc: Any = True) -> np.ndarray:
+    """Unwrap with previous-frame cells, bounding MIC work independently of length.
+
+    Consecutive identical cells/PBC share one ASE MIC call. Exact diagonal cells
+    have a separable numerical kernel; half-cell ties retain ASE's image choice.
+    Skewed cells always use ASE's geometrically correct lattice search.
+    """
     result = np.array(positions, dtype=float, copy=True)
     raw = np.asarray(positions, dtype=float)
-    for i in range(1, len(result)):
-        flags = pbc if np.asarray(pbc).ndim < 2 else pbc[i - 1]
-        step, _ = find_mic(raw[i] - raw[i - 1], cell_matrix(cells[i - 1]), pbc=flags)
-        result[i] = result[i - 1] + step
+    if len(result) < 2:
+        return result
+    flags_array = np.asarray(pbc, dtype=bool)
+    atom_count = max(1, int(np.prod(raw.shape[1:-1])))
+    chunk_frames = max(1, 8192 // atom_count)
+    start = 1
+    while start < len(result):
+        matrix = cell_matrix(cells[start - 1])
+        flags = np.broadcast_to(
+            flags_array if flags_array.ndim < 2 else flags_array[start - 1], (3,)
+        )
+        stop = start + 1
+        while stop < min(len(result), start + chunk_frames):
+            next_flags = flags_array if flags_array.ndim < 2 else flags_array[stop - 1]
+            if not np.array_equal(flags, np.broadcast_to(next_flags, (3,))) or not np.array_equal(
+                matrix, np.asarray(cells[stop - 1])
+            ):
+                break
+            stop += 1
+        steps = raw[start:stop] - raw[start - 1 : stop - 1]
+        if np.array_equal(matrix, np.diag(np.diag(matrix))):
+            lengths = np.diag(matrix)
+            fractional = steps[..., flags] / lengths[flags]
+            fractional -= np.floor(fractional + 0.5)
+            steps[..., flags] = fractional * lengths[flags]
+            # ASE uses its lattice search to break exact half-cell ties. Resolve
+            # tie-bearing frames in bounded vector blocks.
+            ties = np.any(np.abs(fractional) == 0.5, axis=tuple(range(1, fractional.ndim)))
+            for offset in np.flatnonzero(ties):
+                original_step = (raw[start + offset] - raw[start + offset - 1]).reshape(-1, 3)
+                target = steps[offset].reshape(-1, 3)
+                for atom_start in range(0, len(target), 8192):
+                    target[atom_start : atom_start + 8192], _ = find_mic(
+                        original_step[atom_start : atom_start + 8192], matrix, pbc=flags
+                    )
+        else:
+            flat_steps = steps.reshape(-1, 3)
+            for offset in range(0, len(flat_steps), 8192):
+                flat_steps[offset : offset + 8192], _ = find_mic(
+                    flat_steps[offset : offset + 8192], matrix, pbc=flags
+                )
+        result[start:stop] = steps
+        # Include the previous unwrapped point in cumsum so additions have the
+        # same order as sequential reconstruction, even across chunk boundaries.
+        np.cumsum(result[start - 1 : stop], axis=0, out=result[start - 1 : stop])
+        start = stop
     return result
 
 

@@ -2942,6 +2942,7 @@ def _plot_position_projection(
                     )
                 payload = {
                     "label": descriptor_label,
+                    "color": line_color,
                     "show_in_legend": show_in_legend,
                     "base_color": line_color,
                     "line_width": line_width,
@@ -2953,11 +2954,14 @@ def _plot_position_projection(
                     profile_line_payloads.append(payload)
                     line_series_labels.append(descriptor_label)
 
-        if profile_line_payloads:
-            shaded_colors = (
-                [profile_base_color] * len(profile_line_payloads)
-                if profile_descriptor_mode
-                else _build_profile_line_shades(profile_base_color, len(profile_line_payloads))
+        if (
+            profile_line_payloads
+            and line_colors is None
+            and not atom_descriptor_mode
+            and not profile_descriptor_mode
+        ):
+            shaded_colors = _build_profile_line_shades(
+                profile_base_color, len(profile_line_payloads)
             )
             for payload, shaded_color in zip(profile_line_payloads, shaded_colors):
                 payload["color"] = shaded_color
