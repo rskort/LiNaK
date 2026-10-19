@@ -387,7 +387,7 @@ def discover_temperature_metadata(
     return TemperatureMetadata(
         elements=elements,
         regions=regions,
-        atom_symbols=atom_symbols,
+        atom_symbols=tuple(atom_symbols),
         input_path=resolved_input,
         label_resolution_status=status,
     )

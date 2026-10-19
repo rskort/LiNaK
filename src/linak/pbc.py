@@ -470,11 +470,16 @@ def resolve_cell_dimensions(
 def apply_pbc_to_frames(
     frames: list[Atoms],
     cell: Any | None,
+    *,
+    keep_molecules: bool = False,
 ) -> list[Atoms]:
     """Apply PBC and wrap positions into one cell or each frame's own cell.
 
     Passing ``cell=None`` preserves variable-cell trajectories without forcing
     callers to invoke this batch operation once per frame.
+    With ``keep_molecules``, detected OH/H2O/H3O groups are reconstructed using
+    minimum-image bonds and translated together so their mass-weighted COM lies
+    in the cell. Their individual atoms may extend outside it.
     """
     if not frames:
         raise ValueError("At least one trajectory frame is required.")
@@ -486,8 +491,33 @@ def apply_pbc_to_frames(
             wrapped = frame.copy()
             wrapped.set_cell(cell_matrix(frame.cell) if cell_array is None else cell_array)
             wrapped.set_pbc((True, True, True))
-            wrapped.positions[:] = wrapped_frame_positions(wrapped)
+            positions = wrapped_frame_positions(wrapped)
+            if keep_molecules:
+                _wrap_molecules_by_com(wrapped, positions)
+            wrapped.positions[:] = positions
             wrapped_frames.append(wrapped)
             progress.update()
 
     return wrapped_frames
+
+
+def _wrap_molecules_by_com(frame: Atoms, positions: np.ndarray) -> None:
+    """Replace atom-wise wrapping with whole-molecule images in bounded batches."""
+    from ase.geometry import find_mic
+
+    from .analysis.water import oh_molecule_topology
+
+    topology = oh_molecule_topology(frame)
+    masses = frame.get_masses()
+    for label in ("mol:OH", "mol:H2O", "mol:H3O"):
+        groups = topology.groups[label]
+        for start in range(0, len(groups), 4096):
+            indices = groups[start : start + 4096]
+            anchors = frame.positions[indices[:, 0]]
+            displacements = frame.positions[indices] - anchors[:, None, :]
+            vectors, _ = find_mic(displacements.reshape(-1, 3), frame.cell, pbc=frame.pbc)
+            whole = anchors[:, None, :] + vectors.reshape(displacements.shape)
+            weights = masses[indices]
+            centers = np.sum(whole * weights[:, :, None], axis=1) / weights.sum(axis=1)[:, None]
+            shifts = wrapped_frame_positions(frame, centers) - centers
+            positions[indices] = whole + shifts[:, None, :]

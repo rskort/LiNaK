@@ -89,7 +89,7 @@ def test_sparse_prism_projection_matches_dense_normalization(monkeypatch, axes, 
     profile = replace(
         profile, surface_reference=SimpleNamespace(resolved_layout=layout, is_symmetric=False)
     )
-    cache = {}
+    cache: dict[tuple[object, ...], np.ndarray] = {}
     actual = density_module._geometry_project_density(
         profile, axes, (edges, edges), {}, _volume_cache=cache
     )
@@ -139,7 +139,7 @@ def test_fallback_volume_cache_is_bounded(monkeypatch):
     monkeypatch.setattr(
         density_module, "_generic_geometry_volumes", lambda *a, **kw: np.ones((512, 512))
     )
-    cache = {}
+    cache: dict[tuple[object, ...], np.ndarray] = {}
     target_edges = np.linspace(0.0, 1.0, 513)
     density_module._geometry_project_density(
         profile, ("x", "y"), (target_edges, target_edges), {}, _volume_cache=cache

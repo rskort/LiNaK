@@ -63,6 +63,7 @@ from .position import (
     compute_position_profile,
 )
 from .surface import (
+    surface_distance_label,
     _surface_estimate_datasets,
     _surface_estimate_from_payload,
     _surface_metadata_payload,
@@ -2110,7 +2111,7 @@ def _coordination_time_data(
 def _coordination_distance_label(profile: CoordinationProfile) -> str:
     if profile.coordinate_mode != "distance":
         return f"{profile.axis.upper()} (A)"
-    return "Distance to the surface ($\\mathrm{\\AA}$)"
+    return surface_distance_label(profile.surface_reference)
 
 
 def _default_coordination_series_labels(profile: CoordinationProfile) -> list[str]:

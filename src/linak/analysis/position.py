@@ -22,7 +22,7 @@ import numpy as np
 from ase import Atoms
 
 from ..progress import ProgressBar
-from ..storage.hdf5_utils import write_linak_hdf5
+from ..storage.hdf5_utils import _atomic_hdf5_target, resolve_hdf5_output_path, write_linak_hdf5
 from .common import (
     MOLECULE_SPECIES_LABELS,
     available_element_species,
@@ -49,6 +49,8 @@ from .water import (
 )
 from ..working_arrays import working_array
 from .surface import (
+    bind_surface_reference,
+    surface_distance_label,
     _log_framewise_surface_alignment,
     _select_surface_estimate,
     _surface_estimate_datasets,
@@ -61,6 +63,7 @@ from .surface import (
     _surface_reference_metadata,
     estimate_surface_layout_reference,
     surface_distance_components,
+    surface_substrate_mask,
     wrapped_surface_positions,
     SurfaceEstimate,
     SurfaceEstimatorOptions,
@@ -387,7 +390,7 @@ def _position_surface_context(
 
     surface_reference: SurfaceReference | None
     if isinstance(precomputed_surface_estimate, SurfaceReference):
-        surface_reference = precomputed_surface_estimate
+        surface_reference = bind_surface_reference(precomputed_surface_estimate, frames)
     else:
         surface_reference = estimate_surface_layout_reference(
             frames,
@@ -488,6 +491,8 @@ def _distance_components_for_axis_matrix(
     *,
     surface_reference: SurfaceReference | None,
     surface_position_per_frame: np.ndarray | None,
+    substrate_masks: np.ndarray | Sequence[np.ndarray | bool] | None = None,
+    cartesian_matrices: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
 ) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None, np.ndarray | None]:
     values = np.asarray(axis_values, dtype=float)
     if surface_reference is None:
@@ -508,10 +513,29 @@ def _distance_components_for_axis_matrix(
         valid = np.isfinite(values[frame_index])
         if not np.any(valid):
             continue
+        substrate_mask = None
+        if substrate_masks is not None:
+            selected_mask = (
+                substrate_masks
+                if isinstance(substrate_masks, np.ndarray)
+                else substrate_masks[frame_index]
+            )
+            if isinstance(selected_mask, bool):
+                substrate_mask = selected_mask
+            else:
+                padded_mask = np.zeros(values.shape[1], dtype=bool)
+                padded_mask[: len(selected_mask)] = selected_mask
+                substrate_mask = padded_mask[valid]
         frame_folded, frame_top, frame_bottom, frame_side = surface_distance_components(
             surface_reference,
             values[frame_index, valid],
             frame_index=frame_index,
+            substrate_mask=substrate_mask,
+            target_positions=(
+                None
+                if cartesian_matrices is None or surface_reference.distance_mode == "plane"
+                else np.column_stack([matrix[frame_index, valid] for matrix in cartesian_matrices])
+            ),
         )
         folded[frame_index, valid] = frame_folded
         top[frame_index, valid] = frame_top
@@ -609,6 +633,10 @@ def _compute_position_profiles_for_labels(
         timestep_fs=timestep_fs,
     )
 
+    protect_substrate = surface_reference is not None and surface_reference.resolved_layout in {
+        "single-top",
+        "single-bottom",
+    }
     profiles: list[PositionProfile] = []
     if stable_layout:
         selected_indices_by_label: dict[str, np.ndarray] = {}
@@ -623,6 +651,7 @@ def _compute_position_profiles_for_labels(
                 raise ValueError(f"No atoms found for species '{species_label}' in frame 0.")
             selected_indices_by_label[species_label] = np.asarray(atom_indices, dtype=int)
 
+        substrate_by_label: dict[str, np.ndarray] = {}
         matrices_by_label: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
         for species_label, atom_indices in selected_indices_by_label.items():
             shape = (len(frames), int(atom_indices.size))
@@ -637,6 +666,13 @@ def _compute_position_profiles_for_labels(
         ) as progress:
             for frame_i, frame in enumerate(frames):
                 positions = np.asarray(frame.positions, dtype=float)
+                if frame_i == 0 and protect_substrate:
+                    assert surface_reference is not None
+                    full_mask = surface_substrate_mask(surface_reference, frame)
+                    substrate_by_label = {
+                        label: full_mask[indices]
+                        for label, indices in selected_indices_by_label.items()
+                    }
                 for species_label, atom_indices in selected_indices_by_label.items():
                     x_values, y_values, z_values = matrices_by_label[species_label]
                     selected = positions[atom_indices]
@@ -657,6 +693,8 @@ def _compute_position_profiles_for_labels(
                 axis_values_all,
                 surface_reference=surface_reference,
                 surface_position_per_frame=surface_position_per_frame,
+                substrate_masks=substrate_by_label.get(species_label),
+                cartesian_matrices=(x_values, y_values, z_values),
             )
             profiles.append(
                 PositionProfile(
@@ -725,10 +763,19 @@ def _compute_position_profiles_for_labels(
             working_array(shape, dtype=float, fill=np.nan),
         )
 
+    # Capture membership during selection instead of rereading the trajectory
+    # during distance projection. Homogeneous selections need only one boolean.
+    substrate_rows_by_label: dict[str, list[np.ndarray | bool]] = {
+        label: [] for label in species_labels
+    }
     with ProgressBar(desc="Selecting atom positions", total=len(frames), unit="frame") as progress:
         for frame_i, frame in enumerate(frames):
             frame_symbols = np.asarray(frame.get_chemical_symbols(), dtype=object)
             positions = np.asarray(frame.positions, dtype=float)
+            full_mask = None
+            if protect_substrate:
+                assert surface_reference is not None
+                full_mask = surface_substrate_mask(surface_reference, frame)
             for species_label in species_labels:
                 if species_label == "ALL":
                     atom_indices = np.arange(frame_symbols.size, dtype=int)
@@ -736,6 +783,11 @@ def _compute_position_profiles_for_labels(
                     atom_indices = np.where(
                         _position_selector_mask(frame, species_label, symbols=frame_symbols)
                     )[0].astype(int, copy=False)
+                if full_mask is not None:
+                    mask = full_mask[atom_indices]
+                    substrate_rows_by_label[species_label].append(
+                        bool(np.all(mask)) if np.all(mask) or not np.any(mask) else mask
+                    )
                 if atom_indices.size == 0:
                     continue
                 x_values, y_values, z_values = matrices_by_label[species_label]
@@ -759,6 +811,8 @@ def _compute_position_profiles_for_labels(
             axis_values_all,
             surface_reference=surface_reference,
             surface_position_per_frame=surface_position_per_frame,
+            substrate_masks=(substrate_rows_by_label[species_label] if protect_substrate else None),
+            cartesian_matrices=(x_values, y_values, z_values),
         )
         profiles.append(
             PositionProfile(
@@ -962,6 +1016,7 @@ def _compute_molecule_position_profiles_for_labels(
             axis_values_all,
             surface_reference=surface_reference,
             surface_position_per_frame=surface_position_per_frame,
+            cartesian_matrices=(x_values, y_values, z_values),
         )
         profiles.append(
             PositionProfile(
@@ -1296,17 +1351,187 @@ def save_position_profile(
     return output_path
 
 
+def _position_payload_key(payload: Mapping[str, Any]) -> tuple[str, str, str]:
+    metadata = payload.get("metadata", {})
+    return (
+        str(metadata.get("species", "")),
+        str(metadata.get("axis", "z")),
+        str(metadata.get("entity_kind", "atom")),
+    )
+
+
+def _position_arrays_match(old: Any, new: Any) -> bool:
+    if old is None or new is None:
+        return old is None and new is None
+    left, right = np.asarray(old), np.asarray(new)
+    if left.shape != right.shape:
+        return False
+    if left.dtype.kind in "OUS" or right.dtype.kind in "OUS":
+        return bool(np.array_equal(left.astype(str), right.astype(str)))
+    if left.dtype.kind in "biu" and right.dtype.kind in "biu":
+        return bool(np.array_equal(left, right))
+    return bool(np.allclose(left, right, rtol=1e-7, atol=1e-8, equal_nan=True))
+
+
+def _position_collection_compatibility_error(
+    existing: list[dict[str, Any]], incoming: list[dict[str, Any]]
+) -> str | None:
+    reference = incoming[0]
+    reference_metadata = reference["metadata"]
+    reference_datasets = reference["datasets"]
+    seen: set[tuple[str, str, str]] = set()
+    for payload in existing:
+        key = _position_payload_key(payload)
+        if key in seen:
+            return "stored collection contains duplicate species/axis profiles"
+        seen.add(key)
+        metadata = payload["metadata"]
+        source = str(metadata.get("source_path", "")).strip()
+        requested_source = str(reference_metadata.get("source_path", "")).strip()
+        if (
+            source
+            and requested_source
+            and Path(source).resolve() != Path(requested_source).resolve()
+        ):
+            return "stored source_path does not match the requested trajectory"
+        for name in ("n_frames", "frame_timestep_fs", "positions_pbc_corrected", "spatial_filter"):
+            if (
+                name in metadata
+                and name in reference_metadata
+                and metadata[name] != reference_metadata[name]
+            ):
+                return f"stored {name} does not match the requested computation"
+        datasets = payload["datasets"]
+        for name in (
+            "frame_index",
+            "step",
+            "time_fs",
+            "time_ps",
+            "cell_matrices_angstrom",
+            "cell_origins_angstrom",
+            "cell_pbc",
+        ):
+            old = datasets.get(name)
+            new = reference_datasets.get(name)
+            if (old is None) != (new is None):
+                return f"stored {name} availability is incompatible"
+            if not _position_arrays_match(old, new):
+                return f"stored {name} is incompatible"
+        for new_payload in incoming:
+            if str(metadata.get("axis", "z")) != str(new_payload["metadata"].get("axis", "z")):
+                continue
+            new_metadata = new_payload["metadata"]
+            if metadata.get("coordinate_mode") != new_metadata.get("coordinate_mode"):
+                return "stored coordinate_mode is incompatible"
+            old_surface = _surface_metadata_view(metadata)
+            new_surface = _surface_metadata_view(new_metadata)
+            for name in ("layout_resolved", "mode", "selected_elements", "effective_options"):
+                if old_surface.get(name) != new_surface.get(name):
+                    return f"stored surface {name} is incompatible"
+            new_datasets = new_payload["datasets"]
+            surface_names = {
+                name
+                for name in datasets.keys() | new_datasets.keys()
+                if name.startswith("surface_") or name.startswith("surface_reference_")
+            }
+            for name in surface_names:
+                old, new = datasets.get(name), new_datasets.get(name)
+                if (old is None) != (new is None):
+                    return f"stored {name} availability is incompatible"
+                if not _position_arrays_match(old, new):
+                    return f"stored {name} is incompatible"
+    return None
+
+
+def _merge_position_profiles(
+    profiles: list[PositionProfile],
+    output: str | Path,
+    *,
+    additional_metadata: Mapping[str, Any] | None,
+    compression_profile: str,
+) -> Path:
+    from .output_naming import unique_output_path
+
+    output_path = resolve_hdf5_output_path(output)
+    if not output_path.exists():
+        return save_position_profiles(
+            profiles,
+            output_path,
+            additional_metadata=additional_metadata,
+            compression_profile=compression_profile,
+        )
+    incoming = [_position_profile_hdf5_payload(profile) for profile in profiles]
+    for payload in incoming:
+        payload["metadata"].update(dict(additional_metadata or {}))
+    try:
+        _source, stored = read_profile_payloads(output_path, analysis="position", label="Position")
+        existing = [{"datasets": dict(data), "metadata": dict(meta)} for data, meta in stored]
+        error = _position_collection_compatibility_error(existing, incoming)
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        error = str(exc)
+    if error is not None:
+        fallback = unique_output_path(output_path)
+        LOGGER.warning(
+            "Existing position output '%s' is incompatible (%s). Writing fallback file '%s'.",
+            output_path,
+            error,
+            fallback,
+        )
+        return save_position_profiles(
+            profiles,
+            fallback,
+            additional_metadata=additional_metadata,
+            compression_profile=compression_profile,
+        )
+    index_by_key = {_position_payload_key(payload): index for index, payload in enumerate(existing)}
+    for payload in incoming:
+        key = _position_payload_key(payload)
+        index = index_by_key.get(key)
+        if index is None:
+            index_by_key[key] = len(existing)
+            existing.append(payload)
+        else:
+            uid = existing[index]["metadata"].get("profile_uid")
+            if uid is not None:
+                payload["metadata"]["profile_uid"] = uid
+            existing[index] = payload
+    # Preserve window profiles and publish the combined file atomically.
+    import h5py
+
+    with _atomic_hdf5_target(output_path) as temporary_path:
+        write_profile_collection(
+            temporary_path,
+            analysis="position",
+            profiles=existing,
+            metadata=dict(additional_metadata or {}),
+            compression_profile=compression_profile,
+        )
+        with h5py.File(output_path, "r") as source, h5py.File(temporary_path, "r+") as target:
+            if "_linak" in source:
+                source.copy("_linak", target)
+    LOGGER.info("Saved %d position profiles to '%s'.", len(existing), output_path)
+    return output_path
+
+
 def save_position_profiles(
     profiles: list[PositionProfile],
     output: str | Path,
     *,
     additional_metadata: Mapping[str, Any] | None = None,
     compression_profile: str = "fast",
+    merge_existing: bool = False,
 ) -> Path:
     """Save one or more position profiles to LiNaK HDF5 and return the written path."""
 
     if not profiles:
         raise ValueError("At least one position profile is required.")
+    if merge_existing:
+        return _merge_position_profiles(
+            profiles,
+            output,
+            additional_metadata=additional_metadata,
+            compression_profile=compression_profile,
+        )
     if len(profiles) == 1:
         return save_position_profile(
             profiles[0],
@@ -1745,7 +1970,7 @@ def _position_component_data(
                 profile.axis.upper(),
             )
             return profile.distance_to_surface, f"{profile.axis.upper()} (A)"
-        return profile.distance_to_surface, "Distance to the surface ($\\mathrm{\\AA}$)"
+        return profile.distance_to_surface, surface_distance_label(profile.surface_reference)
     if normalized == "x":
         return profile.x, "X (A)"
     if normalized == "y":
@@ -1777,7 +2002,7 @@ def _position_projection_quantity_data(
     if normalized == "distance":
         return (
             np.asarray(profile.distance_to_surface, dtype=float),
-            "Distance to the surface ($\\mathrm{\\AA}$)",
+            surface_distance_label(profile.surface_reference),
         )
     if normalized in {"x", "y", "z"}:
         return _position_component_data(profile, component=normalized)

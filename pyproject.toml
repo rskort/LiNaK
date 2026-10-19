@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "LiNaK"
-version = "0.10.1"
+version = "0.10.2"
 description = "Lightweight molecular dynamics trajectory analysis toolkit."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -83,6 +83,7 @@ line-ending = "lf"
 [tool.mypy]
 python_version = "3.9"
 files = ["src/linak", "tests", "benchmarks"]
+explicit_package_bases = true
 check_untyped_defs = true
 disallow_incomplete_defs = false
 follow_imports = "silent"

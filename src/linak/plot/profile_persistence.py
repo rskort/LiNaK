@@ -146,6 +146,17 @@ def build_plot_profile_payload(profile_key: str, settings: dict[str, Any]) -> di
         and key not in source_fields
         and key not in mapping_fields
     }
+    # Original descriptors are rediscovered from the data. Copies are user
+    # layers: their IDs and source lineage are required to restore their state.
+    descriptors = settings.get("series_descriptors")
+    if isinstance(descriptors, list):
+        copies = [
+            deepcopy(descriptor)
+            for descriptor in descriptors
+            if isinstance(descriptor, dict) and descriptor.get("is_generated")
+        ]
+        if copies:
+            style["series_descriptors"] = copies
     style = _canonicalize_plot_view_state_style(style)
     return {
         _PLOT_PROFILE_SENTINEL: _PLOT_PROFILE_VERSION,

@@ -9,8 +9,8 @@ import sys
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from benchmarks.surface_fixtures import CASES, surface_frames
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from tests.support.surface_fixtures import CASES, surface_frames
 
 
 def density_payloads(case):

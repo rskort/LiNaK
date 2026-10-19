@@ -341,7 +341,7 @@ def test_cache_metadata_does_not_leak_into_ase_exports(tmp_path):
     assert topology.FRAME_KEY not in path.read_text()
     restored = read(path)
     assert restored.get_potential_energy() == pytest.approx(-12.3)
-    np.testing.assert_array_equal(restored.get_forces(), np.ones((3, 3)))
+    np.testing.assert_array_equal(restored.get_forces(apply_constraint=False), np.ones((3, 3)))
 
 
 def test_ambiguous_and_overcoordinated_diagnostics_are_persisted(tmp_path):

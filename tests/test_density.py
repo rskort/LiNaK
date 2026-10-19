@@ -3546,7 +3546,8 @@ def test_plot_density_profiles_compare_interfaces_expands_series_state(monkeypat
     ] * 3
 
 
-def test_plot_density_profiles_compare_interfaces_renders_expanded_curves(tmp_path):
+@pytest.mark.parametrize("copy_only", [False, True])
+def test_plot_density_profiles_compare_interfaces_renders_expanded_curves(tmp_path, copy_only):
     from linak.analysis.density import DensityProfile, plot_density_profiles
 
     profile = DensityProfile(
@@ -3576,14 +3577,32 @@ def test_plot_density_profiles_compare_interfaces_renders_expanded_curves(tmp_pa
                 "series_id": "oxygen",
                 "source_series_id": "oxygen",
                 "default_label": "Oxygen",
-            }
+            },
+            {
+                "series_id": "copy",
+                "source_series_id": "oxygen",
+                "default_label": "Water Copy",
+                "is_generated": True,
+            },
         ],
-        series_overrides_by_id={"oxygen": {"enabled": True}},
+        series_overrides_by_id={
+            "oxygen": {"enabled": not copy_only, "color": "orange"},
+            "copy": {"enabled": copy_only, "color": "purple"},
+        },
         capture_state=capture,
     )
 
     assert isinstance(capture["axes"], Axes)
     assert len(capture["axes"].lines) == 3
+    expected_id = "copy" if copy_only else "oxygen"
+    plotted_series = capture["plotted_xy_series"]
+    assert isinstance(plotted_series, list)
+    assert [row["series_id"] for row in plotted_series] == [
+        f"{expected_id}::interface:{side}" for side in ("folded", "top", "bottom")
+    ]
+    assert all(
+        line.get_color() == ("purple" if copy_only else "orange") for line in capture["axes"].lines
+    )
 
 
 def test_plot_density_profiles_side_view_rejects_raw_axis_profile():

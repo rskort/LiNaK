@@ -128,6 +128,10 @@ class TrajectoryConversionOptions:
     output_was_default: bool = False
     atom_aliases: tuple[str, ...] = ()
     compression_profile: str = "fast"
+    surface_distance_mode: str | None = None
+    surface_elements: tuple[str, ...] | None = None
+    include_fixed_surface_atoms: bool | None = None
+    surface_layout: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1056,11 +1060,9 @@ def _apply_fixed_constraints_from_conversion_metadata(
 ) -> None:
     if metadata is None or not metadata.fixed_atom_indices:
         return
-    from ase.constraints import FixAtoms
+    from .resolution import apply_fixed_atom_constraints
 
-    indices = list(metadata.fixed_atom_indices)
-    for frame in frames:
-        frame.set_constraint(FixAtoms(indices=indices))
+    apply_fixed_atom_constraints(frames, metadata.fixed_atom_indices)
 
 
 def _conversion_metadata_pbc(metadata: Any) -> tuple[bool, bool, bool]:
@@ -1098,11 +1100,60 @@ def _conversion_metadata_with_pbc_cache(
 def _conversion_metadata_with_surface_cache(
     metadata: Any | None,
     frames: list[Any],
+    options: TrajectoryConversionOptions | None = None,
 ) -> Any:
     from dataclasses import replace
     from .trajectory.io import TrajectoryStoredMetadata
 
     base = metadata if metadata is not None else TrajectoryStoredMetadata()
+    preference = base.surface_distance_settings or {}
+    distance_mode = (None if options is None else options.surface_distance_mode) or preference.get(
+        "distance_mode", "plane"
+    )
+    if distance_mode == "nearest-atom":
+        from .analysis.surface import SurfaceEstimatorOptions, estimate_surface_layout_reference
+
+        elements = (
+            options.surface_elements
+            if options is not None and options.surface_elements is not None
+            else preference.get("surface_elements")
+        )
+        include_fixed = bool(
+            options.include_fixed_surface_atoms
+            if options is not None and options.include_fixed_surface_atoms is not None
+            else preference.get("include_fixed_surface_atoms", False)
+        )
+        layout = (
+            options.surface_layout
+            if options is not None and options.surface_layout is not None
+            else preference.get("surface_layout", "auto")
+        )
+        reference = estimate_surface_layout_reference(
+            frames,
+            surface_layout=layout,
+            surface_elements=elements,
+            include_fixed_surface_atoms=include_fixed,
+            surface_options=SurfaceEstimatorOptions(
+                distance_mode="nearest-atom",
+                surface_elements=None if elements is None else tuple(elements),
+                include_fixed_surface_atoms=include_fixed,
+            ),
+            _report_progress=True,
+        )
+        provider = reference._nearest_provider
+        settings = {
+            "distance_mode": distance_mode,
+            "surface_layout": layout,
+            "surface_elements": list(provider.elements),
+            "include_fixed_surface_atoms": provider.options.include_fixed_surface_atoms,
+        }
+        return replace(
+            base,
+            surface_distance_settings=settings,
+            surface_cache_status=None,
+            surface_cache_estimate=None,
+        )
+    base = replace(base, surface_distance_settings=None if distance_mode == "plane" else preference)
     try:
         from .analysis.surface import estimate_surface_layout_reference
 
@@ -1251,6 +1302,28 @@ def _convert_trajectory_request(
             if options is None or options.input_path is None
             else str(options.input_path),
         )
+        preference = (
+            {} if stored_metadata is None else stored_metadata.surface_distance_settings or {}
+        )
+        if (
+            options is not None
+            and (options.surface_distance_mode or preference.get("distance_mode", "plane"))
+            == "nearest-atom"
+        ):
+            options = replace(
+                options,
+                surface_distance_mode="nearest-atom",
+                surface_elements=options.surface_elements
+                if options.surface_elements is not None
+                else preference.get("surface_elements"),
+                include_fixed_surface_atoms=bool(
+                    options.include_fixed_surface_atoms
+                    if options.include_fixed_surface_atoms is not None
+                    else preference.get("include_fixed_surface_atoms", False)
+                ),
+                surface_layout=options.surface_layout or preference.get("surface_layout", "auto"),
+            )
+            _apply_fixed_constraints_from_conversion_metadata(frames, stored_metadata)
         if options is not None and options.cell is not None:
             for frame in frames:
                 frame.set_cell(cell_matrix(options.cell))
@@ -1291,16 +1364,65 @@ def _convert_trajectory_request(
                 },
                 surface_axis="z",
                 surface_mode="auto",
-                surface_elements=None,
-                include_fixed_surface_atoms=False,
+                surface_elements=options.surface_elements,
+                include_fixed_surface_atoms=bool(options.include_fixed_surface_atoms),
+                surface_layout=options.surface_layout or "auto",
                 rough_surface_envelope_A=None,
+                surface_distance_mode=(
+                    options.surface_distance_mode
+                    or (
+                        {}
+                        if stored_metadata is None
+                        else stored_metadata.surface_distance_settings or {}
+                    ).get("distance_mode", "plane")
+                ),
             )
             if spatial_options.active:
+                prefilter_reference = None
+                if options.surface_distance_mode == "nearest-atom":
+                    from .analysis.surface import (
+                        SurfaceEstimatorOptions,
+                        estimate_surface_layout_reference,
+                    )
+
+                    prefilter_reference = estimate_surface_layout_reference(
+                        frames,
+                        surface_layout=options.surface_layout,
+                        surface_elements=options.surface_elements,
+                        include_fixed_surface_atoms=bool(options.include_fixed_surface_atoms),
+                        surface_options=SurfaceEstimatorOptions(
+                            distance_mode="nearest-atom",
+                            surface_elements=options.surface_elements,
+                            include_fixed_surface_atoms=bool(options.include_fixed_surface_atoms),
+                        ),
+                    )
+                    provider = prefilter_reference._nearest_provider
+                    options = replace(
+                        options,
+                        surface_elements=provider.elements,
+                        include_fixed_surface_atoms=provider.options.include_fixed_surface_atoms,
+                    )
+                    spatial_options = replace(
+                        spatial_options,
+                        surface_elements=provider.elements,
+                        include_fixed_surface_atoms=provider.options.include_fixed_surface_atoms,
+                    )
                 spatial_filter_result = apply_spatial_filter(
                     frames,
                     options=spatial_options,
-                    precomputed_surface_estimate=None,
+                    precomputed_surface_estimate=prefilter_reference,
                 )
+                reference = spatial_filter_result.surface_estimate
+                if (
+                    reference is not None
+                    and getattr(reference, "distance_mode", "plane") == "nearest-atom"
+                ):
+                    provider = reference._nearest_provider
+                    options = replace(
+                        options,
+                        surface_elements=provider.elements,
+                        include_fixed_surface_atoms=provider.options.include_fixed_surface_atoms,
+                    )
                 frames = list(spatial_filter_result.frames)
                 if options.output_was_default and spatial_filter_result.filename_suffix:
                     request = ConversionRequest(
@@ -1327,7 +1449,12 @@ def _convert_trajectory_request(
                     cell_angles_deg=cell_angles(options.cell),
                     cell_source="explicit --cell",
                 )
-            _apply_fixed_constraints_from_conversion_metadata(frames, stored_metadata)
+            if (
+                spatial_filter_result is None
+                or options is None
+                or options.surface_distance_mode != "nearest-atom"
+            ):
+                _apply_fixed_constraints_from_conversion_metadata(frames, stored_metadata)
             if stored_metadata is not None and stored_metadata.cell_geometry is not None:
                 conversion_cell = stored_metadata.cell_geometry
                 frames = wrap_trajectory_frames(frames, conversion_cell)
@@ -1357,7 +1484,9 @@ def _convert_trajectory_request(
 
         topology_profile = prepare_topology(frames)
         with progress_stage(LOGGER, "Build surface cache"):
-            stored_metadata = _conversion_metadata_with_surface_cache(stored_metadata, frames)
+            stored_metadata = _conversion_metadata_with_surface_cache(
+                stored_metadata, frames, options
+            )
         if selection_resolution is not None:
             base_metadata = (
                 stored_metadata if stored_metadata is not None else TrajectoryStoredMetadata()

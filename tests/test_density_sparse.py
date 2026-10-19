@@ -13,8 +13,8 @@ from linak.analysis import density_sparse
 from linak.analysis.density_sparse import SparseReducer, SparseWorkspace, compact_rows, row_dtype
 from linak.analysis.surface import SurfaceReference
 from linak.runtime_resources import MIB, ResourcePolicy
-from benchmarks.density_fixtures import density_payloads, json_value
-from benchmarks.surface_fixtures import CASES
+from tests.support.density_fixtures import density_payloads, json_value
+from tests.support.surface_fixtures import CASES
 
 
 @pytest.mark.parametrize("channels", [2, 6])

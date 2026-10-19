@@ -81,7 +81,13 @@ def test_cli_summary_never_rereads_output(tmp_path, monkeypatch, capsys):
     assert len(reads) == len(metadata_calls) == 1
     assert "atoms/frame=1..2" in captured.err
     assert "\r" not in captured.err
-    for stage in ("Read trajectory", "Prepare cell/selection", "Build molecular topology", "Build surface cache", "Write HDF5"):
+    for stage in (
+        "Read trajectory",
+        "Prepare cell/selection",
+        "Build molecular topology",
+        "Build surface cache",
+        "Write HDF5",
+    ):
         assert f"{stage} completed in" in captured.err
 
 

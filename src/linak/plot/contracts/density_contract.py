@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -228,7 +229,7 @@ def density_profile_to_plot_data_contract(profile: DensityProfile) -> PlotDataCo
     has_surface_reference = bool(
         profile.surface_position is not None and np.isfinite(float(profile.surface_position))
     )
-    return _density_contract(
+    contract = _density_contract(
         source_id=f"density:{profile.species}:{profile.axis}:{coordinate_mode}",
         label=f"Density profile: {profile.species}",
         axis_token=str(profile.axis).strip().lower() or "z",
@@ -242,13 +243,15 @@ def density_profile_to_plot_data_contract(profile: DensityProfile) -> PlotDataCo
         ),
     )
 
+    return _observable_contract(contract, profile)
+
 
 def density_heatmap_profile_to_plot_data_contract(
     profile: DensityHeatmapProfile,
 ) -> PlotDataContract:
     """Convert one loaded ``DensityHeatmapProfile`` into a ``PlotDataContract``."""
 
-    return _density_heatmap_contract(
+    contract = _density_heatmap_contract(
         source_id=f"density:heatmap:{profile.species}:{profile.plane}",
         label=f"Density heatmap: {profile.species} {profile.plane.upper()}",
         plane_token=profile.plane,
@@ -259,4 +262,44 @@ def density_heatmap_profile_to_plot_data_contract(
         supports_number_density=(
             profile.number_density is not None and profile.number_density_units is not None
         ),
+    )
+
+    return _observable_contract(contract, profile)
+
+
+def _observable_contract(contract, profile):
+    distribution = str(profile.units).startswith("amu/")
+    quantities = []
+    for quantity in contract.quantities:
+        changes = {}
+        if quantity.source_name == "density":
+            changes = dict(
+                label="Mass distribution" if distribution else "Mass density",
+                unit=profile.units,
+                kind="distribution" if distribution else quantity.kind,
+            )
+        elif quantity.source_name == "number_density":
+            changes = dict(
+                label="Number distribution" if distribution else "Number density",
+                unit=profile.number_density_units,
+                kind="distribution" if distribution else quantity.kind,
+            )
+        elif distribution and quantity.kind == "distance":
+            changes = dict(label="Nearest surface-atom distance")
+        elif quantity.id in {"x_bin_center", "y_bin_center"}:
+            axis = profile.plane_axes[0 if quantity.id == "x_bin_center" else 1]
+            if axis == "distance":
+                changes = dict(
+                    label="Nearest surface-atom distance"
+                    if distribution
+                    else "Surface-plane distance",
+                    kind="distance",
+                )
+        if distribution and quantity.id == "axis_coordinate":
+            continue
+        quantities.append(replace(quantity, **changes))
+    return replace(
+        contract,
+        quantities=tuple(quantities),
+        label=("Distance distribution: " + profile.species) if distribution else contract.label,
     )

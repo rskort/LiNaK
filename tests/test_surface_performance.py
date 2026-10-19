@@ -12,7 +12,7 @@ import numpy as np
 import pytest
 from ase.constraints import FixAtoms
 
-from benchmarks.surface_fixtures import CASES, surface_frames
+from tests.support.surface_fixtures import CASES, surface_frames
 import linak.analysis.surface as surface
 from linak.analysis.topology import prepare_topology
 

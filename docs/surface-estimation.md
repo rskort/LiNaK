@@ -33,12 +33,27 @@ same convention is used by density, position, coordination, orientation, and
 spatial distance filtering.
 
 Automatic detection chooses `symmetric` only if both planes are trusted and
-each face contains at least `max(1, 10% of detected H2O)` in at least 90% of
-frames. One qualifying populated face selects its corresponding single layout;
+each face has persistent **nearby water contact**. Layout geometry uses the
+complete selected substrate, including fixed layers, independently of the
+atoms eligible for distance measurements. Its largest circular gap defines a
+contiguous slab with full-substrate outer bounds. Crossing this coordinate cut
+does not establish contact with the opposite face.
+
+For each water center of mass, outward periodic distances from these bounds
+define a 6 Å contact band, capped at half the inter-slab solvent gap. Boundary
+ties contribute half to each face. A face must have at least
+`max(1, ceil(10% of the combined contacting H2O population))` in at least 90% of
+all frames, including frames without water. One qualifying face selects its corresponding single layout;
 when occupancy cannot decide, the established single-top trust/fallback path is
 retained. Explicit `symmetric` skips only the solvent-population test. A warning
 is emitted when time-averaged relative side-population imbalance exceeds 20%;
 valid sides are still pooled with equal weight.
+
+The same contact classifier serves plane and nearest-atom distance modes,
+conversion, and direct XYZ analysis. Input-file fixed constraints are applied
+consistently before analysis; fixed-atom exclusions still govern measurements.
+Sparse, non-water, or weakly contacting systems may need an explicit layout.
+These thresholds establish two wetted faces, not physical equivalence between them.
 
 The model assumes one planar slab normal to a selected Cartesian axis. Curved
 surfaces, multiple independent slabs, and cells whose selected Cartesian axis
@@ -49,7 +64,7 @@ raw Cartesian position. This page documents the shared surface-reference
 estimator used by density, position, coordination, and orientation.
 
 The implementation lives primarily in
-`src/linak/analysis/density.py`.
+`src/linak/analysis/surface.py`.
 
 ## Goal
 
@@ -505,6 +520,22 @@ elements, fixed-atom policy, and rough-envelope settings match. This applies
 to both symmetric and single-interface references. Omitted layout means
 `auto`. Obsolete one-estimate caches are ignored without reading their payloads;
 the reference is recomputed, and the trajectory file is not rewritten.
+Automatic layout caches also require the current contact-classifier version.
+Older automatic decisions are ignored and recomputed without changing the
+trajectory file; explicit layouts and saved analysis outputs remain readable.
+Validation metadata records the classifier version, band width, thresholds,
+mean contacting populations, and persistence fractions. Logs distinguish these
+contact populations from whole-interface population imbalance.
+
+The historical contact benchmark measured cold and repeated detection. Its
+standalone runner was removed during cleanup.
+On the supplied 132-frame Pt110 Cs trajectory, the detector resolves single-top
+with mean top/bottom contact populations of 25.46/0. A Windows Python 3.12 run
+measured 0.510 s cold and 0.121 s median for three repeated detections, with
+95.7 MiB peak process memory. On the 8,010-frame Pt110 Na trajectory, the same
+run measured 27.81 s cold, 6.86 s repeated median, and 619 MiB peak process memory.
+These times exclude trajectory parsing; memory includes eager input frames and
+scientific imports. Repeated detection reuses exact molecular topology.
 
 ## Important Limitations
 

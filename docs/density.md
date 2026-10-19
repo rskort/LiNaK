@@ -1,5 +1,13 @@
 # Density
 
+The plane-based and Cartesian physical-density methods are described below.
+With `--surface-distance-mode nearest-atom`, LiNaK instead computes mass or
+number **distance distributions**, in amu/Å or atoms/molecules per Å. Supported
+maps combine nearest distance with X or Y and use squared-coordinate units.
+They do not use physical bin volumes or full-cell Cartesian views. See
+[density and distance distributions](density-distributions.md) for the definitions,
+Studio controls, compatibility rules and measured performance.
+
 ## Symmetric Cells
 
 With `surface_layout=symmetric`, density stores folded, top, and bottom

@@ -800,7 +800,7 @@ def test_plot_settings_panel_has_selected_layer_identity_card_and_generated_dele
     assert "def _default_generated_series_color(self, index: int) -> str:" in source
     assert "if original_source_ids:" in source
     assert "if self._series_is_generated(index):" in source
-    assert 'entry["color"] = generated_color' in source
+    assert 'entry["color"] = effective_color' in source
 
 
 def test_plot_settings_panel_keeps_base_series_checkbox_enabled_when_row_is_off():

@@ -293,6 +293,8 @@ _INTERFACE_VIEW_STATIC_LABELS = {
 _DENSITY_VIEW_TYPE_LABEL_BY_ID = _plot_view_label_by_id(include_heatmap=True)
 _DENSITY_VIEW_TYPE_ID_BY_LABEL = _plot_view_id_by_label(include_heatmap=True)
 _DENSITY_X_MODE_BY_LABEL = {
+    "surface-plane distance": "distance",
+    "nearest surface-atom distance": "distance",
     "distance": "distance",
     "x": "x",
     "y": "y",
@@ -9227,6 +9229,7 @@ def launch_plot_settings_panel(
                 self._analysis_name != "density"
                 or not hasattr(self, "density_x_mode")
                 or not self._has_symmetric_interface_views()
+                or self._nearest_density_mode()
             ):
                 return False
             return self._density_current_view_type_id() == PLOT_VIEW_1D_LINE
@@ -9418,6 +9421,16 @@ def launch_plot_settings_panel(
             analysis = self._analysis_name
             if analysis is None:
                 return
+            if self._profile_filter_options.get("surface_distance_mode") == "nearest-atom":
+                note = QLabel("Nearest surface-atom distance (3D, periodic minimum image).")
+                note.setObjectName("sectionNote")
+                note.setWordWrap(True)
+                if analysis == "density":
+                    note.setText(
+                        note.text()
+                        + " Number and mass distributions use atoms or molecules per Angstrom and amu per Angstrom; 2D maps use per Angstrom squared. These are not volumetric densities."
+                    )
+                layout.addWidget(note)
 
             if (
                 analysis in {"density", "position", "coordination", "orientation"}
@@ -9607,6 +9620,9 @@ def launch_plot_settings_panel(
                     self.density_quantity,
                     tooltip_id="data.density.quantity",
                 )
+                self._density_normalization_note = QLabel("")
+                self._density_normalization_note.setWordWrap(True)
+                self._add_form_row(mapping_form, "Normalization", self._density_normalization_note)
                 self._density_filter_widgets = {}
                 for axis_label, axis_id in (
                     ("X range", "x"),
@@ -9945,6 +9961,18 @@ def launch_plot_settings_panel(
             selected_series = self._series_active_index
             existing_order = self._current_series_id_order()
             normalized_descriptors = _coerce_series_descriptors(descriptors)
+            if normalized_descriptors:
+                refreshed_by_id = {d["series_id"]: d for d in normalized_descriptors}
+                # Data discovery returns source layers. User-created copies belong
+                # to the GUI session and must survive preview metadata refreshes.
+                for descriptor in self._series_descriptors_data:
+                    if not descriptor.get("is_generated"):
+                        continue
+                    source = refreshed_by_id.get(descriptor.get("source_series_id"))
+                    if source is None or descriptor["series_id"] in refreshed_by_id:
+                        continue
+                    copy_descriptor = {**deepcopy(source), **deepcopy(descriptor)}
+                    normalized_descriptors.append(copy_descriptor)
             count = max(len(labels), len(normalized_descriptors))
             if count <= 0:
                 return
@@ -11448,6 +11476,142 @@ def launch_plot_settings_panel(
                 return contract
             return _fallback_potential_plot_data_contract()
 
+        def _nearest_density_mode(self) -> bool:
+            return (
+                self._analysis_name == "density"
+                and self._profile_filter_options.get("surface_distance_mode") == "nearest-atom"
+            )
+
+        def _selected_density_quantity(self) -> str:
+            widget = getattr(self, "density_quantity", None)
+            if widget is None:
+                return "mass"
+            return str(
+                widget.currentData()
+                or ("number" if widget.currentText().lower().startswith("number") else "mass")
+            )
+
+        def _refresh_density_semantics(self) -> None:
+            if not hasattr(self, "density_x_mode") or getattr(
+                self, "_refreshing_density_semantics", False
+            ):
+                return
+            self._refreshing_density_semantics = True
+            widgets = [
+                self.density_x_mode,
+                self.density_2d_x_axis,
+                self.density_2d_y_axis,
+                self.density_quantity,
+            ]
+            if hasattr(self, "interface_view_combo"):
+                widgets.append(self.interface_view_combo)
+            previous = [widget.blockSignals(True) for widget in widgets]
+            try:
+                nearest = self._nearest_density_mode()
+                coordinate_label = (
+                    "Nearest surface-atom distance" if nearest else "Surface-plane distance"
+                )
+                for widget in widgets[:3]:
+                    for index in range(widget.count()):
+                        token = _DENSITY_X_MODE_BY_LABEL.get(widget.itemText(index).strip().lower())
+                        if token is not None:
+                            widget.setItemData(index, token)
+                            if token == "distance":
+                                widget.setItemText(index, coordinate_label)
+                            item = widget.model().item(index)
+                            if item is not None:
+                                item.setEnabled(
+                                    not nearest
+                                    or token
+                                    in (
+                                        {"distance"}
+                                        if widget is self.density_x_mode
+                                        else {"x", "y", "distance"}
+                                    )
+                                )
+                if nearest:
+                    self._set_combo_value(self.density_x_mode, "distance")
+                    if hasattr(self, "interface_view_combo"):
+                        item = self.interface_view_combo.model().item(
+                            _INTERFACE_VIEW_ORDER.index("full")
+                        )
+                        if item is not None:
+                            item.setEnabled(False)
+                        if self._selected_interface_view() == "full":
+                            self._set_combo_value(
+                                self.interface_view_combo, self._interface_view_labels()["folded"]
+                            )
+                for index, token in enumerate(("mass", "number")):
+                    self.density_quantity.setItemData(index, token)
+                    self.density_quantity.setItemText(
+                        index, token.capitalize() + (" distribution" if nearest else " density")
+                    )
+                x = _DENSITY_X_MODE_BY_LABEL.get(self.density_2d_x_axis.currentText().lower(), "x")
+                y = _DENSITY_X_MODE_BY_LABEL.get(self.density_2d_y_axis.currentText().lower(), "y")
+                valid = x != y and {x, y} != {"z", "distance"}
+                if nearest:
+                    valid = {x, y} in ({"x", "distance"}, {"y", "distance"})
+                if not valid:
+                    changed_y = self.sender() is self.density_2d_y_axis
+                    chosen = y if changed_y else x
+                    if nearest and chosen not in {"x", "y", "distance"}:
+                        chosen = "x"
+                    other = (
+                        "x"
+                        if chosen == "distance"
+                        else "distance"
+                        if nearest
+                        else "x"
+                        if chosen != "x"
+                        else "y"
+                    )
+                    if changed_y:
+                        self._set_combo_value(self.density_2d_y_axis, chosen)
+                        self._set_combo_value(self.density_2d_x_axis, other)
+                    else:
+                        self._set_combo_value(self.density_2d_x_axis, chosen)
+                        self._set_combo_value(self.density_2d_y_axis, other)
+                stored_pairs = self._profile_filter_options.get("density_supported_2d_axes")
+                if isinstance(stored_pairs, list) and stored_pairs:
+                    current = [
+                        self.density_2d_x_axis.currentData(),
+                        self.density_2d_y_axis.currentData(),
+                    ]
+                    if current not in stored_pairs:
+                        self._set_combo_value(self.density_2d_x_axis, str(stored_pairs[0][0]))
+                        self._set_combo_value(self.density_2d_y_axis, str(stored_pairs[0][1]))
+                    for role, widget in enumerate((self.density_2d_x_axis, self.density_2d_y_axis)):
+                        for index in range(widget.count()):
+                            item = widget.model().item(index)
+                            if item is not None:
+                                item.setEnabled(
+                                    any(
+                                        widget.itemData(index) == pair[role]
+                                        for pair in stored_pairs
+                                    )
+                                )
+                self.density_quantity.setToolTip(
+                    "Average per-frame mass (amu) or population per coordinate interval; no physical volume normalization."
+                    if nearest
+                    else "Physical mass density (g/cm^3) or number density (entities/nm^3)."
+                )
+                if hasattr(self, "_density_normalization_note"):
+                    if nearest:
+                        interval = (
+                            "Angstrom squared" if self._is_density_heatmap_mode() else "Angstrom"
+                        )
+                        self._density_normalization_note.setText(
+                            f"Average per frame per {interval}: mass in amu; population in atoms or molecules. Not a volume density."
+                        )
+                    else:
+                        self._density_normalization_note.setText(
+                            "Physical bin volume: mass in g/cm\u00b3; population in entities/nm\u00b3."
+                        )
+            finally:
+                for widget, blocked in zip(widgets, previous):
+                    widget.blockSignals(blocked)
+                self._refreshing_density_semantics = False
+
         def _current_density_mapping(self) -> PlotViewMapping:
             view_type = (
                 _DENSITY_VIEW_TYPE_ID_BY_LABEL.get(
@@ -11466,11 +11630,7 @@ def launch_plot_settings_panel(
                     if self._selected_interface_view() == "full"
                     else "distance"
                 )
-            quantity = (
-                self.density_quantity.currentText().strip() or "mass"
-                if hasattr(self, "density_quantity")
-                else "mass"
-            )
+            quantity = self._selected_density_quantity()
             return density_plot_options_to_view_mapping(
                 view_type=view_type,
                 x_mode=x_mode,
@@ -12859,6 +13019,7 @@ def launch_plot_settings_panel(
                 ),
             ):
                 _insert(values, copied)
+            self._materialize_series_colors()
             self._validate_series_state_lengths()
             self._series_active_index = insert_at
             self._set_active_series_child_kind("base")
@@ -16900,6 +17061,8 @@ def launch_plot_settings_panel(
                 return
             index = widget.findText(value)
             if index < 0:
+                index = widget.findData(str(value).strip().lower())
+            if index < 0:
                 lowered = value.strip().casefold()
                 for candidate_index in range(widget.count()):
                     candidate = widget.itemText(candidate_index).strip().casefold()
@@ -16961,7 +17124,11 @@ def launch_plot_settings_panel(
                 return normalized_axis.upper()
             if normalized_mode in {"x", "y", "z"}:
                 return normalized_mode.upper()
-            return "Distance"
+            return (
+                "Nearest surface-atom distance"
+                if self._nearest_density_mode()
+                else "Surface-plane distance"
+            )
 
         def _selected_density_x_mode(self) -> str:
             label = self.density_x_mode.currentText().strip().lower()
@@ -18257,6 +18424,8 @@ def launch_plot_settings_panel(
                     coordination_line_x_quantity_row[1],
                     not coordination_time_distance,
                 )
+            if self._analysis_name == "density":
+                self._refresh_density_semantics()
             density_heatmap_mode = (
                 self._analysis_name == "density" and self._is_density_heatmap_mode()
             )
@@ -18316,7 +18485,11 @@ def launch_plot_settings_panel(
             for widget_name in ("density_2d_x_axis", "density_2d_y_axis"):
                 widget = getattr(self, widget_name, None)
                 if widget is not None:
-                    if interface_view == "full" and widget.currentText() == "Distance":
+                    if (
+                        interface_view == "full"
+                        and _DENSITY_X_MODE_BY_LABEL.get(widget.currentText().strip().lower())
+                        == "distance"
+                    ):
                         other_name = (
                             "density_2d_y_axis"
                             if widget_name == "density_2d_x_axis"
@@ -18332,7 +18505,7 @@ def launch_plot_settings_panel(
                             )
                         self._set_combo_value(widget, replacement)
                     widget.setEnabled(density_heatmap_mode)
-                    distance_index = widget.findText("Distance")
+                    distance_index = widget.findData("distance")
                     if distance_index >= 0:
                         distance_item = widget.model().item(distance_index)
                         if distance_item is not None:

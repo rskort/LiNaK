@@ -525,3 +525,31 @@ def test_plot_profile_requires_legacy_mapping_flatten_only_for_compatibility_key
         )
         is True
     )
+
+
+def test_saved_profile_restores_copy_identity_and_style_without_source_catalog():
+    original = {"series_id": "water", "density_species": "mol:H2O"}
+    copy = {
+        "series_id": "water-copy",
+        "source_series_id": "water",
+        "is_generated": True,
+        "default_label": "Water Copy",
+        "density_species": "mol:H2O",
+    }
+    settings = {
+        "series_descriptors": [original, copy],
+        "series_order": ["water-copy", "water"],
+        "series_overrides": {
+            "water": {"enabled": False, "color": "orange"},
+            "water-copy": {"enabled": True, "color": "purple"},
+        },
+    }
+    payload = build_plot_profile_payload("plot:density", settings)
+    restored = flatten_plot_profile_payload("plot:density", payload)
+    assert restored["series_descriptors"] == [copy]
+    assert restored["series_order"] == settings["series_order"]
+    assert restored["series_overrides"] == settings["series_overrides"]
+    restored["series_descriptors"][0]["density_species"] = "O"
+    assert copy["density_species"] == "mol:H2O"
+    source_only = build_plot_profile_payload("plot:density", {"series_descriptors": [original]})
+    assert "series_descriptors" not in source_only["style"]

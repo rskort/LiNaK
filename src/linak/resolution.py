@@ -23,6 +23,20 @@ from .utils import ensure_positive
 LOGGER = logging.getLogger(__name__)
 
 
+def apply_fixed_atom_constraints(frames: Any, indices: tuple[int, ...]) -> None:
+    """Apply input constraints eagerly or when a bounded sequence loads frames."""
+    if not indices:
+        return
+    setter = getattr(frames, "set_fixed_atom_indices", None)
+    if callable(setter):
+        setter(indices)
+        return
+    from ase.constraints import FixAtoms
+
+    for frame in frames:
+        frame.set_constraint(FixAtoms(indices=list(indices)))
+
+
 @dataclass(frozen=True)
 class CellResolution(CellMetadata):
     """Resolved periodic cell with provenance."""

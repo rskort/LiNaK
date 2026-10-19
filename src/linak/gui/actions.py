@@ -702,6 +702,14 @@ def _orientation_settings(_item: ProjectItem) -> list[SettingField]:
 def _pbc_settings(_item: ProjectItem) -> list[SettingField]:
     return [
         SettingField(
+            "keep_molecules",
+            "Keep molecules intact (COM wrapping)",
+            "bool",
+            False,
+            group="Wrapping",
+            help_text="Keep detected OH/H2O/H3O molecules together; wrap other atoms individually.",
+        ),
+        SettingField(
             "cell_angles",
             "Cell alpha beta gamma",
             "text",
@@ -1138,6 +1146,8 @@ def _compute_orientation_backend(ctx: ActionContext) -> ActionExecutionResult:
 def _apply_pbc_backend(ctx: ActionContext) -> ActionExecutionResult:
     output = _project_output(ctx, "_pbc.xyz")
     argv = ["apply", "pbc", str(ctx.item.path), "--output", str(output)]
+    if ctx.settings.get("keep_molecules", False):
+        argv.append("--keep-molecules")
     _add_optional(argv, "--input", ctx.settings.get("input"))
     _add_cell(argv, ctx.settings.get("cell"), ctx.settings.get("cell_angles"))
     _add_atom_aliases(argv, ctx.settings)

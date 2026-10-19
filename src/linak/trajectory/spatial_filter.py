@@ -17,6 +17,7 @@ from ..analysis.surface import (
     _surface_reference_metadata,
     estimate_surface_layout_reference,
     surface_distance_components,
+    surface_substrate_mask,
     SurfaceReference,
 )
 from ..analysis.water import water_molecule_triplets, water_triplet_geometry
@@ -62,6 +63,7 @@ class SpatialFilterOptions:
     surface_elements: tuple[str, ...] | None = None
     include_fixed_surface_atoms: bool = False
     rough_surface_envelope_A: float | None = None
+    surface_distance_mode: str = "plane"
 
     @property
     def active(self) -> bool:
@@ -78,6 +80,19 @@ class SpatialFilterResult:
     filename_suffix: str
     resolved_ranges: dict[str, ResolvedSpatialRange]
     surface_estimate: Any | None = None
+
+
+def _distance_options(options: SpatialFilterOptions):
+    from ..analysis.surface import SurfaceEstimatorOptions
+
+    if options.surface_distance_mode == "plane":
+        return None
+    return SurfaceEstimatorOptions(
+        mode=options.surface_mode,
+        distance_mode=options.surface_distance_mode,
+        surface_elements=options.surface_elements,
+        include_fixed_surface_atoms=options.include_fixed_surface_atoms,
+    )
 
 
 def parse_spatial_range(axis_id: str, raw: str | None) -> SpatialRangeSpec | None:
@@ -124,8 +139,10 @@ def spatial_filter_options_from_mapping(
     surface_elements: Sequence[str] | None = None,
     include_fixed_surface_atoms: bool = False,
     rough_surface_envelope_A: float | None = None,
+    surface_distance_mode: str = "plane",
 ) -> SpatialFilterOptions:
     return SpatialFilterOptions(
+        surface_distance_mode=surface_distance_mode,
         x_range=None if values.get("x_range") is None else str(values.get("x_range")),
         y_range=None if values.get("y_range") is None else str(values.get("y_range")),
         z_range=None if values.get("z_range") is None else str(values.get("z_range")),
@@ -239,6 +256,13 @@ def _empty_frame_like(frame: Atoms) -> Atoms:
     return empty
 
 
+def _surface_substrate_mask_for_groups(
+    reference: SurfaceReference, frame: Atoms, groups: list[np.ndarray]
+) -> np.ndarray:
+    mask = surface_substrate_mask(reference, frame)
+    return np.asarray([np.any(mask[indices]) for indices in groups], dtype=bool)
+
+
 def _surface_distance_values_for_atoms(
     frames: list[Atoms],
     *,
@@ -259,7 +283,7 @@ def _surface_distance_values_for_atoms(
                 None if options.surface_elements is None else list(options.surface_elements)
             ),
             include_fixed_surface_atoms=bool(options.include_fixed_surface_atoms),
-            surface_options=None,
+            surface_options=_distance_options(options),
         )
         provenance = "computed"
     if estimate is None:
@@ -272,6 +296,8 @@ def _surface_distance_values_for_atoms(
                 estimate,
                 np.asarray(frame.positions[:, axis_index], dtype=float),
                 frame_index=frame_index,
+                substrate_mask=surface_substrate_mask(estimate, frame),
+                target_positions=frame.positions,
             )[0]
             for frame_index, frame in enumerate(frames)
         ]
@@ -407,6 +433,10 @@ def apply_spatial_filter(
                             surface_estimate,
                             group_axis_values,
                             frame_index=frame_index,
+                            target_positions=group_centers,
+                            substrate_mask=_surface_substrate_mask_for_groups(
+                                surface_estimate, frame, group_indices
+                            ),
                         )[0]
                     else:
                         group_distances = np.asarray(
@@ -613,7 +643,7 @@ def apply_spatial_filter_streaming(
                 None if options.surface_elements is None else list(options.surface_elements)
             ),
             include_fixed_surface_atoms=options.include_fixed_surface_atoms,
-            surface_options=None,
+            surface_options=_distance_options(options),
         )
         distance_provenance = "computed"
     if "distance" in active_specs and surface_estimate is None:
@@ -621,12 +651,25 @@ def apply_spatial_filter_streaming(
             "Distance-based spatial filtering requires a usable distance-to-surface reference."
         )
 
-    def _distances(values: np.ndarray, frame_index: int) -> np.ndarray:
+    def _distances(
+        values: np.ndarray,
+        frame_index: int,
+        groups: list[np.ndarray] | None = None,
+        positions: np.ndarray | None = None,
+    ) -> np.ndarray:
         if isinstance(surface_estimate, SurfaceReference):
             return surface_distance_components(
                 surface_estimate,
                 np.asarray(values, dtype=float),
                 frame_index=frame_index,
+                target_positions=positions,
+                substrate_mask=(
+                    surface_substrate_mask(surface_estimate, frames[frame_index])
+                    if groups is None
+                    else _surface_substrate_mask_for_groups(
+                        surface_estimate, frames[frame_index], groups
+                    )
+                ),
             )[0]
         assert surface_estimate is not None
         if surface_estimate.per_frame is None or len(surface_estimate.per_frame) != len(frames):
@@ -641,13 +684,14 @@ def apply_spatial_filter_streaming(
     for frame_index, frame in enumerate(frames):
         estimated_spool_bytes += len(frame) * 64 + 512
         if options.keep_molecules_intact:
-            _indices, centers, molecule_selection_mode = _group_centers_and_indices(frame)
+            groups, centers, molecule_selection_mode = _group_centers_and_indices(frame)
             coordinate_source = centers
         else:
+            groups = None
             coordinate_source = _wrapped_positions_for_frame(frame)
         for axis_id in active_specs:
             values = (
-                _distances(coordinate_source[:, axis_index], frame_index)
+                _distances(coordinate_source[:, axis_index], frame_index, groups, coordinate_source)
                 if axis_id == "distance"
                 else coordinate_source[:, axis_to_index(axis_id)]
             )
@@ -676,7 +720,7 @@ def apply_spatial_filter_streaming(
                 keep = np.ones(len(group_indices), dtype=bool)
                 for axis_id, resolved in resolved_ranges.items():
                     values = (
-                        _distances(centers[:, axis_index], frame_index)
+                        _distances(centers[:, axis_index], frame_index, group_indices, centers)
                         if axis_id == "distance"
                         else centers[:, axis_to_index(axis_id)]
                     )
@@ -695,7 +739,7 @@ def apply_spatial_filter_streaming(
                 keep = np.ones(len(frame), dtype=bool)
                 for axis_id, resolved in resolved_ranges.items():
                     values = (
-                        _distances(positions[:, axis_index], frame_index)
+                        _distances(positions[:, axis_index], frame_index, positions=positions)
                         if axis_id == "distance"
                         else positions[:, axis_to_index(axis_id)]
                     )

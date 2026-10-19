@@ -20,6 +20,14 @@ def test_package_version_matches_pyproject() -> None:
     assert linak.__version__ == _pyproject_version()
 
 
+def test_citation_version_matches_pyproject() -> None:
+    citation_file = Path(__file__).resolve().parents[1] / "CITATION.cff"
+    content = citation_file.read_text(encoding="utf-8")
+    match = re.search(r'(?m)^version:\s*"([^"]+)"\s*$', content)
+    assert match is not None, "Could not find the release version in CITATION.cff"
+    assert match.group(1) == _pyproject_version()
+
+
 def test_registered_analysis_schema_versions() -> None:
     for analysis in ("density", "position", "coordination", "orientation"):
         assert get_analysis_schema(analysis).version == 2

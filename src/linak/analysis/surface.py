@@ -7,13 +7,16 @@ from ..cell_geometry import unwrap_positions, cartesian_bounds, frame_origin
 from collections.abc import Mapping, Sequence
 from copy import copy
 from contextlib import nullcontext
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
+from itertools import product
 import logging
 from pathlib import Path
 from typing import Any, Literal, cast
 
 import numpy as np
 from ase import Atoms
+from ase.geometry import minkowski_reduce
+from scipy.spatial import cKDTree
 from ase.data import atomic_masses, atomic_numbers
 
 from ..utils import axis_to_index, ensure_positive
@@ -35,6 +38,11 @@ SURFACE_LAYER_MIN_SUCCESS_RATIO = 0.60
 SURFACE_MOBILITY_EPSILON = 1.0e-8
 _SURFACE_PROVENANCE_MAXLEN = 48
 _SURFACE_REASON_MAXLEN = 80
+_NEAREST_IMAGE_BUDGET_BYTES = 32 * 1024 * 1024
+SURFACE_LAYOUT_CLASSIFIER_VERSION = 2
+SURFACE_CONTACT_BAND_A = 6.0
+SURFACE_CONTACT_POPULATION_FRACTION = 0.10
+SURFACE_CONTACT_PERSISTENCE = 0.90
 
 
 @dataclass(frozen=True)
@@ -68,6 +76,7 @@ class SurfaceEstimatorOptions:
     surface_atom_indices: tuple[int, ...] | None = None
     surface_atom_mask: np.ndarray | None = None
     include_fixed_surface_atoms: bool = False
+    distance_mode: str = "plane"
 
 
 @dataclass(frozen=True)
@@ -154,6 +163,8 @@ class SurfaceReference:
     population_imbalance_threshold: float = 0.20
     slab_thickness_per_frame_A: np.ndarray | None = None
     validation_diagnostics: Mapping[str, Any] | None = None
+    distance_mode: str = "plane"
+    _nearest_provider: Any = field(default=None, repr=False, compare=False)
 
     @property
     def is_symmetric(self) -> bool:
@@ -220,6 +231,17 @@ def log_surface_reference_summary(
         active_logger.info(message, *arguments)
     else:
         active_logger.warning(message, *arguments)
+    contact = validation.get("layout_contact")
+    if isinstance(contact, dict):
+        active_logger.info(
+            "Surface contact: band=%.3g A (capped at half the solvent gap); "
+            "top/bottom occupancy=%.1f%%/%.1f%%, mean contacting H2O=%.2f/%.2f.",
+            contact["band_A"],
+            100.0 * contact["top_occupancy"],
+            100.0 * contact["bottom_occupancy"],
+            contact["mean_top"],
+            contact["mean_bottom"],
+        )
     active_logger.debug(
         "Surface layout diagnostics: periodic_axis_supported=%s, top_trusted=%s, "
         "bottom_trusted=%s, ordering=%s, continuity=%s, top_method=%s, "
@@ -266,7 +288,11 @@ def _json_ready(value: Any) -> Any:
     if isinstance(value, Path):
         return str(value)
     if isinstance(value, Mapping):
-        return {str(key): _json_ready(item) for key, item in value.items()}
+        return {
+            str(key): _json_ready(item)
+            for key, item in value.items()
+            if key != "_nearest_provider" and not (key == "distance_mode" and item == "plane")
+        }
     if isinstance(value, (list, tuple)):
         return [_json_ready(item) for item in value]
     return value
@@ -461,6 +487,8 @@ def _validate_surface_options(
     atom_count: int | None,
 ) -> SurfaceEstimatorOptions:
     mode = _normalize_surface_mode_token(options.mode)
+    if options.distance_mode not in {"plane", "nearest-atom"}:
+        raise ValueError("surface distance mode must be 'plane' or 'nearest-atom'.")
     side = _normalize_surface_side_token(options.side)
     reduction_mode = str(options.reduction_mode).strip().lower()
     if reduction_mode not in {"median", "trimmed_mean"}:
@@ -532,6 +560,7 @@ def _validate_surface_options(
 
     return SurfaceEstimatorOptions(
         mode=mode,
+        distance_mode=options.distance_mode,
         side=cast(Literal["top", "bottom"], side),
         reduction_mode=cast(Literal["median", "trimmed_mean"], reduction_mode),
         trim_fraction=trim_fraction,
@@ -1995,6 +2024,10 @@ def estimate_surface_reference(
         include_fixed_surface_atoms=include_fixed_surface_atoms,
         surface_options=surface_options,
     )
+    if options.distance_mode == "nearest-atom":
+        raise ValueError(
+            "A scalar surface estimate cannot represent nearest-atom distances; use estimate_surface_layout_reference with Cartesian targets."
+        )
     active_logger = LOGGER if logger is None else logger
     context = (
         _build_surface_context(frames, axis, options=options)
@@ -2189,20 +2222,458 @@ def wrapped_surface_positions(
     return lower + np.mod(values + cuts, periods)
 
 
+def surface_substrate_mask(
+    reference: SurfaceReference,
+    frame: Atoms,
+    atom_indices: np.ndarray | None = None,
+) -> np.ndarray:
+    """Identify substrate atoms independently of their instantaneous coordinates.
+
+    Plane candidates can exclude fixed atoms or sample an outer layer. Substrate
+    membership therefore uses the selected chemical elements, including fixed
+    atoms, rather than the estimator's geometric envelope or candidate subset.
+    """
+    estimates = [estimate for estimate in (reference.top, reference.bottom) if estimate is not None]
+    elements = {element for estimate in estimates for element in estimate.selected_elements}
+    mask = np.zeros(len(frame), dtype=bool)
+    if elements:
+        mask = np.isin(np.asarray(frame.get_chemical_symbols()), list(elements))
+    else:
+        for estimate in estimates:
+            if estimate.candidate_indices is not None:
+                indices = np.asarray(estimate.candidate_indices, dtype=int)
+                mask[indices[(indices >= 0) & (indices < len(frame))]] = True
+    return mask if atom_indices is None else mask[np.asarray(atom_indices, dtype=int)]
+
+
+def surface_distance_label(reference: SurfaceReference | None) -> str:
+    if reference is not None and reference.distance_mode == "nearest-atom":
+        return "Nearest surface-atom distance ($\\mathrm{\\AA}$)"
+    return "Distance to the surface ($\\mathrm{\\AA}$)"
+
+
+def bind_surface_reference(
+    reference: SurfaceReference, frames: Sequence[Atoms]
+) -> SurfaceReference:
+    """Rebind a nearest selection to the actual analyzed frame sequence.
+
+    Spatial filtering may change eligible candidates. Persisted analysis
+    references have no live provider; only their selection settings are reused.
+    """
+    if reference.distance_mode == "plane":
+        return reference
+    provider = reference._nearest_provider
+    if provider is not None and provider.frames is frames:
+        return reference
+    if provider is not None:
+        elements = provider.elements
+        options = replace(provider.options, surface_elements=elements or None)
+    else:
+        settings = (
+            {} if reference.primary is None else reference.primary.diagnostics.effective_options
+        )
+        elements = () if reference.primary is None else reference.primary.selected_elements
+        options = SurfaceEstimatorOptions(
+            distance_mode="nearest-atom",
+            surface_elements=elements or None,
+            surface_atom_indices=settings.get("surface_atom_indices"),
+            surface_atom_mask=None
+            if settings.get("surface_atom_mask") is None
+            else np.asarray(settings["surface_atom_mask"], dtype=bool),
+            include_fixed_surface_atoms=bool(settings.get("include_fixed_surface_atoms", False)),
+        )
+    return estimate_surface_layout_reference(
+        frames,
+        reference.axis,
+        surface_layout=reference.requested_layout,
+        surface_elements=None
+        if options.surface_atom_indices is not None or options.surface_atom_mask is not None
+        else list(elements),
+        include_fixed_surface_atoms=options.include_fixed_surface_atoms,
+        surface_options=options,
+    )
+
+
+class NearestSubstrateSearch:
+    """Exact periodic nearest queries with bounded Cartesian KD-tree image buffers.
+
+    ASE's Minkowski-reduced lattice has its Voronoi-relevant neighbors in the
+    adjacent cells. Independently wrapping both point sets adds one translation,
+    so the [-2, 2] image stencil contains every relevant pair displacement.
+    Nonperiodic lattice directions are never replicated or wrapped.
+    """
+
+    def __init__(self, frame: Atoms, candidates: np.ndarray):
+        positions = np.asarray(candidates, dtype=float)
+        if positions.ndim != 2 or positions.shape[1] != 3 or not positions.shape[0]:
+            raise ValueError(
+                "Nearest-atom surface distance requires a nonempty substrate candidate set."
+            )
+        if not np.all(np.isfinite(positions)):
+            raise ValueError("Substrate candidate coordinates must be finite.")
+        self.pbc = np.asarray(frame.pbc, dtype=bool)
+        self.cell = np.asarray(frame.cell.complete(), dtype=float)
+        if not np.all(np.isfinite(self.cell)):
+            raise ValueError("Nearest-atom distances require finite cell vectors.")
+        self.periodic_basis = np.empty((0, 3))
+        self.dual_basis = np.empty((3, 0))
+        self.box_lengths: np.ndarray | None = None
+        self.query_translations: np.ndarray | None = None
+        if (
+            np.all(self.pbc)
+            and np.allclose(self.cell, np.diag(np.diag(self.cell)), rtol=0, atol=1e-12)
+            and np.all(np.abs(np.diag(self.cell)) > 0)
+        ):
+            self.box_lengths = np.abs(np.diag(self.cell))
+            self.tree = cKDTree(np.mod(positions, self.box_lengths), boxsize=self.box_lengths)
+            return
+        if np.any(self.pbc):
+            if np.linalg.matrix_rank(np.asarray(frame.cell)[self.pbc]) < np.count_nonzero(self.pbc):
+                raise ValueError(
+                    "Periodic surface distances require independent, nonzero periodic cell vectors."
+                )
+            self.cell, _operation = minkowski_reduce(self.cell, pbc=self.pbc)
+            self.periodic_basis = self.cell[self.pbc]
+            self.dual_basis = np.linalg.pinv(self.periodic_basis)
+            positions = self._wrap(positions)
+        translations = np.asarray(list(product(*[range(-2, 3) if p else (0,) for p in self.pbc])))
+        shifts = translations @ self.cell
+        if positions.nbytes * len(shifts) > _NEAREST_IMAGE_BUDGET_BYTES:
+            # Large candidate sets use the same image search on query blocks,
+            # retaining one base tree instead of a large replicated tree.
+            self.query_translations = shifts
+            self.tree = cKDTree(positions)
+        else:
+            images = (positions[None, :, :] + shifts[:, None, :]).reshape(-1, 3)
+            self.tree = cKDTree(images)
+
+    def _wrap(self, positions: np.ndarray) -> np.ndarray:
+        # Project onto the periodic subspace. Full-cell fractional wrapping is
+        # unsafe for skewed, partially periodic cells with nonperiodic offsets.
+        coefficients = positions @ self.dual_basis
+        return positions - np.floor(coefficients) @ self.periodic_basis
+
+    def query(self, targets: np.ndarray) -> np.ndarray:
+        points = np.asarray(targets, dtype=float)
+        if points.ndim != 2 or points.shape[1] != 3:
+            raise ValueError("Nearest-atom targets must have shape (n, 3).")
+        result = np.full(len(points), np.nan)
+        # Scratch is independent of trajectory length and target count.
+        block_size = 512 if self.query_translations is not None else 8192
+        for start in range(0, len(points), block_size):
+            block = points[start : start + block_size]
+            valid = np.all(np.isfinite(block), axis=1)
+            selected = block[valid]
+            if self.box_lengths is not None:
+                selected = np.mod(selected, self.box_lengths)
+            elif np.any(self.pbc):
+                selected = self._wrap(selected)
+            if self.query_translations is None:
+                distances = self.tree.query(selected)[0]
+            else:
+                images = selected[None, :, :] - self.query_translations[:, None, :]
+                distances = (
+                    self.tree.query(images.reshape(-1, 3))[0]
+                    .reshape(len(self.query_translations), len(selected))
+                    .min(axis=0)
+                )
+            result[start : start + len(block)][valid] = distances
+        return result
+
+
+class _NearestSurfaceProvider:
+    def __init__(
+        self, frames: Sequence[Atoms], options: SurfaceEstimatorOptions, elements: tuple[str, ...]
+    ):
+        self.frames = frames
+        self.options = options
+        self.elements = elements
+        self._key: Any = None
+        self._searches: dict[str, NearestSubstrateSearch] = {}
+
+    def indices(self, frame: Atoms) -> np.ndarray:
+        options = self.options
+        if options.surface_atom_mask is not None and len(options.surface_atom_mask) != len(frame):
+            raise ValueError("Stored substrate mask does not match this frame's atom layout.")
+        if options.surface_atom_indices is not None and any(
+            i < 0 or i >= len(frame) for i in options.surface_atom_indices
+        ):
+            raise ValueError("Substrate indices do not match this frame's atom layout.")
+        indices = np.flatnonzero(
+            _candidate_mask_for_frame(
+                frame,
+                selected_elements=self.elements,
+                atom_indices=options.surface_atom_indices,
+                atom_mask=options.surface_atom_mask,
+                include_fixed_surface_atoms=options.include_fixed_surface_atoms,
+            )
+        )
+        if not indices.size:
+            raise ValueError(
+                "No eligible substrate atoms remain in a trajectory frame; check surface selection and fixed-atom settings."
+            )
+        return indices
+
+    def components(self, reference: SurfaceReference, targets: np.ndarray, frame_index: int):
+        frame = self.frames[frame_index]
+        indices = self.indices(frame)
+        positions = np.asarray(frame.positions[indices], dtype=float)
+        # Validate moving geometry, ordering, constraints and changing cells on every query.
+        key = (
+            frame_index,
+            indices.tobytes(),
+            positions.tobytes(),
+            np.asarray(frame.cell).tobytes(),
+            frame.pbc.tobytes(),
+            reference.resolved_layout,
+        )
+        if key != self._key:
+            searches = {}
+            if reference.is_symmetric:
+                axis_index = axis_to_index(reference.axis)
+                axis_values = positions[:, axis_index].copy()
+                geometry = _surface_axis_periodic_geometry([frame], axis_index)
+                if geometry is not None:
+                    lower, period = float(geometry[0][0]), float(geometry[1][0])
+                    cut = _largest_circular_gap_cut(axis_values, lower=lower, period=period)
+                    axis_values = _canonical_axis_values(
+                        axis_values, lower=lower, period=period, cut=cut
+                    )
+                elif np.any(
+                    np.abs(np.asarray(frame.cell)[np.asarray(frame.pbc, dtype=bool), axis_index])
+                    > 1e-9
+                ):
+                    raise ValueError(
+                        "Changed cell geometry no longer supports symmetric interface assignment."
+                    )
+                midpoint = 0.5 * (float(np.min(axis_values)) + float(np.max(axis_values)))
+                searches["top"] = NearestSubstrateSearch(frame, positions[axis_values >= midpoint])
+                searches["bottom"] = NearestSubstrateSearch(
+                    frame, positions[axis_values <= midpoint]
+                )
+            else:
+                searches["all"] = NearestSubstrateSearch(frame, positions)
+            self._searches, self._key = searches, key
+        if not reference.is_symmetric:
+            distance = self._searches["all"].query(targets)
+            side_value = -1 if reference.resolved_layout == "single-bottom" else 1
+            return (
+                distance,
+                distance.copy(),
+                distance.copy(),
+                np.full(len(distance), side_value, dtype=np.int8),
+            )
+        top = self._searches["top"].query(targets)
+        bottom = self._searches["bottom"].query(targets)
+        side = np.zeros(len(top), dtype=np.int8)
+        side[top < bottom - 1e-10] = 1
+        side[bottom < top - 1e-10] = -1
+        return np.minimum(top, bottom), top, bottom, side
+
+
+def _nearest_surface_reference(
+    frames: Sequence[Atoms], axis: str, requested: SurfaceLayout, options: SurfaceEstimatorOptions
+) -> SurfaceReference:
+    if options.rough_surface_envelope_A is not None:
+        raise ValueError(
+            "A rough surface envelope selects an exposed layer and is incompatible with nearest-atom distances."
+        )
+    axis_index = axis_to_index(axis)
+    if options.surface_atom_indices is not None or options.surface_atom_mask is not None:
+        if not _frames_share_consistent_atom_layout(frames):
+            raise ValueError(
+                "Explicit substrate indices/masks require stable atom elements and ordering."
+            )
+        elements: tuple[str, ...] = ()
+    else:
+        elements = tuple(
+            _resolve_surface_elements(frames, options.surface_elements, axis_index=axis_index)[0]
+        )
+    provider = _NearestSurfaceProvider(frames, options, elements)
+    try:
+        provider.indices(frames[0])
+    except ValueError:
+        if (
+            options.mode != "auto"
+            or options.include_fixed_surface_atoms
+            or options.surface_elements is not None
+            or options.surface_atom_indices is not None
+            or options.surface_atom_mask is not None
+        ):
+            raise
+        LOGGER.info("Nearest-atom substrate selection uses the existing fixed-slab fallback.")
+        options = replace(options, include_fixed_surface_atoms=True)
+        provider = _NearestSurfaceProvider(frames, options, elements)
+    geometry = _surface_axis_periodic_geometry(frames, axis_index)
+    tilted_periodic_axis = geometry is None and any(
+        np.any(np.abs(np.asarray(frame.cell)[np.asarray(frame.pbc, dtype=bool), axis_index]) > 1e-9)
+        for frame in frames
+    )
+    if requested == "symmetric" and tilted_periodic_axis:
+        raise ValueError(
+            "Symmetric nearest-atom interfaces require a decoupled slab axis; use a single interface for a tilted periodic axis."
+        )
+    count = len(frames)
+    cuts = np.zeros(count)
+    lower, periods = geometry if geometry is not None else (np.zeros(count), np.full(count, np.nan))
+    top_values, bottom_values, counts = np.zeros(count), np.zeros(count), np.zeros(count, dtype=int)
+    for index, frame in enumerate(frames):
+        selected = provider.indices(frame)
+        values = np.asarray(frame.positions[selected, axis_index], dtype=float)
+        counts[index] = len(selected)
+        if geometry is not None:
+            cuts[index] = _largest_circular_gap_cut(
+                values, lower=lower[index], period=periods[index]
+            )
+            values = _canonical_axis_values(
+                values, lower=lower[index], period=periods[index], cut=cuts[index]
+            )
+        top_values[index], bottom_values[index] = np.max(values), np.min(values)
+
+    def coarse_estimate(values: np.ndarray, side: str) -> SurfaceEstimate:
+        diagnostics = SurfaceDiagnostics(
+            counts,
+            np.zeros(count, dtype=int),
+            np.full(count, np.nan),
+            np.full(count, np.nan),
+            np.zeros(count),
+            np.zeros(count, dtype=bool),
+            np.full(count, "", dtype=object),
+            {
+                "distance_mode": "nearest-atom",
+                "include_fixed_surface_atoms": options.include_fixed_surface_atoms,
+                "surface_elements": elements,
+                "surface_atom_indices": options.surface_atom_indices,
+                "surface_atom_mask": _json_ready(options.surface_atom_mask),
+            },
+        )
+        return SurfaceEstimate(
+            values,
+            np.ones(count, dtype=bool),
+            np.ones(count),
+            np.full(count, "candidate_envelope", dtype=object),
+            None,
+            elements,
+            "nearest-atom",
+            side,
+            SurfaceSummary(
+                float(np.mean(values)),
+                float(np.std(values)),
+                1.0,
+                1.0,
+                "candidate_envelope_for_interface_assignment_only",
+                1.0,
+            ),
+            diagnostics,
+        )
+
+    reference = SurfaceReference(
+        requested,
+        "symmetric"
+        if not tilted_periodic_axis and np.all(top_values > bottom_values + 1e-8)
+        else "single-top",
+        axis,
+        coarse_estimate(top_values, "top"),
+        coarse_estimate(bottom_values, "bottom"),
+        cuts,
+        lower,
+        periods,
+        np.zeros(count, dtype=int),
+        np.zeros(count, dtype=int),
+        "nearest_candidates",
+        slab_thickness_per_frame_A=top_values - bottom_values,
+        distance_mode="nearest-atom",
+        _nearest_provider=provider,
+    )
+    if requested == "symmetric" and not reference.is_symmetric:
+        raise ValueError(
+            "Symmetric nearest-atom interfaces require candidates on both sides of the slab."
+        )
+    if requested == "auto" and reference.is_symmetric:
+        top_population, bottom_population, contact = _surface_reference_water_populations(
+            frames, reference, layout_options=options
+        )
+        top_populated = contact["top_occupancy"] >= SURFACE_CONTACT_PERSISTENCE
+        bottom_populated = contact["bottom_occupancy"] >= SURFACE_CONTACT_PERSISTENCE
+        resolved: ResolvedSurfaceLayout = (
+            "symmetric"
+            if top_populated and bottom_populated
+            else "single-bottom"
+            if bottom_populated and not top_populated
+            else "single-top"
+        )
+        reference = replace(
+            reference,
+            resolved_layout=resolved,
+            top_population_per_frame=top_population,
+            bottom_population_per_frame=bottom_population,
+            auto_reason=(
+                "auto_two_sided_water_contact"
+                if top_populated and bottom_populated
+                else "auto_bottom_water_contact"
+                if bottom_populated
+                else "auto_top_water_contact"
+                if top_populated
+                else "auto_default_top_insufficient_water_contact"
+            ),
+            validation_diagnostics={"layout_contact": contact},
+        )
+        mean_top, mean_bottom = float(np.mean(top_population)), float(np.mean(bottom_population))
+        imbalance = (
+            abs(mean_top - mean_bottom) / (0.5 * (mean_top + mean_bottom))
+            if mean_top + mean_bottom > 0
+            else None
+        )
+        reference = replace(reference, population_imbalance=imbalance)
+        if reference.is_symmetric and imbalance is not None and imbalance > 0.20:
+            LOGGER.warning(
+                "Symmetric surface pooling has a %.1f%% mean water-population imbalance "
+                "between top and bottom interfaces.",
+                100.0 * imbalance,
+            )
+    elif requested != "auto":
+        reference = replace(reference, resolved_layout=cast(ResolvedSurfaceLayout, requested))
+    LOGGER.info(
+        "Surface distance: nearest eligible substrate atom (%s; elements=%s).",
+        reference.resolved_layout,
+        ",".join(elements) or "explicit indices",
+    )
+    if requested == "auto":
+        log_surface_reference_summary(reference, logger=LOGGER)
+    return reference
+
+
 def surface_distance_components(
     reference: SurfaceReference,
     values: np.ndarray,
     *,
     frame_index: int,
+    substrate_mask: np.ndarray | bool | None = None,
+    target_positions: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Return folded, top, bottom distances and side assignments.
 
     Side assignments use ``+1`` for top, ``-1`` for bottom and ``0`` for an
-    exact mid-plane tie or unavailable two-interface geometry.
+    exact mid-plane tie or unavailable two-interface geometry. For atomic
+    selections, pass a matching substrate mask to preserve signed slab distances
+    in single-interface layouts. Coordinate-only callers describe fluid entities.
     """
 
+    if reference.distance_mode == "nearest-atom":
+        if target_positions is None or reference._nearest_provider is None:
+            raise ValueError(
+                "Nearest-atom distances require complete Cartesian targets and live substrate geometry."
+            )
+        return reference._nearest_provider.components(reference, target_positions, frame_index)
     canonical = canonical_surface_axis_values(reference, values, frame_index=frame_index)
     count = canonical.size
+    if substrate_mask is None:
+        fluid_mask: np.ndarray | bool = True
+    else:
+        substrate = np.asarray(substrate_mask, dtype=bool)
+        if substrate.ndim != 0 and substrate.shape != canonical.shape:
+            raise ValueError("Substrate mask must match the surface-distance coordinate shape.")
+        fluid_mask = ~substrate
     top_distance = np.full(count, np.nan, dtype=float)
     bottom_distance = np.full(count, np.nan, dtype=float)
     side = np.zeros(count, dtype=np.int8)
@@ -2215,8 +2686,8 @@ def surface_distance_components(
         # Keep the one-sided fluid region continuous across the periodic cut.
         # The canonical cut lies in the non-substrate gap, so values before
         # the bottom plane are the continuation of the region above the top
-        # plane, not negative-distance fluid behind the interface.  Preserve
-        # signed negative distances only inside the slab itself.
+        # plane. Substrate membership is independent of the plane envelope:
+        # rough or thermally displaced slab atoms retain signed distances.
         if reference.bottom is not None and reference.bottom.frame_values.shape[0] > frame_index:
             bottom_plane = float(reference.bottom.frame_values[frame_index])
             period = float(reference.axis_period_per_frame_A[frame_index])
@@ -2229,6 +2700,7 @@ def surface_distance_components(
                 & np.isfinite(period)
                 & (period > 0.0)
                 & (canonical < threshold)
+                & fluid_mask
             )
             top_distance = np.where(wrap_fluid, top_distance + period, top_distance)
         side.fill(1)
@@ -2246,6 +2718,7 @@ def surface_distance_components(
                 & np.isfinite(period)
                 & (period > 0.0)
                 & (canonical > threshold)
+                & fluid_mask
             )
             bottom_distance = np.where(
                 wrap_fluid,
@@ -2342,12 +2815,23 @@ def _surface_reference_water_populations(
     reference: SurfaceReference,
     *,
     report_progress: bool = False,
-) -> tuple[np.ndarray, np.ndarray]:
+    layout_options: SurfaceEstimatorOptions | None = None,
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
     from .water import OHTopologyCache, water_triplet_geometry
 
     axis_index = axis_to_index(reference.axis)
     top_counts = np.zeros(len(frames), dtype=int)
     bottom_counts = np.zeros(len(frames), dtype=int)
+    top_contact = np.zeros(len(frames), dtype=float)
+    bottom_contact = np.zeros(len(frames), dtype=float)
+    contact_supported = (
+        layout_options is not None
+        and np.all(np.isfinite(reference.axis_period_per_frame_A))
+        and np.all(reference.axis_period_per_frame_A > 0)
+    )
+    # Reuse resolved substrate identity and periodic geometry. Preparing another
+    # context would scan a streaming trajectory again merely to recover these.
+    selected_elements = reference.top.selected_elements if reference.top is not None else ()
     topology_cache = OHTopologyCache(
         context="surface-layout water topology",
     )
@@ -2369,13 +2853,60 @@ def _surface_reference_water_populations(
                 replace(reference, resolved_layout="symmetric"),
                 np.asarray(geometry.com_positions[:, axis_index], dtype=float),
                 frame_index=frame_index,
+                target_positions=geometry.com_positions,
             )
             top_counts[frame_index] = int(np.count_nonzero((side == 1) & (top_distance >= 0.0)))
             bottom_counts[frame_index] = int(
                 np.count_nonzero((side == -1) & (bottom_distance >= 0.0))
             )
+            if contact_supported and layout_options is not None:
+                # Full substrate bounds are independent of measurement exclusions.
+                mask = _candidate_mask_for_frame(
+                    frame,
+                    selected_elements=selected_elements,
+                    atom_indices=layout_options.surface_atom_indices,
+                    atom_mask=layout_options.surface_atom_mask,
+                    include_fixed_surface_atoms=True,
+                )
+                substrate = np.asarray(frame.positions[mask, axis_index], dtype=float)
+                lower = float(reference.axis_lower_per_frame_A[frame_index])
+                period = float(reference.axis_period_per_frame_A[frame_index])
+                if substrate.size >= 2 and np.all(np.isfinite(substrate)):
+                    cut = _largest_circular_gap_cut(substrate, lower=lower, period=period)
+                    slab = _canonical_axis_values(substrate, lower=lower, period=period, cut=cut)
+                    bottom_bound, top_bound = float(np.min(slab)), float(np.max(slab))
+                    gap = period - (top_bound - bottom_bound)
+                    band = min(SURFACE_CONTACT_BAND_A, 0.5 * gap)
+                    water = _canonical_axis_values(
+                        geometry.com_positions[:, axis_index], lower=lower, period=period, cut=cut
+                    )
+                    top_outward = np.mod(water - top_bound, period)
+                    bottom_outward = np.mod(bottom_bound - water, period)
+                    top_mask = (top_outward <= band + 1e-10) & (band > 0)
+                    bottom_mask = (bottom_outward <= band + 1e-10) & (band > 0)
+                    ties = top_mask & bottom_mask
+                    top_contact[frame_index] = np.count_nonzero(top_mask) - 0.5 * np.count_nonzero(
+                        ties
+                    )
+                    bottom_contact[frame_index] = np.count_nonzero(
+                        bottom_mask
+                    ) - 0.5 * np.count_nonzero(ties)
             progress.update()
-    return top_counts, bottom_counts
+    thresholds = np.maximum(
+        1, np.ceil(SURFACE_CONTACT_POPULATION_FRACTION * (top_contact + bottom_contact))
+    )
+    contact = {
+        "classifier_version": SURFACE_LAYOUT_CLASSIFIER_VERSION,
+        "band_A": SURFACE_CONTACT_BAND_A,
+        "population_fraction": SURFACE_CONTACT_POPULATION_FRACTION,
+        "persistence": SURFACE_CONTACT_PERSISTENCE,
+        "geometry_supported": bool(contact_supported),
+        "top_occupancy": float(np.mean(top_contact >= thresholds)),
+        "bottom_occupancy": float(np.mean(bottom_contact >= thresholds)),
+        "mean_top": float(np.mean(top_contact)),
+        "mean_bottom": float(np.mean(bottom_contact)),
+    }
+    return top_counts, bottom_counts, contact
 
 
 def estimate_surface_layout_reference(
@@ -2396,7 +2927,11 @@ def estimate_surface_layout_reference(
     requested = normalize_surface_layout(surface_layout)
     if requested == "auto" and surface_options is not None and surface_options.side == "bottom":
         requested = "single-bottom"
-    if surface_layout is not None and surface_options is not None:
+    if (
+        surface_layout is not None
+        and surface_options is not None
+        and surface_options.distance_mode == "plane"
+    ):
         if requested == "single-top" and surface_options.side != "top":
             raise ValueError("surface_layout=single-top conflicts with surface_options.side.")
         if requested == "single-bottom" and surface_options.side != "bottom":
@@ -2425,6 +2960,10 @@ def estimate_surface_layout_reference(
         include_fixed_surface_atoms=include_fixed_surface_atoms,
         surface_options=surface_options,
     )
+    if base_options.distance_mode == "nearest-atom":
+        return _nearest_surface_reference(frames, axis, requested, base_options)
+    if base_options.distance_mode != "plane":
+        raise ValueError("surface distance mode must be 'plane' or 'nearest-atom'.")
     active_logger = LOGGER if logger is None else logger
     with (
         progress_stage(active_logger, "Surface preparation") if _report_progress else nullcontext()
@@ -2529,23 +3068,28 @@ def estimate_surface_layout_reference(
             if _report_progress
             else nullcontext()
         ):
-            top_population, bottom_population = _surface_reference_water_populations(
+            top_population, bottom_population, contact = _surface_reference_water_populations(
                 frames,
                 provisional,
                 report_progress=_report_progress,
+                layout_options=base_options if requested == "auto" else None,
             )
     else:
         top_population = np.zeros(len(frames), dtype=int)
         bottom_population = np.zeros(len(frames), dtype=int)
-    total_population = top_population + bottom_population
-    thresholds = np.maximum(1, np.ceil(0.10 * total_population).astype(int))
-    frames_with_water = total_population > 0
-    denominator = max(1, len(frames))
-    top_occupancy = float(np.count_nonzero(top_population >= thresholds) / denominator)
-    bottom_occupancy = float(np.count_nonzero(bottom_population >= thresholds) / denominator)
-    have_water = bool(np.any(frames_with_water))
-    top_populated = have_water and top_occupancy >= 0.90
-    bottom_populated = have_water and bottom_occupancy >= 0.90
+        contact = {
+            "classifier_version": SURFACE_LAYOUT_CLASSIFIER_VERSION,
+            "band_A": SURFACE_CONTACT_BAND_A,
+            "population_fraction": SURFACE_CONTACT_POPULATION_FRACTION,
+            "persistence": SURFACE_CONTACT_PERSISTENCE,
+            "geometry_supported": False,
+            "top_occupancy": 0.0,
+            "bottom_occupancy": 0.0,
+            "mean_top": 0.0,
+            "mean_bottom": 0.0,
+        }
+    top_populated = contact["top_occupancy"] >= SURFACE_CONTACT_PERSISTENCE
+    bottom_populated = contact["bottom_occupancy"] >= SURFACE_CONTACT_PERSISTENCE
 
     resolved: ResolvedSurfaceLayout = "axis"
     reason = "surface_reference_unavailable"
@@ -2562,11 +3106,11 @@ def estimate_surface_layout_reference(
             resolved, reason = "single-bottom", "explicit_single_bottom"
     else:
         if pair_ordered and periodic_supported and top_populated and bottom_populated:
-            resolved, reason = "symmetric", "auto_two_sided_water"
+            resolved, reason = "symmetric", "auto_two_sided_water_contact"
         elif top_trusted and top_populated and not bottom_populated:
-            resolved, reason = "single-top", "auto_top_water_only"
+            resolved, reason = "single-top", "auto_top_water_contact"
         elif bottom_trusted and bottom_populated and not top_populated:
-            resolved, reason = "single-bottom", "auto_bottom_water_only"
+            resolved, reason = "single-bottom", "auto_bottom_water_contact"
         elif top_trusted:
             # When solvent occupancy cannot identify a side, retain the
             # established single-top trust/fallback behavior on the original
@@ -2589,7 +3133,7 @@ def estimate_surface_layout_reference(
                 _emit_summary=False,
             )
             if _surface_estimate_supports_distance_mode(raw_top, frame_count=len(frames)):
-                resolved, reason = "single-top", "auto_default_top"
+                resolved, reason = "single-top", "auto_default_top_insufficient_water_contact"
             else:
                 top = raw_top
                 resolved, reason = "axis", "auto_default_top_untrusted"
@@ -2618,6 +3162,10 @@ def estimate_surface_layout_reference(
         bottom_population_per_frame=np.asarray(bottom_population, dtype=int),
         auto_reason=reason,
         population_imbalance=population_imbalance,
+        validation_diagnostics={
+            **(provisional.validation_diagnostics or {}),
+            **({"layout_contact": contact} if requested == "auto" else {}),
+        },
     )
     log_surface_reference_summary(
         resolved_reference,
@@ -2704,6 +3252,7 @@ def _surface_effective_options_payload(estimate: SurfaceEstimate) -> dict[str, A
     return {
         str(key): _json_ready(value)
         for key, value in dict(estimate.diagnostics.effective_options).items()
+        if key != "distance_mode" or value != "plane"
     }
 
 
@@ -2839,6 +3388,8 @@ def _surface_reference_metadata(
         "population_imbalance_threshold": reference.population_imbalance_threshold,
         "validation": _json_ready(reference.validation_diagnostics or {}),
     }
+    if reference.distance_mode != "plane":
+        nested["distance_mode"] = reference.distance_mode
     if surface_position is not None and np.isfinite(surface_position):
         nested["position"] = float(surface_position)
     if surface_position_std is not None and np.isfinite(surface_position_std):
@@ -3069,6 +3620,7 @@ def _surface_reference_from_payload(
     return SurfaceReference(
         requested_layout=requested,
         resolved_layout=resolved,
+        distance_mode=str(surface_metadata.get("distance_mode", "plane")),
         axis=str(surface_metadata.get("axis", "z")).strip().lower() or "z",
         top=top,
         bottom=bottom,

@@ -544,15 +544,20 @@ def _surface_view_filter_options(
             .lower()
         )
         raw_axis = profile.get("axis", "z")
+        distance_mode = surface_metadata.get(
+            "distance_mode", profile.get("surface_distance_mode", "plane")
+        )
     else:
         reference = getattr(profile, "surface_reference", None)
         resolved_layout = str(getattr(reference, "resolved_layout", "") or "").strip().lower()
         raw_axis = getattr(profile, "axis", "z")
+        distance_mode = getattr(reference, "distance_mode", "plane")
     if resolved_layout == "symmetric":
         capabilities.update({"top", "bottom", "all"})
     axis = str(raw_axis or "z").strip().lower()
     return {
         "surface_axis": axis if axis in {"x", "y", "z"} else "z",
+        "surface_distance_mode": distance_mode,
         "surface_layout_resolved": resolved_layout or "axis",
         "surface_view_capabilities": [
             value for value in ("full", "top", "bottom", "folded", "all") if value in capabilities
@@ -1281,6 +1286,28 @@ def _open_compute_trajectory(args: argparse.Namespace, *, analysis_name: str):
         ),
         atom_aliases=getattr(args, "atom_alias", None),
     )
+    if _is_raw_text_trajectory_source(args.trajectory):
+        from .pbc import (
+            find_unique_simulation_input,
+            extract_fixed_atom_indices_from_simulation_input,
+        )
+        from .resolution import apply_fixed_atom_constraints
+
+        try:
+            explicit_input = getattr(args, "input", None)
+            simulation_input = (
+                Path(explicit_input).expanduser().resolve()
+                if explicit_input
+                else find_unique_simulation_input(
+                    Path(args.trajectory).expanduser().resolve().parent
+                )
+            )
+        except (FileNotFoundError, ValueError):
+            simulation_input = None
+        if simulation_input is not None:
+            indices = extract_fixed_atom_indices_from_simulation_input(simulation_input)
+            if indices:
+                apply_fixed_atom_constraints(frames, indices)
     if diagnostics.resolved_mode == "stream":
         from .working_arrays import enable_bounded_working_arrays
 
@@ -1763,17 +1790,9 @@ def _position_hdf5_output_path(
 ) -> Path | None:
     if not profiles:
         return None
-
-    default_path = _default_position_hdf5_output_path(source, "all", axis)
-    if base_output is None:
-        return _resolve_non_overwriting_hdf5_path(default_path)
-
-    base_path = Path(base_output).expanduser()
-    if _output_request_looks_like_directory(base_output) or (
-        base_path.exists() and base_path.is_dir()
-    ):
-        return _resolve_non_overwriting_hdf5_path(base_path / default_path.name)
-    return _resolve_single_analysis_hdf5_output_path(base_output, default_path)
+    return _resolve_requested_analysis_hdf5_output_path(
+        base_output, _default_position_hdf5_output_path(source, "all", axis)
+    )
 
 
 def _default_rdf_collection_hdf5_output_path(source: str | Path) -> Path:
@@ -3206,6 +3225,11 @@ def _density_selected_view_type(
     mapping = _coerce_runtime_view_mapping(getattr(args, "view_mapping", None))
     if mapping is not None:
         return _canonical_mapping_view_id(getattr(mapping, "view_type_id", None))
+    explicit_view = getattr(args, "plot_view_type", None)
+    if explicit_view is not None:
+        return _canonical_mapping_view_id(
+            "heatmap_2d" if explicit_view in {"2d", "2d-heatmap", "heatmap"} else "line_1d"
+        )
     view_types_raw = None if filter_options is None else filter_options.get("density_view_types")
     if isinstance(view_types_raw, (list, tuple, set)):
         view_types = {str(value).strip().lower() for value in view_types_raw}
@@ -3220,7 +3244,10 @@ def _build_density_profile_filter_options(
     axis: str | None,
     species: str | None,
 ) -> dict[str, Any] | None:
-    from .analysis.density import _density_payload_matches_selection
+    from .analysis.density import (
+        _density_payload_matches_selection,
+        _validate_density_observable_metadata,
+    )
     from .analysis.common import (
         is_molecule_species_label,
         molecule_display_label,
@@ -3230,6 +3257,7 @@ def _build_density_profile_filter_options(
     available_modes: list[str] = []
     seen_modes: set[str] = set()
     heatmap_sources: list[dict[str, str]] = []
+    stored_heatmap_axes: list[list[str]] = []
     seen_heatmap_sources: set[tuple[str, str]] = set()
     grid_sources: list[dict[str, str]] = []
     seen_grid_sources: set[str] = set()
@@ -3237,6 +3265,7 @@ def _build_density_profile_filter_options(
     seen_species: set[str] = set()
     surface_axes: list[str] = []
     surface_layouts: set[str] = set()
+    surface_distance_modes: set[str] = set()
     symmetric_distance_profiles = 0
     symmetric_top_profiles = 0
     symmetric_bottom_profiles = 0
@@ -3370,12 +3399,16 @@ def _build_density_profile_filter_options(
     for _source, source_payloads in raw_payloads_by_source:
         for payload in source_payloads:
             metadata = dict(payload.get("metadata", {}))
+            _validate_density_observable_metadata(metadata)
+            if metadata.get("surface_distance_mode") is not None:
+                surface_distance_modes.add(str(metadata["surface_distance_mode"]))
             surface_axis = str(metadata.get("surface_axis") or axis or "z").strip().lower()
             if surface_axis in {"x", "y", "z"} and surface_axis not in surface_axes:
                 surface_axes.append(surface_axis)
             surface_metadata = metadata.get("surface")
             layout = ""
             if isinstance(surface_metadata, Mapping):
+                surface_distance_modes.add(str(surface_metadata.get("distance_mode", "plane")))
                 layout = str(surface_metadata.get("layout_resolved") or "").strip().lower()
                 if layout:
                     surface_layouts.add(layout)
@@ -3419,6 +3452,8 @@ def _build_density_profile_filter_options(
                 plane_axes = metadata.get("plane_axes")
                 if not isinstance(plane_axes, Sequence) or isinstance(plane_axes, (str, bytes)):
                     plane_axes = tuple(heatmap_plane[:2])
+                if len(plane_axes) == 2:
+                    stored_heatmap_axes.append([str(v).lower() for v in plane_axes])
                 if len(plane_axes) >= 1:
                     _add_axis_bin_width(
                         str(plane_axes[0]).strip().lower(), metadata.get("x_bin_width_A")
@@ -3492,6 +3527,11 @@ def _build_density_profile_filter_options(
         )
     if len(surface_axes) == 1:
         payload["surface_axis"] = surface_axes[0]
+    if "nearest-atom" in surface_distance_modes:
+        payload["surface_distance_mode"] = "nearest-atom"
+        payload["available_modes"] = ["distance"]
+    elif len(surface_distance_modes) == 1:
+        payload["surface_distance_mode"] = next(iter(surface_distance_modes))
     if len(surface_layouts) == 1:
         payload["surface_layout_resolved"] = next(iter(surface_layouts))
     capabilities = {"folded"}
@@ -3531,6 +3571,8 @@ def _build_density_profile_filter_options(
             payload["density_default_x_bin_width_A"] = default_axis_bin_widths["x"]
         if "y" in default_axis_bin_widths:
             payload["density_default_y_bin_width_A"] = default_axis_bin_widths["y"]
+    if not grid_sources and stored_heatmap_axes:
+        payload["density_supported_2d_axes"] = stored_heatmap_axes
     has_2d = bool(heatmap_sources or grid_sources)
     if available_modes and has_2d:
         payload["density_view_types"] = ["line_1d", "heatmap_2d"]
@@ -6089,6 +6131,28 @@ def _add_density_plot_options(
     group_title: str = "Density plot options",
 ) -> None:
     group = parser.add_argument_group(group_title)
+    group.add_argument(
+        "--view-type",
+        dest="plot_view_type",
+        choices=["1d", "2d", "1d-line", "2d-heatmap", "line", "heatmap"],
+        default=None,
+        help="1D profile or 2D map. Nearest-distance maps require X/Distance or Y/Distance.",
+    )
+    group.add_argument(
+        "--2d-x-axis", dest="density_2d_x_axis", choices=["x", "y", "z", "distance"], default=None
+    )
+    group.add_argument(
+        "--2d-y-axis", dest="density_2d_y_axis", choices=["x", "y", "z", "distance"], default=None
+    )
+    for coordinate in ("x", "y", "z", "distance"):
+        for bound in ("min", "max"):
+            group.add_argument(
+                f"--filter-{coordinate}-{bound}",
+                dest=f"density_filter_{coordinate}_{bound}",
+                type=float,
+                default=None,
+                help=f"Select the {coordinate} coordinate range before histogram projection (Angstrom).",
+            )
     if include_axis:
         group.add_argument(
             "--axis",
@@ -6112,7 +6176,7 @@ def _add_density_plot_options(
         "--quantity",
         choices=["mass", "number"],
         default="mass",
-        help="Density quantity to plot (default: mass; use number for entity number density).",
+        help="Mass or number weighting. Plane/Cartesian views show physical density; nearest-atom views show amu or particles per coordinate interval.",
     )
 
 
@@ -6183,13 +6247,14 @@ def _add_position_plot_options(
             ),
         )
     if include_component:
-        group.add_argument(
-            "--view-type",
-            dest="plot_view_type",
-            choices=["1d-line", "2d-heatmap", "line", "heatmap", "1d", "2d"],
-            default=None,
-            help="Plot view type: 1D Line or 2D Heatmap.",
-        )
+        if "--view-type" not in parser._option_string_actions:
+            group.add_argument(
+                "--view-type",
+                dest="plot_view_type",
+                choices=["1d-line", "2d-heatmap", "line", "heatmap", "1d", "2d"],
+                default=None,
+                help="Plot view type: 1D Line or 2D Heatmap.",
+            )
         if include_line_y_quantity:
             group.add_argument(
                 "--y-quantity",
@@ -10229,6 +10294,7 @@ def _render_profile_plot(
             ordered_profile = [profile[index] for index in indices]
             source_ordered_descriptors = [source_ordered_descriptors[index] for index in indices]
             ordered_descriptors = source_ordered_descriptors
+
             def _reorder_source_list(value: Any) -> Any:
                 if isinstance(value, list) and len(value) == len(indices):
                     return [value[index] for index in indices]
@@ -10876,6 +10942,17 @@ def _write_plotted_data_export(
         if include_metadata:
             handle.write("# LiNaK plotted data export\n")
             handle.write(f"# series_count={len(normalized_series)}\n")
+            axes = render_state.get("axes")
+            if axes is not None:
+                for key, text in (
+                    ("x_label", axes.get_xlabel()),
+                    ("y_label", axes.get_ylabel()),
+                    ("title", axes.get_title()),
+                ):
+                    handle.write(f"# {key}={json.dumps(str(text), ensure_ascii=False)}\n")
+            handle.write(
+                f"# series_labels={json.dumps([s['series_label'] for s in normalized_series], ensure_ascii=False)}\n"
+            )
         writer = csv.writer(handle, delimiter=delimiter, lineterminator="\n")
         if len(normalized_series) == 1:
             writer.writerow(["x", "y"])
@@ -12844,6 +12921,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_spatial_filter_cli_args(apply_convert)
     apply_convert.add_argument(
+        "--surface-elements",
+        nargs="+",
+        metavar="ELEM",
+        help="Eligible substrate elements for nearest-atom conversion and filtering.",
+    )
+    apply_convert.add_argument("--include-fixed-surface-atoms", action="store_true")
+    apply_convert.add_argument(
+        "--surface-layout",
+        choices=["auto", "single-top", "single-bottom", "symmetric"],
+        default=None,
+    )
+    apply_convert.add_argument(
         "--target-file-type",
         dest="target_file_type",
         help="Target file type, for example: traj.h5, xyz, cube.h5, cube",
@@ -12914,7 +13003,7 @@ def build_parser() -> argparse.ArgumentParser:
         "pbc",
         help="Apply periodic boundary conditions by wrapping positions into a cell.",
         description=(
-            "Apply orthorhombic PBC to a trajectory and wrap atom positions. "
+            "Apply PBC to a trajectory and wrap atom positions or molecular centers of mass. "
             "Cell dimensions are resolved in this order: --cell, --input, "
             "or automatic .inp/.lmp simulation-input discovery in the output directory."
         ),
@@ -12965,6 +13054,14 @@ def build_parser() -> argparse.ArgumentParser:
         type=_positive_float,
         metavar=("A", "B", "C"),
         help="Explicit cell lengths in Angstrom (overrides auto-discovery).",
+    )
+    apply_pbc.add_argument(
+        "--keep-molecules",
+        action="store_true",
+        help=(
+            "Keep detected OH/H2O/H3O molecules intact by wrapping their mass-weighted "
+            "centers of mass. Individual atoms may extend outside the cell; other atoms wrap individually."
+        ),
     )
     _add_atom_alias_option(apply_pbc)
     _add_hdf5_compression_option(apply_pbc)
@@ -15047,6 +15144,14 @@ def _handle_plot_density(args: argparse.Namespace) -> int:
             keys=_PLOT_SETTINGS_DENSITY_KEYS,
             profile_name=getattr(args, "settings_profile", None),
         )
+    if getattr(args, "plot_view_type", None) is not None:
+        from .plot.mappings.density_mapping import density_plot_options_to_view_mapping
+
+        args.view_mapping = density_plot_options_to_view_mapping(
+            view_type=_public_plot_view_type(args.plot_view_type) or "line_1d",
+            x_mode=getattr(args, "x_mode", "distance"),
+            quantity=getattr(args, "quantity", "mass"),
+        )
     resolved_axis, resolved_x_mode = _resolve_density_plot_axis_and_x_mode(
         axis=getattr(args, "axis", None),
         x_mode=getattr(args, "x_mode", None),
@@ -16056,11 +16161,13 @@ def _handle_plot_orientation(args: argparse.Namespace) -> int:
 
 def _surface_options_from_cli_args(args: argparse.Namespace):
     rough_surface_envelope = getattr(args, "rough_surface_envelope", None)
-    if rough_surface_envelope is None:
+    distance_mode = getattr(args, "surface_distance_mode", None) or "plane"
+    if rough_surface_envelope is None and distance_mode == "plane":
         return None
     from .analysis.density import SurfaceEstimatorOptions
 
     return SurfaceEstimatorOptions(
+        distance_mode=distance_mode,
         mode=str(getattr(args, "surface_mode", "auto")),
         surface_elements=(
             None
@@ -16068,8 +16175,41 @@ def _surface_options_from_cli_args(args: argparse.Namespace):
             else tuple(str(value) for value in args.surface_elements)
         ),
         include_fixed_surface_atoms=bool(getattr(args, "include_fixed_surface_atoms", False)),
-        rough_surface_envelope_A=float(rough_surface_envelope),
+        rough_surface_envelope_A=None
+        if rough_surface_envelope is None
+        else float(rough_surface_envelope),
     )
+
+
+def _inherit_surface_distance_settings(trajectory: str | Path, args: argparse.Namespace) -> None:
+    if getattr(args, "_surface_distance_inheritance_resolved", False):
+        return
+    from .trajectory.io import read_trajectory_hdf5_metadata
+
+    stored = read_trajectory_hdf5_metadata(trajectory)
+    preference = {} if stored is None else stored.surface_distance_settings or {}
+    explicit_mode = getattr(args, "surface_distance_mode", None)
+    args.surface_distance_mode = explicit_mode or preference.get("distance_mode", "plane")
+    tokens = getattr(args, "_runtime_argv", ())
+
+    def supplied(flag: str) -> bool:
+        return any(token == flag or str(token).startswith(flag + "=") for token in tokens)
+
+    if args.surface_distance_mode == "nearest-atom":
+        if getattr(args, "surface_elements", None) is None:
+            args.surface_elements = preference.get("surface_elements")
+        if not supplied("--include-fixed-surface-atoms"):
+            args.include_fixed_surface_atoms = bool(
+                preference.get(
+                    "include_fixed_surface_atoms",
+                    getattr(args, "include_fixed_surface_atoms", False),
+                )
+            )
+        if not supplied("--surface-layout"):
+            args.surface_layout = preference.get(
+                "surface_layout", getattr(args, "surface_layout", "auto")
+            )
+    args._surface_distance_inheritance_resolved = True
 
 
 def _describe_surface_cli_options(args: argparse.Namespace) -> str:
@@ -16087,6 +16227,12 @@ def _describe_surface_cli_options(args: argparse.Namespace) -> str:
 
 
 def _add_spatial_filter_cli_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--surface-distance-mode",
+        choices=["plane", "nearest-atom"],
+        default=None,
+        help="Surface distance definition (default: stored trajectory preference, otherwise plane).",
+    )
     parser.add_argument("--x-range", help="Keep only atoms within the resolved X range <min:max>.")
     parser.add_argument("--y-range", help="Keep only atoms within the resolved Y range <min:max>.")
     parser.add_argument("--z-range", help="Keep only atoms within the resolved Z range <min:max>.")
@@ -16118,6 +16264,7 @@ def _spatial_filter_surface_config_from_args(args: argparse.Namespace) -> dict[s
     return {
         "surface_axis": surface_axis,
         "surface_mode": str(getattr(args, "surface_mode", "auto")).strip().lower() or "auto",
+        "surface_distance_mode": getattr(args, "surface_distance_mode", None) or "plane",
         "surface_layout": str(getattr(args, "surface_layout", "auto")).strip().lower() or "auto",
         "surface_elements": getattr(args, "surface_elements", None),
         "include_fixed_surface_atoms": bool(getattr(args, "include_fixed_surface_atoms", False)),
@@ -16133,6 +16280,9 @@ def _apply_spatial_filter_from_cli_args(
 ) -> Any | None:
     if not _spatial_filter_is_active(args):
         return None
+    trajectory = getattr(args, "trajectory", None)
+    if trajectory is not None:
+        _inherit_surface_distance_settings(trajectory, args)
     from .trajectory.spatial_filter import (
         apply_spatial_filter,
         apply_spatial_filter_streaming,
@@ -16200,6 +16350,10 @@ def _matching_cached_surface_from_trajectory(
 ) -> Any | None:
     from .trajectory.io import read_trajectory_hdf5_surface_cache
     from .analysis.surface import SurfaceReference, log_surface_reference_summary
+
+    _inherit_surface_distance_settings(trajectory, args)
+    if args.surface_distance_mode == "nearest-atom":
+        return None
 
     if not cached_frame_geometry_matches(trajectory, frames):
         return None
@@ -16669,6 +16823,7 @@ def _handle_compute_position(args: argparse.Namespace) -> int:
         output_path,
         additional_metadata=position_metadata,
         compression_profile=args.hdf5_compression,
+        merge_existing=True,
     )
     _release_compute_resources(analysis_frames, frames)
 
@@ -17525,7 +17680,9 @@ def _handle_apply_pbc(args: argparse.Namespace) -> int:
             f"output trajectory: {output_path}",
             f"overwrite input: {'yes' if args.overwrite else 'no'}",
             f"cell resolution: {cell_preview}",
-            "operation: wrap atom positions into resolved periodic cell",
+            "operation: wrap molecular centers of mass (OH/H2O/H3O) and remaining atoms"
+            if args.keep_molecules
+            else "operation: wrap atom positions into resolved periodic cell",
         ]
         _log_dry_run_plan("apply pbc", plan)
         LOGGER.info("PBC dry run finished in %.2f s.", perf_counter() - start)
@@ -17551,10 +17708,9 @@ def _handle_apply_pbc(args: argparse.Namespace) -> int:
         )
         cell_source = "explicit --cell" if cell_arg is not None else "simulation input"
 
-    if use_trajectory_cells:
-        wrapped_frames = apply_pbc_to_frames(frames, None)
-    else:
-        wrapped_frames = apply_pbc_to_frames(frames, cell)
+    wrapped_frames = apply_pbc_to_frames(
+        frames, None if use_trajectory_cells else cell, keep_molecules=args.keep_molecules
+    )
     log_cell_geometry_summary(
         wrapped_frames,
         logger=LOGGER,
@@ -17605,6 +17761,7 @@ def _handle_apply_convert(args: argparse.Namespace) -> int:
         and args.select is None
         and request.source_path == request.target_path
         and request.source_file_type == request.target_file_type
+        and getattr(args, "surface_distance_mode", None) is None
     ):
         LOGGER.info(
             "Conversion skipped: '%s' is already LiNaK's preferred %s working format.",
@@ -17617,6 +17774,14 @@ def _handle_apply_convert(args: argparse.Namespace) -> int:
     options: TrajectoryConversionOptions | CubeConversionOptions
     if request.family == "trajectory":
         options = TrajectoryConversionOptions(
+            surface_distance_mode=getattr(args, "surface_distance_mode", None),
+            surface_elements=None
+            if getattr(args, "surface_elements", None) is None
+            else tuple(args.surface_elements),
+            include_fixed_surface_atoms=True
+            if getattr(args, "include_fixed_surface_atoms", False)
+            else None,
+            surface_layout=getattr(args, "surface_layout", None),
             input_path=args.input,
             cell=_normalize_cell_args(args),
             select=args.select,
@@ -17630,6 +17795,8 @@ def _handle_apply_convert(args: argparse.Namespace) -> int:
             compression_profile=args.hdf5_compression,
         )
     else:
+        if getattr(args, "surface_distance_mode", None) is not None:
+            raise ValueError("--surface-distance-mode is supported for trajectory conversion only.")
         options = CubeConversionOptions(compression_profile=args.hdf5_compression)
 
     if args.dry_run:

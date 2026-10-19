@@ -228,6 +228,7 @@ class TrajectoryStoredMetadata(CellMetadata):
     selection_resolved_start_step: int | None = None
     selection_resolved_end_step: int | None = None
     spatial_filter_metadata: dict[str, Any] | None = None
+    surface_distance_settings: dict[str, Any] | None = None
 
 
 def default_trajectory_hdf5_output_path(source: str | Path) -> Path:
@@ -415,6 +416,7 @@ def _normalize_stored_metadata(
     )
     return TrajectoryStoredMetadata(
         input_path=input_path,
+        surface_distance_settings=metadata.surface_distance_settings,
         input_format=input_format,
         cell_angstrom=cell_angstrom,
         cell_source=cell_source,
@@ -543,6 +545,7 @@ def _resolve_write_metadata(
         selection_resolved_start_step=resolved.selection_resolved_start_step,
         selection_resolved_end_step=resolved.selection_resolved_end_step,
         spatial_filter_metadata=resolved.spatial_filter_metadata,
+        surface_distance_settings=resolved.surface_distance_settings,
     )
 
 
@@ -744,6 +747,11 @@ def read_trajectory_hdf5_metadata(path: str | Path) -> TrajectoryStoredMetadata 
             TrajectoryStoredMetadata(
                 input_path=input_path,
                 input_format=input_format,
+                surface_distance_settings=json.loads(
+                    str(metadata_group.attrs["surface_distance_settings_json"])
+                )
+                if "surface_distance_settings_json" in metadata_group.attrs
+                else None,
                 cell_angstrom=cell_angstrom,
                 cell_source=cell_source,
                 frame_timestep_fs=(
@@ -963,6 +971,18 @@ def read_trajectory_hdf5_surface_cache(
             "Trajectory HDF5 surface cache is malformed: no paired surface reference. "
             "Reconvert the source trajectory."
         )
+    if reference.requested_layout == "auto":
+        from ..analysis.surface import SURFACE_LAYOUT_CLASSIFIER_VERSION
+
+        contact = (reference.validation_diagnostics or {}).get("layout_contact", {})
+        if (
+            not isinstance(contact, dict)
+            or contact.get("classifier_version") != SURFACE_LAYOUT_CLASSIFIER_VERSION
+        ):
+            LOGGER.debug(
+                "Ignoring obsolete automatic surface-layout cache in '%s'.", trajectory_path
+            )
+            return None
     if reference.axis_cut_per_frame_A.shape != (int(frame_count),):
         raise ValueError(
             "Trajectory HDF5 paired surface cache frame count does not match the trajectory."
@@ -1016,6 +1036,10 @@ def _write_trajectory_surface_cache(
     metadata_group: h5py.Group,
     metadata: TrajectoryStoredMetadata,
 ) -> None:
+    if metadata.surface_distance_settings is not None:
+        metadata_group.attrs["surface_distance_settings_json"] = json.dumps(
+            metadata.surface_distance_settings, sort_keys=True
+        )
     if metadata.surface_cache_status is None:
         return
 
@@ -1202,11 +1226,34 @@ def _write_trajectory_hdf5(
             handle.attrs["raw_species_labels_mode"] = (
                 "fixed" if raw_species_is_fixed else "variable"
             )
+            fixed_mask_dataset = None
+            if (
+                stored_metadata is not None
+                and (stored_metadata.surface_distance_settings or {}).get("distance_mode")
+                == "nearest-atom"
+                and any(frame.constraints for frame in frames)
+            ):
+                from ..analysis.surface import _fixed_atom_mask
+
+                shape = (frame_count, max_atom_count)
+                fixed_mask_dataset = handle.create_dataset(
+                    "fixed_atom_mask",
+                    shape=shape,
+                    dtype=bool,
+                    **dataset_create_options_for_shape(
+                        shape, dtype=bool, compression_profile=resolved_compression
+                    ),
+                )
             chunk_frames = (position_dataset.chunks or (1,))[0]
             for start in range(0, frame_count, chunk_frames):
                 stop = min(start + chunk_frames, frame_count)
                 count = stop - start
                 positions = np.zeros((count, max_atom_count, 3), dtype=np.float32)
+                fixed_masks = (
+                    None
+                    if fixed_mask_dataset is None
+                    else np.zeros((count, max_atom_count), dtype=bool)
+                )
                 numbers = (
                     None
                     if numbers_dataset is None
@@ -1219,6 +1266,8 @@ def _write_trajectory_hdf5(
                 )
                 for index, frame in enumerate(frames[start:stop]):
                     atom_count = len(frame)
+                    if fixed_masks is not None:
+                        fixed_masks[index, :atom_count] = _fixed_atom_mask(frame)
                     positions[index, :atom_count] = frame.positions
                     if numbers is not None:
                         numbers[index, :atom_count] = frame.numbers
@@ -1229,6 +1278,8 @@ def _write_trajectory_hdf5(
                     numbers_dataset[start:stop] = numbers
                 if labels_dataset is not None:
                     labels_dataset[start:stop] = labels
+                if fixed_mask_dataset is not None:
+                    fixed_mask_dataset[start:stop] = fixed_masks
                 progress.update(count)
             if not topology_is_fixed:
                 handle.create_dataset(
@@ -1387,6 +1438,7 @@ def _build_atoms_from_hdf5_chunk(
     frame_info_chunks: dict[str, np.ndarray],
     fixed_atom_indices: tuple[int, ...],
     atom_counts_chunk: np.ndarray | None = None,
+    fixed_masks_chunk: np.ndarray | None = None,
 ) -> list[Atoms]:
     chunk: list[Atoms] = []
     for offset in range(len(positions_chunk)):
@@ -1425,14 +1477,22 @@ def _build_atoms_from_hdf5_chunk(
                 frame.info[key] = float(scalar)
             else:  # pragma: no cover - guarded by writer dtype choices.
                 frame.info[key] = scalar.item()
-        if fixed_atom_indices:
+        if fixed_masks_chunk is not None:
+            frame.set_constraint(
+                FixAtoms(indices=np.flatnonzero(fixed_masks_chunk[offset, : len(frame)]))
+            )
+        elif fixed_atom_indices:
             frame.set_constraint(FixAtoms(indices=list(fixed_atom_indices)))
         chunk.append(frame)
     return chunk
 
 
 def _read_trajectory_hdf5_chunks(
-    path: Path, *, chunk_size: int, start_frame: int = 0, stop_frame: int | None = None,
+    path: Path,
+    *,
+    chunk_size: int,
+    start_frame: int = 0,
+    stop_frame: int | None = None,
     _attach_topology: bool = True,
 ) -> Generator[list[Atoms], None, None]:
     from ..analysis.topology import attach_frames, source_provider
@@ -1450,6 +1510,12 @@ def _read_trajectory_hdf5_chunks(
         pbc = handle["pbc"]
         atomic_numbers = handle["atomic_numbers"]
         raw_species_dataset = handle.get("raw_species_labels")
+        fixed_masks_dataset = handle.get("fixed_atom_mask")
+        if (
+            isinstance(fixed_masks_dataset, h5py.Dataset)
+            and fixed_masks_dataset.shape != positions.shape[:2]
+        ):
+            raise ValueError("Stored fixed-atom masks do not match the trajectory shape.")
         atom_counts_dataset = handle.get("atom_counts")
         frame_count = int(handle.attrs.get("frame_count", positions.shape[0]))
         provider = source_provider(path, handle, frame_count) if _attach_topology else None
@@ -1514,6 +1580,9 @@ def _read_trajectory_hdf5_chunks(
                     frame_info_chunks=frame_info_chunks,
                     fixed_atom_indices=fixed_atom_indices,
                     atom_counts_chunk=atom_counts_chunk,
+                    fixed_masks_chunk=None
+                    if fixed_masks_dataset is None
+                    else np.asarray(fixed_masks_dataset[start:stop], dtype=bool),
                 )
                 if provider is not None:
                     attach_frames(chunk, provider, start)
@@ -1954,7 +2023,7 @@ def read_trajectory_chunks(
     *,
     chunk_size: int,
     atom_aliases: Any = None,
-) -> Iterator[list[Atoms]]:
+) -> Generator[list[Atoms], None, None]:
     """Yield trajectory frames in fixed-size chunks.
 
     This allows analyses to stream large trajectories without materializing all frames.

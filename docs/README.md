@@ -23,6 +23,12 @@ The pages in this folder describe:
 
 ## Analysis Guides
 
+- [Nearest-atom surface distances](nearest_surface_distances.md): optional 3D
+  substrate distances, inherited conversion preferences, interface identity,
+  periodic searches, and density/distribution definitions.
+- [Density and distance distributions](density-distributions.md): physical units,
+  nearest-distance histograms, valid Studio/CLI axes and benchmark results.
+
 - [Density](density.md)
 - [Position](position.md)
 - [RDF](rdf.md)
@@ -36,9 +42,6 @@ The pages in this folder describe:
 - [Surface Estimation](surface-estimation.md)
 - [Water Detection And Water Geometry](water-detection.md)
 - [HDF5 Data Model And Metadata Conventions](hdf5-data-model.md)
-- [Pre-Publication Audit And Verification Record](pre-publication-audit.md)
-- [Essential Release Checklist](release-checklist.md)
-- [Plot Data/View Architecture Proposal](plot-data-view-architecture.md)
 
 ## Common Conventions
 
@@ -76,6 +79,12 @@ All file extensions are invariant when resolving collisions. Counters go before
 the first dot: `run.part.rdf.h5` becomes `run_1.part.rdf.h5`.
 Qualifiers also belong to the base name: use `traj-all.position.h5` and `traj_1.density.h5`, never
 `traj.position-all.h5` or `traj.density_1.h5`.
+
+Repeated `compute position` commands merge compatible species/axis profiles into
+the requested `.position.h5` file. For example, computing O and then H keeps both
+in `traj.position.h5`; recomputing O updates its profile. Source, frame/time grid,
+cell geometry, or surface incompatibilities produce `traj_1.position.h5` instead.
+Saved plot settings are preserved when profiles are merged.
 
 For repeated analysis, first convert raw text trajectories into LiNaK trajectory
 HDF5:
@@ -123,6 +132,12 @@ all their trajectories; `Isolate` shows just the selected trajectory, with Undo
 restoring the previous visibility. `Apply this style to species` copies the
 selected trajectory's styling to its species without changing labels or
 visibility. Hiding layers preserves their order and colors.
+
+Density layers use the same visibility and styling controls for elements and
+molecules. H2O can be shown independently of elemental O and H, including after
+`Hide all`. Layer colors stay attached to their IDs when layers are hidden,
+reordered, or saved; the list, legend, preview and exported figure agree.
+Duplicated layers retain their source identity and saved settings.
 
 Optional value filters and the
 shared colormap/colorbar controls update the preview interactively. The legacy

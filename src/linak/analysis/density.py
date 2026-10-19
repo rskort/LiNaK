@@ -88,6 +88,8 @@ from .common import (
     write_profile_collection,
 )
 from .surface import (
+    bind_surface_reference,
+    surface_distance_label,
     SurfaceEstimate,
     SurfaceEstimatorOptions,
     SurfaceReference,
@@ -106,6 +108,7 @@ from .surface import (
     _surface_reference_metadata,
     estimate_surface_layout_reference,
     surface_distance_components,
+    surface_substrate_mask,
     wrapped_surface_positions,
     estimate_surface_position as estimate_surface_position,
     estimate_surface_reference as estimate_surface_reference,
@@ -170,6 +173,11 @@ class DensityProfile:
     oh_cutoff_A: float | None = None
     min_molecule_frames: int | None = None
 
+    spatial_filters: dict[str, tuple[float | None, float | None]] | None = None
+
+    def __post_init__(self) -> None:
+        _finalize_distribution_units(self)
+
 
 @dataclass(frozen=True)
 class DensityHeatmapProfile:
@@ -198,6 +206,13 @@ class DensityHeatmapProfile:
     visible_y_max_A: float | None = None
     oh_cutoff_A: float | None = None
     min_molecule_frames: int | None = None
+    distance_mode: str = "plane"
+    surface_metadata: dict[str, Any] | None = None
+
+    spatial_filters: dict[str, tuple[float | None, float | None]] | None = None
+
+    def __post_init__(self) -> None:
+        _finalize_distribution_units(self)
 
 
 @dataclass(frozen=True)
@@ -232,6 +247,14 @@ class DensityGridProfile:
 
     geometry_groups: list[dict[str, Any]] | None = None
 
+    def __post_init__(self) -> None:
+        if _is_nearest_distribution(self):
+            object.__setattr__(
+                self,
+                "number_density_units",
+                "molecules" if is_molecule_species_label(self.species) else "atoms",
+            )
+
     @property
     def grid_shape(self) -> tuple[int, int, int, int]:
         return (
@@ -240,6 +263,144 @@ class DensityGridProfile:
             int(np.asarray(self.z_bin_edges).size - 1),
             int(np.asarray(self.distance_bin_edges).size - 1),
         )
+
+
+def _is_nearest_distribution(profile: Any) -> bool:
+    if isinstance(profile, DensityHeatmapProfile):
+        return profile.distance_mode == "nearest-atom"
+    reference = profile.surface_reference
+    return bool(
+        reference is not None
+        and getattr(reference, "distance_mode", "plane") == "nearest-atom"
+        and (isinstance(profile, DensityGridProfile) or profile.coordinate_mode == "distance")
+    )
+
+
+def _finalize_distribution_units(profile: Any) -> None:
+    """Histogram buffers use grams; public nearest-distance profiles use amu."""
+    if not _is_nearest_distribution(profile):
+        return
+    dimensions = 2 if isinstance(profile, DensityHeatmapProfile) else 1
+    if dimensions == 2:
+        validate_nearest_distribution_axes(profile.plane_axes)
+    suffix = "Angstrom^2" if dimensions == 2 else "Angstrom"
+    if profile.units == f"g/{suffix}":
+        for name in ("density", "top_density", "bottom_density"):
+            values = getattr(profile, name, None)
+            if values is not None:
+                object.__setattr__(profile, name, np.asarray(values, dtype=float) / AMU_TO_G)
+        statistics = getattr(profile, "series_statistics", None)
+        if statistics and "density" in statistics:
+            stats = statistics["density"]
+            changes = {
+                name: None if getattr(stats, name) is None else getattr(stats, name) / AMU_TO_G
+                for name in ("sample_std", "sample_sem", "block_std", "block_sem")
+            }
+            object.__setattr__(
+                profile, "series_statistics", {**statistics, "density": replace(stats, **changes)}
+            )
+        object.__setattr__(profile, "units", f"amu/{suffix}")
+    elif profile.units != f"amu/{suffix}":
+        raise ValueError(
+            "Nearest surface-atom distributions cannot use physical-density units; recompute the result."
+        )
+    entity = "molecules" if is_molecule_species_label(profile.species) else "atoms"
+    object.__setattr__(profile, "number_density_units", f"{entity}/{suffix}")
+
+
+def _density_observable_metadata(profile: Any) -> dict[str, Any]:
+    if not _is_nearest_distribution(profile):
+        return {}
+    reference = getattr(profile, "surface_reference", None)
+    folded = getattr(profile, "interface_view", "single") == "folded"
+    symmetric = reference is not None and reference.is_symmetric
+    entity = "molecules" if is_molecule_species_label(profile.species) else "atoms"
+    return dict(
+        observable_kind="distance_distribution",
+        distribution_version=1,
+        coordinate_definition="nearest-surface-atom",
+        normalization="frames_and_coordinate_bin_widths",
+        weighting_channels=["mass", "number"],
+        interface_pooling="equal_interface_mean" if symmetric or folded else "single_interface",
+        interface_view=getattr(profile, "interface_view", "folded" if symmetric else "single"),
+        mass_unit="amu",
+        spatial_filters=getattr(profile, "spatial_filters", None),
+        storage_mass_unit="g" if isinstance(profile, DensityGridProfile) else "amu",
+        projection_units={
+            "mass_1d": "amu/Angstrom",
+            "mass_2d": "amu/Angstrom^2",
+            "number_1d": f"{entity}/Angstrom",
+            "number_2d": f"{entity}/Angstrom^2",
+        },
+    )
+
+
+def _validate_density_observable_metadata(metadata: Mapping[str, Any]) -> None:
+    surface = _surface_metadata_view(metadata)
+    nearest = (
+        surface.get("distance_mode") == "nearest-atom"
+        or metadata.get("surface_distance_mode") == "nearest-atom"
+        or metadata.get("distance_mode") == "nearest-atom"
+    )
+    relevant = (
+        metadata.get("profile_kind") != "line_1d" or metadata.get("coordinate_mode") == "distance"
+    )
+    if (
+        nearest
+        and relevant
+        and (
+            metadata.get("observable_kind") != "distance_distribution"
+            or metadata.get("distribution_version") != 1
+        )
+    ):
+        raise ValueError(
+            "Legacy nearest-atom density data has no unambiguous distribution definition. Recompute from the trajectory with `linak compute density TRAJECTORY --surface-distance-mode nearest-atom`."
+        )
+
+    if nearest and relevant and metadata.get("profile_kind") in {"line_1d", "heatmap_2d"}:
+        expected = (
+            "amu/Angstrom^2" if metadata.get("profile_kind") == "heatmap_2d" else "amu/Angstrom"
+        )
+        if metadata.get("units") != expected:
+            raise ValueError(
+                "Nearest-distance result units conflict with its distribution definition; recompute the result."
+            )
+
+
+def validate_nearest_distribution_axes(axes: tuple[str, ...]) -> None:
+    if axes == ("distance",) or (
+        len(axes) == 2 and set(axes) in ({"x", "distance"}, {"y", "distance"})
+    ):
+        return
+    raise ValueError(
+        "Nearest surface-atom distributions require Distance for 1D, or X/Distance or Y/Distance for 2D (either order). Use surface-plane mode for Cartesian density maps."
+    )
+
+
+def _nearest_selection_components(reference, selections, frame_index):
+    """Query distinct selected centers once per frame, shared across species."""
+    if (
+        reference is None
+        or getattr(reference, "distance_mode", "plane") != "nearest-atom"
+        or not selections
+    ):
+        return {}
+    labels = list(selections)
+    positions = [selections[label][0] for label in labels]
+    unique, inverse = np.unique(np.concatenate(positions), axis=0, return_inverse=True)
+    components = surface_distance_components(
+        reference,
+        unique[:, axis_to_index(reference.axis)],
+        target_positions=unique,
+        frame_index=frame_index,
+    )
+    result = {}
+    start = 0
+    for label, points in zip(labels, positions):
+        indices = inverse[start : start + len(points)]
+        result[label] = tuple(values[indices] for values in components)
+        start += len(points)
+    return result
 
 
 @dataclass
@@ -506,6 +667,18 @@ class _DensityLineAccumulator:
 
     def __post_init__(self) -> None:
         n_bins = int(np.asarray(self.bin_edges, dtype=float).size - 1)
+        if (
+            self.coordinate_mode == "distance"
+            and self.surface_reference is not None
+            and self.surface_reference.distance_mode == "nearest-atom"
+        ):
+            self.normalization_cache = replace(
+                self.normalization_cache,
+                use_volumetric_density=False,
+                slice_volumes=None,
+                framewise_normalization=False,
+                frames=None,
+            )
         if self.normalization_cache.frames is not None and self.surface_reference is None:
             frames = self.normalization_cache.frames
             volumes = np.asarray(
@@ -1091,7 +1264,14 @@ class _DensitySparseGridAccumulator:
         self._strides = tuple(
             np.uint64(math.prod(self.grid_shape[index + 1 :])) for index in range(4)
         )
-        if self.geometry_table is None and self.geometry_frames is not None:
+        if (
+            self.geometry_table is None
+            and self.geometry_frames is not None
+            and not (
+                self.surface_reference is not None
+                and self.surface_reference.distance_mode == "nearest-atom"
+            )
+        ):
             self.geometry_table = _prepare_density_grid_geometry(
                 self.geometry_frames,
                 self.distance_coordinate_mode,
@@ -1287,6 +1467,50 @@ class _DensitySparseGridAccumulator:
 def _frame_has_usable_cell(frame: Atoms, axis_index: int) -> bool:
     """Backward-compatible density cell validation wrapper."""
     return _common_frame_has_usable_cell(frame, axis_index=axis_index)
+
+
+def _nearest_density_targets(
+    reference: SurfaceReference, frame: Atoms, label: str, cutoff: float
+) -> np.ndarray | None:
+    if reference.distance_mode == "plane":
+        return None
+    if is_molecule_species_label(label):
+        from .water import oh_molecule_topology
+
+        topology = oh_molecule_topology(frame, oh_cutoff=cutoff)
+        return _molecule_positions_with_masses(frame, topology.indices_for(label))[0]
+    if label == "ALL":
+        return frame.positions
+    if label.lower().startswith("species:"):
+        mask = raw_species_labels(frame) == species_selector_raw_label(label)
+    else:
+        mask = np.asarray(frame.get_chemical_symbols()) == label
+    return frame.positions[mask]
+
+
+def _density_substrate_mask(
+    reference: SurfaceReference,
+    frame: Atoms,
+    species_label: str,
+) -> np.ndarray | bool:
+    if is_molecule_species_label(species_label):
+        return False
+    if species_label == "ALL":
+        return surface_substrate_mask(reference, frame)
+    if species_label.startswith("species:"):
+        selection = raw_species_labels(frame) == species_selector_raw_label(species_label)
+        return surface_substrate_mask(reference, frame)[selection]
+    # Element selections are homogeneous; no atom-sized buffer is necessary.
+    elements = {
+        element
+        for estimate in (reference.top, reference.bottom)
+        if estimate is not None
+        for element in estimate.selected_elements
+    }
+    if elements:
+        return species_label in elements
+    selection = np.asarray(frame.get_chemical_symbols()) == species_label
+    return surface_substrate_mask(reference, frame)[selection]
 
 
 def _select_axis_values_with_masses(
@@ -1812,6 +2036,8 @@ def _surface_reference_histogram_bounds(
     reference: SurfaceReference,
 ) -> tuple[float, float] | None:
     """Return complete-cell bounds for a canonical surface coordinate."""
+    if reference.distance_mode == "nearest-atom":
+        return None
 
     periods = np.asarray(reference.axis_period_per_frame_A, dtype=float)
     if periods.ndim != 1 or periods.size == 0 or np.any(~np.isfinite(periods)):
@@ -2659,6 +2885,8 @@ def _compute_density_profile_from_selected(
     entity_histogram_sum = np.zeros(n_bins, dtype=float)
     use_volumetric_density = all(_frame_has_usable_cell(frame, axis_index) for frame in frames)
     LOGGER.debug("Density mode: %s.", "volumetric" if use_volumetric_density else "linear")
+    if surface_reference is not None and surface_reference.distance_mode == "nearest-atom":
+        use_volumetric_density = False
 
     slice_volumes: np.ndarray | None = None
     variable_slice_volume = False
@@ -2962,7 +3190,7 @@ def compute_density_profile(
     if str(surface_mode).strip().lower() == "none":
         surface_estimate = None
     elif isinstance(precomputed_surface_estimate, SurfaceReference):
-        surface_reference = precomputed_surface_estimate
+        surface_reference = bind_surface_reference(precomputed_surface_estimate, frames)
         surface_estimate = surface_reference.primary
     elif precomputed_surface_estimate is not None:
         if precomputed_surface_estimate.frame_values.shape != (len(frames),):
@@ -2970,7 +3198,9 @@ def compute_density_profile(
                 "precomputed_surface_estimate frame count does not match the trajectory."
             )
         surface_estimate = precomputed_surface_estimate
-    elif surface_layout is None:
+    elif surface_layout is None and (
+        surface_options is None or surface_options.distance_mode == "plane"
+    ):
         surface_estimate, _surface_method = _select_surface_estimate(
             frames,
             axis,
@@ -3082,6 +3312,12 @@ def compute_density_profile(
                 surface_reference,
                 np.asarray(values, dtype=float),
                 frame_index=frame_index,
+                substrate_mask=_density_substrate_mask(
+                    surface_reference, frames[frame_index], species_label
+                ),
+                target_positions=_nearest_density_targets(
+                    surface_reference, frames[frame_index], species_label, oh_cutoff
+                ),
             )
             selected_for_binning.append(folded)
             top_mask = side >= 0
@@ -3106,7 +3342,12 @@ def compute_density_profile(
         coordinate_mode=coordinate_mode,
         labels=[species_label],
     )
-    LOGGER.info("Density compute summary: %s.", run_summary)
+    if surface_reference is not None and surface_reference.distance_mode == "nearest-atom":
+        LOGGER.info(
+            "Nearest-distance distributions: mass in amu/Angstrom, number in atoms or molecules/Angstrom; normalization=mean per frame and coordinate bin widths."
+        )
+    else:
+        LOGGER.info("Density compute summary: %s.", run_summary)
     LOGGER.debug(
         "Density selections: %s.",
         _density_selection_summary(
@@ -3125,8 +3366,13 @@ def compute_density_profile(
     )
     if selection_mode == "molecule":
         LOGGER.debug("O/H molecule cutoff: %.6g A.", float(oh_cutoff))
+    nearest_distance = (
+        surface_reference is not None and surface_reference.distance_mode == "nearest-atom"
+    )
     histogram_bounds = None
-    if normalized_binning == "cell":
+    if nearest_distance:
+        LOGGER.info("Nearest-atom distance bins use observed distances; bin width is unchanged.")
+    elif normalized_binning == "cell":
         if surface_reference is not None and surface_reference.uses_distance:
             histogram_bounds = _surface_reference_histogram_bounds(surface_reference)
         else:
@@ -3143,7 +3389,8 @@ def compute_density_profile(
             )
         if histogram_bounds is None:
             LOGGER.warning(
-                "Cell binning requested for '%s' along %s, but a usable cell was unavailable. "
+                "Cell binning requested for '%s' along %s, but cell-derived bin bounds "
+                "could not be determined. "
                 "Falling back to observed-data binning.",
                 species_label,
                 axis.lower(),
@@ -3286,7 +3533,14 @@ def compute_density_profiles(
         allow_h2o=True,
         allow_molecules=True,
     )
-    if surface_layout is not None:
+    if (
+        surface_layout is not None
+        or (surface_options is not None and surface_options.distance_mode == "nearest-atom")
+        or (
+            isinstance(precomputed_surface_estimate, SurfaceReference)
+            and precomputed_surface_estimate.distance_mode == "nearest-atom"
+        )
+    ):
         if frames and needs_general_geometry(frames):
             frames = wrap_trajectory_frames(frames)
         paired_reference = (
@@ -3303,6 +3557,29 @@ def compute_density_profiles(
                 logger=LOGGER,
             )
         )
+        if paired_reference.distance_mode == "nearest-atom" and str(surface_mode).lower() != "none":
+            # Use the shared frame prepass so all selected species have aligned
+            # distance bins, including molecular selections and symmetric layouts.
+            return [
+                profile
+                for profile in compute_all_density_profiles(
+                    frames=frames,
+                    species=species,
+                    surface_axis=axis,
+                    bin_width=bin_width,
+                    surface_mode=surface_mode,
+                    surface_layout=surface_layout,
+                    surface_elements=surface_elements,
+                    include_fixed_surface_atoms=include_fixed_surface_atoms,
+                    binning=normalized_binning,
+                    surface_options=surface_options,
+                    precomputed_surface_estimate=paired_reference,
+                    outputs="1d",
+                    oh_cutoff=oh_cutoff,
+                    min_molecule_frames=min_molecule_frames,
+                )
+                if isinstance(profile, DensityProfile) and profile.coordinate_mode == "distance"
+            ]
         if paired_reference.is_symmetric:
             targets = _resolve_density_target_specs(frames, species=species)
             paired_profiles: list[DensityProfile] = []
@@ -3363,7 +3640,7 @@ def compute_density_profiles(
     if str(surface_mode).strip().lower() == "none":
         surface_estimate = None
     elif isinstance(precomputed_surface_estimate, SurfaceReference):
-        surface_reference = precomputed_surface_estimate
+        surface_reference = bind_surface_reference(precomputed_surface_estimate, frames)
         surface_estimate = surface_reference.primary
     elif precomputed_surface_estimate is not None:
         if precomputed_surface_estimate.frame_values.shape != (len(frames),):
@@ -3460,8 +3737,8 @@ def compute_density_profiles(
             )
         if histogram_bounds is None:
             LOGGER.warning(
-                "Cell binning requested for element-resolved density along %s, but a usable "
-                "cell was unavailable. Falling back to observed-data binning.",
+                "Cell binning requested for element-resolved density along %s, but cell-derived "
+                "bin bounds could not be determined. Falling back to observed-data binning.",
                 axis.lower(),
             )
     molecule_selections: dict[str, tuple[list[np.ndarray], list[np.ndarray]]] = {}
@@ -3531,13 +3808,20 @@ def compute_density_profiles(
         coordinate_mode=coordinate_mode_global,
         labels=[*element_species, *molecule_selections],
     )
-    LOGGER.info("Density compute summary: %s.", run_summary)
+    if surface_reference is not None and surface_reference.distance_mode == "nearest-atom":
+        LOGGER.info(
+            "Nearest-distance distributions: mass in amu/Angstrom, number in atoms or molecules/Angstrom; normalization=mean per frame and coordinate bin widths."
+        )
+    else:
+        LOGGER.info("Density compute summary: %s.", run_summary)
     LOGGER.debug("Binning %d density profiles.", total_binning_jobs)
     with ProgressBar(
         desc="Binning density profiles", total=total_binning_jobs, unit="profile"
     ) as progress:
 
-        def aligned_values(values_per_frame: list[np.ndarray]) -> tuple[list[np.ndarray], str]:
+        def aligned_values(
+            values_per_frame: list[np.ndarray], species_label: str
+        ) -> tuple[list[np.ndarray], str]:
             if surface_reference is None or not surface_reference.uses_distance:
                 return _shift_axis_values_by_surface_per_frame(
                     values_per_frame,
@@ -3549,6 +3833,12 @@ def compute_density_profiles(
                         surface_reference,
                         np.asarray(values, dtype=float),
                         frame_index=frame_index,
+                        substrate_mask=_density_substrate_mask(
+                            surface_reference, frames[frame_index], species_label
+                        ),
+                        target_positions=_nearest_density_targets(
+                            surface_reference, frames[frame_index], species_label, oh_cutoff
+                        ),
                     )[0]
                     for frame_index, values in enumerate(values_per_frame)
                 ],
@@ -3556,7 +3846,9 @@ def compute_density_profiles(
             )
 
         for element in element_species:
-            selected_for_binning, coordinate_mode = aligned_values(selected_by_species[element])
+            selected_for_binning, coordinate_mode = aligned_values(
+                selected_by_species[element], element
+            )
             profile_surface_position = surface_position
             profile_surface_position_std = surface_position_std
             profiles.append(
@@ -3587,7 +3879,9 @@ def compute_density_profiles(
             molecule_selected_per_frame,
             molecule_masses_per_frame,
         ) in molecule_selections.items():
-            selected_for_binning, coordinate_mode = aligned_values(molecule_selected_per_frame)
+            selected_for_binning, coordinate_mode = aligned_values(
+                molecule_selected_per_frame, molecule_label
+            )
             profile_surface_position = surface_position
             profile_surface_position_std = surface_position_std
             profiles.append(
@@ -3674,7 +3968,7 @@ def _compute_all_density_profiles_streaming(
     if str(surface_mode).strip().lower() == "none":
         surface_estimate = None
     elif isinstance(precomputed_surface_estimate, SurfaceReference):
-        surface_reference = precomputed_surface_estimate
+        surface_reference = bind_surface_reference(precomputed_surface_estimate, frames)
         surface_estimate = surface_reference.primary
     elif precomputed_surface_estimate is not None:
         if precomputed_surface_estimate.frame_values.shape != (len(frames),):
@@ -3682,7 +3976,9 @@ def _compute_all_density_profiles_streaming(
                 "precomputed_surface_estimate frame count does not match the trajectory."
             )
         surface_estimate = precomputed_surface_estimate
-    elif surface_layout is None:
+    elif surface_layout is None and (
+        surface_options is None or surface_options.distance_mode == "plane"
+    ):
         surface_estimate, _surface_method = _select_surface_estimate(
             frames,
             surface_axis,
@@ -3777,10 +4073,13 @@ def _compute_all_density_profiles_streaming(
         )
     line_normalization_by_axis = (
         {
-            ax: _build_line_normalization_cache(
-                frames=frames,
-                axis_index=axis_indices[ax],
-                bin_width=bin_width,
+            ax: (
+                _DensityLineNormalizationCache(False, None, False, axis_index=axis_indices[ax])
+                if surface_reference is not None
+                and surface_reference.distance_mode == "nearest-atom"
+                else _build_line_normalization_cache(
+                    frames=frames, axis_index=axis_indices[ax], bin_width=bin_width
+                )
             )
             for ax in raw_axes
         }
@@ -3853,6 +4152,9 @@ def _compute_all_density_profiles_streaming(
                     element_selector=element_selector,
                     wrap_positions_to_cell=wrap_positions_to_cell,
                 )
+                shared_components = _nearest_selection_components(
+                    surface_reference, frame_selections, frame_index
+                )
                 for target in target_specs:
                     selection = frame_selections.get(target.species_label)
                     if selection is None:
@@ -3863,11 +4165,17 @@ def _compute_all_density_profiles_streaming(
                     for ax in raw_axes:
                         bounds.update_axis(ax, positions[:, axis_indices[ax]])
                     raw_distance_axis = np.asarray(positions[:, surface_axis_index], dtype=float)
-                    if surface_reference is not None and surface_reference.uses_distance:
+                    if target.species_label in shared_components:
+                        distance_values = shared_components[target.species_label][0]
+                    elif surface_reference is not None and surface_reference.uses_distance:
                         distance_values = surface_distance_components(
                             surface_reference,
                             raw_distance_axis,
                             frame_index=frame_index,
+                            substrate_mask=_density_substrate_mask(
+                                surface_reference, frame, target.species_label
+                            ),
+                            target_positions=positions,
                         )[0]
                     else:
                         distance_values = (
@@ -3901,6 +4209,32 @@ def _compute_all_density_profiles_streaming(
     if not active_targets:
         raise ValueError("No entities found for the requested density selection.")
 
+    nearest_distance = (
+        surface_reference is not None and surface_reference.distance_mode == "nearest-atom"
+    )
+    if nearest_distance and (include_line_outputs or include_grid_outputs):
+        # A radial nearest-atom distance has no complete-cell coordinate bounds.
+        # Share the observed range without modifying raw Cartesian coordinates.
+        distance_lower = min(
+            observed_bounds_by_target[target.species_label].axis_lower["distance"]
+            for target in active_targets
+        )
+        distance_upper = max(
+            observed_bounds_by_target[target.species_label].axis_upper["distance"]
+            for target in active_targets
+        )
+        for target in active_targets:
+            bounds = observed_bounds_by_target[target.species_label]
+            bounds.axis_lower["distance"] = distance_lower
+            bounds.axis_upper["distance"] = distance_upper
+        LOGGER.info(
+            "Nearest-atom distance bins use a shared observed range across %d species "
+            "([%.6g, %.6g] Angstrom); bin widths are unchanged.",
+            len(active_targets),
+            distance_lower,
+            distance_upper,
+        )
+
     active_element_count = sum(1 for target in active_targets if target.selection_kind == "element")
     active_raw_species_count = sum(
         1 for target in active_targets if target.selection_kind == "species"
@@ -3914,7 +4248,12 @@ def _compute_all_density_profiles_streaming(
         coordinate_mode=distance_coordinate_mode,
         labels=[target.species_label for target in active_targets],
     )
-    LOGGER.info("Density compute summary: %s.", run_summary)
+    if surface_reference is not None and surface_reference.distance_mode == "nearest-atom":
+        LOGGER.info(
+            "Nearest-distance distributions: mass in amu/Angstrom, number in atoms or molecules/Angstrom; normalization=mean per frame and coordinate bin widths."
+        )
+    else:
+        LOGGER.info("Density compute summary: %s.", run_summary)
     LOGGER.debug("Density selections: %s.", _density_selection_summary(active_targets))
     if molecule_active_count:
         LOGGER.debug("O/H molecule cutoff: %.6g A.", float(oh_cutoff))
@@ -3955,6 +4294,9 @@ def _compute_all_density_profiles_streaming(
             frames, distance_coordinate_mode, surface_estimate, surface_reference
         )
         if include_grid_outputs
+        and not (
+            surface_reference is not None and surface_reference.distance_mode == "nearest-atom"
+        )
         and all(_frame_has_usable_cell(frame, surface_axis_index) for frame in frames)
         else None
     )
@@ -3969,13 +4311,14 @@ def _compute_all_density_profiles_streaming(
             observed_bounds = observed_bounds_by_target[species_lbl]
             target_line_accumulators: list[tuple[str, _DensityLineAccumulator]] = []
             if include_line_outputs:
-                for ax in raw_axes:
+                for ax in () if nearest_distance else raw_axes:
                     hist_bounds = (
                         cell_bounds_by_axis.get(ax) if normalized_binning == "cell" else None
                     )
                     if normalized_binning == "cell" and hist_bounds is None:
                         LOGGER.warning(
-                            "Cell binning requested for '%s' along %s, but a usable cell was unavailable. "
+                            "Cell binning requested for '%s' along %s, but cell-derived bin bounds "
+                            "could not be determined. "
                             "Falling back to observed-data binning.",
                             species_lbl,
                             ax,
@@ -4017,9 +4360,14 @@ def _compute_all_density_profiles_streaming(
                             ),
                         )
                     )
-                if normalized_binning == "cell" and distance_hist_bounds is None:
+                if (
+                    normalized_binning == "cell"
+                    and distance_hist_bounds is None
+                    and not nearest_distance
+                ):
                     LOGGER.warning(
-                        "Cell binning requested for '%s' distance along %s, but a usable cell was unavailable. "
+                        "Cell binning requested for '%s' distance along %s, but cell-derived "
+                        "distance-bin bounds could not be determined. "
                         "Falling back to observed-data binning.",
                         species_lbl,
                         surface_axis,
@@ -4200,6 +4548,9 @@ def _compute_all_density_profiles_streaming(
                     element_selector=accumulation_element_selector,
                     wrap_positions_to_cell=wrap_positions_to_cell,
                 )
+                shared_components = _nearest_selection_components(
+                    surface_reference, frame_selections, frame_index
+                )
                 for target in active_targets:
                     selection = frame_selections.get(target.species_label)
                     if selection is None:
@@ -4209,15 +4560,21 @@ def _compute_all_density_profiles_streaming(
                     raw_surface_axis_values = np.asarray(
                         positions[:, surface_axis_index], dtype=float
                     )
-                    distance_components = (
-                        surface_distance_components(
-                            surface_reference,
-                            raw_surface_axis_values,
-                            frame_index=frame_index,
+                    distance_components = shared_components.get(target.species_label)
+                    if distance_components is None:
+                        distance_components = (
+                            surface_distance_components(
+                                surface_reference,
+                                raw_surface_axis_values,
+                                frame_index=frame_index,
+                                substrate_mask=_density_substrate_mask(
+                                    surface_reference, frame, target.species_label
+                                ),
+                                target_positions=positions,
+                            )
+                            if surface_reference is not None and surface_reference.uses_distance
+                            else None
                         )
-                        if surface_reference is not None and surface_reference.uses_distance
-                        else None
-                    )
                     for axis_key, accumulator in line_accumulators_by_target[target.species_label]:
                         accumulator_masses = mass_array
                         entity_weights = None
@@ -4429,9 +4786,18 @@ def _density_profile_hdf5_payload(profile: DensityProfile) -> dict[str, Any]:
     }
     if canonical_number_units is not None:
         units_map["number_density"] = canonical_number_units
+    if _is_nearest_distribution(profile):
+        entity = "molecules" if is_molecule_species_label(profile.species) else "atoms"
+        units_map.update(
+            counts_per_frame="g/frame",
+            entities_per_frame=f"{entity}/frame",
+            counts_per_frame_top="g/frame",
+            counts_per_frame_bottom="g/frame",
+        )
 
     metadata_payload = {
         "profile_kind": "line_1d",
+        **_density_observable_metadata(profile),
         "axis": profile.axis,
         "species": profile_species_label,
         "selection_kind": _density_selection_kind_for_label(profile_species_label),
@@ -4442,7 +4808,7 @@ def _density_profile_hdf5_payload(profile: DensityProfile) -> dict[str, Any]:
         "coordinate_mode": profile.coordinate_mode,
         "interface_view": profile.interface_view,
         "bin_width_A": bin_width,
-        "counts_per_frame_available": False,
+        "counts_per_frame_available": _is_nearest_distribution(profile),
         "visible_x_min_A": profile.visible_x_min_A,
         "visible_x_max_A": profile.visible_x_max_A,
         "oh_cutoff_A": profile.oh_cutoff_A,
@@ -4475,6 +4841,14 @@ def _density_profile_hdf5_payload(profile: DensityProfile) -> dict[str, Any]:
     )
     datasets = {
         "bin_centers_A": profile.bin_centers,
+        **(
+            {
+                "counts_per_frame": profile.counts_per_frame,
+                "entities_per_frame": profile.entities_per_frame,
+            }
+            if _is_nearest_distribution(profile)
+            else {}
+        ),
         "density": canonical_density,
         "number_density": canonical_number_density,
         "density_top": profile.top_density,
@@ -4529,6 +4903,13 @@ def _density_heatmap_profile_hdf5_payload(profile: DensityHeatmapProfile) -> dic
         analysis="density",
         metadata={
             "profile_kind": "heatmap_2d",
+            **_density_observable_metadata(profile),
+            **(profile.surface_metadata or {}),
+            **(
+                {"surface_distance_mode": profile.distance_mode}
+                if profile.distance_mode != "plane"
+                else {}
+            ),
             "plane": profile.plane,
             "plane_axes": list(profile.plane_axes),
             "species": profile_species_label,
@@ -4560,6 +4941,16 @@ def _density_heatmap_profile_hdf5_payload(profile: DensityHeatmapProfile) -> dic
         "datasets": {
             "x_bin_centers_A": np.asarray(profile.x_bin_centers, dtype=float),
             "y_bin_centers_A": np.asarray(profile.y_bin_centers, dtype=float),
+            **(
+                {
+                    "density_top": profile.top_density,
+                    "density_bottom": profile.bottom_density,
+                    "number_density_top": profile.top_number_density,
+                    "number_density_bottom": profile.bottom_number_density,
+                }
+                if _is_nearest_distribution(profile)
+                else {}
+            ),
             "density": canonical_density,
             "number_density": canonical_number_density,
         },
@@ -4627,6 +5018,7 @@ def _density_grid_profile_hdf5_payload(profile: DensityGridProfile) -> dict[str,
 
     metadata_payload = {
         "profile_kind": "grid_3d_sparse",
+        **_density_observable_metadata(profile),
         "species": profile_species_label,
         "selection_kind": _density_selection_kind_for_label(profile_species_label),
         "entity_kind": "molecule" if is_molecule_species_label(profile_species_label) else "atom",
@@ -4876,6 +5268,7 @@ def _load_density_profiles_from_payloads(
 ) -> list[DensityProfile]:
     profiles: list[DensityProfile] = []
     for datasets, metadata in payloads:
+        _validate_density_observable_metadata(metadata)
         if not _density_payload_matches_selection(
             metadata,
             axis=axis,
@@ -5011,6 +5404,7 @@ def _load_density_profiles_from_payloads(
                 counts_per_frame=counts_per_frame,
                 density=canonical_density,
                 units=canonical_units,
+                spatial_filters=metadata.get("spatial_filters"),
                 n_frames=int(metadata.get("n_frames", 0)),
                 entities_per_frame=entities_per_frame,
                 number_density=canonical_number_density,
@@ -5048,6 +5442,7 @@ def _load_density_heatmap_profiles_from_payloads(
 
     profiles: list[DensityHeatmapProfile] = []
     for datasets, metadata in payloads:
+        _validate_density_observable_metadata(metadata)
         if not _density_payload_matches_selection(
             metadata,
             species=species,
@@ -5120,6 +5515,11 @@ def _load_density_heatmap_profiles_from_payloads(
         profiles.append(
             DensityHeatmapProfile(
                 plane=plane_token,
+                distance_mode=str(metadata.get("surface_distance_mode", "plane")),
+                spatial_filters=metadata.get("spatial_filters"),
+                surface_metadata={"surface": metadata["surface"]}
+                if "surface" in metadata
+                else None,
                 plane_axes=plane_axes,
                 species=species_label,
                 x_bin_edges=x_bin_edges,
@@ -5128,6 +5528,11 @@ def _load_density_heatmap_profiles_from_payloads(
                 y_bin_centers=y_bin_centers,
                 density=density_values,
                 units=units,
+                interface_view=str(metadata.get("interface_view", "single")),
+                top_density=datasets.get("density_top"),
+                bottom_density=datasets.get("density_bottom"),
+                top_number_density=datasets.get("number_density_top"),
+                bottom_number_density=datasets.get("number_density_bottom"),
                 n_frames=int(metadata.get("n_frames", 0)),
                 number_density=number_density_values,
                 number_density_units=number_density_units,
@@ -5152,6 +5557,7 @@ def _load_density_grid_profiles_from_payloads(
 
     profiles: list[DensityGridProfile] = []
     for datasets, metadata in payloads:
+        _validate_density_observable_metadata(metadata)
         if not _density_payload_matches_selection(
             metadata,
             species=species,
@@ -5612,6 +6018,107 @@ def _density_grid_has_paired_geometry(profile: DensityGridProfile) -> bool:
     )
 
 
+def _nearest_grid_distribution(
+    profile: DensityGridProfile, axes: tuple[str, ...], filters: Mapping
+) -> bool:
+    nearest = _is_nearest_distribution(profile)
+    if nearest:
+        validate_nearest_distribution_axes(axes)
+    return nearest
+
+
+def _nearest_grid_project(
+    profile: DensityGridProfile,
+    axes: tuple[str, ...],
+    edges: tuple[np.ndarray, ...],
+    filters: Mapping,
+    side: str = "folded",
+):
+    mask, source_indices = _density_grid_sparse_mask_and_indices(profile, filters=filters)
+    shape = tuple(len(e) - 1 for e in edges)
+    indices = [
+        _density_grid_target_indices(
+            profile,
+            axis,
+            source_indices[axis][mask],
+            target_edges=e,
+            target_bin_width=float(e[1] - e[0]),
+        )
+        for axis, e in zip(axes, edges)
+    ]
+    flat = np.ravel_multi_index(tuple(indices), shape)
+    symmetric = profile.surface_reference is not None and profile.surface_reference.is_symmetric
+    if side in {"top", "bottom"}:
+        mass = getattr(profile, f"{side}_mass_sum_g")
+        entities = getattr(profile, f"{side}_entity_sum")
+        if mass is None or entities is None:
+            raise ValueError(
+                "Nearest-atom interface view requires stored side-resolved counts; recompute the density."
+            )
+        mass, entities = np.asarray(mass), np.asarray(entities)
+    else:
+        mass, entities = profile.mass_sum_g, profile.entity_sum
+        if symmetric and side == "folded":
+            mass, entities = 0.5 * mass, 0.5 * entities
+    interval = float(np.prod([e[1] - e[0] for e in edges]))
+    denominator = max(1, profile.n_frames) * interval
+    md = (
+        np.bincount(flat, weights=np.asarray(mass)[mask], minlength=int(np.prod(shape))).reshape(
+            shape
+        )
+        / denominator
+    )
+    nd = (
+        np.bincount(
+            flat, weights=np.asarray(entities)[mask], minlength=int(np.prod(shape))
+        ).reshape(shape)
+        / denominator
+    )
+    return md, nd
+
+
+def _nearest_grid_heatmap(
+    profile: DensityGridProfile,
+    axes: tuple[str, str],
+    filters: Mapping,
+    widths: tuple[float | None, float | None],
+) -> DensityHeatmapProfile:
+    edges = tuple(
+        _density_grid_target_bins(profile, axis, requested_bin_width=width)[0]
+        for axis, width in zip(axes, widths)
+    )
+    density, number = _nearest_grid_project(profile, axes, edges, filters)
+    symmetric = profile.surface_reference is not None and profile.surface_reference.is_symmetric
+    top = _nearest_grid_project(profile, axes, edges, filters, "top") if symmetric else (None, None)
+    bottom = (
+        _nearest_grid_project(profile, axes, edges, filters, "bottom")
+        if symmetric
+        else (None, None)
+    )
+    return DensityHeatmapProfile(
+        plane="".join(axes),
+        plane_axes=axes,
+        species=profile.species,
+        x_bin_edges=edges[0],
+        y_bin_edges=edges[1],
+        x_bin_centers=(edges[0][:-1] + edges[0][1:]) / 2,
+        y_bin_centers=(edges[1][:-1] + edges[1][1:]) / 2,
+        density=density,
+        units="g/Angstrom^2",
+        n_frames=profile.n_frames,
+        number_density=number,
+        number_density_units=_entity_areal_density_units_for_species(profile.species),
+        interface_view="folded" if symmetric else "single",
+        top_density=top[0],
+        top_number_density=top[1],
+        bottom_density=bottom[0],
+        bottom_number_density=bottom[1],
+        distance_mode="nearest-atom",
+        surface_metadata=_surface_reference_metadata(profile.surface_reference),
+        spatial_filters=dict(filters),
+    )
+
+
 def density_grid_to_line_profile(
     profile: DensityGridProfile,
     *,
@@ -5627,6 +6134,43 @@ def density_grid_to_line_profile(
     if x_axis not in _DENSITY_GRID_AXES:
         raise ValueError("Density grid 1D x-axis must be distance, x, y, or z.")
     normalized_filters = _normalized_density_grid_filters(filters)
+    if _nearest_grid_distribution(profile, (x_axis,), normalized_filters):
+        edges, width = _density_grid_target_bins(profile, x_axis, requested_bin_width=x_bin_width)
+        mass, number = _nearest_grid_project(profile, (x_axis,), (edges,), normalized_filters)
+        symmetric = profile.surface_reference is not None and profile.surface_reference.is_symmetric
+        top = (
+            _nearest_grid_project(profile, (x_axis,), (edges,), normalized_filters, "top")
+            if symmetric
+            else (None, None)
+        )
+        bottom = (
+            _nearest_grid_project(profile, (x_axis,), (edges,), normalized_filters, "bottom")
+            if symmetric
+            else (None, None)
+        )
+        return DensityProfile(
+            axis=profile.surface_axis if x_axis == "distance" else x_axis,
+            species=profile.species,
+            bin_edges=edges,
+            bin_centers=(edges[:-1] + edges[1:]) / 2,
+            counts_per_frame=mass * width,
+            density=mass,
+            units="g/Angstrom",
+            n_frames=profile.n_frames,
+            entities_per_frame=number * width,
+            number_density=number,
+            number_density_units=_entity_density_units_for_species(
+                profile.species, volumetric=False
+            ),
+            coordinate_mode="distance" if x_axis == "distance" else "axis",
+            surface_reference=profile.surface_reference,
+            spatial_filters=dict(normalized_filters),
+            interface_view="folded" if symmetric else "single",
+            top_density=top[0],
+            top_number_density=top[1],
+            bottom_density=bottom[0],
+            bottom_number_density=bottom[1],
+        )
     symmetric = bool(
         profile.surface_reference is not None and profile.surface_reference.is_symmetric
     )
@@ -5798,6 +6342,10 @@ def density_grid_to_heatmap_profile(
             "Y/distance, or the reverse of those pairs."
         )
     normalized_filters = _normalized_density_grid_filters(filters)
+    if _nearest_grid_distribution(profile, (x_key, y_key), normalized_filters):
+        return _nearest_grid_heatmap(
+            profile, (x_key, y_key), normalized_filters, (x_bin_width, y_bin_width)
+        )
     symmetric = bool(
         profile.surface_reference is not None and profile.surface_reference.is_symmetric
     )
@@ -6018,6 +6566,58 @@ def density_grids_to_averaged_heatmap_profile(
             "Y/distance, or the reverse of those pairs."
         )
     normalized_filters = _normalized_density_grid_filters(filters)
+    distance_modes = {
+        "plane" if p.surface_reference is None else p.surface_reference.distance_mode
+        for p in profiles
+    }
+    distance_relevant = "distance" in (x_key, y_key) or "distance" in normalized_filters
+    if distance_relevant and len(distance_modes) > 1:
+        raise ValueError("Cannot average plane and nearest-atom distance distributions.")
+    if "nearest-atom" in distance_modes:
+        if len(distance_modes) != 1:
+            raise ValueError("Cannot mix physical density and nearest-distance distributions.")
+        validate_nearest_distribution_axes((x_key, y_key))
+        x_edges, x_width = _density_grid_common_target_bins(
+            profiles, x_key, requested_bin_width=x_bin_width
+        )
+        y_edges, y_width = _density_grid_common_target_bins(
+            profiles, y_key, requested_bin_width=y_bin_width
+        )
+        del x_width, y_width
+        total = sum(p.n_frames for p in profiles)
+        weights = [p.n_frames / max(1, total) for p in profiles]
+        nearest_values = [
+            _nearest_grid_project(p, (x_key, y_key), (x_edges, y_edges), normalized_filters)
+            for p in profiles
+        ]
+        template = _nearest_grid_heatmap(
+            profiles[0], (x_key, y_key), normalized_filters, (x_bin_width, y_bin_width)
+        )
+        side_values = {}
+        if all(
+            p.surface_reference is not None and p.surface_reference.is_symmetric for p in profiles
+        ):
+            for side in ("top", "bottom"):
+                sv = [
+                    _nearest_grid_project(
+                        p, (x_key, y_key), (x_edges, y_edges), normalized_filters, side
+                    )
+                    for p in profiles
+                ]
+                side_values[f"{side}_density"] = sum(w * v[0] for w, v in zip(weights, sv))
+                side_values[f"{side}_number_density"] = sum(w * v[1] for w, v in zip(weights, sv))
+        return replace(
+            template,
+            units="g/Angstrom^2",
+            x_bin_edges=x_edges,
+            y_bin_edges=y_edges,
+            x_bin_centers=(x_edges[:-1] + x_edges[1:]) / 2,
+            y_bin_centers=(y_edges[:-1] + y_edges[1:]) / 2,
+            density=sum(w * v[0] for w, v in zip(weights, nearest_values)),
+            number_density=sum(w * v[1] for w, v in zip(weights, nearest_values)),
+            n_frames=total,
+            **side_values,
+        )
     x_edges, x_width = _density_grid_common_target_bins(
         profiles,
         x_key,
@@ -6301,6 +6901,8 @@ def density_grids_to_averaged_heatmap_profile(
 
 
 def _format_plot_density_units(units: str) -> str:
+    if units.startswith(("amu/", "atoms/Angstrom", "molecules/Angstrom", "entities/Angstrom")):
+        return units.replace("Angstrom", "\u00c5").replace("^2", "$^2$")
     return units.replace("Angstrom", "A").replace("cm^3", "cm$^3$")
 
 
@@ -6337,6 +6939,16 @@ def _density_x_data(
     x_mode: str,
 ) -> tuple[np.ndarray, str]:
     normalized_x_mode = str(x_mode).strip().lower() or "distance"
+    if (
+        profile.coordinate_mode == "distance"
+        and profile.surface_reference is not None
+        and profile.surface_reference.distance_mode == "nearest-atom"
+    ):
+        if normalized_x_mode not in {"distance"}:
+            raise ValueError(
+                "Nearest-atom distance bins cannot be converted back to a Cartesian axis. Select a stored raw-axis profile or sparse grid for full-cell plotting."
+            )
+        return profile.bin_centers, surface_distance_label(profile.surface_reference)
     if normalized_x_mode in {"x", "y", "z"} and profile.axis != normalized_x_mode:
         raise ValueError(
             f"Density profile '{profile.species}' is stored along the {profile.axis.upper()} axis, "
@@ -6396,7 +7008,11 @@ def _density_y_data(
         )
         assert canonical_number is not None
         assert canonical_number_units is not None
-        return canonical_number, canonical_number_units, "Entity density"
+        return (
+            canonical_number,
+            canonical_number_units,
+            "Number distribution" if _is_nearest_distribution(profile) else "Entity density",
+        )
 
     if quantity == "mass":
         density_values, units, _number, _number_units = canonicalize_density_units(
@@ -6405,7 +7021,11 @@ def _density_y_data(
             number_density=profile.number_density,
             number_density_units=profile.number_density_units,
         )
-        return density_values, units, "Density"
+        return (
+            density_values,
+            units,
+            "Mass distribution" if _is_nearest_distribution(profile) else "Density",
+        )
 
     raise ValueError(f"Unsupported density quantity '{quantity}'. Choose 'mass' or 'number'.")
 
@@ -6433,11 +7053,15 @@ def _density_heatmap_z_data(
             )
             assert canonical_number is not None
             assert canonical_number_units is not None
-            return canonical_number, canonical_number_units, "Entity density"
+            return (
+                canonical_number,
+                canonical_number_units,
+                "Number distribution" if _is_nearest_distribution(profile) else "Entity density",
+            )
         return (
             np.asarray(profile.number_density, dtype=float),
             str(profile.number_density_units),
-            "Entity density",
+            "Number distribution" if _is_nearest_distribution(profile) else "Entity density",
         )
 
     if quantity == "mass":
@@ -6448,8 +7072,16 @@ def _density_heatmap_z_data(
                 number_density=profile.number_density,
                 number_density_units=profile.number_density_units,
             )
-            return density_values, units, "Density"
-        return np.asarray(profile.density, dtype=float), str(profile.units), "Density"
+            return (
+                density_values,
+                units,
+                "Mass distribution" if _is_nearest_distribution(profile) else "Density",
+            )
+        return (
+            np.asarray(profile.density, dtype=float),
+            str(profile.units),
+            "Mass distribution" if _is_nearest_distribution(profile) else "Density",
+        )
 
     raise ValueError(f"Unsupported density quantity '{quantity}'. Choose 'mass' or 'number'.")
 
@@ -6868,9 +7500,29 @@ def plot_density_profile(
         )
         units = _format_plot_density_units(units)
         display_species = _density_species_display_label(profile.species)
-        default_title = f"{display_species} density heatmap ({profile.plane.upper()})"
-        default_x_label = f"{profile.plane_axes[0].upper()} (A)"
-        default_y_label = f"{profile.plane_axes[1].upper()} (A)"
+        default_title = (
+            f"{display_species} distance distribution"
+            if _is_nearest_distribution(profile)
+            else f"{display_species} density heatmap ({profile.plane.upper()})"
+        )
+        default_x_label = (
+            (
+                "Nearest surface-atom distance ($\\mathrm{\\AA}$)"
+                if _is_nearest_distribution(profile)
+                else "Surface-plane distance ($\\mathrm{\\AA}$)"
+            )
+            if profile.plane_axes[0] == "distance"
+            else f"{profile.plane_axes[0].upper()} (A)"
+        )
+        default_y_label = (
+            (
+                "Nearest surface-atom distance ($\\mathrm{\\AA}$)"
+                if _is_nearest_distribution(profile)
+                else "Surface-plane distance ($\\mathrm{\\AA}$)"
+            )
+            if profile.plane_axes[1] == "distance"
+            else f"{profile.plane_axes[1].upper()} (A)"
+        )
         return plot_heatmap_series(
             np.asarray(profile.x_bin_edges, dtype=float),
             np.asarray(profile.y_bin_edges, dtype=float),
@@ -6996,7 +7648,8 @@ def plot_density_profile(
     return plot_line_series(
         x_values,
         density_values,
-        title=title or f"{display_species} density profile",
+        title=title
+        or f"{display_species} {'distance distribution' if _is_nearest_distribution(profile) else 'density profile'}",
         x_label=resolve_explicit_plot_text(x_label, default_x_label),
         y_label=resolve_explicit_plot_text(y_label, f"{y_label_prefix} ({units})"),
         output=output,
@@ -7329,27 +7982,18 @@ def plot_density_profiles(
                     resolved_value.setdefault("linestyle", line_style)
                     expanded_line_kwargs.append(resolved_value)
             series_line_kwargs = expanded_line_kwargs
-        if (
-            render_series_descriptors is not None
-            and len(render_series_descriptors) == source_profile_count
-        ):
+        original_render_ids: list[str] = []
+        if render_series_descriptors is not None:
             expanded_descriptors: list[dict[str, Any]] = []
             for index, descriptor in enumerate(render_series_descriptors):
-                source_id = (
-                    base_ids[index]
-                    if base_ids is not None
-                    else str(descriptor.get("series_id") or f"density:{index}")
-                )
+                layer_id = str(descriptor.get("series_id") or f"density:{index}")
+                source_id = str(descriptor.get("source_series_id") or layer_id)
+                original_render_ids.append(layer_id)
                 for view_token, view_label in zip(view_tokens, view_labels):
                     expanded_descriptor = dict(descriptor)
-                    expanded_id = f"{source_id}::interface:{view_token}"
-                    expanded_descriptor["series_id"] = expanded_id
-                    # Each expanded profile is a real source entry for the
-                    # generic multi-line renderer.  Keep the unexpanded id as
-                    # lineage metadata instead of pointing source_series_id at
-                    # data that no longer exists in the expanded source map.
-                    expanded_descriptor["source_series_id"] = expanded_id
-                    expanded_descriptor["parent_series_id"] = source_id
+                    expanded_descriptor["series_id"] = f"{layer_id}::interface:{view_token}"
+                    expanded_descriptor["source_series_id"] = f"{source_id}::interface:{view_token}"
+                    expanded_descriptor["parent_series_id"] = layer_id
                     expanded_descriptor["interface_view"] = view_token
                     default_label = str(descriptor.get("default_label") or f"Series {index + 1}")
                     expanded_descriptor["default_label"] = f"{default_label} ({view_label})"
@@ -7357,7 +8001,7 @@ def plot_density_profiles(
             render_series_descriptors = expanded_descriptors
         if series_overrides_by_id is not None and base_ids is not None:
             expanded_overrides = dict(series_overrides_by_id)
-            for source_id in base_ids:
+            for source_id in dict.fromkeys([*base_ids, *original_render_ids]):
                 source_override = series_overrides_by_id.get(source_id)
                 if not isinstance(source_override, dict):
                     continue
@@ -7388,6 +8032,22 @@ def plot_density_profiles(
     )
     runtime_x_mode = resolved_mapping.x_mode
     runtime_quantity = resolved_mapping.quantity
+    if runtime_x_mode == "distance":
+        modes = {
+            getattr(
+                getattr(p, "surface_reference", None),
+                "distance_mode",
+                getattr(p, "distance_mode", "plane"),
+            )
+            for index, p in enumerate(profiles)
+            if series_enabled is None
+            or len(series_enabled) != len(profiles)
+            or series_enabled[index]
+        }
+        if len(modes) > 1:
+            raise ValueError(
+                "Cannot mix plane and nearest-atom density definitions on one distance plot."
+            )
     if normalized_interface_view == "full":
         for item in profiles:
             if isinstance(item, DensityProfile) and item.coordinate_mode == "distance":
@@ -7560,6 +8220,9 @@ def plot_density_profiles(
         def _pick(lst: list[Any] | None) -> list[Any] | None:
             return None if lst is None else [lst[i] for i in compat]
 
+        compatible_source_ids = (
+            {str(series_ids[index]) for index in compat} if series_ids is not None else None
+        )
         line_profiles = [line_profiles[index] for index in compat]
         labels = [labels[index] for index in compat]
         series_ids = _pick(series_ids)
@@ -7576,7 +8239,15 @@ def plot_density_profiles(
         series_normalization_x_refs = _pick(series_normalization_x_refs)
         series_line_kwargs = _pick(series_line_kwargs)
         if render_series_descriptors is not None:
-            render_series_descriptors = _pick(render_series_descriptors)
+            if compatible_source_ids is None:
+                render_series_descriptors = _pick(render_series_descriptors)
+            else:
+                render_series_descriptors = [
+                    descriptor
+                    for descriptor in render_series_descriptors
+                    if str(descriptor.get("source_series_id") or descriptor.get("series_id") or "")
+                    in compatible_source_ids
+                ]
 
     first = line_profiles[0]
     if runtime_x_mode == "distance" and any(
@@ -7652,7 +8323,12 @@ def plot_density_profiles(
         x_series,
         y_series,
         labels,
-        title=title or "Density profile",
+        title=title
+        or (
+            "Nearest-distance distribution"
+            if any(_is_nearest_distribution(p) for p in line_profiles)
+            else "Density profile"
+        ),
         x_label=resolve_explicit_plot_text(x_label, default_x_label),
         y_label=resolve_explicit_plot_text(y_label, f"{y_label_prefix} ({display_units})"),
         output=output,

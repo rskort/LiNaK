@@ -65,6 +65,7 @@ class ChunkedTrajectorySequence(Sequence[Atoms]):
         self.chunk_frames = max(1, int(chunk_frames))
         self._length = sum(self.counts)
         self._cell_override: np.ndarray | None = None
+        self._fixed_atom_indices: tuple[int, ...] = ()
         self._topology_providers: dict[Path, Any] = {}
 
     def set_cell_override(self, cell: Any) -> None:
@@ -75,6 +76,9 @@ class ChunkedTrajectorySequence(Sequence[Atoms]):
             raise ValueError("Trajectory cell override must be a finite 3-vector or 3x3 matrix.")
         self._cell_override = matrix.copy()
 
+    def set_fixed_atom_indices(self, indices: tuple[int, ...]) -> None:
+        self._fixed_atom_indices = indices
+
     def __len__(self) -> int:
         return self._length
 
@@ -82,6 +86,10 @@ class ChunkedTrajectorySequence(Sequence[Atoms]):
         for path in self.paths:
             for chunk in trajectory_io.read_trajectory_chunks(path, chunk_size=self.chunk_frames):
                 self._retain_topology_provider(path, chunk)
+                if self._fixed_atom_indices:
+                    from ..resolution import apply_fixed_atom_constraints
+
+                    apply_fixed_atom_constraints(chunk, self._fixed_atom_indices)
                 if self._cell_override is not None:
                     for frame in chunk:
                         frame.set_cell(self._cell_override)
@@ -137,6 +145,10 @@ class ChunkedTrajectorySequence(Sequence[Atoms]):
             self._cached_key = key
             self._retain_topology_provider(path, self._cached_frames)
         frame = self._cached_frames[local_index - start].copy()
+        if self._fixed_atom_indices:
+            from ..resolution import apply_fixed_atom_constraints
+
+            apply_fixed_atom_constraints([frame], self._fixed_atom_indices)
         if self._cell_override is not None:
             frame.set_cell(self._cell_override)
             frame.set_pbc((True, True, True))
@@ -163,6 +175,11 @@ class ManagedTrajectorySequence(Sequence[Atoms]):
         closer, self._closer = self._closer, None
         if closer is not None:
             closer()
+
+    def set_fixed_atom_indices(self, indices: tuple[int, ...]) -> None:
+        from ..resolution import apply_fixed_atom_constraints
+
+        apply_fixed_atom_constraints(self.inner, indices)
 
     def set_cell_override(self, cell: Any) -> None:
         setter = getattr(self.inner, "set_cell_override", None)

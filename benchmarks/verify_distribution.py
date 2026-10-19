@@ -12,11 +12,24 @@ from email.parser import BytesParser
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tarfile
 from tempfile import TemporaryDirectory
 import zipfile
+
+
+def _project_version() -> str:
+    pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    match = re.search(
+        r'^version\s*=\s*"([^"]+)"\s*$',
+        pyproject.read_text(encoding="utf-8"),
+        flags=re.MULTILINE,
+    )
+    if match is None:
+        raise AssertionError(f"Could not read the project version from '{pyproject}'.")
+    return match.group(1)
 
 
 def main() -> None:
@@ -31,7 +44,7 @@ def main() -> None:
         metadata_name = next(n for n in names if n.endswith(".dist-info/METADATA"))
         metadata = BytesParser().parsebytes(archive.read(metadata_name))
         assert metadata["License-Expression"] == "Apache-2.0"
-        assert metadata["Version"] == "0.10.0"
+        assert metadata["Version"] == _project_version()
         assert metadata["Requires-Python"] == ">=3.9"
         assert any(n.endswith("/licenses/LICENSE") for n in names)
         assert "linak/temporary_resources.py" in names

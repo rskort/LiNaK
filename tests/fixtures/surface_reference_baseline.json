@@ -492,7 +492,7 @@
       1,
       1
     ],
-    "auto_reason": "auto_two_sided_water",
+    "auto_reason": "auto_two_sided_water_contact",
     "population_imbalance": 0.0,
     "population_imbalance_threshold": 0.2,
     "slab_thickness_per_frame_A": [
@@ -511,7 +511,18 @@
       "top_trusted": true,
       "bottom_trusted": true,
       "surface_order_and_thickness_valid": true,
-      "frame_continuity_valid": true
+      "frame_continuity_valid": true,
+      "layout_contact": {
+        "classifier_version": 2,
+        "band_A": 6.0,
+        "population_fraction": 0.1,
+        "persistence": 0.9,
+        "geometry_supported": true,
+        "top_occupancy": 1.0,
+        "bottom_occupancy": 1.0,
+        "mean_top": 1.0,
+        "mean_bottom": 1.0
+      }
     }
   },
   "mobile": {
@@ -1033,7 +1044,7 @@
       1,
       1
     ],
-    "auto_reason": "auto_two_sided_water",
+    "auto_reason": "auto_two_sided_water_contact",
     "population_imbalance": 0.0,
     "population_imbalance_threshold": 0.2,
     "slab_thickness_per_frame_A": [
@@ -1052,7 +1063,18 @@
       "top_trusted": true,
       "bottom_trusted": true,
       "surface_order_and_thickness_valid": true,
-      "frame_continuity_valid": true
+      "frame_continuity_valid": true,
+      "layout_contact": {
+        "classifier_version": 2,
+        "band_A": 6.0,
+        "population_fraction": 0.1,
+        "persistence": 0.9,
+        "geometry_supported": true,
+        "top_occupancy": 1.0,
+        "bottom_occupancy": 1.0,
+        "mean_top": 1.0,
+        "mean_bottom": 1.0
+      }
     }
   },
   "partial": {
@@ -1542,7 +1564,7 @@
       1,
       1
     ],
-    "auto_reason": "auto_two_sided_water",
+    "auto_reason": "auto_two_sided_water_contact",
     "population_imbalance": 0.0,
     "population_imbalance_threshold": 0.2,
     "slab_thickness_per_frame_A": [
@@ -1561,7 +1583,18 @@
       "top_trusted": true,
       "bottom_trusted": true,
       "surface_order_and_thickness_valid": true,
-      "frame_continuity_valid": true
+      "frame_continuity_valid": true,
+      "layout_contact": {
+        "classifier_version": 2,
+        "band_A": 6.0,
+        "population_fraction": 0.1,
+        "persistence": 0.9,
+        "geometry_supported": true,
+        "top_occupancy": 1.0,
+        "bottom_occupancy": 1.0,
+        "mean_top": 1.0,
+        "mean_bottom": 1.0
+      }
     }
   },
   "triclinic": {
@@ -2083,7 +2116,7 @@
       1,
       1
     ],
-    "auto_reason": "auto_two_sided_water",
+    "auto_reason": "auto_two_sided_water_contact",
     "population_imbalance": 0.0,
     "population_imbalance_threshold": 0.2,
     "slab_thickness_per_frame_A": [
@@ -2102,7 +2135,18 @@
       "top_trusted": true,
       "bottom_trusted": true,
       "surface_order_and_thickness_valid": true,
-      "frame_continuity_valid": true
+      "frame_continuity_valid": true,
+      "layout_contact": {
+        "classifier_version": 2,
+        "band_A": 6.0,
+        "population_fraction": 0.1,
+        "persistence": 0.9,
+        "geometry_supported": true,
+        "top_occupancy": 1.0,
+        "bottom_occupancy": 1.0,
+        "mean_top": 1.0,
+        "mean_bottom": 1.0
+      }
     }
   },
   "variable-triclinic": {
@@ -2624,7 +2668,7 @@
       1,
       1
     ],
-    "auto_reason": "auto_two_sided_water",
+    "auto_reason": "auto_two_sided_water_contact",
     "population_imbalance": 0.0,
     "population_imbalance_threshold": 0.2,
     "slab_thickness_per_frame_A": [
@@ -2643,7 +2687,18 @@
       "top_trusted": true,
       "bottom_trusted": true,
       "surface_order_and_thickness_valid": true,
-      "frame_continuity_valid": true
+      "frame_continuity_valid": true,
+      "layout_contact": {
+        "classifier_version": 2,
+        "band_A": 6.0,
+        "population_fraction": 0.1,
+        "persistence": 0.9,
+        "geometry_supported": true,
+        "top_occupancy": 1.0,
+        "bottom_occupancy": 1.0,
+        "mean_top": 1.0,
+        "mean_bottom": 1.0
+      }
     }
   },
   "symmetric": {
@@ -3165,7 +3220,7 @@
       1,
       1
     ],
-    "auto_reason": "auto_two_sided_water",
+    "auto_reason": "auto_two_sided_water_contact",
     "population_imbalance": 0.0,
     "population_imbalance_threshold": 0.2,
     "slab_thickness_per_frame_A": [
@@ -3184,7 +3239,18 @@
       "top_trusted": true,
       "bottom_trusted": true,
       "surface_order_and_thickness_valid": true,
-      "frame_continuity_valid": true
+      "frame_continuity_valid": true,
+      "layout_contact": {
+        "classifier_version": 2,
+        "band_A": 6.0,
+        "population_fraction": 0.1,
+        "persistence": 0.9,
+        "geometry_supported": true,
+        "top_occupancy": 1.0,
+        "bottom_occupancy": 1.0,
+        "mean_top": 1.0,
+        "mean_bottom": 1.0
+      }
     }
   },
   "asymmetric": {
@@ -3706,7 +3772,7 @@
       0,
       0
     ],
-    "auto_reason": "auto_top_water_only",
+    "auto_reason": "auto_top_water_contact",
     "population_imbalance": 2.0,
     "population_imbalance_threshold": 0.2,
     "slab_thickness_per_frame_A": [
@@ -3725,7 +3791,18 @@
       "top_trusted": true,
       "bottom_trusted": true,
       "surface_order_and_thickness_valid": true,
-      "frame_continuity_valid": true
+      "frame_continuity_valid": true,
+      "layout_contact": {
+        "classifier_version": 2,
+        "band_A": 6.0,
+        "population_fraction": 0.1,
+        "persistence": 0.9,
+        "geometry_supported": true,
+        "top_occupancy": 1.0,
+        "bottom_occupancy": 0.0,
+        "mean_top": 1.0,
+        "mean_bottom": 0.0
+      }
     }
   },
   "crossing": {
@@ -4251,7 +4328,7 @@
       1,
       1
     ],
-    "auto_reason": "auto_two_sided_water",
+    "auto_reason": "auto_two_sided_water_contact",
     "population_imbalance": 0.0,
     "population_imbalance_threshold": 0.2,
     "slab_thickness_per_frame_A": [
@@ -4270,7 +4347,18 @@
       "top_trusted": true,
       "bottom_trusted": true,
       "surface_order_and_thickness_valid": true,
-      "frame_continuity_valid": true
+      "frame_continuity_valid": true,
+      "layout_contact": {
+        "classifier_version": 2,
+        "band_A": 6.0,
+        "population_fraction": 0.1,
+        "persistence": 0.9,
+        "geometry_supported": true,
+        "top_occupancy": 1.0,
+        "bottom_occupancy": 1.0,
+        "mean_top": 1.0,
+        "mean_bottom": 1.0
+      }
     }
   },
   "reconstruction": {
@@ -4792,7 +4880,7 @@
       1,
       1
     ],
-    "auto_reason": "auto_two_sided_water",
+    "auto_reason": "auto_two_sided_water_contact",
     "population_imbalance": 0.0,
     "population_imbalance_threshold": 0.2,
     "slab_thickness_per_frame_A": [
@@ -4811,7 +4899,18 @@
       "top_trusted": true,
       "bottom_trusted": true,
       "surface_order_and_thickness_valid": true,
-      "frame_continuity_valid": true
+      "frame_continuity_valid": true,
+      "layout_contact": {
+        "classifier_version": 2,
+        "band_A": 6.0,
+        "population_fraction": 0.1,
+        "persistence": 0.9,
+        "geometry_supported": true,
+        "top_occupancy": 1.0,
+        "bottom_occupancy": 1.0,
+        "mean_top": 1.0,
+        "mean_bottom": 1.0
+      }
     }
   },
   "reactive": {
@@ -5333,7 +5432,7 @@
       1,
       1
     ],
-    "auto_reason": "auto_bottom_water_only",
+    "auto_reason": "auto_bottom_water_contact",
     "population_imbalance": 0.11764705882352947,
     "population_imbalance_threshold": 0.2,
     "slab_thickness_per_frame_A": [
@@ -5352,7 +5451,18 @@
       "top_trusted": true,
       "bottom_trusted": true,
       "surface_order_and_thickness_valid": true,
-      "frame_continuity_valid": true
+      "frame_continuity_valid": true,
+      "layout_contact": {
+        "classifier_version": 2,
+        "band_A": 6.0,
+        "population_fraction": 0.1,
+        "persistence": 0.9,
+        "geometry_supported": true,
+        "top_occupancy": 0.8888888888888888,
+        "bottom_occupancy": 1.0,
+        "mean_top": 0.8888888888888888,
+        "mean_bottom": 1.0
+      }
     }
   },
   "variable-count": {
@@ -5750,7 +5860,7 @@
       0,
       1
     ],
-    "auto_reason": "auto_top_water_only",
+    "auto_reason": "auto_top_water_contact",
     "population_imbalance": 0.5714285714285714,
     "population_imbalance_threshold": 0.2,
     "slab_thickness_per_frame_A": [
@@ -5769,7 +5879,18 @@
       "top_trusted": true,
       "bottom_trusted": true,
       "surface_order_and_thickness_valid": true,
-      "frame_continuity_valid": true
+      "frame_continuity_valid": true,
+      "layout_contact": {
+        "classifier_version": 2,
+        "band_A": 6.0,
+        "population_fraction": 0.1,
+        "persistence": 0.9,
+        "geometry_supported": true,
+        "top_occupancy": 1.0,
+        "bottom_occupancy": 0.5555555555555556,
+        "mean_top": 1.0,
+        "mean_bottom": 0.5555555555555556
+      }
     }
   },
   "reordered": {
@@ -6167,7 +6288,7 @@
       1,
       1
     ],
-    "auto_reason": "auto_two_sided_water",
+    "auto_reason": "auto_two_sided_water_contact",
     "population_imbalance": 0.0,
     "population_imbalance_threshold": 0.2,
     "slab_thickness_per_frame_A": [
@@ -6186,7 +6307,18 @@
       "top_trusted": true,
       "bottom_trusted": true,
       "surface_order_and_thickness_valid": true,
-      "frame_continuity_valid": true
+      "frame_continuity_valid": true,
+      "layout_contact": {
+        "classifier_version": 2,
+        "band_A": 6.0,
+        "population_fraction": 0.1,
+        "persistence": 0.9,
+        "geometry_supported": true,
+        "top_occupancy": 1.0,
+        "bottom_occupancy": 1.0,
+        "mean_top": 1.0,
+        "mean_bottom": 1.0
+      }
     }
   },
   "unsupported": {
@@ -6692,7 +6824,7 @@
       0,
       0
     ],
-    "auto_reason": "auto_default_top",
+    "auto_reason": "auto_default_top_insufficient_water_contact",
     "population_imbalance": null,
     "population_imbalance_threshold": 0.2,
     "slab_thickness_per_frame_A": [
@@ -6711,7 +6843,18 @@
       "top_trusted": true,
       "bottom_trusted": true,
       "surface_order_and_thickness_valid": false,
-      "frame_continuity_valid": false
+      "frame_continuity_valid": false,
+      "layout_contact": {
+        "classifier_version": 2,
+        "band_A": 6.0,
+        "population_fraction": 0.1,
+        "persistence": 0.9,
+        "geometry_supported": false,
+        "top_occupancy": 0.0,
+        "bottom_occupancy": 0.0,
+        "mean_top": 0.0,
+        "mean_bottom": 0.0
+      }
     }
   },
   "missing": {
@@ -7207,7 +7350,7 @@
       0,
       0
     ],
-    "auto_reason": "auto_default_top",
+    "auto_reason": "auto_default_top_insufficient_water_contact",
     "population_imbalance": null,
     "population_imbalance_threshold": 0.2,
     "slab_thickness_per_frame_A": [
@@ -7226,7 +7369,18 @@
       "top_trusted": true,
       "bottom_trusted": true,
       "surface_order_and_thickness_valid": false,
-      "frame_continuity_valid": false
+      "frame_continuity_valid": false,
+      "layout_contact": {
+        "classifier_version": 2,
+        "band_A": 6.0,
+        "population_fraction": 0.1,
+        "persistence": 0.9,
+        "geometry_supported": false,
+        "top_occupancy": 0.0,
+        "bottom_occupancy": 0.0,
+        "mean_top": 0.0,
+        "mean_bottom": 0.0
+      }
     }
   },
   "axis-x": {
@@ -7748,7 +7902,7 @@
       1,
       1
     ],
-    "auto_reason": "auto_two_sided_water",
+    "auto_reason": "auto_two_sided_water_contact",
     "population_imbalance": 0.0,
     "population_imbalance_threshold": 0.2,
     "slab_thickness_per_frame_A": [
@@ -7767,7 +7921,18 @@
       "top_trusted": true,
       "bottom_trusted": true,
       "surface_order_and_thickness_valid": true,
-      "frame_continuity_valid": true
+      "frame_continuity_valid": true,
+      "layout_contact": {
+        "classifier_version": 2,
+        "band_A": 6.0,
+        "population_fraction": 0.1,
+        "persistence": 0.9,
+        "geometry_supported": true,
+        "top_occupancy": 1.0,
+        "bottom_occupancy": 1.0,
+        "mean_top": 1.0,
+        "mean_bottom": 1.0
+      }
     }
   },
   "axis-y": {
@@ -8289,7 +8454,7 @@
       1,
       1
     ],
-    "auto_reason": "auto_two_sided_water",
+    "auto_reason": "auto_two_sided_water_contact",
     "population_imbalance": 0.0,
     "population_imbalance_threshold": 0.2,
     "slab_thickness_per_frame_A": [
@@ -8308,7 +8473,18 @@
       "top_trusted": true,
       "bottom_trusted": true,
       "surface_order_and_thickness_valid": true,
-      "frame_continuity_valid": true
+      "frame_continuity_valid": true,
+      "layout_contact": {
+        "classifier_version": 2,
+        "band_A": 6.0,
+        "population_fraction": 0.1,
+        "persistence": 0.9,
+        "geometry_supported": true,
+        "top_occupancy": 1.0,
+        "bottom_occupancy": 1.0,
+        "mean_top": 1.0,
+        "mean_bottom": 1.0
+      }
     }
   }
 }

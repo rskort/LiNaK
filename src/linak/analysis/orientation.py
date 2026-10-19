@@ -59,6 +59,7 @@ from .statistics import (
     resolve_block_slices,
 )
 from .surface import (
+    bind_surface_reference,
     _cell_histogram_bounds,
     _surface_estimate_datasets,
     _surface_estimate_from_payload,
@@ -265,6 +266,7 @@ def _build_orientation_frame_data(
             surface_reference,
             raw_axis_values,
             frame_index=frame_index,
+            target_positions=geom.com_positions,
         )
     elif surface_position is not None and np.isfinite(surface_position):
         distances = distances - float(surface_position)
@@ -1147,14 +1149,16 @@ def compute_orientation_profile(
     surface_estimate: SurfaceEstimate | None = None
     surface_reference: SurfaceReference | None = None
     if isinstance(precomputed_surface_estimate, SurfaceReference):
-        surface_reference = precomputed_surface_estimate
+        surface_reference = bind_surface_reference(precomputed_surface_estimate, frames)
     elif precomputed_surface_estimate is not None:
         if precomputed_surface_estimate.frame_values.shape != (len(frames),):
             raise ValueError(
                 "precomputed_surface_estimate frame count does not match the trajectory."
             )
         surface_estimate = precomputed_surface_estimate
-    elif surface_layout is not None:
+    elif surface_layout is not None or (
+        surface_options is not None and surface_options.distance_mode == "nearest-atom"
+    ):
         surface_reference = estimate_surface_layout_reference(
             frames,
             axis,
@@ -1256,7 +1260,10 @@ def compute_orientation_profile(
         binning=(
             "observed"
             if active_surface_reference is not None
-            and active_surface_reference.resolved_layout == "symmetric"
+            and (
+                active_surface_reference.resolved_layout == "symmetric"
+                or active_surface_reference.distance_mode == "nearest-atom"
+            )
             else binning
         ),
         coordinate_mode=coordinate_mode,
@@ -1298,6 +1305,11 @@ def compute_orientation_profile(
         axis_index=axis_index,
         bin_width=bin_width,
     )
+    if (
+        active_surface_reference is not None
+        and active_surface_reference.distance_mode == "nearest-atom"
+    ):
+        slab_volume_per_frame = None
     slab_volumes = slab_volume_per_frame
     if slab_volumes is not None and not (
         active_surface_reference is not None
@@ -1630,6 +1642,16 @@ def _orientation_profile_hdf5_payload(
     metadata = build_profile_metadata(
         analysis=_ANALYSIS_NAME,
         metadata=metadata_payload,
+        units_map=(
+            {
+                "density": "molecule/Angstrom",
+                "cos_polar_density": "molecule/Angstrom",
+                "cos_azimuthal_density": "molecule/Angstrom",
+            }
+            if profile.surface_reference is not None
+            and profile.surface_reference.distance_mode == "nearest-atom"
+            else None
+        ),
     )
     datasets: dict[str, np.ndarray | None] = {
         "bin_edges_A": profile.bin_edges,
@@ -2354,6 +2376,12 @@ def _normalize_component_token(component: str | None) -> str:
 
 
 def _distance_label(profile: OrientationProfile) -> str:
+    if (
+        profile.coordinate_mode == "distance"
+        and profile.surface_reference is not None
+        and profile.surface_reference.distance_mode == "nearest-atom"
+    ):
+        return "Distance to nearest substrate atom (Angstrom)"
     if profile.coordinate_mode == "distance":
         return f"Distance to surface along {profile.axis.upper()} (Angstrom)"
     return f"{profile.axis.upper()} (Angstrom)"

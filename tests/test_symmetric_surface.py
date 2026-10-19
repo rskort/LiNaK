@@ -33,6 +33,8 @@ from linak.analysis.position import (
 from linak.analysis.surface import (
     estimate_surface_layout_reference,
     surface_distance_components,
+    surface_substrate_mask,
+    canonical_surface_axis_values,
 )
 
 
@@ -154,7 +156,7 @@ def test_symmetric_reference_assigns_outward_distances_and_auto_detects_both_sid
     )
 
     assert reference.resolved_layout == "symmetric"
-    assert reference.auto_reason == "auto_two_sided_water"
+    assert reference.auto_reason == "auto_two_sided_water_contact"
     folded, top, bottom, side = surface_distance_components(
         reference,
         np.asarray([4.0, 16.0]),
@@ -795,3 +797,224 @@ def test_shared_surface_context_matches_independent_estimates(monkeypatch, fixed
             assert left == right
 
     compare(asdict(shared), asdict(separate))
+
+
+@pytest.fixture(params=["single-top", "single-bottom"])
+def rough_single_interface(request):
+    from ase.constraints import FixAtoms
+    from linak.analysis.surface import _single_interface_wrap_threshold
+
+    layout = request.param
+    frame = (
+        _single_top_boundary_frame() if layout == "single-top" else _single_bottom_boundary_frame()
+    )
+    frame.set_constraint(FixAtoms(indices=[0]))
+    reference = estimate_surface_layout_reference(
+        [frame], axis="z", surface_layout=layout, mode="layered", surface_elements=["Pt"]
+    )
+    threshold = _single_interface_wrap_threshold(reference, 0)
+    assert threshold is not None
+    canonical = threshold + (-0.75 if layout == "single-top" else 0.75)
+    raw = float(reference.axis_lower_per_frame_A[0]) + np.mod(
+        canonical + float(reference.axis_cut_per_frame_A[0]),
+        float(reference.axis_period_per_frame_A[0]),
+    )
+    # Same coordinate, different identity: a displaced fixed Pt atom and fluid Li.
+    frame.positions[0, 2] = raw
+    frame.positions[-1, 2] = raw
+    return frame, reference
+
+
+def test_rough_substrate_keeps_signed_distance_while_same_coordinate_fluid_wraps(
+    rough_single_interface,
+):
+    frame, reference = rough_single_interface
+    values = frame.positions[:, 2]
+    mask = surface_substrate_mask(reference, frame)
+    assert mask[0] and not mask[-1]
+    assert reference.primary is not None
+    assert reference.primary.candidate_indices is not None
+    assert (
+        0 not in reference.primary.candidate_indices
+    )  # Fixed atom excluded from plane estimation.
+    folded, top, bottom, side = surface_distance_components(
+        reference, values, frame_index=0, substrate_mask=mask
+    )
+    canonical = canonical_surface_axis_values(reference, values, frame_index=0)
+    expected = (
+        canonical - reference.top.frame_values[0]
+        if reference.resolved_layout == "single-top"
+        else reference.bottom.frame_values[0] - canonical
+    )
+    assert folded[0] < 0 < folded[-1]
+    assert folded[0] == pytest.approx(expected[0])
+    assert folded[-1] == pytest.approx(expected[-1] + reference.axis_period_per_frame_A[0])
+    np.testing.assert_array_equal(side, 1 if reference.resolved_layout == "single-top" else -1)
+    np.testing.assert_allclose(folded, top if reference.resolved_layout == "single-top" else bottom)
+    # Mask shape must not accidentally broadcast onto a different selection.
+    with pytest.raises(ValueError, match="Substrate mask"):
+        surface_distance_components(reference, values, frame_index=0, substrate_mask=mask[:2])
+
+
+def test_position_and_density_keep_rough_substrate_below_surface(rough_single_interface):
+    frame, reference = rough_single_interface
+    position = compute_position_profile(
+        [frame], species="all", axis="z", precomputed_surface_estimate=reference
+    )
+    assert position.distance_to_surface[0, 0] < 0
+    assert position.distance_to_surface[0, -1] > 0
+    for species, sign in (("Pt", -1), ("Li", 1)):
+        density = compute_density_profile(
+            [frame],
+            species=species,
+            axis="z",
+            bin_width=0.1,
+            binning="observed",
+            precomputed_surface_estimate=reference,
+        )
+        occupied = density.bin_centers[density.counts_per_frame > 0]
+        assert occupied.size
+        assert np.all(occupied < 0.1) if sign < 0 else np.all(occupied > 0)
+        atom_mask = np.asarray(frame.get_chemical_symbols()) == species
+        expected_mass = float(np.sum(frame.get_masses()[atom_mask])) * density_mod.AMU_TO_G
+        np.testing.assert_allclose(
+            np.sum(density.counts_per_frame), expected_mass, rtol=1e-12, atol=0
+        )
+    profiles = compute_all_density_profiles(
+        [frame],
+        species="Pt",
+        outputs="all",
+        binning="observed",
+        bin_width=0.25,
+        grid_bin_width=0.5,
+        precomputed_surface_estimate=reference,
+    )
+    line = next(
+        p for p in profiles if isinstance(p, DensityProfile) and p.coordinate_mode == "distance"
+    )
+    assert np.all(line.bin_centers[line.counts_per_frame > 0] < 0.25)
+    expected_mass = float(np.sum(frame.get_masses()[:16])) * density_mod.AMU_TO_G
+    np.testing.assert_allclose(np.sum(line.counts_per_frame), expected_mass, rtol=1e-12, atol=0)
+    grid = next(p for p in profiles if isinstance(p, DensityGridProfile))
+    shape = tuple(
+        len(edges) - 1
+        for edges in (grid.x_bin_edges, grid.y_bin_edges, grid.z_bin_edges, grid.distance_bin_edges)
+    )
+    distance_indices = np.unravel_index(grid.flat_indices, shape)[3]
+    centers = 0.5 * (grid.distance_bin_edges[:-1] + grid.distance_bin_edges[1:])
+    assert np.all(centers[distance_indices] < 0.5)
+
+
+@pytest.mark.parametrize("keep_molecules", [False, True])
+@pytest.mark.parametrize("streaming", [False, True])
+def test_distance_filter_keeps_rough_substrate_and_excludes_wrapped_fluid(
+    rough_single_interface, tmp_path, keep_molecules, streaming
+):
+    from linak.trajectory.spatial_filter import (
+        SpatialFilterOptions,
+        apply_spatial_filter,
+        apply_spatial_filter_streaming,
+    )
+
+    frame, reference = rough_single_interface
+    options = SpatialFilterOptions(distance_range="-8:-0.05", keep_molecules_intact=keep_molecules)
+    if streaming:
+        result = apply_spatial_filter_streaming(
+            [frame],
+            options=options,
+            precomputed_surface_estimate=reference,
+            temporary_directory=tmp_path,
+        )
+    else:
+        result = apply_spatial_filter(
+            [frame], options=options, precomputed_surface_estimate=reference
+        )
+    try:
+        filtered = result.frames[0]
+        assert len(filtered)
+        assert set(filtered.get_chemical_symbols()) == {"Pt"}
+        assert np.any(np.isclose(filtered.positions[:, 2], frame.positions[0, 2]))
+    finally:
+        close = getattr(result.frames, "close", None)
+        if close is not None:
+            close()
+
+
+def test_substrate_identity_survives_aliases_variable_layout_and_triclinic_cell(
+    rough_single_interface,
+):
+    from linak.analysis.common import RAW_SPECIES_ARRAY
+    from linak.analysis.position import compute_position_profiles
+
+    frame, reference = rough_single_interface
+    frame.set_cell([[10, 0, 0], [0, 10, 0], [1, 0, 20]])
+    symbols = np.asarray(frame.get_chemical_symbols())
+    frame.new_array(RAW_SPECIES_ARRAY, np.where(symbols == "Pt", "Pt_rough", symbols))
+    frames = [frame, frame[:-1]]
+    reference = estimate_surface_layout_reference(
+        frames,
+        axis="z",
+        surface_layout=reference.resolved_layout,
+        mode="layered",
+        surface_elements=["Pt"],
+    )
+    profiles = compute_position_profiles(
+        frames, species="species:Pt_rough", axis="z", precomputed_surface_estimate=reference
+    )
+    assert len(profiles) == 1
+    assert np.all(profiles[0].distance_to_surface[:, 0] < 0)
+    density_profiles = compute_all_density_profiles(
+        frames,
+        species="species:Pt_rough",
+        outputs="1d",
+        binning="observed",
+        bin_width=0.1,
+        precomputed_surface_estimate=reference,
+    )
+    density = next(
+        p
+        for p in density_profiles
+        if isinstance(p, DensityProfile) and p.coordinate_mode == "distance"
+    )
+    assert np.all(density.bin_centers[density.counts_per_frame > 0] < 0.1)
+
+
+def test_cached_surface_reference_preserves_rough_substrate_membership(
+    rough_single_interface, tmp_path
+):
+    from linak.trajectory.io import (
+        TrajectoryStoredMetadata,
+        read_trajectory_hdf5_surface_cache,
+        write_trajectory,
+    )
+
+    frame, reference = rough_single_interface
+    path = tmp_path / "rough.traj.h5"
+    write_trajectory(
+        [frame],
+        path,
+        metadata=TrajectoryStoredMetadata(
+            surface_cache_status="available",
+            surface_cache_axis="z",
+            surface_cache_mode="layered",
+            surface_cache_layout=reference.resolved_layout,
+            surface_cache_elements=("Pt",),
+            surface_cache_estimate=reference,
+        ),
+    )
+    cached = read_trajectory_hdf5_surface_cache(
+        path,
+        axis="z",
+        surface_mode="layered",
+        surface_layout=reference.resolved_layout,
+        surface_elements=["Pt"],
+        include_fixed_surface_atoms=False,
+        rough_surface_envelope_A=None,
+        frame_count=1,
+    )
+    assert cached is not None
+    np.testing.assert_array_equal(
+        surface_substrate_mask(cached, frame), surface_substrate_mask(reference, frame)
+    )
+    position = compute_position_profile([frame], species="Pt", precomputed_surface_estimate=cached)
+    assert position.distance_to_surface[0, 0] < 0

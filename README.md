@@ -15,15 +15,22 @@ LiNaK's recommended path is the command-line `apply`/`compute`/`plot` workflow:
 `linak project` exists as an experimental workspace UI, but it is still WIP and
 is not the recommended workflow.
 
+Surface-aware analyses also support `--surface-distance-mode nearest-atom`: the
+shortest three-dimensional periodic distance to an eligible substrate atom,
+without selecting an exposed layer. Conversion can store this preference for
+later analyses. Distance density views use mass/particle distributions per
+angstrom rather than planar shell volumes. See the
+[nearest-atom surface distance guide](docs/nearest_surface_distances.md) for
+candidate selection, interface behavior, periodic geometry, and examples.
+
 Supported inputs include:
 - ASE-supported trajectory files (e.g. CP2K's `.xyz`, LAMMPS's `.dump`, etc.)
 - LAMMPS and CP2K input scripts (`.lmp`, and `.inp`, respectively)
 - CP2K Hartree cube files for potential analysis
 
-LiNaK targets stable CPython **3.9–3.14**, including Python 3.9. See the
-[pre-publication audit](docs/pre-publication-audit.md) for executed checks and
-platforms still awaiting verification. Future versions and prereleases are not
-advertised as supported. LiNaK is licensed under **Apache-2.0**.
+LiNaK targets stable CPython **3.9?3.14**, including Python 3.9. GitHub CI
+checks the supported versions on Linux, Windows and macOS. Future versions and
+prereleases are not advertised as supported. LiNaK is licensed under **Apache-2.0**.
 
 ## Installation
 
@@ -271,6 +278,10 @@ LiNaK supports both slab/vacuum trajectories and periodic two-interface cells
 with liquid on both metal faces. Use
 `--surface-layout auto|single-top|single-bottom|symmetric`; `auto` is the CLI
 and Studio default. Symmetric plots default to the equal-weight folded mean.
+Automatic selection uses persistent water contact within 6 Å of each complete
+substrate face, including fixed layers for layout geometry; it does not classify
+distant water by which side of a periodic coordinate cut it occupies. See the
+[surface estimation guide](docs/surface-estimation.md) for thresholds and cache behavior.
 Use `--interface-view full|top|bottom|folded|all` to select the complete
 unfolded cell, the positive-axis interface, the negative-axis interface, the
 combined interfaces, or a three-curve interface comparison. The Studio exposes
@@ -574,10 +585,17 @@ vertices and can therefore start below zero. CP2K `ABC` plus
 preserved through trajectory conversion and HDF5 storage. Older files containing
 only three cell lengths continue to load as orthorhombic cells.
 
+Add `--keep-molecules` to reconstruct detected OH/H2O/H3O molecules across periodic
+boundaries and wrap each molecule by its mass-weighted center of mass. Its atoms
+move together and may extend outside the cell. Other atoms wrap individually.
+Molecular membership is resolved per frame using LiNaK's existing O/H topology
+(default 1.27 Angstrom cutoff); ambiguous or unclassified atoms wrap individually.
+The default remains atom-wise wrapping.
+
 Examples:
 
 ```bash
-linak apply pbc pos.xyz
+linak apply pbc pos.xyz --keep-molecules
 linak apply pbc pos.xyz --input input.inp --output wrapped.xyz
 linak apply pbc pos.xyz --cell 13.859251 10.7354 40.7792 --cell-angles 90 90 97.4176
 linak apply pbc pos.xyz --overwrite
