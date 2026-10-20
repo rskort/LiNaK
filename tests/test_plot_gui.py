@@ -277,7 +277,8 @@ def test_plot_settings_panel_event_filter_uses_qt_modifier_flags_directly():
     source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
 
     event_filter_index = source.rindex("def eventFilter(self, watched: Any, event: Any) -> bool:")
-    event_filter_block = source[event_filter_index : event_filter_index + 1800]
+    event_filter_end = source.index("\n        def resizeEvent(", event_filter_index)
+    event_filter_block = source[event_filter_index:event_filter_end]
 
     assert "modifiers = event.modifiers()" in event_filter_block
     assert "int(event.modifiers())" not in event_filter_block
@@ -557,7 +558,7 @@ def test_plot_settings_panel_uses_reusable_collapsible_sections_with_session_sta
     assert '"_collapsible_section_state"' not in source
 
 
-def test_plot_settings_panel_themes_message_boxes_and_dialog_buttons():
+def test_plot_settings_panel_styles_message_boxes_and_dialog_buttons():
     source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
 
     assert 'f"QMessageBox {{' in source
@@ -677,19 +678,20 @@ def test_plot_settings_panel_keeps_x_y_label_font_sizes_independent():
     assert '"tick_font_size": shared_tick_font_size_value' in source
 
 
-def test_plot_settings_panel_uses_explicit_series_row_theme_tokens():
+def test_plot_settings_panel_uses_shared_light_colors():
     source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
+    colors = Path("src/linak/gui/styles.py").read_text(encoding="utf-8")
 
-    assert '"series_row_selected_bg"' in source
-    assert '"series_row_selected_border"' in source
-    assert '"series_row_selected_text"' in source
-    assert '"series_badge_original_bg"' in source
-    assert '"series_badge_copy_bg"' in source
+    assert '"series_row_selected_bg"' in colors
+    assert '"series_row_selected_border"' in colors
+    assert '"series_row_selected_text"' in colors
+    assert '"series_badge_original_bg"' in colors
+    assert '"series_badge_copy_bg"' in colors
     assert "QToolButton {" in source
-    assert '"tooltip_bg"' in source
-    assert '"tooltip_text"' in source
-    assert '"tooltip_border"' in source
-    assert '"placeholder_text"' in source
+    assert '"tooltip_bg"' in colors
+    assert '"tooltip_text"' in colors
+    assert '"tooltip_border"' in colors
+    assert '"placeholder_text"' in colors
     assert "QToolTip {" in source
     assert "QMenu {" in source
     assert "QMenu::item:disabled {" in source
@@ -699,7 +701,7 @@ def test_plot_settings_panel_uses_explicit_series_row_theme_tokens():
     assert "QAbstractItemView::item:selected {" in source
     assert "QAbstractItemView::indicator:checked {" in source
     assert "QScrollBar:horizontal {" in source
-    assert "theme=self._theme_tokens()" in source
+    assert "colors=light_colors()" in source
     assert "self.palette().color(QPalette.ColorRole.Text)" not in source
     assert "self.palette().color(QPalette.ColorRole.Mid)" not in source
     assert "_win.lightness() < _wtxt.lightness()" not in source
@@ -837,12 +839,10 @@ def test_plot_settings_panel_busts_preview_pixmap_cache_before_reload():
     assert "if not pixmap.load(str(image_path_obj)):" in source
 
 
-def test_plot_settings_panel_composites_preview_transparency_on_theme_matte():
+def test_plot_settings_panel_composites_preview_transparency_on_light_matte():
     source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
 
     assert "def _preview_transparency_matte_colors(self) -> tuple[QColor, QColor]:" in source
-    assert 'if self._theme_mode == "dark":' in source
-    assert 'return QColor("#8793a3"), QColor("#aeb7c3")' in source
     assert 'return QColor("#f4f7fb"), QColor("#dce4ee")' in source
     assert "def _preview_display_pixmap(self, pixmap: QPixmap) -> QPixmap:" in source
     assert "painter.fillRect(composed.rect(), matte_a)" in source
@@ -899,15 +899,15 @@ def test_plot_settings_panel_sizes_interactive_canvas_from_export_aspect_ratio()
     assert "available_width = 800" in source
     assert "available_height = 520" in source
     assert "candidates: list[QWidget] = []" in source
-    assert "if width >= 160 and height >= 120:" in source
-    assert "available_width = max(320, available_width)" in source
+    assert "if width > 0 and height > 0:" in source
+    assert "available_width = max(1, available_width)" in source
     assert "export_width, export_height = self._preview_export_figsize()" in source
     assert "export_aspect = max(1.0e-9, export_width / export_height)" in source
     assert "preview_dpi = max(target_width / export_width" in source
     assert (
         "self._preview_figure.set_size_inches(export_width, export_height, forward=False)" in source
     )
-    assert "self._preview_figure.set_dpi(preview_dpi)" in source
+    assert "preview_dpi * self._preview_canvas.device_pixel_ratio" in source
     assert "self._preview_canvas.setFixedSize(QSize(target_width, target_height))" in source
     assert "self._resize_preview_canvas_to_figure()" in source
 
@@ -984,12 +984,12 @@ def test_plot_settings_panel_updates_canvas_axes_style_without_worker_rerender()
     source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
 
     assert "def _apply_axis_style_fields_to_canvas(self) -> bool:" in source
-    assert "ax.set_xscale(x_scale)" in source
-    assert "ax.set_yscale(y_scale)" in source
-    assert "if grid_enabled:" in source
-    assert "ax.grid(True, **grid_kwargs)" in source
-    assert "ax.grid(False)" in source
-    assert "gridline.set_visible(False)" in source
+    assert "ax.get_xscale()," in source
+    assert "ax.set_xscale," in source
+    assert "ax.get_yscale()," in source
+    assert "ax.set_yscale," in source
+    assert "if current == scale:" in source
+    assert "_apply_plot_grid(" in source
     assert "Preview axes updated." in source
     schedule_start = source.index("def _schedule_preview_update(self, *_unused: object) -> None:")
     schedule_end = source.index("def _handle_debounced_preview", schedule_start)
@@ -1020,11 +1020,9 @@ def test_plot_settings_panel_updates_line_style_without_worker_rerender():
     source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
 
     assert "def _apply_line_style_fields_to_canvas(self) -> bool:" in source
-    assert "line.set_linewidth(line_width)" in source
-    assert "line.set_linestyle(line_style)" in source
-    assert "line.set_marker(marker)" in source
-    assert "line.set_markerfacecolor(marker_color)" in source
-    assert "Preview line style updated." in source
+    assert "return self._apply_series_artist_updates_to_canvas()" in source
+    assert "_line_artist_kwargs(" in source
+    assert "self._refresh_preview_legend(settings)" in source
     schedule_start = source.index("def _schedule_preview_update(self, *_unused: object) -> None:")
     schedule_end = source.index("def _handle_debounced_preview", schedule_start)
     schedule_body = source[schedule_start:schedule_end]
@@ -1107,11 +1105,9 @@ def test_plot_settings_panel_updates_series_artists_without_worker_rerender():
     source = ast.unparse(ast.parse(source)).replace("'", '"')
 
     assert "def _apply_series_artist_updates_to_canvas(self) -> bool:" in source
-    assert 'line_artists = self._last_preview_state.get("line_artists")' in source
-    assert 'plotted_series = self._last_preview_state.get("plotted_xy_series")' in source
-    assert "artist.set_label(self._effective_series_label(index))" in source
-    assert "artist.set_color(color)" in source
-    assert "artist.set_zorder(float(index + 2))" in source
+    assert 'artists = self._last_preview_state.get("series_artists")' in source
+    assert "artist.set(**resolved)" in source
+    assert "self._refresh_preview_legend(settings)" in source
     method = next(
         node
         for node in ast.walk(
@@ -1931,7 +1927,11 @@ def test_plot_settings_panel_fits_interactive_canvas_to_preview_viewport_aspect_
     assert "self._preview_canvas.draw_idle()" in resize_body
     assert "canvas_scroll.viewport().installEventFilter(self)" in source
     assert "preview_canvas_viewport" in source
-    assert "QTimer.singleShot(0, self._resize_preview_canvas_to_figure)" in source
+    assert (
+        "self._preview_layout_timer.timeout.connect(self._resize_preview_canvas_to_figure)"
+        in source
+    )
+    assert "self._schedule_preview_canvas_resize()" in source
 
 
 def test_plot_settings_panel_allows_resizable_workspace_and_preview_split():
@@ -2004,17 +2004,13 @@ def test_plot_settings_panel_uses_rdf_layer_summary_and_coordination_selector_ch
     assert "Points per visible bin:" in source
 
 
-def test_plot_settings_panel_has_manual_light_dark_theme_switch():
+def test_plot_settings_panel_has_only_fixed_light_styling():
     source = Path("src/linak/plot/plot_gui.py").read_text(encoding="utf-8")
-
-    assert 'self._theme_switch = QCheckBox("Dark mode")' in source
-    assert 'self._theme_switch.setObjectName("themeSwitch")' in source
-    assert "self._theme_switch.toggled.connect(self._handle_theme_switch_toggled)" in source
-    assert "QCheckBox#themeSwitch" in source
-    assert 'if self._theme_mode == "dark":' in source
-    assert 'if self._theme_mode == "light":' in source
-    assert '"_gui_theme_mode"' not in source
-    assert "_GUI_THEME_MODES" not in source
+    assert "apply_light_palette(self)" in source
+    assert "colors = light_colors()" in source
+    assert "themeSwitch" not in source
+    assert "_theme_mode" not in source
+    assert "PaletteChange" not in source
 
 
 def test_plot_settings_panel_keeps_status_outside_hidden_preview_panel():

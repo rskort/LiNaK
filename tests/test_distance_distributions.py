@@ -252,11 +252,8 @@ def test_studio_prevents_invalid_nearest_axes_and_reopens_settings(monkeypatch, 
             assert "Number distribution" in window.density_quantity.currentText()
             window._nav_list.setCurrentRow(1)
             window.resize(1100, 760)
-            for theme in ("light", "dark"):
-                window._theme_mode = theme
-                window._apply_theme_styles()
-                application.processEvents()
-                assert window.grab().save(str(tmp_path / f"studio-{theme}.png"))
+            application.processEvents()
+            assert window.grab().save(str(tmp_path / "studio.png"))
             checked.append(True)
         finally:
             window._saved_signature = window._signature(window._collect_settings())

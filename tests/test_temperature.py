@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import math
+import logging
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 import linak.analysis.temperature as temperature_module
 from linak.analysis.temperature import (
@@ -325,3 +327,85 @@ def test_gui_detects_temperature_sources_and_velocity_readiness(tmp_path: Path) 
     assert action.supports(temp_item)
     assert readiness_for_action(action, velocity_item).available
     assert not readiness_for_action(action, position_item).available
+
+
+@pytest.mark.parametrize(
+    "comment", ["# layers 99..999", "! layers 99..999", "# &END DEFINE_REGION ! note"]
+)
+def test_temperature_input_comments_preserve_lists_and_results(tmp_path, caplog, comment):
+    source = tmp_path / "run-vel-1.xyz"
+    _write_velocity_xyz(source)
+    input_path = tmp_path / "input.inp"
+    _write_cp2k_input(input_path)
+    baseline = compute_temperature_profiles(source)
+    contents = input_path.read_text(encoding="utf-8")
+    input_path.write_text(
+        "# &DEFINE_REGION\n" + "\n".join(line + " " + comment for line in contents.splitlines()),
+        encoding="utf-8",
+    )
+    caplog.clear()
+    actual = compute_temperature_profiles(source)
+    assert [p.default_label for p in actual] == [p.default_label for p in baseline]
+    for expected, result in zip(baseline, actual):
+        np.testing.assert_array_equal(result.atom_indices, expected.atom_indices)
+        np.testing.assert_array_equal(result.temperature_K, expected.temperature_K)
+        np.testing.assert_array_equal(result.time_fs, expected.time_fs)
+    assert "unsupported CP2K atom-list token" not in caplog.text
+    assert temperature_module._parse_cp2k_list_expression("1..3, 5 # layers 99") == (0, 1, 2, 4)
+
+
+@pytest.mark.parametrize("suffix", ["temp", "tregion"])
+def test_temperature_tables_accept_trailing_hash_comments(tmp_path, suffix, caplog):
+    _write_cp2k_input(tmp_path / "input.inp")
+    source = tmp_path / f"run.{suffix}"
+    source.write_text("# headers\n10 5.0 100 200 300 400 # layers 1 2 3\n", encoding="utf-8")
+    profiles = compute_temperature_profiles(source)
+    assert [p.temperature_K.tolist() for p in profiles] == [[100], [200], [300], [400]]
+    assert "non-numeric" not in caplog.text
+
+
+@pytest.mark.parametrize("group", ["auto", "both", "elements", "regions"])
+@pytest.mark.parametrize("input_kind", ["missing", "empty", "unreadable"])
+def test_missing_temperature_regions_warn_once_at_compute_boundary(
+    tmp_path, monkeypatch, caplog, group, input_kind
+):
+    source = tmp_path / "run-vel-1.xyz"
+    _write_velocity_xyz(source)
+    input_path = tmp_path / "input.inp"
+    if input_kind != "missing":
+        input_path.write_text("&KIND K\n&END KIND\n", encoding="utf-8")
+    if input_kind == "unreadable":
+        original = temperature_module._parse_cp2k_input
+
+        def unreadable(path):
+            if Path(path) == input_path:
+                raise PermissionError("test input is unreadable")
+            return original(path)
+
+        monkeypatch.setattr(temperature_module, "_parse_cp2k_input", unreadable)
+    metadata = temperature_module.discover_temperature_metadata(source, input_path=input_path)
+    assert not caplog.records  # Discovery also runs while browsing GUI sources.
+    if group == "regions":
+        with pytest.raises(ValueError, match="No usable temperature regions"):
+            compute_temperature_profiles(source, input_path=input_path, group_by=group)
+    else:
+        profiles = compute_temperature_profiles(source, input_path=input_path, group_by=group)
+        assert profiles and all(p.selection_kind == "element" for p in profiles)
+    records = [r for r in caplog.records if r.name == temperature_module.__name__]
+    assert len(records) == 1
+    assert records[0].levelno == logging.WARNING
+    assert "--input" in records[0].message
+    caplog.clear()
+    with caplog.at_level(logging.ERROR, logger=temperature_module.__name__):
+        temperature_module.compute_temperature_from_velocity_xyz(source, metadata=metadata)
+    assert not caplog.records
+
+
+@pytest.mark.parametrize("suffix", ["temp", "tregion"])
+def test_temperature_table_missing_metadata_has_one_actionable_warning(tmp_path, caplog, suffix):
+    source = tmp_path / f"run.{suffix}"
+    source.write_text("10 5.0 100\n", encoding="utf-8")
+    profiles = compute_temperature_profiles(source)
+    assert profiles[0].temperature_K.tolist() == [100]
+    records = [r for r in caplog.records if r.name == temperature_module.__name__]
+    assert len(records) == 1 and "--input" in records[0].message

@@ -22,7 +22,7 @@ from .model import ProjectItem, ProjectStore, Task
 from .services import descriptor_for_action
 from .styles import badge_style
 from .tasks import TaskManager
-from .theme import ThemeMode, is_dark_theme, workspace_stylesheet
+from .styles import apply_light_palette, light_colors, workspace_stylesheet
 from .viewers import open_project_item
 from .viewmodels import (
     Badge,
@@ -121,7 +121,7 @@ class SettingsDialog:
         action: Action,
         item: ProjectItem,
         project_dir: Path,
-        theme_colors: dict[str, str] | None = None,
+        style_colors: dict[str, str] | None = None,
     ) -> None:
         from PySide6.QtCore import Qt
         from PySide6.QtWidgets import (
@@ -142,6 +142,7 @@ class SettingsDialog:
         )
 
         self.dialog = QDialog(parent)
+        apply_light_palette(self.dialog)
         self.dialog.setWindowTitle(f"{action.name} settings")
         self.dialog.resize(720, 620)
         if parent is not None and hasattr(parent, "styleSheet"):
@@ -156,7 +157,7 @@ class SettingsDialog:
         self._action = action
         self._item = item
         self._project_dir = project_dir
-        self._theme_colors = theme_colors or {}
+        self._style_colors = style_colors or {}
         self._section_state: dict[str, bool] = {}
 
         root = QVBoxLayout(self.dialog)
@@ -361,7 +362,7 @@ class SettingsDialog:
         except Exception as exc:
             self._validation_label.setText(f"Invalid settings: {exc}")
             self._validation_label.setStyleSheet(
-                badge_style("danger", colors=self._theme_colors or None)
+                badge_style("danger", colors=self._style_colors or None)
             )
             return
         self.dialog.accept()
@@ -378,7 +379,7 @@ class SettingsDialog:
             validate_action_settings(self._action, self._item, values)
             self._validation_label.setText("Settings are valid.")
             self._validation_label.setStyleSheet(
-                badge_style("success", colors=self._theme_colors or None)
+                badge_style("success", colors=self._style_colors or None)
             )
             self._summary_label.setText(
                 self._action.summary(
@@ -390,7 +391,7 @@ class SettingsDialog:
         except Exception as exc:
             self._validation_label.setText(f"Check settings: {exc}")
             self._validation_label.setStyleSheet(
-                badge_style("warning", colors=self._theme_colors or None)
+                badge_style("warning", colors=self._style_colors or None)
             )
 
     def exec(self) -> tuple[bool, dict[str, Any]]:
@@ -412,7 +413,6 @@ class ProjectWorkspaceWindow:
         from PySide6.QtCore import QObject, Qt, Signal
         from PySide6.QtWidgets import (
             QAbstractItemView,
-            QCheckBox,
             QComboBox,
             QFrame,
             QHBoxLayout,
@@ -430,22 +430,6 @@ class ProjectWorkspaceWindow:
             QVBoxLayout,
             QWidget,
         )
-
-        class _ProjectMainWindow(QMainWindow):
-            def __init__(self, owner: ProjectWorkspaceWindow) -> None:
-                super().__init__()
-                self._owner = owner
-
-            def changeEvent(self, event: Any) -> None:  # pragma: no cover - UI flow
-                from PySide6.QtCore import QEvent
-
-                if event.type() in {
-                    QEvent.Type.PaletteChange,
-                    QEvent.Type.ApplicationPaletteChange,
-                }:
-                    self._owner._apply_theme_styles()
-                    self._owner._sync_theme_switch_label()
-                super().changeEvent(event)
 
         class _Bridge(QObject):
             task_updated = Signal(object)
@@ -469,16 +453,15 @@ class ProjectWorkspaceWindow:
         self.store = store
         self.registry = ActionRegistry()
         self.task_manager = TaskManager(store)
-        self._theme_mode: ThemeMode = "system"
-        self._theme_switch: Any | None = None
-        self._theme_colors: dict[str, str] = {}
+        self._style_colors = light_colors()
         self._tooltips: dict[int, str] = {}
         self._section_state: dict[str, bool] = {}
         self.bridge = _Bridge()
         self.bridge.task_updated.connect(self._handle_task_updated)
         self.bridge.task_finished.connect(self._handle_task_finished)
 
-        self.window = _ProjectMainWindow(self)
+        self.window = QMainWindow()
+        apply_light_palette(self.window)
         self.window.setWindowTitle(f"LiNaK Workspace - {store.project_dir}")
         self.window.resize(1280, 820)
 
@@ -502,10 +485,6 @@ class ProjectWorkspaceWindow:
         title_stack.addWidget(app_title)
         title_stack.addWidget(app_subtitle)
         header_layout.addLayout(title_stack, 1)
-        self._theme_switch = QCheckBox("Dark mode")
-        self._theme_switch.setObjectName("themeSwitch")
-        self._theme_switch.toggled.connect(self._handle_theme_switch_toggled)
-        header_layout.addWidget(self._theme_switch)
         root.addWidget(app_header)
 
         splitter = QSplitter(Qt.Orientation.Vertical)
@@ -647,8 +626,7 @@ class ProjectWorkspaceWindow:
         splitter.setSizes([560, 260])
         root.addWidget(splitter)
         self.window.setCentralWidget(central)
-        self._apply_theme_styles()
-        self._sync_theme_switch_label()
+        self._apply_styles()
 
         self._load_project_items()
         self._refresh_items()
@@ -661,36 +639,8 @@ class ProjectWorkspaceWindow:
     def show(self) -> None:
         self.window.show()
 
-    def _is_dark_theme(self) -> bool:
-        return is_dark_theme(self._theme_mode, self.window)
-
-    def _theme_tokens(self) -> dict[str, str]:
-        from .theme import plot_like_theme_tokens
-
-        return plot_like_theme_tokens(self._is_dark_theme())
-
-    def _sync_theme_switch_label(self) -> None:
-        if self._theme_switch is None:
-            return
-        is_dark = self._is_dark_theme()
-        self._theme_switch.blockSignals(True)
-        try:
-            self._theme_switch.setChecked(is_dark)
-            self._theme_switch.setText("Dark mode" if is_dark else "Light mode")
-        finally:
-            self._theme_switch.blockSignals(False)
-
-    def _handle_theme_switch_toggled(self, checked: bool) -> None:
-        self._theme_mode = "dark" if checked else "light"
-        self._sync_theme_switch_label()
-        self._apply_theme_styles()
-        self._refresh_items()
-        self._refresh_tasks()
-        self._render_actions(self._selected_item())
-
-    def _apply_theme_styles(self) -> None:
-        colors = self._theme_tokens()
-        self._theme_colors = colors
+    def _apply_styles(self) -> None:
+        colors = self._style_colors
         self.window.setStyleSheet(workspace_stylesheet(colors))
 
     def _register_tooltip(self, widget: Any, text: str | None) -> None:
@@ -927,7 +877,7 @@ class ProjectWorkspaceWindow:
             badge_style(
                 badge.tone,
                 progress_fraction=progress_fraction,
-                colors=self._theme_colors or self._theme_tokens(),
+                colors=self._style_colors,
             )
         )
         return label
@@ -1192,7 +1142,7 @@ class ProjectWorkspaceWindow:
             action=action,
             item=item,
             project_dir=self.store.project_dir,
-            theme_colors=self._theme_colors or self._theme_tokens(),
+            style_colors=self._style_colors,
         )
         accepted, settings = dialog.exec()
         if not accepted:

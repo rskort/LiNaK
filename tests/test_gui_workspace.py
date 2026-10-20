@@ -38,8 +38,7 @@ from linak.gui.viewmodels import (
     suggested_actions_for_item,
     task_progress_label,
 )
-from linak.gui.styles import badge_style
-from linak.gui.theme import plot_like_theme_tokens, workspace_stylesheet
+from linak.gui.styles import badge_style, light_colors, workspace_stylesheet
 from linak.storage.hdf5_utils import write_linak_hdf5
 
 
@@ -330,18 +329,17 @@ def test_running_badge_style_changes_with_progress():
     assert half != done
 
 
-def test_project_workspace_uses_plot_gui_theme_switch_pattern():
+def test_project_workspace_uses_fixed_light_styling():
     source = Path("src/linak/gui/workspace.py").read_text(encoding="utf-8")
+    assert "apply_light_palette(self.window)" in source
+    assert "light_colors()" in source
+    assert "themeSwitch" not in source
+    assert "_theme_mode" not in source
+    assert "PaletteChange" not in source
 
-    assert 'self._theme_switch = QCheckBox("Dark mode")' in source
-    assert 'self._theme_switch.setObjectName("themeSwitch")' in source
-    assert 'self._theme_mode: ThemeMode = "system"' in source
-    assert '"dark" if checked else "light"' in source
-    assert "_gui_theme_mode" not in source
 
-
-def test_project_theme_tokens_and_stylesheet_match_plotting_gui_contract():
-    tokens = plot_like_theme_tokens(False)
+def test_project_light_colors_and_stylesheet_match_plotting_gui_contract():
+    tokens = light_colors()
     required = {
         "window_bg",
         "header_bg",
@@ -361,16 +359,16 @@ def test_project_theme_tokens_and_stylesheet_match_plotting_gui_contract():
 
     assert required <= set(tokens)
     stylesheet = workspace_stylesheet(tokens)
-    assert "QCheckBox#themeSwitch" in stylesheet
+    assert "QCheckBox#themeSwitch" not in stylesheet
     assert "QMessageBox" in stylesheet
 
 
-def test_running_badge_style_uses_theme_tokens():
-    dark = plot_like_theme_tokens(True)
-    style = badge_style("running", progress_fraction=0.5, colors=dark)
+def test_running_badge_style_uses_light_colors():
+    colors = light_colors()
+    style = badge_style("running", progress_fraction=0.5, colors=colors)
 
-    assert dark["accent"] in style
-    assert dark["accent_hover"] in style
+    assert colors["accent"] in style
+    assert colors["accent_hover"] in style
     assert "progress 50%" in style
 
 

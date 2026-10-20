@@ -266,6 +266,31 @@ def species_selector_raw_label(species: str) -> str:
     return token
 
 
+def species_mapping_label(species: str | None) -> str:
+    """Return the element or molecular group used by GUI species mappings.
+
+    Raw atom labels remain distinct analysis selections, but their GUI mapping
+    control belongs to the element inferred from that label. Molecular O/H
+    topology selections retain their canonical molecule label.
+    """
+
+    token = "" if species is None else str(species).strip()
+    if not token or token == "UNKNOWN":
+        return token or "UNKNOWN"
+    try:
+        mode, normalized = normalize_species_query(
+            token,
+            allow_h2o=True,
+            allow_molecules=True,
+        )
+    except ValueError:
+        return token
+    if mode != "species":
+        return normalized
+    element = infer_element_from_raw_label(species_selector_raw_label(normalized))
+    return element or normalized
+
+
 def select_species_indices(frame: Atoms, species: str) -> np.ndarray:
     """Return atom indices for one normalized species selection."""
     if species == "ALL":

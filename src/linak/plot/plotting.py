@@ -134,8 +134,8 @@ def _apply_plot_grid(
     properties prevents a saved false state from being reversed on rerender.
     """
 
+    ax.grid(False, which="both", axis="both")
     if not style.grid:
-        ax.grid(False, which="both", axis="both")
         return
     resolved_grid_kwargs: dict[str, Any] = {
         "linestyle": style.grid_linestyle,
@@ -1799,6 +1799,90 @@ def _apply_minor_tick_modes(
         ax.tick_params(axis="y", which="minor", left=False, right=False)
 
 
+def _update_legend(
+    ax: Any,
+    *,
+    style: PlotStyle,
+    enabled: bool | None = None,
+    title: str | None = None,
+    location: str = "best",
+    options: dict[str, Any] | None = None,
+    artist_order: Sequence[Any] | None = None,
+) -> Any:
+    """Rebuild legend proxies from current artists using the shared presentation policy."""
+    handles, labels = ax.get_legend_handles_labels()
+
+    def visible(handle):
+        getter = getattr(handle, "get_visible", None)
+        if callable(getter):
+            return bool(getter())
+        return any(child.get_visible() for child in handle.get_children())
+
+    pairs = [(h, label) for h, label in zip(handles, labels) if visible(h)]
+    if artist_order is not None:
+        ranks = {id(artist): i for i, artist in enumerate(artist_order)}
+        pairs.sort(key=lambda pair: ranks.get(id(pair[0]), len(ranks)))
+    old = ax.get_legend()
+    if not pairs or enabled is False:
+        if old is not None:
+            old.remove()
+        return None
+    kwargs: dict[str, Any] = {"fontsize": style.legend_font_size, "title": title, "loc": location}
+    kwargs.update(options or {})
+    if "ncols" in kwargs and "ncol" not in kwargs:
+        kwargs["ncol"] = kwargs["ncols"]
+    kwargs.setdefault("handles", [h for h, _ in pairs])
+    kwargs.setdefault("labels", [label for _, label in pairs])
+    legend = ax.legend(**kwargs)
+    for text in legend.get_texts():
+        text.set_color(style.font_color)
+        if not kwargs.get("prop"):
+            text.set_fontfamily(style.font_family)
+    legend.get_title().set_color(style.font_color)
+    if not kwargs.get("title_fontproperties"):
+        legend.get_title().set_fontfamily(style.font_family)
+    return legend
+
+
+def _line_artist_kwargs(
+    *,
+    style: PlotStyle,
+    label: str,
+    show_in_legend: bool,
+    markers: bool | None,
+    color: Any = None,
+    width: Any = None,
+    marker: Any = None,
+    global_options: dict[str, Any] | None = None,
+    layer_options: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    from matplotlib.cbook import normalize_kwargs
+    from matplotlib.lines import Line2D
+
+    kwargs = {"linewidth": style.line_width, "marker": "o" if markers else ""}
+    if width not in {None, ""}:
+        kwargs["linewidth"] = float(width)
+    if marker is not None:
+        kwargs["marker"] = str(marker)
+    if color:
+        kwargs["color"] = color
+    for options in (global_options, layer_options):
+        kwargs.update(normalize_kwargs(dict(options or {}), Line2D))
+    kwargs["label"] = label if show_in_legend else "_nolegend_"
+    return kwargs
+
+
+def _visible_major_ticks(axis: Any) -> list[float]:
+    """Return locator positions inside the displayed interval, including reversed axes."""
+    lower, upper = sorted(axis.get_view_interval())
+    tolerance = max(abs(lower), abs(upper), 1.0) * 1e-12
+    return [
+        float(value)
+        for value in axis.get_majorticklocs()
+        if np.isfinite(value) and lower - tolerance <= value <= upper + tolerance
+    ]
+
+
 def _capture_plot_state(
     *,
     ax: Any,
@@ -1810,6 +1894,7 @@ def _capture_plot_state(
     grid_kwargs: dict[str, Any] | None = None,
     capture_state: dict[str, Any] | None,
     annotation_summaries: list[dict[str, Any]] | None = None,
+    legend_options: Mapping[str, Any] | None = None,
 ) -> None:
     if capture_state is None:
         return
@@ -1829,7 +1914,7 @@ def _capture_plot_state(
     except Exception:
         facecolor_value = str(figure.get_facecolor())
     first_line = ax.lines[0] if getattr(ax, "lines", None) else None
-    legend_kwargs = None
+    legend_kwargs = dict(legend_options) if legend_options else None
     if legend is not None:
         legend_title_fontsize = None
         title_obj = legend.get_title()
@@ -1839,6 +1924,7 @@ def _capture_plot_state(
             except (TypeError, ValueError):
                 legend_title_fontsize = None
         legend_kwargs = {
+            **(legend_kwargs or {}),
             "frameon": bool(legend.get_frame_on()),
             "ncols": int(getattr(legend, "_ncols", 1)),
         }
@@ -1880,8 +1966,8 @@ def _capture_plot_state(
             "y_scale": str(ax.get_yscale()),
             "x_lim": _to_float_list(ax.get_xlim()),
             "y_lim": _to_float_list(ax.get_ylim()),
-            "x_ticks": _to_float_list(ax.get_xticks()),
-            "y_ticks": _to_float_list(ax.get_yticks()),
+            "x_ticks": _visible_major_ticks(ax.xaxis),
+            "y_ticks": _visible_major_ticks(ax.yaxis),
             "ticks": bool(
                 any(label.get_visible() for label in ax.get_xticklabels() + ax.get_yticklabels())
             ),
@@ -2894,6 +2980,11 @@ def plot_heatmap_series(
                 save_kwargs.update(dict(savefig_kwargs))
             save_kwargs.setdefault("dpi", style.dpi)
             fig.savefig(output_path, **save_kwargs)
+            if capture_state is not None:
+                capture_state.update(
+                    x_ticks=_visible_major_ticks(ax.xaxis),
+                    y_ticks=_visible_major_ticks(ax.yaxis),
+                )
             if not suppress_output_log:
                 LOGGER.info("Saved plot to '%s'.", output_path)
 
@@ -3304,6 +3395,8 @@ def plot_multi_line_series(
         source_bin_widths: dict[str, float | None] = {}
         masked_bin_counts: dict[str, int] = {}
         plotted_xy_series: list[dict[str, Any]] = []
+        series_artists: dict[str, Any] = {}
+        legend_artist_order: list[Any] = []
         visible_x_series: list[np.ndarray] = []
         visible_y_series: list[np.ndarray] = []
         density_visible_x_series: list[np.ndarray] = []
@@ -3334,34 +3427,25 @@ def plot_multi_line_series(
             masked_bin_counts[fit_key] = int(prepared_item.masked_bin_count)
             layer_enabled = bool(item.get("series_enabled", True))
             line_visible = bool(item.get("line_visible", True))
-            kwargs: dict[str, Any] = {
-                "lw": style.line_width,
-                "label": label if bool(item.get("show_in_legend", True)) else "_nolegend_",
-            }
-            raw_line_width = item.get("line_width")
-            if raw_line_width not in {None, ""}:
-                kwargs["lw"] = float(str(raw_line_width))
-            marker_value = "o" if markers else ""
-            if item.get("marker") is not None:
-                marker_value = str(item["marker"])
-            kwargs["marker"] = marker_value
-            color_token = str(item.get("line_color") or "").strip()
-            if color_token:
-                kwargs["color"] = color_token
-            if line_kwargs is not None:
-                resolved_line_kwargs = dict(line_kwargs)
-                resolved_line_kwargs.pop("label", None)
-                kwargs.update(resolved_line_kwargs)
-            if item.get("line_kwargs") is not None:
-                resolved_item_line_kwargs = dict(item["line_kwargs"])
-                resolved_item_line_kwargs.pop("label", None)
-                kwargs.update(resolved_item_line_kwargs)
+            kwargs = _line_artist_kwargs(
+                style=style,
+                label=label,
+                show_in_legend=bool(item.get("show_in_legend", True)),
+                markers=markers,
+                color=item.get("line_color"),
+                width=item.get("line_width"),
+                marker=item.get("marker"),
+                global_options=line_kwargs,
+                layer_options=item.get("line_kwargs"),
+            )
             artist = None
             if line_visible:
                 (artist,) = ax.plot(x_values, y_values, **kwargs)
+                series_artists[fit_key] = artist
+                legend_artist_order.append(artist)
                 rendered_colors.append(str(artist.get_color()))
                 rendered_markers.append(str(artist.get_marker()))
-                rendered_labels.append(str(artist.get_label()))
+                rendered_labels.append(label)
                 visible_x_series.append(np.asarray(x_values, dtype=float))
                 visible_y_series.append(np.asarray(y_values, dtype=float))
                 plotted_xy_series.append(
@@ -3479,7 +3563,7 @@ def plot_multi_line_series(
                                 )
                             )
                             if prepared_item.error_config.style == "band":
-                                ax.fill_between(
+                                error_artist = ax.fill_between(
                                     x_values[finite_mask],
                                     y_values[finite_mask] - error_values[finite_mask],
                                     y_values[finite_mask] + error_values[finite_mask],
@@ -3490,7 +3574,7 @@ def plot_multi_line_series(
                                     else "_nolegend_",
                                 )
                             else:
-                                ax.errorbar(
+                                error_artist = ax.errorbar(
                                     x_values[finite_mask],
                                     y_values[finite_mask],
                                     yerr=error_values[finite_mask],
@@ -3499,13 +3583,14 @@ def plot_multi_line_series(
                                     elinewidth=float(
                                         artist.get_linewidth()
                                         if artist is not None
-                                        else kwargs["lw"]
+                                        else kwargs["linewidth"]
                                     ),
                                     capsize=2.0,
                                     label=error_label
                                     if prepared_item.error_config.show_in_legend
                                     else "_nolegend_",
                                 )
+                            legend_artist_order.append(error_artist)
                             has_visible_overlay_bounds = True
                             error_summaries[fit_key] = {
                                 "enabled": True,
@@ -3599,7 +3684,7 @@ def plot_multi_line_series(
                         else kwargs.get("color", style.line_color)
                     )
                     _fit_base_lw = float(
-                        artist.get_linewidth() if artist is not None else kwargs["lw"]
+                        artist.get_linewidth() if artist is not None else kwargs["linewidth"]
                     )
                     _fit_color_override = str(fit_config.get("fit_color") or "").strip() or None
                     _fit_alpha_override = fit_config.get("fit_alpha")
@@ -3625,11 +3710,12 @@ def plot_multi_line_series(
                             pass
                     elif artist is not None and artist.get_alpha() is not None:
                         fit_kwargs["alpha"] = float(artist.get_alpha())
-                    ax.plot(
+                    (fit_artist,) = ax.plot(
                         np.asarray(fit_summary.get("x_fit", []), dtype=float),
                         np.asarray(fit_summary.get("y_fit", []), dtype=float),
                         **fit_kwargs,
                     )
+                    legend_artist_order.append(fit_artist)
                     fit_x = np.asarray(fit_summary.get("x_fit", []), dtype=float)
                     fit_y = np.asarray(fit_summary.get("y_fit", []), dtype=float)
                     visible_x_series.append(fit_x)
@@ -3665,7 +3751,9 @@ def plot_multi_line_series(
                         if artist is not None
                         else kwargs.get("color", style.line_color)
                     )
-                    _base_lw = float(artist.get_linewidth() if artist is not None else kwargs["lw"])
+                    _base_lw = float(
+                        artist.get_linewidth() if artist is not None else kwargs["linewidth"]
+                    )
                     _base_ls = ":"
                     cumulative_kwargs: dict[str, Any] = {
                         "color": cumulative_config.color
@@ -3686,7 +3774,8 @@ def plot_multi_line_series(
                         cumulative_kwargs["alpha"] = float(cumulative_config.alpha)
                     elif artist is not None and artist.get_alpha() is not None:
                         cumulative_kwargs["alpha"] = float(artist.get_alpha())
-                    ax.plot(cumulative_x, cumulative_y, **cumulative_kwargs)
+                    (cumulative_artist,) = ax.plot(cumulative_x, cumulative_y, **cumulative_kwargs)
+                    legend_artist_order.append(cumulative_artist)
                     visible_x_series.append(np.asarray(cumulative_x, dtype=float))
                     visible_y_series.append(np.asarray(cumulative_y, dtype=float))
                     plotted_xy_series.append(
@@ -3711,21 +3800,15 @@ def plot_multi_line_series(
                 }
 
         handles, legend_labels = ax.get_legend_handles_labels()
-        should_show_legend = bool(handles) if legend is None else bool(legend and handles)
-        if should_show_legend:
-            resolved_legend_kwargs: dict[str, Any] = {
-                "fontsize": style.legend_font_size,
-                "title": legend_title,
-                "loc": legend_loc,
-            }
-            if legend_kwargs is not None:
-                resolved_legend_kwargs.update(dict(legend_kwargs))
-            if "ncols" in resolved_legend_kwargs and "ncol" not in resolved_legend_kwargs:
-                resolved_legend_kwargs["ncol"] = resolved_legend_kwargs["ncols"]
-            legend_obj = ax.legend(**resolved_legend_kwargs)
-            for text in legend_obj.get_texts():
-                text.set_color(style.font_color)
-            legend_obj.get_title().set_color(style.font_color)
+        _update_legend(
+            ax,
+            style=style,
+            enabled=legend,
+            title=legend_title,
+            location=legend_loc,
+            options=legend_kwargs,
+            artist_order=legend_artist_order,
+        )
         auto_x_lim, auto_y_lim = _axes_artist_auto_limits(ax)
         requested_x_window = (
             x_lim if x_lim is not None and any(bound is not None for bound in x_lim[:2]) else None
@@ -3813,6 +3896,8 @@ def plot_multi_line_series(
                 color=style.font_color,
                 pad=style.title_pad,
             )
+        ax.set_xscale(x_scale)
+        ax.set_yscale(y_scale)
         ax.tick_params(axis="both", labelsize=style.tick_font_size, colors=style.font_color)
         resolved_tick_params_kwargs, tick_axis_hint, minor_ticks_mode = _extract_tick_controls(
             tick_params_kwargs
@@ -3861,8 +3946,6 @@ def plot_multi_line_series(
             tick_params_kwargs=tick_params_kwargs,
             fallback_mode=minor_ticks_mode,
         )
-        ax.set_xscale(x_scale)
-        ax.set_yscale(y_scale)
         if x_ticks is not None:
             ax.set_xticks([float(value) for value in x_ticks])
         if y_ticks is not None:
@@ -3893,11 +3976,14 @@ def plot_multi_line_series(
             line_labels=rendered_labels or legend_labels,
             line_markers=rendered_markers,
             legend_loc=legend_loc,
+            legend_options=legend_kwargs,
             grid_kwargs=grid_kwargs,
             capture_state=capture_state,
             annotation_summaries=annotation_summaries,
         )
         if capture_state is not None:
+            capture_state["series_artists"] = series_artists
+            capture_state["legend_artist_order"] = legend_artist_order
             capture_state["series_fit_summaries"] = fit_summaries
             capture_state["series_cumulative_summaries"] = cumulative_summaries
             capture_state["series_statistics"] = series_stats
@@ -3922,6 +4008,11 @@ def plot_multi_line_series(
                 save_kwargs.update(dict(savefig_kwargs))
             save_kwargs.setdefault("dpi", style.dpi)
             fig.savefig(output_path, **save_kwargs)
+            if capture_state is not None:
+                capture_state.update(
+                    x_ticks=_visible_major_ticks(ax.xaxis),
+                    y_ticks=_visible_major_ticks(ax.yaxis),
+                )
             if not suppress_output_log:
                 LOGGER.info("Saved plot to '%s'.", output_path)
 

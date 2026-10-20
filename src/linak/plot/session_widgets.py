@@ -6,13 +6,13 @@ Imported only by the GUI launcher, keeping Qt optional for CLI use.
 from __future__ import annotations
 
 import logging
+import json
 import math
 import re
-from collections.abc import Callable
 from typing import Any
 
 from PySide6.QtCore import QEvent, QObject, QPointF, QSize, QTimer, Qt, Signal
-from PySide6.QtGui import QColor, QPainter, QPen
+from PySide6.QtGui import QColor, QFontDatabase, QPainter, QPen, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
     QHBoxLayout,
@@ -27,6 +27,93 @@ from PySide6.QtWidgets import (
 from .session_log import SessionLog, SessionMessage
 
 
+class JsonOptionsEditor(QWidget):
+    """An optional JSON object with local validation and reversible editing aids."""
+
+    def __init__(self, description: str, example: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.example = example
+        self.is_valid = True
+        self.setMinimumWidth(0)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 8)
+        layout.setSpacing(6)
+        explanation = QLabel(description, self)
+        explanation.setWordWrap(True)
+        explanation.setObjectName("sectionNote")
+        layout.addWidget(explanation)
+        self.editor = QPlainTextEdit(self)
+        self.editor.setFixedHeight(100)
+        self.editor.setPlaceholderText(example)
+        self.editor.setFont(QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont))
+        self.editor.setTabStopDistance(self.editor.fontMetrics().horizontalAdvance(" ") * 4)
+        self.editor.setMinimumWidth(0)
+        layout.addWidget(self.editor)
+        actions = QHBoxLayout()
+        actions.setSpacing(6)
+        self.format_button = QPushButton("Format JSON", self)
+        self.format_button.setToolTip("Indent this JSON object. Its values stay the same.")
+        self.format_button.clicked.connect(self.format_json)
+        self.example_button = QPushButton("Use example", self)
+        self.example_button.setToolTip("Insert the example into an empty field.\n" + example)
+        self.example_button.clicked.connect(self.use_example)
+        self.clear_button = QPushButton("Clear", self)
+        self.clear_button.setToolTip("Clear this field. You can undo this edit with Ctrl+Z.")
+        self.clear_button.clicked.connect(lambda: self._replace_text(""))
+        for button in (self.format_button, self.example_button, self.clear_button):
+            actions.addWidget(button)
+        actions.addStretch(1)
+        layout.addLayout(actions)
+        self.validation_label = QLabel(self)
+        self.validation_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.validation_label.setWordWrap(True)
+        self.validation_label.setAccessibleName("JSON validation")
+        layout.addWidget(self.validation_label)
+        self.editor.textChanged.connect(self.validate)
+        self.validate()
+
+    def validate(self) -> None:
+        raw = self.editor.toPlainText().strip()
+        self.is_valid = False
+        try:
+            value = json.loads(raw) if raw else {}
+            if not isinstance(value, dict):
+                raise ValueError('Use a JSON object: {"option": value}.')
+        except json.JSONDecodeError as error:
+            message = f"Line {error.lineno}, column {error.colno}: {error.msg}"
+        except ValueError as error:
+            message = str(error)
+        else:
+            self.is_valid = True
+            count = len(value)
+            message = (
+                f"{count} option{'s' if count != 1 else ''} configured"
+                if count
+                else "No extra options"
+            )
+        self.validation_label.setText(message)
+        self.validation_label.setStyleSheet("" if self.is_valid else "color: #b91c1c;")
+        self.format_button.setEnabled(self.is_valid and bool(raw))
+        self.example_button.setEnabled(not raw)
+        self.clear_button.setEnabled(bool(raw))
+
+    def _replace_text(self, text: str) -> None:
+        cursor = self.editor.textCursor()
+        cursor.beginEditBlock()
+        cursor.select(QTextCursor.SelectionType.Document)
+        cursor.insertText(text)
+        cursor.endEditBlock()
+        self.editor.setTextCursor(cursor)
+
+    def format_json(self) -> None:
+        if self.is_valid and self.editor.toPlainText().strip():
+            self._replace_text(json.dumps(json.loads(self.editor.toPlainText()), indent=2))
+
+    def use_example(self) -> None:
+        if not self.editor.toPlainText().strip():
+            self._replace_text(self.example)
+
+
 class SessionFooter(QLabel):
     activated = Signal()
 
@@ -36,7 +123,6 @@ class SessionFooter(QLabel):
         self._message = ""
         self._display = ""
         self._level = logging.INFO
-        self._dark = False
         self.setTextFormat(Qt.TextFormat.PlainText)
         self.setWordWrap(False)
         self.setMinimumWidth(0)
@@ -80,18 +166,12 @@ class SessionFooter(QLabel):
         )
         self._elide()
 
-    def set_dark(self, dark: bool) -> None:
-        self._dark = dark
-        self._elide()
-
     def _elide(self) -> None:
         # One plain-text line, including messages containing HTML or newlines.
         color = (
-            ("#f87171" if self._dark else "#b91c1c")
+            "#b91c1c"
             if self._level >= logging.ERROR
-            else (
-                ("#fbbf24" if self._dark else "#92400e") if self._level >= logging.WARNING else ""
-            )
+            else ("#92400e" if self._level >= logging.WARNING else "")
         )
         self.setStyleSheet(f"color: {color};" if color else "")
         available = max(0, self.contentsRect().width() - 12)
@@ -207,10 +287,9 @@ class SessionDiagnostics(QObject):
 class PreviewLoadingOverlay(QWidget):
     """Dim retained content and animate a small spinner only during rendering."""
 
-    def __init__(self, target: QWidget, is_dark: Callable[[], bool]) -> None:
+    def __init__(self, target: QWidget) -> None:
         super().__init__(target)
         self._target = target
-        self._is_dark = is_dark
         self._active = False
         self._angle = 0
         self.delay = QTimer(self)
@@ -262,11 +341,10 @@ class PreviewLoadingOverlay(QWidget):
 
     def paintEvent(self, event: Any) -> None:
         painter = QPainter(self)
-        dark = self._is_dark()
-        background = QColor("#101827" if dark else "#ffffff")
+        background = QColor("#ffffff")
         background.setAlpha(170)
         painter.fillRect(self.rect(), background)
-        foreground = QColor("#e5e7eb" if dark else "#334155")
+        foreground = QColor("#334155")
         center_x, center_y = self.width() // 2, self.height() // 2 - 12
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         for index in range(12):

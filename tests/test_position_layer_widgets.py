@@ -16,8 +16,7 @@ from PySide6.QtWidgets import QApplication, QPushButton
 from linak.plot.plot_gui import launch_plot_settings_panel
 
 
-@pytest.mark.parametrize("dark", [False, True])
-def test_position_layer_browser_visibility_style_and_history(monkeypatch, tmp_path, dark):
+def test_position_layer_browser_visibility_style_and_history(monkeypatch, tmp_path):
     app = QApplication.instance() or QApplication([])
     if os.name == "nt" and not QFontDatabase.families():
         QFontDatabase.addApplicationFont("C:/Windows/Fonts/segoeui.ttf")
@@ -55,8 +54,6 @@ def test_position_layer_browser_visibility_style_and_history(monkeypatch, tmp_pa
             monkeypatch.setattr(
                 window, "_schedule_or_apply_series_preview_update", lambda **kw: None
             )
-            window._theme_mode = "dark" if dark else "light"
-            window._apply_theme_styles()
             window.resize(1100, 720)
             for row in range(window._nav_list.count()):
                 if window._nav_list.item(row).text() == "Layers":
@@ -184,13 +181,14 @@ def test_position_layer_browser_visibility_style_and_history(monkeypatch, tmp_pa
                 not window._series_enabled_data[index]
                 for index in window._series_species_members["Pt"]
             )
-            # Real Qt layout and painting, including narrower panels in both themes.
+            # Real Qt layout and painting, including narrower panels.
             for width in (1100, 900):
                 window.resize(width, 720)
                 application.processEvents()
                 assert browser.isVisible()
-                assert window._layers_splitter.count() == 2
-                assert window.grab().save(str(tmp_path / f"layers_{dark}_{width}.png"))
+                assert window._layers_scroll.widget() is window._tab_series_content
+                assert window._layer_browser_section.is_expanded()
+                assert window.grab().save(str(tmp_path / f"layers_{width}.png"))
             checked.append(True)
         finally:
             window._saved_signature = window._signature(window._collect_settings())

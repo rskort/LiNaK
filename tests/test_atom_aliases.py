@@ -11,6 +11,7 @@ from linak.analysis.common import (
     normalize_species_query,
     raw_species_labels,
     select_species_indices,
+    species_mapping_label,
 )
 from linak.analysis.water import oh_molecule_topology
 from linak.trajectory.io import read_trajectory, write_trajectory
@@ -93,3 +94,13 @@ def test_grouped_raw_species_only_exposes_split_elements():
 
     assert grouped_raw_species_for_split_elements([frame]) == ["Pt", "Pt_top"]
     assert select_species_indices(frame, "species:O").tolist() == [2]
+
+
+def test_species_mapping_groups_raw_labels_by_element_but_not_molecules():
+    assert species_mapping_label("Pt") == "Pt"
+    assert species_mapping_label("species:Pt") == "Pt"
+    assert species_mapping_label("species:Pt_top") == "Pt"
+    assert species_mapping_label("species:Ow") == "O"
+    assert species_mapping_label("mol:H") == "mol:H"
+    assert species_mapping_label("H2O") == "mol:H2O"
+    assert species_mapping_label("mol:OH") == "mol:OH"

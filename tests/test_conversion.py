@@ -240,3 +240,145 @@ def test_conversion_registry_describe_plan_reports_family_and_target(tmp_path):
 
     assert any("source family: trajectory" in line for line in plan)
     assert any("target file type: trajectory_hdf5" in line for line in plan)
+
+
+@pytest.mark.parametrize("select, expected_frames", [(None, 2), ("first:0.001ps", 1)])
+def test_convert_cli_explicit_timestep_without_input_is_stored_and_used_by_position(
+    tmp_path, select, expected_frames
+):
+    from linak.cli import main
+    from linak.analysis.position import load_position_profile
+    from linak.trajectory.io import read_trajectory_hdf5_metadata
+
+    source = tmp_path / "trajectory.xyz"
+    target = tmp_path / "trajectory.traj.h5"
+    _write_xyz(source)
+    arguments = [
+        "--log-level",
+        "ERROR",
+        "apply",
+        "convert",
+        str(source),
+        "--timestep",
+        "2.5",
+        "--output",
+        str(target),
+    ]
+    if select is not None:
+        arguments.extend(["--select", select])
+    assert main(arguments) == 0
+    metadata = read_trajectory_hdf5_metadata(target)
+    assert metadata is not None
+    assert metadata.frame_timestep_fs == 2.5
+    assert metadata.timestep_source == "explicit --timestep"
+    assert metadata.md_timestep_fs is None and metadata.trajectory_stride_md is None
+    frames = read_trajectory(target)
+    assert len(frames) == expected_frames
+    assert [frame.info["time_fs"] for frame in frames] == [2.5 * i for i in range(expected_frames)]
+    if select is None:
+        output = tmp_path / "result.position.h5"
+        assert (
+            main(
+                [
+                    "--log-level",
+                    "ERROR",
+                    "compute",
+                    "position",
+                    str(target),
+                    "--species",
+                    "O",
+                    "--output",
+                    str(output),
+                ]
+            )
+            == 0
+        )
+        np.testing.assert_array_equal(load_position_profile(output).time_fs, [0.0, 2.5])
+
+
+def test_convert_explicit_timestep_overrides_stored_timing_without_being_skipped(tmp_path):
+    from linak.cli import main
+    from linak.trajectory.io import TrajectoryStoredMetadata, read_trajectory_hdf5_metadata
+
+    source = tmp_path / "trajectory.traj.h5"
+    frames = [
+        Atoms(
+            "O",
+            positions=[[0, 0, 0]],
+            info={
+                "time_fs": 10 + index,
+                "frame_timestep_fs": 1,
+                "md_timestep_fs": 0.5,
+                "trajectory_stride_md": 2,
+            },
+        )
+        for index in range(2)
+    ]
+    write_trajectory(
+        frames,
+        source,
+        metadata=TrajectoryStoredMetadata(
+            frame_timestep_fs=1, md_timestep_fs=0.5, trajectory_stride_md=2
+        ),
+    )
+    assert main(["--log-level", "ERROR", "apply", "convert", str(source), "--timestep", "2.5"]) == 0
+    metadata = read_trajectory_hdf5_metadata(source)
+    assert metadata is not None and metadata.frame_timestep_fs == 2.5
+    assert metadata.md_timestep_fs is None and metadata.trajectory_stride_md is None
+    result = read_trajectory(source)
+    assert [frame.info["time_fs"] for frame in result] == [10, 12.5]
+    assert all(
+        "md_timestep_fs" not in frame.info and "trajectory_stride_md" not in frame.info
+        for frame in result
+    )
+
+
+def test_convert_explicit_timestep_dry_run_does_not_read_payload(tmp_path, monkeypatch, capsys):
+    from linak.cli import main
+
+    source = tmp_path / "trajectory.xyz"
+    target = tmp_path / "result.traj.h5"
+    _write_xyz(source)
+
+    def unexpected_read(*args, **kwargs):
+        raise AssertionError("dry run must not read trajectory payload")
+
+    monkeypatch.setattr("linak.trajectory.io.read_trajectory", unexpected_read)
+    assert (
+        main(
+            [
+                "apply",
+                "convert",
+                str(source),
+                "--timestep",
+                "2.5",
+                "--output",
+                str(target),
+                "--dry-run",
+            ]
+        )
+        == 0
+    )
+    out, err = capsys.readouterr()
+    assert not out
+    assert "explicit --timestep (frame=2.5 fs)" in err
+    assert not target.exists()
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "nan", "inf"])
+def test_convert_cli_rejects_invalid_timestep(value):
+    from linak.cli import build_parser
+
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["apply", "convert", "trajectory.xyz", "--timestep", value])
+    with pytest.raises(ValueError, match="timestep must be finite"):
+        TrajectoryConversionOptions(timestep_fs=float(value))
+
+
+def test_convert_rejects_timestep_for_cube_input(tmp_path, capsys):
+    from linak.cli import main
+
+    source = tmp_path / "volume.cube"
+    _write_cube(source)
+    assert main(["apply", "convert", str(source), "--timestep", "2.5"]) != 0
+    assert "--timestep is supported for trajectory conversion only" in capsys.readouterr().err

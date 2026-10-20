@@ -70,6 +70,7 @@ class TemperatureMetadata:
     atom_symbols: tuple[str, ...] = ()
     input_path: Path | None = None
     label_resolution_status: str = "unresolved"
+    region_resolution_issue: str | None = None
 
 
 @dataclass(frozen=True)
@@ -101,12 +102,12 @@ class TemperatureProfile:
 
 
 def _strip_inline_comment(line: str) -> str:
-    return line.split("!", 1)[0].strip()
+    return line.split("!", 1)[0].split("#", 1)[0].strip()
 
 
 def _parse_cp2k_list_expression(expression: str) -> tuple[int, ...]:
     indices: list[int] = []
-    for token in re.split(r"[\s,]+", str(expression).strip()):
+    for token in re.split(r"[\s,]+", _strip_inline_comment(str(expression))):
         if not token:
             continue
         match = _INT_RANGE_RE.match(token)
@@ -349,15 +350,18 @@ def discover_temperature_metadata(
     regions: tuple[TemperatureRegion, ...] = ()
     fixed_indices: tuple[int, ...] = ()
     status = "generic"
+    region_issue = "no CP2K input file was found"
     if resolved_input is not None and resolved_input.exists():
         try:
             kinds, parsed_regions, fixed_indices = _parse_cp2k_input(resolved_input)
             input_elements = tuple(kinds)
             regions = tuple(parsed_regions)
             status = "resolved"
+            region_issue = f"CP2K input '{resolved_input}' contains no usable region definitions"
         except OSError as exc:
-            LOGGER.warning("Could not read CP2K input '%s': %s", resolved_input, exc)
-            resolved_input = None
+            region_issue = f"CP2K input '{resolved_input}' could not be read: {exc}"
+    elif resolved_input is not None:
+        region_issue = f"CP2K input '{resolved_input}' does not exist"
 
     if atom_symbols is None:
         if source_path.suffix.lower() == ".xyz":
@@ -390,15 +394,35 @@ def discover_temperature_metadata(
         atom_symbols=tuple(atom_symbols),
         input_path=resolved_input,
         label_resolution_status=status,
+        region_resolution_issue=None
+        if any(region.atom_indices for region in regions)
+        else region_issue,
     )
+
+
+def _warn_missing_temperature_regions(
+    metadata: TemperatureMetadata, source: Path, *, behavior: str
+) -> bool:
+    """Report missing regions once at the actual computation boundary."""
+    if any(region.atom_indices for region in metadata.regions):
+        return False
+    reason = metadata.region_resolution_issue or "no usable region definitions were resolved"
+    LOGGER.warning(
+        "Temperature regions unavailable for '%s': %s. %s "
+        "Provide a CP2K input with region definitions using --input.",
+        source.name,
+        reason,
+        behavior,
+    )
+    return True
 
 
 def _read_numeric_table(path: str | Path, *, skip_comments: bool) -> np.ndarray:
     rows: list[list[float]] = []
     with Path(path).expanduser().resolve().open("r", encoding="utf-8", errors="replace") as handle:
         for line in handle:
-            stripped = line.strip()
-            if not stripped or (skip_comments and stripped.startswith("#")):
+            stripped = line.split("#", 1)[0].strip() if skip_comments else line.strip()
+            if not stripped:
                 continue
             try:
                 rows.append([float(part) for part in stripped.split()])
@@ -472,10 +496,16 @@ def compute_temperature_from_temp(
     source_path = Path(source).expanduser().resolve()
     table = _read_numeric_table(source_path, skip_comments=True)
     metadata = metadata or discover_temperature_metadata(source_path)
+    missing_regions = _warn_missing_temperature_regions(
+        metadata,
+        source_path,
+        behavior="Only element/kind temperatures are available; unresolved kinds use generic labels.",
+    )
     value_count = table.shape[1] - 2
     labels = list(metadata.elements)
     if len(labels) < value_count:
-        LOGGER.warning("Could not resolve all .temp labels; using generic kind labels.")
+        if not missing_regions:
+            LOGGER.warning("Could not resolve all .temp labels; using generic kind labels.")
         labels.extend(f"kind {index + 1}" for index in range(len(labels), value_count))
     return [
         _profile_from_table_column(
@@ -503,10 +533,16 @@ def compute_temperature_from_tregion(
     source_path = Path(source).expanduser().resolve()
     table = _read_numeric_table(source_path, skip_comments=True)
     metadata = metadata or discover_temperature_metadata(source_path)
+    missing_regions = _warn_missing_temperature_regions(
+        metadata,
+        source_path,
+        behavior="Temperature table columns retain generic region labels.",
+    )
     value_count = table.shape[1] - 2
     regions = list(metadata.regions)
     if len(regions) < value_count:
-        LOGGER.warning("Could not resolve all .tregion labels; using generic region labels.")
+        if not missing_regions:
+            LOGGER.warning("Could not resolve all .tregion labels; using generic region labels.")
         for index in range(len(regions), value_count):
             regions.append(
                 TemperatureRegion(
@@ -625,10 +661,25 @@ def compute_temperature_from_velocity_xyz(
         atom_symbols=frames[0][2],
     )
     normalized_group = str(group_by or "auto").strip().lower()
-    if normalized_group == "auto":
-        normalized_group = "both" if metadata.regions else "elements"
-    if normalized_group not in {"elements", "regions", "both"}:
+    if normalized_group not in {"auto", "elements", "regions", "both"}:
         raise ValueError("group_by must be one of auto, elements, regions, or both.")
+    missing_regions = _warn_missing_temperature_regions(
+        metadata,
+        source_path,
+        behavior=(
+            "Region-only temperatures cannot be computed."
+            if normalized_group == "regions"
+            else "Computing element temperatures only."
+        ),
+    )
+    if missing_regions:
+        if normalized_group == "regions":
+            raise ValueError(
+                "No usable temperature regions; provide CP2K region definitions with --input."
+            )
+        normalized_group = "elements"
+    elif normalized_group == "auto":
+        normalized_group = "both"
     resolved_unit, factor = _velocity_factor(velocity_unit)
 
     first_symbols = frames[0][2]
@@ -643,9 +694,7 @@ def compute_temperature_from_velocity_xyz(
             selections.append(("element", element, element, None, indices))
     if normalized_group in {"regions", "both"}:
         regions = list(metadata.regions)
-        if not regions:
-            LOGGER.warning("No region metadata resolved for velocity input; using elements only.")
-        elif not any(region.region_formula for region in regions):
+        if not any(region.region_formula for region in regions):
             regions = list(_with_region_composition(regions, first_symbols))
         for region in regions:
             selections.append(

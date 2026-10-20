@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+from time import monotonic
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -18,7 +19,7 @@ from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QLabel, QWidget
 
 from linak.plot.session_log import SessionLog
-from linak.plot.session_widgets import PreviewLoadingOverlay, SessionDiagnostics
+from linak.plot.session_widgets import JsonOptionsEditor, PreviewLoadingOverlay, SessionDiagnostics
 
 
 @pytest.fixture
@@ -43,6 +44,49 @@ def diagnostics(app):
     parent.close()
     parent.deleteLater()
     app.processEvents()
+
+
+def test_json_options_editor_validation_examples_format_and_undo(app):
+    import json
+
+    options = JsonOptionsEditor("Extra legend spacing.", '{"borderpad": 0.8}')
+    try:
+        assert options.is_valid
+        assert options.validation_label.text() == "No extra options"
+        assert not options.format_button.isEnabled()
+        options.example_button.click()
+        assert json.loads(options.editor.toPlainText()) == {"borderpad": 0.8}
+        assert not options.example_button.isEnabled()
+        options.format_button.click()
+        assert options.editor.toPlainText() == '{\n  "borderpad": 0.8\n}'
+        options.editor.undo()
+        assert options.editor.toPlainText() == '{"borderpad": 0.8}'
+        options.clear_button.click()
+        assert options.editor.toPlainText() == ""
+        options.editor.undo()
+        assert json.loads(options.editor.toPlainText()) == {"borderpad": 0.8}
+        options.editor.setPlainText('{\n "borderpad": }')
+        assert not options.is_valid
+        assert "Line 2, column" in options.validation_label.text()
+        assert not options.format_button.isEnabled()
+        assert not options.example_button.isEnabled()
+        options.editor.setPlainText("[]")
+        assert not options.is_valid
+        assert "JSON object" in options.validation_label.text()
+        options.editor.setPlainText('{"borderpad": 1.0, "labelspacing": 0.5}')
+        assert options.is_valid
+        assert options.validation_label.text() == "2 options configured"
+        assert options.validation_label.styleSheet() == ""
+        options.resize(320, 250)
+        options.show()
+        app.processEvents()
+        assert options.width() == 320
+        for button in (options.format_button, options.example_button, options.clear_button):
+            assert button.geometry().right() <= options.width()
+    finally:
+        options.close()
+        options.deleteLater()
+        app.processEvents()
 
 
 def test_worker_order_newest_footer_and_full_history(app, diagnostics):
@@ -105,17 +149,19 @@ def test_history_preserves_scrolled_reading_position(app, diagnostics):
     assert scroll.value() == before
 
 
-@pytest.mark.parametrize("dark", [False, True])
-def test_overlay_delay_resize_repeated_render_and_cleanup(app, dark):
+def test_overlay_delay_resize_repeated_render_and_cleanup(app):
     target = QWidget()
     target.resize(500, 300)
     QLabel("Retained plot", target)
     target.show()
-    overlay = PreviewLoadingOverlay(target, lambda: dark)
+    overlay = PreviewLoadingOverlay(target)
     overlay.set_active(True)
     assert overlay.delay.isActive()
+    assert overlay.delay.interval() == 150
     assert not overlay.isVisible()
-    QTest.qWait(190)
+    deadline = monotonic() + 2.0
+    while not overlay.isVisible() and monotonic() < deadline:
+        QTest.qWait(10)
     assert overlay.isVisible()
     assert overlay.animation.isActive()
     overlay.set_active(True)
@@ -134,7 +180,7 @@ def test_overlay_delay_resize_repeated_render_and_cleanup(app, dark):
 def test_fast_render_never_displays_overlay(app):
     target = QWidget()
     target.show()
-    overlay = PreviewLoadingOverlay(target, lambda: False)
+    overlay = PreviewLoadingOverlay(target)
     overlay.set_active(True)
     overlay.set_active(False)
     QTest.qWait(180)
@@ -275,10 +321,7 @@ def test_setting_change_supersedes_render_and_stale_callbacks_preserve_latest(
     assert checked == [True]
 
 
-@pytest.mark.parametrize("dark", [False, True])
-def test_plot_window_logs_navigation_queued_render_detach_and_failure(
-    app, monkeypatch, dark, tmp_path
-):
+def test_plot_window_logs_navigation_queued_render_detach_and_failure(app, monkeypatch, tmp_path):
     from linak.plot.plot_gui import launch_plot_settings_panel
     import warnings
 
@@ -300,8 +343,6 @@ def test_plot_window_logs_navigation_queued_render_detach_and_failure(
             if widget.windowTitle() == "Session integration" and widget.isVisible()
         )
         try:
-            window._theme_mode = "dark" if dark else "light"
-            window._apply_theme_styles()
             window.resize(1100, 720)
             window._preview_timer.stop()
             retained = Figure(figsize=(5, 3))
@@ -330,9 +371,7 @@ def test_plot_window_logs_navigation_queued_render_detach_and_failure(
             QTest.qWait(180)
             overlay = window._active_preview_pane.loading_overlay
             assert overlay.isVisible()
-            assert window.grab().save(
-                str(tmp_path / ("dark_loading.png" if dark else "light_loading.png"))
-            )
+            assert window.grab().save(str(tmp_path / "loading.png"))
             # A stale finished render hands off to the queued replacement without
             # restarting the overlay's delay or stopping the spinner.
             generation = window._active_preview_generation
@@ -359,8 +398,8 @@ def test_plot_window_logs_navigation_queued_render_detach_and_failure(
             window._status_label.setText("Preview updated.")
             assert window._status_label.text() == "Preview updated."
             assert "ValueError" in window._session_diagnostics.viewer.toPlainText()
-            # Both themes and the narrow layout are exercised with real Qt painting.
-            assert window.grab().save(str(tmp_path / ("dark.png" if dark else "light.png")))
+            # The light appearance and narrow layout are exercised with real Qt painting.
+            assert window.grab().save(str(tmp_path / "session.png"))
             checked.append(True)
         finally:
             release.set()

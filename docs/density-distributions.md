@@ -103,7 +103,7 @@ Validation on this implementation: **1,699 tests passed** in the complete Python
 3.12 suite. The 64 focused nearest-surface/distribution regressions also passed
 on Python 3.9, 3.10, 3.11, 3.13 and 3.14. Ruff lint/format checks and mypy over
 `src`, `tests` and `benchmarks` passed (157 Python files). Offscreen Qt checks
-exercise Studio controls and light/dark layouts. Existing dependency deprecation
+exercise Studio controls and narrow layouts. Existing dependency deprecation
 warnings remain; they are not test failures.
 
 Nearest-distance distributions deliberately do not represent volume density or

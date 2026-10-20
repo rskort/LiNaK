@@ -2921,6 +2921,7 @@ def estimate_surface_layout_reference(
     logger: logging.Logger | None = None,
     _summary_source: str = "computed",
     _report_progress: bool = False,
+    _log_summary: bool = True,
 ) -> SurfaceReference:
     """Resolve a single- or double-sided slab reference."""
 
@@ -3167,11 +3168,12 @@ def estimate_surface_layout_reference(
             **({"layout_contact": contact} if requested == "auto" else {}),
         },
     )
-    log_surface_reference_summary(
-        resolved_reference,
-        logger=active_logger,
-        source=_summary_source,
-    )
+    if _log_summary:
+        log_surface_reference_summary(
+            resolved_reference,
+            logger=active_logger,
+            source=_summary_source,
+        )
     return resolved_reference
 
 

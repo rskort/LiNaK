@@ -132,6 +132,13 @@ class TrajectoryConversionOptions:
     surface_elements: tuple[str, ...] | None = None
     include_fixed_surface_atoms: bool | None = None
     surface_layout: str | None = None
+    timestep_fs: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.timestep_fs is not None and (
+            not np.isfinite(self.timestep_fs) or self.timestep_fs <= 0
+        ):
+            raise ValueError("Conversion timestep must be finite and greater than zero (fs).")
 
 
 @dataclass(frozen=True)
@@ -1000,6 +1007,27 @@ def _collect_trajectory_conversion_metadata(
     return metadata, metadata_notes
 
 
+def _conversion_metadata_with_timestep(
+    metadata: Any | None, options: TrajectoryConversionOptions | None, notes: list[str]
+) -> Any | None:
+    if options is None or options.timestep_fs is None:
+        return metadata
+    from dataclasses import replace
+    from .trajectory.io import TrajectoryStoredMetadata
+
+    interval = float(options.timestep_fs)
+    notes[:] = [note for note in notes if not note.startswith("timestep metadata:")]
+    notes.append(f"timestep metadata: explicit --timestep (frame={interval:.6g} fs)")
+    # A frame interval does not establish the original MD integration step or stride.
+    return replace(
+        metadata or TrajectoryStoredMetadata(),
+        frame_timestep_fs=interval,
+        md_timestep_fs=None,
+        trajectory_stride_md=None,
+        timestep_source="explicit --timestep",
+    )
+
+
 def _frames_have_usable_periodic_cell(frames: list[Any]) -> bool:
     if not frames:
         return False
@@ -1254,6 +1282,9 @@ def _describe_trajectory_conversion_plan(
             if options is None
             else (None if options.input_path is None else str(options.input_path)),
         )
+        stored_metadata = _conversion_metadata_with_timestep(
+            stored_metadata, options, metadata_notes
+        )
         plan.extend(
             [
                 "format marker: linak-trajectory-hdf5",
@@ -1268,6 +1299,8 @@ def _describe_trajectory_conversion_plan(
             )
         plan.extend(metadata_notes)
         return plan
+    if options is not None and options.timestep_fs is not None:
+        plan.append(f"frame interval: {options.timestep_fs:.6g} fs (explicit --timestep)")
     plan.extend(
         [
             "format marker: standard multi-frame trajectory file",
@@ -1302,6 +1335,23 @@ def _convert_trajectory_request(
             if options is None or options.input_path is None
             else str(options.input_path),
         )
+        stored_metadata = _conversion_metadata_with_timestep(
+            stored_metadata, options, metadata_notes
+        )
+        if options is not None and options.timestep_fs is not None:
+            interval = float(options.timestep_fs)
+            try:
+                origin = float(frames[0].info.get("time_fs", 0.0)) if frames else 0.0
+            except (TypeError, ValueError):
+                origin = 0.0
+            if not np.isfinite(origin):
+                origin = 0.0
+            for index, frame in enumerate(frames):
+                frame.info["frame_timestep_fs"] = interval
+                frame.info["time_fs"] = origin + index * interval
+                frame.info.pop("md_timestep_fs", None)
+                frame.info.pop("trajectory_stride_md", None)
+            LOGGER.info("Using explicit conversion frame interval: %.6g fs.", interval)
         preference = (
             {} if stored_metadata is None else stored_metadata.surface_distance_settings or {}
         )

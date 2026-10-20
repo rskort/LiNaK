@@ -1086,8 +1086,8 @@ class _ProgressAwareStreamHandler(logging.StreamHandler):
     def emit(self, record: logging.LogRecord) -> None:
         from .progress import ProgressBar
 
-        ProgressBar.prepare_for_external_write(self.stream)
-        super().emit(record)
+        with ProgressBar.external_write(self.stream):
+            super().emit(record)
 
 
 class _LiNaKConsoleFormatter(logging.Formatter):
@@ -3500,22 +3500,24 @@ def _build_density_profile_filter_options(
                 mode = axis_value if axis_value in {"x", "y", "z"} else "z"
             _add_axis_bin_width(mode, metadata.get("bin_width_A"))
             _add_mode(mode)
-    species_options = _deduplicate_density_species_options(species_options)
+    species_options = _group_density_mapping_species_options(species_options)
     allowed_species_options = {
         str(option.get("value") or "").strip()
         for option in species_options
         if str(option.get("value") or "").strip()
     }
     if allowed_species_options:
+        from .analysis.common import species_mapping_label
+
         heatmap_sources = [
             source
             for source in heatmap_sources
-            if str(source.get("species") or "").strip() in allowed_species_options
+            if species_mapping_label(str(source.get("species") or "")) in allowed_species_options
         ]
         grid_sources = [
             source
             for source in grid_sources
-            if str(source.get("species") or "").strip() in allowed_species_options
+            if species_mapping_label(str(source.get("species") or "")) in allowed_species_options
         ]
     payload = {}
     if available_modes:
@@ -3722,19 +3724,31 @@ def _deduplicate_grouped_density_species_labels(labels: Sequence[str]) -> list[s
     return kept
 
 
-def _deduplicate_density_species_options(
+def _group_density_mapping_species_options(
     species_options: list[dict[str, str]],
 ) -> list[dict[str, str]]:
-    allowed_labels = set(
-        _deduplicate_grouped_density_species_labels(
-            [str(option.get("value") or "") for option in species_options]
-        )
+    from .analysis.common import (
+        is_molecule_species_label,
+        molecule_display_label,
+        species_mapping_label,
     )
-    return [
-        dict(option)
-        for option in species_options
-        if str(option.get("value") or "").strip() in allowed_labels
-    ]
+
+    grouped: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for option in species_options:
+        value = species_mapping_label(str(option.get("value") or ""))
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        grouped.append(
+            {
+                "value": value,
+                "label": (
+                    molecule_display_label(value) if is_molecule_species_label(value) else value
+                ),
+            }
+        )
+    return grouped
 
 
 def _deduplicate_density_descriptor_segments_by_species(
@@ -11040,9 +11054,11 @@ def _gui_series_descriptors_from_settings(
 
 
 def _density_enabled_species_set(value: Any) -> set[str] | None:
+    from .analysis.common import species_mapping_label
+
     if not isinstance(value, (list, tuple, set)):
         return None
-    enabled = {str(item).strip() for item in value if str(item).strip()}
+    enabled = {species_mapping_label(str(item)) for item in value if str(item).strip()}
     return enabled
 
 
@@ -11054,13 +11070,15 @@ def _filter_density_descriptors_by_enabled_species(
     descriptors: list[dict[str, Any]],
     enabled_species_value: Any,
 ) -> list[dict[str, Any]]:
+    from .analysis.common import species_mapping_label
+
     enabled_species = _density_enabled_species_set(enabled_species_value)
     if enabled_species is None:
         return [dict(descriptor) for descriptor in descriptors]
     filtered: list[dict[str, Any]] = []
     for descriptor in descriptors:
         species = _density_descriptor_species(descriptor)
-        if species and species not in enabled_species:
+        if species and species_mapping_label(species) not in enabled_species:
             continue
         filtered.append(dict(descriptor))
     return filtered
@@ -11070,6 +11088,8 @@ def _filter_density_descriptor_segments_by_enabled_species(
     descriptor_segments_by_source: list[list[dict[str, Any]]],
     enabled_species_value: Any,
 ) -> list[list[dict[str, Any]]]:
+    from .analysis.common import species_mapping_label
+
     enabled_species = _density_enabled_species_set(enabled_species_value)
     if enabled_species is None:
         return [
@@ -11081,7 +11101,7 @@ def _filter_density_descriptor_segments_by_enabled_species(
             dict(descriptor)
             for descriptor in segment
             if not _density_descriptor_species(descriptor)
-            or _density_descriptor_species(descriptor) in enabled_species
+            or species_mapping_label(_density_descriptor_species(descriptor)) in enabled_species
         ]
         for segment in descriptor_segments_by_source
     ]
@@ -11091,6 +11111,8 @@ def _density_2d_single_species_from_segments(
     descriptor_segments_by_source: list[list[dict[str, Any]]],
     enabled_species_value: Any,
 ) -> str | None:
+    from .analysis.common import species_mapping_label
+
     available_species: list[str] = []
     available_set: set[str] = set()
     for segment in descriptor_segments_by_source:
@@ -11103,13 +11125,14 @@ def _density_2d_single_species_from_segments(
         return None
     if isinstance(enabled_species_value, (list, tuple)):
         for item in enabled_species_value:
-            species = str(item).strip()
-            if species in available_set:
-                return species
+            mapping_species = species_mapping_label(str(item))
+            for species in available_species:
+                if species_mapping_label(species) == mapping_species:
+                    return species
     enabled_species = _density_enabled_species_set(enabled_species_value)
     if enabled_species:
         for species in available_species:
-            if species in enabled_species:
+            if species_mapping_label(species) in enabled_species:
                 return species
     return available_species[0]
 
@@ -12673,8 +12696,8 @@ def build_parser() -> argparse.ArgumentParser:
     analysis_group.add_argument(
         "--cshe-offset-ev",
         type=float,
-        default=0.81,
-        help="cSHE offset in eV applied as U_cSHE = V_bulk - E_F - offset (default: 0.81).",
+        default=0.65,
+        help="cSHE offset in eV applied as U_cSHE = V_bulk - E_F - offset (default: 0.65).",
     )
     analysis_group.add_argument(
         "--surface-layout",
@@ -12895,6 +12918,16 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Optional simulation input file used to embed cell/timestep/fixed-atom metadata "
             "into the converted trajectory HDF5."
+        ),
+    )
+    apply_convert.add_argument(
+        "--timestep",
+        dest="timestep_fs",
+        type=_positive_float,
+        metavar="FS",
+        help=(
+            "Explicit interval between saved trajectory frames in femtoseconds; "
+            "overrides input/stored timing and is embedded in trajectory HDF5."
         ),
     )
     apply_convert.add_argument(
@@ -17762,6 +17795,7 @@ def _handle_apply_convert(args: argparse.Namespace) -> int:
         and request.source_path == request.target_path
         and request.source_file_type == request.target_file_type
         and getattr(args, "surface_distance_mode", None) is None
+        and args.timestep_fs is None
     ):
         LOGGER.info(
             "Conversion skipped: '%s' is already LiNaK's preferred %s working format.",
@@ -17783,6 +17817,7 @@ def _handle_apply_convert(args: argparse.Namespace) -> int:
             else None,
             surface_layout=getattr(args, "surface_layout", None),
             input_path=args.input,
+            timestep_fs=args.timestep_fs,
             cell=_normalize_cell_args(args),
             select=args.select,
             x_range=getattr(args, "x_range", None),
@@ -17795,6 +17830,8 @@ def _handle_apply_convert(args: argparse.Namespace) -> int:
             compression_profile=args.hdf5_compression,
         )
     else:
+        if args.timestep_fs is not None:
+            raise ValueError("--timestep is supported for trajectory conversion only.")
         if getattr(args, "surface_distance_mode", None) is not None:
             raise ValueError("--surface-distance-mode is supported for trajectory conversion only.")
         options = CubeConversionOptions(compression_profile=args.hdf5_compression)

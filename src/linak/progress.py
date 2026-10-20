@@ -9,6 +9,7 @@ from contextvars import ContextVar
 from collections.abc import Iterator
 import shutil
 import sys
+import threading
 import time
 from types import TracebackType
 from typing import TextIO
@@ -44,8 +45,9 @@ class ProgressBar:
 
     _SPINNER = ("|", "/", "-", "\\")
     _BRAND = "[LiNaK]"
-    _ACTIVE_BY_STREAM: dict[int, int] = {}
+    _ACTIVE_BY_STREAM: dict[int, list[ProgressBar]] = {}
     _LINE_OPEN_BY_STREAM: dict[int, bool] = {}
+    _WRITE_LOCK = threading.RLock()
 
     @staticmethod
     def _stream_is_tty(stream: TextIO) -> bool:
@@ -88,9 +90,8 @@ class ProgressBar:
 
     def __enter__(self) -> ProgressBar:
         if self.enabled:
-            self._ACTIVE_BY_STREAM[self._stream_id] = (
-                self._ACTIVE_BY_STREAM.get(self._stream_id, 0) + 1
-            )
+            with self._WRITE_LOCK:
+                self._ACTIVE_BY_STREAM.setdefault(self._stream_id, []).append(self)
         self._render(force=True)
         return self
 
@@ -115,12 +116,38 @@ class ProgressBar:
         self._closed = True
         self._render(force=True, final=True)
         if self.enabled:
-            active = self._ACTIVE_BY_STREAM.get(self._stream_id, 0) - 1
-            if active > 0:
-                self._ACTIVE_BY_STREAM[self._stream_id] = active
-            else:
-                self._ACTIVE_BY_STREAM.pop(self._stream_id, None)
-                self._LINE_OPEN_BY_STREAM.pop(self._stream_id, None)
+            with self._WRITE_LOCK:
+                active = self._ACTIVE_BY_STREAM.get(self._stream_id, [])
+                if self in active:
+                    active.remove(self)
+                if not active:
+                    self._ACTIVE_BY_STREAM.pop(self._stream_id, None)
+                    self._LINE_OPEN_BY_STREAM.pop(self._stream_id, None)
+
+    @classmethod
+    @contextmanager
+    def external_write(cls, stream: TextIO) -> Iterator[None]:
+        """Print a message above the active bar, then resume it on a fresh line."""
+        with cls._WRITE_LOCK:
+            stream_id = id(stream)
+            active = cls._ACTIVE_BY_STREAM.get(stream_id, [])
+            if active and cls._LINE_OPEN_BY_STREAM.get(stream_id, False):
+                # Erase the transient progress row so an early log message does
+                # not leave a stranded 0% bar behind. Spaces also work in
+                # Windows terminals without requiring ANSI escape sequences.
+                # The stored length includes the leading carriage return,
+                # which occupies no column and must not cause a wrapped erase.
+                columns = max(0, active[-1]._last_line_length - 1)
+                stream.write("\r" + " " * columns + "\r")
+                stream.flush()
+                cls._LINE_OPEN_BY_STREAM[stream_id] = False
+            try:
+                yield
+            finally:
+                active = cls._ACTIVE_BY_STREAM.get(stream_id, [])
+                if active and not active[-1]._closed:
+                    active[-1]._last_line_length = 0
+                    active[-1]._render(force=True)
 
     @classmethod
     def prepare_for_external_write(cls, stream: TextIO) -> None:
@@ -128,7 +155,7 @@ class ProgressBar:
         if not cls._stream_is_tty(stream):
             return
         stream_id = id(stream)
-        if cls._ACTIVE_BY_STREAM.get(stream_id, 0) <= 0:
+        if not cls._ACTIVE_BY_STREAM.get(stream_id):
             return
         if not cls._LINE_OPEN_BY_STREAM.get(stream_id, False):
             return
@@ -222,14 +249,15 @@ class ProgressBar:
             line = line + (" " * (self._last_line_length - len(line)))
         self._last_line_length = len(line)
 
-        self.stream.write(line)
-        if final:
-            self.stream.write("\n")
-            self._LINE_OPEN_BY_STREAM[self._stream_id] = False
-            self._last_line_length = 0
-        else:
-            self._LINE_OPEN_BY_STREAM[self._stream_id] = True
-        self.stream.flush()
+        with self._WRITE_LOCK:
+            self.stream.write(line)
+            if final:
+                self.stream.write("\n")
+                self._LINE_OPEN_BY_STREAM[self._stream_id] = False
+                self._last_line_length = 0
+            else:
+                self._LINE_OPEN_BY_STREAM[self._stream_id] = True
+            self.stream.flush()
 
     def _refresh_terminal_width(self, now: float) -> None:
         """Probe terminal width at low frequency to avoid extra overhead."""

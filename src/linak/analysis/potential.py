@@ -901,6 +901,7 @@ def _two_sided_water_bulk_potentials(
             axis="z",
             surface_layout=config.surface_layout,
             mode=config.surface_mode,
+            _log_summary=False,
         )
     except (ValueError, RuntimeError) as exc:
         LOGGER.warning("Surface-aware potential windows unavailable: %s", exc)
@@ -962,16 +963,53 @@ def _two_sided_water_bulk_potentials(
         ~true_water_mask,
     )
 
+    symmetric = reference.resolved_layout == "symmetric"
+    period = float(reference.axis_period_per_frame_A[0])
+    minimum_widths: dict[str, float] = {}
+    diagnostics: list[str] = []
+    if symmetric:
+        bottom_plane = float(reference.bottom.frame_values[0])
+        top_plane = float(reference.top.frame_values[0])
+        side_limits = {"bottom": (0.0, bottom_plane), "top": (top_plane, period)}
+        # Unwrap each molecule about its COM before taking bounds. Mapping
+        # individual H/O atoms modulo the cell can otherwise give BOTH sides
+        # a min/max interval spanning almost the entire cell at the solvent cut.
+        molecule_q = atom_q[triplets]
+        molecule_q = com_q[:, None] + (
+            molecule_q - com_q[:, None] + 0.5 * period
+        ) % period - 0.5 * period
+        grid_spacing = float(np.median(np.diff(np.sort(grid_q)))) if grid_q.size > 1 else period
+        diagnostics.append(
+            f"canonical z in A: lower={reference.axis_lower_per_frame_A[0]:.8g}, "
+            f"cut={reference.axis_cut_per_frame_A[0]:.8g}, period={period:.8g}, "
+            f"slab bottom={bottom_plane:.8g}, top={top_plane:.8g}"
+        )
+
     results: dict[str, tuple[float | None, float | None, float | None]] = {}
     for side_name, side_value in (("top", 1), ("bottom", -1)):
         selected_molecules = np.where(molecule_side == side_value)[0]
         if selected_molecules.size == 0:
             results[side_name] = (None, None, None)
+            if symmetric or reference.resolved_layout == f"single-{side_name}":
+                diagnostics.append(f"{side_name}: missing H2O region")
+                LOGGER.warning("Missing %s bulk-water region.", side_name)
             continue
         selected_atom_indices = np.unique(
             np.asarray(triplets, dtype=int)[selected_molecules].reshape(-1)
         )
         side_coordinates = atom_q[selected_atom_indices]
+        allowed = None
+        minimum_width = 0.0
+        if symmetric:
+            lower, upper = side_limits[side_name]
+            side_coordinates = np.clip(molecule_q[selected_molecules].reshape(-1), lower, upper)
+            # The electrode interior and the opposite solvent half are never
+            # candidates, even if a molecule straddles an interface/cell cut.
+            allowed = (grid_q >= lower) & (grid_q <= upper)
+            water_span = float(np.ptp(side_coordinates))
+            minimum_width = max(2.0 * grid_spacing, 0.5 * water_span)
+            minimum_widths[side_name] = minimum_width
+        side_diagnostics: list[str] = []
         results[side_name] = _water_bulk_potential_ev(
             z_ang=grid_q,
             v_xyavg_ev=np.asarray(v_xyavg_ev, dtype=float),
@@ -979,16 +1017,58 @@ def _two_sided_water_bulk_potentials(
             water_z_max_ang=float(np.max(side_coordinates)),
             padding_ang=float(config.water_padding_ang),
             contaminated_z_mask=contaminated,
+            allowed_z_mask=allowed,
+            minimum_width_ang=minimum_width,
+            diagnostics=side_diagnostics,
+        )
+        diagnostics.extend(f"{side_name}: {note}" for note in side_diagnostics)
+    if symmetric:
+        diagnostics.extend(
+            _validate_symmetric_water_windows(
+                results, side_limits=side_limits, minimum_widths=minimum_widths
+            )
         )
     return {
         "reference": reference,
         "top": results["top"],
         "bottom": results["bottom"],
-        "reason": "true H2O topology; non-water atoms excluded from clean windows",
+        "reason": "; ".join(
+            ["true H2O topology; non-water atoms excluded from clean windows", *diagnostics]
+        ),
         "combined": None,
         "water_molecule_count": int(triplets.shape[0]),
         "water_com_coordinate_A": com_q.tolist(),
     }
+
+
+def _validate_symmetric_water_windows(
+    windows: dict[str, tuple[float | None, float | None, float | None]],
+    *,
+    side_limits: dict[str, tuple[float, float]],
+    minimum_widths: dict[str, float],
+) -> list[str]:
+    """Reject invalid pairs in the common, contiguous slab coordinate frame."""
+    problems: dict[str, str] = {}
+    for side, (value, lo, hi) in windows.items():
+        if value is None or lo is None or hi is None:
+            problems[side] = "missing clean bulk-water window"
+            continue
+        if (
+            not np.all(np.isfinite([value, lo, hi]))
+            or hi - lo + 1.0e-8 < minimum_widths.get(side, 0.0)
+        ):
+            problems[side] = "nonfinite or unexpectedly narrow bulk-water window"
+        elif lo < side_limits[side][0] - 1.0e-8 or hi > side_limits[side][1] + 1.0e-8:
+            problems[side] = "bulk-water window lies outside its slab side"
+    _, top_lo, top_hi = windows["top"]
+    _, bottom_lo, bottom_hi = windows["bottom"]
+    if all(v is not None for v in (top_lo, top_hi, bottom_lo, bottom_hi)):
+        if max(top_lo, bottom_lo) <= min(top_hi, bottom_hi):
+            problems.update({side: "overlapping bulk-water windows" for side in windows})
+    for side, problem in problems.items():
+        windows[side] = (None, None, None)
+        LOGGER.warning("Invalid %s potential reference: %s.", side, problem)
+    return [f"{side}: {problem}" for side, problem in problems.items()]
 
 
 def _widest_clean_run_mask(
@@ -1037,6 +1117,9 @@ def _water_bulk_potential_ev(
     water_z_max_ang: float,
     padding_ang: float,
     contaminated_z_mask: np.ndarray | None = None,
+    allowed_z_mask: np.ndarray | None = None,
+    minimum_width_ang: float = 0.0,
+    diagnostics: list[str] | None = None,
 ) -> tuple[float | None, float | None, float | None]:
     if water_z_min_ang > water_z_max_ang:
         water_z_min_ang, water_z_max_ang = water_z_max_ang, water_z_min_ang
@@ -1068,6 +1151,8 @@ def _water_bulk_potential_ev(
             continue
 
         candidate_mask = (z_values >= z_min) & (z_values <= z_max) & ~contaminated
+        if allowed_z_mask is not None:
+            candidate_mask &= np.asarray(allowed_z_mask, dtype=bool)
         selected_mask = _widest_clean_run_mask(
             z_ang=z_values,
             candidate_mask=candidate_mask,
@@ -1075,13 +1160,26 @@ def _water_bulk_potential_ev(
         )
         if selected_mask is not None and np.any(selected_mask):
             selected_z = z_values[selected_mask]
+            if float(np.ptp(selected_z)) + 1.0e-8 < minimum_width_ang:
+                continue
+            if pad != padding_ang:
+                note = (
+                    f"padding relaxed from {padding_ang:g} to {pad:g} A "
+                    "to avoid an empty or unexpectedly narrow clean window"
+                )
+                LOGGER.debug(note)
+                if diagnostics is not None:
+                    diagnostics.append(note)
             return (
                 float(np.mean(v_values[selected_mask])),
                 float(np.min(selected_z)),
                 float(np.max(selected_z)),
             )
 
-    LOGGER.warning("Could not resolve a clean water-bulk averaging window without non-water atoms.")
+    LOGGER.warning(
+        "Could not resolve a sufficiently wide clean water-bulk averaging window "
+        "without non-water atoms (minimum width %.3f A).", minimum_width_ang
+    )
     return None, None, None
 
 

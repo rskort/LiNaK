@@ -755,7 +755,7 @@ def _potential_settings(_item: ProjectItem) -> list[SettingField]:
             "cshe_offset_ev",
             "cSHE offset",
             "float",
-            0.81,
+            0.65,
             required=True,
             group="Analysis",
             widget="float",

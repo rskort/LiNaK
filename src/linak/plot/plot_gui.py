@@ -21,7 +21,13 @@ from uuid import uuid4
 
 import numpy as np
 
+from ..analysis.common import (
+    is_molecule_species_label,
+    molecule_display_label,
+    species_mapping_label,
+)
 from ..cancellation import ComputationCancelled, cancellation_scope
+from ..gui.styles import apply_light_palette, light_colors
 
 from .data_contract import (
     PLOT_VIEW_1D_LINE,
@@ -77,6 +83,11 @@ from .mappings.potential_mapping import (
 from .profile_persistence import deserialize_plot_view_mapping, serialize_plot_view_mapping
 from .plot_settings import profile_name_conflict_message
 from .plotting import (
+    _update_legend,
+    _apply_plot_grid,
+    _visible_major_ticks,
+    _line_artist_kwargs,
+    with_style_overrides,
     _describe_error_provenance,
     _coerce_plot_annotations,
     DEFAULT_PLOT_STYLE,
@@ -621,15 +632,6 @@ _TOOLTIPS: dict[str, str] = {
     "figure.canvas.facecolor": "Sets the figure background color.",
     "figure.canvas.alpha": "Sets the figure background opacity from 0 to 1.",
     "advanced.matplotlib_guide_link": "Opens the official Matplotlib user guide.",
-    "advanced.rcparams": "Sets raw Matplotlib rcParams.",
-    "advanced.figure_kwargs": "Sets raw figure options.",
-    "advanced.axes_kwargs": "Sets raw axes options.",
-    "advanced.tight_layout_kwargs": "Sets raw tight-layout options.",
-    "advanced.savefig_kwargs": "Sets raw savefig options.",
-    "advanced.legend_kwargs": "Sets raw legend options.",
-    "advanced.grid_kwargs": "Sets raw grid options.",
-    "advanced.tick_params_kwargs": "Sets raw tick options.",
-    "advanced.line_kwargs": "Sets raw default line options.",
 }
 
 
@@ -1839,7 +1841,6 @@ def launch_plot_settings_panel(
             QIntValidator,
             QKeySequence,
             QPainter,
-            QPalette,
             QPen,
             QPixmap,
             QPixmapCache,
@@ -1899,7 +1900,7 @@ def launch_plot_settings_panel(
         ) from exc
 
     from .session_log import SessionLog
-    from .session_widgets import PreviewLoadingOverlay, SessionDiagnostics
+    from .session_widgets import JsonOptionsEditor, PreviewLoadingOverlay, SessionDiagnostics
 
     navigation_toolbar_type = None
     if NavigationToolbar2QT is not None:
@@ -2077,9 +2078,8 @@ def launch_plot_settings_panel(
             index: QModelIndex,
         ) -> None:  # pragma: no cover - UI paint
             state = self._row_state(index)
-            theme = state.get("theme")
-            if not isinstance(theme, dict):
-                theme = {}
+            colors = state.get("colors")
+            colors = {**light_colors(), **(colors if isinstance(colors, dict) else {})}
             selected = bool(option.state & QStyle.StateFlag.State_Selected)
             enabled = bool(state.get("enabled", True))
             kind = str(state.get("kind") or "base")
@@ -2088,24 +2088,14 @@ def launch_plot_settings_panel(
 
             painter.save()
             try:
-                row_bg = (
-                    theme.get("series_row_selected_bg", "#14515a")
-                    if selected
-                    else theme.get("series_row_bg", "#132033")
-                )
-                border = (
-                    theme.get("series_row_selected_border", "#2fb7c9")
-                    if selected
-                    else "transparent"
-                )
+                row_bg = colors["series_row_selected_bg"] if selected else colors["series_row_bg"]
+                border = colors["series_row_selected_border"] if selected else "transparent"
                 painter.setPen(QPen(QColor(border)))
                 painter.setBrush(QBrush(QColor(row_bg)))
                 painter.drawRoundedRect(rect, 6, 6)
 
                 text_color = (
-                    theme.get("series_row_selected_text", "#ffffff")
-                    if selected
-                    else theme.get("series_row_text", "#e6edf7")
+                    colors["series_row_selected_text"] if selected else colors["series_row_text"]
                 )
                 if kind == "species":
                     font = painter.font()
@@ -2132,18 +2122,12 @@ def launch_plot_settings_panel(
                         )
                     return
                 if not enabled:
-                    text_color = theme.get("series_row_disabled_text", "#8290a3")
+                    text_color = colors["series_row_disabled_text"]
 
                 checkbox_rect = self._checkbox_rect(option.rect)
-                painter.setPen(QPen(QColor(theme.get("series_row_swatch_border", "#46627f"))))
+                painter.setPen(QPen(QColor(colors["series_row_swatch_border"])))
                 painter.setBrush(
-                    QBrush(
-                        QColor(
-                            theme.get("accent", "#2fb7c9")
-                            if bool(state.get("checked", True))
-                            else row_bg
-                        )
-                    )
+                    QBrush(QColor(colors["accent"] if bool(state.get("checked", True)) else row_bg))
                 )
                 painter.drawRoundedRect(checkbox_rect, 3, 3)
                 if bool(state.get("checked", True)):
@@ -2166,9 +2150,9 @@ def launch_plot_settings_panel(
                 if color_token:
                     swatch_color = QColor(color_token)
                     if not swatch_color.isValid():
-                        swatch_color = QColor(theme.get("series_row_swatch_bg", "#20304a"))
+                        swatch_color = QColor(colors["series_row_swatch_bg"])
                     swatch_rect = QRect(x_cursor, option.rect.top() + 13, 12, 12)
-                    painter.setPen(QPen(QColor(theme.get("series_row_swatch_border", "#46627f"))))
+                    painter.setPen(QPen(QColor(colors["series_row_swatch_border"])))
                     painter.setBrush(QBrush(swatch_color))
                     painter.drawRoundedRect(swatch_rect, 6, 6)
                     x_cursor = swatch_rect.right() + 10
@@ -2188,12 +2172,12 @@ def launch_plot_settings_panel(
                     if layer_role.strip().lower() == "copy"
                     else "series_badge_original"
                 )
-                painter.setPen(QPen(QColor(theme.get(f"{badge_prefix}_border", "#4e6380"))))
-                painter.setBrush(QBrush(QColor(theme.get(f"{badge_prefix}_bg", "#1d2b42"))))
+                painter.setPen(QPen(QColor(colors[f"{badge_prefix}_border"])))
+                painter.setBrush(QBrush(QColor(colors[f"{badge_prefix}_bg"])))
                 show_badge = layer_role.strip().lower() != "original"
                 if show_badge:
                     painter.drawRoundedRect(badge_rect, 6, 6)
-                painter.setPen(QPen(QColor(theme.get(f"{badge_prefix}_text", text_color))))
+                painter.setPen(QPen(QColor(colors[f"{badge_prefix}_text"])))
                 if show_badge:
                     painter.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter, badge_text)
 
@@ -2224,14 +2208,14 @@ def launch_plot_settings_panel(
                     arrow_color = QColor(
                         text_color
                         if bool(state.get("can_move_up", False))
-                        else theme.get("series_row_disabled_text", "#8290a3")
+                        else colors["series_row_disabled_text"]
                     )
                     painter.setPen(QPen(arrow_color))
                     painter.drawText(self._up_rect(option.rect), Qt.AlignmentFlag.AlignCenter, "^")
                     arrow_color = QColor(
                         text_color
                         if bool(state.get("can_move_down", False))
-                        else theme.get("series_row_disabled_text", "#8290a3")
+                        else colors["series_row_disabled_text"]
                     )
                     painter.setPen(QPen(arrow_color))
                     painter.drawText(
@@ -2280,6 +2264,41 @@ def launch_plot_settings_panel(
             self.setModel(self._series_model)
             self.setItemDelegate(_SeriesListDelegate(owner, self))
             self.selectionModel().currentChanged.connect(self._emit_current_row_changed)
+
+        def fit_visible_rows(self) -> None:
+            """Keep the browser compact without laying out the entire trajectory list."""
+            rows = 0
+            for row in range(self.count()):
+                if not self.isRowHidden(row):
+                    rows += 1
+                    if rows == 6:
+                        break
+            row_height = (
+                self.itemDelegate().sizeHint(QStyleOptionViewItem(), QModelIndex()).height()
+            )
+            height = max(1, rows) * (row_height + 2 * self.spacing()) + 2 * self.frameWidth()
+            self.setFixedHeight(min(240, height))
+
+        def wheelEvent(self, event: Any) -> None:
+            # At either end, continue scrolling the page instead of trapping the
+            # wheel over the list. Send the original event to retain trackpad deltas.
+            delta = event.pixelDelta().y() or event.angleDelta().y()
+            bar = self.verticalScrollBar()
+            if (delta > 0 and bar.value() == bar.minimum()) or (
+                delta < 0 and bar.value() == bar.maximum()
+            ):
+                parent = self.parentWidget()
+                while parent is not None:
+                    if isinstance(parent, QScrollArea):
+                        if event.pixelDelta().y():
+                            page_bar = parent.verticalScrollBar()
+                            page_bar.setValue(page_bar.value() - event.pixelDelta().y())
+                            event.accept()
+                        else:
+                            QApplication.sendEvent(parent.viewport(), event)
+                        return
+                    parent = parent.parentWidget()
+            super().wheelEvent(event)
 
         def mousePressEvent(self, event: Any) -> None:
             index = self.indexAt(event.position().toPoint())
@@ -2465,20 +2484,22 @@ def launch_plot_settings_panel(
             can_move_up: bool,
             can_move_down: bool,
             tooltip_text: str,
-            theme: dict[str, str],
+            colors: dict[str, str],
         ) -> None:
             self.text_label.setText(text)
             self.setToolTip(tooltip_text)
             self.text_label.setToolTip(tooltip_text)
-            text_color = theme["series_row_selected_text"] if selected else theme["series_row_text"]
+            text_color = (
+                colors["series_row_selected_text"] if selected else colors["series_row_text"]
+            )
             if not enabled:
-                text_color = theme["series_row_disabled_text"]
+                text_color = colors["series_row_disabled_text"]
             if selected:
-                row_bg = theme["series_row_selected_bg"]
-                left_border = f"5px solid {theme['series_row_selected_border']}"
-                edge_border = f"1px solid {theme['series_row_selected_border']}"
+                row_bg = colors["series_row_selected_bg"]
+                left_border = f"5px solid {colors['series_row_selected_border']}"
+                edge_border = f"1px solid {colors['series_row_selected_border']}"
             else:
-                row_bg = theme["series_row_bg"]
+                row_bg = colors["series_row_bg"]
                 left_border = "4px solid transparent"
                 edge_border = "1px solid transparent"
             self.setStyleSheet(
@@ -2502,10 +2523,10 @@ def launch_plot_settings_panel(
                 "}"
                 "QToolButton#seriesRowButton:hover {"
                 "border-radius: 6px;"
-                f"background-color: {theme['series_row_button_hover']};"
+                f"background-color: {colors['series_row_button_hover']};"
                 "}"
                 "QToolButton#seriesRowButton:disabled {"
-                f"color: {theme['series_row_disabled_text']};"
+                f"color: {colors['series_row_disabled_text']};"
                 "}"
             )
             self.text_label.setStyleSheet(f"color: {text_color};")
@@ -2630,10 +2651,7 @@ def launch_plot_settings_panel(
             self.preview_canvas_container.setVisible(False)
             preview_frame_layout.addWidget(self.preview_canvas_container, stretch=1)
             layout.addWidget(self.preview_frame, stretch=1)
-            self.loading_overlay = PreviewLoadingOverlay(
-                self.preview_frame,
-                event_filter_owner._is_dark_theme,
-            )
+            self.loading_overlay = PreviewLoadingOverlay(self.preview_frame)
 
     class _PreviewWorkerBridge(QObject):
         finished = Signal(int, object)
@@ -2846,6 +2864,7 @@ def launch_plot_settings_panel(
             parent: QWidget | None = None,
         ) -> None:
             super().__init__(parent)
+            apply_light_palette(self)
             self._on_dock_requested = on_dock_requested
             self._allow_close = False
             self.setWindowTitle("LiNaK Figure Preview")
@@ -2864,6 +2883,7 @@ def launch_plot_settings_panel(
     class _PlotSettingsWindow(QMainWindow):
         def __init__(self) -> None:
             super().__init__()
+            apply_light_palette(self)
             self.setWindowTitle(title)
             self.resize(980, 760)
             self.setAttribute(Qt.WidgetAttribute.WA_AlwaysShowToolTips, True)
@@ -3094,6 +3114,7 @@ def launch_plot_settings_panel(
             self._preview_canvas: Any | None = None
             self._preview_toolbar: Any | None = None
             self._preview_axis_callback_ids: list[tuple[Any, int]] = []
+            self._preview_draw_callback: tuple[Any, int] | None = None
             self._canvas_axis_limit_syncing = False
             self._preview_zoom_factor = 1.0
             self._splitter: QSplitter | None = None
@@ -3129,7 +3150,6 @@ def launch_plot_settings_panel(
             self._nav_list: QListWidget | None = None
             self._page_stack: QStackedWidget | None = None
             self._page_title_label: QLabel | None = None
-            self._page_note_label: QLabel | None = None
             self._layers_tabs: QTabWidget | None = None
             self._header_state_label: QLabel | None = None
             self._warning_summary_label: QLabel | None = None
@@ -3232,10 +3252,12 @@ def launch_plot_settings_panel(
             self._preview_timer = QTimer(self)
             self._preview_timer.setSingleShot(True)
             self._preview_timer.timeout.connect(self._handle_debounced_preview)
+            self._preview_layout_timer = QTimer(self)
+            self._preview_layout_timer.setSingleShot(True)
+            self._preview_layout_timer.setInterval(40)
+            self._preview_layout_timer.timeout.connect(self._resize_preview_canvas_to_figure)
             self._preview_loading = False
             self._preview_error: str | None = None
-            self._theme_mode = "system"
-            self._theme_switch: QCheckBox | None = None
             self._session_diagnostics = SessionDiagnostics(session_messages, self)
             self._status_label = self._session_diagnostics.footer
             self._status_label.activated.connect(self._open_session_logs)
@@ -3648,6 +3670,32 @@ def launch_plot_settings_panel(
             self._update_integration_summary()
             self._update_heatmap_value_summary()
 
+        def _sync_preview_tick_fields(self, event: Any = None) -> None:
+            if self._preview_figure is None or self._preview_canvas is None:
+                return
+            if event is not None and event.canvas is not self._preview_canvas:
+                return
+            if self._preview_loading or self._suspend_preview_events:
+                return
+            axes = list(self._preview_figure.axes)
+            if not axes:
+                return
+            ax = axes[0]
+            previous_suspend = self._suspend_preview_events
+            self._suspend_preview_events = True
+            try:
+                for key, field, axis in (
+                    ("x_ticks", self.x_ticks, ax.xaxis),
+                    ("y_ticks", self.y_ticks, ax.yaxis),
+                ):
+                    if self._synced_field_mode(key) != "auto":
+                        continue
+                    visible = _visible_major_ticks(axis)
+                    field.setText(_format_float_list(visible))
+                    self._last_preview_state[key] = visible
+            finally:
+                self._suspend_preview_events = previous_suspend
+
         def _set_axis_limit_fields_from_canvas(self, ax: Any) -> None:
             if self._canvas_axis_limit_syncing:
                 return
@@ -3797,11 +3845,44 @@ def launch_plot_settings_panel(
 
             x_scale = self.x_scale.currentText().strip() or "linear"
             y_scale = self.y_scale.currentText().strip() or "linear"
+            previous_syncing = self._canvas_axis_limit_syncing
+            self._canvas_axis_limit_syncing = True
             try:
-                ax.set_xscale(x_scale)
-                ax.set_yscale(y_scale)
+                for scale, current, setter, key, field, set_ticks, get_lim, set_lim in (
+                    (
+                        x_scale,
+                        ax.get_xscale(),
+                        ax.set_xscale,
+                        "x_ticks",
+                        self.x_ticks,
+                        ax.set_xticks,
+                        ax.get_xlim,
+                        ax.set_xlim,
+                    ),
+                    (
+                        y_scale,
+                        ax.get_yscale(),
+                        ax.set_yscale,
+                        "y_ticks",
+                        self.y_ticks,
+                        ax.set_yticks,
+                        ax.get_ylim,
+                        ax.set_ylim,
+                    ),
+                ):
+                    if current == scale:
+                        continue
+                    setter(scale)
+                    if self._synced_field_mode(key) == "manual":
+                        values = _optional_float_list(field.text(), field_name=key)
+                        if values is not None:
+                            limits = get_lim()
+                            set_ticks(values)
+                            set_lim(limits)
             except Exception:
                 return False
+            finally:
+                self._canvas_axis_limit_syncing = previous_syncing
 
             grid_mode = self.grid_mode.currentText().strip().lower()
             grid_enabled = grid_mode != "off"
@@ -3830,13 +3911,11 @@ def launch_plot_settings_panel(
             if grid_kwargs["which"] not in _GRID_WHICH:
                 grid_kwargs["which"] = "major"
             try:
-                if grid_enabled:
-                    ax.grid(True, **grid_kwargs)
-                else:
-                    ax.grid(False)
-                    for axis in (ax.xaxis, ax.yaxis):
-                        for gridline in axis.get_gridlines():
-                            gridline.set_visible(False)
+                _apply_plot_grid(
+                    ax,
+                    style=with_style_overrides(grid=grid_enabled),
+                    grid_kwargs=grid_kwargs,
+                )
             except Exception:
                 return False
             self._last_preview_state["x_scale"] = x_scale
@@ -3953,61 +4032,7 @@ def launch_plot_settings_panel(
             return True
 
         def _apply_line_style_fields_to_canvas(self) -> bool:
-            if self._preview_canvas is None or self._preview_figure is None:
-                return False
-            axes = list(getattr(self._preview_figure, "axes", []) or [])
-            if not axes:
-                return False
-            lines = [line for ax in axes for line in list(getattr(ax, "lines", []) or [])]
-            if not lines:
-                return False
-
-            def _optional_float_text(widget: QLineEdit) -> float | None:
-                text = widget.text().strip()
-                if not text:
-                    return None
-                try:
-                    return float(text)
-                except ValueError:
-                    return None
-
-            line_width = _optional_float_text(self.line_width)
-            line_alpha = _optional_float_text(self.line_alpha)
-            marker_size = _optional_float_text(self.marker_size)
-            line_style = self.line_style.currentText().strip()
-            marker_mode = self.markers_mode.currentText().strip().lower()
-            marker_type = self.marker_type.currentText().strip() or "o"
-            marker = "" if marker_mode == "off" else marker_type
-            marker_color = self.marker_color.text().strip()
-            try:
-                for line in lines:
-                    if line_width is not None:
-                        line.set_linewidth(line_width)
-                    if line_alpha is not None:
-                        line.set_alpha(line_alpha)
-                    if line_style:
-                        line.set_linestyle(line_style)
-                    line.set_marker(marker)
-                    if marker_size is not None:
-                        line.set_markersize(marker_size)
-                    if marker_color:
-                        line.set_markerfacecolor(marker_color)
-                        line.set_markeredgecolor(marker_color)
-            except Exception:
-                return False
-            self._last_preview_state["line_width"] = line_width
-            self._last_preview_state["markers"] = marker_mode != "off"
-            self._last_preview_state["line_kwargs"] = {
-                "linestyle": line_style or None,
-                "alpha": line_alpha,
-                "marker": marker,
-                "markersize": marker_size,
-            }
-            self._preview_canvas.draw_idle()
-            if self._preview_status is not None:
-                self._preview_status.setText("Preview line style updated.")
-            self._refresh_shell_state()
-            return True
+            return self._apply_series_artist_updates_to_canvas()
 
         def _optional_float_from_line(self, widget: QLineEdit) -> float | None:
             text = widget.text().strip()
@@ -4076,12 +4101,12 @@ def launch_plot_settings_panel(
             for widget in candidates:
                 width = int(widget.width()) - 8
                 height = int(widget.height()) - 8
-                if width >= 160 and height >= 120:
+                if width > 0 and height > 0:
                     available_width = width
                     available_height = height
                     break
-            available_width = max(320, available_width)
-            available_height = max(240, available_height)
+            available_width = max(1, available_width)
+            available_height = max(1, available_height)
             export_width, export_height = self._preview_export_figsize()
             export_aspect = max(1.0e-9, export_width / export_height)
             available_aspect = available_width / available_height
@@ -4095,8 +4120,14 @@ def launch_plot_settings_panel(
             target_height = max(1, min(available_height, target_height))
             try:
                 preview_dpi = max(target_width / export_width, target_height / export_height, 1.0)
+                # Qt sizes are logical pixels; Matplotlib renders in physical
+                # pixels. Keep its base DPI current for later screen changes,
+                # then scale the renderer by the canvas device-pixel ratio.
+                # Otherwise a settled resize at 125% scaling draws a figure
+                # only 80% as large as its correctly centered Qt widget.
+                self._preview_figure._original_dpi = preview_dpi
+                self._preview_figure.set_dpi(preview_dpi * self._preview_canvas.device_pixel_ratio)
                 self._preview_figure.set_size_inches(export_width, export_height, forward=False)
-                self._preview_figure.set_dpi(preview_dpi)
             except Exception:
                 pass
             self._preview_canvas.setFixedSize(QSize(target_width, target_height))
@@ -4108,6 +4139,15 @@ def launch_plot_settings_panel(
             self._preview_canvas.updateGeometry()
             self._preview_canvas.update()
             QTimer.singleShot(0, self._redraw_preview_canvas)
+
+        def _schedule_preview_canvas_resize(self) -> None:
+            timer = getattr(self, "_preview_layout_timer", None)
+            if getattr(self, "_closing", False) or timer is None:
+                return
+            # Window-state transitions and splitter movement resize nested Qt
+            # widgets in several passes. Recalculate after that burst so the
+            # final viewport determines the canvas size and centered position.
+            timer.start()
 
         def _redraw_preview_canvas(self) -> None:
             if self._preview_canvas is None:
@@ -4226,170 +4266,150 @@ def launch_plot_settings_panel(
                 fig.tight_layout()
             except Exception:
                 pass
+            if not self._refresh_preview_legend():
+                return False
             self._preview_canvas.draw_idle()
             if self._preview_status is not None:
                 self._preview_status.setText("Preview canvas updated.")
             self._refresh_shell_state()
             return True
 
+        def _preview_plot_style(self, settings: dict[str, Any]):
+            return with_style_overrides(
+                font_family=settings.get("font_family"),
+                font_color=settings.get("font_color"),
+                font_size=settings.get("font_size"),
+                legend_font_size=settings.get("legend_font_size"),
+                line_width=settings.get("line_width"),
+            )
+
+        def _refresh_preview_legend(self, settings: dict[str, Any] | None = None) -> bool:
+            if self._preview_figure is None or self._preview_canvas is None:
+                return False
+            try:
+                settings = self._collect_settings() if settings is None else settings
+                style = self._preview_plot_style(settings)
+                artists = self._last_preview_state.get("series_artists", {})
+                artist_ids = {id(artist) for artist in artists.values()}
+                for ax in self._preview_figure.axes:
+                    artist_order = self._last_preview_state.get("legend_artist_order")
+                    if (
+                        artists
+                        and not ax.collections
+                        and all(id(line) in artist_ids for line in ax.lines)
+                    ):
+                        artist_order = [
+                            artists[d["series_id"]]
+                            for d in self._series_descriptors_data
+                            if d.get("series_id") in artists
+                        ]
+                    _update_legend(
+                        ax,
+                        style=style,
+                        enabled=settings.get("legend"),
+                        title=settings.get("legend_title"),
+                        location=settings.get("legend_loc") or "best",
+                        options=settings.get("legend_kwargs"),
+                        artist_order=artist_order,
+                    )
+            except (ValueError, TypeError, AttributeError):
+                return False
+            return True
+
         def _apply_series_artist_updates_to_canvas(self) -> bool:
             if self._preview_canvas is None or self._preview_figure is None:
                 return False
-            line_artists = self._last_preview_state.get("line_artists")
-            plotted_series = self._last_preview_state.get("plotted_xy_series")
-            if not isinstance(line_artists, list) or not isinstance(plotted_series, list):
+            # Derived/uncertainty artists have independent styling and geometry.
+            # Use the cached full renderer when those mappings need rebuilding.
+            if any(
+                any(getattr(self, name, []))
+                for name in (
+                    "_series_fit_enabled_data",
+                    "_series_cumulative_enabled_data",
+                    "_series_error_enabled_data",
+                    "_series_integration_enabled_data",
+                )
+            ):
                 return False
-            if not line_artists or len(line_artists) < len(plotted_series):
+            artists = self._last_preview_state.get("series_artists")
+            if not isinstance(artists, dict) or not artists:
                 return False
-            artist_by_series_id: dict[str, Any] = {}
-            for artist, payload in zip(line_artists, plotted_series):
-                if not isinstance(payload, dict):
-                    continue
-                series_id = str(payload.get("series_id") or "").strip()
-                if series_id:
-                    artist_by_series_id[series_id] = artist
-            if not artist_by_series_id:
+            ids = {
+                str(d.get("series_id") or f"series:{i}")
+                for i, d in enumerate(self._series_descriptors_data)
+            }
+            if set(artists) - ids:
                 return False
-
-            missing_enabled_artist = False
-            for index, descriptor in enumerate(self._series_descriptors_data):
-                series_id = str(descriptor.get("series_id") or f"series:{index}")
-                artist = artist_by_series_id.get(series_id)
-                enabled = bool(
-                    self._series_enabled_data[index]
-                    if index < len(self._series_enabled_data)
-                    else True
-                )
-                if enabled and artist is None:
-                    missing_enabled_artist = True
-                    break
-                if artist is None:
-                    continue
-                show_raw = bool(
-                    self._series_show_raw_line_data[index]
-                    if index < len(self._series_show_raw_line_data)
-                    else True
-                )
-                artist.set_visible(enabled and show_raw)
-                artist.set_label(self._effective_series_label(index))
-                color = self._effective_series_color(index).strip()
-                if color:
-                    try:
-                        artist.set_color(color)
-                    except ValueError:
-                        pass
-                alpha = (
-                    self._series_alpha_data[index].strip()
-                    if index < len(self._series_alpha_data)
-                    else ""
-                )
-                if alpha:
-                    try:
-                        artist.set_alpha(float(alpha))
-                    except ValueError:
-                        pass
-                width = (
-                    self._series_line_widths_data[index].strip()
-                    if index < len(self._series_line_widths_data)
-                    else ""
-                )
-                if width:
-                    try:
-                        artist.set_linewidth(float(width))
-                    except ValueError:
-                        pass
-                marker = (
-                    self._series_markers_data[index].strip()
-                    if index < len(self._series_markers_data)
-                    else ""
-                )
-                if marker:
-                    artist.set_marker(marker)
-                line_kwargs = (
-                    self._series_line_kwargs_data[index].strip()
-                    if index < len(self._series_line_kwargs_data)
-                    else ""
-                )
-                if line_kwargs:
-                    try:
-                        parsed_kwargs = _optional_json_dict(
-                            line_kwargs,
-                            field_name="Series Matplotlib line options",
-                        )
-                    except ValueError:
-                        parsed_kwargs = None
-                    if parsed_kwargs:
-                        for key, value in parsed_kwargs.items():
-                            if key == "label":
-                                continue
-                            setter = getattr(artist, f"set_{key}", None)
-                            if callable(setter):
-                                try:
-                                    setter(value)
-                                except Exception:
-                                    pass
-                artist.set_zorder(float(index + 2))
-
-                fit_artist = artist_by_series_id.get(f"{series_id}::fit")
-                if fit_artist is not None:
-                    fit_enabled = bool(
-                        index < len(self._series_fit_enabled_data)
-                        and self._series_fit_enabled_data[index]
-                    )
-                    fit_artist.set_visible(fit_enabled)
-                    fit_artist.set_label(self._fit_effective_label(index))
-                    fit_color = (
-                        self._series_fit_color_data[index].strip()
-                        if index < len(self._series_fit_color_data)
-                        else ""
-                    )
-                    if fit_color:
-                        try:
-                            fit_artist.set_color(fit_color)
-                        except ValueError:
-                            pass
-                    fit_artist.set_zorder(float(index + 2.5))
-
-                cumulative_artist = artist_by_series_id.get(f"{series_id}::cumulative")
-                if cumulative_artist is not None:
-                    cumulative_enabled = bool(
-                        index < len(self._series_cumulative_enabled_data)
-                        and self._series_cumulative_enabled_data[index]
-                    )
-                    cumulative_artist.set_visible(cumulative_enabled)
-                    cumulative_artist.set_label(self._cumulative_effective_label(index))
-                    cumulative_color = (
-                        self._series_cumulative_color_data[index].strip()
-                        if index < len(self._series_cumulative_color_data)
-                        else ""
-                    )
-                    if cumulative_color:
-                        try:
-                            cumulative_artist.set_color(cumulative_color)
-                        except ValueError:
-                            pass
-                    cumulative_artist.set_zorder(float(index + 2.25))
-            if missing_enabled_artist:
-                return False
-
+            artist_ids = {id(artist) for artist in artists.values()}
             for ax in self._preview_figure.axes:
-                legend = ax.get_legend()
-                if legend is None:
-                    continue
-                handles, labels = ax.get_legend_handles_labels()
-                visible_pairs = [
-                    (handle, label)
-                    for handle, label in zip(handles, labels)
-                    if getattr(handle, "get_visible", lambda: True)()
-                    and not str(label).startswith("_")
-                ]
-                legend.remove()
-                if visible_pairs and self.legend_mode.currentText().strip().lower() != "off":
-                    ax.legend(
-                        [handle for handle, _label in visible_pairs],
-                        [label for _handle, label in visible_pairs],
-                        loc=self.legend_loc.currentText().strip() or "best",
+                if (
+                    ax.collections
+                    or ax.patches
+                    or any(id(line) not in artist_ids for line in ax.lines)
+                ):
+                    return False
+            from matplotlib.lines import Line2D
+
+            properties = (
+                "color",
+                "linewidth",
+                "linestyle",
+                "alpha",
+                "marker",
+                "markersize",
+                "markerfacecolor",
+                "markeredgecolor",
+                "markeredgewidth",
+            )
+            try:
+                settings = self._collect_settings()
+                style = self._preview_plot_style(settings)
+                updates = []
+                for index, descriptor in enumerate(self._series_descriptors_data):
+                    series_id = str(descriptor.get("series_id") or f"series:{index}")
+                    artist = artists.get(series_id)
+                    enabled = (
+                        self._series_enabled_data[index] and self._series_show_raw_line_data[index]
                     )
+                    if artist is None:
+                        if enabled:
+                            return False
+                        continue
+                    options = _optional_json_dict(
+                        self._series_line_kwargs_data[index], field_name="Series line options"
+                    )
+                    options = dict(options or {})
+                    if self._series_alpha_data[index].strip():
+                        options["alpha"] = float(self._series_alpha_data[index])
+                    kwargs = _line_artist_kwargs(
+                        style=style,
+                        label=self._effective_series_label(index),
+                        show_in_legend=self._series_show_in_legend_data[index],
+                        markers=bool(settings.get("markers")),
+                        color=self._effective_series_color(index),
+                        width=self._series_line_widths_data[index].strip() or None,
+                        marker=self._series_markers_data[index].strip() or None,
+                        global_options=settings.get("line_kwargs"),
+                        layer_options=options,
+                    )
+                    if set(kwargs) - {*properties, "label"}:
+                        return False
+                    # Resolve defaults as a fresh render would, including removed overrides.
+                    sample = Line2D([], [], **kwargs)
+                    resolved = {key: getattr(sample, f"get_{key}")() for key in properties}
+                    resolved.update(
+                        label=kwargs["label"], visible=bool(enabled), zorder=float(index + 2)
+                    )
+                    updates.append((artist, resolved))
+                for artist, resolved in updates:
+                    artist.set(**resolved)
+                if not self._refresh_preview_legend(settings):
+                    return False
+            except (ValueError, TypeError, AttributeError):
+                return False
+            self._last_preview_state.update(
+                line_width=style.line_width, line_kwargs=settings.get("line_kwargs")
+            )
             self._preview_canvas.draw_idle()
             if self._preview_status is not None:
                 self._preview_status.setText("Preview series styling updated.")
@@ -4641,7 +4661,7 @@ def launch_plot_settings_panel(
             for widget in self.findChildren(QComboBox):
                 widget.currentTextChanged.connect(self._record_history_after_non_text_change)
             for widget in self.findChildren(QCheckBox):
-                if widget in {self._theme_switch, self._auto_preview_checkbox}:
+                if widget is self._auto_preview_checkbox:
                     continue
                 widget.toggled.connect(self._record_history_after_non_text_change)
 
@@ -5061,12 +5081,6 @@ def launch_plot_settings_panel(
 
             header_layout.addStretch(1)
 
-            self._theme_switch = QCheckBox("Dark mode")
-            self._theme_switch.setObjectName("themeSwitch")
-            self._sync_theme_switch_label()
-            self._theme_switch.toggled.connect(self._handle_theme_switch_toggled)
-            header_layout.addWidget(self._theme_switch)
-
             self._undo_button = QPushButton("Undo")
             self._undo_button.clicked.connect(self._handle_undo)
             self._register_tooltip(self._undo_button, "profiles.undo")
@@ -5150,12 +5164,6 @@ def launch_plot_settings_panel(
             self._page_title_label = QLabel("Data")
             self._page_title_label.setObjectName("pageTitle")
             inspector_layout.addWidget(self._page_title_label)
-            self._page_note_label = QLabel(
-                "Choose which stored data and view mode are sent into the plot."
-            )
-            self._page_note_label.setWordWrap(True)
-            self._page_note_label.setObjectName("sectionNote")
-            inspector_layout.addWidget(self._page_note_label)
             self._page_stack = QStackedWidget(inspector_panel)
             self._page_stack.setMinimumWidth(0)
             self._page_stack.setSizePolicy(
@@ -5208,167 +5216,10 @@ def launch_plot_settings_panel(
             )
             root_layout.addWidget(self._status_label)
 
-            self._apply_theme_styles()
+            self._apply_styles()
 
-        def _is_dark_theme(self) -> bool:
-            if self._theme_mode == "dark":
-                return True
-            if self._theme_mode == "light":
-                return False
-            app = QApplication.instance()
-            palette = app.palette() if app is not None else self.palette()
-            window_color = palette.color(QPalette.ColorRole.Window)
-            text_color = palette.color(QPalette.ColorRole.WindowText)
-            return window_color.lightness() < text_color.lightness()
-
-        def _theme_tokens(self) -> dict[str, str]:
-            if self._is_dark_theme():
-                return {
-                    "window_bg": "#0b1220",
-                    "header_bg": "#131d2d",
-                    "panel_bg": "#101826",
-                    "panel_elevated": "#162233",
-                    "card_bg": "#142030",
-                    "input_bg": "#0e1725",
-                    "button_bg": "#182334",
-                    "button_hover": "#1e2d42",
-                    "button_pressed": "#25364c",
-                    "disabled_bg": "#0f1724",
-                    "disabled_text": "#607086",
-                    "text": "#edf3fb",
-                    "heading": "#f7fbff",
-                    "muted_text": "#9caec5",
-                    "border": "#31425a",
-                    "border_soft": "#3f5270",
-                    "input_border": "#425774",
-                    "accent": "#2aa7b8",
-                    "accent_hover": "#34bed1",
-                    "accent_text": "#07151b",
-                    "accent_soft": "#163e47",
-                    "series_row_bg": "transparent",
-                    "series_row_text": "#edf3fb",
-                    "series_row_disabled_text": "#7f8fa6",
-                    "series_row_selected_bg": "#123c46",
-                    "series_row_selected_border": "#34bed1",
-                    "series_row_selected_text": "#f7fbff",
-                    "series_row_button_hover": "#203349",
-                    "series_row_swatch_bg": "#0e1725",
-                    "series_row_swatch_border": "#607086",
-                    "series_badge_original_bg": "#1f2d40",
-                    "series_badge_original_border": "#566b88",
-                    "series_badge_original_text": "#dce8f7",
-                    "series_badge_copy_bg": "#463a16",
-                    "series_badge_copy_border": "#b9973d",
-                    "series_badge_copy_text": "#ffe7a3",
-                    "selected_card_bg": "#102f3a",
-                    "selected_card_border": "#34bed1",
-                    "nav_hover": "#182637",
-                    "nav_selected": "#18424b",
-                    "nav_selected_border": "#2aa7b8",
-                    "nav_selected_text": "#f6fbff",
-                    "badge_bg": "#1a2637",
-                    "badge_border": "#465a76",
-                    "badge_text": "#edf3fb",
-                    "warning_bg": "#33250e",
-                    "warning_border": "#b98934",
-                    "warning_text": "#f5d9a1",
-                    "tooltip_bg": "#1a2435",
-                    "tooltip_border": "#4a607e",
-                    "tooltip_text": "#f7fbff",
-                    "placeholder_text": "#7f8fa6",
-                    "item_hover": "#1c2c40",
-                    "item_selected_bg": "#2aa7b8",
-                    "item_selected_text": "#07151b",
-                    "splitter": "#42556f",
-                    "scrollbar_track": "#0f1724",
-                    "scrollbar_thumb": "#40536d",
-                    "scrollbar_thumb_hover": "#56708f",
-                }
-            return {
-                "window_bg": "#eef3f8",
-                "header_bg": "#f9fbfe",
-                "panel_bg": "#fdfefe",
-                "panel_elevated": "#ffffff",
-                "card_bg": "#f8fafc",
-                "input_bg": "#ffffff",
-                "button_bg": "#f4f7fb",
-                "button_hover": "#e9f0f8",
-                "button_pressed": "#dbe6f2",
-                "disabled_bg": "#eef2f6",
-                "disabled_text": "#8190a3",
-                "text": "#142033",
-                "heading": "#0f1728",
-                "muted_text": "#556274",
-                "border": "#c8d3e0",
-                "border_soft": "#d9e2ec",
-                "input_border": "#bcc9d8",
-                "accent": "#0f8f95",
-                "accent_hover": "#0c7a80",
-                "accent_text": "#f8feff",
-                "accent_soft": "#d9f0f2",
-                "series_row_bg": "transparent",
-                "series_row_text": "#142033",
-                "series_row_disabled_text": "#6d7b8e",
-                "series_row_selected_bg": "#cbecef",
-                "series_row_selected_border": "#0c7a80",
-                "series_row_selected_text": "#082f34",
-                "series_row_button_hover": "#d8edf0",
-                "series_row_swatch_bg": "#ffffff",
-                "series_row_swatch_border": "#93a4b8",
-                "series_badge_original_bg": "#e7edf5",
-                "series_badge_original_border": "#9aacbf",
-                "series_badge_original_text": "#23324a",
-                "series_badge_copy_bg": "#fff0bd",
-                "series_badge_copy_border": "#c6941f",
-                "series_badge_copy_text": "#4f3600",
-                "selected_card_bg": "#d7f1f4",
-                "selected_card_border": "#087982",
-                "nav_hover": "#edf4fa",
-                "nav_selected": "#0f8f95",
-                "nav_selected_border": "#0c7a80",
-                "nav_selected_text": "#f8feff",
-                "badge_bg": "#edf4fa",
-                "badge_border": "#c3d1df",
-                "badge_text": "#142033",
-                "warning_bg": "#fff3d9",
-                "warning_border": "#d8a94f",
-                "warning_text": "#7c5400",
-                "tooltip_bg": "#f8fbff",
-                "tooltip_border": "#b7c6d8",
-                "tooltip_text": "#102033",
-                "placeholder_text": "#7b8797",
-                "item_hover": "#edf4fa",
-                "item_selected_bg": "#0f8f95",
-                "item_selected_text": "#f8feff",
-                "splitter": "#cad5e1",
-                "scrollbar_track": "#edf2f7",
-                "scrollbar_thumb": "#b9c5d4",
-                "scrollbar_thumb_hover": "#95a6bb",
-            }
-
-        def _sync_theme_switch_label(self) -> None:
-            if self._theme_switch is None:
-                return
-            is_dark = self._is_dark_theme()
-            self._theme_switch.blockSignals(True)
-            try:
-                self._theme_switch.setChecked(is_dark)
-                self._theme_switch.setText("Dark mode" if is_dark else "Light mode")
-            finally:
-                self._theme_switch.blockSignals(False)
-
-        def _handle_theme_switch_toggled(self, checked: bool) -> None:
-            self._theme_mode = "dark" if checked else "light"
-            self._sync_theme_switch_label()
-            self._apply_theme_styles()
-            if hasattr(self, "series_list") and self.series_list is not None:
-                for index in range(self.series_list.count()):
-                    self._apply_series_list_item_visuals(self.series_list.item(index), index)
-            self._update_selected_layer_card(self._series_active_index)
-            self._refresh_shell_state()
-
-        def _apply_theme_styles(self) -> None:
-            colors = self._theme_tokens()
+        def _apply_styles(self) -> None:
+            colors = light_colors()
             self.setStyleSheet(
                 f"QWidget#windowRoot {{"
                 f"  background-color: {colors['window_bg']};"
@@ -5665,18 +5516,6 @@ def launch_plot_settings_panel(
                 f"  color: {colors['item_selected_text']};"
                 f"}}"
                 f"QCheckBox {{ spacing: 6px; }}"
-                f"QCheckBox#themeSwitch {{"
-                f"  padding: 6px 10px;"
-                f"  border: 1px solid {colors['border']};"
-                f"  border-radius: 999px;"
-                f"  background-color: {colors['button_bg']};"
-                f"  color: {colors['text']};"
-                f"  font-weight: 600;"
-                f"}}"
-                f"QCheckBox#themeSwitch:hover {{"
-                f"  border-color: {colors['accent']};"
-                f"  background-color: {colors['button_hover']};"
-                f"}}"
                 f"QCheckBox::indicator {{"
                 f"  width: 16px;"
                 f"  height: 16px;"
@@ -5710,17 +5549,6 @@ def launch_plot_settings_panel(
                 f"QAbstractItemView::indicator:disabled {{"
                 f"  background-color: {colors['disabled_bg']};"
                 f"  border-color: {colors['border_soft']};"
-                f"}}"
-                f"QCheckBox#themeSwitch::indicator {{"
-                f"  width: 34px;"
-                f"  height: 18px;"
-                f"  border-radius: 9px;"
-                f"  background-color: {colors['input_bg']};"
-                f"  border: 1px solid {colors['input_border']};"
-                f"}}"
-                f"QCheckBox#themeSwitch::indicator:checked {{"
-                f"  background-color: {colors['accent']};"
-                f"  border-color: {colors['accent']};"
                 f"}}"
                 f"QLabel#appTitle {{ font-size: 22px; font-weight: 700; color: {colors['heading']}; }}"
                 f"QLabel#appSubtitle {{ color: {colors['muted_text']}; font-size: 12px; }}"
@@ -5918,29 +5746,12 @@ def launch_plot_settings_panel(
             )
             if self._detached_preview_window is not None:
                 self._detached_preview_window.setStyleSheet(self.styleSheet())
-            self._status_label.set_dark(self._is_dark_theme())
 
         def _register_workspace_page(self, label: str, page: QWidget) -> None:
             if self._page_stack is None or self._nav_list is None:
                 return
             self._page_stack.addWidget(page)
             self._nav_list.addItem(label)
-
-        @staticmethod
-        def _workspace_note(label: str) -> str:
-            notes = {
-                "Profiles": "Save, load, duplicate, import, export, or reset plot presets.",
-                "Data": "Choose which stored data and view mode are sent into the plot.",
-                "Layers": (
-                    "Toggle visibility with the checkboxes. Select a layer to edit its appearance."
-                ),
-                "Figure": (
-                    "Adjust figure-wide styling, layout, axes, and heatmap presentation. "
-                    "Use the preview toolbar to export the current figure."
-                ),
-                "Advanced": "Use raw Matplotlib overrides only when the standard controls are not enough.",
-            }
-            return notes.get(label, "")
 
         def _handle_navigation_change(self, index: int) -> None:
             if self._page_stack is None or self._nav_list is None or index < 0:
@@ -5950,8 +5761,6 @@ def launch_plot_settings_panel(
             if item is not None:
                 if self._page_title_label is not None:
                     self._page_title_label.setText(item.text())
-                if self._page_note_label is not None:
-                    self._page_note_label.setText(self._workspace_note(item.text()))
 
         def _humanized_analysis_name(self) -> str:
             if self._analysis_name is None:
@@ -5982,6 +5791,9 @@ def launch_plot_settings_panel(
                 widget.setPlainText(rendered)
             finally:
                 widget.blockSignals(False)
+            parent = widget.parentWidget()
+            if isinstance(parent, JsonOptionsEditor):
+                parent.validate()
 
         def _apply_advanced_json_to_standard_controls(self, section_key: str) -> None:
             editor = self._advanced_editor(section_key)
@@ -6514,6 +6326,7 @@ def launch_plot_settings_panel(
             self._refresh_header_preview_detach_button()
             self._refresh_shell_state()
             QTimer.singleShot(0, self._refresh_preview_pixmap)
+            self._schedule_preview_canvas_resize()
 
         def _handle_dock_preview(self) -> None:
             if self._detached_preview_window is None or self._embedded_preview_pane is None:
@@ -6551,6 +6364,7 @@ def launch_plot_settings_panel(
             self._refresh_header_preview_detach_button()
             self._refresh_shell_state()
             QTimer.singleShot(0, self._refresh_preview_pixmap)
+            self._schedule_preview_canvas_resize()
 
         def _build_content_page(self) -> QWidget:
             self._tab_data = QWidget()
@@ -7759,14 +7573,16 @@ def launch_plot_settings_panel(
             self._propagate_base_font_size_change_to_auto_fields()
 
         def _build_series_tab(self) -> None:
-            tab_layout = QVBoxLayout(self._tab_series)
-            tab_layout.setContentsMargins(0, 0, 0, 0)
-            tab_layout.setSpacing(4)
+            self._tab_series_content = self._make_scrollable_tab(self._tab_series)
+            self._layers_scroll = self._tab_series.findChild(QScrollArea)
+            assert self._layers_scroll is not None
+            self._layers_scroll.setObjectName("layersScroll")
+            layout = QVBoxLayout(self._tab_series_content)
+            layout.setSpacing(8)
 
             self.series_list = _SeriesListView(self)
             self.series_list.setObjectName("seriesList")
             self.series_list.setAlternatingRowColors(True)
-            self.series_list.setMinimumHeight(180)
             self.series_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
             self.series_list.setSpacing(2)
             self.series_list.setUniformItemSizes(True)
@@ -7799,28 +7615,30 @@ def launch_plot_settings_panel(
             self._selected_layer_title.setSizePolicy(
                 QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
             )
-            self._layers_splitter = QSplitter(Qt.Orientation.Vertical, self._tab_series)
-            self._layers_splitter.setChildrenCollapsible(False)
+            layout.addWidget(self._selected_layer_card)
             browser = QWidget()
+            browser.setObjectName("layerBrowserContent")
+            browser.setMinimumWidth(0)
             browser_layout = QVBoxLayout(browser)
-            browser_layout.setContentsMargins(0, 0, 0, 0)
+            # Keep the browser controls clear of the surrounding section edge.
+            # This also aligns them with the selected-layer card above.
+            browser_layout.setContentsMargins(8, 8, 8, 8)
             browser_layout.setSpacing(6)
-            selector_row = QHBoxLayout()
-            for text, enabled in (("Show all", True), ("Hide all", False)):
+            selector_row = QGridLayout()
+            for column, (text, enabled) in enumerate((("Show all", True), ("Hide all", False))):
                 button = QPushButton(text)
                 button.clicked.connect(
                     lambda _checked=False, value=enabled: self._set_all_series_enabled(value)
                 )
-                selector_row.addWidget(button)
+                selector_row.addWidget(button, 0, column)
             self._series_duplicate_button = QPushButton("Duplicate")
             self._series_duplicate_button.clicked.connect(self._duplicate_selected_series)
             self._series_duplicate_button.setToolTip("Duplicate the selected layer.")
-            selector_row.addWidget(self._series_duplicate_button)
+            selector_row.addWidget(self._series_duplicate_button, 1, 0)
             self._series_delete_button.setText("Delete")
             self._series_delete_button.setToolTip("Delete the selected copy.")
-            selector_row.addWidget(self._series_delete_button)
+            selector_row.addWidget(self._series_delete_button, 1, 1)
             browser_layout.addLayout(selector_row)
-            browser_layout.addWidget(self._selected_layer_card)
             filter_row = QHBoxLayout()
             filter_row.addWidget(QLabel("Filter list"))
             self._layer_search = QLineEdit()
@@ -7851,34 +7669,21 @@ def launch_plot_settings_panel(
                 self._layer_match_buttons.append(button)
             self._layer_count_label = QLabel()
             self._layer_count_label.setObjectName("sectionNote")
-            browser_actions.addWidget(self._layer_count_label, stretch=1)
             browser_layout.addLayout(browser_actions)
-            browser_layout.addWidget(self.series_list, stretch=1)
+            browser_layout.addWidget(self._layer_count_label)
+            browser_layout.addWidget(self.series_list)
             self._layer_empty_label = QLabel("No layers match. Clear the search to see all layers.")
             self._layer_empty_label.setWordWrap(True)
             self._layer_empty_label.setObjectName("sectionNote")
             browser_layout.addWidget(self._layer_empty_label)
-            self.series_list.setMinimumHeight(160)
-            self._layers_splitter.addWidget(browser)
-
-            scroll = QScrollArea(self._tab_series)
-            scroll.setWidgetResizable(True)
-            scroll.setFrameShape(QFrame.Shape.NoFrame)
-            scroll.setMinimumWidth(0)
-            scroll.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-            self._tab_series_content = QWidget(scroll)
-            self._tab_series_content.setMinimumWidth(0)
-            self._tab_series_content.setSizePolicy(
-                QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred
+            self.series_list.fit_visible_rows()
+            self._layer_browser_section = self._make_collapsible_section(
+                title="Choose layer",
+                section_id="layers.browser",
+                body_widget=browser,
+                default_expanded=True,
             )
-            scroll.setWidget(self._tab_series_content)
-            self._layers_splitter.addWidget(scroll)
-            self._layers_splitter.setStretchFactor(0, 1)
-            self._layers_splitter.setStretchFactor(1, 1)
-            self._layers_splitter.setSizes([300, 260])
-            tab_layout.addWidget(self._layers_splitter, stretch=1)
-
-            layout = QVBoxLayout(self._tab_series_content)
+            layout.addWidget(self._layer_browser_section)
 
             visibility_group = QGroupBox("Visibility and Label")
             visibility_form = QFormLayout(visibility_group)
@@ -8488,6 +8293,11 @@ def launch_plot_settings_panel(
             layout.addStretch(1)
             for form in self._tab_series_content.findChildren(QFormLayout):
                 form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+            for widget in [
+                self._tab_series_content,
+                *self._tab_series_content.findChildren(QWidget),
+            ]:
+                widget.installEventFilter(self)
 
         def _build_annotations_tab(self) -> None:
             layout = QVBoxLayout(self._tab_annotations_content)
@@ -8843,7 +8653,7 @@ def launch_plot_settings_panel(
                         can_move_up=index > 0,
                         can_move_down=index < len(self._annotations_data) - 1,
                         tooltip_text=tooltip_text,
-                        theme=self._theme_tokens(),
+                        colors=light_colors(),
                     )
                     item.setSizeHint(row_widget.sizeHint())
                     self.annotation_list.setItemWidget(item, row_widget)
@@ -9512,6 +9322,22 @@ def launch_plot_settings_panel(
                         for label in self._density_target_filter_labels()
                         if label != "All targets"
                     ]
+                grouped_species_options: list[tuple[str, str]] = []
+                seen_mapping_species: set[str] = set()
+                for value, _label in resolved_species_options:
+                    mapping_species = species_mapping_label(value)
+                    if not mapping_species or mapping_species in seen_mapping_species:
+                        continue
+                    seen_mapping_species.add(mapping_species)
+                    grouped_species_options.append(
+                        (
+                            mapping_species,
+                            molecule_display_label(mapping_species)
+                            if is_molecule_species_label(mapping_species)
+                            else mapping_species,
+                        )
+                    )
+                resolved_species_options = grouped_species_options
                 option_count = max(1, len(resolved_species_options))
                 species_columns = 1
                 if option_count > 12:
@@ -10603,10 +10429,10 @@ def launch_plot_settings_panel(
                 color = str(state["color"])
                 swatch_color = QColor(color)
                 if not swatch_color.isValid():
-                    swatch_color = QColor(self._theme_tokens()["accent"])
+                    swatch_color = QColor(light_colors()["accent"])
                 self._selected_layer_swatch.setStyleSheet(
                     f"background-color: {swatch_color.name()};"
-                    f"border: 1px solid {self._theme_tokens()['border']};"
+                    f"border: 1px solid {light_colors()['border']};"
                     "border-radius: 4px;"
                 )
             if self._series_delete_button is not None:
@@ -10674,7 +10500,7 @@ def launch_plot_settings_panel(
                 return
             if not isinstance(value, (list, tuple, set)):
                 return
-            enabled = {str(item).strip() for item in value if str(item).strip()}
+            enabled = {species_mapping_label(str(item)) for item in value if str(item).strip()}
             if not enabled:
                 return
             available = set(checkboxes)
@@ -10697,7 +10523,7 @@ def launch_plot_settings_panel(
             if enabled_species is None:
                 return True
             target = self._density_target_for_descriptor(descriptor)
-            return not target or target in enabled_species
+            return not target or species_mapping_label(target) in enabled_species
 
         def _position_species_options(self) -> list[tuple[str, str]]:
             raw_options = self._profile_filter_options.get("position_species_options")
@@ -10964,12 +10790,32 @@ def launch_plot_settings_panel(
                 )
             return defaults
 
+        def _snapshot_view_settings(self, view_type: str) -> dict[str, Any]:
+            """Read the outgoing widgets under their original view identity."""
+            selector = getattr(self, f"{self._analysis_name}_view_type")
+            labels = {
+                "density": _DENSITY_VIEW_TYPE_ID_BY_LABEL,
+                "position": _POSITION_GUI_VIEW_TYPE_ID_BY_LABEL,
+                "orientation": _ORIENTATION_VIEW_TYPE_ID_BY_LABEL,
+            }[str(self._analysis_name)]
+            previous_index = selector.currentIndex()
+            blocked = selector.blockSignals(True)
+            try:
+                for index in range(selector.count()):
+                    if labels.get(selector.itemText(index)) == view_type:
+                        selector.setCurrentIndex(index)
+                        break
+                return self._collect_settings()
+            finally:
+                selector.setCurrentIndex(previous_index)
+                selector.blockSignals(blocked)
+
         def _snapshot_density_view_state(self, view_type: str) -> dict[str, Any]:
             normalized = self._normalize_density_view_type_id(view_type)
             if self._analysis_name != "density" or not hasattr(self, "density_view_type"):
                 return {}
             try:
-                snapshot = self._collect_settings()
+                snapshot = self._snapshot_view_settings(normalized)
             except Exception:
                 snapshot = {}
             if not isinstance(snapshot, dict):
@@ -11021,6 +10867,9 @@ def launch_plot_settings_panel(
                 normalized,
                 restore_state,
             )
+            # _populate also resolves nested view states; keep that copy authoritative.
+            restore_settings["density_view_states"] = deepcopy(self._density_view_states)
+            restore_settings["density_view_states"][normalized] = deepcopy(restore_state)
             previous_switching = self._density_view_state_switching
             previous_suspend = self._suspend_preview_events
             self._density_view_state_switching = True
@@ -11141,7 +10990,7 @@ def launch_plot_settings_panel(
             if self._analysis_name != "position" or not hasattr(self, "position_view_type"):
                 return {}
             try:
-                snapshot = self._collect_settings()
+                snapshot = self._snapshot_view_settings(normalized)
             except Exception:
                 snapshot = {}
             if not isinstance(snapshot, dict):
@@ -11177,6 +11026,9 @@ def launch_plot_settings_panel(
                 normalized,
                 restore_state,
             )
+            # _populate also resolves nested view states; keep that copy authoritative.
+            restore_settings["position_view_states"] = deepcopy(self._position_view_states)
+            restore_settings["position_view_states"][normalized] = deepcopy(restore_state)
             previous_switching = self._position_view_state_switching
             previous_suspend = self._suspend_preview_events
             self._position_view_state_switching = True
@@ -11316,7 +11168,7 @@ def launch_plot_settings_panel(
             if self._analysis_name != "orientation" or not hasattr(self, "orientation_view_type"):
                 return {}
             try:
-                snapshot = self._collect_settings()
+                snapshot = self._snapshot_view_settings(normalized)
             except Exception:
                 snapshot = {}
             if not isinstance(snapshot, dict):
@@ -11371,6 +11223,9 @@ def launch_plot_settings_panel(
                 normalized,
                 restore_state,
             )
+            # _populate also resolves nested view states; keep that copy authoritative.
+            restore_settings["orientation_view_states"] = deepcopy(self._orientation_view_states)
+            restore_settings["orientation_view_states"][normalized] = deepcopy(restore_state)
             previous_switching = self._orientation_view_state_switching
             previous_suspend = self._suspend_preview_events
             self._orientation_view_state_switching = True
@@ -13115,6 +12970,7 @@ def launch_plot_settings_panel(
                         species in self._series_collapsed_species and not searching
                     )
                 self.series_list.setRowHidden(row, hidden)
+            self.series_list.fit_visible_rows()
             shown = len(matches)
             enabled = sum(bool(value) for value in self._series_enabled_data)
             count_text = f"{shown} matches" if searching else f"{shown} layers"
@@ -13629,7 +13485,7 @@ def launch_plot_settings_panel(
                     {
                         "kind": "species",
                         "species": species,
-                        "theme": self._theme_tokens(),
+                        "colors": light_colors(),
                         "text": f"{species} · {len(members)} trajectories · {enabled_count} visible",
                         "checked": enabled_count == len(members),
                         "partial": 0 < enabled_count < len(members),
@@ -13713,7 +13569,7 @@ def launch_plot_settings_panel(
                     if group_members
                     else base_index < len(self._series_labels_data) - 1,
                     "tooltip_text": item.toolTip(),
-                    "theme": self._theme_tokens(),
+                    "colors": light_colors(),
                     "series_id": series_id,
                 },
             )
@@ -13935,173 +13791,143 @@ def launch_plot_settings_panel(
 
         def _build_advanced_tab(self) -> None:
             layout = QVBoxLayout(self._tab_advanced_content)
-            cache_group = QGroupBox("Preview resources")
-            cache_form = QFormLayout(cache_group)
-            self._cache_budget_mib_edit = QLineEdit()
-            self._cache_budget_mib_edit.setPlaceholderText("512 (or LINAK_CACHE_BUDGET_MIB)")
-            self._cache_budget_mib_edit.editingFinished.connect(self._apply_preview_cache_budget)
-            self._add_form_row(
-                cache_form,
-                "Cache budget (MiB)",
-                self._cache_budget_mib_edit,
-            )
-            clear_cache_button = QPushButton("Clear preview cache")
-            clear_cache_button.clicked.connect(self._clear_preview_cache)
-            cache_form.addRow("", clear_cache_button)
-            layout.addWidget(
-                self._make_collapsible_section(
-                    title="Preview resources",
-                    section_id="advanced.preview_resources",
-                    body_widget=cache_group,
-                )
-            )
-            guide_link = QLabel(
-                '<a href="https://matplotlib.org/stable/users/index.html">Matplotlib user guide</a>'
-            )
-            guide_link.setOpenExternalLinks(True)
-            self._register_tooltip(guide_link, "advanced.matplotlib_guide_link")
-            self._apply_widget_tooltip(guide_link)
-            layout.addWidget(guide_link)
+            self._advanced_option_editors: dict[str, JsonOptionsEditor] = {}
 
-            def _json_editor(
-                placeholder: str,
+            def _options(
+                form: QFormLayout,
+                key: str,
+                label: str,
+                description: str,
+                example: str,
                 *,
-                sync_section: str | None = None,
-            ) -> QPlainTextEdit:
-                editor = QPlainTextEdit()
-                editor.setPlaceholderText(placeholder)
-                editor.setFixedHeight(84)
-                self._configure_horizontal_growth(editor)
-                if sync_section is None:
-                    editor.textChanged.connect(self._schedule_preview_update)
-                else:
-                    editor.textChanged.connect(
-                        lambda section=sync_section: self._handle_advanced_editor_changed(section)
-                    )
-                return editor
+                sync: bool = True,
+            ) -> JsonOptionsEditor:
+                options = JsonOptionsEditor(description, example)
+                options.editor.setAccessibleName(label + " (JSON)")
+                self._configure_horizontal_growth(options)
+                self._configure_horizontal_growth(options.editor)
+                self._advanced_option_editors[key] = options
+                setattr(self, f"{key}_json", options.editor)
 
-            rc_group = QGroupBox("Matplotlib rcParams")
-            rc_form = QFormLayout(rc_group)
-            self.matplotlib_rc_json = _json_editor('{"axes.facecolor": "#f8f8f8"}')
-            self._add_form_row(
-                rc_form,
-                "rcParams (JSON object)",
-                self.matplotlib_rc_json,
-                tooltip_id="advanced.rcparams",
-            )
-            layout.addWidget(
-                self._make_collapsible_section(
-                    title="Matplotlib rcParams",
-                    section_id="advanced.rcparams",
-                    body_widget=rc_group,
-                )
-            )
+                def changed() -> None:
+                    if not options.is_valid:
+                        self._preview_timer.stop()
+                        self._refresh_shell_state()
+                    elif sync:
+                        self._handle_advanced_editor_changed(key)
+                    else:
+                        self._schedule_preview_update()
 
-            render_group = QGroupBox("Figure / Axes / Layout")
-            render_form = QFormLayout(render_group)
-            self.figure_kwargs_json = _json_editor(
-                '{"facecolor": "white"}',
-                sync_section="figure_kwargs",
-            )
-            self.axes_kwargs_json = _json_editor(
-                '{"xmargin": 0.02, "ymargin": 0.05}',
-                sync_section="axes_kwargs",
-            )
-            self.tight_layout_kwargs_json = _json_editor('{"pad": 0.6}')
-            self.savefig_kwargs_json = _json_editor(
-                '{"transparent": false}',
-                sync_section="savefig_kwargs",
-            )
-            self._add_form_row(
-                render_form,
-                "Figure kwargs",
-                self.figure_kwargs_json,
-                tooltip_id="advanced.figure_kwargs",
-            )
-            self._add_form_row(
-                render_form,
-                "Axes kwargs",
-                self.axes_kwargs_json,
-                tooltip_id="advanced.axes_kwargs",
-            )
-            self._add_form_row(
-                render_form,
-                "tight_layout kwargs",
-                self.tight_layout_kwargs_json,
-                tooltip_id="advanced.tight_layout_kwargs",
-            )
-            self._add_form_row(
-                render_form,
-                "savefig kwargs",
-                self.savefig_kwargs_json,
-                tooltip_id="advanced.savefig_kwargs",
-            )
-            layout.addWidget(
-                self._make_collapsible_section(
-                    title="Figure / Axes / Layout",
-                    section_id="advanced.render",
-                    body_widget=render_group,
-                )
-            )
+                options.editor.textChanged.connect(changed)
+                self._add_form_row(form, label, options)
+                return options
 
-            style_group = QGroupBox("Raw Matplotlib kwargs")
+            style_group = QGroupBox("Plot details")
             style_form = QFormLayout(style_group)
-            self.legend_kwargs_json = _json_editor(
-                '{"frameon": true}',
-                sync_section="legend_kwargs",
-            )
-            self.grid_kwargs_json = _json_editor(
-                '{"color": "#dddddd"}',
-                sync_section="grid_kwargs",
-            )
-            self.tick_params_kwargs_json = _json_editor(
-                '{"direction": "out"}',
-                sync_section="tick_params_kwargs",
-            )
-            self.line_kwargs_json = _json_editor(
-                '{"linestyle": "-", "alpha": 1.0}',
-                sync_section="line_kwargs",
-            )
-            self._add_form_row(
+            legend_options = _options(
                 style_form,
-                "Legend kwargs",
-                self.legend_kwargs_json,
-                tooltip_id="advanced.legend_kwargs",
+                "legend_kwargs",
+                "Legend",
+                "Extra spacing and placement options for the legend. Shared settings also update Figure → Legend.",
+                '{"borderpad": 0.8, "labelspacing": 0.6}',
             )
-            self._advanced_legend_kwargs_rows.append((style_form, self.legend_kwargs_json))
-            self._add_form_row(
+            self._advanced_legend_kwargs_rows.append((style_form, legend_options))
+            _options(
                 style_form,
-                "Grid kwargs",
-                self.grid_kwargs_json,
-                tooltip_id="advanced.grid_kwargs",
+                "grid_kwargs",
+                "Grid",
+                "Fine-tune grid lines. Colour and axis settings stay synchronized with Figure → Grid.",
+                '{"color": "#dddddd", "zorder": 0}',
             )
-            self._add_form_row(
+            _options(
                 style_form,
-                "Tick params kwargs",
-                self.tick_params_kwargs_json,
-                tooltip_id="advanced.tick_params_kwargs",
+                "tick_params_kwargs",
+                "Ticks",
+                "Extra tick appearance options, such as the spacing between tick marks and their labels.",
+                '{"pad": 6, "direction": "out"}',
             )
-            self._add_form_row(
+            line_options = _options(
                 style_form,
-                "Global line kwargs",
-                self.line_kwargs_json,
-                tooltip_id="advanced.line_kwargs",
+                "line_kwargs",
+                "Lines and markers",
+                "Defaults for all plotted lines. Individual layer styles take precedence.",
+                '{"solid_capstyle": "round"}',
             )
-            self._advanced_line_kwargs_rows.append((style_form, self.line_kwargs_json))
+            self._advanced_line_kwargs_rows.append((style_form, line_options))
             layout.addWidget(
                 self._make_collapsible_section(
-                    title="Raw Matplotlib kwargs",
+                    title="Plot details",
                     section_id="advanced.style",
                     body_widget=style_group,
                 )
             )
 
-            hint = QLabel(
-                "Advanced JSON fields map directly onto Matplotlib API kwargs. "
-                "Recognized keys stay synchronized with the standard controls; extra keys remain available here."
+            render_group = QGroupBox("Canvas, layout and export")
+            render_form = QFormLayout(render_group)
+            _options(
+                render_form,
+                "figure_kwargs",
+                "Figure background",
+                "Figure-wide Matplotlib options. Background colour and opacity also update the Figure controls.",
+                '{"facecolor": "white"}',
             )
-            hint.setWordWrap(True)
-            layout.addWidget(hint)
+            _options(
+                render_form,
+                "axes_kwargs",
+                "Plot area",
+                "Options for the axes, including the space left around the plotted data.",
+                '{"xmargin": 0.02, "ymargin": 0.05}',
+            )
+            _options(
+                render_form,
+                "tight_layout_kwargs",
+                "Layout spacing",
+                "Padding around the figure and between axes, in fractions of the font size.",
+                '{"pad": 0.6}',
+                sync=False,
+            )
+            _options(
+                render_form,
+                "savefig_kwargs",
+                "Image export",
+                "Options used when saving the figure, including transparency and border padding.",
+                '{"transparent": false, "pad_inches": 0.1}',
+            )
+            layout.addWidget(
+                self._make_collapsible_section(
+                    title="Canvas, layout and export",
+                    section_id="advanced.render",
+                    body_widget=render_group,
+                )
+            )
+
+            rc_group = QGroupBox("Matplotlib defaults")
+            rc_form = QFormLayout(rc_group)
+            _options(
+                rc_form,
+                "matplotlib_rc",
+                "Global appearance defaults",
+                "Matplotlib rcParams provide base styling. Explicit Figure and Layer settings take precedence.",
+                '{"axes.facecolor": "#f8f8f8"}',
+                sync=False,
+            )
+            layout.addWidget(
+                self._make_collapsible_section(
+                    title="Matplotlib defaults",
+                    section_id="advanced.rcparams",
+                    body_widget=rc_group,
+                )
+            )
+            for form in (style_form, render_form, rc_form):
+                form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapAllRows)
+                form.setVerticalSpacing(10)
+            guide_link = QLabel(
+                '<a href="https://matplotlib.org/stable/users/index.html">Matplotlib options reference ↗</a>'
+            )
+            guide_link.setOpenExternalLinks(True)
+            self._register_tooltip(guide_link, "advanced.matplotlib_guide_link")
+            self._apply_widget_tooltip(guide_link)
+            layout.addWidget(guide_link)
             self._logs_section = self._make_collapsible_section(
                 title="Logs",
                 section_id="advanced.logs",
@@ -14130,28 +13956,6 @@ def launch_plot_settings_panel(
                 viewer.setFocus(Qt.FocusReason.OtherFocusReason)
 
             QTimer.singleShot(0, reveal)
-
-        def _apply_preview_cache_budget(self) -> None:
-            from ..cache import PREVIEW_CACHE
-
-            raw = self._cache_budget_mib_edit.text().strip()
-            if not raw:
-                return
-            try:
-                resolved = float(raw)
-                PREVIEW_CACHE.set_budget_mib(resolved)
-            except ValueError as exc:
-                self._status_label.setText(f"Invalid preview cache budget: {exc}")
-                return
-            self._status_label.setText(f"Preview cache budget set to {resolved:g} MiB.")
-
-        def _clear_preview_cache(self) -> None:
-            from ..cache import clear_preview_cache
-
-            released = clear_preview_cache()
-            self._status_label.setText(
-                f"Cleared in-memory preview cache ({released / (1024 * 1024):.1f} MiB released)."
-            )
 
         def _series_count_from_settings(self, settings: dict[str, Any]) -> int:
             candidates = [1]
@@ -16340,6 +16144,27 @@ def launch_plot_settings_panel(
             if self._preview_loading:
                 self._preview_timer.start(self._preview_debounce_ms_for_sender(sender))
                 return
+            if (
+                sender
+                in {
+                    getattr(self, name, None)
+                    for name in (
+                        "legend_mode",
+                        "legend_loc",
+                        "legend_frame_mode",
+                        "legend_title",
+                        "legend_title_font",
+                        "legend_columns",
+                        "legend_font",
+                        "legend_kwargs_json",
+                    )
+                }
+                and self._refresh_preview_legend()
+            ):
+                if self._preview_canvas is not None:
+                    self._preview_canvas.draw_idle()
+                self._preview_timer.stop()
+                return
             if sender in {
                 getattr(self, "x_min", None),
                 getattr(self, "x_max", None),
@@ -16518,6 +16343,10 @@ def launch_plot_settings_panel(
                 self._preview_figure = None
 
         def _disconnect_preview_axis_callbacks(self) -> None:
+            if self._preview_draw_callback is not None:
+                canvas, callback_id = self._preview_draw_callback
+                canvas.mpl_disconnect(callback_id)
+                self._preview_draw_callback = None
             for ax, callback_id in list(self._preview_axis_callback_ids):
                 try:
                     ax.callbacks.disconnect(callback_id)
@@ -16531,6 +16360,11 @@ def launch_plot_settings_panel(
             if not axes:
                 return
             primary_ax = axes[0]
+            canvas = figure.canvas
+            self._preview_draw_callback = (
+                canvas,
+                canvas.mpl_connect("draw_event", self._sync_preview_tick_fields),
+            )
             try:
                 x_callback_id = primary_ax.callbacks.connect(
                     "xlim_changed",
@@ -16605,6 +16439,7 @@ def launch_plot_settings_panel(
                 self._preview_scroll.setVisible(False)
             self._preview_canvas_container.setVisible(True)
             self._resize_preview_canvas_to_figure()
+            self._schedule_preview_canvas_resize()
             canvas.draw_idle()
             self._connect_preview_axis_callbacks(figure)
 
@@ -16852,6 +16687,7 @@ def launch_plot_settings_panel(
             return (
                 self._preview_worker_job_cancelled(generation)
                 or self._pending_preview_request is not None
+                or self._preview_timer.isActive()
             )
 
         def _handle_preview_worker_finished(self, generation: int, payload: object) -> None:
@@ -17013,8 +16849,6 @@ def launch_plot_settings_panel(
             self._preview_label.resize(scaled.size())
 
         def _preview_transparency_matte_colors(self) -> tuple[QColor, QColor]:
-            if self._theme_mode == "dark":
-                return QColor("#8793a3"), QColor("#aeb7c3")
             return QColor("#f4f7fb"), QColor("#dce4ee")
 
         def _preview_display_pixmap(self, pixmap: QPixmap) -> QPixmap:
@@ -20511,6 +20345,7 @@ def launch_plot_settings_panel(
                 if pane is not None:
                     pane.loading_overlay.shutdown()
             self._preview_timer.stop()
+            self._preview_layout_timer.stop()
             self._preview_generation += 1
             self._active_preview_generation = None
             self._active_preview_signature = None
@@ -20556,20 +20391,35 @@ def launch_plot_settings_panel(
         def showEvent(self, event: Any) -> None:  # pragma: no cover - UI flow
             super().showEvent(event)
             QTimer.singleShot(0, self._refresh_preview_after_layout)
+            self._schedule_preview_canvas_resize()
 
         def changeEvent(self, event: Any) -> None:  # pragma: no cover - UI flow
-            if event.type() in {
-                QEvent.Type.PaletteChange,
-                QEvent.Type.ApplicationPaletteChange,
-            }:
-                self._apply_theme_styles()
-                self._sync_theme_switch_label()
-                if hasattr(self, "series_list") and self.series_list is not None:
-                    for index in range(self.series_list.count()):
-                        self._apply_series_list_item_visuals(self.series_list.item(index), index)
             super().changeEvent(event)
+            if event.type() == QEvent.Type.WindowStateChange:
+                self._schedule_preview_canvas_resize()
 
         def eventFilter(self, watched: Any, event: Any) -> bool:  # pragma: no cover - UI flow
+            if event.type() == QEvent.Type.Wheel and isinstance(watched, QWidget):
+                content = getattr(self, "_tab_series_content", None)
+                if content is not None and (watched is content or content.isAncestorOf(watched)):
+                    parent = watched
+                    while parent is not content:
+                        # Preserve independent scrolling in the layer list, JSON
+                        # editors, and open combo-box popups.
+                        if isinstance(parent, (QAbstractItemView, QPlainTextEdit)) or (
+                            isinstance(parent, QComboBox) and parent.view().isVisible()
+                        ):
+                            break
+                        parent = parent.parentWidget()
+                    else:
+                        if event.pixelDelta().y():
+                            bar = self._layers_scroll.verticalScrollBar()
+                            bar.setValue(bar.value() - event.pixelDelta().y())
+                            event.accept()
+                        else:
+                            QApplication.sendEvent(self._layers_scroll.viewport(), event)
+                        return True
+
             preview_scroll = self._preview_scroll
             preview_label = self._preview_label
             preview_frame = self._preview_frame
@@ -20631,13 +20481,14 @@ def launch_plot_settings_panel(
                 watched in {preview_frame, preview_canvas_viewport}
                 and event.type() == QEvent.Type.Resize
             ):
-                QTimer.singleShot(0, self._resize_preview_canvas_to_figure)
+                self._schedule_preview_canvas_resize()
             return super().eventFilter(watched, event)
 
         def resizeEvent(self, event: Any) -> None:  # pragma: no cover - UI flow
             super().resizeEvent(event)
             self._refresh_preview_pixmap()
             self._resize_preview_canvas_to_figure()
+            self._schedule_preview_canvas_resize()
 
         def closeEvent(self, event: Any) -> None:  # pragma: no cover - UI flow
             try:

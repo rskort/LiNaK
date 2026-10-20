@@ -91,6 +91,8 @@ HDF5:
 
 ```bash
 linak apply convert /path/to/traj.xyz --input /path/to/input.inp
+# Without a simulation input: supply the interval between saved frames in fs.
+linak apply convert /path/to/traj.xyz --timestep 2.5
 linak compute density /path/to/LiNaK_outputs/traj.traj.h5 --species O --axis z
 ```
 
@@ -192,6 +194,15 @@ Missing cells retain `nan` values so the grid can be reconstructed.
 The export uses the selected plot's processed grid. Color limits and logarithmic
 color scaling do not change the exported numeric values. Enable **Include metadata
 comments** to include grid dimensions and axis/value labels.
+
+### Advanced plot options
+
+The **Advanced** page groups extra settings into **Plot details**, **Canvas,
+layout and export**, and **Matplotlib defaults**. Each optional JSON field
+explains its purpose and shows errors next to the editor. **Format JSON**
+indents valid input; **Use example** fills an empty field; **Clear** removes
+its contents. These edits support Ctrl+Z. Shared settings remain synchronized
+with the regular Figure controls, and saved profiles retain the same format.
 
 ### Plot window messages
 

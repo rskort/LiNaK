@@ -48,6 +48,8 @@ def main() -> None:
         assert metadata["Requires-Python"] == ">=3.9"
         assert any(n.endswith("/licenses/LICENSE") for n in names)
         assert "linak/temporary_resources.py" in names
+        assert "linak/gui/styles.py" in names
+        assert "linak/gui/theme.py" not in names
         assert not any("msd" in n.lower() for n in names)
         for asset in ("logo_simple.svg", "linak_gui_banner.svg", "screenshot_gui.png"):
             assert any(n.endswith("/assets/" + asset) for n in names)
@@ -66,11 +68,16 @@ from pathlib import Path
 import linak
 from linak.cli import main
 from linak.plot.plot_gui import _resolve_asset_path
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QWidget
+from PySide6.QtGui import QPalette
+from linak.gui.styles import apply_light_palette, light_colors
 from PySide6.QtSvg import QSvgRenderer
 expected = Path(sys.argv[1]).resolve()
 assert expected in Path(linak.__file__).resolve().parents
 app = QApplication([])
+window = QWidget()
+apply_light_palette(window)
+assert window.palette().color(QPalette.ColorRole.Window).name() == light_colors()['window_bg']
 for name in ('logo_simple.svg', 'linak_gui_banner.svg'):
     path = _resolve_asset_path(name)
     assert path.is_file(), path

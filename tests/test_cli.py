@@ -5902,7 +5902,7 @@ def test_density_profile_filter_options_fall_back_to_grid_shape_distance_range()
     assert options["density_axis_ranges"]["distance"] == [0.0, 4.0]
 
 
-def test_density_gui_deduplicates_old_unsplit_raw_species_profiles(tmp_path):
+def test_density_gui_groups_mapping_by_element_but_keeps_distinct_layers(tmp_path):
     output = tmp_path / "old_duplicate_species_density.h5"
     profiles = [
         DensityProfile(
@@ -5947,15 +5947,54 @@ def test_density_gui_deduplicates_old_unsplit_raw_species_profiles(tmp_path):
         option["value"] for option in catalog.profile_filter_options["density_species_options"]
     }
 
-    expected = {"H", "Na", "O", "Pt", "species:Pt", "species:Pt_top", "mol:H", "mol:H2O"}
-    assert expected <= descriptor_species
-    assert expected <= option_species
+    expected_layers = {
+        "H",
+        "Na",
+        "O",
+        "Pt",
+        "species:Pt",
+        "species:Pt_top",
+        "mol:H",
+        "mol:H2O",
+    }
+    assert expected_layers <= descriptor_species
+    assert option_species == {"H", "Na", "O", "Pt", "mol:H", "mol:H2O"}
     assert "species:H" not in descriptor_species
     assert "species:Na" not in descriptor_species
     assert "species:O" not in descriptor_species
     assert "species:H" not in option_species
     assert "species:Na" not in option_species
     assert "species:O" not in option_species
+
+    args.density_enabled_species = ["Pt"]
+    filtered_catalog = cli_mod._build_density_gui_lazy_catalog(
+        args,
+        sources=[str(output)],
+    )
+    assert {
+        descriptor["density_species"] for descriptor in filtered_catalog.series_descriptors
+    } == {"Pt", "species:Pt", "species:Pt_top"}
+
+    args.density_enabled_species = ["species:Pt_top"]
+    restored_catalog = cli_mod._build_density_gui_lazy_catalog(
+        args,
+        sources=[str(output)],
+    )
+    assert {
+        descriptor["density_species"] for descriptor in restored_catalog.series_descriptors
+    } == {"Pt", "species:Pt", "species:Pt_top"}
+
+
+def test_density_gui_2d_resolves_element_mapping_to_available_raw_species():
+    segments = [
+        [
+            {"density_species": "species:Pt_top"},
+            {"density_species": "mol:H2O"},
+        ]
+    ]
+
+    assert cli_mod._density_2d_single_species_from_segments(segments, ["Pt"]) == ("species:Pt_top")
+    assert cli_mod._density_2d_single_species_from_segments(segments, ["mol:H2O"]) == ("mol:H2O")
 
 
 def test_density_gui_symmetric_representation_overrides_stale_raw_axis_mapping(tmp_path):

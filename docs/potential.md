@@ -64,6 +64,14 @@ O/H topology detection identifies complete H2O molecules. Only their atom
 indices determine the water-region bounds along `z`; ions, adsorbed H/O, and
 incomplete fragments are excluded.
 
+For a symmetric slab, LiNaK first constructs a contiguous periodic slab image.
+Top is the face pointing along positive z; bottom points along negative z.
+Water molecules are assigned by their center of mass, and their atoms are
+unwrapped around that center before computing bounds. A molecule crossing the
+periodic solvent cut therefore cannot expand a side's bounds across the cell.
+Each side searches only its own solvent half, outside the slab. Top and bottom
+windows cannot use the same physical grid slices.
+
 If the water-like atom coordinates are `z_i`, LiNaK defines:
 
 - `z_water_min = min_i z_i`
@@ -109,6 +117,20 @@ If even zero padding leaves no clean water slice, the water-bulk potential is
 left unavailable and the source row remains incomplete. LiNaK does not fall back
 to a contaminated slice.
 
+For symmetric references, a clean window must span at least half the unpadded
+water extent on its side and at least two grid spacings. An unexpectedly narrow
+window triggers the same padding relaxation instead of being accepted just
+because it is nonempty. Relaxation is recorded in `water_bulk_provenance`.
+Missing, overlapping, incorrectly assigned, or persistently narrow windows are
+reported with warnings and stored as unavailable; an invalid symmetric side
+also makes the combined potential unavailable and the row incomplete.
+
+The `water_bulk_window_top_min_A`, `water_bulk_window_top_max_A`, and matching
+bottom fields store the actual selected grid bounds in canonical periodic z
+coordinates, not distances from the slab. Provenance records the coordinate
+cut, cell lower bound and period, and slab planes. To recover an original
+wrapped cube coordinate, use `z = lower + ((canonical_z + cut) % period)`.
+
 ## Step 4: Resolve The Fermi Energy
 
 LiNaK searches for a suitable CP2K output file in the same directory as the
@@ -128,7 +150,7 @@ If both upstream quantities are available, LiNaK computes:
 `electrode_cshe_ev = water_bulk_potential_ev - efermi_ev - cshe_offset_ev`
 
 The `cshe_offset_ev` value is configurable and defaults to LiNaK's internal
-reference constant.
+reference constant of -0.65. (10.1063/5.0322322)
 
 If either upstream quantity is missing, LiNaK does not fabricate a cSHE value.
 Instead, the row is marked as incomplete.
