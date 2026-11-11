@@ -216,3 +216,7 @@ def test_density_gui_real_preview_layer_identity_visibility_colors_and_order(
     assert result == 0
     app.processEvents()
     assert checked == [True]
+
+
+# Callback tests receive a prepared session; startup itself is tested separately.
+pytestmark = pytest.mark.usefixtures("prepared_studio")

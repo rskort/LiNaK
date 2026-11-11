@@ -138,6 +138,11 @@ def resolve_topology(
     frame: Atoms, *, cutoff: float, backend: str, build_source: bool = True
 ) -> OHTopology:
     from .water import _normalize_topology_backend, _oh_molecule_topology_with_backend
+    from ..parallel import in_worker
+
+    # Worker tasks may consume existing immutable profiles, but source upgrades
+    # and their HDF5 writes belong to the coordinator.
+    build_source = build_source and not in_worker()
 
     backend = _normalize_topology_backend(backend)
     if not np.isfinite(cutoff) or cutoff <= 0:

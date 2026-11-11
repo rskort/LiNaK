@@ -6,9 +6,20 @@ The top outward normal is `+axis` and the bottom outward normal is `-axis`.
 LiNaK flips the bottom polar cosine before pooling while retaining the existing
 in-plane azimuthal convention. Folded density, averages, and heatmaps are equal
 side means; top/bottom arrays and sparse-grid accumulators are stored.
+Spatially filtered line and mean-orientation heatmap projections first
+accumulate each side separately, then average the available side means with
+equal weight. Selecting a range that includes all data therefore preserves
+the folded result even when the side populations differ. Folded sample and
+block uncertainties use the same per-frame side averaging and per-interface
+density normalization. Full-cell and individual-interface views retain their
+own reference and weighting conventions.
 
 `interface_view=all` overlays the three labeled 1D views. Orientation heatmaps
 select exactly one of `full`, `folded`, `top`, or `bottom`.
+The comparison expands source IDs, labels, and per-series styles together so
+GUI preview and export can render all three curves. Interface plots default
+to outward distance; returning from Full cell restores the interface axis
+selection, defaulting to distance.
 `interface_view=full` uses the raw periodic surface-axis coordinate and one
 laboratory `+axis` polar reference across the complete cell; it does not flip
 the negative-axis half. The analysis stores separate full-cell 1D averages,
@@ -24,6 +35,50 @@ and `−X/−Y/−Z` labels follow the selected surface axis.
 `linak compute orientation` computes water-orientation observables as a function
 of distance to a trusted shared surface reference or, when no trusted surface
 reference is available, along a raw Cartesian axis.
+
+## Aligning symmetric interfaces
+
+**Combined interfaces (folded mean)** averages the two interface means with
+equal weight. Without registration, their lateral coordinates retain the
+original cell positions, so mirrored steps or shifted terraces may overlap
+incorrectly in spatial maps.
+
+For new symmetric orientation results, open **Surface representation → Align
+interfaces…** to preview the substrate overlay, suggest or select a compatible
+rotation/reflection, and adjust the lateral translation. Apply remains
+explicit; Cancel discards dialog changes. Matching diagnostics, mismatch
+acknowledgement, and reference validation are shared with density and position.
+
+Registration maps the negative interface's **sample locations** into the
+positive interface's lateral coordinates. It preserves the stored polar and
+azimuthal angle definitions, including their existing sign conventions; it
+does not rotate or reflect molecular orientation directions. Per-geometry
+cosine sums, valid-orientation counts, and water counts move together by
+conservative periodic overlap before filtering, rebinning, normalization, and
+equal-interface averaging. Density-weighted orientation remains the product
+of the displayed mean and density. Fractional shifts cannot recover detail
+below the original source-bin resolution shown in the dialog.
+
+Alignment applies to spatial maps and mean-orientation lines that use lateral
+axes or lateral filters. Use **Distance** for an aligned normal cross-section.
+The positive interface stays fixed. Full-cell views, distance-only profiles,
+and orientation distributions retain their interpretation. Saved alignment
+settings survive these view switches and are included in plot profiles,
+preview/export rendering, and quantitative export metadata.
+
+New computations automatically embed substrate reference snapshots and
+per-geometry moments during existing trajectory processing. Older results
+retain their ordinary plotting capabilities, but alignment is disabled with
+**Recompute this orientation file to enable interface alignment.** No
+attachment or approximate legacy-normalization workflow is provided. Current
+orientation alignment requires a fully periodic, decoupled slab geometry and
+surface-plane sparse geometry. See [Interface alignment](interface-alignment.md)
+for the matching controls and geometry limitations.
+
+Python plotting and sparse-grid projection functions accept
+`interface_alignments={reference_id: alignment.to_dict()}`. Settings can be
+copied between density, position, and orientation results only when their
+embedded reference fingerprints match.
 
 ## What Is Being Computed
 
@@ -191,8 +246,11 @@ density along the chosen axis.
 
 ## 2D Orientation Heatmaps
 
-The orientation heatmaps use `cos(angle)` on the second axis, not the angle in
-radians or degrees.
+In Studio, **2D representation** selects **Orientation distribution** (the
+default) or **Spatial map**. Each representation retains its own settings.
+
+Orientation distributions use `cos(angle)` on the second axis, rather than the
+angle in radians or degrees.
 
 LiNaK stores:
 
@@ -235,6 +293,63 @@ silently select a replacement scientific normalization.
 Values exactly equal to `-1` and `+1` are handled deterministically and are
 assigned to the first and last cosine bins respectively.
 
+### Spatial maps
+
+Select **Spatial map** to expose spatial X/Y axes, spatial filters, and **Color
+quantity**. Both polar and azimuthal orientation support:
+
+| Color quantity | Definition | Units |
+| --- | --- | --- |
+| Mean orientation | Valid-sample mean of cos(θ), or cos(φ) | Dimensionless |
+| Water density | Water molecule count normalized by physical volume and frames | molecules/Å³ |
+| Density-weighted orientation | Displayed mean orientation × displayed water density | molecules/Å³ |
+
+A new spatial view starts with X/Y and mean orientation. Choose Cartesian
+planes or a lateral coordinate paired with outward **Distance**. Distance and
+the raw surface-normal coordinate are redundant. Folded density cross-sections
+use Distance; Full cell uses Cartesian coordinates and laboratory-frame polar
+orientation. Disabled axis and quantity choices explain the restriction.
+Frequency normalization controls apply only to orientation distributions.
+
+Filtering and rebinning operate on raw cosine sums, valid-orientation counts,
+water counts, and normalization geometry before deriving values. Enabled
+sources pool these accumulators; density uses frame-aware normalization.
+Different source grids are coarsened to shared boundaries so stored bins are
+never split to invent finer spatial detail. For symmetric cells, interface means and interface densities are folded separately
+with equal weight, then multiplied for density-weighted orientation. This is
+the same definition as the 1D density-weighted result. A mean of interface
+products would give a different quantity.
+
+Density uses the same per-geometry physical volumes as density analysis,
+including changing cells, origins, and empty frames. Covered empty bins have
+zero density. Mean and density-weighted orientation remain undefined where no
+valid orientation exists; bins outside physical coverage stay masked. Values
+exported to data files precede colormap and logarithmic rendering and include
+quantity, units, axes, filters, interface representation, and normalization
+metadata.
+
+New computations store the optional normalization record automatically during
+the existing trajectory processing. Older orientation files retain their
+distributions and sparse-grid mean maps. **Recompute orientation to enable
+density and density-weighted spatial maps.** A fully periodic usable cell and
+a physically supported distance definition are required; nearest-atom
+distance cannot supply this normalization.
+
+```bash
+linak plot traj.orientation.h5 --heatmap-kind spatial \
+  --heatmap-quantity density-weighted \
+  --heatmap-x-axis x --heatmap-y-axis distance
+```
+
+Python plotting accepts `orientation_heatmap_kind="spatial"`,
+`orientation_heatmap_quantity="average"`, `"density"`, or `"density-weighted"`,
+and `orientation_heatmap_x_axis` / `orientation_heatmap_y_axis`. Mapping builders
+also accept `orientation_heatmap_kind` and `orientation_heatmap_quantity`
+(with `heatmap_kind` / `heatmap_quantity` shorthand), plus `heatmap_x_axis` and
+`heatmap_y_axis`. Existing Python calls with explicit spatial
+axes continue to produce spatial mean-orientation maps. Select
+`orientation_heatmap_kind="distribution"` explicitly to request a distribution.
+
 ## What Gets Stored
 
 The orientation HDF5 profile stores:
@@ -263,6 +378,9 @@ It also stores metadata such as:
 - `n_molecules_per_frame`
 - `coordinate_mode`
 - optional representative cell lengths
+- versioned optional spatial-density geometry: cells, origins, surface shifts,
+  frame counts, and separate interface water-count accumulators, shared by
+  polar and azimuthal quantities
 
 When a surface estimate exists, orientation may additionally persist the shared
 surface datasets and metadata described in

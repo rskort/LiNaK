@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from .settings_validation import validate_source_descriptor
+from .rendering import PlotFigure, validate_render_settings
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 import difflib
 import logging
 import os
@@ -23,6 +24,13 @@ from ..analysis.statistics import (
     statistics_available_stats,
 )
 from .fitting import execute_series_fit, resolve_series_fit_configs
+
+from ..analysis.uncertainty import (
+    bootstrap_interval,
+    grouped_frame_statistics,
+    block_stability,
+    subset_blocks,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -107,6 +115,7 @@ class PlotStyle:
     grid_alpha: float = 0.35
 
     def __post_init__(self) -> None:
+        validate_render_settings({**asdict(self), "figsize": self.figure_size})
         base = max(1, int(self.base_font_size))
         object.__setattr__(self, "base_font_size", base)
         default_sizes = default_plot_font_sizes(base)
@@ -456,10 +465,26 @@ class SeriesErrorConfig:
 
     enabled: bool = False
     stat: str | None = None
+    confidence: float = 0.95
+    resamples: int = 1000
+    seed: int = 0
+    block_merge: int = 1
+    sampling: str = "auto"
     style: str = "band"
     color: str | None = None
     label_override: str | None = None
     show_in_legend: bool = False
+
+    def __post_init__(self):
+        if (
+            not 0 < self.confidence < 1
+            or self.resamples < 100
+            or self.seed < 0
+            or self.block_merge < 1
+        ):
+            raise ValueError(
+                "Uncertainty requires confidence between 0 and 1, at least 100 resamples, nonnegative seed and positive block merge."
+            )
 
 
 @dataclass(frozen=True)
@@ -488,6 +513,9 @@ class PreparedLineSeries:
     error_status: str
     statistics_mode: str
     error_reason: str | None = None
+    interval_lower: np.ndarray | None = None
+    interval_upper: np.ndarray | None = None
+    uncertainty_details: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -564,14 +592,16 @@ def _describe_error_provenance(
     statistics_mode: str,
 ) -> str:
     normalized_analysis = str(analysis_name or "").strip().lower()
+    if requested_stat == "block_ci":
+        return "Confidence interval from resampling contiguous temporal blocks and recomputing the plotted estimator. Check block-size stability; block independence is not established."
     family = _error_provenance_family(
         requested_stat=requested_stat,
         statistics_mode=statistics_mode,
     )
     if statistics_mode == "raw_grouped":
         return (
-            "Computed from the currently grouped raw plotted points for this series. "
-            "The spread updates whenever section width or grouping changes."
+            "Computed from frame-level observations within the selected section; coordination distance bins use one ensemble mean per frame. "
+            "Potential records require an explicit sampling assumption for confidence intervals."
         )
     if statistics_mode == "saved_rebinned_sample":
         return (
@@ -982,16 +1012,17 @@ def _normalize_error_stat_name(value: str | None) -> str | None:
     token = str(value).strip().lower()
     if not token:
         return None
-    if token not in {"sample_std", "sample_sem", "block_std", "block_sem"}:
+    if token not in {"sample_std", "sample_sem", "block_std", "block_sem", "block_ci"}:
         raise ValueError(
-            "Error statistic must be one of: sample_std, sample_sem, block_std, block_sem."
+            "Error statistic must be block_ci, sample_std, sample_sem, block_std, or block_sem."
         )
     return token
 
 
 _FRIENDLY_STAT_LABELS: dict[str, str] = {
-    "sample_sem": "Sample SEM",
-    "sample_std": "Sample Std. Dev.",
+    "block_ci": "95% CI, temporal block bootstrap",
+    "sample_sem": "Advanced: SEM (independent observations)",
+    "sample_std": "Variability (standard deviation)",
     "block_sem": "Block SEM",
     "block_std": "Block Std. Dev.",
 }
@@ -1013,17 +1044,7 @@ def _resolve_effective_error_stat(
     available_stats: Sequence[str] | None,
 ) -> str | None:
     configured = _normalize_error_stat_name(configured_stat)
-    available = [
-        token
-        for token in (str(value).strip().lower() for value in (available_stats or ()))
-        if token in {"sample_std", "sample_sem", "block_std", "block_sem"}
-    ]
-    if configured is not None and configured in available:
-        return configured
-    for candidate in ("block_sem", "sample_sem", "block_std", "sample_std"):
-        if candidate in available:
-            return candidate
-    return configured
+    return configured or "block_ci"
 
 
 def _coerce_error_config(value: Any) -> SeriesErrorConfig:
@@ -1032,6 +1053,11 @@ def _coerce_error_config(value: Any) -> SeriesErrorConfig:
     return SeriesErrorConfig(
         enabled=bool(value.get("enabled", False)),
         stat=_normalize_error_stat_name(value.get("stat")),
+        confidence=float(value.get("confidence", 0.95)),
+        resamples=int(value.get("resamples", 1000)),
+        seed=int(value.get("seed", 0)),
+        block_merge=int(value.get("block_merge", 1)),
+        sampling=str(value.get("sampling", "auto")),
         style=_normalize_error_style_name(value.get("style")),
         color=None if value.get("color") in {None, ""} else str(value.get("color")),
         label_override=(
@@ -1224,20 +1250,10 @@ def resolve_series_error_availability(
     resolved = [
         token
         for token in (str(value).strip().lower() for value in (available_stats or ()))
-        if token in {"sample_std", "sample_sem", "block_std", "block_sem"}
+        if token in {"sample_std", "sample_sem", "block_std", "block_sem", "block_ci"}
     ]
     unique_available = list(dict.fromkeys(resolved))
-    default_stat = (
-        "block_sem"
-        if "block_sem" in unique_available
-        else (
-            "sample_sem"
-            if "sample_sem" in unique_available
-            else unique_available[0]
-            if unique_available
-            else None
-        )
-    )
+    default_stat = "block_ci"
     normalized_status = str(error_status or "").strip().lower()
     normalized_reason = str(error_reason or "").strip() or None
     if normalized_status == "rebinned_saved_profile" and not unique_available:
@@ -1314,6 +1330,7 @@ def _scale_series_statistics(stats: SeriesStatistics, *, scale: float) -> Series
             if stats.block_sem is None
             else np.asarray(stats.block_sem, dtype=float) * magnitude
         ),
+        resampling=stats.resampling,
     )
 
 
@@ -1378,7 +1395,9 @@ def _group_xy_series_with_statistics(
 def _subset_series_statistics(stats: SeriesStatistics, mask: np.ndarray) -> SeriesStatistics:
     return SeriesStatistics(
         point_count=np.asarray(stats.point_count, dtype=int)[mask],
+        sampling_unit=stats.sampling_unit,
         sample_n=np.asarray(stats.sample_n, dtype=int)[mask],
+        resampling=subset_blocks(stats.resampling, mask),
         sample_std=np.asarray(stats.sample_std, dtype=float)[mask],
         sample_sem=np.asarray(stats.sample_sem, dtype=float)[mask],
         block_n=None if stats.block_n is None else np.asarray(stats.block_n, dtype=int)[mask],
@@ -1480,14 +1499,30 @@ def _rebin_persisted_series_statistics(
             rebinned_sample_std[out_index] = float(std_value)
             rebinned_sample_sem[out_index] = float(std_value) / np.sqrt(float(total_n))
 
+    resampling = None
+    if stats.resampling is not None:
+        if stats.resampling.groups is not None:
+            return (
+                None,
+                "Repeated rebinning needs the original profile. Reload it before changing sections.",
+            )
+        groups = np.full(x.shape, -1, dtype=int)
+        groups[np.flatnonzero(mask)[order]] = bin_index
+        resampling = replace(stats.resampling, groups=groups)
+        rebinned_sample_std[:] = np.nan
+        rebinned_sample_sem[:] = np.nan
     return (
         SeriesStatistics(
+            resampling=resampling,
+            sampling_unit=stats.sampling_unit,
             point_count=rebinned_point_count,
             sample_n=rebinned_sample_n,
             sample_std=rebinned_sample_std,
             sample_sem=rebinned_sample_sem,
         ),
-        None,
+        None
+        if resampling is None
+        else "Frame covariance for spatially rebinned SD/SEM is unavailable; use the retained block confidence interval or the original binning.",
     )
 
 
@@ -2034,6 +2069,7 @@ def _plotted_xy_series_payload(
         "x": x_export.tolist(),
         "y": y_export.tolist(),
         "point_count": int(x_export.size),
+        "source_point_indices": np.flatnonzero(finite_mask).tolist(),
     }
 
 
@@ -2178,7 +2214,8 @@ def _validate_section_width_request(x: np.ndarray, *, bin_width: float) -> None:
         )
 
     source_bin_width = _resolve_meaningful_source_bin_width(finite_x)
-    if source_bin_width is not None and float(bin_width) + 1.0e-12 < source_bin_width:
+    if (source_bin_width is not None and float(bin_width) < source_bin_width
+            and not np.isclose(bin_width, source_bin_width, rtol=1e-6, atol=1e-12)):
         raise ValueError(
             f"Section width {float(bin_width):.6g} is smaller than the data bin width "
             f"{source_bin_width:.6g}. Use a width >= {source_bin_width:.6g}."
@@ -2327,8 +2364,11 @@ def _prepare_line_render_series(
     series_normalization_x_refs: list[float | None] | None = None,
     series_statistics_data: list[SeriesStatistics | None] | None = None,
     series_raw_statistics: list[bool] | None = None,
+    series_frame_indices: list[np.ndarray | None] | None = None,
+    series_frame_timestep_fs: list[float | None] | None = None,
     series_error_configs: list[dict[str, Any] | None] | None = None,
     min_bin_points: int | None = None,
+    analysis_name: str | None = None,
 ) -> tuple[list[PreparedLineSeries], int]:
     series_count = len(labels)
     if len(x_series) != series_count or len(y_series) != series_count:
@@ -2364,6 +2404,7 @@ def _prepare_line_render_series(
     resolved_error_configs = _coerce_error_config_list(series_count, series_error_configs)
     prepared: list[PreparedLineSeries] = []
     normalized_count = 0
+    unavailable_reasons: dict[str, list[str]] = {}
     for index, (x_values, y_values, label) in enumerate(zip(x_series, y_series, labels)):
         check_cancelled()
         x_data = np.asarray(x_values, dtype=float)
@@ -2429,6 +2470,45 @@ def _prepare_line_render_series(
             )
             statistics_mode = "raw_grouped"
 
+        raw_sampling = error_config.sampling
+        if raw_sampling not in {"auto", "temporal", "independent"}:
+            raise ValueError("Uncertainty sampling must be auto, temporal, or independent.")
+        if raw_statistics_enabled and (x_bin_width is not None or requires_raw_grouping):
+            if reducer in {"mean", "median"}:
+                temporal = (
+                    str(analysis_name or "").lower() in {"position", "coordination", "temperature"}
+                    or raw_sampling == "temporal"
+                )
+                grouped = grouped_frame_statistics(
+                    np.asarray(x_data),
+                    np.asarray(y_data),
+                    bin_width=x_bin_width,
+                    frame_indices=None
+                    if series_frame_indices is None
+                    else series_frame_indices[index],
+                    temporal=temporal,
+                    independent=raw_sampling == "independent",
+                    reducer=reducer,
+                )
+                if grouped is not None:
+                    x_plot, y_plot, plot_stats = grouped
+                    if (
+                        str(analysis_name).lower() == "potential"
+                        and temporal
+                        and raw_sampling != "independent"
+                    ):
+                        plot_stats = replace(
+                            plot_stats,
+                            sampling_unit="ordered records",
+                            resampling=None
+                            if plot_stats.resampling is None
+                            else replace(plot_stats.resampling, unit="ordered records"),
+                        )
+
+            elif error_config.enabled:
+                plot_stats = None
+                error_reason = "Mean uncertainty cannot describe a median or other reducer. Select mean sectioning."
+
         mode = _normalize_mode(
             series_normalization_modes[index] if series_normalization_modes is not None else None
         )
@@ -2460,6 +2540,16 @@ def _prepare_line_render_series(
                 y_plot = y_plot[mask]
                 plot_stats = _subset_series_statistics(plot_stats, mask)
 
+        if (
+            plot_stats is not None
+            and plot_stats.resampling is not None
+            and series_frame_timestep_fs is not None
+        ):
+            step = series_frame_timestep_fs[index]
+            if step is not None:
+                plot_stats = replace(
+                    plot_stats, resampling=replace(plot_stats.resampling, timestep_fs=step)
+                )
         available_error_stats = statistics_available_stats(plot_stats)
         error_availability = resolve_series_error_availability(
             supported_for_view=True,
@@ -2467,49 +2557,102 @@ def _prepare_line_render_series(
             error_status=error_status if error_status != "off" else None,
             error_reason=error_reason,
         )
+        lower = upper = details = None
         if error_config.enabled:
-            if plot_stats is None or not error_availability.available_stats:
-                if error_status == "off":
-                    error_status = "unavailable"
-                    error_reason = (
-                        error_availability.reason
-                        or "No uncertainty statistics are available for this series."
+            requested_stat = error_config.stat or "block_ci"
+            error_status = "unavailable"
+            if plot_stats is None:
+                error_reason = (
+                    error_reason
+                    or "Statistics are unavailable for this view. Recompute the profile or select a supported view."
+                )
+            elif reducer == "median" and requested_stat in {"sample_sem", "block_sem", "block_std"}:
+                error_reason = "Mean SEM/block moments cannot describe a median. Choose the resampled median confidence interval or Variability."
+            elif requested_stat not in available_error_stats:
+                error_reason = (
+                    "Temporal block data are missing or insufficient. Use at least 100 frames per estimate, "
+                    "recompute older profiles, or explicitly choose Variability. No estimator was substituted."
+                    if requested_stat == "block_ci"
+                    else (
+                        error_reason
+                        or f"Requested {requested_stat} is unavailable; no estimator was substituted."
                     )
-            else:
-                requested_stat = error_config.stat or error_availability.default_stat
-                if requested_stat is None:
-                    error_status = "unavailable"
-                    error_reason = (
-                        error_availability.reason
-                        or "No uncertainty statistics are available for this series."
+                )
+                if str(analysis_name).lower() == "potential" and raw_sampling == "auto":
+                    error_reason = "Record IDs do not establish temporal order or independence. Specify temporal or independent sampling and group records."
+            elif requested_stat == "block_ci":
+                try:
+                    normalize_draws = None
+                    if applied:
+
+                        def normalize_draws(
+                            draws,
+                            coordinates=x_plot,
+                            kind=mode,
+                            target=target_value,
+                            reference=reference_x,
+                            name=label,
+                        ):
+                            result = []
+                            for row in draws:
+                                try:
+                                    value = _normalize_series_values(
+                                        coordinates,
+                                        row,
+                                        mode=kind,
+                                        target_value=target,
+                                        reference_x=reference,
+                                        label=name,
+                                    )[0]
+                                except ValueError:
+                                    value = np.full_like(row, np.nan)
+                                result.append(value)
+                            return np.stack(result)
+
+                    interval = bootstrap_interval(
+                        plot_stats.resampling,
+                        confidence=error_config.confidence,
+                        repeats=error_config.resamples,
+                        seed=error_config.seed,
+                        block_merge=error_config.block_merge,
+                        normalization=normalize_draws,
                     )
-                elif requested_stat not in error_availability.available_stats:
-                    fallback_stat = error_availability.default_stat
-                    if (
-                        fallback_stat is not None
-                        and fallback_stat in error_availability.available_stats
-                    ):
-                        requested_stat = fallback_stat
-                        error_status = "ok"
-                        if statistics_mode == "saved_rebinned_sample":
-                            error_reason = (
-                                "Block uncertainty is unavailable after x rebinning; "
-                                f"using {requested_stat}."
-                            )
-                    else:
-                        error_status = "unavailable"
-                        error_reason = f"Requested error statistic '{requested_stat}' is unavailable for this series."
-                else:
-                    error_status = "ok"
-                    if statistics_mode == "saved_rebinned_sample" and error_config.stat in {
-                        "block_sem",
-                        "block_std",
-                    }:
-                        resolved_stat = requested_stat
-                        error_reason = (
-                            "Block uncertainty is unavailable after x rebinning; "
-                            f"using {resolved_stat}."
+                    lower, upper, details = interval.lower, interval.upper, interval.details
+                    details["sample_n"] = (
+                        plot_stats.sample_n.tolist()
+                        if plot_stats.resampling.groups is None
+                        else None
+                    )
+                    if plot_stats.resampling.groups is not None:
+                        details["sample_n_note"] = (
+                            "The valid-frame union after spatial rebinning is not recoverable from marginal counts; block confidence intervals remain available."
                         )
+                    details["contributing_entities_or_pairs"] = plot_stats.point_count.tolist()
+                    details["block_size_stability"] = block_stability(
+                        plot_stats.resampling,
+                        confidence=error_config.confidence,
+                        repeats=error_config.resamples,
+                        seed=error_config.seed,
+                        normalization=normalize_draws,
+                    )
+                    if np.any(np.isfinite(lower) & np.isfinite(upper)):
+                        error_status, error_reason = "ok", None
+                    else:
+                        error_status = "insufficient_samples"
+                        error_reason = "No bin has four populated blocks and enough finite resamples. Use more data or wider bins/time windows."
+                except ValueError as exc:
+                    error_reason = str(exc)
+            else:
+                values = _statistics_error_values(plot_stats, stat_name=requested_stat)
+                if values is not None and np.any(np.isfinite(values)):
+                    error_status, error_reason = "ok", None
+                else:
+                    error_status, error_reason = (
+                        "insufficient_samples",
+                        "At least two finite observations are required for SD/SEM. Select a wider section or use more data.",
+                    )
+        if error_config.enabled and error_status != "ok":
+            unavailable_reasons.setdefault(str(error_reason), []).append(str(label))
         prepared.append(
             PreparedLineSeries(
                 x=np.asarray(x_plot, dtype=float),
@@ -2521,7 +2664,17 @@ def _prepare_line_render_series(
                 error_status=error_status,
                 statistics_mode=statistics_mode,
                 error_reason=error_reason,
+                interval_lower=lower,
+                interval_upper=upper,
+                uncertainty_details=details,
             )
+        )
+    for reason, names in unavailable_reasons.items():
+        LOGGER.warning(
+            "Uncertainty unavailable for %d series (%s): %s",
+            len(names),
+            ", ".join(names[:3]) + (" ..." if len(names) > 3 else ""),
+            reason,
         )
     return prepared, normalized_count
 
@@ -2582,6 +2735,8 @@ def plot_line_series(
     cumulative_config: dict[str, Any] | None = None,
     series_statistics: SeriesStatistics | None = None,
     raw_point_statistics: bool = False,
+    frame_indices: np.ndarray | None = None,
+    frame_timestep_fs: float | None = None,
     error_config: dict[str, Any] | None = None,
     normalization_mode: str | None = None,
     normalization_value: float | None = None,
@@ -2630,6 +2785,8 @@ def plot_line_series(
     keep_figure_open: bool = False,
 ) -> Path | None:
     """Plot a single line using the shared LiNaK style."""
+    from .gui_session import report_progress
+    report_progress("Drawing plot")
     resolved_fit_config = None if fit_config is None else dict(fit_config)
     if fit_enabled or fit_label not in {None, ""} or fit_show_in_legend is False:
         resolved_fit_config = dict(resolved_fit_config or {})
@@ -2662,6 +2819,8 @@ def plot_line_series(
         series_cumulative_configs=[cumulative_config],
         series_statistics_data=[series_statistics],
         series_raw_statistics=[raw_point_statistics],
+        series_frame_indices=[frame_indices],
+        series_frame_timestep_fs=[frame_timestep_fs],
         series_error_configs=[error_config],
         series_normalization_modes=[normalization_mode],
         series_normalization_values=[normalization_value],
@@ -2764,6 +2923,8 @@ def plot_heatmap_series(
     capture_state_extra: dict[str, Any] | None = None,
 ) -> Path | None:
     """Plot a pcolormesh heatmap using the shared LiNaK plot contract."""
+    from .gui_session import report_progress
+    report_progress("Drawing plot")
     from matplotlib.colors import LogNorm
 
     active_backend = configure_matplotlib_backend(
@@ -2776,7 +2937,7 @@ def plot_heatmap_series(
     if matplotlib_rc is not None:
         rc_context_args.update(dict(matplotlib_rc))
     with plt.rc_context(rc_context_args):
-        fig, ax = plt.subplots(figsize=style.figure_size)
+        fig, ax = plt.subplots(figsize=style.figure_size, FigureClass=PlotFigure)
         register_cancel_cleanup(lambda: plt.close(fig))
         figure_alpha = _apply_figure_kwargs(fig, figure_kwargs)
 
@@ -3031,6 +3192,8 @@ def plot_multi_line_series(
     series_cumulative_configs: list[dict[str, Any] | None] | None = None,
     series_statistics_data: list[SeriesStatistics | None] | None = None,
     series_raw_statistics: list[bool] | None = None,
+    series_frame_indices: list[np.ndarray | None] | None = None,
+    series_frame_timestep_fs: list[float | None] | None = None,
     series_error_configs: list[dict[str, Any] | None] | None = None,
     series_normalization_modes: list[str | None] | None = None,
     series_normalization_values: list[float | None] | None = None,
@@ -3081,6 +3244,8 @@ def plot_multi_line_series(
     keep_figure_open: bool = False,
 ) -> Path | None:
     """Plot multiple line series in a single axes using the shared LiNaK style."""
+    from .gui_session import report_progress
+    report_progress("Drawing plot")
     if not (len(x_series) == len(y_series) == len(labels)):
         raise ValueError("x_series, y_series, and labels must have equal lengths.")
     if not x_series:
@@ -3151,6 +3316,10 @@ def plot_multi_line_series(
             "statistics": (
                 None if series_statistics_data is None else series_statistics_data[index]
             ),
+            "frame_indices": None if series_frame_indices is None else series_frame_indices[index],
+            "frame_timestep_fs": None
+            if series_frame_timestep_fs is None
+            else series_frame_timestep_fs[index],
             "raw_statistics": (
                 False if series_raw_statistics is None else bool(series_raw_statistics[index])
             ),
@@ -3259,6 +3428,8 @@ def plot_multi_line_series(
             "y": np.asarray(source_entry["y"], dtype=float),
             "statistics": source_entry["statistics"],
             "raw_statistics": bool(source_entry["raw_statistics"]),
+            "frame_indices": source_entry["frame_indices"],
+            "frame_timestep_fs": source_entry["frame_timestep_fs"],
             "series_enabled": bool(current_override.get("enabled", True)),
             "line_visible": bool(current_override.get("enabled", True))
             and bool(source_entry["line_visible"])
@@ -3295,14 +3466,7 @@ def plot_multi_line_series(
             "error_config": _coerce_error_config(
                 current_override.get("error")
                 if isinstance(current_override.get("error"), dict)
-                else {
-                    "enabled": source_entry["error_config"].enabled,
-                    "stat": source_entry["error_config"].stat,
-                    "style": source_entry["error_config"].style,
-                    "color": source_entry["error_config"].color,
-                    "label_override": source_entry["error_config"].label_override,
-                    "show_in_legend": source_entry["error_config"].show_in_legend,
-                }
+                else asdict(source_entry["error_config"])
             ),
             "normalization_mode": (
                 str(current_override.get("normalization_mode") or "").strip()
@@ -3333,6 +3497,7 @@ def plot_multi_line_series(
         render_items.append(item)
 
     prepared_series, normalized_count = _prepare_line_render_series(
+        analysis_name=analysis_name,
         x_series=[item["x"] for item in render_items],
         y_series=[item["y"] for item in render_items],
         labels=[item["label"] for item in render_items],
@@ -3340,17 +3505,9 @@ def plot_multi_line_series(
         x_bin_reducer=x_bin_reducer,
         series_statistics_data=[item["statistics"] for item in render_items],
         series_raw_statistics=[item["raw_statistics"] for item in render_items],
-        series_error_configs=[
-            {
-                "enabled": item["error_config"].enabled,
-                "stat": item["error_config"].stat,
-                "style": item["error_config"].style,
-                "color": item["error_config"].color,
-                "label_override": item["error_config"].label_override,
-                "show_in_legend": item["error_config"].show_in_legend,
-            }
-            for item in render_items
-        ],
+        series_frame_indices=[item["frame_indices"] for item in render_items],
+        series_frame_timestep_fs=[item["frame_timestep_fs"] for item in render_items],
+        series_error_configs=[asdict(item["error_config"]) for item in render_items],
         min_bin_points=min_bin_points,
         series_normalization_modes=[item["normalization_mode"] for item in render_items],
         series_normalization_values=[item["normalization_value"] for item in render_items],
@@ -3380,7 +3537,7 @@ def plot_multi_line_series(
     if matplotlib_rc is not None:
         rc_context_args.update(dict(matplotlib_rc))
     with plt.rc_context(rc_context_args):
-        fig, ax = plt.subplots(figsize=style.figure_size)
+        fig, ax = plt.subplots(figsize=style.figure_size, FigureClass=PlotFigure)
         register_cancel_cleanup(lambda: plt.close(fig))
         figure_alpha = _apply_figure_kwargs(fig, figure_kwargs)
         rendered_colors: list[str] = []
@@ -3537,9 +3694,13 @@ def plot_multi_line_series(
                     prepared_item.available_error_stats,
                 )
                 if requested_stat is not None:
-                    error_values = _statistics_error_values(
-                        prepared_item.statistics,
-                        stat_name=requested_stat,
+                    interval_mode = requested_stat == "block_ci"
+                    error_values = (
+                        prepared_item.interval_upper - prepared_item.interval_lower
+                        if interval_mode and prepared_item.interval_lower is not None
+                        else _statistics_error_values(
+                            prepared_item.statistics, stat_name=requested_stat
+                        )
                     )
                     if error_values is not None:
                         finite_mask = (
@@ -3548,9 +3709,20 @@ def plot_multi_line_series(
                             & np.isfinite(error_values)
                         )
                         if np.any(finite_mask):
-                            error_label = (
-                                prepared_item.error_config.label_override
-                                or f"{label} \u00b1{_friendly_stat_label(requested_stat)}"
+                            lower_bound = (
+                                prepared_item.interval_lower
+                                if interval_mode
+                                else y_values - error_values
+                            )
+                            upper_bound = (
+                                prepared_item.interval_upper
+                                if interval_mode
+                                else y_values + error_values
+                            )
+                            error_label = prepared_item.error_config.label_override or (
+                                f"{label}: {prepared_item.error_config.confidence:.0%} CI, {(prepared_item.uncertainty_details or {}).get('method', 'block bootstrap')}"
+                                if interval_mode
+                                else f"{label}: {_friendly_stat_label(requested_stat)}"
                             )
                             error_color = (
                                 str(prepared_item.error_config.color).strip()
@@ -3564,9 +3736,9 @@ def plot_multi_line_series(
                             )
                             if prepared_item.error_config.style == "band":
                                 error_artist = ax.fill_between(
-                                    x_values[finite_mask],
-                                    y_values[finite_mask] - error_values[finite_mask],
-                                    y_values[finite_mask] + error_values[finite_mask],
+                                    x_values,
+                                    np.where(finite_mask, lower_bound, np.nan),
+                                    np.where(finite_mask, upper_bound, np.nan),
                                     color=error_color,
                                     alpha=0.20,
                                     label=error_label
@@ -3576,8 +3748,8 @@ def plot_multi_line_series(
                             else:
                                 error_artist = ax.errorbar(
                                     x_values[finite_mask],
-                                    y_values[finite_mask],
-                                    yerr=error_values[finite_mask],
+                                    (lower_bound[finite_mask] + upper_bound[finite_mask]) / 2,
+                                    yerr=(upper_bound[finite_mask] - lower_bound[finite_mask]) / 2,
                                     fmt="none",
                                     ecolor=error_color,
                                     elinewidth=float(
@@ -3610,6 +3782,17 @@ def plot_multi_line_series(
                                 ),
                                 "reason": prepared_item.error_reason,
                                 "point_count": int(np.count_nonzero(finite_mask)),
+                                "lower": lower_bound.tolist(),
+                                "upper": upper_bound.tolist(),
+                                "details": prepared_item.uncertainty_details
+                                or {
+                                    "sampling_unit": prepared_item.statistics.sampling_unit,
+                                    "sample_n": prepared_item.statistics.sample_n.tolist()
+                                    if prepared_item.statistics.resampling is None
+                                    or prepared_item.statistics.resampling.groups is None
+                                    else None,
+                                    "contributing_entities_or_pairs": prepared_item.statistics.point_count.tolist(),
+                                },
                             }
                         else:
                             error_summaries[fit_key] = {
@@ -3649,6 +3832,26 @@ def plot_multi_line_series(
                         else prepared_item.error_reason
                     ),
                 }
+            if fit_key in error_summaries:
+                error_summaries[fit_key].setdefault(
+                    "stat", prepared_item.error_config.stat or "block_ci"
+                )
+                error_summaries[fit_key].setdefault(
+                    "details",
+                    prepared_item.uncertainty_details
+                    or (
+                        {
+                            "sampling_unit": prepared_item.statistics.sampling_unit,
+                            "sample_n": prepared_item.statistics.sample_n.tolist()
+                            if prepared_item.statistics.resampling is None
+                            or prepared_item.statistics.resampling.groups is None
+                            else None,
+                            "contributing_entities_or_pairs": prepared_item.statistics.point_count.tolist(),
+                        }
+                        if prepared_item.statistics is not None
+                        else {}
+                    ),
+                )
             fit_config = dict(item.get("fit_config") or {})
             if not layer_enabled:
                 fit_summaries[fit_key] = {

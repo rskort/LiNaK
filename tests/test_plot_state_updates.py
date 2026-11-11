@@ -98,6 +98,120 @@ def exercise_panel(monkeypatch, analysis, inspect, *, settings_updates=None):
     app.processEvents()
 
 
+@pytest.mark.parametrize("changed_axis", ["x", "y"])
+def test_orientation_duplicate_axes_warn_and_keep_the_valid_preview(monkeypatch, changed_axis):
+    import sys
+    from linak.plot.mappings.orientation_mapping import orientation_plot_options_to_view_mapping
+    from linak.plot.profile_persistence import serialize_plot_view_mapping
+
+    exceptions = []
+    monkeypatch.setattr(sys, "excepthook", lambda *args: exceptions.append(args))
+
+    def inspect(window, app):
+        requests = []
+        monkeypatch.setattr(window, "_handle_series_identity_change", lambda: requests.append(True))
+        mapping = window._current_orientation_mapping()
+        assert mapping.fixed_values["orientation_heatmap_x_axis"] == "x"
+        assert mapping.fixed_values["orientation_heatmap_y_axis"] == "y"
+        widget = getattr(window, f"orientation_heatmap_{changed_axis}_axis")
+        widget.setCurrentText("Y" if changed_axis == "x" else "X")
+        assert not exceptions
+        assert not requests
+        assert window.orientation_heatmap_x_axis.currentText() == "X"
+        assert window.orientation_heatmap_y_axis.currentText() == "Y"
+        assert "Warning:" in window.orientation_spatial_note.text()
+        assert "must be different" in window.orientation_spatial_note.text()
+        window._refresh_widget_states()
+        assert "Warning:" in window.orientation_spatial_note.text()
+        assert window._current_orientation_mapping() == mapping
+        settings = window._collect_settings()
+        assert settings["orientation_heatmap_x_axis"] == "x"
+        assert settings["orientation_heatmap_y_axis"] == "y"
+
+        window.orientation_heatmap_y_axis.setCurrentText("Distance")
+        assert requests
+        assert "Warning:" not in window.orientation_spatial_note.text()
+        assert window._collect_settings()["orientation_heatmap_y_axis"] == "distance"
+        assert not exceptions
+
+    exercise_panel(monkeypatch, "orientation", inspect, settings_updates={
+        "view_mapping": serialize_plot_view_mapping(orientation_plot_options_to_view_mapping(
+            orientation_heatmap_kind="spatial")),
+        "_profile_filter_options": {"orientation_sparse_grid_available": True,
+            "orientation_spatial_density_available": True},
+    })
+
+
+def test_orientation_swapped_axes_restore_without_a_transient_duplicate_warning(monkeypatch):
+    import sys
+    from linak.plot.mappings.orientation_mapping import orientation_plot_options_to_view_mapping
+    from linak.plot.profile_persistence import serialize_plot_view_mapping
+
+    exceptions = []
+    monkeypatch.setattr(sys, "excepthook", lambda *args: exceptions.append(args))
+
+    def inspect(window, app):
+        settings = window._collect_settings()
+        settings["view_mapping"] = serialize_plot_view_mapping(orientation_plot_options_to_view_mapping(
+            orientation_heatmap_kind="spatial", heatmap_x_axis="y", heatmap_y_axis="x"))
+        settings.pop("orientation_view_states", None)
+        window._suspend_preview_events = True
+        try:
+            window._populate(settings)
+        finally:
+            window._suspend_preview_events = False
+        window._refresh_widget_states()
+        assert window.orientation_heatmap_x_axis.currentText() == "Y"
+        assert window.orientation_heatmap_y_axis.currentText() == "X"
+        assert "Warning:" not in window.orientation_spatial_note.text()
+        assert not exceptions
+
+    exercise_panel(monkeypatch, "orientation", inspect, settings_updates={
+        "view_mapping": serialize_plot_view_mapping(orientation_plot_options_to_view_mapping(
+            orientation_heatmap_kind="spatial")),
+        "_profile_filter_options": {"orientation_sparse_grid_available": True,
+            "orientation_spatial_density_available": True},
+    })
+
+
+@pytest.mark.parametrize("ratio", [1, 1.25, 2])
+def test_tiny_preview_uses_safe_dpi_and_reports_deferred_draw_errors(monkeypatch, ratio):
+    from matplotlib.figure import Figure
+    from linak.plot.rendering import PlotFigure
+
+    def inspect(window, app):
+        fig = PlotFigure(figsize=(7, 4))
+        ax = fig.subplots()
+        ax.set_xlabel(r"Distance ($\mathrm{\AA}$)")
+        ax.set_ylabel(r"Density (g/cm$^3$)")
+        window._install_preview_figure(fig)
+        window._preview_layout_timer.stop()
+        canvas = window._preview_canvas
+        canvas._set_device_pixel_ratio(ratio)
+        window._preview_canvas_scroll.setFixedSize(30, 30)
+        app.processEvents()
+        window._resize_preview_canvas_to_figure()
+        app.processEvents()
+        assert fig._original_dpi >= 72
+        assert fig.dpi == pytest.approx(fig._original_dpi * canvas.device_pixel_ratio)
+        assert canvas.width() >= 504
+        assert canvas.height() >= 288
+        canvas.draw()
+        # Exercise Qt's deferred callback, where the caller's try/except cannot help.
+        def fail(*args, **kwargs):
+            raise RuntimeError("Could not set the fontsize (invalid ppem value; error code 0x97)")
+        with monkeypatch.context() as patch:
+            patch.setattr(Figure, "draw", fail)
+            canvas.draw_idle()
+            app.processEvents()
+            assert "Increase the rendering DPI or font size" in window._preview_error
+        canvas.draw_idle()
+        app.processEvents()
+        assert window._preview_error is None
+
+    exercise_panel(monkeypatch, "density", inspect)
+
+
 def _open_layers(window, app):
     for row in range(window._nav_list.count()):
         if window._nav_list.item(row).text() == "Layers":
@@ -577,10 +691,15 @@ def test_preview_canvas_recenters_after_window_panel_and_detached_resizes(monkey
             canvas = window._preview_canvas
             canvas.draw()
             top_left = canvas.mapTo(viewport, QPoint())
-            assert canvas.width() <= viewport.width()
-            assert canvas.height() <= viewport.height()
-            assert abs(2 * top_left.x() + canvas.width() - viewport.width()) <= 1
-            assert abs(2 * top_left.y() + canvas.height() - viewport.height()) <= 1
+            if canvas.width() <= viewport.width():
+                assert abs(2 * top_left.x() + canvas.width() - viewport.width()) <= 1
+            else:
+                assert window._preview_canvas_scroll.horizontalScrollBar().maximum() > 0
+            if canvas.height() <= viewport.height():
+                assert abs(2 * top_left.y() + canvas.height() - viewport.height()) <= 1
+            else:
+                assert window._preview_canvas_scroll.verticalScrollBar().maximum() > 0
+            assert fig._original_dpi >= 72
             # Centering the QWidget alone is insufficient: at fractional screen
             # scaling the rendered pixels must fill that widget as well.
             ratio = canvas.device_pixel_ratio

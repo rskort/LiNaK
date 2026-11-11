@@ -107,6 +107,7 @@ def _orientation_heatmap_contract(
     distance_bin_length: int | None,
     angle_bin_length: int | None,
     sparse_grid_cell_count: int | None = None,
+    supports_spatial: bool = True,
 ) -> PlotDataContract:
     dimensions = [
         PlotDimension(
@@ -166,6 +167,61 @@ def _orientation_heatmap_contract(
             source_name="density",
         ),
     ]
+    if supports_spatial:
+        dimensions.extend(
+            (
+                PlotDimension(
+                    id="spatial_x_bin",
+                    label="Spatial X bins",
+                    kind="histogram_bin",
+                    length=None,
+                    unit="Angstrom",
+                ),
+                PlotDimension(
+                    id="spatial_y_bin",
+                    label="Spatial Y bins",
+                    kind="histogram_bin",
+                    length=None,
+                    unit="Angstrom",
+                ),
+            )
+        )
+        quantities.extend(
+            (
+                PlotQuantity(
+                    id="spatial_x_centers",
+                    label="Spatial X coordinate",
+                    kind="coordinate",
+                    dimensions=("spatial_x_bin",),
+                    unit="Angstrom",
+                    source_name="spatial_x_centers",
+                ),
+                PlotQuantity(
+                    id="spatial_y_centers",
+                    label="Spatial Y coordinate",
+                    kind="coordinate",
+                    dimensions=("spatial_y_bin",),
+                    unit="Angstrom",
+                    source_name="spatial_y_centers",
+                ),
+            )
+        )
+        for angle in ("polar", "azimuthal"):
+            for quantity, label in (
+                ("average", "Mean orientation"),
+                ("density", "Water density"),
+                ("density-weighted", "Density-weighted orientation"),
+            ):
+                quantities.append(
+                    PlotQuantity(
+                        id=f"spatial_{angle}_{quantity}",
+                        label=f"{label} ({angle})",
+                        kind="heatmap",
+                        dimensions=("spatial_x_bin", "spatial_y_bin"),
+                        unit="1" if quantity == "average" else "molecules/Angstrom^3",
+                        source_name=f"spatial_{angle}_{quantity}",
+                    )
+                )
     if sparse_grid_cell_count is not None:
         dimensions.append(
             PlotDimension(
@@ -300,4 +356,5 @@ def orientation_heatmap_profile_to_plot_data_contract(
         distance_bin_length=distance_bin_length,
         angle_bin_length=angle_bin_length,
         sparse_grid_cell_count=sparse_grid_cell_count,
+        supports_spatial=sparse_grid is not None,
     )

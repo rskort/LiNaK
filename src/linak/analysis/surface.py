@@ -1413,6 +1413,28 @@ def _log_surface_estimate_candidate_debug(
         )
 
 
+def _surface_layer_batches(context):
+    """Fit independent layers after global context; keep tracking/filling ordered."""
+    from ..parallel import batches, bounded_map, frame_batch_size, stage_workers
+    count = len(context.frames)
+    chunk_size = frame_batch_size(max(1, len(context.frames[0])) * 64)
+    workers = stage_workers('surface.frames', (count + chunk_size - 1) // chunk_size,
+                            bytes_per_task=max(1024 * 1024, len(context.frames[0]) * chunk_size * 64))
+    def inputs():
+        for index in range(count):
+            values, indices = _candidate_axis_values_and_indices(context, index)
+            yield index, values, indices
+    def fit(chunk):
+        result = []
+        for index, values, indices in chunk:
+            selected = (_extract_layer_selection(values, side=context.options.side, options=context.options)
+                        if values.size >= max(4, int(context.options.minimum_top_layer_atoms)) else None)
+            result.append((index, values, indices, selected))
+        return result
+    for results in bounded_map(fit, batches(inputs(), chunk_size), workers=workers, stage='surface.frames'):
+        yield from results
+
+
 def _build_layered_estimate(context: _SurfaceAnalysisContext) -> SurfaceEstimate | None:
     frame_count = len(context.frames)
     values = np.full(frame_count, np.nan, dtype=float)
@@ -1428,19 +1450,12 @@ def _build_layered_estimate(context: _SurfaceAnalysisContext) -> SurfaceEstimate
     layer_counts: list[int] = []
     top_layer_indices_by_frame: list[np.ndarray | None] = [None] * frame_count
 
-    for frame_index in range(frame_count):
-        axis_values, _frame_indices = _candidate_axis_values_and_indices(context, frame_index)
+    for frame_index, axis_values, _frame_indices, selection in _surface_layer_batches(context):
         candidate_count[frame_index] = int(axis_values.size)
-        if axis_values.size < max(4, int(context.options.minimum_top_layer_atoms)):
+        if selection is None:
             rejection_reason[frame_index] = "insufficient_candidates"
             continue
-        layer_values, local_indices, layer_count, largest_gap_value, baseline_value = (
-            _extract_layer_selection(
-                axis_values,
-                side=context.options.side,
-                options=context.options,
-            )
-        )
+        layer_values, local_indices, layer_count, largest_gap_value, baseline_value = selection
         largest_gap[frame_index] = largest_gap_value
         baseline_gap[frame_index] = baseline_value
         layer_counts.append(layer_count)
@@ -2358,6 +2373,15 @@ class NearestSubstrateSearch:
         if points.ndim != 2 or points.shape[1] != 3:
             raise ValueError("Nearest-atom targets must have shape (n, 3).")
         result = np.full(len(points), np.nan)
+        from ..parallel import stage_workers, current_execution
+        workers = 1
+        execution = current_execution()
+        if len(points) >= 4096 and execution is not None:
+            cache = execution.nearest_decisions
+            key = min(len(points), 8192)
+            if key not in cache:
+                cache[key] = stage_workers('position.nearest', key, bytes_per_task=1024 * 1024)
+            workers = cache[key]
         # Scratch is independent of trajectory length and target count.
         block_size = 512 if self.query_translations is not None else 8192
         for start in range(0, len(points), block_size):
@@ -2369,11 +2393,11 @@ class NearestSubstrateSearch:
             elif np.any(self.pbc):
                 selected = self._wrap(selected)
             if self.query_translations is None:
-                distances = self.tree.query(selected)[0]
+                distances = self.tree.query(selected, workers=workers)[0]
             else:
                 images = selected[None, :, :] - self.query_translations[:, None, :]
                 distances = (
-                    self.tree.query(images.reshape(-1, 3))[0]
+                    self.tree.query(images.reshape(-1, 3), workers=workers)[0]
                     .reshape(len(self.query_translations), len(selected))
                     .min(axis=0)
                 )

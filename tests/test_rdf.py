@@ -954,6 +954,81 @@ def test_save_rdf_profiles_can_force_collection_for_single_profile(tmp_path):
     assert len(payloads) == 1
 
 
+def test_merge_molecular_rdf_pairs_after_float32_storage(tmp_path, caplog):
+    frame = Atoms(
+        "NaOHOHH",
+        positions=[[4, 1, 1], [1, 1, 1], [2, 1, 1], [7, 7, 7], [8, 7, 7], [7, 8, 7]],
+        cell=[12, 12, 12],
+        pbc=True,
+    )
+    oh = compute_rdf([frame], "Na", "mol:OH", r_max=5.3, bin_width=0.05)
+    water = compute_rdf([frame], "Na", "mol:H2O", r_max=5.3, bin_width=0.05)
+    assert oh.bin_centers.size == 106
+    out = tmp_path / "run.rdf.h5"
+    save_rdf_profiles([oh], out, force_collection=True)
+    stored, _ = read_linak_hdf5_profiles(out, expected_analysis="rdf")[0]
+    assert stored["bin_centers_A"].dtype == np.float32
+    assert not np.allclose(stored["bin_centers_A"], water.bin_centers, rtol=1e-9, atol=1e-12)
+
+    written = save_rdf_profiles([water], out, force_collection=True, merge_existing=True)
+    assert written == out
+    assert {tuple((p.species_a, p.species_b)) for p in load_rdf_profiles(out)} == {
+        ("Na", "mol:OH"),
+        ("Na", "mol:H2O"),
+    }
+    assert not (tmp_path / "run_1.rdf.h5").exists()
+
+    caplog.clear()
+    caplog.set_level("INFO", logger=rdf_mod.LOGGER.name)
+    written = save_rdf_profiles([water], out, force_collection=True, merge_existing=True)
+    assert written == out
+    assert len(load_rdf_profiles(out)) == 2
+    assert "already up to date" in caplog.text
+    assert "Writing fallback file" not in caplog.text
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_rdf_grid_comparison_supports_stored_precision(dtype):
+    centers = (np.arange(106) + 0.5) * 0.05
+    existing = {
+        "datasets": {"bin_centers_A": centers.astype(dtype)},
+        "metadata": {"bin_width_A": 0.05},
+    }
+    incoming = {"datasets": {"bin_centers_A": centers}, "metadata": {"bin_width_A": 0.05}}
+    assert rdf_mod._rdf_bin_grids_match(existing, incoming)
+
+
+@pytest.mark.parametrize("change", ["width", "count", "shift", "nan", "inf", "missing_width"])
+def test_rdf_grid_comparison_rejects_incompatible_grids(change):
+    centers = (np.arange(106) + 0.5) * 0.05
+    existing = {
+        "datasets": {"bin_centers_A": centers.astype(np.float32)},
+        "metadata": {"bin_width_A": 0.05},
+    }
+    incoming = {"datasets": {"bin_centers_A": centers.copy()}, "metadata": {"bin_width_A": 0.05}}
+    if change == "width":
+        # Width metadata must remain strict even if centers round identically.
+        incoming["metadata"]["bin_width_A"] += 1e-8
+    elif change == "count":
+        incoming["datasets"]["bin_centers_A"] = centers[:-1]
+    elif change == "shift":
+        incoming["datasets"]["bin_centers_A"] += 0.001
+    elif change == "missing_width":
+        incoming["metadata"].clear()
+    else:
+        incoming["datasets"]["bin_centers_A"][5] = np.nan if change == "nan" else np.inf
+    assert not rdf_mod._rdf_bin_grids_match(existing, incoming)
+    assert (
+        rdf_mod._rdf_collection_compatibility_error(
+            [(existing["datasets"], existing["metadata"])],
+            [incoming],
+            expected_source_path=None,
+        )
+        is not None
+    )
+    assert not rdf_mod._rdf_payloads_match_within_tolerance(existing, incoming)
+
+
 def test_save_rdf_profiles_merge_replaces_existing_pair_without_duplicate(tmp_path, caplog):
     out = tmp_path / "rdf_collection.h5"
     source_path = tmp_path / "traj.xyz"
@@ -1333,22 +1408,17 @@ def test_compute_rdf_parallel_path_uses_thread_executor(monkeypatch):
     ]
     captured = {"chunks": 0}
 
-    class _FakeThreadPoolExecutor:
-        def __init__(self, *, max_workers):
-            captured["max_workers"] = max_workers
+    from linak.parallel import bounded_map
 
-        def __enter__(self):
-            return self
+    def tracked_map(function, values, *, workers, **kwargs):
+        captured['max_workers'] = workers
+        def counted():
+            for value in values:
+                captured['chunks'] += 1
+                yield value
+        return bounded_map(function, counted(), workers=workers, **kwargs)
 
-        def __exit__(self, exc_type, exc, tb):
-            return None
-
-        def map(self, func, chunks, configs):
-            for chunk, config in zip(chunks, configs):
-                captured["chunks"] += 1
-                yield func(chunk, config)
-
-    monkeypatch.setattr("linak.analysis.rdf.ThreadPoolExecutor", _FakeThreadPoolExecutor)
+    monkeypatch.setattr('linak.analysis.rdf.bounded_map', tracked_map)
 
     profile = compute_rdf(frames, species_a="O", species_b="H", r_max=2.0, bin_width=1.0, threads=2)
 

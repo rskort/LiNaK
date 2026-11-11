@@ -472,7 +472,7 @@ def _write_coordination_hdf5(path: Path) -> None:
 
 
 def _write_potential_hdf5(path: Path) -> None:
-    from linak.analysis.potential import PotentialRecord, write_potential_records_csv
+    from linak.analysis.potential import PotentialRecord, write_potential_records
 
     rows = [
         PotentialRecord(
@@ -492,7 +492,7 @@ def _write_potential_hdf5(path: Path) -> None:
             (2, None, 2.2, None, "missing_fermi", "missing Fermi"),
         )
     ]
-    write_potential_records_csv(rows, path, append=False)
+    write_potential_records(rows, path, append=False)
 
 
 def _read_table_frame(path: Path):
@@ -7492,16 +7492,15 @@ def test_plot_density_gui_preview_renders_for_each_request(tmp_path, monkeypatch
     )
 
     assert rc == 0
-    assert len(preview_calls) == 3
+    assert len(preview_calls) == 2
     assert isinstance(preview_calls[0]["args"], Namespace)
-    assert preview_calls[0]["args"].show is False
+    assert preview_calls[0]["args"].show is True
+    assert preview_calls[0]["args"].x_min == 0.0
     assert isinstance(preview_calls[1]["args"], Namespace)
-    assert preview_calls[1]["args"].x_min == 0.0
-    assert isinstance(preview_calls[2]["args"], Namespace)
-    assert preview_calls[2]["args"].x_min == 1.0
+    assert preview_calls[1]["args"].x_min == 1.0
 
 
-def test_plot_density_gui_seed_render_uses_noninteractive_backend_without_warning(
+def test_plot_density_gui_preparation_does_not_configure_render_backend(
     tmp_path, monkeypatch, caplog
 ):
     source_h5 = tmp_path / "source_density.h5"
@@ -7536,14 +7535,13 @@ def test_plot_density_gui_seed_render_uses_noninteractive_backend_without_warnin
     )
 
     assert rc == 0
-    assert backend_calls
-    assert all(call is False for call in backend_calls)
+    assert backend_calls == []
     assert (
         "No interactive display or output path requested. Nothing was rendered." not in caplog.text
     )
 
 
-def test_plot_density_gui_preview_switches_from_seed_agg_to_interactive_backend(
+def test_plot_density_gui_explicit_external_preview_uses_interactive_backend(
     tmp_path, monkeypatch
 ):
     source_h5 = tmp_path / "source_density.h5"
@@ -7582,8 +7580,7 @@ def test_plot_density_gui_preview_switches_from_seed_agg_to_interactive_backend(
 
     assert rc == 0
     assert backend_calls
-    assert backend_calls[0] is False
-    assert True in backend_calls
+    assert backend_calls[0] is True
 
 
 def test_plot_density_gui_provides_hdf5_import_callback(tmp_path, monkeypatch):
@@ -8297,14 +8294,12 @@ def test_plot_density_gui_first_open_preview_disables_series_immediately(tmp_pat
     )
 
     assert rc == 0
-    assert len(render_calls) == 2
+    assert len(render_calls) == 1
     assert render_calls[0]["series_enabled"] is None
     assert render_calls[0]["line_colors"] is None
-    assert render_calls[1]["series_enabled"] is None
-    assert render_calls[1]["line_colors"] is None
-    assert isinstance(render_calls[1]["series_overrides"], dict)
+    assert isinstance(render_calls[0]["series_overrides"], dict)
     assert (
-        render_calls[1]["series_overrides"][disabled_series_id_holder["value"]]["enabled"] is False
+        render_calls[0]["series_overrides"][disabled_series_id_holder["value"]]["enabled"] is False
     )
 
 
@@ -9071,10 +9066,9 @@ def test_plot_density_gui_preview_uses_non_blocking_show(tmp_path, monkeypatch):
     )
 
     assert rc == 0
-    assert len(plot_calls) == 2
-    assert plot_calls[0]["show"] is False
-    assert plot_calls[1]["show"] is True
-    assert plot_calls[1]["show_blocking"] is False
+    assert len(plot_calls) == 1
+    assert plot_calls[0]["show"] is True
+    assert plot_calls[0]["show_blocking"] is False
 
 
 def test_plot_density_gui_single_series_label_maps_to_line_label(tmp_path, monkeypatch):
@@ -9112,9 +9106,8 @@ def test_plot_density_gui_single_series_label_maps_to_line_label(tmp_path, monke
     )
 
     assert rc == 0
-    assert len(plot_calls) == 2
-    assert plot_calls[0]["show"] is False
-    assert plot_calls[1].get("line_label") == "custom-series" or plot_calls[1].get(
+    assert len(plot_calls) == 1
+    assert plot_calls[0].get("line_label") == "custom-series" or plot_calls[0].get(
         "series_labels"
     ) == ["custom-series"]
 
@@ -11932,3 +11925,7 @@ def test_apply_pbc_dump_default_output_uses_xyz_suffix(tmp_path):
     assert rc == 0
     wrapped = read(tmp_path / "lammps_pbc.xyz")
     assert wrapped.positions[0, 0] == pytest.approx(0.2)
+
+
+# Callback tests receive a prepared session; startup itself is tested separately.
+pytestmark = pytest.mark.usefixtures("prepared_studio")

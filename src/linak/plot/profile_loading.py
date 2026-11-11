@@ -55,6 +55,14 @@ def read_analysis_profile_payloads_by_source(
 
     payloads_by_source: list[tuple[str, list[dict[str, Any]]]] = []
     for source_index, source in enumerate(sources):
+        from .gui_session import report_progress, preparing_session
+
+        report_progress(
+            "Preparing combined results" if preparing_session() else "Loading plot data",
+            Path(source).name,
+            source_index + 1,
+            len(sources),
+        )
         source_path = Path(source).expanduser().resolve()
         profiles = read_linak_hdf5_profiles(source_path, expected_analysis=analysis)
         if not profiles:
@@ -85,6 +93,14 @@ def read_analysis_profile_headers_by_source(
 ) -> list[tuple[str, list[dict[str, Any]]]]:
     headers_by_source: list[tuple[str, list[dict[str, Any]]]] = []
     for source_index, source in enumerate(sources):
+        from .gui_session import report_progress
+
+        report_progress(
+            "Checking files" if analysis else "Loading plot data",
+            Path(source).name,
+            source_index + 1,
+            len(sources),
+        )
         source_path = Path(source).expanduser().resolve()
         try:
             stat = source_path.stat()

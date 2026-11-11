@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
-from collections.abc import Mapping, Sequence
+from functools import partial
+from copy import copy
+from ..parallel import bounded_map, current_execution, stage_workers, timed_stage, _initialize_worker
+from collections.abc import Mapping, Sequence, Iterator
 from contextlib import nullcontext
-from dataclasses import dataclass
-from itertools import combinations_with_replacement, repeat
+from dataclasses import dataclass, replace
+from itertools import combinations_with_replacement
 import logging
 import os
 from pathlib import Path
@@ -25,6 +27,7 @@ from ..storage.hdf5_utils import (
     resolve_hdf5_output_path,
     write_linak_hdf5,
 )
+from ..storage.policies import storage_array
 from .binning import (
     reconstruct_uniform_bin_edges_from_centers,
     resolve_uniform_bin_width_for_load,
@@ -51,12 +54,11 @@ from ..plot.plotting import (
     resolve_single_series_options,
 )
 from ..progress import ProgressBar
-from ..runtime_resources import MIB, resolve_resource_policy, resolve_worker_count
+from ..runtime_resources import MIB
 from ..utils import ensure_positive
 from .common import (
     available_element_species as _available_element_species,
     grouped_raw_species_for_split_elements,
-    normalize_species_label as _normalize_species,
     normalize_species_query as _normalize_species_query,
     raw_species_labels,
     species_selector_raw_label,
@@ -65,6 +67,21 @@ from .common import (
     use_multi_series_plot,
     write_profile_collection,
 )
+
+from .entities import (
+    EntityResolver,
+    entity_distances,
+    is_molecular,
+    pair_label,
+    molecule_metadata,
+    read_molecule_metadata,
+    selection_kind,
+    atom_selector_indices,
+)
+
+from .uncertainty import BlockData, frame_blocks
+
+_normalize_species = pair_label
 
 LOGGER = logging.getLogger(__name__)
 
@@ -77,13 +94,11 @@ def _warning_logger() -> logging.Logger:
 
 _NEIGHBORLIST_DENSITY_THRESHOLD = 0.25
 _SELECTED_MATRIX_FRACTION_THRESHOLD = 0.40
-_DEFAULT_RDF_THREAD_CAP = 4
 _RDF_MIN_PARALLEL_FRAMES_PER_WORKER = 4
 _RDF_MIN_CHUNK_SIZE = 16
 _RDF_MAX_CHUNK_SIZE = 128
 _RDF_DENSE_PAIR_THRESHOLD = 250_000
 _RDF_FAST_MAX_DISTANCE_VALUES_PER_CHUNK = 2_000_000
-_RDF_FAST_TARGET_CHUNKS_PER_WORKER = 4
 _RDF_BACKEND_DENSE = "chunked_dense_matrix"
 _RDF_BACKEND_SPARSE = "chunked_sparse_cutoff"
 _RDF_BACKEND_GENERIC = "framewise_generic_fallback"
@@ -106,6 +121,7 @@ class RDFProfile:
     atom_indices_b: np.ndarray | None = None
     selection_kind_a: str = "species"
     selection_kind_b: str = "species"
+    molecular_metadata: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -204,6 +220,9 @@ class _RDFStatisticsMoments:
     sample_sumsq: np.ndarray
     block_sum: np.ndarray | None = None
     block_n: np.ndarray | None = None
+    block_frames: np.ndarray | None = None
+    block_observed: np.ndarray | None = None
+    block_expected: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -254,6 +273,9 @@ def _empty_rdf_statistics_moments(
         sample_sumsq=np.zeros(int(n_bins), dtype=float),
         block_sum=None if block_shape is None else np.zeros(block_shape, dtype=float),
         block_n=None if block_shape is None else np.zeros(block_shape, dtype=int),
+        block_frames=None if n_blocks is None else np.zeros(n_blocks, dtype=int),
+        block_observed=None if block_shape is None else np.zeros(block_shape),
+        block_expected=None if block_shape is None else np.zeros(block_shape),
     )
 
 
@@ -268,6 +290,10 @@ def _update_rdf_statistics_moments(
     """Accumulate one frame's exact RDF values into per-bin sample/block moments."""
     if moments is None:
         return
+    if block_index_by_frame is not None and moments.block_frames is not None:
+        block_id = int(block_index_by_frame[frame_index])
+        if block_id >= 0:
+            moments.block_frames[block_id] += 1
     counts_array = np.asarray(counts, dtype=float)
     expected_array = np.asarray(expected, dtype=float)
     moments.point_count += np.rint(counts_array).astype(int)
@@ -290,6 +316,8 @@ def _update_rdf_statistics_moments(
     block_index = int(block_index_by_frame[frame_index])
     if block_index < 0:
         return
+    moments.block_observed[block_index, finite] += counts_array[finite]
+    moments.block_expected[block_index, finite] += expected_array[finite]
     moments.block_sum[block_index, finite] += g_values[finite]
     moments.block_n[block_index, finite] += 1
 
@@ -311,6 +339,10 @@ def _merge_rdf_statistics_moments(
         destination.block_sum += source.block_sum
     if destination.block_n is not None and source.block_n is not None:
         destination.block_n += source.block_n
+    if destination.block_frames is not None and source.block_frames is not None:
+        destination.block_frames += source.block_frames
+        destination.block_observed += source.block_observed
+        destination.block_expected += source.block_expected
     return destination
 
 
@@ -335,6 +367,15 @@ def _finalize_rdf_statistics_moments(
         sample_n=moments.sample_n,
         sample_sum=moments.sample_sum,
         sample_sumsq=moments.sample_sumsq,
+        resampling=(
+            None
+            if moments.block_frames is None
+            else BlockData(
+                moments.block_observed[..., None],
+                moments.block_expected[..., None],
+                moments.block_frames,
+            )
+        ),
         block_values=_block_mean_matrix_from_rdf_moments(moments),
     )
 
@@ -714,14 +755,7 @@ def _sample_distances_full_matrix(
     ]
 
 
-def _resolve_rdf_worker_count(
-    threads: int | None,
-    n_frames: int,
-    *,
-    estimated_bytes_per_worker: int = 64 * MIB,
-    memory_budget_mib: float | None = None,
-) -> int:
-    """Resolve requested RDF worker count."""
+def _requested_rdf_threads(threads):
     if threads is None:
         env_threads = os.getenv("LINAK_RDF_THREADS")
         if env_threads:
@@ -736,17 +770,24 @@ def _resolve_rdf_worker_count(
 
     if threads is not None and threads < 1:
         raise ValueError("RDF threads must be >= 1.")
-    policy = resolve_resource_policy(memory_budget_mib)
-    requested = threads
-    automatic_cpu_count = min(_DEFAULT_RDF_THREAD_CAP, os.cpu_count() or 1)
-    return resolve_worker_count(
-        task_count=max(1, n_frames),
-        estimated_bytes_per_worker=estimated_bytes_per_worker,
-        requested_threads=requested,
-        policy=policy,
-        cpu_count=automatic_cpu_count,
-        logger=LOGGER,
-        context="RDF",
+    return threads
+
+
+def _resolve_rdf_worker_count(
+    threads: int | None,
+    n_frames: int,
+    *,
+    estimated_bytes_per_worker: int = 64 * MIB,
+    memory_budget_mib: float | None = None,
+) -> int:
+    """Resolve requested RDF worker count."""
+    threads = _requested_rdf_threads(threads)
+    return stage_workers(
+        'rdf.distances', max(1, n_frames),
+        bytes_per_task=max(MIB, estimated_bytes_per_worker // 4),
+        memory_budget_mib=memory_budget_mib,
+        requested_threads=threads,
+        use_requested=threads is not None or current_execution() is None,
     )
 
 
@@ -754,8 +795,9 @@ def _estimate_rdf_worker_bytes(frames: Sequence[Atoms]) -> int:
     """Conservatively estimate one RDF worker's peak scratch allocation."""
 
     max_atoms = max((len(frame) for frame in frames), default=1)
-    pair_matrix_bytes = max_atoms * max_atoms * np.dtype(np.float64).itemsize
-    return max(64 * MIB, 3 * pair_matrix_bytes)
+    # Include frame batching and simultaneous distance/MIC/weight temporaries.
+    values = min(_RDF_FAST_MAX_DISTANCE_VALUES_PER_CHUNK, 16 * max_atoms * max_atoms)
+    return max(64 * MIB, 64 * values)
 
 
 def _build_uniform_rdf_bins(
@@ -830,8 +872,8 @@ def _resolve_rdf_fast_chunk_size(
     if pair_count <= 0:
         return frame_count
 
-    target_chunks = max(worker_count * _RDF_FAST_TARGET_CHUNKS_PER_WORKER, 1)
-    parallel_chunk = max(1, (frame_count + target_chunks - 1) // target_chunks)
+    # Fixed logical blocks keep floating-point statistics independent of workers.
+    parallel_chunk = min(16, frame_count)
     memory_chunk = max(1, _RDF_FAST_MAX_DISTANCE_VALUES_PER_CHUNK // max(1, pair_count))
     return max(1, min(frame_count, parallel_chunk, memory_chunk))
 
@@ -926,14 +968,17 @@ def _resolve_rdf_backend(
     )
 
 
-def _iter_rdf_frame_chunks(
-    frames: Sequence[Atoms],
-    chunk_size: int,
-) -> list[list[tuple[int, Atoms]]]:
-    return [
-        list(enumerate(frames[start : start + chunk_size], start))
-        for start in range(0, len(frames), chunk_size)
-    ]
+def _iter_rdf_frame_chunks(frames: Sequence[Atoms], chunk_size: int) -> Iterator[list[tuple[int, Atoms]]]:
+    from ..parallel import batches
+    from .topology import FRAME_KEY
+    for chunk in batches(enumerate(frames), chunk_size):
+        payload = []
+        for index, frame in chunk:
+            item = copy(frame)
+            item.info = {key: value for key, value in frame.info.items() if key != FRAME_KEY}
+            item.calc = None
+            payload.append((index, item))
+        yield payload
 
 
 def _iter_rdf_orthorhombic_chunks(
@@ -943,9 +988,8 @@ def _iter_rdf_orthorhombic_chunks(
     cell_lengths: np.ndarray,
     volumes: np.ndarray,
     chunk_size: int,
-) -> list[_RDFOrthorhombicChunk]:
+) -> Iterator[_RDFOrthorhombicChunk]:
     """Build compact orthorhombic chunk payloads from selected positions only."""
-    chunks: list[_RDFOrthorhombicChunk] = []
     indices_a = np.asarray(selection_cache.indices_a, dtype=int)
     indices_b = np.asarray(selection_cache.indices_b, dtype=int)
     for start in range(0, len(frames), chunk_size):
@@ -958,17 +1002,14 @@ def _iter_rdf_orthorhombic_chunks(
             [np.asarray(frame.positions[indices_b], dtype=float) for frame in frames[start:stop]],
             axis=0,
         )
-        chunks.append(
-            _RDFOrthorhombicChunk(
+        yield _RDFOrthorhombicChunk(
                 positions_a=positions_a,
                 positions_b=positions_b,
                 cell_lengths=np.asarray(cell_lengths[start:stop], dtype=float),
                 volumes=np.asarray(volumes[start:stop], dtype=float),
                 frame_count=stop - start,
                 frame_start=start,
-            )
         )
-    return chunks
 
 
 def _iter_rdf_orthorhombic_multi_chunks(
@@ -978,9 +1019,8 @@ def _iter_rdf_orthorhombic_multi_chunks(
     cell_lengths: np.ndarray,
     volumes: np.ndarray,
     chunk_size: int,
-) -> list[_RDFOrthorhombicMultiChunk]:
+) -> Iterator[_RDFOrthorhombicMultiChunk]:
     """Build compact orthorhombic chunk payloads shared across RDF species pairs."""
-    chunks: list[_RDFOrthorhombicMultiChunk] = []
     for start in range(0, len(frames), chunk_size):
         stop = min(len(frames), start + chunk_size)
         positions_by_species = {
@@ -993,16 +1033,13 @@ def _iter_rdf_orthorhombic_multi_chunks(
             )
             for species, cache in selection_caches_by_species.items()
         }
-        chunks.append(
-            _RDFOrthorhombicMultiChunk(
+        yield _RDFOrthorhombicMultiChunk(
                 positions_by_species=positions_by_species,
                 cell_lengths=np.asarray(cell_lengths[start:stop], dtype=float),
                 volumes=np.asarray(volumes[start:stop], dtype=float),
                 frame_count=stop - start,
                 frame_start=start,
-            )
         )
-    return chunks
 
 
 def _resolve_rdf_expected_counts_from_volumes(
@@ -1270,6 +1307,61 @@ def _resolve_rdf_pair_selection_caches(
     return resolved
 
 
+def _accumulate_entity_pairs(
+    frames, pairs, bin_edges, *, collect_statistics, oh_cutoff, oh_topology_backend,
+    worker_count=1,
+):
+    """Accumulate dynamic entity counts with exactly the atom RDF convention."""
+    resolver = EntityResolver(oh_cutoff=oh_cutoff, oh_topology_backend=oh_topology_backend)
+    shells = _shell_volumes_from_edges(bin_edges)
+    counts = {pair: np.zeros(len(shells)) for pair in pairs}
+    expected = {pair: np.zeros(len(shells)) for pair in pairs}
+    blocks = _resolve_rdf_block_index_by_frame(len(frames)) if collect_statistics else None
+    moments = {
+        pair: _empty_rdf_statistics_moments(
+            n_bins=len(shells),
+            n_blocks=None if blocks is None else int(blocks.max()) + 1,
+        )
+        if collect_statistics
+        else None
+        for pair in pairs
+    }
+    labels = list(dict.fromkeys(label for pair in pairs for label in pair))
+    with ProgressBar(
+        desc="Computing molecular RDF pairs", total=len(frames), unit="frame"
+    ) as progress:
+        from ..parallel import batches
+        if worker_count > 1:
+            resolver.select(frames[0], labels, 0)
+        def calculate(chunk):
+            resolver = EntityResolver(oh_cutoff=oh_cutoff, oh_topology_backend=oh_topology_backend)
+            result = []
+            for index, frame in chunk:
+                volume = _frame_volume(frame)
+                selections = resolver.select(frame, labels, index)
+                for pair in pairs:
+                    distances, eligible = entity_distances(
+                        frame, selections[pair[0]], selections[pair[1]]
+                    )
+                    observed = _histogram_rdf_distances(distances[eligible], bin_edges=bin_edges)
+                    ideal = (np.count_nonzero(eligible) / volume) * shells
+                    result.append((index, pair, observed, ideal))
+            return result
+        for results in bounded_map(calculate, batches(enumerate(frames), 16), workers=worker_count, stage='rdf.entities'):
+            for index, pair, observed, ideal in results:
+                counts[pair] += observed
+                expected[pair] += ideal
+                _update_rdf_statistics_moments(moments[pair], counts=observed, expected=ideal,
+                    frame_index=index, block_index_by_frame=blocks)
+            progress.update(len(results) // len(pairs))
+    for pair in pairs:
+        if not np.any(expected[pair] > 0):
+            raise ValueError(
+                f"RDF selection has no eligible pairs in the trajectory: {pair[0]}-{pair[1]}."
+            )
+    return pairs, bin_edges, shells, counts, expected, {pair: None for pair in pairs}, moments
+
+
 def _accumulate_rdf_pair_collection(
     frames: Sequence[Atoms],
     *,
@@ -1280,6 +1372,8 @@ def _accumulate_rdf_pair_collection(
     progress_desc: str | None = None,
     collect_statistics: bool = False,
     memory_budget_mib: float | None = None,
+    oh_cutoff: float = 1.27,
+    oh_topology_backend: str = "auto",
 ) -> tuple[
     list[tuple[str, str]],
     np.ndarray,
@@ -1326,6 +1420,42 @@ def _accumulate_rdf_pair_collection(
         )
 
     shell_volumes = _shell_volumes_from_edges(bin_edges)
+    if any(is_molecular(label) for pair in unique_pairs for label in pair):
+        molecular_pairs = [
+            pair for pair in unique_pairs if any(is_molecular(label) for label in pair)
+        ]
+        atomic_pairs = [pair for pair in unique_pairs if pair not in molecular_pairs]
+        threads = _requested_rdf_threads(threads)
+        worker_count = stage_workers('rdf.entities', (len(frames) + 15) // 16,
+            bytes_per_task=_estimate_rdf_worker_bytes(frames) // 4,
+            memory_budget_mib=memory_budget_mib,
+            requested_threads=threads, use_requested=threads is not None or current_execution() is None)
+        result = list(
+            _accumulate_entity_pairs(
+                frames,
+                molecular_pairs,
+                bin_edges,
+                collect_statistics=collect_statistics,
+                oh_cutoff=oh_cutoff,
+                oh_topology_backend=oh_topology_backend,
+                worker_count=worker_count,
+            )
+        )
+        if atomic_pairs:
+            atomic_result = _accumulate_rdf_pair_collection(
+                frames,
+                pairs=atomic_pairs,
+                r_max=resolved_r_max,
+                bin_width=requested_bin_width,
+                threads=threads,
+                progress_desc=progress_desc,
+                collect_statistics=collect_statistics,
+                memory_budget_mib=memory_budget_mib,
+            )
+            for index in range(3, 7):
+                result[index].update(atomic_result[index])
+        result[0] = unique_pairs
+        return tuple(result)
     worker_count = _resolve_rdf_worker_count(
         threads,
         len(frames),
@@ -1401,30 +1531,28 @@ def _accumulate_rdf_pair_collection(
         progress_context = nullcontext(progress_cm) if progress_cm is None else progress_cm
         with progress_context as progress:
             if use_parallel:
-                with ThreadPoolExecutor(max_workers=worker_count) as executor:
-                    for chunk_results in executor.map(
-                        _compute_rdf_pairwise_orthorhombic_chunk_contributions,
-                        chunks,
-                        repeat(tuple(jobs)),
-                    ):
-                        processed_frames = 0
-                        for (
-                            species_a,
-                            species_b,
-                            counts,
-                            expected,
-                            processed,
+                for chunk_results in bounded_map(
+                    partial(_compute_rdf_pairwise_orthorhombic_chunk_contributions, jobs=tuple(jobs)),
+                    chunks, workers=worker_count, stage='rdf.distances',
+                ):
+                    processed_frames = 0
+                    for (
+                        species_a,
+                        species_b,
+                        counts,
+                        expected,
+                        processed,
+                        chunk_moments,
+                    ) in chunk_results:
+                        counts_by_pair[(species_a, species_b)] += counts
+                        expected_by_pair[(species_a, species_b)] += expected
+                        moments_by_pair[(species_a, species_b)] = _merge_rdf_statistics_moments(
+                            moments_by_pair[(species_a, species_b)],
                             chunk_moments,
-                        ) in chunk_results:
-                            counts_by_pair[(species_a, species_b)] += counts
-                            expected_by_pair[(species_a, species_b)] += expected
-                            moments_by_pair[(species_a, species_b)] = _merge_rdf_statistics_moments(
-                                moments_by_pair[(species_a, species_b)],
-                                chunk_moments,
-                            )
-                            processed_frames = max(processed_frames, processed)
-                        if progress is not None:
-                            progress.update(processed_frames)
+                        )
+                        processed_frames = max(processed_frames, processed)
+                    if progress is not None:
+                        progress.update(processed_frames)
             else:
                 for chunk in chunks:
                     chunk_results = _compute_rdf_pairwise_orthorhombic_chunk_contributions(
@@ -1888,6 +2016,31 @@ def _compute_rdf_chunk_contributions(
     return counts_accum, expected_accum, len(chunk), moments
 
 
+_RDF_PROCESS_CONFIG: _RDFWorkerConfig | None = None
+
+
+def _initialize_rdf_process(config):
+    global _RDF_PROCESS_CONFIG
+    _initialize_worker()
+    _RDF_PROCESS_CONFIG = config
+
+
+def _rdf_process_chunk(chunk):
+    config = _RDF_PROCESS_CONFIG
+    assert config is not None, "RDF process worker was not initialized."
+    result = []
+    for index, frame in chunk:
+        counts, expected = _compute_rdf_frame_contribution(
+            index, frame, label_a=config.label_a, label_b=config.label_b,
+            same_selection=config.same_selection, r_max=config.r_max,
+            bin_edges=config.bin_edges, shell_volumes=config.shell_volumes,
+            max_sphere_volume=config.max_sphere_volume, selection_cache=config.selection_cache,
+            strategy_override=config.strategy_override,
+        )
+        result.append((index, counts, expected))
+    return result
+
+
 def _compute_rdf_generic_backend(
     frames: Sequence[Atoms],
     *,
@@ -1940,16 +2093,16 @@ def _compute_rdf_generic_backend(
         return counts_accum, expected_accum, moments
 
     chunks = _iter_rdf_frame_chunks(frames, chunk_size)
-    with ProcessPoolExecutor(max_workers=worker_count) as executor:
-        for counts, expected, processed_frames, chunk_moments in executor.map(
-            _compute_rdf_chunk_contributions,
-            chunks,
-            repeat(config),
-        ):
+    for results in bounded_map(
+        _rdf_process_chunk, chunks, workers=worker_count, processes=True,
+        initializer=_initialize_rdf_process, initargs=(config,), stage='rdf.distances',
+    ):
+        for index, counts, expected in results:
             counts_accum += counts
             expected_accum += expected
-            moments = _merge_rdf_statistics_moments(moments, chunk_moments)
-            progress.update(processed_frames)
+            _update_rdf_statistics_moments(moments, counts=counts, expected=expected,
+                frame_index=index, block_index_by_frame=config.block_index_by_frame)
+        progress.update(len(results))
     return counts_accum, expected_accum, moments
 
 
@@ -2003,14 +2156,13 @@ def _compute_rdf_orthorhombic_backend(
             progress.update(processed_frames)
         return counts_accum, expected_accum, moments
 
-    with ThreadPoolExecutor(max_workers=worker_count) as executor:
-        for counts, expected, processed_frames, chunk_moments in executor.map(
-            worker, chunks, repeat(config)
-        ):
-            counts_accum += counts
-            expected_accum += expected
-            moments = _merge_rdf_statistics_moments(moments, chunk_moments)
-            progress.update(processed_frames)
+    for counts, expected, processed_frames, chunk_moments in bounded_map(
+        partial(worker, config=config), chunks, workers=worker_count, stage='rdf.distances',
+    ):
+        counts_accum += counts
+        expected_accum += expected
+        moments = _merge_rdf_statistics_moments(moments, chunk_moments)
+        progress.update(processed_frames)
     return counts_accum, expected_accum, moments
 
 
@@ -2029,6 +2181,7 @@ def _compute_rdf_statistics_profile(
     max_sphere_volume = (4.0 / 3.0) * np.pi * (float(r_max) ** 3)
     same_selection = label_a == label_b
     sample_rows: list[np.ndarray] = []
+    count_rows, expected_rows = [], []
     point_count = np.zeros(bin_edges.size - 1, dtype=int)
     for frame_index, frame in enumerate(frames):
         counts, expected = _compute_rdf_frame_contribution(
@@ -2049,16 +2202,23 @@ def _compute_rdf_statistics_profile(
         finite = expected > 0.0
         g_values[finite] = counts[finite] / expected[finite]
         sample_rows.append(g_values)
+        count_rows.append(counts)
+        expected_rows.append(expected)
     sample_matrix = np.vstack(sample_rows)
     block_resolution = resolve_block_slices(len(frames))
     block_slices = None if block_resolution is None else block_resolution[0]
-    return build_series_statistics(
+    stats = build_series_statistics(
         point_count=point_count,
         sample_values=sample_matrix,
         block_values=block_mean_matrix(sample_matrix, block_slices=block_slices),
     )
 
+    return replace(
+        stats, resampling=frame_blocks(np.asarray(count_rows), np.asarray(expected_rows))
+    )
 
+
+@timed_stage("calculation")
 def compute_rdf(
     frames: Sequence[Atoms],
     species_a: str | None = "all",
@@ -2069,6 +2229,8 @@ def compute_rdf(
     bin_width: float = 0.05,
     threads: int | None = None,
     memory_budget_mib: float | None = None,
+    oh_cutoff: float = 1.27,
+    oh_topology_backend: str = "auto",
     _strategy_override: str | None = None,
 ) -> RDFProfile:
     """Compute a radial distribution function averaged across frames."""
@@ -2076,6 +2238,45 @@ def compute_rdf(
         raise ValueError("At least one trajectory frame is required.")
 
     ensure_positive("bin_width", bin_width)
+    if is_molecular(species_a) or is_molecular(species_b):
+        if atom_indices_a is not None:
+            species_a = _format_atom_selector_label(atom_indices_a)
+        if atom_indices_b is not None:
+            species_b = _format_atom_selector_label(atom_indices_b)
+        profiles = compute_rdf_profiles(
+            frames,
+            pairs=[
+                (
+                    pair_label(species_a),
+                    pair_label(species_b if species_b is not None else species_a),
+                )
+            ],
+            r_max=r_max,
+            bin_width=bin_width,
+            threads=threads,
+            memory_budget_mib=memory_budget_mib,
+            oh_cutoff=oh_cutoff,
+            oh_topology_backend=oh_topology_backend,
+        )
+        profile = profiles[0]
+        if pair_label(species_a) != profile.species_a:
+            metadata = dict(profile.molecular_metadata or {})
+            for prefix in ("selection_kind", "entity_kind"):
+                metadata[prefix + "_a"], metadata[prefix + "_b"] = (
+                    metadata[prefix + "_b"],
+                    metadata[prefix + "_a"],
+                )
+            profile = replace(
+                profile,
+                species_a=profile.species_b,
+                species_b=profile.species_a,
+                selection_kind_a=profile.selection_kind_b,
+                selection_kind_b=profile.selection_kind_a,
+                atom_indices_a=profile.atom_indices_b,
+                atom_indices_b=profile.atom_indices_a,
+                molecular_metadata=metadata,
+            )
+        return profile
     selector_a = _resolve_rdf_selector(species=species_a, atom_indices=atom_indices_a)
     selector_b = _resolve_rdf_selector(
         species=species_b if species_b is not None else species_a,
@@ -2286,6 +2487,7 @@ def compute_rdf(
     )
 
 
+@timed_stage("calculation")
 def compute_rdf_profiles(
     frames: Sequence[Atoms],
     *,
@@ -2294,6 +2496,8 @@ def compute_rdf_profiles(
     bin_width: float = 0.05,
     threads: int | None = None,
     memory_budget_mib: float | None = None,
+    oh_cutoff: float = 1.27,
+    oh_topology_backend: str = "auto",
 ) -> list[RDFProfile]:
     """Compute requested RDF pairs, or all unique element/raw-species pairs."""
     if not frames:
@@ -2337,6 +2541,8 @@ def compute_rdf_profiles(
         progress_desc="Computing RDF pair collection",
         collect_statistics=True,
         memory_budget_mib=memory_budget_mib,
+        oh_cutoff=oh_cutoff,
+        oh_topology_backend=oh_topology_backend,
     )
 
     bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
@@ -2361,6 +2567,19 @@ def compute_rdf_profiles(
                 RDFProfile(
                     species_a=species_a,
                     species_b=species_b,
+                    selection_kind_a=selection_kind(species_a),
+                    atom_indices_a=atom_selector_indices(species_a)
+                    if species_a.startswith("atoms[")
+                    else None,
+                    selection_kind_b=selection_kind(species_b),
+                    atom_indices_b=atom_selector_indices(species_b)
+                    if species_b.startswith("atoms[")
+                    else None,
+                    molecular_metadata=(
+                        molecule_metadata(species_a, species_b, oh_cutoff, oh_topology_backend)
+                        if is_molecular(species_a) or is_molecular(species_b)
+                        else None
+                    ),
                     bin_edges=np.asarray(bin_edges, dtype=float),
                     bin_centers=np.asarray(bin_centers, dtype=float),
                     g_r=g_r,
@@ -2401,6 +2620,7 @@ def _rdf_profile_hdf5_payload(profile: RDFProfile) -> dict[str, Any]:
     metadata_payload = {
         "species_a": profile.species_a,
         "species_b": profile.species_b,
+        **(profile.molecular_metadata or {}),
         "selection_kind_a": str(profile.selection_kind_a),
         "selection_kind_b": str(profile.selection_kind_b),
         "n_frames": profile.n_frames,
@@ -2456,6 +2676,46 @@ def _resolve_non_overwriting_rdf_output_path(path: str | Path) -> Path:
     return unique_output_path(resolve_hdf5_output_path(path))
 
 
+def _rdf_bin_grids_match(
+    existing_payload: Mapping[str, Any], incoming_payload: Mapping[str, Any]
+) -> bool:
+    """Compare uniform RDF grids at their persisted coordinate precision."""
+    existing_centers = np.asarray(existing_payload.get("datasets", {}).get("bin_centers_A", []))
+    incoming_centers = np.asarray(incoming_payload.get("datasets", {}).get("bin_centers_A", []))
+    if (
+        existing_centers.ndim != 1
+        or existing_centers.size == 0
+        or existing_centers.shape != incoming_centers.shape
+        or not np.all(np.isfinite(existing_centers))
+        or not np.all(np.isfinite(incoming_centers))
+    ):
+        return False
+    try:
+        widths = np.asarray(
+            [
+                float(payload.get("metadata", {}).get("bin_width_A"))
+                for payload in (existing_payload, incoming_payload)
+            ]
+        )
+    except (TypeError, ValueError):
+        return False
+    if (
+        not np.all(np.isfinite(widths))
+        or np.any(widths <= 0)
+        or not np.isclose(widths[0], widths[1], rtol=1.0e-9, atol=1.0e-12)
+    ):
+        return False
+    # mixed-v1 stores centers as float32. Compare both grids in that tier,
+    # including legacy float64 coordinates, while keeping width metadata strict.
+    stored = storage_array(analysis="rdf", name="bin_centers_A", values=existing_centers)
+    incoming = storage_array(analysis="rdf", name="bin_centers_A", values=incoming_centers)
+    return bool(
+        np.all(np.isfinite(stored))
+        and np.all(np.isfinite(incoming))
+        and np.allclose(stored, incoming, rtol=1.0e-9, atol=1.0e-12)
+    )
+
+
 def _rdf_collection_compatibility_error(
     existing_payloads: Sequence[tuple[dict[str, np.ndarray], dict[str, Any]]],
     incoming_payloads: Sequence[Mapping[str, Any]],
@@ -2469,10 +2729,29 @@ def _rdf_collection_compatibility_error(
 
     incoming_source = str(expected_source_path or "").strip()
     incoming_reference = incoming_payloads[0]
-    incoming_reference_datasets = incoming_reference.get("datasets", {})
     incoming_reference_metadata = incoming_reference.get("metadata", {})
-    incoming_centers = np.asarray(incoming_reference_datasets.get("bin_centers_A", []), dtype=float)
     incoming_n_frames = int(incoming_reference_metadata.get("n_frames", 0) or 0)
+
+    molecular_metadata_rows = [
+        metadata for _, metadata in existing_payloads if metadata.get("molecular_coordinate_mode")
+    ]
+    molecular_metadata_rows += [
+        payload.get("metadata", {})
+        for payload in incoming_payloads
+        if payload.get("metadata", {}).get("molecular_coordinate_mode")
+    ]
+    if molecular_metadata_rows:
+        for key in (
+            "molecular_coordinate_mode",
+            "oh_cutoff_A",
+            "molecular_classifier",
+            "pair_exclusion",
+        ):
+            if any(
+                row.get(key) != molecular_metadata_rows[0].get(key)
+                for row in molecular_metadata_rows
+            ):
+                return f"incompatible molecular RDF metadata: {key}"
 
     seen_pair_keys: set[tuple[str, str]] = set()
     for index, (datasets, metadata) in enumerate(existing_payloads):
@@ -2495,12 +2774,8 @@ def _rdf_collection_compatibility_error(
             ):
                 return "stored source_path does not match the requested trajectory source"
 
-        stored_centers = np.asarray(datasets.get("bin_centers_A", []), dtype=float)
-        if stored_centers.shape != incoming_centers.shape or not np.allclose(
-            stored_centers,
-            incoming_centers,
-            rtol=1.0e-9,
-            atol=1.0e-12,
+        if not _rdf_bin_grids_match(
+            {"datasets": datasets, "metadata": metadata}, incoming_reference
         ):
             return f"stored RDF bin geometry is incompatible at profile index {index}"
 
@@ -2517,14 +2792,11 @@ def _rdf_payloads_match_within_tolerance(
 ) -> bool:
     existing_datasets = existing_payload.get("datasets", {})
     incoming_datasets = incoming_payload.get("datasets", {})
-    existing_centers = np.asarray(existing_datasets.get("bin_centers_A", []), dtype=float)
-    incoming_centers = np.asarray(incoming_datasets.get("bin_centers_A", []), dtype=float)
     existing_g_r = np.asarray(existing_datasets.get("g_r", []), dtype=float)
     incoming_g_r = np.asarray(incoming_datasets.get("g_r", []), dtype=float)
     return (
-        existing_centers.shape == incoming_centers.shape
+        _rdf_bin_grids_match(existing_payload, incoming_payload)
         and existing_g_r.shape == incoming_g_r.shape
-        and np.allclose(existing_centers, incoming_centers, rtol=1.0e-9, atol=1.0e-12)
         and np.allclose(
             existing_g_r,
             incoming_g_r,
@@ -2663,6 +2935,7 @@ def _save_rdf_profile_collection(
     return written_path
 
 
+@timed_stage("writing")
 def save_rdf_profile(
     profile: RDFProfile,
     output: str | Path,
@@ -2687,6 +2960,7 @@ def save_rdf_profile(
     return output_path
 
 
+@timed_stage("writing")
 def save_rdf_profiles(
     profiles: list[RDFProfile],
     output: str | Path,
@@ -2827,6 +3101,7 @@ def _load_rdf_profiles_from_payloads(
             ),
             atom_indices_a=atom_indices_a,
             atom_indices_b=atom_indices_b,
+            molecular_metadata=read_molecule_metadata(metadata),
             selection_kind_a=selection_kind_a,
             selection_kind_b=selection_kind_b,
         )
@@ -2838,22 +3113,23 @@ def _load_rdf_profiles_from_payloads(
         ):
             exact_profiles.append(profile)
         elif _pair_request_is_cross_species(wanted_species_a, wanted_species_b):
+            metadata_reversed = dict(profile.molecular_metadata or {})
+            if metadata_reversed:
+                for prefix in ("selection_kind", "entity_kind"):
+                    metadata_reversed[prefix + "_a"], metadata_reversed[prefix + "_b"] = (
+                        metadata_reversed[prefix + "_b"],
+                        metadata_reversed[prefix + "_a"],
+                    )
             reversed_profiles.append(
-                RDFProfile(
+                replace(
+                    profile,
                     species_a=str(wanted_species_a),
                     species_b=str(wanted_species_b),
-                    bin_edges=bin_edges,
-                    bin_centers=bin_centers,
-                    g_r=g_r,
-                    n_frames=n_frames,
-                    series_statistics=statistics_series_map_from_datasets(
-                        datasets,
-                        dataset_names=("g_r",),
-                    ),
-                    atom_indices_a=atom_indices_a,
-                    atom_indices_b=atom_indices_b,
-                    selection_kind_a=selection_kind_a,
-                    selection_kind_b=selection_kind_b,
+                    atom_indices_a=profile.atom_indices_b,
+                    atom_indices_b=profile.atom_indices_a,
+                    selection_kind_a=profile.selection_kind_b,
+                    selection_kind_b=profile.selection_kind_a,
+                    molecular_metadata=metadata_reversed or None,
                 )
             )
         else:

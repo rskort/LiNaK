@@ -32,7 +32,8 @@ two selectors: center `A`, then neighbor `B`. Unlike RDF, `O H` and `H O` are
 distinct coordination profiles. Duplicate ordered pairs are computed once, and
 the requested profiles share one trajectory load and output collection.
 Selectors support elements, `element:<symbol>`, `species:<stored raw label>`, and
-`all`; dynamic molecule selectors are not supported by the coordination CLI.
+`all`, and dynamic O/H molecule selectors (`mol:H`, `mol:O`, `mol:OH`,
+`mol:H2O`, `mol:H3O`).
 An explicit `--cutoff` applies to every requested pair. RDF-derived cutoffs are
 resolved separately for each physical pair.
 
@@ -49,6 +50,35 @@ The stored result is atom-resolved and time-resolved:
 
 This is not just one average CN per frame. Each tracked center atom keeps its
 own coordination trajectory.
+
+
+## Molecular Coordination
+
+```bash
+linak compute cn trajectory.traj.h5 --species Na mol:OH --cutoff 3.5
+linak compute cn trajectory.traj.h5 --species mol:OH Na --cutoff 3.5
+```
+
+Molecular distances and surface coordinates use periodic-boundary-aware centers
+of mass. Classification is exact in every frame, using `--oh-cutoff` (default
+1.27 Angstrom) and `--oh-topology-backend auto|ckdtree|ase`. Existing molecule aliases
+are accepted. Pairs sharing member atoms are excluded, including constituent
+atoms of the selected molecule. The usual continuous cutoff function applies.
+Both saved-RDF and computed-RDF cutoff modes use these same selection semantics;
+saved molecular RDFs must have compatible classification and exclusion metadata.
+
+For molecular centers, each column tracks an oxygen anchor (a hydrogen anchor
+for `mol:H`), using the sorted union of anchors selected at any time. Coordinates
+and coordination values are `NaN` while that anchor is outside the selected
+class. Changing hydrogen membership keeps the same oxygen column. An active
+center with no eligible neighbors has coordination zero. No selected centers
+anywhere produces an error. Surface views retain the same column alignment.
+
+In molecular-center files, `atom_indices` contains anchor atom indices and
+`n_atoms` counts tracked molecular columns. Additive selection and entity
+metadata identifies this interpretation and records center-of-mass mode,
+classifier version, cutoff, backend, and shared-member exclusion. Atom-only
+files keep their existing interpretation.
 
 ## Step 1: Reuse Position Tracking For Species `A`
 

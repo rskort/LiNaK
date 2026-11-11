@@ -283,6 +283,9 @@ def test_density_outputs_match_prechange_baseline(case, spill, monkeypatch):
     assert len(actual) == len(expected)
     for payload, reference in zip(actual, expected):
         metadata = json.loads(json.dumps(payload["metadata"], default=json_value))
+        # The optional registration reference is tested in test_interface_alignment;
+        # retain the historical scientific/normalization baseline here.
+        metadata.pop("interface_reference", None)
         _assert_metadata(metadata, reference["metadata"])
         assert set(payload["datasets"]) == set(reference["datasets"])
         for name, values in payload["datasets"].items():

@@ -326,3 +326,7 @@ def test_studio_legend_live_edits_match_render_export_and_profile(monkeypatch, t
     assert result == 0
     app.processEvents()
     assert checked == [True]
+
+
+# Callback tests receive a prepared session; startup itself is tested separately.
+pytestmark = pytest.mark.usefixtures("prepared_studio")

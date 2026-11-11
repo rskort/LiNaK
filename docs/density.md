@@ -10,6 +10,12 @@ Studio controls, compatibility rules and measured performance.
 
 ## Symmetric Cells
 
+Mirrored steps and lateral lattice offsets can be registered in Studio using
+**Surface representation → Align interfaces…**. This optional spatial-map
+feature requires a newly computed result containing a side-resolved sparse
+grid. See [Interface alignment](interface-alignment.md) for the workflow,
+geometry checks, and source-bin resolution limits.
+
 With `surface_layout=symmetric`, density stores folded, top, and bottom
 outward-distance profiles. Each side is normalized using its own per-frame
 slice volume. Folded density is the equal arithmetic mean of the two normalized

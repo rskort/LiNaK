@@ -4,11 +4,10 @@ Computes water-orientation observables as a function of either distance to a
 trusted frame-wise surface reference or, when no trusted surface reference is
 available, along a raw Cartesian axis.
 
-The primary observable is ``cos_polar = b . e_ref``, where ``b`` is the
+The laboratory observable is ``cos_polar = b . e_ref``, where ``b`` is the
 normalized water-bisector vector and ``e_ref`` is the chosen Cartesian
-reference axis. Positive and negative values therefore track the positive and
-negative reference-axis directions directly; the sign is not auto-flipped by
-surface-side inference.
+reference axis. Interface-relative profiles reverse the negative-side polar
+sign before combining the two sides with equal weight.
 
 LiNaK also stores an azimuthal descriptor derived from the water-plane normal.
 That quantity is mathematically well defined for a chosen Cartesian in-plane
@@ -18,10 +17,12 @@ system itself defines a preferred in-plane direction.
 
 from __future__ import annotations
 
+from ..parallel import analysis_execution, batches, bounded_map, frame_batch_size, stage_workers, timed_stage
 from collections.abc import Sequence
 
 from ..cell_geometry import (
     bin_volumes,
+    bin_volumes_for_frames,
     frame_origin,
     cartesian_bounds,
     needs_general_geometry,
@@ -29,7 +30,7 @@ from ..cell_geometry import (
 )
 
 from collections.abc import Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 import logging
 import os
 from pathlib import Path
@@ -42,6 +43,7 @@ from ase import Atoms
 from ..plot.data_contract import PlotDataContract, PlotViewMapping
 from ..plot.mappings.orientation_mapping import resolve_orientation_plot_mapping
 from ..storage.hdf5_utils import write_linak_hdf5
+from .interface_alignment import InterfaceReference, InterfaceReferenceCollector, alignment_metadata
 from ..runtime_resources import resolve_resource_policy
 from .common import (
     frame_has_usable_cell as _frame_has_usable_cell,
@@ -151,6 +153,9 @@ class OrientationSparseGrid:
     bottom_cos_azimuthal_sum: np.ndarray | None = None
     top_count_azimuthal_valid: np.ndarray | None = None
     bottom_count_azimuthal_valid: np.ndarray | None = None
+    density_geometry_groups: list[dict[str, Any]] | None = None
+    density_geometry_version: int | None = None
+    density_geometry_reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -220,6 +225,10 @@ class OrientationProfile:
     cell_lengths_angstrom: tuple[float, float, float] | None = None
     series_statistics: dict[str, SeriesStatistics] | None = None
     sparse_grid: OrientationSparseGrid | None = None
+    spatial_interface_view: str = "folded"
+    interface_reference: InterfaceReference | None = None
+    interface_alignment_metadata: dict[str, Any] | None = None
+    _gui_cache_key: tuple[Any, ...] | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -438,7 +447,7 @@ def _angle_bin_indices(values: np.ndarray, bin_edges: np.ndarray) -> np.ndarray:
 
 def _mean_with_nan(sum_values: np.ndarray, count_values: np.ndarray) -> np.ndarray:
     mean = np.full(sum_values.shape, np.nan, dtype=float)
-    valid = np.asarray(count_values, dtype=int) > 0
+    valid = np.asarray(count_values, dtype=float) > 0
     if np.any(valid):
         mean[valid] = np.asarray(sum_values[valid], dtype=float) / np.asarray(
             count_values[valid],
@@ -462,6 +471,128 @@ def _equal_nan_mean(first: np.ndarray, second: np.ndarray) -> np.ndarray:
         out=np.full(total.shape, np.nan, dtype=float),
         where=count > 0,
     )
+
+
+def _orientation_uncertainty_statistics(
+    frame_data, edges, density_samples, *, symmetric=False, side=None, axis_index=None
+):
+    """Retain populations so resampling reproduces the plotted orientation estimator."""
+    from .uncertainty import frame_blocks
+
+    size = len(edges) - 1
+    components = 2 if symmetric else 1
+    result = {}
+    for angle in ("polar", "azimuthal"):
+        numerator = np.zeros((len(frame_data), size, components))
+        denominator = np.zeros_like(numerator)
+        for index, data in enumerate(frame_data):
+            coordinates = data.distances if axis_index is None else data.positions[:, axis_index]
+            valid = _distance_bin_membership_mask(coordinates, edges)
+            valid &= data.polar_valid if angle == "polar" else data.azimuthal_valid
+            bins = _distance_bin_indices(coordinates[valid], edges)
+            values = (
+                (data.cos_polar_lab if axis_index is not None else data.cos_polar)[valid]
+                if angle == "polar"
+                else data.cos_azimuthal[valid]
+            )
+            for component, selected_side in enumerate((1, -1) if symmetric else (side,)):
+                weights = (
+                    np.ones(len(bins))
+                    if selected_side is None
+                    else np.where(
+                        data.interface_side[valid] == selected_side,
+                        1.0,
+                        np.where(data.interface_side[valid] == 0, 0.5, 0.0),
+                    )
+                )
+                numerator[index, :, component] = np.bincount(
+                    bins, weights=weights * values, minlength=size
+                )
+                denominator[index, :, component] = np.bincount(
+                    bins, weights=weights, minlength=size
+                )
+        ratios = np.divide(
+            numerator, denominator, out=np.full_like(numerator, np.nan), where=denominator > 0
+        )
+        sample_means = (
+            _equal_nan_mean(ratios[..., 0], ratios[..., 1]) if symmetric else ratios[..., 0]
+        )
+        count = np.rint(denominator.sum(axis=(0, 2))).astype(int)
+        for suffix, samples, n, d, estimator in (
+            ("mean", sample_means, numerator, denominator, "side_mean" if symmetric else "ratio"),
+            (
+                "density",
+                sample_means * density_samples,
+                np.concatenate([numerator, density_samples[..., None]], axis=-1),
+                np.concatenate([denominator, np.ones_like(density_samples[..., None])], axis=-1),
+                "side_product" if symmetric else "product",
+            ),
+        ):
+            stats = build_series_statistics(point_count=count, sample_values=samples)
+            result[f"cos_{angle}_{suffix}"] = replace(
+                stats, resampling=frame_blocks(n, d, estimator=estimator)
+            )
+    total_counts = np.zeros(size)
+    for data in frame_data:
+        coordinates = data.distances if axis_index is None else data.positions[:, axis_index]
+        mask = _distance_bin_membership_mask(coordinates, edges)
+        weights = (
+            np.ones(np.count_nonzero(mask))
+            if side is None
+            else np.where(
+                data.interface_side[mask] == side,
+                1.0,
+                np.where(data.interface_side[mask] == 0, 0.5, 0.0),
+            )
+        )
+        total_counts += np.bincount(
+            _distance_bin_indices(coordinates[mask], edges), weights=weights, minlength=size
+        )
+    result["density"] = build_series_statistics(
+        point_count=np.rint(total_counts).astype(int),
+        sample_values=density_samples,
+    )
+    return result
+
+
+def _orientation_side_density_samples(frame_data, edges, *, side, volumes, bin_width):
+    samples = np.zeros((len(frame_data), len(edges) - 1))
+    for index, data in enumerate(frame_data):
+        mask = _distance_bin_membership_mask(data.distances, edges)
+        weights = np.where(
+            data.interface_side[mask] == side,
+            1.0,
+            np.where(data.interface_side[mask] == 0, 0.5, 0.0),
+        )
+        counts = np.bincount(
+            _distance_bin_indices(data.distances[mask], edges),
+            weights=weights,
+            minlength=len(edges) - 1,
+        )
+        volume = bin_width if volumes is None else float(volumes[index])
+        samples[index] = counts / volume if volume > 0 else 0
+    return samples
+
+
+def _orientation_side_frame_means(
+    data: _OrientationFrameData,
+    *,
+    distance_edges: np.ndarray,
+    angle: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return per-frame side means for folded uncertainty statistics."""
+    selected = _distance_bin_membership_mask(data.distances, distance_edges)
+    selected &= data.polar_valid if angle == "polar" else data.azimuthal_valid
+    bins = _distance_bin_indices(data.distances[selected], distance_edges)
+    values = (data.cos_polar if angle == "polar" else data.cos_azimuthal)[selected]
+    sides = data.interface_side[selected]
+    means = []
+    for side in (1, -1):
+        weights = np.where(sides == side, 1.0, np.where(sides == 0, 0.5, 0.0))
+        count = np.bincount(bins, weights=weights, minlength=len(distance_edges) - 1)
+        sums = np.bincount(bins, weights=weights * values, minlength=len(distance_edges) - 1)
+        means.append(_mean_with_nan(sums, count))
+    return means[0], means[1]
 
 
 def _aggregate_orientation_side(
@@ -693,6 +824,13 @@ def _aggregate_orientation_full_axis(
             ),
         ),
     }
+    exact_stats = _orientation_uncertainty_statistics(
+        frame_data, axis_edges, sample_density, axis_index=axis_index
+    )
+    statistics = {
+        key: replace(value, resampling=exact_stats[key].resampling)
+        for key, value in statistics.items()
+    }
     return (
         _mean_with_nan(polar_sum, polar_count),
         _mean_with_nan(azimuthal_sum, azimuthal_count),
@@ -771,8 +909,9 @@ def _cartesian_grid_edges_for_orientation(
     frame_data: list[_OrientationFrameData],
     bin_width: float,
     cell_lengths: tuple[float, float, float] | None,
+    include_full_geometry: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    if cell_lengths is not None and needs_general_geometry(frames):
+    if (include_full_geometry and all(_frame_has_usable_cell(frame, require_all_pbc=True) for frame in frames)) or (cell_lengths is not None and needs_general_geometry(frames)):
         bounds = np.asarray([cartesian_bounds(frame.cell, frame_origin(frame)) for frame in frames])
         return tuple(
             _build_uniform_bin_edges(
@@ -916,12 +1055,18 @@ def _build_orientation_sparse_grid(
     bin_width: float,
     cell_lengths: tuple[float, float, float] | None,
     buffer_limit_bytes: int = 128 * 1024 * 1024,
+    geometry_frames: Sequence[Atoms] | None = None,
+    surface_reference: SurfaceReference | None = None,
+    surface_estimate: SurfaceEstimate | None = None,
+    coordinate_mode: str = "axis",
+    surface_axis: str = "z",
 ) -> OrientationSparseGrid:
     x_edges, y_edges, z_edges = _cartesian_grid_edges_for_orientation(
-        frames=frames,
+        frames=geometry_frames if geometry_frames is not None else frames,
         frame_data=frame_data,
         bin_width=bin_width,
         cell_lengths=cell_lengths,
+        include_full_geometry=geometry_frames is not None,
     )
     d_edges = np.asarray(distance_edges, dtype=float)
     shape = (
@@ -948,128 +1093,112 @@ def _build_orientation_sparse_grid(
         "bottom_azimuthal",
         "bottom_azimuthal_count",
     )
-    per_reducer_limit = max(1024, int(buffer_limit_bytes) // len(reducer_names))
-    reducers = {
-        name: _AdaptiveSparseReducer(buffer_limit_bytes=per_reducer_limit) for name in reducer_names
-    }
+    from .density import _DensityValidationPlan
+    from .orientation_spatial import build_density_accumulator
+    _nx, ny, nz, nd = shape
+    density_accumulator, density_reason = build_density_accumulator(
+        geometry_frames, axis=surface_axis, coordinate_mode=coordinate_mode,
+        estimate=surface_estimate, reference=surface_reference,
+        edges=(x_edges, y_edges, z_edges, d_edges),
+    ) if geometry_frames is not None else (None, "")
+    from .density_sparse import SparseReducer, row_dtype
+    from .orientation_spatial import BOTTOM_MOMENT_CHANNELS
+    moment_reducer = None
+    if density_accumulator is not None and surface_reference is not None and surface_reference.is_symmetric:
+        moment_reducer = SparseReducer(density_accumulator.workspace, len(BOTTOM_MOMENT_CHANNELS))
+    density_validation = _DensityValidationPlan(False, frozenset())
+    from .density_sparse import SparseWorkspace
+    workspace = density_accumulator.workspace if density_accumulator is not None else SparseWorkspace()
+    all_reducer = SparseReducer(workspace, len(reducer_names))
 
-    nx, ny, nz, nd = shape
-    if min(shape) <= 0:
-        return OrientationSparseGrid(
-            x_edges=x_edges,
-            y_edges=y_edges,
-            z_edges=z_edges,
-            distance_edges=d_edges,
-            shape=shape,
-            flat_indices=np.array([], dtype=np.int64),
-            entity_sum=np.array([], dtype=np.float32),
-            cos_polar_sum=np.array([], dtype=np.float32),
-            count_polar_valid=np.array([], dtype=np.float32),
-            cos_azimuthal_sum=np.array([], dtype=np.float32),
-            count_azimuthal_valid=np.array([], dtype=np.float32),
-        )
+    def prepare_bins(chunk):
+        output = []
+        for frame_index, data in chunk:
+            positions = np.asarray(data.positions, dtype=float)
+            if not len(positions):
+                output.append((frame_index, data, None))
+                continue
+            ix, mx = _bin_indices_and_mask(positions[:, 0], x_edges)
+            iy, my = _bin_indices_and_mask(positions[:, 1], y_edges)
+            iz, mz = _bin_indices_and_mask(positions[:, 2], z_edges)
+            idist, md = _bin_indices_and_mask(data.distances, d_edges)
+            mask = mx & my & mz & md
+            flat = (((ix[mask] * ny + iy[mask]) * nz + iz[mask]) * nd + idist[mask]).astype(np.int64)
+            rows = np.zeros(len(flat), dtype=row_dtype(len(reducer_names)))
+            rows['bin'] = flat
+            values = rows['values']
+            values[:, 0] = 1.
+            sides = np.asarray(data.interface_side, dtype=np.int8)[mask]
+            polar_valid = np.asarray(data.polar_valid, bool)[mask]
+            az_valid = np.asarray(data.azimuthal_valid, bool)[mask]
+            polar = np.where(polar_valid, np.asarray(data.cos_polar, float)[mask], 0.)
+            azimuthal = np.where(az_valid, np.asarray(data.cos_azimuthal, float)[mask], 0.)
+            values[:, 1] = polar
+            values[:, 2] = np.where(polar_valid, np.asarray(data.cos_polar_lab, float)[mask], 0.)
+            values[:, 3] = polar_valid
+            values[:, 4] = azimuthal
+            values[:, 5] = az_valid
+            for offset, side in ((6, 1), (11, -1)):
+                weight = np.where(sides == side, 1., np.where(sides == 0, .5, 0.))
+                values[:, offset] = weight
+                values[:, offset + 1] = polar * weight
+                values[:, offset + 2] = polar_valid * weight
+                values[:, offset + 3] = azimuthal * weight
+                values[:, offset + 4] = az_valid * weight
+            output.append((frame_index, data, rows))
+        return output
 
-    for data in frame_data:
-        positions = np.asarray(data.positions, dtype=float)
-        if positions.size == 0:
-            continue
-        ix, mx = _bin_indices_and_mask(positions[:, 0], x_edges)
-        iy, my = _bin_indices_and_mask(positions[:, 1], y_edges)
-        iz, mz = _bin_indices_and_mask(positions[:, 2], z_edges)
-        idist, md = _bin_indices_and_mask(data.distances, d_edges)
-        mask = mx & my & mz & md
-        if not np.any(mask):
-            continue
-        flat = (((ix[mask] * ny + iy[mask]) * nz + iz[mask]) * nd + idist[mask]).astype(
-            np.int64,
-            copy=False,
-        )
-        reducers["entity"].add(flat)
-        selected_sides = np.asarray(data.interface_side, dtype=np.int8)[mask]
-        for side_name, side_value in (("top", 1), ("bottom", -1)):
-            weights = np.where(
-                selected_sides == side_value,
-                1.0,
-                np.where(selected_sides == 0, 0.5, 0.0),
-            )
-            use = weights > 0.0
-            if np.any(use):
-                reducers[f"{side_name}_entity"].add(flat[use], weights[use])
-
-        polar_mask = mask & np.asarray(data.polar_valid, dtype=bool)
-        if np.any(polar_mask):
-            polar_flat = (
-                ((ix[polar_mask] * ny + iy[polar_mask]) * nz + iz[polar_mask]) * nd
-                + idist[polar_mask]
-            ).astype(np.int64, copy=False)
-            polar_values_frame = np.asarray(data.cos_polar[polar_mask], dtype=float)
-            reducers["polar"].add(polar_flat, polar_values_frame)
-            reducers["lab_polar"].add(
-                polar_flat, np.asarray(data.cos_polar_lab[polar_mask], dtype=float)
-            )
-            reducers["polar_count"].add(polar_flat)
-            polar_sides = np.asarray(data.interface_side, dtype=np.int8)[polar_mask]
-            for side_name, side_value in (("top", 1), ("bottom", -1)):
-                weights = np.where(
-                    polar_sides == side_value,
-                    1.0,
-                    np.where(polar_sides == 0, 0.5, 0.0),
-                )
-                use = weights > 0.0
-                if np.any(use):
-                    reducers[f"{side_name}_polar"].add(
-                        polar_flat[use], weights[use] * polar_values_frame[use]
-                    )
-                    reducers[f"{side_name}_polar_count"].add(polar_flat[use], weights[use])
-
-        azimuthal_mask = mask & np.asarray(data.azimuthal_valid, dtype=bool)
-        if np.any(azimuthal_mask):
-            azimuthal_flat = (
-                ((ix[azimuthal_mask] * ny + iy[azimuthal_mask]) * nz + iz[azimuthal_mask]) * nd
-                + idist[azimuthal_mask]
-            ).astype(np.int64, copy=False)
-            azimuthal_values_frame = np.asarray(data.cos_azimuthal[azimuthal_mask], dtype=float)
-            reducers["azimuthal"].add(azimuthal_flat, azimuthal_values_frame)
-            reducers["azimuthal_count"].add(azimuthal_flat)
-            azimuthal_sides = np.asarray(data.interface_side, dtype=np.int8)[azimuthal_mask]
-            for side_name, side_value in (("top", 1), ("bottom", -1)):
-                weights = np.where(
-                    azimuthal_sides == side_value,
-                    1.0,
-                    np.where(azimuthal_sides == 0, 0.5, 0.0),
-                )
-                use = weights > 0.0
-                if np.any(use):
-                    reducers[f"{side_name}_azimuthal"].add(
-                        azimuthal_flat[use], weights[use] * azimuthal_values_frame[use]
-                    )
-                    reducers[f"{side_name}_azimuthal_count"].add(azimuthal_flat[use], weights[use])
-
-    flat_indices, entity_sum = reducers["entity"].finish()
-    polar_indices, polar_sum = reducers["polar"].finish()
-    lab_polar_indices, lab_polar_sum = reducers["lab_polar"].finish()
-    polar_count_indices, polar_count = reducers["polar_count"].finish()
-    azimuthal_indices, azimuthal_sum = reducers["azimuthal"].finish()
-    azimuthal_count_indices, azimuthal_count = reducers["azimuthal_count"].finish()
-
-    def side_values(side_name: str) -> tuple[np.ndarray, ...]:
-        entity_idx, entity_value = reducers[f"{side_name}_entity"].finish()
-        polar_idx, polar_value = reducers[f"{side_name}_polar"].finish()
-        polar_count_idx, polar_count_value = reducers[f"{side_name}_polar_count"].finish()
-        az_idx, az_value = reducers[f"{side_name}_azimuthal"].finish()
-        az_count_idx, az_count_value = reducers[f"{side_name}_azimuthal_count"].finish()
-        return (
-            _align_sparse_values(flat_indices, entity_idx, entity_value),
-            _align_sparse_values(flat_indices, polar_idx, polar_value),
-            _align_sparse_values(flat_indices, polar_count_idx, polar_count_value),
-            _align_sparse_values(flat_indices, az_idx, az_value),
-            _align_sparse_values(flat_indices, az_count_idx, az_count_value),
-        )
-
-    top_side = side_values("top")
-    bottom_side = side_values("bottom")
+    chunk_size = frame_batch_size(max((len(d.positions) for d in frame_data), default=1) * 256)
+    workers = stage_workers('orientation.bins', (len(frame_data) + chunk_size - 1) // chunk_size,
+                             bytes_per_task=max(8 * 1024 * 1024,
+                                 max((len(d.positions) for d in frame_data), default=0) * chunk_size * 256))
+    with workspace:
+        for results in bounded_map(prepare_bins, batches(enumerate(frame_data), chunk_size), workers=workers, stage='orientation.bins'):
+            for frame_index, data, rows in results:
+                if density_accumulator is not None:
+                    density_accumulator.update(positions=data.positions, distance_values=data.distances,
+                        masses=np.zeros(len(data.positions)), frame_index=frame_index,
+                        validation_plan=density_validation, interface_side=data.interface_side)
+                if rows is None or not len(rows):
+                    continue
+                all_reducer.add(rows)
+                if moment_reducer is not None:
+                    assert density_accumulator is not None
+                    moment_rows = np.zeros(len(rows), dtype=row_dtype(len(BOTTOM_MOMENT_CHANNELS)))
+                    moment_rows['group'] = density_accumulator.geometry_table[1][frame_index]
+                    moment_rows['bin'] = rows['bin']
+                    moment_rows['values'][:] = rows['values'][:, [12, 13, 14, 15]]
+                    moment_reducer.add(moment_rows[rows['values'][:, 11] > 0])
+        moment_data = None
+        if moment_reducer is not None:
+            assert density_accumulator is not None
+            run = moment_reducer.finish()
+            bins, values, offsets = run.unpack(float, len(density_accumulator.geometry_table[0]))
+            moment_data = (bins.copy(), [value.copy() for value in values], offsets.copy())
+            run.release()
+        run = all_reducer.finish()
+        indices, channels, _offsets = run.unpack(float)
+        flat_indices = indices.astype(np.int64)
+        channel_values = [value.copy() for value in channels]
+        run.release()
+        density_geometry = (None if density_accumulator is None else
+                            density_accumulator.finalize(n_frames=len(frame_data)).geometry_groups)
+        if moment_data is not None:
+            assert density_geometry is not None
+            bins, values, offsets = moment_data
+            for group_id, group in enumerate(density_geometry):
+                start, stop = offsets[group_id:group_id + 2]
+                for name, value in zip(BOTTOM_MOMENT_CHANNELS, values):
+                    group[name] = _align_sparse_values(group["flat_indices"], bins[start:stop], value[start:stop])
+    entity_sum, polar_sum, lab_polar_sum, polar_count, azimuthal_sum, azimuthal_count = channel_values[:6]
+    polar_indices = lab_polar_indices = polar_count_indices = azimuthal_indices = azimuthal_count_indices = flat_indices
+    top_side = tuple(channel_values[6:11])
+    bottom_side = tuple(channel_values[11:16])
 
     return OrientationSparseGrid(
+        density_geometry_groups=density_geometry,
+        density_geometry_version=1 if geometry_frames is not None else None,
+        density_geometry_reason=density_reason,
         x_edges=x_edges,
         y_edges=y_edges,
         z_edges=z_edges,
@@ -1118,6 +1247,7 @@ def _build_orientation_sparse_grid(
     )
 
 
+@analysis_execution
 def compute_orientation_profile(
     frames: Sequence[Atoms],
     *,
@@ -1135,6 +1265,7 @@ def compute_orientation_profile(
     oh_cutoff: float = H2O_OH_CUTOFF_A,
     oh_topology_backend: str = "auto",
     memory_budget_mib: float | None = None,
+    threads: int | None = 1,
 ) -> OrientationProfile:
     """Compute water-orientation profiles from a trajectory."""
     if not frames:
@@ -1207,6 +1338,10 @@ def compute_orientation_profile(
         if surface_reference is not None and surface_reference.uses_distance
         else None
     )
+    symmetric = (
+        active_surface_reference is not None
+        and active_surface_reference.resolved_layout == "symmetric"
+    )
     topology_cache = OHTopologyCache(
         oh_cutoff=oh_cutoff,
         logger=LOGGER,
@@ -1215,10 +1350,24 @@ def compute_orientation_profile(
     )
     n_molecules_per_frame = 0
     frame_data: list[_OrientationFrameData] = []
+    geometry_frames: list[Atoms] = []
+    reference_collector = InterfaceReferenceCollector(active_surface_reference, len(frames))
 
-    with ProgressBar(desc="Computing orientation", total=len(frames), unit="frame") as progress:
-        for frame_idx, frame in enumerate(frames):
-            cached_triplets = topology_cache.select(
+    chunk_size = frame_batch_size(len(frames[0]) * 256)
+    worker_count = stage_workers('orientation.frames', (len(frames) + chunk_size - 1) // chunk_size,
+                                 bytes_per_task=max(8 * 1024 * 1024, len(frames[0]) * chunk_size * 256),
+                                 serial_reason='nearest-surface provider is coordinated'
+                                 if active_surface_reference is not None
+                                 and active_surface_reference.distance_mode == 'nearest-atom' else None)
+    if worker_count > 1:
+        # Any source topology cache creation/publication stays on the coordinator.
+        topology_cache.select(frames[0], frame_index=0)
+
+    def prepare_batch(chunk):
+        local_topology = OHTopologyCache(oh_cutoff=oh_cutoff, backend=oh_topology_backend)
+        result = []
+        for frame_idx, frame in chunk:
+            cached_triplets = local_topology.select(
                 frame,
                 frame_index=frame_idx,
             ).indices_for("mol:H2O")
@@ -1227,10 +1376,7 @@ def compute_orientation_profile(
                 geom = geom._replace(
                     com_positions=wrapped_frame_positions(frame, geom.com_positions)
                 )
-            n_mol = geom.com_positions.shape[0]
-            if frame_idx == 0 or (n_molecules_per_frame == 0 and n_mol > 0):
-                n_molecules_per_frame = n_mol
-            frame_data.append(
+            result.append((frame_idx, frame,
                 _build_orientation_frame_data(
                     geom,
                     axis_index=axis_index,
@@ -1243,8 +1389,19 @@ def compute_orientation_profile(
                     in_plane_ref_vec=in_plane_ref_vec,
                     oh_cutoff=oh_cutoff,
                 )
-            )
-            progress.update()
+            ))
+
+        return result
+
+    with ProgressBar(desc="Computing orientation", total=len(frames), unit="frame") as progress:
+        for results in bounded_map(prepare_batch, batches(enumerate(frames), chunk_size), workers=worker_count, stage='orientation.frames'):
+            for frame_idx, frame, data in results:
+                reference_collector.observe(frame_idx, frame)
+                geometry_frames.append(Atoms(cell=frame.cell, pbc=frame.pbc, celldisp=frame.get_celldisp()))
+                if frame_idx == 0 or (n_molecules_per_frame == 0 and len(data.positions) > 0):
+                    n_molecules_per_frame = len(data.positions)
+                frame_data.append(data)
+                progress.update()
 
     LOGGER.debug(
         "Orientation frame analysis complete: %d frames, %d H2O/frame. "
@@ -1315,17 +1472,8 @@ def compute_orientation_profile(
         active_surface_reference is not None
         and active_surface_reference.resolved_layout == "symmetric"
     ):
-        slab_volumes = np.asarray(
-            [
-                bin_volumes(
-                    frame.cell,
-                    dist_bin_edges,
-                    axis_index,
-                    origin=frame_origin(frame),
-                    shift=0.0 if surface_per_frame is None else float(surface_per_frame[i]),
-                )
-                for i, frame in enumerate(frames)
-            ]
+        slab_volumes = bin_volumes_for_frames(
+            frames, dist_bin_edges, axis_index, shifts=surface_per_frame,
         )
     variable_slab_volume = (
         slab_volumes is not None and slab_volumes.size > 1 and slab_volumes.ndim == 2
@@ -1342,6 +1490,8 @@ def compute_orientation_profile(
         distance_edges=dist_bin_edges,
         bin_width=bin_width,
         cell_lengths=cell_lengths,
+        geometry_frames=geometry_frames, surface_reference=active_surface_reference,
+        surface_estimate=surface_estimate, coordinate_mode=coordinate_mode, surface_axis=axis,
         buffer_limit_bytes=min(
             128 * 1024 * 1024,
             max(1024, resolve_resource_policy(memory_budget_mib).memory_budget_bytes // 4),
@@ -1425,6 +1575,21 @@ def compute_orientation_profile(
             )
             frame_cos_polar_mean = _mean_with_nan(frame_polar_sum, frame_polar_count)
             frame_cos_azimuthal_mean = _mean_with_nan(frame_azimuthal_sum, frame_azimuthal_count)
+            if symmetric:
+                # The stored folded curves are equal side means. Their sample
+                # and block statistics must use that same observable, including
+                # the factor of two in the per-interface number density.
+                frame_density *= 0.5
+                frame_cos_polar_mean = _equal_nan_mean(
+                    *_orientation_side_frame_means(
+                        data, distance_edges=dist_bin_edges, angle="polar"
+                    )
+                )
+                frame_cos_azimuthal_mean = _equal_nan_mean(
+                    *_orientation_side_frame_means(
+                        data, distance_edges=dist_bin_edges, angle="azimuthal"
+                    )
+                )
             sample_density[frame_idx] = frame_density
             sample_cos_polar_mean[frame_idx] = frame_cos_polar_mean
             sample_cos_azimuthal_mean[frame_idx] = frame_cos_azimuthal_mean
@@ -1493,7 +1658,8 @@ def compute_orientation_profile(
         heatmap_polar = 0.5 * (top_heatmap_polar + bottom_heatmap_polar)
         heatmap_azimuthal = 0.5 * (top_heatmap_azimuthal + bottom_heatmap_azimuthal)
     full_bin_edges = np.asarray(
-        (sparse_grid.x_edges, sparse_grid.y_edges, sparse_grid.z_edges)[axis_index],
+        _cartesian_grid_edges_for_orientation(frames=geometry_frames, frame_data=frame_data,
+            bin_width=bin_width, cell_lengths=cell_lengths)[axis_index],
         dtype=float,
     )
     full_bin_centers = 0.5 * (full_bin_edges[:-1] + full_bin_edges[1:])
@@ -1544,6 +1710,36 @@ def compute_orientation_profile(
         ),
     }
 
+    symmetric_statistics = (
+        active_surface_reference is not None
+        and active_surface_reference.resolved_layout == "symmetric"
+    )
+    exact_stats = _orientation_uncertainty_statistics(
+        frame_data, dist_bin_edges, sample_density, symmetric=symmetric_statistics
+    )
+    series_statistics = {
+        key: replace(value, resampling=exact_stats[key].resampling)
+        for key, value in series_statistics.items()
+    }
+    if symmetric_statistics:
+        for prefix, side in (("top", 1), ("bottom", -1)):
+            side_density_samples = _orientation_side_density_samples(
+                frame_data,
+                dist_bin_edges,
+                side=side,
+                volumes=slab_volume_per_frame,
+                bin_width=bin_width,
+            )
+            side_stats = _orientation_uncertainty_statistics(
+                frame_data,
+                dist_bin_edges,
+                side_density_samples,
+                side=side,
+            )
+            series_statistics.update(
+                {f"{prefix}_{key}": value for key, value in side_stats.items()}
+            )
+
     return OrientationProfile(
         axis=axis,
         reference_axis=reference_axis,
@@ -1592,6 +1788,7 @@ def compute_orientation_profile(
         cell_lengths_angstrom=cell_lengths,
         series_statistics=series_statistics,
         sparse_grid=sparse_grid,
+        interface_reference=reference_collector.finish(),
     )
 
 
@@ -1627,11 +1824,27 @@ def _orientation_profile_hdf5_payload(
             )
         ),
     }
+    metadata_payload.update(alignment_metadata(profile.interface_reference))
+    from .orientation_spatial import ALIGNMENT_VERSION, BOTTOM_MOMENT_CHANNELS
+    groups = None if profile.sparse_grid is None else profile.sparse_grid.density_geometry_groups
+    if groups and all(name in group for group in groups for name in BOTTOM_MOMENT_CHANNELS):
+        assert profile.sparse_grid is not None
+        metadata_payload["orientation_alignment_version"] = ALIGNMENT_VERSION
+        metadata_payload["orientation_spatial_grid_resolution_A"] = [float(edge[1] - edge[0])
+            for edge in (profile.sparse_grid.x_edges, profile.sparse_grid.y_edges, profile.sparse_grid.z_edges)]
     if profile.sparse_grid is not None:
         metadata_payload["orientation_grid_kind"] = "orientation_grid_sparse"
         metadata_payload["orientation_grid_shape"] = [
             int(value) for value in profile.sparse_grid.shape
         ]
+    if profile.sparse_grid is not None:
+        metadata_payload["orientation_spatial_axis_ranges_A"] = {
+            axis: [float(edges[0]), float(edges[-1])]
+            for axis, edges in (("x", profile.sparse_grid.x_edges), ("y", profile.sparse_grid.y_edges),
+                                ("z", profile.sparse_grid.z_edges), ("distance", profile.sparse_grid.distance_edges))
+        }
+        metadata_payload["orientation_spatial_density_version"] = profile.sparse_grid.density_geometry_version
+        metadata_payload["orientation_spatial_density_reason"] = profile.sparse_grid.density_geometry_reason
     if profile.series_statistics:
         block_resolution = resolve_block_slices(int(profile.n_frames))
         block_lengths = None if block_resolution is None else block_resolution[1]
@@ -1758,9 +1971,13 @@ def _orientation_profile_hdf5_payload(
             else {f"full_{name}": stats for name, stats in profile.full_series_statistics.items()}
         ),
     }
-    return {"datasets": datasets, "metadata": metadata}
+    from .orientation_spatial import density_geometry_datasets
+
+    datasets.update(density_geometry_datasets(profile.sparse_grid))
+    return {"datasets": datasets, "metadata": metadata, "interface_reference": profile.interface_reference}
 
 
+@timed_stage("writing")
 def save_orientation_profile(
     profile: OrientationProfile,
     output: str | Path,
@@ -1777,6 +1994,7 @@ def save_orientation_profile(
         output,
         analysis=_ANALYSIS_NAME,
         datasets=payload["datasets"],
+        interface_references=[profile.interface_reference],
         metadata=metadata,
         compression_profile=compression_profile,
     )
@@ -1793,6 +2011,7 @@ def _build_orientation_profile_from_hdf5(
     metadata: dict[str, Any],
     *,
     allow_partial: bool = False,
+    source_path: str | Path | None = None,
 ) -> OrientationProfile:
     def _get(name: str) -> np.ndarray:
         arr = datasets.get(name)
@@ -1837,6 +2056,16 @@ def _build_orientation_profile_from_hdf5(
     series_statistics = statistics_series_map_from_datasets(
         datasets,
         dataset_names=(
+            "top_cos_polar_mean",
+            "bottom_cos_polar_mean",
+            "top_cos_azimuthal_mean",
+            "bottom_cos_azimuthal_mean",
+            "top_density",
+            "bottom_density",
+            "top_cos_polar_density",
+            "bottom_cos_polar_density",
+            "top_cos_azimuthal_density",
+            "bottom_cos_azimuthal_density",
             "cos_polar_mean",
             "cos_azimuthal_mean",
             "density",
@@ -1895,7 +2124,12 @@ def _build_orientation_profile_from_hdf5(
             if len(shape_values) != 4:
                 raise ValueError("orientation_grid_shape must contain four dimensions.")
             shape = tuple(shape_values)  # type: ignore[assignment]
+        from .orientation_spatial import load_density_geometry
+
         sparse_grid = OrientationSparseGrid(
+            density_geometry_groups=load_density_geometry(datasets, metadata),
+            density_geometry_version=metadata.get("orientation_spatial_density_version"),
+            density_geometry_reason=str(metadata.get("orientation_spatial_density_reason") or ""),
             x_edges=np.asarray(datasets["grid_x_edges_A"], dtype=float),
             y_edges=np.asarray(datasets["grid_y_edges_A"], dtype=float),
             z_edges=np.asarray(datasets["grid_z_edges_A"], dtype=float),
@@ -2060,6 +2294,7 @@ def _build_orientation_profile_from_hdf5(
         cell_lengths_angstrom=cell_lengths,
         series_statistics=series_statistics,
         sparse_grid=sparse_grid,
+        interface_reference=None if source_path is None else InterfaceReference.from_metadata(metadata, source_path),
     )
 
 
@@ -2079,7 +2314,7 @@ def load_orientation_profiles(path: str | Path) -> list[OrientationProfile]:
         label="Orientation",
     )
     return [
-        _build_orientation_profile_from_hdf5(datasets, metadata)
+        _build_orientation_profile_from_hdf5(datasets, metadata, source_path=_source_path)
         for datasets, metadata in raw_profiles
     ]
 
@@ -2103,6 +2338,7 @@ def load_orientation_profiles_by_index(
             datasets,
             metadata,
             allow_partial=dataset_names is not None,
+            source_path=_source_path,
         )
         for datasets, metadata in raw
     ]
@@ -2222,12 +2458,15 @@ def orientation_sparse_grid_to_line(
     x_axis: str = "distance",
     angle: str = "polar",
     filters: Mapping[str, tuple[float | None, float | None] | None] | None = None,
+    interface_alignments: Mapping[str, Any] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Derive a filtered 1D orientation line from a sparse orientation grid.
 
     Returns ``(x_edges, x_centers, y_values)``. Data ranges are selection filters, not
     axis-limit controls; excluded bins remain present with ``NaN`` values.
     """
+    from .orientation_spatial import aligned_orientation_profile
+    profile = aligned_orientation_profile(profile, (str(x_axis).strip().lower(),), filters, interface_alignments)
     grid = profile.sparse_grid
     if grid is None:
         raise ValueError(
@@ -2243,22 +2482,11 @@ def orientation_sparse_grid_to_line(
         filters=filters,
         indices_by_axis=indices_by_axis,
     )
-    value_sum, value_count = _orientation_grid_sum_and_count(grid, angle)
     axis_indices = indices_by_axis[normalized_x_axis]
     n_bins = x_edges.size - 1
-    out_sum = np.zeros(n_bins, dtype=float)
-    out_count = np.zeros(n_bins, dtype=float)
-    if np.any(mask):
-        out_sum += np.bincount(
-            axis_indices[mask],
-            weights=value_sum[mask],
-            minlength=n_bins,
-        )
-        out_count += np.bincount(
-            axis_indices[mask],
-            weights=value_count[mask],
-            minlength=n_bins,
-        )
+    out_sum, out_count = _project_orientation_grid_moments(
+        profile, angle=angle, mask=mask, indices=axis_indices, size=n_bins
+    )
     y_values = np.full(n_bins, np.nan, dtype=float)
     valid = out_count > 0.0
     y_values[valid] = out_sum[valid] / out_count[valid]
@@ -2272,19 +2500,18 @@ def orientation_sparse_grid_to_heatmap(
     y_axis: str = "y",
     angle: str = "polar",
     filters: Mapping[str, tuple[float | None, float | None] | None] | None = None,
+    interface_alignments: Mapping[str, Any] | None = None,
+    quantity: str = "average",
+    x_bin_width: float | None = None,
+    y_bin_width: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Derive a filtered 2D orientation heatmap from a sparse orientation grid."""
-    x_edges, y_edges, out_sum, out_count = _orientation_sparse_grid_to_heatmap_accumulators(
-        profile,
-        x_axis=x_axis,
-        y_axis=y_axis,
-        angle=angle,
-        filters=filters,
-    )
-    heatmap = np.full(out_sum.shape, np.nan, dtype=float)
-    valid = out_count > 0.0
-    heatmap[valid] = out_sum[valid] / out_count[valid]
-    return x_edges, y_edges, heatmap
+    from .orientation_spatial import spatial_orientation_map
+
+    result = spatial_orientation_map([profile], x_axis=x_axis, y_axis=y_axis, angle=angle,
+        quantity=quantity, filters=filters, x_bin_width=x_bin_width, y_bin_width=y_bin_width,
+        interface_alignments=interface_alignments)
+    return result.x_edges, result.y_edges, result.values
 
 
 def _orientation_sparse_grid_to_heatmap_accumulators(
@@ -2314,24 +2541,57 @@ def _orientation_sparse_grid_to_heatmap_accumulators(
         filters=filters,
         indices_by_axis=indices_by_axis,
     )
-    value_sum, value_count = _orientation_grid_sum_and_count(grid, angle)
     x_indices = indices_by_axis[normalized_x_axis]
     y_indices = indices_by_axis[normalized_y_axis]
     nx = x_edges.size - 1
     ny = y_edges.size - 1
-    out_sum = np.zeros((nx, ny), dtype=float)
-    out_count = np.zeros((nx, ny), dtype=float)
-    if np.any(mask):
-        flat_2d = x_indices[mask] * ny + y_indices[mask]
-        out_sum_flat = np.bincount(flat_2d, weights=value_sum[mask], minlength=nx * ny)
-        out_count_flat = np.bincount(
-            flat_2d,
-            weights=value_count[mask],
-            minlength=nx * ny,
+    out_sum, out_count = _project_orientation_grid_moments(
+        profile, angle=angle, mask=mask, indices=x_indices * ny + y_indices, size=nx * ny
+    )
+    return x_edges, y_edges, out_sum.reshape(nx, ny), out_count.reshape(nx, ny)
+
+
+def _project_orientation_grid_moments(
+    profile: OrientationProfile,
+    *,
+    angle: str,
+    mask: np.ndarray,
+    indices: np.ndarray,
+    size: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Project molecule moments, averaging symmetric sides after projection."""
+    grid = profile.sparse_grid
+    assert grid is not None
+
+    def project(sums: np.ndarray, counts: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        return (
+            np.bincount(indices[mask], weights=np.asarray(sums)[mask], minlength=size),
+            np.bincount(indices[mask], weights=np.asarray(counts)[mask], minlength=size),
         )
-        out_sum = out_sum_flat.reshape(nx, ny)
-        out_count = out_count_flat.reshape(nx, ny)
-    return x_edges, y_edges, out_sum, out_count
+
+    value_sum, value_count = _orientation_grid_sum_and_count(grid, angle)
+    if not (
+        profile.coordinate_mode == "distance"
+        and profile.surface_reference is not None
+        and profile.surface_reference.resolved_layout == "symmetric"
+    ):
+        return project(value_sum, value_count)
+
+    out_sum = np.zeros(size, dtype=float)
+    out_count = np.zeros(size, dtype=float)
+    for side in ("top", "bottom"):
+        side_sum = getattr(grid, f"{side}_cos_{angle}_sum")
+        side_count = getattr(grid, f"{side}_count_{angle}_valid")
+        if side_sum is None or side_count is None:
+            raise ValueError(
+                "Symmetric orientation projections require top/bottom grid accumulators. "
+                "Recompute the orientation analysis."
+            )
+        sums, counts = project(side_sum, side_count)
+        valid = counts > 0
+        out_sum[valid] += sums[valid] / counts[valid]
+        out_count[valid] += 1
+    return out_sum, out_count
 
 
 def _orientation_grid_filters_from_plot_kwargs(
@@ -2494,6 +2754,7 @@ def _orientation_profile_for_interface_view(
             heatmap_polar=full_polar_heatmap,
             heatmap_azimuthal=full_azimuthal_heatmap,
             coordinate_mode="axis",
+            spatial_interface_view="full",
             series_statistics=profile.full_series_statistics,
             sparse_grid=full_grid,
         )
@@ -2534,6 +2795,7 @@ def _orientation_profile_for_interface_view(
             )
     return replace(
         profile,
+        spatial_interface_view=view,
         cos_polar_mean=polar_values,
         cos_azimuthal_mean=azimuthal_values,
         density=density_values,
@@ -2541,7 +2803,18 @@ def _orientation_profile_for_interface_view(
         cos_azimuthal_density=azimuthal_values * density_values,
         heatmap_polar=np.asarray(polar_heatmap, dtype=float),
         heatmap_azimuthal=np.asarray(azimuthal_heatmap, dtype=float),
-        series_statistics=None,
+        surface_reference=(
+            None
+            if profile.surface_reference is None
+            else replace(profile.surface_reference, resolved_layout="single-top" if prefix == "top" else "single-bottom")
+        ),
+        series_statistics=None
+        if profile.series_statistics is None
+        else {
+            name.removeprefix(prefix + "_"): stats
+            for name, stats in profile.series_statistics.items()
+            if name.startswith(prefix + "_")
+        },
         sparse_grid=side_grid,
     )
 
@@ -2558,6 +2831,7 @@ def plot_orientation_profile(
     component: str = "average",
     angle: str = "polar",
     interface_view: str = "folded",
+    interface_alignments: Mapping[str, Any] | None = None,
     title: str | None = None,
     x_label: str | None = None,
     y_label: str | None = None,
@@ -2605,6 +2879,8 @@ def plot_orientation_profile(
     orientation_line_x_axis: str | None = None,
     orientation_heatmap_x_axis: str | None = None,
     orientation_heatmap_y_axis: str | None = None,
+    orientation_heatmap_kind: str | None = None,
+    orientation_heatmap_quantity: str | None = None,
     orientation_grid_filters: Mapping[str, tuple[float | None, float | None] | None] | None = None,
     orientation_filter_x_min: float | None = None,
     orientation_filter_x_max: float | None = None,
@@ -2656,6 +2932,7 @@ def plot_orientation_profile(
         line_x_axis=orientation_line_x_axis,
         heatmap_x_axis=orientation_heatmap_x_axis,
         heatmap_y_axis=orientation_heatmap_y_axis,
+        heatmap_kind=orientation_heatmap_kind, heatmap_quantity=orientation_heatmap_quantity,
     )
     norm_component = _normalize_component_token(resolved_mapping.component)
     norm_angle = _normalize_angle_token(resolved_mapping.angle)
@@ -2666,12 +2943,15 @@ def plot_orientation_profile(
     )
 
     if resolved_mapping.is_heatmap:
-        heatmap_axes_are_explicit = (
+        heatmap_kind_value = orientation_heatmap_kind or resolved_mapping.renderer_options.get("orientation_heatmap_kind")
+        resolved_heatmap_kind = None if heatmap_kind_value is None else str(heatmap_kind_value)
+        resolved_heatmap_quantity = str(orientation_heatmap_quantity or resolved_mapping.renderer_options.get("orientation_heatmap_quantity") or "average")
+        heatmap_axes_are_explicit = resolved_heatmap_kind == "spatial" or (resolved_heatmap_kind != "distribution" and (
             orientation_heatmap_x_axis is not None
             or orientation_heatmap_y_axis is not None
             or "orientation_heatmap_x_axis" in resolved_mapping.mapping.fixed_values
             or "orientation_heatmap_y_axis" in resolved_mapping.mapping.fixed_values
-        )
+        ))
         resolved_heatmap_x_axis = str(
             orientation_heatmap_x_axis
             or (
@@ -2693,6 +2973,9 @@ def plot_orientation_profile(
         return _plot_orientation_heatmap(
             [profile],
             angle=norm_angle,
+            orientation_heatmap_kind=resolved_heatmap_kind,
+            orientation_heatmap_quantity=resolved_heatmap_quantity,
+            interface_alignments=interface_alignments,
             output=output,
             show=show,
             show_blocking=show_blocking,
@@ -2798,6 +3081,8 @@ def plot_orientation_profile(
                 "Orientation 1D Line data ranges currently support Mean orientation only. "
                 "Choose Mean orientation or clear orientation data ranges."
             )
+        from .orientation_spatial import aligned_orientation_profile
+        profile = aligned_orientation_profile(profile, (grid_x_axis,), grid_filters, interface_alignments)
         _x_edges, x, y = orientation_sparse_grid_to_line(
             profile,
             x_axis=grid_x_axis,
@@ -2881,6 +3166,8 @@ def plot_orientation_profile(
     )
     if capture_state is not None and grid_line_state is not None:
         capture_state.update(grid_line_state)
+        from .orientation_spatial import alignment_records
+        capture_state["interface_alignments"] = alignment_records([profile])
     return result
 
 
@@ -2896,6 +3183,7 @@ def plot_orientation_profiles(
     component: str = "average",
     angle: str = "polar",
     interface_view: str = "folded",
+    interface_alignments: Mapping[str, Any] | None = None,
     title: str | None = None,
     x_label: str | None = None,
     y_label: str | None = None,
@@ -2946,6 +3234,8 @@ def plot_orientation_profiles(
     orientation_line_x_axis: str | None = None,
     orientation_heatmap_x_axis: str | None = None,
     orientation_heatmap_y_axis: str | None = None,
+    orientation_heatmap_kind: str | None = None,
+    orientation_heatmap_quantity: str | None = None,
     orientation_grid_filters: Mapping[str, tuple[float | None, float | None] | None] | None = None,
     orientation_filter_x_min: float | None = None,
     orientation_filter_x_max: float | None = None,
@@ -2988,6 +3278,30 @@ def plot_orientation_profiles(
         raise ValueError("interface_view must be full, folded, top, bottom, or all.")
     profile_view_names: list[str | None]
     if normalized_interface_view == "all":
+        source_count = len(profiles)
+        view_tokens = ("folded", "top", "bottom")
+        view_labels = (
+            "Combined interfaces (folded mean)",
+            "Positive-axis interface",
+            "Negative-axis interface",
+        )
+
+        def expand_source_values(values: list[Any] | None) -> list[Any] | None:
+            if values is None or len(values) != source_count:
+                return values
+            return [value for value in values for _view in view_tokens]
+
+        base_ids = (
+            [str(value) for value in series_ids]
+            if series_ids is not None and len(series_ids) == source_count
+            else [
+                str(descriptor.get("series_id") or f"orientation:{index}")
+                for index, descriptor in enumerate(render_series_descriptors)
+            ]
+            if render_series_descriptors is not None
+            and len(render_series_descriptors) == source_count
+            else None
+        )
         expanded_profiles: list[OrientationProfile] = []
         expanded_views: list[str | None] = []
         for profile in profiles:
@@ -3003,6 +3317,70 @@ def plot_orientation_profiles(
                 )
         profiles = expanded_profiles
         profile_view_names = expanded_views
+        if series_labels is not None and len(series_labels) == source_count:
+            series_labels = [
+                f"{label} ({view_label})" for label in series_labels for view_label in view_labels
+            ]
+        if base_ids is not None:
+            series_ids = [
+                f"{series_id}::interface:{view}" for series_id in base_ids for view in view_tokens
+            ]
+        line_colors = expand_source_values(line_colors)
+        series_enabled = expand_source_values(series_enabled)
+        series_show_in_legend = expand_source_values(series_show_in_legend)
+        series_line_widths = expand_source_values(series_line_widths)
+        series_markers = expand_source_values(series_markers)
+        series_fit_configs = expand_source_values(series_fit_configs)
+        series_cumulative_configs = expand_source_values(series_cumulative_configs)
+        series_error_configs = expand_source_values(series_error_configs)
+        series_normalization_modes = expand_source_values(series_normalization_modes)
+        series_normalization_values = expand_source_values(series_normalization_values)
+        series_normalization_x_refs = expand_source_values(series_normalization_x_refs)
+        if series_line_kwargs is None or len(series_line_kwargs) == source_count:
+            series_line_kwargs = [
+                {**dict(value or {}), "linestyle": style}
+                for value in (series_line_kwargs or [None] * source_count)
+                for style in ("-", "--", ":")
+            ]
+        render_ids = []
+        if render_series_descriptors is not None:
+            expanded_descriptors = []
+            for index, descriptor in enumerate(render_series_descriptors):
+                layer_id = str(descriptor.get("series_id") or f"orientation:{index}")
+                source_id = str(descriptor.get("source_series_id") or layer_id)
+                render_ids.append(layer_id)
+                for view, label in zip(view_tokens, view_labels):
+                    expanded_descriptors.append(
+                        {
+                            **descriptor,
+                            "series_id": f"{layer_id}::interface:{view}",
+                            "source_series_id": f"{source_id}::interface:{view}",
+                            "parent_series_id": layer_id,
+                            "interface_view": view,
+                            "default_label": f"{descriptor.get('default_label') or f'Series {index + 1}'} ({label})",
+                        }
+                    )
+            render_series_descriptors = expanded_descriptors
+        if series_overrides_by_id is not None and base_ids is not None:
+            expanded_overrides = dict(series_overrides_by_id)
+            for source_id in dict.fromkeys([*base_ids, *render_ids]):
+                source_override = series_overrides_by_id.get(source_id)
+                if not isinstance(source_override, dict):
+                    continue
+                for view, label, line_style in zip(view_tokens, view_labels, ("-", "--", ":")):
+                    override = dict(source_override)
+                    override["line_kwargs"] = {
+                        **dict(override.get("line_kwargs") or {}),
+                        "linestyle": line_style,
+                    }
+                    if str(override.get("label_override") or "").strip():
+                        override["label_override"] = f"{override['label_override']} ({label})"
+                    key = f"{source_id}::interface:{view}"
+                    expanded_overrides[key] = {
+                        **override,
+                        **dict(expanded_overrides.get(key) or {}),
+                    }
+            series_overrides_by_id = expanded_overrides
     else:
         profiles = [
             _orientation_profile_for_interface_view(profile, normalized_interface_view)
@@ -3023,7 +3401,10 @@ def plot_orientation_profiles(
     """Plot one or more orientation profiles overlaid."""
     if not profiles:
         raise ValueError("At least one orientation profile is required.")
-    first_profile = profiles[0]
+    from .orientation_spatial import enabled_source_mask
+    source_mask = enabled_source_mask(len(profiles), series_enabled=series_enabled, series_ids=series_ids,
+        render_series_descriptors=render_series_descriptors, series_overrides_by_id=series_overrides_by_id)
+    first_profile = next((profile for profile, enabled in zip(profiles, source_mask) if enabled), profiles[0])
     resolved_mapping = resolve_orientation_plot_mapping(
         contract=data_contract,
         profile=first_profile,
@@ -3033,6 +3414,7 @@ def plot_orientation_profiles(
         line_x_axis=orientation_line_x_axis,
         heatmap_x_axis=orientation_heatmap_x_axis,
         heatmap_y_axis=orientation_heatmap_y_axis,
+        heatmap_kind=orientation_heatmap_kind, heatmap_quantity=orientation_heatmap_quantity,
     )
     norm_component = _normalize_component_token(resolved_mapping.component)
     norm_angle = _normalize_angle_token(resolved_mapping.angle)
@@ -3048,12 +3430,15 @@ def plot_orientation_profiles(
                 "interface_view='all' is only available for orientation line plots; "
                 "select full, folded, top, or bottom for heatmaps."
             )
-        heatmap_axes_are_explicit = (
+        heatmap_kind_value = orientation_heatmap_kind or resolved_mapping.renderer_options.get("orientation_heatmap_kind")
+        resolved_heatmap_kind = None if heatmap_kind_value is None else str(heatmap_kind_value)
+        resolved_heatmap_quantity = str(orientation_heatmap_quantity or resolved_mapping.renderer_options.get("orientation_heatmap_quantity") or "average")
+        heatmap_axes_are_explicit = resolved_heatmap_kind == "spatial" or (resolved_heatmap_kind != "distribution" and (
             orientation_heatmap_x_axis is not None
             or orientation_heatmap_y_axis is not None
             or "orientation_heatmap_x_axis" in resolved_mapping.mapping.fixed_values
             or "orientation_heatmap_y_axis" in resolved_mapping.mapping.fixed_values
-        )
+        ))
         resolved_heatmap_x_axis = str(
             orientation_heatmap_x_axis
             or (
@@ -3072,9 +3457,19 @@ def plot_orientation_profiles(
             )
             or "y"
         )
+        spatial_requested = resolved_heatmap_kind == "spatial" or (
+            resolved_heatmap_kind != "distribution" and heatmap_axes_are_explicit)
+        heatmap_profiles = profiles
+        if spatial_requested:
+            heatmap_profiles = [profile for profile, enabled in zip(profiles, source_mask) if enabled]
+            if not heatmap_profiles:
+                raise ValueError("No orientation sources are enabled for the spatial map.")
         return _plot_orientation_heatmap(
-            profiles,
+            heatmap_profiles,
             angle=norm_angle,
+            orientation_heatmap_kind=resolved_heatmap_kind,
+            orientation_heatmap_quantity=resolved_heatmap_quantity,
+            interface_alignments=interface_alignments,
             output=output,
             show=show,
             show_blocking=show_blocking,
@@ -3192,6 +3587,9 @@ def plot_orientation_profiles(
             "orientation_grid_x_axis": grid_x_axis,
             "orientation_grid_filters": dict(grid_filters),
         }
+    if use_grid_line:
+        from .orientation_spatial import aligned_orientation_profile
+        profiles = [aligned_orientation_profile(p, (grid_x_axis,), grid_filters, interface_alignments) for p in profiles]
     for i, (profile, view_name) in enumerate(zip(profiles, profile_view_names)):
         if use_grid_line:
             _x_edges, x, y = orientation_sparse_grid_to_line(
@@ -3280,6 +3678,8 @@ def plot_orientation_profiles(
     )
     if capture_state is not None and grid_line_state is not None:
         capture_state.update(grid_line_state)
+        from .orientation_spatial import alignment_records
+        capture_state["interface_alignments"] = alignment_records(profiles)
     return result
 
 
@@ -3573,6 +3973,9 @@ def _plot_orientation_heatmap(
     profiles: list[OrientationProfile],
     *,
     angle: str,
+    orientation_heatmap_kind: str | None,
+    orientation_heatmap_quantity: str,
+    interface_alignments: Mapping[str, Any] | None,
     output: str | Path | None,
     show: bool,
     show_blocking: bool,
@@ -3651,11 +4054,13 @@ def _plot_orientation_heatmap(
         orientation_filter_distance_min=orientation_filter_distance_min,
         orientation_filter_distance_max=orientation_filter_distance_max,
     )
-    use_sparse_grid = (
+    if orientation_heatmap_kind not in {None, "distribution", "spatial"}:
+        raise ValueError("Orientation heatmap kind must be distribution or spatial.")
+    use_sparse_grid = orientation_heatmap_kind == "spatial" or (orientation_heatmap_kind != "distribution" and (
         orientation_heatmap_x_axis is not None
         or orientation_heatmap_y_axis is not None
         or bool(grid_filters)
-    )
+    ))
 
     if use_sparse_grid:
         if value_mode != "raw_counts":
@@ -3668,84 +4073,14 @@ def _plot_orientation_heatmap(
         if x_axis == y_axis:
             raise ValueError("Orientation 2D Heatmap axes must be different.")
 
-        ref = profiles[0]
-        x_edges, y_edges, heatmap_sum, heatmap_count = (
-            _orientation_sparse_grid_to_heatmap_accumulators(
-                ref,
-                x_axis=x_axis,
-                y_axis=y_axis,
-                angle=angle,
-                filters=grid_filters,
-            )
-        )
-        for profile in profiles[1:]:
-            extra_x_edges, extra_y_edges, extra_sum, extra_count = (
-                _orientation_sparse_grid_to_heatmap_accumulators(
-                    profile,
-                    x_axis=x_axis,
-                    y_axis=y_axis,
-                    angle=angle,
-                    filters=grid_filters,
-                )
-            )
-            if (
-                extra_sum.shape != heatmap_sum.shape
-                or extra_x_edges.shape != x_edges.shape
-                or extra_y_edges.shape != y_edges.shape
-                or not np.allclose(extra_x_edges, x_edges)
-                or not np.allclose(extra_y_edges, y_edges)
-            ):
-                raise ValueError(
-                    "Orientation sparse-grid heatmaps require compatible grid edges across "
-                    "all enabled profiles."
-                )
-            heatmap_sum += extra_sum
-            heatmap_count += extra_count
+        from .orientation_spatial import spatial_orientation_map
 
-        original_x_edges = np.asarray(x_edges, dtype=float)
-        original_y_edges = np.asarray(y_edges, dtype=float)
-        if x_bin_width is not None and x_bin_width > 0:
-            heatmap_sum, x_edges = _rebin_heatmap_axis(
-                heatmap_sum,
-                original_x_edges,
-                x_bin_width,
-                axis=0,
-                reducer="sum",
-            )
-            heatmap_count, _ = _rebin_heatmap_axis(
-                heatmap_count,
-                original_x_edges,
-                x_bin_width,
-                axis=0,
-                reducer="sum",
-            )
-        if y_bin_width is not None and y_bin_width > 0:
-            heatmap_sum, y_edges = _rebin_heatmap_axis(
-                heatmap_sum,
-                original_y_edges,
-                y_bin_width,
-                axis=1,
-                reducer="sum",
-            )
-            heatmap_count, _ = _rebin_heatmap_axis(
-                heatmap_count,
-                original_y_edges,
-                y_bin_width,
-                axis=1,
-                reducer="sum",
-            )
-
-        heatmap_plot = np.full(heatmap_sum.shape, np.nan, dtype=float)
-        valid = heatmap_count > 0.0
-        heatmap_plot[valid] = heatmap_sum[valid] / heatmap_count[valid]
-
-        angle_symbol = "\u03b8" if angle == "polar" else "\u03c6"
-        default_title = f"H2O orientation 2D Heatmap ({angle})"
-        resolved_colorbar_label = (
-            heatmap_colorbar_label
-            if heatmap_colorbar_label is not None
-            else f"Mean cos({angle_symbol})"
-        )
+        spatial = spatial_orientation_map(profiles, x_axis=x_axis, y_axis=y_axis, angle=angle,
+            quantity=orientation_heatmap_quantity, filters=grid_filters,
+            x_bin_width=x_bin_width, y_bin_width=y_bin_width, interface_alignments=interface_alignments)
+        x_edges, y_edges, heatmap_plot = spatial.x_edges, spatial.y_edges, spatial.values
+        default_title = f"H2O spatial {orientation_heatmap_quantity} ({angle})"
+        resolved_colorbar_label = heatmap_colorbar_label if heatmap_colorbar_label is not None else spatial.colorbar_label
         return plot_heatmap_series(
             x_edges,
             y_edges,
@@ -3801,17 +4136,29 @@ def _plot_orientation_heatmap(
             annotations=annotations,
             capture_state_extra={
                 "orientation_grid_heatmap": True,
+                "interface_alignments": spatial.alignments,
+                "orientation_heatmap_kind": "spatial",
+                "orientation_heatmap_quantity": spatial.quantity,
+                "orientation_spatial_normalization": {
+                    "method": spatial.normalization,
+                    "source_frames": [int(profile.n_frames) for profile in profiles],
+                    "source_geometry_counts": [len(profile.sparse_grid.density_geometry_groups or [])
+                                               for profile in profiles if profile.sparse_grid is not None],
+                    "geometry_versions": [profile.sparse_grid.density_geometry_version
+                                          for profile in profiles if profile.sparse_grid is not None],
+                    "source_bins_merged_before_normalization": True,
+                },
+                "orientation_interface_view": profiles[0].spatial_interface_view,
                 "orientation_grid_x_axis": x_axis,
                 "orientation_grid_y_axis": y_axis,
                 "orientation_grid_filters": dict(grid_filters),
-                "heatmap_value_mode": "mean_orientation",
-                "heatmap_value_units": "1",
+                "heatmap_value_mode": "mean_orientation" if spatial.quantity == "average" else spatial.quantity,
+                "heatmap_value_units": spatial.units,
                 "heatmap_value_summary": (
-                    "Mean orientation values; no frequency transformation was applied."
+                    spatial.normalization
                 ),
                 "heatmap_value_pipeline": (
-                    "Raw observations \u2192 combine sources \u2192 filter \u2192 "
-                    "weighted-mean rebin \u2192 color mapping"
+                    "Raw moments and geometry → filter/rebin → combine sources → derive quantity → color mapping"
                 ),
                 "heatmap_value_modes_supported": [],
                 "heatmap_bulk_reference": None,

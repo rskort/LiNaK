@@ -2,6 +2,12 @@
 
 from __future__ import annotations
 
+from ._cli_bootstrap import NATIVE_THREAD_ENV_CONFIGURATION as _NATIVE_THREAD_ENV_CONFIGURATION
+
+from .parallel import computation, timed_stage
+
+from time import perf_counter
+
 from .cell_geometry import (
     cached_frame_geometry_matches,
     cartesian_bounds,
@@ -37,19 +43,29 @@ import shlex
 import sys
 import tempfile
 import textwrap
-from time import perf_counter
 from typing import Any, Callable, TYPE_CHECKING
 
 from . import __version__
-from .runtime_threads import configure_native_thread_env
+from .plot.setting_keys import (
+    PLOT_SETTINGS_DENSITY_KEYS as _PLOT_SETTINGS_DENSITY_KEYS,
+    PLOT_SETTINGS_TEMPERATURE_KEYS as _PLOT_SETTINGS_TEMPERATURE_KEYS,
+    PLOT_SETTINGS_RDF_KEYS as _PLOT_SETTINGS_RDF_KEYS,
+    PLOT_SETTINGS_POSITION_KEYS as _PLOT_SETTINGS_POSITION_KEYS,
+    PLOT_SETTINGS_COORDINATION_KEYS as _PLOT_SETTINGS_COORDINATION_KEYS,
+    PLOT_SETTINGS_POTENTIAL_KEYS as _PLOT_SETTINGS_POTENTIAL_KEYS,
+    PLOT_SETTINGS_ORIENTATION_KEYS as _PLOT_SETTINGS_ORIENTATION_KEYS,
+    PLOT_SETTINGS_TABLE_KEYS as _PLOT_SETTINGS_TABLE_KEYS,
+    copy_settings,
+)
+from .plot.gui_session import (
+    PlotGuiSession, capture_session, prepare_session, preparing_session, report_progress,
+)
 from .plot.settings_validation import validate_current_plot_settings, validate_source_descriptor
 from .plot.profile_loading import (
     read_analysis_profile_payloads,
     read_analysis_profile_payloads_by_source,
     read_analysis_profile_headers_by_source,
 )
-
-_NATIVE_THREAD_ENV_CONFIGURATION = configure_native_thread_env()
 
 np = importlib.import_module("numpy")
 
@@ -852,207 +868,7 @@ _PERSISTED_PLOT_SETTING_OPTION_FLAGS = {
     "time_section_width": ("--time-section-width",),
 }
 
-_PLOT_SETTINGS_COMMON_KEYS = (
-    "title",
-    "title_visible",
-    "x_label",
-    "y_label",
-    "x_scale",
-    "x_axis_scale",
-    "x_axis_offset",
-    "y_scale",
-    "x_lim",
-    "y_lim",
-    "x_ticks",
-    "y_ticks",
-    "x_tick_rotation",
-    "y_tick_rotation",
-    "x_label_pad",
-    "y_label_pad",
-    "series_labels",
-    "series_order",
-    "series_descriptors",
-    "series_overrides",
-    "series_enabled",
-    "series_show_in_legend",
-    "series_alpha",
-    "series_line_widths",
-    "series_markers",
-    "series_normalization_modes",
-    "series_normalization_values",
-    "series_normalization_x_refs",
-    "annotations",
-    "integration_config",
-    "x_bin_width",
-    "x_bin_reducer",
-    "min_bin_points",
-    "matplotlib_rc",
-    "figure_kwargs",
-    "axes_kwargs",
-    "line_kwargs",
-    "series_line_kwargs",
-    "grid_kwargs",
-    "legend_kwargs",
-    "tick_params_kwargs",
-    "tight_layout_kwargs",
-    "savefig_kwargs",
-    "legend",
-    "legend_title",
-    "legend_loc",
-    "ticks",
-    "markers",
-    "figsize",
-    "dpi",
-    "font_family",
-    "font_color",
-    "font_size",
-    "title_font_size",
-    "title_pad",
-    "label_font_size",
-    "x_label_font_size",
-    "y_label_font_size",
-    "tick_font_size",
-    "x_tick_font_size",
-    "y_tick_font_size",
-    "legend_font_size",
-    "figure_alpha",
-    "line_width",
-    "line_color",
-    "line_colors",
-    "border",
-    "grid",
-    "grid_linestyle",
-    "grid_linewidth",
-    "grid_alpha",
-    "plot_data_format",
-    "plot_data_delimiter",
-    "plot_data_include_metadata",
-    "plot_data_enabled_only",
-    "_gui_sync_modes",
-)
-_PLOT_SETTINGS_DENSITY_KEYS = (
-    "interface_view",
-    "species",
-    "density_enabled_species",
-    "density_active_view_type",
-    "density_view_states",
-    "axis",
-    "plane",
-    "density_2d_x_axis",
-    "density_2d_y_axis",
-    "density_filter_x_min",
-    "density_filter_x_max",
-    "density_filter_y_min",
-    "density_filter_y_max",
-    "density_filter_z_min",
-    "density_filter_z_max",
-    "density_filter_distance_min",
-    "density_filter_distance_max",
-    "view_mapping",
-    *_PLOT_SETTINGS_COMMON_KEYS,
-)
-_PLOT_SETTINGS_TEMPERATURE_KEYS = (
-    "time_axis",
-    *_PLOT_SETTINGS_COMMON_KEYS,
-)
-_PLOT_SETTINGS_RDF_KEYS = (
-    "species_pairs",
-    "view_mapping",
-    *_PLOT_SETTINGS_COMMON_KEYS,
-)
-_PLOT_SETTINGS_POSITION_KEYS = (
-    "interface_view",
-    "species",
-    "position_enabled_species",
-    "position_active_view_type",
-    "position_view_states",
-    "axis",
-    "view_mapping",
-    "plot_view_type",
-    "plot_y_quantity",
-    "component",
-    "map_color",
-    "projection_x",
-    "projection_y",
-    "projection_value",
-    "projection_render_mode",
-    "projection_line_width",
-    "projection_filter_min",
-    "projection_filter_max",
-    "xy_z_distance_max",
-    "heatmap_vmin",
-    "heatmap_vmax",
-    "heatmap_cmap",
-    "heatmap_log_scale",
-    "heatmap_colorbar_enabled",
-    "heatmap_colorbar_label",
-    "heatmap_colorbar_label_size",
-    "heatmap_colorbar_tick_size",
-    "heatmap_colorbar_position",
-    "heatmap_colorbar_pad",
-    "heatmap_colorbar_shrink",
-    "heatmap_colorbar_aspect",
-    "time_axis",
-    "time_section_width",
-    *_PLOT_SETTINGS_COMMON_KEYS,
-)
-_PLOT_SETTINGS_COORDINATION_KEYS = (
-    "interface_view",
-    "species_pairs",
-    "axis",
-    "plot_view_type",
-    "plot_x_quantity",
-    "view_mapping",
-    *_PLOT_SETTINGS_COMMON_KEYS,
-)
-_PLOT_SETTINGS_POTENTIAL_KEYS = ("view_mapping", *_PLOT_SETTINGS_COMMON_KEYS)
-_PLOT_SETTINGS_ORIENTATION_KEYS = (
-    "interface_view",
-    "view_mapping",
-    "orientation_active_view_type",
-    "orientation_view_states",
-    "plot_view_type",
-    "plot_y_quantity",
-    "orientation_line_x_axis",
-    "orientation_heatmap_x_axis",
-    "orientation_heatmap_y_axis",
-    "orientation_filter_x_min",
-    "orientation_filter_x_max",
-    "orientation_filter_y_min",
-    "orientation_filter_y_max",
-    "orientation_filter_z_min",
-    "orientation_filter_z_max",
-    "orientation_filter_distance_min",
-    "orientation_filter_distance_max",
-    "heatmap_vmin",
-    "heatmap_vmax",
-    "heatmap_cmap",
-    "heatmap_value_mode",
-    "heatmap_bulk_reference_mode",
-    "heatmap_bulk_min",
-    "heatmap_bulk_max",
-    "heatmap_log_scale",
-    "heatmap_colorbar_enabled",
-    "heatmap_colorbar_label",
-    "heatmap_colorbar_label_size",
-    "heatmap_colorbar_tick_size",
-    "heatmap_colorbar_position",
-    "heatmap_colorbar_pad",
-    "heatmap_colorbar_shrink",
-    "heatmap_colorbar_aspect",
-    "y_bin_width",
-    "y_bin_reducer",
-    *_PLOT_SETTINGS_COMMON_KEYS,
-)
-_PLOT_SETTINGS_TABLE_KEYS = (
-    "kind",
-    "group",
-    "x",
-    "y",
-    "bins",
-    "file_labels",
-    *_PLOT_SETTINGS_COMMON_KEYS,
-)
+
 
 
 def _project_pyproject_path() -> Path:
@@ -1261,6 +1077,7 @@ def _add_atom_alias_option(parser: argparse.ArgumentParser) -> None:
     )
 
 
+@timed_stage("loading")
 def _read_trajectory_with_optional_atom_aliases(
     read_trajectory_func: Any, path: Any, args: argparse.Namespace
 ):
@@ -1270,6 +1087,7 @@ def _read_trajectory_with_optional_atom_aliases(
     return read_trajectory_func(path)
 
 
+@timed_stage("loading")
 def _open_compute_trajectory(args: argparse.Namespace, *, analysis_name: str):
     from .trajectory.execution import (
         TrajectoryExecutionOptions,
@@ -1374,6 +1192,15 @@ def _log_dry_run_plan(title: str, lines: list[str]) -> None:
     LOGGER.info("Dry-run plan for %s:", title)
     for line in lines:
         _log_wrapped_info(f"  - {line}")
+    if title.startswith("compute "):
+        from .parallel import current_execution
+        from .runtime_resources import detect_cpu_count, resolve_resource_policy
+        execution = current_execution()
+        policy = resolve_resource_policy(execution.memory_budget_mib if execution else None)
+        LOGGER.info("CPU budget: %d available; requested=%s; memory=%.1f MiB. "
+                    "Workers are selected per stage; unbenchmarked stages use conservative defaults.",
+                    detect_cpu_count(), execution.threads if execution else "auto",
+                    policy.memory_budget_mib)
 
 
 def _log_wrapped_info(message: str, *, width: int | None = None) -> None:
@@ -1715,12 +1542,18 @@ def _validate_hdf5_only_sources(sources: list[str], *, command_name: str) -> Non
 
 def _is_non_analysis_hdf5(source: str | Path) -> str | None:
     """Return a human-readable label if *source* is a non-analysis LiNaK HDF5, else ``None``."""
-    from .cube_io import is_linak_cube_hdf5
-    from .trajectory.io import is_linak_trajectory_hdf5
+    import h5py
 
-    if is_linak_trajectory_hdf5(source):
-        return "trajectory"
-    if is_linak_cube_hdf5(source):
+    try:
+        with h5py.File(Path(source).expanduser().resolve(), "r") as handle:
+            if (
+                str(handle.attrs.get("linak_format", "")).strip() == "linak-trajectory-hdf5"
+                and str(handle.attrs.get("kind", "")).strip() == "trajectory"
+            ):
+                return "trajectory"
+    except OSError:
+        pass
+    if str(source).lower().endswith((".cube.h5", ".cube.hdf5")):
         return "cube"
     return None
 
@@ -2001,6 +1834,8 @@ def _coordination_component_from_public_args(args: argparse.Namespace) -> str:
 
 
 def _orientation_component_from_public_args(args: argparse.Namespace) -> str:
+    if any(getattr(args, name, None) is not None for name in ("orientation_heatmap_kind", "orientation_heatmap_quantity", "orientation_heatmap_x_axis", "orientation_heatmap_y_axis")):
+        return "heatmap"
     view_type = _public_plot_view_type(getattr(args, "plot_view_type", None))
     from .plot.data_contract import PLOT_VIEW_2D_HEATMAP
 
@@ -2057,6 +1892,7 @@ def _resolve_position_plotter_kwargs(
     payload: dict[str, Any] = {
         "view_mapping": resolved.mapping,
         "interface_view": getattr(args, "interface_view", "folded"),
+        "interface_alignments": _effective_interface_alignments(args),
     }
     if data_contract is not None:
         payload["data_contract"] = resolved.contract
@@ -2087,7 +1923,7 @@ def _resolve_coordination_plotter_kwargs(
 
 
 def _coordination_plot_dataset_names(args: argparse.Namespace) -> tuple[str, ...]:
-    """Resolve the coordination matrices needed by the active GUI mapping."""
+    """Resolve active coordination matrices and the shared surface reference arrays."""
 
     mapping = _resolve_coordination_plotter_kwargs(args).get("view_mapping")
     names = {"atom_indices", "coordination_number"}
@@ -2120,6 +1956,21 @@ def _coordination_plot_dataset_names(args: argparse.Namespace) -> tuple[str, ...
         )
     else:
         names.add("distance_to_surface_A")
+    # Reconstruct the surface reference even when large coordinate matrices are
+    # omitted. Symmetric references require both per-frame surface estimates.
+    names.update(
+        (
+            "surface_position_per_frame_A",
+            "surface_top_position_per_frame_A",
+            "surface_bottom_position_per_frame_A",
+            "surface_axis_cut_per_frame_A",
+            "surface_axis_lower_per_frame_A",
+            "surface_axis_period_per_frame_A",
+            "surface_top_population_per_frame",
+            "surface_bottom_population_per_frame",
+            "surface_slab_thickness_per_frame_A",
+        )
+    )
     return tuple(sorted(names))
 
 
@@ -2240,6 +2091,8 @@ def _resolve_orientation_plotter_kwargs(
             line_x_axis=getattr(args, "orientation_line_x_axis", None),
             heatmap_x_axis=getattr(args, "orientation_heatmap_x_axis", None),
             heatmap_y_axis=getattr(args, "orientation_heatmap_y_axis", None),
+            heatmap_kind=getattr(args, "orientation_heatmap_kind", None),
+            heatmap_quantity=getattr(args, "orientation_heatmap_quantity", None),
         )
     else:
         resolved = resolve_orientation_plot_mapping(
@@ -2249,6 +2102,7 @@ def _resolve_orientation_plotter_kwargs(
     payload: dict[str, Any] = {
         "view_mapping": resolved.mapping,
         "interface_view": getattr(args, "interface_view", "folded"),
+        "interface_alignments": _effective_interface_alignments(args),
     }
     if data_contract is not None:
         payload["data_contract"] = resolved.contract
@@ -2493,6 +2347,11 @@ def _position_plot_dataset_names(args: argparse.Namespace) -> tuple[str, ...]:
             "surface_bottom_position_per_frame_A",
         )
     )
+    if resolved.is_projection:
+        names.update(("frame_index", "time_ps"))
+    if resolved.is_projection and _effective_interface_alignments(args):
+        names.update(("x_A", "y_A", "z_A", "interface_side", "cell_matrices_angstrom",
+                      "cell_origins_angstrom", "cell_pbc", "periodic_crossings"))
     return tuple(sorted(names))
 
 
@@ -2888,6 +2747,12 @@ def _coordination_series_labels_for_profile(profile: Any) -> list[str]:
     return labels
 
 
+def _position_side_column(profile: Any, column: int) -> dict[str, Any]:
+    """Keep the side masks and seam flags aligned with a selected atom column."""
+    return {name: None if getattr(profile, name, None) is None else np.asarray(getattr(profile, name))[:, [column]]
+            for name in ("distance_to_top_surface", "distance_to_bottom_surface", "interface_side", "periodic_crossings")}
+
+
 def _split_position_profile_into_atom_series(profile: Any) -> list[Any]:
     atom_indices = getattr(profile, "atom_indices", None)
     if atom_indices is None:
@@ -2909,6 +2774,7 @@ def _split_position_profile_into_atom_series(profile: Any) -> list[Any]:
                     profile.distance_to_surface[:, [column]], dtype=float
                 ),
                 n_atoms=1,
+                **_position_side_column(profile, column),
             )
         )
     return split_profiles
@@ -2958,6 +2824,7 @@ def _extract_position_profile_atom_series(profile: Any, atom_index: int) -> Any:
             z=np.asarray(profile.z[:, [column]], dtype=float),
             distance_to_surface=np.asarray(profile.distance_to_surface[:, [column]], dtype=float),
             n_atoms=1,
+            **_position_side_column(profile, column),
         )
     raise ValueError(f"Position profile does not contain atom index {atom_index}.")
 
@@ -4075,13 +3942,42 @@ def _load_density_profiles_for_render_descriptors(
     return [loaded_by_id[str(descriptor["series_id"])] for descriptor in descriptors]
 
 
+def _metadata_series_segments(headers_by_source, analysis, prefix):
+    labels, identifiers, origins = [], [], []
+    for source, headers in headers_by_source:
+        source_labels = []
+        for index, header in enumerate(headers):
+            label = (
+                f"orientation [{index}]"
+                if analysis == "orientation"
+                else str(
+                    header.get("default_label")
+                    or header.get("element")
+                    or header.get("region_name")
+                    or analysis
+                )
+            )
+            if prefix:
+                label = f"{_metadata_source_label(header, fallback_source=source)}:{'orientation' if analysis == 'orientation' else label}"
+            source_labels.append(label)
+        labels.append(source_labels)
+        identifiers.append(
+            [
+                _profile_uid_from_payload(
+                    {"metadata": header}, fallback_prefix=analysis, index=index
+                )
+                for index, header in enumerate(headers)
+            ]
+        )
+        origins.append([str(header.get("origin_hdf5_path") or source) for header in headers])
+    return [], labels, identifiers, origins
+
+
 def _load_orientation_plot_profiles(
     *,
     sources: list[str],
     args: argparse.Namespace | None = None,
 ) -> tuple[list[Any], list[list[str]], list[list[str]], list[list[str]]]:
-    from .analysis.orientation import load_orientation_profiles_by_index
-
     headers_by_source = read_analysis_profile_headers_by_source(
         sources=sources,
         analysis="orientation",
@@ -4094,19 +3990,25 @@ def _load_orientation_plot_profiles(
             for header in source_headers
         ],
     )
+    if preparing_session():
+        return _metadata_series_segments(headers_by_source, "orientation", prefix_source_labels)
     mapping = (
         None if args is None else _resolve_orientation_plotter_kwargs(args).get("view_mapping")
     )
     view_id = _canonical_mapping_view_id(getattr(mapping, "view_type_id", None))
     fixed = {} if mapping is None else dict(getattr(mapping, "fixed_values", {}) or {})
+    from .plot.mappings.orientation_mapping import orientation_view_mapping_to_plot_options
+    orientation_options = {} if mapping is None else orientation_view_mapping_to_plot_options(mapping)
+    spatial = orientation_options.get("orientation_heatmap_kind") == "spatial" or bool(
+        fixed.get("orientation_heatmap_x_axis") or fixed.get("orientation_heatmap_y_axis"))
     line_axis = (
-        str(getattr(args, "orientation_line_x_axis", None) if args is not None else "distance")
+        str((getattr(args, "orientation_line_x_axis", None) if args is not None else None) or "distance")
         .strip()
         .lower()
         or "distance"
     )
     heatmap_x_axis = (
-        str(getattr(args, "orientation_heatmap_x_axis", None) if args is not None else "distance")
+        str((getattr(args, "orientation_heatmap_x_axis", None) if args is not None else None) or "distance")
         .strip()
         .lower()
         or "distance"
@@ -4128,7 +4030,7 @@ def _load_orientation_plot_profiles(
         if args is not None
         else False
     )
-    needs_grid = needs_grid or (view_id == "plot_2d_heatmap" and heatmap_x_axis != "distance")
+    needs_grid = needs_grid or (view_id == "plot_2d_heatmap" and (spatial or heatmap_x_axis != "distance"))
     needs_grid = needs_grid or (view_id != "plot_2d_heatmap" and line_axis != "distance")
 
     base_names = {
@@ -4184,8 +4086,8 @@ def _load_orientation_plot_profiles(
                 "full_count_azimuthal_valid",
             )
         )
-    angle = str(fixed.get("angle") or getattr(args, "angle", "polar") if args else "polar").lower()
-    if view_id == "plot_2d_heatmap":
+    angle = str(orientation_options.get("angle") or (getattr(args, "angle", "polar") if args else "polar")).lower()
+    if view_id == "plot_2d_heatmap" and not spatial:
         base_names.add("heatmap_azimuthal" if angle == "azimuthal" else "heatmap_polar")
 
     profiles_by_source: list[tuple[str, list[Any]]] = []
@@ -4197,7 +4099,7 @@ def _load_orientation_plot_profiles(
         dataset_names.update(
             name
             for name in inventory_names
-            if any(
+            if "_resampling_" in name or any(
                 name.endswith(suffix)
                 for suffix in (
                     "_point_count",
@@ -4207,15 +4109,19 @@ def _load_orientation_plot_profiles(
                     "_block_n",
                     "_block_std",
                     "_block_sem",
+                    "_resampling_numerator", "_resampling_denominator", "_resampling_lengths",
+                    "_resampling_estimator", "_resampling_unit", "_sampling_unit",
+                    "_resampling_median_values", "_resampling_median_offsets",
                 )
             )
         )
         if needs_grid:
-            dataset_names.update(name for name in inventory_names if name.startswith("grid_"))
+            dataset_names.update(name for name in inventory_names if name.startswith(("grid_", "orientation_density_")))
         # Surface diagnostics are small and required to retain capability and
         # interface labels in the view-complete profile.
         dataset_names.update(name for name in inventory_names if name.startswith("surface_"))
-        profiles = load_orientation_profiles_by_index(
+        from .analysis.orientation_cache import load_gui_orientation_profiles
+        profiles = load_gui_orientation_profiles(
             source,
             [int(header.get("profile_index", index)) for index, header in enumerate(headers)],
             dataset_names=tuple(sorted(dataset_names)),
@@ -4294,6 +4200,8 @@ def _load_temperature_plot_profiles(
             for header in source_headers
         ],
     )
+    if preparing_session():
+        return _metadata_series_segments(headers_by_source, "temperature", prefix_source_labels)
     profiles_by_source: list[tuple[str, list[Any]]] = []
     for source, headers in headers_by_source:
         profiles_by_source.append(
@@ -5329,7 +5237,7 @@ def _format_atom_index_selection_label(atom_indices: Sequence[int] | None) -> st
 def _normalize_cli_species_pairs(
     pairs: Sequence[Sequence[str]], *, allow_atoms: bool = False
 ) -> list[tuple[str, str]]:
-    from .analysis.common import normalize_species_query, is_molecule_species_label
+    from .analysis.common import normalize_species_query
 
     result: list[tuple[str, str]] = []
     for pair in pairs:
@@ -5345,12 +5253,7 @@ def _normalize_cli_species_pairs(
                     raise ValueError("Atom-index selections must not be empty.")
                 labels.append(_format_atom_index_selection_label(indices))
                 continue
-            if is_molecule_species_label(token):
-                raise ValueError(
-                    f"Dynamic molecule selector '{token}' is not supported by RDF/coordination. "
-                    "Use an element, species:<stored raw label>, or fixed RDF atom indices."
-                )
-            mode, label = normalize_species_query(token)
+            mode, label = normalize_species_query(token, allow_molecules=True)
             if mode in {"elements", "molecules"}:
                 raise ValueError("Pair selectors must identify atoms, not a selector group.")
             labels.append(label)
@@ -5428,7 +5331,7 @@ def _pair_matches_plot_filter(
     def normalize(token: str) -> str:
         if token.startswith("atoms["):
             return token
-        return normalize_species_query(token)[1]
+        return normalize_species_query(token, allow_molecules=True)[1]
 
     stored = (normalize(species_a), normalize(species_b))
     for a, b in pairs:
@@ -6085,6 +5988,9 @@ def _add_plot_common_options(parser: argparse.ArgumentParser) -> None:
         help="Grid alpha transparency (default: 0.35)",
     )
 
+    parser.add_argument("--reference-diagnostics", action="store_true",
+        help="Render the persisted potential-reference diagnostic figure instead of the summary plot (potential HDF5 only).")
+
 
 def _add_plot_source_options(parser: argparse.ArgumentParser, *, help_text: str) -> None:
     parser.add_argument(
@@ -6472,6 +6378,14 @@ def _add_orientation_plot_options(
             default="average",
             help=argparse.SUPPRESS,
         )
+    group.add_argument("--heatmap-kind", dest="orientation_heatmap_kind", choices=["distribution", "spatial"], default=None,
+        help="2D orientation representation: distance/cosine distribution (default) or spatial map.")
+    group.add_argument("--heatmap-quantity", dest="orientation_heatmap_quantity", choices=["average", "density", "density-weighted"], default=None,
+        help="Color quantity for spatial orientation maps (default: average).")
+    group.add_argument("--heatmap-x-axis", dest="orientation_heatmap_x_axis", choices=["x", "y", "z", "distance"], default=None,
+        help="Horizontal coordinate for spatial orientation maps (default: x).")
+    group.add_argument("--heatmap-y-axis", dest="orientation_heatmap_y_axis", choices=["x", "y", "z", "distance"], default=None,
+        help="Vertical coordinate for spatial orientation maps (default: y).")
     group.add_argument(
         "--angle",
         choices=["polar", "azimuthal"],
@@ -7408,6 +7322,34 @@ def _apply_effective_series_settings(
                 )
                 args.line_colors = None
 
+    uncertainty = getattr(args, "uncertainty", None)
+    if uncertainty is not None and not getattr(args, "_uncertainty_cli_applied", False):
+        config = {
+            "enabled": uncertainty != "off",
+            "stat": {"estimate": "block_ci", "mean": "block_ci", "variability": "sample_std", "off": "block_ci"}.get(
+                uncertainty, uncertainty
+            ),
+            "confidence": args.uncertainty_confidence,
+            "resamples": args.uncertainty_resamples,
+            "seed": args.uncertainty_seed,
+            "block_merge": args.uncertainty_block_merge,
+            "sampling": args.uncertainty_sampling,
+            "style": args.uncertainty_style,
+        }
+        from .plot.plotting import _coerce_error_config
+
+        _coerce_error_config(config)
+        uncertainty_descriptors = series_descriptors or [
+            {"series_id": f"series:{index}"} for index in range(total_series)
+        ]
+        args.series_error_configs = [dict(config) for _ in uncertainty_descriptors]
+        overrides = dict(getattr(args, "series_overrides", None) or {})
+        for descriptor in uncertainty_descriptors:
+            key = str(descriptor["series_id"])
+            overrides[key] = {**overrides.get(key, {}), "error": dict(config)}
+        args.series_overrides = overrides
+        args._uncertainty_cli_applied = True
+
     source_for_reorder = [
         d for d in (list(series_descriptors) if isinstance(series_descriptors, list) else [])
     ]
@@ -7820,7 +7762,7 @@ def _without_preview_series_state(settings: dict[str, Any] | None) -> dict[str, 
         "markers",
         "integration_config",
     }
-    return {key: deepcopy(value) for key, value in settings.items() if key not in blocked}
+    return copy_settings(settings, exclude=blocked)
 
 
 def _merge_preview_defaults_into_gui_settings(
@@ -7846,10 +7788,16 @@ def _merge_preview_defaults_into_gui_settings(
         "y_label_pad": "y_label_pad",
     }
     for key, value in preview_defaults.items():
+        if key == "interface_alignments":
+            # Applied-render provenance is a subset of the user's saved transforms.
+            continue
+        if key == "heatmap_value_mode" and preview_state.get("orientation_grid_heatmap"):
+            # Spatial quantities are not distribution frequency-normalization modes.
+            continue
         mode_key = guarded_keys.get(key)
         if mode_key is not None and explicit_sync_modes.get(mode_key, "auto") != "auto":
             continue
-        merged[key] = deepcopy(value)
+        merged[key] = value
     return merged
 
 
@@ -7881,6 +7829,7 @@ def _build_density_gui_context(
         )
         or {}
     )
+    filter_options["interface_references"] = _interface_reference_options(headers_by_source, "density")
     selected_view_type = _density_selected_view_type(args, filter_options)
     resolved_density_mapping = resolve_density_plot_mapping(
         mapping=_coerce_runtime_view_mapping(getattr(args, "view_mapping", None)),
@@ -8111,6 +8060,7 @@ def _build_density_gui_logical_context(
         )
         or {}
     )
+    filter_options["interface_references"] = _interface_reference_options(headers_by_source, "density")
     selected_view_type = _density_selected_view_type(args, filter_options)
     resolved_density_mapping = resolve_density_plot_mapping(
         mapping=_coerce_runtime_view_mapping(getattr(args, "view_mapping", None)),
@@ -8613,6 +8563,44 @@ def _group_descriptors_by_load_source(
     return [(source_path, grouped[source_path]) for source_path in order]
 
 
+def _interface_reference_options(headers_by_source, analysis):
+    """Describe reference capabilities using headers only; atom arrays stay lazy."""
+    records: dict[str, dict[str, Any]] = {}
+    for source, headers in headers_by_source:
+        for header in headers:
+            record = header.get("interface_reference")
+            if not isinstance(record, Mapping):
+                continue
+            identifier = str(record.get("reference_id") or "")
+            if not identifier:
+                continue
+            entry = records.setdefault(identifier, {
+                "metadata": {"interface_reference": dict(record)},
+                "source_path": str(Path(source).expanduser().resolve()),
+                "label": f"{Path(source).name} ({str(record.get('axis', 'z')).upper()} surface)",
+                "can_align": analysis in {"position", "orientation"},
+                "resolution": None,
+            })
+            if header.get("profile_kind") == "grid_3d_sparse":
+                entry["can_align"] = True
+                entry["resolution"] = header.get("grid_bin_width_A") or header.get("grid_bin_width")
+            if analysis == "orientation":
+                from .analysis.orientation_spatial import alignment_capability_from_header
+                can_align, reason = alignment_capability_from_header(header)
+                entry["can_align"] = entry["can_align"] and can_align
+                entry["resolution"] = header.get("orientation_spatial_grid_resolution_A")
+                if reason:
+                    entry["unavailable_reason"] = reason
+            if record.get("unavailable_reason"):
+                entry["unavailable_reason"] = record["unavailable_reason"]
+    return list(records.values())
+
+
+def _effective_interface_alignments(args):
+    return ({} if str(getattr(args, "interface_view", "folded")).strip().lower() == "full"
+            else getattr(args, "interface_alignments", None) or {})
+
+
 def _build_density_gui_lazy_catalog(
     args: argparse.Namespace,
     *,
@@ -8648,6 +8636,7 @@ def _build_density_gui_lazy_catalog(
         )
         or {}
     )
+    filter_options["interface_references"] = _interface_reference_options(headers_by_source, "density")
     selected_view_type = _density_selected_view_type(args, filter_options)
     resolved_density_mapping = resolve_density_plot_mapping(
         mapping=_coerce_runtime_view_mapping(getattr(args, "view_mapping", None)),
@@ -8672,6 +8661,7 @@ def _build_density_gui_lazy_catalog(
         grid_slice_key = json.dumps(
             {
                 "kind": "heatmap_2d",
+                "interface_alignments": _effective_interface_alignments(args),
                 "x": grid_x_axis,
                 "y": grid_y_axis,
                 "filters": grid_filters,
@@ -8909,6 +8899,7 @@ def _build_density_gui_lazy_catalog(
                         x_bin_width=first_descriptor.get("density_grid_x_bin_width"),
                         y_bin_width=first_descriptor.get("density_grid_y_bin_width"),
                         species=active_species_label,
+                        interface_alignments=_effective_interface_alignments(args),
                     )
                 ]
                 geometry_group_count = sum(len(grid.geometry_groups or []) for grid in loaded_grids)
@@ -9303,6 +9294,7 @@ def _build_rdf_gui_lazy_catalog(
     )
 
     def _load_profiles(descriptors: list[dict[str, Any]]) -> list[Any]:
+        from .analysis.statistics import statistics_suffixes
         loaded_by_id: dict[str, Any] = {}
         for load_source_path, source_descriptors in _group_descriptors_by_load_source(descriptors):
             indices = [int(descriptor["profile_index"]) for descriptor in source_descriptors]
@@ -9312,13 +9304,7 @@ def _build_rdf_gui_lazy_catalog(
                 dataset_names=(
                     "bin_centers_A",
                     "g_r",
-                    "g_r_point_count",
-                    "g_r_sample_n",
-                    "g_r_sample_std",
-                    "g_r_sample_sem",
-                    "g_r_block_n",
-                    "g_r_block_std",
-                    "g_r_block_sem",
+                    *(f"g_r_{suffix}" for suffix in statistics_suffixes()),
                 ),
             )
             if len(profiles) != len(source_descriptors):
@@ -9547,7 +9533,7 @@ def _build_position_gui_lazy_catalog(
 
     raw_candidate_points = raw_estimated_total_points
     estimated_total_points = raw_estimated_total_points
-    if resolved_projection.is_projection:
+    if resolved_projection.is_projection and not preparing_session():
         raw_candidate_points = 0
         estimated_total_points = 0
         dataset_names = _position_projection_estimate_dataset_names(resolved_projection)
@@ -9629,6 +9615,7 @@ def _build_position_gui_lazy_catalog(
                 )
             ),
             "position_species_options": position_species_options,
+            "interface_references": _interface_reference_options(headers_by_source, "position"),
         },
         load_profiles=_load_profiles,
         estimated_total_points=estimated_total_points,
@@ -9849,7 +9836,7 @@ def _build_coordination_gui_lazy_catalog(
         return [loaded_by_id[str(descriptor["series_id"])] for descriptor in descriptors]
 
     reference_profile = None
-    for source, headers in filtered_headers_by_source:
+    for source, headers in ([] if preparing_session() else filtered_headers_by_source):
         if not headers:
             continue
         source_path = Path(source).expanduser().resolve()
@@ -9922,7 +9909,10 @@ def _build_potential_gui_context(
     complete_rows = 0
     incomplete_rows = 0
     for source_path in resolved_sources:
-        plot_profiles, summary = load_potential_plot_profiles(source_path)
+        plot_profiles, summary = (
+            load_potential_plot_profiles(source_path, _metadata_only=True)
+            if preparing_session() else load_potential_plot_profiles(source_path)
+        )
         total_rows += int(summary.get("total_rows") or 0)
         complete_rows += int(summary.get("complete_rows") or 0)
         incomplete_rows += int(summary.get("incomplete_rows") or 0)
@@ -10076,6 +10066,29 @@ def _build_orientation_gui_context(
             reference_contract = heatmap_contract
         else:
             reference_contract = line_contract
+    from .analysis.orientation_spatial import density_capability_from_header
+    # Header capabilities remain available while line/distribution loading stays lazy.
+    source_headers = read_analysis_profile_headers_by_source(sources=sources, analysis="orientation")
+    orientation_headers = [header for _source, headers in source_headers for header in headers]
+    spatial_capabilities = [density_capability_from_header(header) for header in orientation_headers]
+    sparse_available = bool(orientation_headers) and all(
+        "grid_entity_sum" in header.get("dataset_inventory", {}) for header in orientation_headers)
+    if any("grid_entity_sum" in header.get("dataset_inventory", {}) for header in orientation_headers) and reference_profile is not None and reference_profile.sparse_grid is None:
+        heatmap_contract = default_orientation_heatmap_plot_data_contract()
+    for header in orientation_headers:
+        for axis_id, bounds in header.get("orientation_spatial_axis_ranges_A", {}).items():
+            _merge_orientation_axis_range(axis_id, bounds)
+    spatial_density_available = bool(spatial_capabilities) and all(ok for ok, _ in spatial_capabilities)
+    if reference_contract is not None and _canonical_mapping_view_id(getattr(resolved_mapping, "view_type_id", None)) == "plot_2d_heatmap":
+        reference_contract = heatmap_contract
+    spatial_density_reason = next((reason for ok, reason in spatial_capabilities if not ok), "")
+    spatial_source_capabilities = {
+        identifier: {"sparse": "grid_entity_sum" in header.get("dataset_inventory", {}),
+                     "density": ok, "reason": reason}
+        for identifier, header, (ok, reason) in zip(
+            [identifier for segment in series_id_segments_by_source for identifier in segment],
+            orientation_headers, spatial_capabilities)
+    }
     return _GuiPlotRenderContext(
         profile=plot_profiles,
         plot_source_label=sources[0] if len(sources) == 1 else "multi_source_orientation",
@@ -10130,15 +10143,20 @@ def _build_orientation_gui_context(
             origin_path_segments_by_source=origin_path_segments_by_source,
         ),
         profile_filter_options={
+            "interface_references": _interface_reference_options(source_headers, "orientation"),
             "orientation_line_plot_contract": _serialize_plot_data_contract(line_contract),
             "orientation_heatmap_plot_contract": _serialize_plot_data_contract(heatmap_contract),
             "orientation_axis_ranges": orientation_axis_ranges,
+            "orientation_spatial_density_available": spatial_density_available,
+            "orientation_spatial_density_reason": spatial_density_reason,
+            "orientation_sparse_grid_available": sparse_available,
+            "orientation_spatial_source_capabilities": spatial_source_capabilities,
             "orientation_default_axis_bin_widths_A": orientation_axis_bin_widths,
             **_surface_view_filter_options(
-                reference_profile,
-                full_supported=(
-                    reference_profile is not None
-                    and getattr(reference_profile, "full_bin_edges", None) is not None
+                reference_profile if reference_profile is not None else (orientation_headers[0] if orientation_headers else None),
+                full_supported=bool(orientation_headers) and (
+                    getattr(reference_profile, "full_bin_edges", None) is not None
+                    or all("full_bin_edges_A" in header.get("dataset_inventory", {}) for header in orientation_headers)
                 ),
             ),
         },
@@ -10284,6 +10302,12 @@ def _render_profile_plot(
         configure_matplotlib_backend(interactive=False, preferred_backend=args.backend)
 
     extra_kwargs = {} if plotter_kwargs is None else dict(plotter_kwargs)
+    requested_uncertainty = getattr(args, "uncertainty", None)
+    mapping = extra_kwargs.get("view_mapping")
+    view_type = str(getattr(mapping, "view_type_id", ""))
+    if requested_uncertainty not in {None, "off"} and view_type and "heatmap" in view_type:
+        raise ValueError("Uncertainty overlays are unavailable for heatmaps/projections. Select a 1D line view.")
+
     style = _build_plot_style(args)
     captured_state: dict[str, Any] = {}
     ordered_profile = profile
@@ -10599,6 +10623,8 @@ def _apply_gui_settings_to_args(args: argparse.Namespace, settings: dict[str, An
     settings = deepcopy(settings)
     validate_current_plot_settings(settings)
     always_forward = {
+        "orientation_heatmap_kind", "orientation_heatmap_quantity", "orientation_heatmap_states",
+        "interface_alignments",
         "title",
         "title_visible",
         "x_label",
@@ -10785,6 +10811,9 @@ def _open_plot_settings_gui(
     on_set_active_profile: Callable[[str], str] | None = None,
     allow_named_profiles: bool = True,
 ) -> None:
+    session = PlotGuiSession.from_parameters(locals())
+    if capture_session(session):
+        return
     from .plot.plot_gui import launch_plot_settings_panel
 
     launch_plot_settings_panel(
@@ -10878,6 +10907,10 @@ def _write_plotted_heatmap_data_export(
         if include_metadata:
             handle.write("# LiNaK plotted heatmap data export\n")
             handle.write(f"# grid_shape={values.shape[0]},{values.shape[1]}\n")
+            if heatmap.get("orientation_spatial"):
+                handle.write(f"# orientation_spatial={json.dumps(heatmap['orientation_spatial'], ensure_ascii=False)}\n")
+            if heatmap.get("interface_alignments"):
+                handle.write(f"# interface_alignments={json.dumps(heatmap['interface_alignments'], ensure_ascii=False)}\n")
             for key in ("x_label", "y_label", "value_label"):
                 handle.write(
                     f"# {key}={json.dumps(str(heatmap.get(key) or ''), ensure_ascii=False)}\n"
@@ -10905,6 +10938,28 @@ def _write_plotted_heatmap_data_export(
     return target_path
 
 
+def _write_plotted_projection_data_export(render_state, output_path, *, delimiter=None, include_metadata=False):
+    series = render_state["plotted_projection"]
+    for item in series:
+        samples = np.asarray(item.get("samples"))
+        if samples.ndim != 2 or samples.shape[1] != 6:
+            raise ValueError("Position export requires matching projected sample arrays.")
+    target = Path(output_path).expanduser().resolve()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with target.open("w", encoding="utf-8", newline="") as handle:
+        if include_metadata:
+            handle.write("# LiNaK plotted position projection export\n")
+            for key in ("projection_x", "projection_y", "projection_value", "interface_alignments"):
+                handle.write(f"# {key}={json.dumps(render_state.get(key), ensure_ascii=False)}\n")
+        writer = csv.writer(handle, delimiter=_plot_data_export_delimiter_from_setting(delimiter, target), lineterminator="\n")
+        writer.writerow(["series_id", "series_label", "atom_index", "frame_index", "time_ps", "x", "y", "value", "break_before"])
+        for item in series:
+            for row in item["samples"]:
+                writer.writerow([item["series_id"], item["series_label"], item["atom_index"],
+                                 *(_format_plot_data_export_value(value) for value in row)])
+    return target
+
+
 def _write_plotted_data_export(
     render_state: Mapping[str, Any],
     output_path: str | Path,
@@ -10912,10 +10967,14 @@ def _write_plotted_data_export(
     delimiter: Any = None,
     include_metadata: bool = False,
 ) -> Path:
+    if render_state.get("plotted_projection"):
+        return _write_plotted_projection_data_export(render_state, output_path, delimiter=delimiter, include_metadata=include_metadata)
     heatmap = render_state.get("plotted_heatmap")
     if isinstance(heatmap, Mapping):
         return _write_plotted_heatmap_data_export(
-            heatmap,
+            {**heatmap, "interface_alignments": render_state.get("interface_alignments"),
+             "orientation_spatial": {key: render_state.get(key) for key in ("orientation_heatmap_kind", "orientation_heatmap_quantity", "heatmap_value_units", "orientation_interface_view", "orientation_spatial_normalization", "orientation_grid_x_axis", "orientation_grid_y_axis", "orientation_grid_filters")}
+             if render_state.get("orientation_grid_heatmap") else None},
             output_path,
             delimiter=delimiter,
             include_metadata=include_metadata,
@@ -10941,6 +11000,9 @@ def _write_plotted_data_export(
                 "series_id": str(raw_series.get("series_id") or ""),
                 "series_label": str(raw_series.get("series_label") or ""),
                 "series_kind": str(raw_series.get("series_kind") or "source"),
+                "source_point_indices": raw_series.get(
+                    "source_point_indices", list(range(len(x_values)))
+                ),
                 "x": list(x_values),
                 "y": list(y_values),
             }
@@ -10949,6 +11011,50 @@ def _write_plotted_data_export(
     if not normalized_series:
         raise ValueError("No plotted data is available for this preview.")
 
+    summaries = render_state.get("series_error_summaries") or {}
+    has_errors = any(
+        isinstance(value, Mapping) and value.get("status") == "ok" for value in summaries.values()
+    )
+    error_columns = (
+        [
+            "error_lower",
+            "error_upper",
+            "error_method",
+            "confidence",
+            "sampling_unit",
+            "seed",
+            "resamples",
+            "sample_n",
+            "valid_blocks",
+        ]
+        if has_errors
+        else []
+    )
+
+    def error_row(series, index):
+        if not has_errors:
+            return []
+        indices = series.get("source_point_indices", [])
+        if index < len(indices):
+            index = indices[index]
+        summary = summaries.get(series["series_id"], {})
+        details = summary.get("details") or {}
+
+        def at(values):
+            return values[index] if isinstance(values, list) and index < len(values) else ""
+
+        return [
+            at(summary.get("lower")),
+            at(summary.get("upper")),
+            details.get("method", summary.get("stat", "")),
+            details.get("confidence", ""),
+            details.get("sampling_unit", ""),
+            details.get("seed", ""),
+            details.get("resamples", ""),
+            at(details.get("sample_n")),
+            at(details.get("valid_blocks_per_bin")),
+        ]
+
     target_path = Path(output_path).expanduser().resolve()
     target_path.parent.mkdir(parents=True, exist_ok=True)
     delimiter = _plot_data_export_delimiter_from_setting(delimiter, target_path)
@@ -10956,6 +11062,8 @@ def _write_plotted_data_export(
         if include_metadata:
             handle.write("# LiNaK plotted data export\n")
             handle.write(f"# series_count={len(normalized_series)}\n")
+            if render_state.get("interface_alignments"):
+                handle.write(f"# interface_alignments={json.dumps(render_state['interface_alignments'], ensure_ascii=False)}\n")
             axes = render_state.get("axes")
             if axes is not None:
                 for key, text in (
@@ -10967,20 +11075,25 @@ def _write_plotted_data_export(
             handle.write(
                 f"# series_labels={json.dumps([s['series_label'] for s in normalized_series], ensure_ascii=False)}\n"
             )
+        if include_metadata and summaries:
+            handle.write(f"# uncertainty={json.dumps(summaries, ensure_ascii=False)}\n")
         writer = csv.writer(handle, delimiter=delimiter, lineterminator="\n")
         if len(normalized_series) == 1:
-            writer.writerow(["x", "y"])
+            writer.writerow(["x", "y"] + error_columns)
             series = normalized_series[0]
-            for x_value, y_value in zip(series["x"], series["y"]):
+            for index, (x_value, y_value) in enumerate(zip(series["x"], series["y"])):
                 writer.writerow(
                     [
                         _format_plot_data_export_value(x_value),
                         _format_plot_data_export_value(y_value),
                     ]
+                    + error_row(series, index)
                 )
             return target_path
 
-        writer.writerow(["series_id", "series_label", "series_kind", "point_index", "x", "y"])
+        writer.writerow(
+            ["series_id", "series_label", "series_kind", "point_index", "x", "y"] + error_columns
+        )
         for series in normalized_series:
             for point_index, (x_value, y_value) in enumerate(
                 zip(series["x"], series["y"]), start=1
@@ -10994,6 +11107,7 @@ def _write_plotted_data_export(
                         _format_plot_data_export_value(x_value),
                         _format_plot_data_export_value(y_value),
                     ]
+                    + error_row(series, point_index - 1)
                 )
     return target_path
 
@@ -11202,6 +11316,7 @@ def _launch_profile_plot_gui(
     initial_context: _GuiPlotRenderContext,
     build_context: Callable[[argparse.Namespace], _GuiPlotRenderContext],
     build_full_context: Callable[[argparse.Namespace], _GuiPlotRenderContext] | None = None,
+    source_paths: Sequence[str] | None = None,
 ) -> None:
     from .plot.plot_settings import (
         delete_named_plot_profile,
@@ -11264,15 +11379,14 @@ def _launch_profile_plot_gui(
     from .cache import PREVIEW_CACHE
 
     def _source_state_signature() -> dict[str, Any]:
-        try:
-            stat = source_path.stat()
-        except OSError:
-            return {"path": str(source_path), "mtime_ns": None, "size": None}
-        return {
-            "path": str(source_path),
-            "mtime_ns": int(stat.st_mtime_ns),
-            "size": int(stat.st_size),
-        }
+        from .cache import source_revision
+        versions: list[tuple[str, int | None, int | None]] = []
+        for path in sorted({str(source_path), *(str(value) for value in source_paths or [])}):
+            try:
+                versions.append(source_revision(path))
+            except OSError:
+                versions.append((str(Path(path).expanduser().resolve()), None, None))
+        return {"path": str(source_path), "files": versions}
 
     def _gui_context_data_signature(
         settings: dict[str, Any],
@@ -11281,6 +11395,8 @@ def _launch_profile_plot_gui(
         required_source_ids: set[str],
     ) -> str:
         data_keys = (
+            "orientation_heatmap_kind", "orientation_heatmap_quantity",
+            "interface_alignments",
             "species",
             "axis",
             "component",
@@ -11369,10 +11485,11 @@ def _launch_profile_plot_gui(
 
     effective_guard_args = deepcopy(args)
     _apply_gui_settings_to_args(effective_guard_args, initial_settings)
-    effective_context = (
+    # The prepared catalog already describes the restored source selection.
+    # Actual, data-dependent complexity is checked by the preview worker.
+    effective_context = initial_context if preparing_session() else (
         build_context(effective_guard_args)
-        if analysis_name == "position"
-        else build_full_context(effective_guard_args)
+        if analysis_name == "position" else build_full_context(effective_guard_args)
     )
     effective_series_descriptors = _merge_gui_series_descriptors(
         effective_context.series_descriptors,
@@ -11388,7 +11505,7 @@ def _launch_profile_plot_gui(
         final_series_count=len(effective_series_descriptors),
         final_point_count=effective_context.estimated_total_points,
     )
-    if not getattr(args, "force_gui", False):
+    if not getattr(args, "force_gui", False) and not preparing_session():
         _raise_or_warn_for_plot_complexity(
             _estimate_plot_complexity(
                 analysis_name=analysis_name,
@@ -11482,6 +11599,7 @@ def _launch_profile_plot_gui(
             load_args,
             required_source_ids,
         )
+        report_progress("Loading plot data", Path(source_path).name)
         try:
             context = _cached_gui_context(
                 kind="render",
@@ -11556,6 +11674,7 @@ def _launch_profile_plot_gui(
             if str(descriptor.get("source_series_id") or descriptor.get("series_id") or "")
             in loaded_ids
         ]
+        report_progress("Rendering preview")
         try:
             saved_path, render_state = _render_profile_plot(
                 args=preview_args,
@@ -11577,6 +11696,8 @@ def _launch_profile_plot_gui(
             )
             raise
         render_state = dict(render_state or {})
+        if analysis_name == "orientation":
+            LOGGER.debug("GUI orientation preview/export render seconds=%.6f", perf_counter() - preview_started)
         check_cancelled()
         if analysis_name == "density":
             descriptor_context = _cached_gui_context(
@@ -11595,38 +11716,6 @@ def _launch_profile_plot_gui(
                 descriptor_source.profile_filter_options
             )
         return saved_path, render_state
-
-    initial_render_state: dict[str, Any] = {}
-    initial_required_source_ids = _required_source_ids_for_gui_render(initial_settings)
-    if initial_required_source_ids:
-        _initial_saved_path, initial_render_state = _render_gui_preview_settings(
-            initial_settings,
-            show=False,
-            output=None,
-            empty_error_message="No series are enabled. Turn on at least one series to preview.",
-        )
-    if initial_render_state:
-        initial_settings = _merge_preview_defaults_into_gui_settings(
-            initial_settings,
-            initial_render_state,
-        )
-        # Render-state values are matplotlib defaults, not explicit user choices.
-        # Explicitly mark any synced field without a stored mode as "auto" so
-        # _derive_synced_field_modes in the GUI does not infer "manual" from them.
-        _render_sync_modes = dict(initial_settings.get("_gui_sync_modes") or {})
-        for _k in (
-            "title",
-            "x_label",
-            "y_label",
-            "x_lim",
-            "y_lim",
-            "x_ticks",
-            "y_ticks",
-            "x_label_pad",
-            "y_label_pad",
-        ):
-            _render_sync_modes.setdefault(_k, "auto")
-        initial_settings["_gui_sync_modes"] = _render_sync_modes
 
     def _preview(gui_settings: dict[str, Any]) -> dict[str, Any]:
         _saved_path, render_state = _render_gui_preview_settings(
@@ -12091,6 +12180,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     plot_parser.set_defaults(handler=_handle_plot)
     _configure_plot_parser(plot_parser)
+    plot_parser.add_argument("--uncertainty", choices=("off", "estimate", "mean", "variability", "sample_sem", "block_sem", "block_std"), default=None,
+                             help="Error meaning: estimate (or mean) = block-bootstrap confidence interval; variability = observation SD. Other estimators are advanced, explicit choices.")
+    plot_parser.add_argument("--uncertainty-confidence", type=float, default=.95)
+    plot_parser.add_argument("--uncertainty-resamples", type=int, default=1000)
+    plot_parser.add_argument("--uncertainty-seed", type=int, default=0)
+    plot_parser.add_argument("--uncertainty-block-merge", type=int, default=1,
+                             help="Merge this many consecutive stored temporal blocks; at least four merged blocks must remain.")
+    plot_parser.add_argument("--uncertainty-sampling", choices=("auto", "temporal", "independent"), default="auto",
+                             help="Potential records require an explicit temporal-order or independent-replicate assumption.")
+    plot_parser.add_argument("--uncertainty-style", choices=("band", "whiskers"), default="band")
+
     _add_dry_run_option(plot_parser)
 
     compute_parser = commands.add_parser(
@@ -12450,6 +12550,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Compute RDF and save HDF5.",
     )
     compute_rdf.add_argument(
+        "--oh-cutoff",
+        type=_positive_float,
+        default=1.27,
+        help="O-H molecular classification cutoff in Angstrom (default: 1.27).",
+    )
+    _add_oh_topology_backend_option(compute_rdf)
+    compute_rdf.add_argument(
         "trajectory",
         nargs="?",
         help=(
@@ -12474,7 +12581,7 @@ def build_parser() -> argparse.ArgumentParser:
         metavar=("A", "B"),
         help=(
             "RDF pair: element, element:<symbol>, species:<raw_label>, all, or "
-            "'atoms[0,1..3]'. Repeat for multiple pairs; omitted: all element/raw-species pairs."
+            "'atoms[0,1..3]', or mol:OH/mol:H2O/mol:H3O/mol:H/mol:O (molecular COM). Repeat for multiple pairs; omitted: all element/raw-species pairs."
         ),
     )
     compute_rdf.add_argument(
@@ -12528,6 +12635,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Compute continuous coordination numbers and save HDF5.",
     )
     compute_coordination.add_argument(
+        "--oh-cutoff",
+        type=_positive_float,
+        default=1.27,
+        help="O-H molecular classification cutoff in Angstrom (default: 1.27).",
+    )
+    _add_oh_topology_backend_option(compute_coordination)
+    compute_coordination.add_argument(
         "trajectory",
         nargs="?",
         help=(
@@ -12553,7 +12667,7 @@ def build_parser() -> argparse.ArgumentParser:
         metavar=("A", "B"),
         help=(
             "Coordination center A and neighbor B: element, element:<symbol>, "
-            "species:<raw_label>, or all. Repeat for multiple ordered pairs."
+            "species:<raw_label>, mol:OH/mol:H2O/mol:H3O/mol:H/mol:O (molecular COM), or all. Repeat for multiple ordered pairs."
         ),
     )
     _add_atom_alias_option(compute_coordination)
@@ -12690,8 +12804,8 @@ def build_parser() -> argparse.ArgumentParser:
     analysis_group.add_argument(
         "--water-padding-ang",
         type=_non_negative_float,
-        default=5.0,
-        help="Padding removed from O/H z-bounds for water-bulk averaging (default: 5.0).",
+        default=None,
+        help="Strict exclusion from each detected water-reservoir edge (auto default: 5 A; never reduced).",
     )
     analysis_group.add_argument(
         "--cshe-offset-ev",
@@ -12711,6 +12825,33 @@ def build_parser() -> argparse.ArgumentParser:
         default="auto",
         help="Plane-estimation algorithm (default: auto).",
     )
+    analysis_group.add_argument("--bulk-window", type=float, nargs=2, metavar=("Z_MIN", "Z_MAX"),
+        help="Fixed Cartesian z window in Angstrom for every snapshot; Z_MIN > Z_MAX wraps under periodic Z. Incompatible with water padding.")
+    analysis_group.add_argument("--window-plan", help="Reuse a saved geometry-only reference plan JSON.")
+    analysis_group.add_argument("--save-window-plan", help="Save the selected reference plan JSON for exact reuse.")
+    analysis_group.add_argument("--surface-elements", nargs="+", help="Chemical substrate elements, e.g. Pt Au.")
+    analysis_group.add_argument("--z-boundary", choices=["periodic", "open"], default="periodic",
+        help="Z boundary condition (cube files do not encode PBC; default: periodic).")
+    analysis_group.add_argument("--min-window-width-ang", type=_positive_float, default=4.0)
+    analysis_group.add_argument("--min-window-grid-points", type=int, default=5)
+    analysis_group.add_argument("--water-density-bin-ang", type=_positive_float, default=1.0)
+    analysis_group.add_argument("--water-density-bandwidth-ang", type=_positive_float, default=1.5,
+        help="Fixed Gaussian bandwidth for structural water density only; never smooths Hartree data (default: 1.5 A).")
+    analysis_group.add_argument("--min-water-density", type=_positive_float, default=0.015,
+        help="Minimum H2O number density in molecules/A^3 (default: 0.015).")
+    analysis_group.add_argument("--max-reference-gradient", type=_positive_float, default=0.05,
+        help="Maximum absolute linear Hartree gradient in eV/A (default: 0.05).")
+    analysis_group.add_argument("--max-reference-std", type=_positive_float, default=0.25,
+        help="Maximum spatial Hartree standard deviation in eV (default: 0.25).")
+    analysis_group.add_argument("--max-reference-range", type=_positive_float, default=1.0,
+        help="Maximum peak-to-peak Hartree variation in eV (default: 1.0).")
+    analysis_group.add_argument("--sensitivity-ang", type=_non_negative_float, default=1.0,
+        help="Declared shift/inset/outset size for reference sensitivity checks (default: 1 A).")
+    analysis_group.add_argument("--fermi-map", help="CSV with source,fermi_ev in the matching CP2K electron-energy gauge.")
+    analysis_group.add_argument("--snapshot-interval-fs", type=_positive_float,
+        help="Physical spacing between input snapshots, in fs; otherwise plots use input index.")
+    analysis_group.add_argument("--diagnostics", help="Diagnostic plot path (default: next to output HDF5).")
+    analysis_group.add_argument("--no-diagnostics", action="store_true", help="Skip the automatic diagnostic figure.")
     execution_group = compute_potential.add_argument_group("Execution")
     execution_group.add_argument(
         "--threads",
@@ -12752,7 +12893,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-append",
         dest="append",
         action="store_false",
-        help="Do not append to an existing HDF5 file (a new fallback file is created unless --overwrite is used).",
+        help="Do not append; an existing output requires --overwrite.",
     )
     output_group.add_argument(
         "--overwrite",
@@ -13588,6 +13729,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     csv_plot_settings.set_defaults(handler=_handle_csv_plot_settings)
 
+    for compute_parser in (compute_density, compute_temperature, compute_position,
+                           compute_rdf, compute_coordination, compute_potential,
+                           compute_orientation):
+        if "--threads" not in compute_parser._option_string_actions:
+            compute_parser.add_argument(
+                "--threads", type=_positive_int, default=None,
+                help="Maximum CPU workers for supported compute stages (default: automatic; 1: serial).",
+            )
+        if "--memory-budget-mib" not in compute_parser._option_string_actions:
+            _add_memory_budget_option(compute_parser)
+
     return parser
 
 
@@ -14311,6 +14463,7 @@ def _render_csv_plot(
 ) -> tuple[Path | None, dict[str, Any]]:
     import pandas as pd
 
+    from .plot.rendering import PlotFigure
     from .plot.plotting import configure_matplotlib_backend
 
     style = _build_plot_style(args)
@@ -14331,7 +14484,7 @@ def _render_csv_plot(
         import matplotlib.pyplot as plt
 
         with plt.rc_context({"font.family": style.font_family}):
-            fig, ax = plt.subplots(figsize=style.figure_size)
+            fig, ax = plt.subplots(figsize=style.figure_size, FigureClass=PlotFigure)
             kind = args.kind
             rendered_handles: list[Any] = []
             rendered_labels: list[str] = []
@@ -15083,6 +15236,7 @@ def _combine_analysis_hdf5_sources(
     from .storage.hdf5_utils import write_linak_hdf5_profile_collection
 
     del settings_source_path
+    report_progress("Preparing combined results")
     payloads = read_analysis_profile_payloads(sources=sources, analysis=analysis)
     if output is None:
         output_path = _resolve_non_overwriting_hdf5_path(
@@ -15102,10 +15256,14 @@ def _combine_analysis_hdf5_sources(
         profiles=payloads,
         metadata=combined_metadata,
     )
+    from .plot.gui_session import own_preparation_output
+    own_preparation_output(written_path)
+    check_cancelled()
     return written_path
 
 
 def _resolve_plot_hdf5_sources(args: argparse.Namespace, *, command_name: str) -> list[str]:
+    report_progress("Checking files")
     sources = _resolve_plot_sources(args)
     _validate_hdf5_only_sources(sources, command_name=command_name)
     _validate_no_non_analysis_hdf5_sources(sources, command_name=command_name)
@@ -15120,6 +15278,9 @@ def _handle_plot(args: argparse.Namespace) -> int:
 
     sources = _resolve_plot_hdf5_sources(args, command_name="linak plot")
     detected_analysis = _resolve_auto_plot_analysis_from_sources(sources)
+    if getattr(args, "reference_diagnostics", False) and detected_analysis != "potential":
+        raise ValueError("--reference-diagnostics requires a potential HDF5 file.")
+
     if detected_analysis in {"rdf", "coordination"}:
         if getattr(args, "species", None) is not None:
             raise ValueError("RDF/CN plotting requires two selectors per --species A B.")
@@ -15294,6 +15455,7 @@ def _handle_plot_density(args: argparse.Namespace) -> int:
                 except OSError:
                     source_states.append((str(path), None, None))
             data_setting_names = (
+                "interface_alignments",
                 "species",
                 "density_enabled_species",
                 "density_active_view_type",
@@ -15365,7 +15527,7 @@ def _handle_plot_density(args: argparse.Namespace) -> int:
             ),
             build_full_context=_build_full_context,
         )
-        LOGGER.info("Density GUI plotting session finished in %.2f s.", perf_counter() - start)
+        _log_studio_session_end("Density", start)
         return 0
 
     from .analysis.density import plot_density_profiles
@@ -15492,7 +15654,7 @@ def _handle_plot_temperature(args: argparse.Namespace) -> int:
                 sources=gui_sources,
             ),
         )
-        LOGGER.info("Temperature GUI plotting session finished in %.2f s.", perf_counter() - start)
+        _log_studio_session_end("Temperature", start)
         return 0
 
     from .analysis.temperature import plot_temperature_profiles
@@ -15632,7 +15794,7 @@ def _handle_plot_rdf(args: argparse.Namespace) -> int:
                 current_args
             ).build_initial_context(),
         )
-        LOGGER.info("RDF GUI plotting session finished in %.2f s.", perf_counter() - start)
+        _log_studio_session_end("RDF", start)
         return 0
 
     from .analysis.rdf import plot_rdf_profiles
@@ -15791,7 +15953,7 @@ def _handle_plot_position(args: argparse.Namespace) -> int:
                 current_args
             ).build_initial_context(),
         )
-        LOGGER.info("Position GUI plotting session finished in %.2f s.", perf_counter() - start)
+        _log_studio_session_end("Position", start)
         return 0
 
     from .analysis.position import plot_position_profiles
@@ -15936,7 +16098,7 @@ def _handle_plot_coordination(args: argparse.Namespace) -> int:
                 current_args
             ).build_initial_context(),
         )
-        LOGGER.info("Coordination GUI plotting session finished in %.2f s.", perf_counter() - start)
+        _log_studio_session_end("Coordination", start)
         return 0
 
     from .analysis.coordination import plot_coordination_profiles
@@ -15975,6 +16137,15 @@ def _handle_plot_potential(args: argparse.Namespace) -> int:
     start = perf_counter()
     LOGGER.info("Starting potential plotting.")
     sources = _resolve_plot_hdf5_sources(args, command_name="linak plot")
+    if getattr(args, "reference_diagnostics", False):
+        if len(sources) != 1:
+            raise ValueError("Reference diagnostics require one potential HDF5 file at a time.")
+        from .analysis.potential_diagnostics import plot_potential_diagnostics
+        path = args.output or str(Path(sources[0]).with_suffix(".diagnostics.png"))
+        plot_potential_diagnostics(sources[0], path)
+        LOGGER.info("Saved reference diagnostics to '%s'.", path)
+        return 0
+
     settings_source_path = (
         _resolve_plot_settings_source_path(
             sources,
@@ -16065,7 +16236,7 @@ def _handle_plot_potential(args: argparse.Namespace) -> int:
                 sources=sources,
             ),
         )
-        LOGGER.info("Potential GUI plotting session finished in %.2f s.", perf_counter() - start)
+        _log_studio_session_end("Potential", start)
         return 0
 
     _saved_path, _rendered_state = _render_profile_plot(
@@ -16169,13 +16340,14 @@ def _handle_plot_orientation(args: argparse.Namespace) -> int:
             gui_title="LiNaK Plot Controls: Water Orientation",
             analysis_name="orientation",
             plotter=plot_orientation_profiles,
+            source_paths=sources,
             initial_context=render_context,
             build_context=lambda current_args: _build_orientation_gui_context(
                 current_args,
                 sources=sources,
             ),
         )
-        LOGGER.info("Orientation GUI plotting session finished in %.2f s.", perf_counter() - start)
+        _log_studio_session_end("Orientation", start)
         return 0
 
     _saved_path, _rendered_state = _render_profile_plot(
@@ -16997,6 +17169,8 @@ def _handle_compute_rdf(args: argparse.Namespace) -> int:
     ):
         profiles = [
             compute_rdf(
+                oh_cutoff=args.oh_cutoff,
+                oh_topology_backend=args.oh_topology_backend,
                 frames=frames,
                 **_rdf_selector_kwargs(pair),
                 r_max=args.r_max,
@@ -17008,6 +17182,8 @@ def _handle_compute_rdf(args: argparse.Namespace) -> int:
         ]
     else:
         profiles = compute_rdf_profiles(
+            oh_cutoff=args.oh_cutoff,
+            oh_topology_backend=args.oh_topology_backend,
             frames=frames,
             pairs=requested_pairs,
             r_max=args.r_max,
@@ -17247,6 +17423,8 @@ def _handle_compute_coordination(args: argparse.Namespace) -> int:
         pair_species_a, pair_species_b = ordered_pairs[0]
         cutoff_resolutions = {
             ordered_pairs[0]: resolve_coordination_cutoff(
+                oh_cutoff=args.oh_cutoff,
+                oh_topology_backend=args.oh_topology_backend,
                 frames=analysis_frames,
                 species_a=pair_species_a,
                 species_b=pair_species_b,
@@ -17263,6 +17441,8 @@ def _handle_compute_coordination(args: argparse.Namespace) -> int:
         }
     else:
         cutoff_resolutions = resolve_coordination_cutoffs(
+            oh_cutoff=args.oh_cutoff,
+            oh_topology_backend=args.oh_topology_backend,
             frames=analysis_frames,
             ordered_pairs=ordered_pairs,
             cutoff_A=args.cutoff,
@@ -17272,6 +17452,8 @@ def _handle_compute_coordination(args: argparse.Namespace) -> int:
             diagnostic_plot_outputs=diagnostic_plot_outputs,
         )
     profiles = compute_coordination_profiles(
+        oh_cutoff=args.oh_cutoff,
+        oh_topology_backend=args.oh_topology_backend,
         frames=analysis_frames,
         ordered_pairs=ordered_pairs,
         axis=args.axis,
@@ -17301,12 +17483,12 @@ def _handle_compute_potential(args: argparse.Namespace) -> int:
     LOGGER.info("Starting potential compute.")
 
     from .analysis.potential import (
-        PotentialCsvAppender,
+        PotentialHdf5Appender,
         PotentialConfig,
         compute_potential_records,
         error_record_for_source,
         expand_hartree_cube_sources,
-        plan_potential_csv_output,
+        plan_potential_hdf5_output,
         summarize_potential_statistics,
         validate_hartree_cube_source,
     )
@@ -17336,6 +17518,11 @@ def _handle_compute_potential(args: argparse.Namespace) -> int:
                 continue
             seen_sources.add(key)
             validated_sources.append(key)
+            if resolved.suffix.lower() == ".cube":
+                expanded_sources.append(resolved)
+                expanded_source_labels.append(key)
+                progress.update()
+                continue
             for dataset in expand_hartree_cube_sources(resolved):
                 dataset_source = str(Path(dataset.source_path or key).expanduser().resolve())
                 dataset_profile_index = int(dataset.source_profile_index or 0)
@@ -17373,13 +17560,13 @@ def _handle_compute_potential(args: argparse.Namespace) -> int:
             "already present in HDF5 and would be skipped: not inspected in dry-run",
             "files that would be computed: not inspected in dry-run",
             (
-                f"water_padding_ang={args.water_padding_ang}, "
+                f"water_padding_ang={args.water_padding_ang if args.water_padding_ang is not None else 0 if args.bulk_window is not None else 5}, "
                 f"cshe_offset_ev={args.cshe_offset_ev}, "
                 f"surface_layout={args.surface_layout}, surface_mode={args.surface_mode}"
             ),
             f"threads={args.threads if args.threads is not None else 'auto'}, strict={'yes' if args.strict else 'no'}",
             f"HDF5 requested target: {_compact_path_for_log(output_target)}",
-            "HDF5 actual target (append/fallback behavior): not inspected in dry-run",
+            "HDF5 target/schema compatibility: not inspected in dry-run",
             (
                 "dry-run behavior: inputs validated, no file contents inspected, "
                 "no compute executed, no file written"
@@ -17389,7 +17576,7 @@ def _handle_compute_potential(args: argparse.Namespace) -> int:
         LOGGER.info("Potential compute dry run finished in %.2f s.", perf_counter() - start)
         return 0
 
-    hdf5_plan_preview = plan_potential_csv_output(
+    hdf5_plan_preview = plan_potential_hdf5_output(
         output_target,
         append=args.append,
         overwrite=args.overwrite,
@@ -17406,14 +17593,90 @@ def _handle_compute_potential(args: argparse.Namespace) -> int:
         if source_label not in existing_sources
     ]
 
+    from .analysis.potential_reference import validate_config, build_reference_plan, serialize_config
+    window_plan = None
+    if args.window_plan:
+        window_plan = json.loads(Path(args.window_plan).read_text(encoding="utf-8"))
+    elif hdf5_plan_preview.mode == "a":
+        import h5py
+        with h5py.File(hdf5_plan_preview.target_path, "r") as handle:
+            raw_plan = handle.attrs.get("reference_plan_json")
+            if raw_plan:
+                window_plan = json.loads(str(raw_plan))
+    if args.bulk_window is not None and args.water_padding_ang is not None:
+        raise ValueError("--bulk-window and --water-padding-ang are mutually exclusive.")
+    fermi_map = None
+    if args.fermi_map:
+        import csv
+        map_path = Path(args.fermi_map).expanduser().resolve()
+        fermi_map = {}
+        with map_path.open(encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
+            if not {"source", "fermi_ev"}.issubset(reader.fieldnames or []):
+                raise ValueError("--fermi-map needs source,fermi_ev columns.")
+            for row in reader:
+                source_name, _, profile_index = row["source"].partition("::profile:")
+                source_path = Path(source_name).expanduser()
+                if not source_path.is_absolute():
+                    source_path = map_path.parent / source_path
+                key = str(source_path.resolve())
+                if profile_index and int(profile_index) != 0:
+                    key += f"::profile:{int(profile_index)}"
+                if key in fermi_map:
+                    raise ValueError(f"Duplicate source in Fermi map: {key}")
+                value = float(row["fermi_ev"])
+                if not math.isfinite(value):
+                    raise ValueError("Fermi map values must be finite eV energies.")
+                fermi_map[key] = value
     config = PotentialConfig(
-        water_padding_ang=args.water_padding_ang,
-        # The public CLI option follows the documented subtraction
-        # convention; PotentialConfig stores the signed additive correction.
-        cshe_offset_ev=-float(args.cshe_offset_ev),
-        surface_layout=args.surface_layout,
+        water_padding_ang=(args.water_padding_ang if args.water_padding_ang is not None
+                           else 0.0 if args.bulk_window is not None else 5.0),
+        cshe_offset_ev=float(args.cshe_offset_ev), surface_layout=args.surface_layout,
         surface_mode=args.surface_mode,
+        surface_elements=None if args.surface_elements is None else tuple(args.surface_elements),
+        boundary=args.z_boundary, bulk_window=None if args.bulk_window is None else tuple(args.bulk_window),
+        window_plan=window_plan, min_width_ang=args.min_window_width_ang,
+        min_grid_points=args.min_window_grid_points, density_bin_ang=args.water_density_bin_ang,
+        density_bandwidth_ang=args.water_density_bandwidth_ang,
+        min_water_density=args.min_water_density, max_gradient_ev_ang=args.max_reference_gradient,
+        max_std_ev=args.max_reference_std, max_range_ev=args.max_reference_range,
+        sensitivity_ang=args.sensitivity_ang, fermi_map=fermi_map,
+        snapshot_interval_fs=args.snapshot_interval_fs,
     )
+    if window_plan is not None:
+        selection_flags = {
+            "water_padding_ang": "--water-padding-ang", "bulk_window": "--bulk-window",
+            "boundary": "--z-boundary", "surface_layout": "--surface-layout",
+            "surface_mode": "--surface-mode",
+            "surface_elements": "--surface-elements", "density_bin_ang": "--water-density-bin-ang",
+            "density_bandwidth_ang": "--water-density-bandwidth-ang", "min_water_density": "--min-water-density",
+            "min_width_ang": "--min-window-width-ang",
+        }
+        tokens = tuple(getattr(args, "_runtime_argv", ()))
+        restored = {}
+        for name, flag in selection_flags.items():
+            explicit = any(token == flag or token.startswith(flag + "=") for token in tokens)
+            if not explicit and name in window_plan["parameters"]:
+                value = window_plan["parameters"][name]
+                restored[name] = tuple(value) if name in {"bulk_window", "surface_elements"} and value is not None else value
+        config = replace(config, **restored)
+    snapshot_start = 0
+    if hdf5_plan_preview.mode == "a":
+        import h5py
+        with h5py.File(hdf5_plan_preview.target_path, "r") as handle:
+            snapshot_start = len(handle["records/id"])
+            previous_config = handle.attrs.get("reference_config_json")
+            if previous_config is not None and str(previous_config) != serialize_config(config):
+                raise ValueError("Existing output uses different reference settings. Use --overwrite or a separate output.")
+        if fermi_map:
+            from .analysis.potential import load_potential_records
+            for record in load_potential_records(hdf5_plan_preview.target_path):
+                mapped = fermi_map.get(record.source)
+                if mapped is not None and (record.efermi_ev is None or not math.isclose(mapped, record.efermi_ev, rel_tol=0, abs_tol=1e-10)):
+                    raise ValueError("Fermi map changes an existing snapshot. Use --overwrite or a separate output.")
+    validate_config(config)
+    if config.window_plan is not None:
+        build_reference_plan([], config)
 
     if duplicate_sources:
         LOGGER.info("Skipping %d duplicate CLI input file(s).", len(duplicate_sources))
@@ -17427,39 +17690,25 @@ def _handle_compute_potential(args: argparse.Namespace) -> int:
             ),
         )
         LOGGER.debug("HDF5-existing source keys skipped: %s", skip_existing)
-    if hdf5_plan_preview.used_fallback_path:
-        LOGGER.warning(
-            "HDF5 target switched to fallback '%s'.",
-            _compact_path_for_log(hdf5_plan_preview.target_path),
-        )
-        LOGGER.debug("HDF5 fallback target path: %s", hdf5_plan_preview.target_path)
-
     if not sources_to_compute:
         LOGGER.info("No new input files to compute after pre-checks. HDF5 left unchanged.")
         LOGGER.info("Potential compute finished in %.2f s.", perf_counter() - start)
         return 0
 
-    with PotentialCsvAppender(
+    with PotentialHdf5Appender(
         output=output_target,
         append=args.append,
         overwrite=args.overwrite,
         sync_on_write=True,
         compression_profile=args.hdf5_compression,
-    ) as csv_appender:
-        if csv_appender.used_fallback_path and csv_appender.path != hdf5_plan_preview.target_path:
-            LOGGER.warning(
-                "HDF5 write fallback in use: '%s'.",
-                _compact_path_for_log(csv_appender.path),
-            )
-            LOGGER.debug("HDF5 appender fallback path: %s", csv_appender.path)
-
+    ) as hdf5_appender:
         def _persist_record(record: PotentialRecord) -> None:
-            csv_appender.append_record(record)
+            hdf5_appender.append_record(record)
 
         def _persist_failure(failure: PotentialComputationFailure) -> None:
             if not args.include_failures:
                 return
-            csv_appender.append_record(error_record_for_source(failure.source, failure.error))
+            hdf5_appender.append_record(error_record_for_source(failure.source, failure.error, config))
 
         records, failures = compute_potential_records(
             sources_to_compute,
@@ -17468,11 +17717,12 @@ def _handle_compute_potential(args: argparse.Namespace) -> int:
             memory_budget_mib=args.memory_budget_mib,
             on_record=_persist_record,
             on_failure=_persist_failure,
+            start_index=snapshot_start,
+            previous_sources=tuple(existing_sources),
         )
 
-        rows_written = csv_appender.rows_written
-        write_path = csv_appender.path
-        write_used_fallback = csv_appender.used_fallback_path
+        rows_written = hdf5_appender.rows_written
+        write_path = hdf5_appender.path
 
     if failures:
         for failure in failures:
@@ -17485,12 +17735,15 @@ def _handle_compute_potential(args: argparse.Namespace) -> int:
 
     if not records and not (args.include_failures and failures):
         raise ValueError("No potential records were produced for HDF5 export.")
-    if write_used_fallback:
-        LOGGER.warning(
-            "Used fallback HDF5 path for this run: '%s'.",
-            _compact_path_for_log(write_path),
-        )
-        LOGGER.debug("Write-result fallback path: %s", write_path)
+    if args.save_window_plan and records:
+        plan_path = Path(args.save_window_plan).expanduser().resolve()
+        plan_path.parent.mkdir(parents=True, exist_ok=True)
+        plan_path.write_text(records[0].reference_plan_json + "\n", encoding="utf-8")
+    if not args.no_diagnostics:
+        from .analysis.potential_diagnostics import plot_potential_diagnostics
+        diagnostic_path = args.diagnostics or str(write_path.with_suffix(".diagnostics.png"))
+        plot_potential_diagnostics(write_path, diagnostic_path)
+        LOGGER.info("Saved reference diagnostics to '%s'.", diagnostic_path)
 
     stats = summarize_potential_statistics(records)
     for key, label in (
@@ -17505,10 +17758,13 @@ def _handle_compute_potential(args: argparse.Namespace) -> int:
             LOGGER.info("%s avg+-std (n=%d): %.6f +- %.6f eV", label, count, mean, std)
 
     incomplete_count = sum(1 for record in records if not record.is_complete())
+    rejected_count = sum(1 for record in records if not record.reference_valid)
+    missing_fermi_count = sum(1 for record in records if record.efermi_ev is None)
     if incomplete_count:
         LOGGER.warning(
-            "Computed %d incomplete potential row(s) (missing E_Fermi and/or water bulk and/or cSHE).",
-            incomplete_count,
+            "Computed %d incomplete potential row(s): %d rejected water reference(s), "
+            "%d missing source-specific Fermi energy value(s). See per-record rejection reasons.",
+            incomplete_count, rejected_count, missing_fermi_count,
         )
 
     if not records:
@@ -17518,8 +17774,11 @@ def _handle_compute_potential(args: argparse.Namespace) -> int:
 
     if args.strict and (failures or incomplete_count):
         LOGGER.error(
-            "Strict mode enabled: failing run due to %d failure(s) and %d incomplete row(s).",
+            "Strict mode enabled: %d failure(s), %d rejected reference(s), "
+            "%d missing Fermi energy value(s); %d incomplete row(s).",
             len(failures),
+            rejected_count,
+            missing_fermi_count,
             incomplete_count,
         )
         LOGGER.info("Potential compute finished in %.2f s.", perf_counter() - start)
@@ -18176,6 +18435,37 @@ def _rewrite_implicit_csv_interactive(argv: list[str]) -> list[str]:
     return rewritten
 
 
+def _log_studio_session_end(analysis: str, started: float) -> None:
+    if preparing_session():
+        LOGGER.debug("%s Studio session prepared in %.3f s", analysis, perf_counter() - started)
+    else:
+        LOGGER.info(
+            "%s GUI plotting session finished in %.2f s", analysis, perf_counter() - started
+        )
+
+
+def _launch_studio(args: argparse.Namespace) -> int:
+    imports_started = perf_counter()
+    from .plot.plot_gui import launch_plot_settings_panel
+
+    LOGGER.debug("Studio GUI imports seconds=%.6f", perf_counter() - imports_started)
+
+    sources = [str(value) for value in _normalize_source_values(getattr(args, "source", None))]
+    sources += [str(value) for value in _normalize_source_values(getattr(args, "files", None))]
+    LOGGER.info("Opening LiNaK Studio...")
+    return (
+        launch_plot_settings_panel(
+            title="LiNaK Studio",
+            initial_settings={},
+            on_preview=lambda settings: None,
+            on_save=lambda name, settings: "",
+            session_loader=lambda: prepare_session(lambda: args.handler(deepcopy(args))),
+            startup_sources=sources,
+        )
+        or 0
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point used by the ``linak`` console script."""
     runtime_argv = list(argv) if argv is not None else sys.argv[1:]
@@ -18191,8 +18481,26 @@ def main(argv: list[str] | None = None) -> int:
         return int(exc.code or 0)
     args._runtime_argv = tuple(runtime_argv)
     configure_logging(level=args.log_level, log_file=args.log_file)
+    LOGGER.debug("Native thread bootstrap: %s", _NATIVE_THREAD_ENV_CONFIGURATION)
     _log_run_banner(args, runtime_argv)
     try:
+        if (args.handler is _handle_plot and not args.dry_run
+                and (getattr(args, "source", None) or getattr(args, "files", None))
+                and (args.gui if args.gui is not None else args.show)):
+            return _launch_studio(args)
+        if getattr(args, "command", None) == "compute" and hasattr(args, "threads"):
+            from .runtime_resources import detect_cpu_count
+            LOGGER.info("Compute CPU budget: %d CPU(s); worker limit=%s.", detect_cpu_count(),
+                        args.threads if args.threads is not None else "automatic")
+            started = perf_counter()
+            with computation(args.threads, args.memory_budget_mib) as execution:
+                try:
+                    return args.handler(args)
+                finally:
+                    LOGGER.debug("Compute execution report: %s", json.dumps({
+                        "seconds": perf_counter() - started,
+                        "timings": execution.timings, "stages": execution.stages,
+                    }))
         return args.handler(args)
     except Exception as exc:
         print(f"Error: {exc}", file=sys.stderr)

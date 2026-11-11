@@ -708,3 +708,7 @@ def test_conversion_cannot_replace_removed_substrate_with_fluid(tmp_path, capsys
     )
     assert not target.exists()
     assert "Pt" in capsys.readouterr().err
+
+
+# Callback tests receive a prepared session; startup itself is tested separately.
+pytestmark = pytest.mark.usefixtures("prepared_studio")

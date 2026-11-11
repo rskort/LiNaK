@@ -8,6 +8,8 @@ from typing import Any
 
 import numpy as np
 
+from .uncertainty import BlockData, frame_blocks
+
 _SERIES_STAT_SUFFIXES = (
     "point_count",
     "sample_n",
@@ -16,8 +18,20 @@ _SERIES_STAT_SUFFIXES = (
     "block_n",
     "block_std",
     "block_sem",
+    "sampling_unit",
+    "resampling_numerator",
+    "resampling_denominator",
+    "resampling_lengths",
+    "resampling_estimator",
+    "resampling_unit",
+    "resampling_timestep_fs",
+    "resampling_lengths_per_bin",
+    "resampling_independent_bins",
+    "resampling_groups",
+    "resampling_median_values",
+    "resampling_median_offsets",
 )
-_DEFAULT_ERROR_STAT = "sample_sem"
+_DEFAULT_ERROR_STAT = "block_ci"
 
 
 @dataclass(frozen=True)
@@ -31,6 +45,8 @@ class SeriesStatistics:
     block_n: np.ndarray | None = None
     block_std: np.ndarray | None = None
     block_sem: np.ndarray | None = None
+    resampling: BlockData | None = None
+    sampling_unit: str = "legacy observations (unit not recorded)"
 
 
 def statistics_suffixes() -> tuple[str, ...]:
@@ -74,7 +90,13 @@ def statistics_available_stats(stats: SeriesStatistics | None) -> list[str]:
     """Return the available error-stat identifiers for one statistics payload."""
     if stats is None:
         return []
-    available = ["sample_std", "sample_sem"]
+    available = (
+        []
+        if stats.resampling is not None and stats.resampling.groups is not None
+        else ["sample_std", "sample_sem"]
+    )
+    if stats.resampling is not None:
+        available.insert(0, "block_ci")
     if stats.block_std is not None and stats.block_sem is not None and stats.block_n is not None:
         available.extend(["block_std", "block_sem"])
     return available
@@ -85,7 +107,7 @@ def default_error_stat_for_statistics(stats: SeriesStatistics | None) -> str | N
     available = statistics_available_stats(stats)
     if not available:
         return None
-    return "block_sem" if "block_sem" in available else "sample_sem"
+    return "block_ci" if "block_ci" in available else None
 
 
 def build_statistics_metadata(
@@ -101,10 +123,23 @@ def build_statistics_metadata(
         for stats in statistics_by_series.values()
     )
     families = ["sample", "block"] if any_block else ["sample"]
+    bootstrap = [
+        stats.resampling for stats in statistics_by_series.values() if stats.resampling is not None
+    ]
+    if bootstrap:
+        families.append("block_bootstrap")
     metadata: dict[str, Any] = {
         "families": families,
-        "default_error_stat": "block_sem" if any_block else _DEFAULT_ERROR_STAT,
+        "default_error_stat": "block_ci",
+        "uncertainty_version": 1,
+        "bootstrap_defaults": {"confidence": 0.95, "resamples": 1000, "seed": 0},
     }
+    if bootstrap:
+        metadata["sampling_units"] = {
+            key: stats.sampling_unit for key, stats in statistics_by_series.items()
+        }
+        metadata["block_count"] = len(bootstrap[0].lengths)
+        metadata["block_lengths"] = bootstrap[0].lengths.tolist()
     if any_block and block_lengths is not None:
         lengths = [int(length) for length in block_lengths]
         metadata["block_count"] = len(lengths)
@@ -123,6 +158,7 @@ def statistics_payload_from_series_map(
         base = str(dataset_name).strip()
         if not base:
             continue
+        payload[f"{base}_sampling_unit"] = np.asarray(stats.sampling_unit.encode("utf-8"))
         payload[f"{base}_point_count"] = np.asarray(stats.point_count, dtype=int)
         payload[f"{base}_sample_n"] = np.asarray(stats.sample_n, dtype=int)
         payload[f"{base}_sample_std"] = np.asarray(stats.sample_std, dtype=float)
@@ -133,6 +169,28 @@ def statistics_payload_from_series_map(
             payload[f"{base}_block_std"] = np.asarray(stats.block_std, dtype=float)
         if stats.block_sem is not None:
             payload[f"{base}_block_sem"] = np.asarray(stats.block_sem, dtype=float)
+        if stats.resampling is not None:
+            data = stats.resampling
+            payload[f"{base}_resampling_numerator"] = data.numerator
+            payload[f"{base}_resampling_denominator"] = data.denominator
+            payload[f"{base}_resampling_lengths"] = data.lengths
+            payload[f"{base}_resampling_estimator"] = np.asarray(data.estimator.encode("utf-8"))
+            payload[f"{base}_resampling_unit"] = np.asarray(data.unit.encode("utf-8"))
+            if data.timestep_fs is not None:
+                payload[f"{base}_resampling_timestep_fs"] = np.asarray(data.timestep_fs)
+            if data.lengths_per_bin is not None:
+                payload[f"{base}_resampling_lengths_per_bin"] = data.lengths_per_bin
+                payload[f"{base}_resampling_independent_bins"] = np.asarray(data.independent_bins)
+            if data.groups is not None:
+                payload[f"{base}_resampling_groups"] = data.groups
+
+            if data.median_samples is not None:
+                rows = [values for block in data.median_samples for values in block]
+                payload[f"{base}_resampling_median_values"] = np.concatenate(rows)
+                payload[f"{base}_resampling_median_offsets"] = np.r_[
+                    0, np.cumsum([len(row) for row in rows])
+                ]
+
     return payload
 
 
@@ -182,7 +240,79 @@ def statistics_series_map_from_datasets(
             _validate_stat_shape("block_std", block_std, expected_shape=expected_shape)
         if block_sem is not None:
             _validate_stat_shape("block_sem", block_sem, expected_shape=expected_shape)
+        resampling = None
+        resampling_keys = [
+            f"{base}_resampling_{suffix}"
+            for suffix in ("numerator", "denominator", "lengths", "estimator", "unit")
+        ]
+        present = [key in datasets for key in resampling_keys]
+        if any(present) and not all(present):
+            raise ValueError(f"Incomplete uncertainty block data for {base}.")
+        if all(present):
+
+            def text_value(key):
+                value = np.asarray(datasets[key]).item()
+                return value.decode() if isinstance(value, bytes) else str(value)
+
+            median_samples = None
+            estimator = text_value(resampling_keys[3])
+            if estimator == "median":
+                values = np.asarray(
+                    datasets.get(f"{base}_resampling_median_values", []), dtype=float
+                )
+                offsets = np.asarray(
+                    datasets.get(f"{base}_resampling_median_offsets", []), dtype=int
+                )
+                shape = np.asarray(datasets[resampling_keys[0]]).shape
+                if (
+                    offsets.size != shape[0] * shape[1] + 1
+                    or offsets[0] != 0
+                    or offsets[-1] != values.size
+                    or np.any(np.diff(offsets) < 0)
+                ):
+                    raise ValueError("Invalid retained observations for median uncertainty.")
+                median_samples = tuple(
+                    tuple(
+                        values[offsets[b * shape[1] + k] : offsets[b * shape[1] + k + 1]]
+                        for k in range(shape[1])
+                    )
+                    for b in range(shape[0])
+                )
+            resampling = BlockData(
+                np.asarray(datasets[resampling_keys[0]], dtype=float),
+                np.asarray(datasets[resampling_keys[1]], dtype=float),
+                np.asarray(datasets[resampling_keys[2]], dtype=int),
+                estimator,
+                text_value(resampling_keys[4]),
+                median_samples=median_samples,
+                timestep_fs=None
+                if f"{base}_resampling_timestep_fs" not in datasets
+                else float(np.asarray(datasets[f"{base}_resampling_timestep_fs"])),
+                lengths_per_bin=None
+                if f"{base}_resampling_lengths_per_bin" not in datasets
+                else np.asarray(datasets[f"{base}_resampling_lengths_per_bin"], dtype=int),
+                independent_bins=bool(
+                    np.asarray(datasets.get(f"{base}_resampling_independent_bins", False))
+                ),
+                groups=None
+                if f"{base}_resampling_groups" not in datasets
+                else np.asarray(datasets[f"{base}_resampling_groups"], dtype=int),
+            )
+            count = (
+                resampling.numerator.shape[1]
+                if resampling.groups is None
+                else np.unique(resampling.groups[resampling.groups >= 0]).size
+            )
+            if count != point_count.size:
+                raise ValueError(f"Uncertainty block bin count does not match {base}.")
+        unit = np.asarray(
+            datasets.get(f"{base}_sampling_unit", "legacy observations (unit not recorded)")
+        ).item()
+        if isinstance(unit, bytes):
+            unit = unit.decode("utf-8")
         resolved[base] = SeriesStatistics(
+            sampling_unit=str(unit),
+            resampling=resampling,
             point_count=point_count,
             sample_n=sample_n,
             sample_std=sample_std,
@@ -236,6 +366,8 @@ def build_series_statistics(
         sample_n=sample_n,
         sample_std=sample_std,
         sample_sem=sample_sem,
+        resampling=frame_blocks(sample_values),
+        sampling_unit="frames",
     )
     if block_values is None:
         return stats
@@ -259,6 +391,7 @@ def build_series_statistics_from_moments(
     sample_sum: np.ndarray,
     sample_sumsq: np.ndarray,
     block_values: np.ndarray | None = None,
+    resampling: BlockData | None = None,
 ) -> SeriesStatistics:
     """Build persisted statistics from per-bin sample moments plus optional block means."""
     point_count_array = np.asarray(point_count, dtype=int)
@@ -289,6 +422,8 @@ def build_series_statistics_from_moments(
         sample_n=sample_n_array,
         sample_std=sample_std,
         sample_sem=sample_sem,
+        resampling=resampling,
+        sampling_unit="frames",
     )
     if block_values is None:
         return stats

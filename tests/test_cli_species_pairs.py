@@ -129,14 +129,64 @@ def test_pair_parser_rejects_incomplete_and_removed_flags(command, extra):
     assert error.value.code == 2
 
 
-@pytest.mark.parametrize("pair", [("mol:H", "Pt"), ("mol:OH", "element:O")])
-def test_dynamic_molecule_rdf_has_clear_error_before_read(tmp_path, monkeypatch, pair, capsys):
-    def unexpected_read(*args, **kwargs):
-        raise AssertionError("Unsupported selector should fail before reading the trajectory")
+@pytest.mark.parametrize("command", ["rdf", "cn"])
+def test_dynamic_molecule_pair_cli(pair_trajectory, tmp_path, command):
+    source, _ = pair_trajectory
+    output = tmp_path / ("molecular.rdf.h5" if command == "rdf" else "molecular.coordination.h5")
+    extra = ["--r-max", "4"] if command == "rdf" else ["--cutoff", "3", "--timestep-fs", "1"]
+    assert (
+        cli.main(
+            [
+                "compute",
+                command,
+                str(source),
+                "--species",
+                "Pt",
+                "mol:OH",
+                "--oh-cutoff",
+                "1.27",
+                "-o",
+                str(output),
+                *extra,
+            ]
+        )
+        == 0
+    )
+    profiles = load_rdf_profiles(output) if command == "rdf" else load_coordination_profiles(output)
+    assert len(profiles) == 1
+    assert {profiles[0].species_a, profiles[0].species_b} == {"Pt", "mol:OH"}
+    assert profiles[0].molecular_metadata["molecular_coordinate_mode"] == "center_of_mass"
 
-    monkeypatch.setattr(io, "read_trajectory", unexpected_read)
-    assert cli.main(["compute", "rdf", str(tmp_path / "input.traj.h5"), "--species", *pair]) == 1
-    assert "Dynamic molecule selector" in capsys.readouterr().err
+
+def test_reported_na_oh_command_and_alias_dedup(pair_trajectory, tmp_path):
+    source, frames = pair_trajectory
+    for frame in frames:
+        frame[0].symbol = "Na"
+    io.write_trajectory(frames, source)
+    output = tmp_path / "na_oh.rdf.h5"
+    assert (
+        cli.main(
+            [
+                "compute",
+                "rdf",
+                str(source),
+                "--species",
+                "Na",
+                "mol:OH",
+                "--species",
+                "OH",
+                "Na",
+                "--r-max",
+                "4",
+                "-o",
+                str(output),
+            ]
+        )
+        == 0
+    )
+    profiles = load_rdf_profiles(output)
+    assert len(profiles) == 1
+    assert (profiles[0].species_a, profiles[0].species_b) == ("Na", "mol:OH")
 
 
 def test_rdf_raw_label_pair_and_atom_pair(pair_trajectory, tmp_path):

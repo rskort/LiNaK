@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+from ..parallel import analysis_execution, timed_stage
+
+from ..plot.rendering import PlotFigure
+
 from collections.abc import Sequence
 
 from ..cell_geometry import (
@@ -91,6 +95,9 @@ from ..plot.plotting import (
 )
 from ..utils import axis_to_index, ensure_positive
 
+from .interface_alignment import (InterfaceReference, InterfaceReferenceCollector, alignment_metadata)
+from .uncertainty import time_step_fs
+
 LOGGER = logging.getLogger(__name__)
 DEFAULT_MIN_MOLECULE_FRAMES = 5
 _POSITION_PROJECTION_COMPONENT = "2d-projection"
@@ -144,6 +151,8 @@ class PositionProfile(ProfileCellGeometry):
     oh_cutoff_A: float | None = None
     min_molecule_frames: int | None = None
     oh_topology_stride: int | None = None
+    interface_reference: InterfaceReference | None = None
+    interface_alignment_metadata: dict[str, Any] | None = None
 
 
 def _frame_has_usable_cell(frame: Atoms) -> bool:
@@ -633,6 +642,7 @@ def _compute_position_profiles_for_labels(
         timestep_fs=timestep_fs,
     )
 
+    reference_collector = InterfaceReferenceCollector(surface_reference, len(frames))
     protect_substrate = surface_reference is not None and surface_reference.resolved_layout in {
         "single-top",
         "single-bottom",
@@ -665,6 +675,7 @@ def _compute_position_profiles_for_labels(
             desc="Selecting atom positions", total=len(frames), unit="frame"
         ) as progress:
             for frame_i, frame in enumerate(frames):
+                reference_collector.observe(frame_i, frame)
                 positions = np.asarray(frame.positions, dtype=float)
                 if frame_i == 0 and protect_substrate:
                     assert surface_reference is not None
@@ -731,13 +742,15 @@ def _compute_position_profiles_for_labels(
                     cell_pbc=cell_pbc,
                 )
             )
-        return profiles
+        interface_reference = reference_collector.finish()
+        return [replace(p, interface_reference=interface_reference) for p in profiles]
 
     counts_by_label: dict[str, np.ndarray] = {
         label: np.zeros(len(frames), dtype=int) for label in species_labels
     }
     max_counts_by_label: dict[str, int] = {label: 0 for label in species_labels}
     for frame_i, frame in enumerate(frames):
+        reference_collector.observe(frame_i, frame)
         frame_symbols = np.asarray(frame.get_chemical_symbols(), dtype=object)
         for species_label in species_labels:
             if species_label == "ALL":
@@ -850,7 +863,8 @@ def _compute_position_profiles_for_labels(
                 entity_counts_per_frame=np.asarray(counts_by_label[species_label], dtype=int),
             )
         )
-    return profiles
+    interface_reference = reference_collector.finish()
+    return [replace(p, interface_reference=interface_reference) for p in profiles]
 
 
 def _pad_molecule_position_frames(
@@ -932,6 +946,7 @@ def _compute_molecule_position_profiles_for_labels(
         precomputed_surface_estimate=precomputed_surface_estimate,
     )
 
+    reference_collector = InterfaceReferenceCollector(surface_reference, len(frames))
     requested_labels = list(dict.fromkeys(molecule_labels))
     topology_indices_by_frame: list[dict[str, np.ndarray]] = []
     counts_by_label: dict[str, np.ndarray] = {
@@ -950,6 +965,7 @@ def _compute_molecule_position_profiles_for_labels(
         desc="Selecting O/H molecules for position", total=len(frames), unit="frame"
     ) as progress:
         for frame_i, frame in enumerate(frames):
+            reference_collector.observe(frame_i, frame)
             topology = topology_cache.select(frame, frame_index=frame_i)
             frame_indices: dict[str, np.ndarray] = {}
             for label in requested_labels:
@@ -1060,9 +1076,11 @@ def _compute_molecule_position_profiles_for_labels(
                 oh_topology_stride=int(oh_topology_stride),
             )
         )
-    return profiles
+    interface_reference = reference_collector.finish()
+    return [replace(p, interface_reference=interface_reference) for p in profiles]
 
 
+@analysis_execution
 def compute_position_profile(
     frames: Sequence[Atoms],
     species: str | None = "all",
@@ -1079,6 +1097,8 @@ def compute_position_profile(
     min_molecule_frames: int = DEFAULT_MIN_MOLECULE_FRAMES,
     oh_topology_stride: int = H2O_VALIDATION_STRIDE,
     oh_topology_backend: str = "auto",
+    threads: int | None = 1,
+    memory_budget_mib: float | None = None,
 ) -> PositionProfile:
     """Compute one atom-resolved position profile."""
     selection_mode, species_label = _normalize_species_query(
@@ -1127,6 +1147,7 @@ def compute_position_profile(
     return profiles[0]
 
 
+@analysis_execution
 def compute_position_profiles(
     frames: Sequence[Atoms],
     species: str | None = "all",
@@ -1143,6 +1164,8 @@ def compute_position_profiles(
     min_molecule_frames: int = DEFAULT_MIN_MOLECULE_FRAMES,
     oh_topology_stride: int = H2O_VALIDATION_STRIDE,
     oh_topology_backend: str = "auto",
+    threads: int | None = 1,
+    memory_budget_mib: float | None = None,
 ) -> list[PositionProfile]:
     """Compute one or more atom-resolved position profiles."""
     ensure_positive("oh_cutoff", oh_cutoff)
@@ -1299,7 +1322,9 @@ def _position_profile_hdf5_payload(profile: PositionProfile) -> dict[str, Any]:
             ),
         },
     )
+    metadata.update(alignment_metadata(profile.interface_reference))
     return {
+        "interface_reference": profile.interface_reference,
         "datasets": {
             **profile_geometry_datasets(profile),
             "frame_index": profile.frame_index,
@@ -1344,6 +1369,7 @@ def save_position_profile(
         output,
         analysis="position",
         datasets=payload["datasets"],
+        interface_references=[payload.get("interface_reference")],
         metadata=metadata,
         compression_profile=compression_profile,
     )
@@ -1465,7 +1491,9 @@ def _merge_position_profiles(
         payload["metadata"].update(dict(additional_metadata or {}))
     try:
         _source, stored = read_profile_payloads(output_path, analysis="position", label="Position")
-        existing = [{"datasets": dict(data), "metadata": dict(meta)} for data, meta in stored]
+        existing: list[dict[str, Any]] = [{"datasets": dict(data), "metadata": dict(meta),
+                     "interface_reference": InterfaceReference.from_metadata(meta, output_path)}
+                    for data, meta in stored]
         error = _position_collection_compatibility_error(existing, incoming)
     except (OSError, ValueError, KeyError, TypeError) as exc:
         error = str(exc)
@@ -1513,6 +1541,7 @@ def _merge_position_profiles(
     return output_path
 
 
+@timed_stage("writing")
 def save_position_profiles(
     profiles: list[PositionProfile],
     output: str | Path,
@@ -1800,6 +1829,7 @@ def _load_position_profiles_from_payloads(
         surface_metadata = _surface_metadata_view(metadata)
         profiles.append(
             PositionProfile(
+                interface_reference=InterfaceReference.from_metadata(metadata, source_path),
                 species=resolved_species,
                 axis=resolved_axis,
                 atom_indices=atom_indices,
@@ -2529,7 +2559,7 @@ def _plot_position_xy_z_projection(
         rc_context_args.update(dict(matplotlib_rc))
 
     with plt.rc_context(rc_context_args):
-        fig, ax = plt.subplots(figsize=style.figure_size)
+        fig, ax = plt.subplots(figsize=style.figure_size, FigureClass=PlotFigure)
         if figure_kwargs is not None:
             fig.set(**dict(figure_kwargs))
 
@@ -2940,6 +2970,7 @@ def _plot_position_projection(
     color_scale_point_values: list[float] = []
     visible_x_values: list[float] = []
     visible_y_values: list[float] = []
+    projection_export: list[dict[str, Any]] = []
     line_series_payloads: list[dict[str, Any]] = []
     line_series_labels: list[str] = []
     value_label_reference: str | None = None
@@ -3118,6 +3149,20 @@ def _plot_position_projection(
             if not np.any(visible_mask):
                 continue
 
+            if capture_state is not None:
+                breaks = np.zeros(len(visible_mask), dtype=bool)
+                breaks[0] = True
+                breaks[1:] = ~visible_mask[:-1]
+                if profile.periodic_crossings is not None:
+                    breaks |= profile.periodic_crossings[:, atom_column]
+                projection_export.append({
+                    "series_id": str(option_index),
+                    "series_label": descriptor_label,
+                    "atom_index": int(profile.atom_indices[atom_column]),
+                    "samples": np.column_stack((profile.frame_index[visible_mask], profile.time_ps[visible_mask],
+                        x_values[visible_mask], y_values[visible_mask], value_values[visible_mask], breaks[visible_mask])),
+                })
+
             visible_x = np.asarray(x_values[visible_mask], dtype=float)
             visible_y = np.asarray(y_values[visible_mask], dtype=float)
             visible_values = np.asarray(value_values[visible_mask], dtype=float)
@@ -3233,7 +3278,7 @@ def _plot_position_projection(
     isolated_point_size = max(1.0, float(resolved_projection_line_width) ** 2)
 
     with plt.rc_context(rc_context_args):
-        fig, ax = plt.subplots(figsize=style.figure_size)
+        fig, ax = plt.subplots(figsize=style.figure_size, FigureClass=PlotFigure)
         if figure_kwargs is not None:
             fig.set(**dict(figure_kwargs))
 
@@ -3481,6 +3526,9 @@ def _plot_position_projection(
                     ),
                     "legend_loc": legend_loc,
                     "annotations_summary": annotation_summaries,
+                    "plotted_projection": projection_export,
+                    "interface_alignments": {p.interface_reference.reference_id: p.interface_alignment_metadata
+                        for p in profiles if p.interface_reference and p.interface_alignment_metadata},
                     "projection_x": resolved_projection_x,
                     "projection_y": resolved_projection_y,
                     "projection_value": resolved_projection_value,
@@ -3565,6 +3613,22 @@ def _position_profile_for_interface_view(
     )
 
 
+def _aligned_position_profiles(profiles, interface_alignments, interface_view, component, projection_x, projection_y):
+    if not interface_alignments or str(interface_view).strip().lower() == "full" or _normalize_component_token(component) != "2d-projection":
+        return profiles
+    from .interface_alignment import alignment_for_reference, align_position_profile
+
+    result = []
+    for profile in profiles:
+        alignment = alignment_for_reference(profile.interface_reference, interface_alignments)
+        if alignment is not None:
+            if profile.axis in (str(projection_x or "x").strip().lower(), str(projection_y or "y").strip().lower()):
+                raise ValueError("Choose Distance for the interface-normal axis when using interface alignment.")
+            profile = align_position_profile(profile, alignment)
+        result.append(profile)
+    return result
+
+
 def plot_position_profile(
     profile: PositionProfile,
     output: str | Path | None = None,
@@ -3580,6 +3644,7 @@ def plot_position_profile(
     map_color: str = "distance",
     time_axis: str = "ps",
     interface_view: str = "folded",
+    interface_alignments: Mapping[str, Any] | None = None,
     title: str | None = None,
     x_label: str | None = None,
     y_label: str | None = None,
@@ -3658,6 +3723,17 @@ def plot_position_profile(
     projection_filter_max: float | None = None,
     xy_z_distance_max: float | None = None,
 ) -> Path | None:
+    alignment_x: str | None
+    alignment_y: str | None
+    if view_mapping is not None:
+        aligned_mapping = resolve_position_plot_mapping(mapping=view_mapping, component=component,
+            projection_x=projection_x, projection_y=projection_y)
+        alignment_component = str(aligned_mapping.renderer_options.get("component") or component)
+        alignment_x = aligned_mapping.renderer_options.get("projection_x")
+        alignment_y = aligned_mapping.renderer_options.get("projection_y")
+    else:
+        alignment_component, alignment_x, alignment_y = str(component or "distance"), projection_x, projection_y
+    profile = _aligned_position_profiles([profile], interface_alignments, interface_view, alignment_component, alignment_x, alignment_y)[0]
     normalized_interface_view = str(interface_view).strip().lower()
     if normalized_interface_view == "all":
         raise ValueError(
@@ -3836,6 +3912,7 @@ def plot_position_profile(
             fit_config=None if not series_fit_configs else series_fit_configs[0],
             cumulative_config=cumulative_config,
             raw_point_statistics=True,
+            frame_timestep_fs=time_step_fs(profile.time_fs),
             error_config=error_config,
             normalization_mode=single_series.normalization_mode,
             normalization_value=single_series.normalization_value,
@@ -3902,6 +3979,7 @@ def plot_position_profile(
             [error_config] * matrix.shape[1] if error_config is not None else None
         ),
         series_raw_statistics=[True] * matrix.shape[1],
+        series_frame_timestep_fs=[time_step_fs(profile.time_fs)] * matrix.shape[1],
         series_line_kwargs=series_line_kwargs,
         series_normalization_modes=series_normalization_modes,
         series_normalization_values=series_normalization_values,
@@ -3963,6 +4041,7 @@ def plot_position_profiles(
     map_color: str = "distance",
     time_axis: str = "ps",
     interface_view: str = "folded",
+    interface_alignments: Mapping[str, Any] | None = None,
     title: str | None = None,
     x_label: str | None = None,
     y_label: str | None = None,
@@ -4040,6 +4119,17 @@ def plot_position_profiles(
     projection_filter_max: float | None = None,
     xy_z_distance_max: float | None = None,
 ) -> Path | None:
+    alignment_x: str | None
+    alignment_y: str | None
+    if view_mapping is not None:
+        aligned_mapping = resolve_position_plot_mapping(mapping=view_mapping, component=component,
+            projection_x=projection_x, projection_y=projection_y)
+        alignment_component = str(aligned_mapping.renderer_options.get("component") or component)
+        alignment_x = aligned_mapping.renderer_options.get("projection_x")
+        alignment_y = aligned_mapping.renderer_options.get("projection_y")
+    else:
+        alignment_component, alignment_x, alignment_y = str(component or "distance"), projection_x, projection_y
+    profiles = _aligned_position_profiles(profiles, interface_alignments, interface_view, alignment_component, alignment_x, alignment_y)
     normalized_interface_view = str(interface_view).strip().lower()
     if normalized_interface_view not in {"full", "folded", "top", "bottom", "all"}:
         raise ValueError("interface_view must be full, folded, top, bottom, or all.")
@@ -4331,6 +4421,9 @@ def plot_position_profiles(
         series_cumulative_configs=series_cumulative_configs,
         series_error_configs=series_error_configs,
         series_raw_statistics=[True] * len(labels),
+        series_frame_timestep_fs=[
+            time_step_fs(p.time_fs) for p in profiles for _ in range(p.n_atoms)
+        ],
         series_normalization_modes=series_normalization_modes,
         series_normalization_values=series_normalization_values,
         series_normalization_x_refs=series_normalization_x_refs,

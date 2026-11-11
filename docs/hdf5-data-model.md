@@ -285,7 +285,7 @@ enough to use distance-to-surface coordinates.
 ## Current-Schema Loading
 
 Readers validate each analysis's current schema before loading its payload:
-density, position, coordination, orientation, and potential tables use v2;
+density, position, coordination and orientation use v2; potential uses v3;
 RDF and temperature use v1. A different version or missing required data produces an actionable
 recomputation error. No analysis files are automatically migrated or rewritten.
 
@@ -329,3 +329,37 @@ not just say "here are some numbers." It should also say:
 - [Potential](potential.md)
 - [Orientation](orientation.md)
 - [Surface Estimation](surface-estimation.md)
+
+## Molecular pair analyses
+
+RDF schema v1 and coordination schema v2 support dynamic molecular selectors
+through additive profile metadata. `selection_kind_a/b` and `entity_kind_a/b`
+distinguish atom selections from molecular entities. Molecular profiles record
+`molecular_coordinate_mode=center_of_mass`, `oh_cutoff_A`,
+`oh_topology_backend`, `molecular_classifier`, and `pair_exclusion=shared_members`.
+RDF collections require compatible molecular classification and exclusion
+policies; molecular coordination cutoff references are checked against them.
+
+For molecular coordination centers, `center_tracking=anchor_atom` and
+`atom_indices_role=molecular_anchor` identify oxygen anchors (hydrogen for
+`mol:H`). `atom_indices` is the sorted union of anchors ever selected;
+`n_entities` and the compatibility field `n_atoms` count these columns. An
+inactive anchor has NaN coordinates and coordination. An active anchor with
+no eligible neighbors has zero coordination. Atom-only files remain readable
+without these fields. Topology membership remains in the existing trajectory
+cache; pair analyses calculate molecular centers from current geometry.
+
+## Uncertainty statistics
+
+Existing analysis schemas support additive estimator-aware uncertainty data.
+Per-series `<quantity>_resampling_*` datasets retain temporal block numerators,
+denominators, lengths, estimator, and observation unit. They use float64 for
+floating sufficient statistics, independently of float32 display coordinates.
+Optional fields retain per-window block lengths, known frame intervals, spatial
+rebin groups, and raw within-block observations for median resampling.
+`<quantity>_sampling_unit` identifies what the sample counts represent.
+
+The `statistics` metadata records `uncertainty_version=1`, available families,
+and bootstrap defaults (95% confidence, 1000 resamples, seed 0). Old profiles
+remain readable without these fields. Missing block data disables the requested
+confidence interval with a recomputation message; sample SEM is not substituted.

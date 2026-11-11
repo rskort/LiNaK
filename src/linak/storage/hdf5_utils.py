@@ -122,6 +122,7 @@ def _atomic_hdf5_target(output_path: Path):
     )
     try:
         yield temporary_path
+        check_cancelled()
         os.replace(temporary_path, output_path)
     finally:
         try:
@@ -139,6 +140,7 @@ def _create_policy_dataset(
     compression_profile: str,
 ) -> Any:
     """Create one policy dataset without materializing a full dtype-conversion copy."""
+    check_cancelled()
 
     source = np.asarray(values)
     target_dtype = storage_dtype(analysis=analysis, name=str(name), dtype=source.dtype)
@@ -160,6 +162,7 @@ def _create_policy_dataset(
     if dataset.chunks:
         rows_per_write = max(1, int(dataset.chunks[0]))
     for start in range(0, source.shape[0], rows_per_write):
+        check_cancelled()
         stop = min(start + rows_per_write, source.shape[0])
         dataset[start:stop] = source[start:stop]
     return dataset
@@ -278,6 +281,7 @@ def write_linak_hdf5(
     datasets: Mapping[str, np.ndarray | list[float] | tuple[float, ...] | None],
     metadata: Mapping[str, Any] | None = None,
     compression_profile: str = DEFAULT_COMPRESSION_PROFILE,
+    interface_references: Sequence[Any] = (),
 ) -> Path:
     """Write a LiNaK HDF5 analysis file."""
     require_h5py()
@@ -304,6 +308,11 @@ def write_linak_hdf5(
         handle.attrs["compression_profile"] = resolved_compression
         handle.attrs["storage_precision_policy"] = STORAGE_PRECISION_POLICY
         handle.attrs["metadata_json"] = metadata_json
+
+        if interface_references:
+            from ..analysis.interface_alignment import write_interface_references
+
+            write_interface_references(handle, interface_references)
 
         for name, values in datasets.items():
             if values is None:
@@ -663,6 +672,9 @@ def write_linak_hdf5_profile_collection(
         handle.attrs["metadata_json"] = json.dumps(_json_ready(root_metadata), sort_keys=True)
 
         profiles_group = handle.require_group(_COLLECTION_GROUP)
+        from ..analysis.interface_alignment import write_interface_references
+
+        write_interface_references(handle, [p.get("interface_reference") for p in profiles])
         for index, payload in enumerate(profiles):
             datasets = payload.get("datasets")
             if not isinstance(datasets, Mapping):

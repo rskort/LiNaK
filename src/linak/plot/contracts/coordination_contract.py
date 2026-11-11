@@ -25,6 +25,7 @@ def _coordination_contract(
     coordinate_mode: str,
     frame_length: int | None,
     atom_length: int | None,
+    molecular_centers: bool = False,
 ) -> PlotDataContract:
     dimensions = (
         PlotDimension(
@@ -36,7 +37,7 @@ def _coordination_contract(
         ),
         PlotDimension(
             id="atom",
-            label="Atom",
+            label="Molecule" if molecular_centers else "Atom",
             kind="entity_index",
             length=None if atom_length is None else int(atom_length),
             unit="index",
@@ -78,7 +79,7 @@ def _coordination_contract(
         ),
         PlotQuantity(
             id="atom_index",
-            label="Atom index",
+            label="Molecule anchor atom index" if molecular_centers else "Atom index",
             kind="entity_index",
             dimensions=("atom",),
             unit="index",
@@ -164,4 +165,7 @@ def coordination_profile_to_plot_data_contract(profile: CoordinationProfile) -> 
         coordinate_mode=str(profile.coordinate_mode),
         frame_length=int(profile.n_frames),
         atom_length=int(profile.n_atoms),
+        molecular_centers=bool(
+            (profile.molecular_metadata or {}).get("entity_kind_a") == "molecule"
+        ),
     )

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from ..plot.rendering import PlotFigure
+
 from ..plot.settings_validation import validate_source_descriptor
 
 from ..cell_geometry import ProfileCellGeometry, profile_geometry_datasets
@@ -9,6 +11,8 @@ from ..cell_geometry import ProfileCellGeometry, profile_geometry_datasets
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from itertools import islice
+from ..parallel import analysis_execution, batches, bounded_map, frame_batch_size, stage_workers, timed_stage
+from ..runtime_resources import MIB, resolve_resource_policy
 import logging
 from pathlib import Path
 from typing import Any
@@ -46,7 +50,6 @@ from .common import (
     frame_has_usable_cell as _common_frame_has_usable_cell,
     grouped_raw_species_for_split_elements,
     is_molecule_species_label,
-    normalize_species_label as _normalize_species,
     optional_cell_lengths as _optional_cell_lengths,
     optional_finite_float as _optional_finite_float,
     read_profile_payloads,
@@ -82,6 +85,27 @@ from .rdf import (
     _canonical_rdf_pair,
 )
 from .schema import build_profile_metadata
+
+from .entities import (
+    EntityResolver,
+    entity_distances,
+    is_molecular,
+    pair_label,
+    molecule_metadata,
+    read_molecule_metadata,
+)
+from .position import (
+    PositionProfile,
+    _distance_components_for_axis_matrix,
+    _position_surface_context,
+    _position_time_arrays,
+    _position_cell_arrays,
+    _resolve_cell_lengths_from_frames,
+)
+
+from .uncertainty import time_step_fs
+
+_normalize_species = pair_label
 
 LOGGER = logging.getLogger(__name__)
 _DEFAULT_DISTANCE_BIN_WIDTH_A = 0.25
@@ -156,6 +180,7 @@ class CoordinationProfile(ProfileCellGeometry):
     cutoff_rdf_sampled_frame_index: np.ndarray | None = None
     cutoff_rdf_source_path: str | None = None
     cutoff_diagnostic_plot_path: str | None = None
+    molecular_metadata: dict[str, Any] | None = None
 
 
 def _frame_has_usable_cell(frame: Atoms) -> bool:
@@ -439,6 +464,8 @@ def _compute_reference_rdf_pairs(
     pairs: Sequence[tuple[str, str]],
     r_max: float | None,
     bin_width: float,
+    oh_cutoff: float = 1.27,
+    oh_topology_backend: str = "auto",
 ) -> dict[tuple[str, str], tuple[np.ndarray, np.ndarray]]:
     """Compute full-trajectory reference RDF curves for one or more physical pairs."""
     if not frames:
@@ -464,6 +491,8 @@ def _compute_reference_rdf_pairs(
         r_max=r_max,
         bin_width=float(bin_width),
         progress_desc="Coordination cutoff RDF",
+        oh_cutoff=oh_cutoff,
+        oh_topology_backend=oh_topology_backend,
     )
     if accumulated_pairs != unique_pairs:
         raise ValueError("Full coordination RDF accumulation changed pair ordering.")
@@ -675,7 +704,7 @@ def _save_cutoff_diagnostic_plot(
     output_path = Path(output).expanduser().resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    fig, ax = plt.subplots(figsize=DEFAULT_PLOT_STYLE.figure_size)
+    fig, ax = plt.subplots(figsize=DEFAULT_PLOT_STYLE.figure_size, FigureClass=PlotFigure)
     ax.plot(bin_centers_A, g_r, label="RDF", color="#4c6a92", lw=1.6)
     ax.plot(bin_centers_A, g_r_smoothed, label="Smoothed RDF", color="#d07b29", lw=2.2)
     ax.axvline(minimum_A, color="#b22222", linestyle="--", lw=1.5, label="Cutoff")
@@ -718,6 +747,7 @@ def _save_cutoff_diagnostic_plot(
     return output_path
 
 
+@analysis_execution
 def resolve_coordination_cutoff(
     *,
     frames: Sequence[Atoms],
@@ -728,12 +758,18 @@ def resolve_coordination_cutoff(
     cutoff_from_rdf: bool,
     cutoff_smoothing_width_A: float = _DEFAULT_CUTOFF_SMOOTHING_WIDTH_A,
     diagnostic_plot_output: str | Path | None = None,
+    oh_cutoff: float = 1.27,
+    oh_topology_backend: str = "auto",
+    threads: int | None = 1,
+    memory_budget_mib: float | None = None,
 ) -> CoordinationCutoffResolution:
     label_a = _normalize_species(species_a)
     label_b = _normalize_species(species_b if species_b is not None else species_a)
     resolutions = resolve_coordination_cutoffs(
         frames=frames,
         ordered_pairs=[(label_a, label_b)],
+        oh_cutoff=oh_cutoff,
+        oh_topology_backend=oh_topology_backend,
         cutoff_A=cutoff_A,
         cutoff_rdf_path=cutoff_rdf_path,
         cutoff_from_rdf=cutoff_from_rdf,
@@ -745,6 +781,7 @@ def resolve_coordination_cutoff(
     return resolutions[(label_a, label_b)]
 
 
+@analysis_execution
 def resolve_coordination_cutoffs(
     *,
     frames: Sequence[Atoms],
@@ -754,6 +791,10 @@ def resolve_coordination_cutoffs(
     cutoff_from_rdf: bool,
     cutoff_smoothing_width_A: float = _DEFAULT_CUTOFF_SMOOTHING_WIDTH_A,
     diagnostic_plot_outputs: Mapping[tuple[str, str], str | Path] | None = None,
+    oh_cutoff: float = 1.27,
+    oh_topology_backend: str = "auto",
+    threads: int | None = 1,
+    memory_budget_mib: float | None = None,
 ) -> dict[tuple[str, str], CoordinationCutoffResolution]:
     cutoff_smoothing_width_A = _ensure_nonnegative(
         "cutoff_smoothing_width_A", cutoff_smoothing_width_A
@@ -792,6 +833,21 @@ def resolve_coordination_cutoffs(
                 species_a=physical_pair[0],
                 species_b=physical_pair[1],
             )
+            if any(is_molecular(label) for label in physical_pair):
+                expected_metadata = molecule_metadata(
+                    *physical_pair, oh_cutoff, oh_topology_backend
+                )
+                actual_metadata = rdf_profile.molecular_metadata or {}
+                for key in (
+                    "molecular_coordinate_mode",
+                    "oh_cutoff_A",
+                    "molecular_classifier",
+                    "pair_exclusion",
+                ):
+                    if actual_metadata.get(key) != expected_metadata[key]:
+                        raise ValueError(
+                            f"Coordination cutoff RDF has incompatible molecular selection metadata: {key}."
+                        )
             smoothed, peak_A, minimum_A, minimum_g_r = _resolve_cutoff_from_rdf_curve(
                 bin_centers_A=np.asarray(rdf_profile.bin_centers, dtype=float),
                 g_r=np.asarray(rdf_profile.g_r, dtype=float),
@@ -860,6 +916,8 @@ def resolve_coordination_cutoffs(
         pairs=unique_physical_pairs,
         r_max=None,
         bin_width=float(_DEFAULT_RDF_BIN_WIDTH_A),
+        oh_cutoff=oh_cutoff,
+        oh_topology_backend=oh_topology_backend,
     )
     resolved_by_ordered_pair = {}
     for pair in normalized_pairs:
@@ -1279,54 +1337,68 @@ def _compute_coordination_values_chunked(
     neighbor_count = int(selection_cache.neighbor_count)
     pair_count = int(selection_cache.pair_count)
     chunk_size = _resolve_coordination_chunk_size(frame_count=frame_count, pair_count=pair_count)
+    chunk_size = min(frame_batch_size(pair_count * 64), chunk_size)
     use_mic = bool(frames) and all(_frame_has_usable_cell(frame) for frame in frames)
 
-    coordination = working_array((frame_count, center_count), dtype=np.float32, fill=0)
-    with ProgressBar(
-        desc=f"Computing coordination ({center_count}x{neighbor_count})",
-        total=frame_count,
-        unit="frame",
-    ) as progress:
-        frame_iterator = iter(frames)
+    tile_bytes = min(32 * MIB, max(64, resolve_resource_policy().memory_budget_bytes // 8))
+    workers = stage_workers('coordination.distances', (frame_count + chunk_size - 1) // chunk_size,
+                            bytes_per_task=max(MIB, min(tile_bytes, pair_count * chunk_size * 64)))
+
+    def compute_chunk(item):
+        start, frame_chunk = item
+        center_positions = np.stack(
+            [np.asarray(frame.positions[center_indices], dtype=float) for frame in frame_chunk],
+            axis=0,
+        )
+        neighbor_positions = np.stack(
+            [
+                np.asarray(frame.positions[neighbor_indices], dtype=float)
+                for frame in frame_chunk
+            ],
+            axis=0,
+        )
+        result = np.zeros((len(frame_chunk), center_count), dtype=float)
+        max_pairs = max(1, tile_bytes // (64 * len(frame_chunk)))
+        neighbor_block = max(1, min(neighbor_count, max_pairs))
+        center_block = max(1, min(center_count, max_pairs // neighbor_block))
+        if use_mic:
+            cell_lengths = np.stack([np.asarray(np.diag(frame.cell.array), dtype=float)
+                                     for frame in frame_chunk])
+        for center_start in range(0, center_count, center_block):
+            center_stop = min(center_count, center_start + center_block)
+            for neighbor_start in range(0, neighbor_count, neighbor_block):
+                neighbor_stop = min(neighbor_count, neighbor_start + neighbor_block)
+                deltas = (center_positions[:, center_start:center_stop, None, :]
+                          - neighbor_positions[:, None, neighbor_start:neighbor_stop, :])
+                if use_mic:
+                    deltas -= cell_lengths[:, None, None, :] * np.round(deltas / cell_lengths[:, None, None, :])
+                distances = np.linalg.norm(deltas, axis=3)
+                if selection_cache.same_selection:
+                    first = max(center_start, neighbor_start)
+                    last = min(center_stop, neighbor_stop)
+                    diagonal = np.arange(first, last)
+                    distances[:, diagonal - center_start, diagonal - neighbor_start] = np.inf
+                weights = _continuous_coordination_weights(distances, cutoff_A=float(cutoff_A),
+                                                           smoothing_width_A=float(smoothing_width_A))
+                result[:, center_start:center_stop] += np.sum(weights, axis=2, dtype=float)
+        result = result.astype(np.float32)
+        return start, result
+
+    def inputs():
+        iterator = iter(frames)
         for start in range(0, frame_count, chunk_size):
-            stop = min(frame_count, start + chunk_size)
-            frame_chunk = list(islice(frame_iterator, stop - start))
-            if len(frame_chunk) != stop - start:
+            size = min(chunk_size, frame_count - start)
+            chunk = list(islice(iterator, size))
+            if len(chunk) != size:
                 raise ValueError("Trajectory ended while computing chunked coordination values.")
-            center_positions = np.stack(
-                [np.asarray(frame.positions[center_indices], dtype=float) for frame in frame_chunk],
-                axis=0,
-            )
-            neighbor_positions = np.stack(
-                [
-                    np.asarray(frame.positions[neighbor_indices], dtype=float)
-                    for frame in frame_chunk
-                ],
-                axis=0,
-            )
-            deltas = center_positions[:, :, np.newaxis, :] - neighbor_positions[:, np.newaxis, :, :]
-            if use_mic:
-                cell_lengths = np.stack(
-                    [np.asarray(np.diag(frame.cell.array), dtype=float) for frame in frame_chunk],
-                    axis=0,
-                )
-                deltas -= cell_lengths[:, np.newaxis, np.newaxis, :] * np.round(
-                    deltas / cell_lengths[:, np.newaxis, np.newaxis, :]
-                )
-            distances = np.linalg.norm(deltas, axis=3)
-            if selection_cache.same_selection:
-                diagonal = np.arange(center_count, dtype=int)
-                distances[:, diagonal, diagonal] = np.inf
-            weights = _continuous_coordination_weights(
-                distances,
-                cutoff_A=float(cutoff_A),
-                smoothing_width_A=float(smoothing_width_A),
-            )
-            coordination[start:stop, :] = np.sum(weights, axis=2, dtype=float).astype(
-                np.float32,
-                copy=False,
-            )
-            progress.update(stop - start)
+            yield start, chunk
+
+    coordination = working_array((frame_count, center_count), dtype=np.float32, fill=0)
+    with ProgressBar(desc=f"Computing coordination ({center_count}x{neighbor_count})",
+                     total=frame_count, unit='frame') as progress:
+        for start, result in bounded_map(compute_chunk, inputs(), workers=workers, stage='coordination.distances'):
+            coordination[start:start + len(result)] = result
+            progress.update(len(result))
     return coordination
 
 
@@ -1336,69 +1408,109 @@ def _compute_coordination_profile_from_position_profile(
     position_profile: Any,
     species_b: str,
     cutoff_resolution: CoordinationCutoffResolution,
+    oh_cutoff: float = 1.27,
+    oh_topology_backend: str = "auto",
+    entity_frames: list[dict] | None = None,
 ) -> CoordinationProfile:
     """Compute one coordination profile reusing a precomputed center position profile."""
     label_a = _normalize_species(str(position_profile.species))
     label_b = _normalize_species(species_b)
 
-    selection_cache = _build_coordination_selection_cache(
-        frame=frames[0],
-        center_species=label_a,
-        neighbor_species=label_b,
-        center_indices=np.asarray(position_profile.atom_indices, dtype=int),
-    )
-    center_indices = selection_cache.center_indices
-    center_count = int(selection_cache.center_count)
-    neighbor_count = int(selection_cache.neighbor_count)
-    pair_count = int(selection_cache.pair_count)
-    if _can_vectorize_coordination_kernel(frames, pair_count=pair_count):
-        backend = _COORD_BACKEND_DENSE
-        coordination = _compute_coordination_values_chunked(
-            frames,
-            selection_cache=selection_cache,
-            cutoff_A=float(cutoff_resolution.cutoff_A),
-            smoothing_width_A=float(cutoff_resolution.smoothing_width_A),
-        )
-    else:
-        backend = (
-            _COORD_BACKEND_NEIGHBOR
-            if bool(frames) and all(_frame_has_usable_cell(frame) for frame in frames)
-            else _COORD_BACKEND_GENERIC
-        )
-        coordination = working_array(
-            (len(frames), center_count),
-            dtype=np.float32,
-            fill=0,
-        )
-        with ProgressBar(
-            desc=f"Computing coordination ({center_count}x{neighbor_count})",
-            total=len(frames),
-            unit="frame",
-        ) as progress:
-            for frame_index, frame in enumerate(frames):
-                coordination[frame_index, :] = _compute_coordination_frame_values(
-                    frame,
-                    selection_cache=selection_cache,
+    molecular = is_molecular(label_a) or is_molecular(label_b)
+    if molecular:
+        resolver = EntityResolver(oh_cutoff=oh_cutoff, oh_topology_backend=oh_topology_backend)
+        center_indices = np.asarray(position_profile.atom_indices, dtype=int)
+        center_count = len(center_indices)
+        coordination = np.full((len(frames), center_count), np.nan)
+        workers = stage_workers('coordination.distances', (len(frames) + 15) // 16,
+                                 bytes_per_task=max(8 * 1024 * 1024, len(frames[0]) ** 2 * 64))
+        def molecular_batch(chunk):
+            result = []
+            for frame_index, frame in chunk:
+                entities = (
+                    entity_frames[frame_index]
+                    if entity_frames is not None
+                    else resolver.select(frame, [label_a, label_b], frame_index)
+                )
+                centers, neighbors = entities[label_a], entities[label_b]
+                distances, eligible = entity_distances(frame, centers, neighbors)
+                weights = _continuous_coordination_weights(
+                    distances,
                     cutoff_A=float(cutoff_resolution.cutoff_A),
                     smoothing_width_A=float(cutoff_resolution.smoothing_width_A),
                 )
-                progress.update()
+                values = np.where(eligible, weights, 0).sum(axis=1)
+                columns = np.searchsorted(center_indices, centers.anchors)
+                result.append((frame_index, columns, values))
+            return result
+        for results in bounded_map(molecular_batch, batches(enumerate(frames), 16), workers=workers, stage='coordination.distances'):
+            for frame_index, columns, values in results:
+                coordination[frame_index, columns] = values
 
-    LOGGER.debug(
-        "Computed coordination for %s-%s over %d frame(s) using %s (pair_count=%d, cutoff=%.6g A).",
-        label_a,
-        label_b,
-        len(frames),
-        backend,
-        pair_count,
-        float(cutoff_resolution.cutoff_A),
-    )
+    else:
+        selection_cache = _build_coordination_selection_cache(
+            frame=frames[0],
+            center_species=label_a,
+            neighbor_species=label_b,
+            center_indices=np.asarray(position_profile.atom_indices, dtype=int),
+        )
+        center_indices = selection_cache.center_indices
+        center_count = int(selection_cache.center_count)
+        neighbor_count = int(selection_cache.neighbor_count)
+        pair_count = int(selection_cache.pair_count)
+        if _can_vectorize_coordination_kernel(frames, pair_count=pair_count):
+            backend = _COORD_BACKEND_DENSE
+            coordination = _compute_coordination_values_chunked(
+                frames,
+                selection_cache=selection_cache,
+                cutoff_A=float(cutoff_resolution.cutoff_A),
+                smoothing_width_A=float(cutoff_resolution.smoothing_width_A),
+            )
+        else:
+            backend = (
+                _COORD_BACKEND_NEIGHBOR
+                if bool(frames) and all(_frame_has_usable_cell(frame) for frame in frames)
+                else _COORD_BACKEND_GENERIC
+            )
+            coordination = working_array(
+                (len(frames), center_count),
+                dtype=np.float32,
+                fill=0,
+            )
+            with ProgressBar(
+                desc=f"Computing coordination ({center_count}x{neighbor_count})",
+                total=len(frames),
+                unit="frame",
+            ) as progress:
+                def compute_frames(chunk):
+                    return [(index, _compute_coordination_frame_values(
+                        frame, selection_cache=selection_cache,
+                        cutoff_A=float(cutoff_resolution.cutoff_A),
+                        smoothing_width_A=float(cutoff_resolution.smoothing_width_A),
+                    )) for index, frame in chunk]
+                workers = stage_workers('coordination.distances', (len(frames) + 15) // 16,
+                                        bytes_per_task=max(8 * 1024 * 1024, pair_count * 64))
+                for results in bounded_map(compute_frames, batches(enumerate(frames), 16), workers=workers, stage='coordination.distances'):
+                    for frame_index, values in results:
+                        coordination[frame_index, :] = values
+                        progress.update()
 
-    coordination = _validate_coordination_matrix(
-        coordination,
-        frame_count=len(frames),
-        center_count=center_count,
-    )
+
+        LOGGER.debug(
+            "Computed coordination for %s-%s over %d frame(s) using %s (pair_count=%d, cutoff=%.6g A).",
+            label_a,
+            label_b,
+            len(frames),
+            backend,
+            pair_count,
+            float(cutoff_resolution.cutoff_A),
+        )
+
+        coordination = _validate_coordination_matrix(
+            coordination,
+            frame_count=len(frames),
+            center_count=center_count,
+        )
     distance_to_surface = np.asarray(position_profile.distance_to_surface, dtype=float)
     if distance_to_surface.shape != coordination.shape:
         raise ValueError(
@@ -1413,6 +1525,14 @@ def _compute_coordination_profile_from_position_profile(
     return CoordinationProfile(
         species_a=label_a,
         species_b=label_b,
+        molecular_metadata={
+            **molecule_metadata(label_a, label_b, oh_cutoff, oh_topology_backend),
+            "center_tracking": "anchor_atom" if is_molecular(label_a) else "atom",
+            "atom_indices_role": "molecular_anchor" if is_molecular(label_a) else "atom",
+            "n_entities": center_count,
+        }
+        if molecular
+        else None,
         axis=str(position_profile.axis),
         atom_indices=center_indices,
         frame_index=np.asarray(position_profile.frame_index, dtype=int),
@@ -1475,6 +1595,74 @@ def _compute_coordination_profile_from_position_profile(
     )
 
 
+def _molecular_center_position_profile(
+    frames, label, entity_frames, *, axis, timestep_fs, **surface_options
+):
+    """Build anchor-aligned COM trajectories with the original trajectory surface context."""
+    selections = [entities[label] for entities in entity_frames]
+    anchors = np.unique(np.concatenate([selection.anchors for selection in selections]))
+    if anchors.size == 0:
+        raise ValueError(f"No selected molecular centers in trajectory: {label}.")
+    coordinates = np.full((len(frames), len(anchors), 3), np.nan)
+    for index, selection in enumerate(selections):
+        coordinates[index, np.searchsorted(anchors, selection.anchors)] = selection.positions
+    x, y, z = (coordinates[:, :, index] for index in range(3))
+    (
+        coordinate_mode,
+        surface_position,
+        surface_std,
+        surface_per_frame,
+        surface_estimate,
+        surface_reference,
+    ) = _position_surface_context(
+        frames=frames,
+        axis=axis,
+        **surface_options,
+    )
+    distance, top, bottom, side = _distance_components_for_axis_matrix(
+        coordinates[:, :, "xyz".index(axis)],
+        surface_reference=surface_reference,
+        surface_position_per_frame=surface_per_frame,
+        cartesian_matrices=(x, y, z),
+    )
+    frame_index, step, time_fs, time_ps = _position_time_arrays(
+        frames=frames, timestep_fs=timestep_fs
+    )
+    lengths = _resolve_cell_lengths_from_frames(frames)
+    cells, origins, pbc = _position_cell_arrays(frames, cell_lengths_angstrom=lengths)
+    return PositionProfile(
+        species=label,
+        axis=axis,
+        atom_indices=anchors,
+        n_atoms=len(anchors),
+        n_frames=len(frames),
+        frame_index=frame_index,
+        step=step,
+        time_fs=time_fs,
+        time_ps=time_ps,
+        x=x,
+        y=y,
+        z=z,
+        distance_to_surface=distance,
+        distance_to_top_surface=top,
+        distance_to_bottom_surface=bottom,
+        interface_side=side,
+        coordinate_mode=coordinate_mode,
+        surface_position=surface_position,
+        surface_position_std=surface_std,
+        surface_position_per_frame=surface_per_frame,
+        surface_estimate=surface_estimate,
+        surface_reference=surface_reference,
+        cell_lengths_angstrom=lengths,
+        cell_matrices_angstrom=cells,
+        cell_origins_angstrom=origins,
+        cell_pbc=pbc,
+        selection_kind="molecule",
+        entity_kind="molecule",
+    )
+
+
+@analysis_execution
 def compute_coordination_profile(
     frames: Sequence[Atoms],
     *,
@@ -1489,6 +1677,10 @@ def compute_coordination_profile(
     surface_options: SurfaceEstimatorOptions | None = None,
     precomputed_surface_estimate: SurfaceEstimate | SurfaceReference | None = None,
     cutoff_resolution: CoordinationCutoffResolution,
+    oh_cutoff: float = 1.27,
+    oh_topology_backend: str = "auto",
+    threads: int | None = 1,
+    memory_budget_mib: float | None = None,
 ) -> CoordinationProfile:
     if not frames:
         raise ValueError("At least one trajectory frame is required.")
@@ -1507,6 +1699,22 @@ def compute_coordination_profile(
         len(frames),
         label_a,
     )
+    if is_molecular(label_a) or is_molecular(label_b):
+        return compute_coordination_profiles(
+            frames,
+            ordered_pairs=[(label_a, label_b)],
+            cutoff_resolutions={(label_a, label_b): cutoff_resolution},
+            axis=axis_label,
+            timestep_fs=timestep_fs,
+            surface_mode=surface_mode,
+            surface_layout=surface_layout,
+            surface_elements=surface_elements,
+            include_fixed_surface_atoms=include_fixed_surface_atoms,
+            surface_options=surface_options,
+            precomputed_surface_estimate=precomputed_surface_estimate,
+            oh_cutoff=oh_cutoff,
+            oh_topology_backend=oh_topology_backend,
+        )[0]
     position_profile = compute_position_profile(
         frames,
         species=label_a,
@@ -1518,15 +1726,20 @@ def compute_coordination_profile(
         include_fixed_surface_atoms=include_fixed_surface_atoms,
         surface_options=surface_options,
         precomputed_surface_estimate=precomputed_surface_estimate,
+        oh_cutoff=oh_cutoff,
+        oh_topology_backend=oh_topology_backend,
     )
     return _compute_coordination_profile_from_position_profile(
         frames,
         position_profile=position_profile,
         species_b=label_b,
         cutoff_resolution=cutoff_resolution,
+        oh_cutoff=oh_cutoff,
+        oh_topology_backend=oh_topology_backend,
     )
 
 
+@analysis_execution
 def compute_coordination_profiles(
     frames: Sequence[Atoms],
     *,
@@ -1540,6 +1753,10 @@ def compute_coordination_profiles(
     surface_options: SurfaceEstimatorOptions | None = None,
     precomputed_surface_estimate: SurfaceEstimate | SurfaceReference | None = None,
     cutoff_resolutions: Mapping[tuple[str, str], CoordinationCutoffResolution],
+    oh_cutoff: float = 1.27,
+    oh_topology_backend: str = "auto",
+    threads: int | None = 1,
+    memory_budget_mib: float | None = None,
 ) -> list[CoordinationProfile]:
     """Compute ordered coordination profiles while reusing center trajectories."""
     if not frames:
@@ -1561,6 +1778,21 @@ def compute_coordination_profiles(
     )
     if not resolved_pairs:
         raise ValueError("At least one coordination pair is required.")
+
+    entity_frames = None
+    if any(is_molecular(label) for pair in resolved_pairs for label in pair):
+        resolver = EntityResolver(oh_cutoff=oh_cutoff, oh_topology_backend=oh_topology_backend)
+        labels = list(dict.fromkeys(label for pair in resolved_pairs for label in pair))
+        workers = stage_workers('coordination.entities', (len(frames) + 15) // 16,
+                                 bytes_per_task=max(8 * 1024 * 1024, len(frames[0]) * 16 * 256))
+        if workers > 1:
+            resolver.select(frames[0], labels, 0)
+        def select_batch(chunk):
+            local = EntityResolver(oh_cutoff=oh_cutoff, oh_topology_backend=oh_topology_backend)
+            return [local.select(frame, labels, index) for index, frame in chunk]
+        entity_frames = [entities for chunk in bounded_map(
+            select_batch, batches(enumerate(frames), 16), workers=workers, stage='coordination.entities') for entities in chunk]
+
 
     center_species_in_order: list[str] = []
     for species_a, _species_b in resolved_pairs:
@@ -1597,9 +1829,10 @@ def compute_coordination_profiles(
     for species_a in center_species_in_order:
         if not is_molecule_species_label(species_a):
             continue
-        position_profiles_by_species[species_a] = compute_position_profile(
+        position_profiles_by_species[species_a] = _molecular_center_position_profile(
             frames,
-            species=species_a,
+            species_a,
+            entity_frames,
             axis=axis_label,
             timestep_fs=float(timestep_fs),
             surface_mode=surface_mode,
@@ -1622,6 +1855,9 @@ def compute_coordination_profiles(
                 position_profile=position_profiles_by_species[pair[0]],
                 species_b=pair[1],
                 cutoff_resolution=cutoff_resolutions[pair],
+                entity_frames=entity_frames,
+                oh_cutoff=oh_cutoff,
+                oh_topology_backend=oh_topology_backend,
             )
         )
     return profiles
@@ -1637,6 +1873,7 @@ def save_coordination_profile(
     metadata = build_profile_metadata(
         analysis="coordination",
         metadata={
+            **(profile.molecular_metadata or {}),
             "species_a": profile.species_a,
             "species_b": profile.species_b,
             "axis": profile.axis,
@@ -1751,6 +1988,7 @@ def _coordination_profile_hdf5_payload(profile: CoordinationProfile) -> dict[str
         "metadata": build_profile_metadata(
             analysis="coordination",
             metadata={
+                **(profile.molecular_metadata or {}),
                 "species_a": profile.species_a,
                 "species_b": profile.species_b,
                 "axis": profile.axis,
@@ -1787,6 +2025,7 @@ def _coordination_profile_hdf5_payload(profile: CoordinationProfile) -> dict[str
     }
 
 
+@timed_stage("writing")
 def save_coordination_profiles(
     profiles: list[CoordinationProfile],
     output: str | Path,
@@ -2004,6 +2243,7 @@ def _load_coordination_profiles_from_payloads(
         surface_metadata = _surface_metadata_view(metadata)
         profiles.append(
             CoordinationProfile(
+                molecular_metadata=read_molecule_metadata(metadata),
                 species_a=resolved_species_a,
                 species_b=resolved_species_b,
                 axis=resolved_axis,
@@ -2116,7 +2356,8 @@ def _coordination_distance_label(profile: CoordinationProfile) -> str:
 
 def _default_coordination_series_labels(profile: CoordinationProfile) -> list[str]:
     prefix = profile.species_a if profile.species_a != "ALL" else "A"
-    return [f"{prefix}[{int(atom_index)}]" for atom_index in profile.atom_indices.tolist()]
+    suffix = " COM, anchor " if is_molecular(profile.species_a) else ""
+    return [f"{prefix}[{suffix}{int(atom_index)}]" for atom_index in profile.atom_indices.tolist()]
 
 
 def _plot_coordination_time_distance_projection(
@@ -2293,7 +2534,7 @@ def _plot_coordination_time_distance_projection(
     if matplotlib_rc is not None:
         rc_context_args.update(dict(matplotlib_rc))
     with plt.rc_context(rc_context_args):
-        fig, ax = plt.subplots(figsize=style.figure_size)
+        fig, ax = plt.subplots(figsize=style.figure_size, FigureClass=PlotFigure)
         if figure_kwargs is not None:
             fig.set(**dict(figure_kwargs))
 
@@ -2663,6 +2904,7 @@ def plot_coordination_profile(
             if error_config is not None
             else None,
             series_raw_statistics=[True] * profile.n_atoms,
+            series_frame_timestep_fs=[time_step_fs(profile.time_fs)] * profile.n_atoms,
             series_normalization_modes=series_normalization_modes,
             series_normalization_values=series_normalization_values,
             series_normalization_x_refs=series_normalization_x_refs,
@@ -2732,6 +2974,8 @@ def plot_coordination_profile(
         fit_config=None if not series_fit_configs else series_fit_configs[0],
         cumulative_config=cumulative_config,
         raw_point_statistics=True,
+        frame_timestep_fs=time_step_fs(profile.time_fs),
+        frame_indices=np.repeat(np.arange(profile.n_frames), profile.n_atoms),
         error_config=error_config,
         normalization_mode=series_normalization_modes[0] if series_normalization_modes else None,
         normalization_value=series_normalization_values[0] if series_normalization_values else None,
@@ -2850,6 +3094,7 @@ def plot_coordination_profiles(
     normalized_interface_view = str(interface_view).strip().lower()
     if normalized_interface_view not in {"full", "folded", "top", "bottom", "all"}:
         raise ValueError("interface_view must be full, folded, top, bottom, or all.")
+    original_profiles = profiles
     profile_view_names: list[str | None] = [None] * len(profiles)
     if normalized_interface_view in {"full", "top", "bottom"}:
         profiles = [
@@ -2894,6 +3139,69 @@ def plot_coordination_profiles(
     runtime_component = resolved_mapping.component
     runtime_time_axis = resolved_mapping.time_axis
     normalized_component = _normalize_component_token(runtime_component)
+
+    if normalized_interface_view == "all":
+        # Each source contributes three interface curves. Preserve its styling
+        # and give each rendered view a distinct ID, in the same profile order.
+        source_views: list[tuple[int, str, str]] = []
+        offset = 0
+        for index, profile in enumerate(original_profiles):
+            count = profile.n_atoms if normalized_component in {"time", "time-distance"} else 1
+            for view_index, view in enumerate(("folded", "top", "bottom")):
+                label = str(profile_view_names[3 * index + view_index])
+                source_views.extend((offset + column, view, label) for column in range(count))
+            offset += count
+
+        def expand_options(values, *, labels=False, identifiers=False):
+            if values is None:
+                return None
+            if len(values) != offset:
+                raise ValueError(
+                    "Series options must match the number of source coordination series."
+                )
+            return [
+                f"{values[index]} ({label})"
+                if labels
+                else f"{values[index]}:{view}"
+                if identifiers
+                else values[index]
+                for index, view, label in source_views
+            ]
+
+        series_ids = expand_options(series_ids, identifiers=True)
+        series_labels = expand_options(series_labels, labels=True)
+        line_colors = expand_options(line_colors)
+        series_error_configs = expand_options(series_error_configs)
+        series_enabled = expand_options(series_enabled)
+        series_show_in_legend = expand_options(series_show_in_legend)
+        series_line_widths = expand_options(series_line_widths)
+        series_markers = expand_options(series_markers)
+        series_fit_configs = expand_options(series_fit_configs)
+        series_cumulative_configs = expand_options(series_cumulative_configs)
+        series_normalization_modes = expand_options(series_normalization_modes)
+        series_normalization_values = expand_options(series_normalization_values)
+        series_normalization_x_refs = expand_options(series_normalization_x_refs)
+        series_line_kwargs = expand_options(series_line_kwargs)
+        if render_series_descriptors:
+            render_series_descriptors = [
+                {
+                    **descriptor,
+                    **{
+                        key: f"{descriptor[key]}:{view}"
+                        for key in ("series_id", "source_series_id", "source_id")
+                        if descriptor.get(key)
+                    },
+                    "default_label": f"{descriptor.get('default_label', '')} ({view})",
+                }
+                for descriptor in render_series_descriptors
+                for view in ("folded", "top", "bottom")
+            ]
+        if series_overrides_by_id:
+            series_overrides_by_id = {
+                f"{key}:{view}": value
+                for key, value in series_overrides_by_id.items()
+                for view in ("folded", "top", "bottom")
+            }
 
     if normalized_component == "time-distance":
         return _plot_coordination_time_distance_projection(
@@ -3069,6 +3377,9 @@ def plot_coordination_profiles(
             series_cumulative_configs=series_cumulative_configs,
             series_error_configs=series_error_configs,
             series_raw_statistics=[True] * len(labels),
+            series_frame_timestep_fs=[
+                time_step_fs(p.time_fs) for p in profiles for _ in range(p.n_atoms)
+            ],
             series_normalization_modes=series_normalization_modes,
             series_normalization_values=series_normalization_values,
             series_normalization_x_refs=series_normalization_x_refs,
@@ -3150,6 +3461,8 @@ def plot_coordination_profiles(
         series_cumulative_configs=series_cumulative_configs,
         series_error_configs=series_error_configs,
         series_raw_statistics=[True] * len(labels),
+        series_frame_timestep_fs=[time_step_fs(p.time_fs) for p in profiles],
+        series_frame_indices=[np.repeat(np.arange(p.n_frames), p.n_atoms) for p in profiles],
         series_normalization_modes=series_normalization_modes,
         series_normalization_values=series_normalization_values,
         series_normalization_x_refs=series_normalization_x_refs,

@@ -415,21 +415,30 @@ def test_current_error_statistics_mode_tracks_raw_and_rebinned_saved_series():
 
 
 def test_inferred_available_error_stats_follow_current_series_mode():
-    assert _inferred_available_error_stats(
-        analysis_name="position",
-        error_supported=True,
-        x_bin_width_active=False,
-    ) == ["sample_std", "sample_sem"]
-    assert _inferred_available_error_stats(
-        analysis_name="rdf",
-        error_supported=True,
-        x_bin_width_active=True,
-    ) == ["sample_std", "sample_sem"]
-    assert _inferred_available_error_stats(
-        analysis_name="rdf",
-        error_supported=True,
-        x_bin_width_active=False,
-    ) == ["sample_std", "sample_sem", "block_std", "block_sem"]
+    assert (
+        _inferred_available_error_stats(
+            analysis_name="position",
+            error_supported=True,
+            x_bin_width_active=False,
+        )
+        == []
+    )
+    assert (
+        _inferred_available_error_stats(
+            analysis_name="rdf",
+            error_supported=True,
+            x_bin_width_active=True,
+        )
+        == []
+    )
+    assert (
+        _inferred_available_error_stats(
+            analysis_name="rdf",
+            error_supported=True,
+            x_bin_width_active=False,
+        )
+        == []
+    )
 
 
 def test_plot_settings_panel_shows_error_provenance_explanation_text():
@@ -733,7 +742,7 @@ def test_plot_settings_panel_generated_copies_start_with_independent_derivations
 
     for expected in (
         "(self._series_error_enabled_data, False)",
-        '(self._series_error_stats_data, "block_sem")',
+        '(self._series_error_stats_data, "block_ci")',
         '(self._series_error_styles_data, "band")',
         "(self._series_fit_enabled_data, False)",
         '(self._series_fit_label_overrides_data, "")',
@@ -902,8 +911,7 @@ def test_plot_settings_panel_sizes_interactive_canvas_from_export_aspect_ratio()
     assert "if width > 0 and height > 0:" in source
     assert "available_width = max(1, available_width)" in source
     assert "export_width, export_height = self._preview_export_figsize()" in source
-    assert "export_aspect = max(1.0e-9, export_width / export_height)" in source
-    assert "preview_dpi = max(target_width / export_width" in source
+    assert "target_width, target_height, preview_dpi = preview_canvas_geometry(" in source
     assert (
         "self._preview_figure.set_size_inches(export_width, export_height, forward=False)" in source
     )
@@ -1516,7 +1524,8 @@ def test_orientation_gui_uses_stored_distribution_heatmap_for_normal_2d_view():
     refresh_start = source.index("def _refresh_widget_states(self, *_unused: object) -> None:")
     refresh_end = source.index("def _collect_settings(self) -> dict[str, Any]:", refresh_start)
     refresh_body = source[refresh_start:refresh_end]
-    assert "self._set_rows_visible(self._orientation_mapping_2d_rows, False)" in refresh_body
+    assert "self._set_rows_visible(self._orientation_mapping_2d_rows, spatial_mode)" in refresh_body
+    assert '"orientation_heatmap_kind": "distribution"' in default_body
     assert 'label.setText("Angle quantity")' in refresh_body
 
 
@@ -1636,9 +1645,12 @@ def test_plot_settings_panel_keeps_latest_preview_request():
     assert "def _preview_worker_job_cancelled(self, generation: int) -> bool:" in source
     assert "def _preview_worker_result_is_stale(self, generation: int) -> bool:" in source
     assert "if self._preview_worker_result_is_stale(generation):" in source
-    worker_start = source.index("def _preview_worker_loop(self) -> None:")
-    worker_end = source.index("def _start_preview_worker(", worker_start)
-    worker_body = source[worker_start:worker_end]
+    worker_functions = [
+        node for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.FunctionDef)
+        and node.name in {"_preview_worker_loop", "_run_preview_worker"}
+    ]
+    worker_body = "\n".join(ast.get_source_segment(source, node) or "" for node in worker_functions)
     assert "self._preview_worker_job_cancelled(generation)" in worker_body
     assert "self._preview_worker_result_is_stale(generation)" not in worker_body
     assert "self._cleanup_preview_temp_path(image_path)" in source
@@ -1915,10 +1927,8 @@ def test_plot_settings_panel_fits_interactive_canvas_to_preview_viewport_aspect_
     assert "for widget in candidates:" in resize_body
     assert "width = int(widget.width()) - 8" in resize_body
     assert "height = int(widget.height()) - 8" in resize_body
-    assert "available_aspect = available_width / available_height" in resize_body
-    assert "if available_aspect > export_aspect:" in resize_body
-    assert "target_width = int(round(target_height * export_aspect))" in resize_body
-    assert "target_height = int(round(target_width / export_aspect))" in resize_body
+    assert "preview_canvas_geometry(" in resize_body
+    assert "(export_width, export_height), (available_width, available_height)" in resize_body
     assert "self._preview_canvas.setFixedSize(QSize(target_width, target_height))" in resize_body
     assert "self._preview_canvas_scroll.setAlignment(Qt.AlignmentFlag.AlignCenter)" in resize_body
     assert "self._preview_canvas.updateGeometry()" in resize_body
@@ -2154,20 +2164,21 @@ def test_font_size_placeholder_text_includes_effective_size_in_brackets():
     assert _font_size_placeholder_text(14) == "Auto (14)"
 
 
-def test_resolve_error_stat_for_available_prefers_available_semantics():
+def test_resolve_error_stat_for_available_never_changes_requested_estimator():
     assert (
-        _resolve_error_stat_for_available("block_sem", ["sample_sem", "sample_std"]) == "sample_sem"
+        _resolve_error_stat_for_available("block_sem", ["sample_sem", "sample_std"]) == "block_sem"
     )
     assert (
         _resolve_error_stat_for_available("sample_std", ["sample_sem", "sample_std"])
         == "sample_std"
     )
-    assert _resolve_error_stat_for_available(None, ["block_std"]) == "block_std"
+    assert _resolve_error_stat_for_available(None, ["block_std"]) == "block_ci"
 
 
 def test_default_error_series_label_uses_effective_stat_name():
     assert (
-        _default_error_series_label("H2O density", "sample_sem") == "H2O density \u00b1Sample SEM"
+        _default_error_series_label("H2O density", "sample_sem")
+        == "H2O density: Advanced: SEM (independent observations)"
     )
 
 

@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from pathlib import Path
-
 from linak.runtime_threads import configure_native_thread_env
 
 
@@ -26,8 +24,10 @@ def test_configure_native_thread_env_respects_preconfigured_backend_env():
     result = configure_native_thread_env(env)
 
     assert result.skipped_reason == "preconfigured"
-    assert result.applied == {}
-    assert env == {"OPENBLAS_NUM_THREADS": "8"}
+    assert env["OPENBLAS_NUM_THREADS"] == "8"
+    assert "OPENBLAS_NUM_THREADS" not in result.applied
+    assert env["OMP_NUM_THREADS"] == "1"
+    assert env["MKL_NUM_THREADS"] == "1"
 
 
 def test_configure_native_thread_env_respects_explicit_disable():
@@ -71,8 +71,18 @@ def test_configure_native_thread_env_ignores_invalid_linak_num_threads():
 
 
 def test_cli_configures_native_thread_env_before_numpy_import():
-    source = Path("src/linak/cli.py").read_text(encoding="utf-8")
+    import subprocess
+    import sys
 
-    assert source.index(
-        "_NATIVE_THREAD_ENV_CONFIGURATION = configure_native_thread_env()"
-    ) < source.index('np = importlib.import_module("numpy")')
+    script = """
+import sys
+import linak.runtime_threads as runtime
+original = runtime.configure_native_thread_env
+def checked(*args, **kwargs):
+    assert 'numpy' not in sys.modules, 'NumPy imported before native bootstrap'
+    assert 'ase' not in sys.modules, 'ASE imported before native bootstrap'
+    return original(*args, **kwargs)
+runtime.configure_native_thread_env = checked
+import linak.cli
+"""
+    subprocess.run([sys.executable, "-c", script], check=True, capture_output=True, text=True)

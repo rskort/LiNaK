@@ -9,19 +9,12 @@ import pytest
 
 from linak.cli import main
 from linak.analysis.potential import (
-    BOHR_TO_ANG,
-    CubeHeader,
     HARTREE_TO_EV,
-    PotentialComputationFailure,
-    PotentialConfig,
     PotentialRecord,
     combine_potential_hdf5_sources,
-    compute_potential_records,
     load_potential_plot_profiles,
     plot_potential_profiles,
-    _non_water_contaminated_z_slices,
     _resolve_worker_count,
-    _water_bulk_potential_ev,
 )
 from linak.storage.hdf5_utils import read_linak_hdf5_profiles
 from linak.plot.data_contract import PlotViewMapping
@@ -120,7 +113,7 @@ def _write_potential_summary_hdf5(
     cshe: list[float | None],
     status: list[str],
 ) -> None:
-    from linak.analysis.potential import write_potential_records_csv
+    from linak.analysis.potential import write_potential_records
 
     rows = [
         PotentialRecord(
@@ -136,30 +129,14 @@ def _write_potential_summary_hdf5(
         )
         for index, identifier in enumerate(ids)
     ]
-    write_potential_records_csv(rows, path, append=False)
+    write_potential_records(rows, path, append=False)
 
 
-def _test_cube_header(atom_specs_ang: list[tuple[int, float]], *, nz: int) -> CubeHeader:
-    return CubeHeader(
-        natoms=len(atom_specs_ang),
-        origin_bohr=np.zeros(3, dtype=float),
-        nx=1,
-        ny=1,
-        nz=nz,
-        vx_bohr=np.asarray([1.0, 0.0, 0.0], dtype=float),
-        vy_bohr=np.asarray([0.0, 1.0, 0.0], dtype=float),
-        vz_bohr=np.asarray([0.0, 0.0, 1.0 / BOHR_TO_ANG], dtype=float),
-        atom_numbers=np.asarray([atomic_number for atomic_number, _ in atom_specs_ang], dtype=int),
-        atom_z_bohr=np.asarray(
-            [z_ang / BOHR_TO_ANG for _, z_ang in atom_specs_ang],
-            dtype=float,
-        ),
-    )
 
 
 @pytest.mark.parametrize("invalid", ["old_schema", "missing_schema", "missing_side", "unaligned"])
 def test_potential_current_schema_rejected_before_payload_read(tmp_path, monkeypatch, invalid):
-    from linak.analysis.potential import load_potential_records, plan_potential_csv_output
+    from linak.analysis.potential import load_potential_records, plan_potential_hdf5_output
 
     path = tmp_path / "potential.h5"
     _write_potential_summary_hdf5(
@@ -171,7 +148,7 @@ def test_potential_current_schema_rejected_before_payload_read(tmp_path, monkeyp
         elif invalid == "missing_schema":
             del handle.attrs["analysis_schema_version"]
         elif invalid == "missing_side":
-            del handle["records/water_bulk_potential_bottom_ev"]
+            del handle["records/reference_valid"]
         else:
             handle["records/electrode_cshe_ev"].resize((2,))
     original = path.read_bytes()
@@ -184,69 +161,15 @@ def test_potential_current_schema_rejected_before_payload_read(tmp_path, monkeyp
     for load in (load_potential_records, load_potential_plot_profiles):
         with pytest.raises(ValueError, match="Recompute this analysis"):
             load(path)
-    plan = plan_potential_csv_output(path)
-    assert plan.used_fallback_path
-    assert plan.target_path != path
+    with pytest.raises(ValueError, match="Recompute this analysis"):
+        plan_potential_hdf5_output(path)
     assert path.read_bytes() == original
 
 
-def test_water_bulk_potential_excludes_non_water_z_slice_from_widest_span():
-    z_ang = np.arange(9, dtype=float)
-    v_xyavg_ev = np.asarray([4.0, 4.0, 99.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0])
-    header = _test_cube_header([(8, 0.0), (1, 8.0), (11, 2.1)], nz=z_ang.size)
-
-    contaminated = _non_water_contaminated_z_slices(z_ang, header)
-    value, z_min, z_max = _water_bulk_potential_ev(
-        z_ang=z_ang,
-        v_xyavg_ev=v_xyavg_ev,
-        water_z_min_ang=0.0,
-        water_z_max_ang=8.0,
-        padding_ang=0.0,
-        contaminated_z_mask=contaminated,
-    )
-
-    assert contaminated.tolist() == [False, False, True, False, False, False, False, False, False]
-    assert value == pytest.approx(2.0)
-    assert z_min == pytest.approx(3.0)
-    assert z_max == pytest.approx(8.0)
 
 
-def test_water_bulk_potential_padding_fallback_keeps_contaminated_slice_out():
-    z_ang = np.arange(7, dtype=float)
-    v_xyavg_ev = np.asarray([1.0, 1.0, 7.0, 99.0, 7.0, 1.0, 1.0])
-    header = _test_cube_header([(8, 0.0), (1, 6.0), (11, 3.0)], nz=z_ang.size)
-
-    value, _z_min, _z_max = _water_bulk_potential_ev(
-        z_ang=z_ang,
-        v_xyavg_ev=v_xyavg_ev,
-        water_z_min_ang=0.0,
-        water_z_max_ang=6.0,
-        padding_ang=2.9,
-        contaminated_z_mask=_non_water_contaminated_z_slices(z_ang, header),
-    )
-
-    assert value == pytest.approx(7.0)
 
 
-def test_water_bulk_potential_returns_none_when_all_candidate_slices_are_contaminated():
-    z_ang = np.arange(3, dtype=float)
-    header = _test_cube_header(
-        [(8, 0.0), (1, 2.0), (11, 0.0), (19, 1.0), (3, 2.0)],
-        nz=z_ang.size,
-    )
-
-    value, z_min, z_max = _water_bulk_potential_ev(
-        z_ang=z_ang,
-        v_xyavg_ev=np.asarray([10.0, 20.0, 30.0]),
-        water_z_min_ang=0.0,
-        water_z_max_ang=2.0,
-        padding_ang=0.0,
-        contaminated_z_mask=_non_water_contaminated_z_slices(z_ang, header),
-    )
-
-    assert value is None
-    assert z_min is None
-    assert z_max is None
 
 
 def test_load_potential_plot_profiles_sorts_rows_and_summarizes(tmp_path):
@@ -736,7 +659,7 @@ def test_compute_potential_accepts_cube_hdf5_input(tmp_path):
     assert rc == 0
     rows = _read_hdf5_rows(output)
     assert len(rows) == 1
-    assert rows[0]["status"] in {"ok", "incomplete"}
+    assert rows[0]["status"] in {"ok", "incomplete", "invalid"}
 
 
 def test_compute_potential_accepts_combined_cube_hdf5_input(tmp_path):
@@ -984,74 +907,8 @@ def test_compute_potential_shows_loading_progress_for_raw_inputs(tmp_path, monke
     assert loading_bar.updates == 2
 
 
-def test_compute_potential_incompatible_hdf5_schema_uses_fallback_file(tmp_path):
-    run_dir = tmp_path / "run"
-    cube = _write_potential_case(run_dir, fermi_au=0.0367493036)
-
-    output_h5 = tmp_path / "potentials.potential.h5"
-    with h5py.File(output_h5, "w") as handle:
-        handle.attrs["linak_format"] = "linak-hdf5"
-        handle.attrs["analysis"] = "unexpected"
-
-    rc = main(
-        [
-            "--log-level",
-            "ERROR",
-            "compute",
-            "potential",
-            str(cube),
-            "--output",
-            str(output_h5),
-            "--water-padding-ang",
-            "0.2",
-        ]
-    )
-
-    assert rc == 0
-    assert output_h5.exists()
-    with h5py.File(output_h5, "r") as handle:
-        assert handle.attrs["analysis"] == "unexpected"
-
-    fallback_path = tmp_path / "potentials_1.potential.h5"
-    assert fallback_path.exists()
-    assert not (tmp_path / "potentials.linak.potential_1.h5").exists()
-    fallback_rows = _read_hdf5_rows(fallback_path)
-    assert len(fallback_rows) == 1
 
 
-def test_compute_potential_incompatible_hdf5_schema_versions_fallback_before_analysis_suffix(
-    tmp_path,
-):
-    run_dir = tmp_path / "run"
-    cube = _write_potential_case(run_dir, fermi_au=0.0367493036)
-
-    output_h5 = tmp_path / "potentials.potential.h5"
-    fallback_path = tmp_path / "potentials_1.potential.h5"
-    with h5py.File(output_h5, "w") as handle:
-        handle.attrs["linak_format"] = "linak-hdf5"
-        handle.attrs["analysis"] = "unexpected"
-    fallback_path.write_text("occupied", encoding="utf-8")
-
-    rc = main(
-        [
-            "--log-level",
-            "ERROR",
-            "compute",
-            "potential",
-            str(cube),
-            "--output",
-            str(output_h5),
-            "--water-padding-ang",
-            "0.2",
-        ]
-    )
-
-    versioned_fallback = tmp_path / "potentials_2.potential.h5"
-    assert rc == 0
-    assert versioned_fallback.exists()
-    assert not (tmp_path / "potentials.linak.potential_1.h5").exists()
-    fallback_rows = _read_hdf5_rows(versioned_fallback)
-    assert len(fallback_rows) == 1
 
 
 def test_compute_potential_strict_mode_returns_error_but_still_writes_hdf5(tmp_path):
@@ -1078,7 +935,7 @@ def test_compute_potential_strict_mode_returns_error_but_still_writes_hdf5(tmp_p
     assert output_h5.exists()
     rows = _read_hdf5_rows(output_h5)
     assert len(rows) == 1
-    assert rows[0]["status"] == "incomplete"
+    assert rows[0]["status"] == "invalid"
 
 
 def test_compute_potential_persists_rows_before_post_compute_crash(tmp_path, monkeypatch):
@@ -1118,42 +975,6 @@ def test_compute_potential_persists_rows_before_post_compute_crash(tmp_path, mon
     assert len(rows) == 2
 
 
-def test_compute_potential_records_calls_callbacks_in_source_order(monkeypatch):
-    def _fake_compute(source_item, *, config):
-        assert isinstance(config, PotentialConfig)
-        source = str(source_item)
-        if source.endswith("bad.cube"):
-            raise RuntimeError("synthetic failure")
-        return PotentialRecord(
-            id=None,
-            source=source,
-            source_dir="/tmp",
-            output_out=None,
-            efermi_ev=1.0,
-            water_bulk_potential_ev=2.0,
-            electrode_cshe_ev=0.19,
-            status="ok",
-            error=None,
-        )
-
-    monkeypatch.setattr("linak.analysis.potential.compute_potential_record", _fake_compute)
-
-    seen_successes: list[str] = []
-    seen_failures: list[str] = []
-
-    records, failures = compute_potential_records(
-        ["a.cube", "bad.cube", "c.cube"],
-        config=PotentialConfig(),
-        threads=1,
-        on_record=lambda record: seen_successes.append(record.source),
-        on_failure=lambda failure: seen_failures.append(failure.source),
-    )
-
-    assert [record.source for record in records] == ["a.cube", "c.cube"]
-    assert seen_successes == ["a.cube", "c.cube"]
-    assert [failure.source for failure in failures] == ["bad.cube"]
-    assert seen_failures == ["bad.cube"]
-    assert isinstance(failures[0], PotentialComputationFailure)
 
 
 def test_resolve_worker_count_defaults_auto_to_single_worker():

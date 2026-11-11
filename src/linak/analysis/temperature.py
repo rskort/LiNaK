@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from ..parallel import analysis_execution, batches, bounded_map, frame_batch_size, stage_workers, timed_stage
+
 from collections.abc import Mapping, Sequence
 from contextlib import closing
 from dataclasses import dataclass
@@ -32,6 +34,8 @@ from .common import (
     write_profile_collection,
 )
 from .schema import build_profile_metadata, default_plot_labels
+
+from .uncertainty import time_step_fs
 
 LOGGER = logging.getLogger(__name__)
 
@@ -417,6 +421,7 @@ def _warn_missing_temperature_regions(
     return True
 
 
+@timed_stage("loading")
 def _read_numeric_table(path: str | Path, *, skip_comments: bool) -> np.ndarray:
     rows: list[list[float]] = []
     with Path(path).expanduser().resolve().open("r", encoding="utf-8", errors="replace") as handle:
@@ -574,6 +579,7 @@ def _parse_velocity_frame_comment(comment: str, frame_index: int) -> tuple[int, 
     return int(match.group(1)), float(match.group(2))
 
 
+@timed_stage("loading")
 def _iter_velocity_xyz(
     path: Path,
     *,
@@ -640,6 +646,7 @@ def _temperature_for_selection(
     return 2.0 * kinetic_j / (float(dof) * BOLTZMANN_J_PER_K)
 
 
+@analysis_execution
 def compute_temperature_from_velocity_xyz(
     source: str | Path,
     *,
@@ -649,6 +656,8 @@ def compute_temperature_from_velocity_xyz(
     velocity_unit: str = "auto",
     remove_com: bool = False,
     atom_aliases: Any = None,
+    threads: int | None = 1,
+    memory_budget_mib: float | None = None,
 ) -> list[TemperatureProfile]:
     """Compute element and/or region temperatures from a CP2K velocity XYZ file."""
 
@@ -734,15 +743,28 @@ def compute_temperature_from_velocity_xyz(
         selected_masses_by_layout = {
             layout: masses[indices] for layout, masses in masses_by_symbol_layout.items()
         }
-        for index, (_step, _time_fs, symbols, velocities) in enumerate(frames):
-            values[index] = _temperature_for_selection(
-                symbols=symbols,
-                velocities=velocities,
-                indices=indices,
-                velocity_factor=factor,
-                remove_com=remove_com,
-                selected_masses_kg=selected_masses_by_layout[symbol_layout_by_frame[index]],
-            )
+        def compute_batch(chunk, indices=indices, selected_masses_by_layout=selected_masses_by_layout):
+            indices_in_time = [item[0] for item in chunk]
+            velocities = np.stack([np.asarray(item[1][3], float)[indices] for item in chunk]) * factor
+            masses = np.stack([selected_masses_by_layout[symbol_layout_by_frame[i]] for i in indices_in_time])
+            dof = 3 * len(indices)
+            if remove_com:
+                dof -= 3
+                if len(indices) > 1:
+                    com = np.sum(velocities * masses[:, :, None], axis=1) / np.sum(masses, axis=1)[:, None]
+                    velocities = velocities - com[:, None, :]
+            if dof <= 0:
+                temperature = np.full(len(chunk), np.nan)
+            else:
+                energy = .5 * np.sum(masses[:, :, None] * velocities * velocities, axis=(1, 2))
+                temperature = 2. * energy / (dof * BOLTZMANN_J_PER_K)
+            return indices_in_time, temperature
+
+        chunk_size = frame_batch_size(len(indices) * 128, maximum=64)
+        workers = stage_workers('temperature.velocities', (len(frames) + chunk_size - 1) // chunk_size,
+                                 bytes_per_task=max(1024 * 1024, len(indices) * chunk_size * 128))
+        for frame_indices, temperatures in bounded_map(compute_batch, batches(enumerate(frames), chunk_size), workers=workers, stage='temperature.velocities'):
+            values[frame_indices] = temperatures
         profiles.append(
             TemperatureProfile(
                 default_label=label,
@@ -782,6 +804,7 @@ def compute_temperature_from_velocity_xyz(
     return profiles
 
 
+@analysis_execution
 def compute_temperature_profiles(
     source: str | Path,
     *,
@@ -790,6 +813,8 @@ def compute_temperature_profiles(
     velocity_unit: str = "auto",
     remove_com: bool = False,
     atom_aliases: Any = None,
+    threads: int | None = 1,
+    memory_budget_mib: float | None = None,
 ) -> list[TemperatureProfile]:
     """Compute or load temperature profiles from a supported source file."""
 
@@ -854,6 +879,7 @@ def _temperature_profile_hdf5_payload(profile: TemperatureProfile) -> dict[str, 
     }
 
 
+@timed_stage("writing")
 def save_temperature_profiles(
     profiles: list[TemperatureProfile],
     output: str | Path,
@@ -1034,6 +1060,7 @@ def plot_temperature_profile(
     tick_params_kwargs: dict[str, Any] | None = None,
     tight_layout_kwargs: dict[str, Any] | None = None,
     savefig_kwargs: dict[str, Any] | None = None,
+    error_config: dict[str, Any] | None = None,
 ) -> Path | None:
     resolved_mapping = resolve_temperature_plot_mapping(
         contract=data_contract,
@@ -1087,6 +1114,9 @@ def plot_temperature_profile(
         x_bin_reducer=x_bin_reducer,
         min_bin_points=min_bin_points,
         analysis_name="temperature",
+        raw_point_statistics=True,
+        frame_timestep_fs=time_step_fs(profile.time_fs),
+        error_config=error_config,
         annotations=annotations,
         integration_config=integration_config,
         style=style,
@@ -1190,6 +1220,7 @@ def plot_temperature_profiles(
     tick_params_kwargs: dict[str, Any] | None = None,
     tight_layout_kwargs: dict[str, Any] | None = None,
     savefig_kwargs: dict[str, Any] | None = None,
+    series_error_configs: list[dict[str, Any] | None] | None = None,
 ) -> Path | None:
     if not profiles:
         raise ValueError("At least one temperature profile is required.")
@@ -1217,6 +1248,7 @@ def plot_temperature_profiles(
     ):
         return plot_temperature_profile(
             profiles[0],
+            error_config=None if not series_error_configs else series_error_configs[0],
             output=output,
             show=show,
             show_blocking=show_blocking,
@@ -1308,6 +1340,9 @@ def plot_temperature_profiles(
         x_bin_reducer=x_bin_reducer,
         min_bin_points=min_bin_points,
         analysis_name="temperature",
+        series_raw_statistics=[True] * len(profiles),
+        series_error_configs=series_error_configs,
+        series_frame_timestep_fs=[time_step_fs(profile.time_fs) for profile in profiles],
         annotations=annotations,
         integration_config=integration_config,
         x_scale=x_scale,

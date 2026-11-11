@@ -59,15 +59,48 @@ def orientation_plot_options_to_view_mapping(
     line_x_axis: str | None = None,
     heatmap_x_axis: str | None = None,
     heatmap_y_axis: str | None = None,
+    heatmap_kind: str | None = None,
+    heatmap_quantity: str | None = None,
+    orientation_heatmap_kind: str | None = None,
+    orientation_heatmap_quantity: str | None = None,
 ) -> PlotViewMapping:
     """Translate current orientation plot options into a generic view mapping."""
 
+    if orientation_heatmap_kind is not None:
+        if heatmap_kind is not None and heatmap_kind != orientation_heatmap_kind:
+            raise ValueError("Conflicting orientation heatmap kinds.")
+        heatmap_kind = orientation_heatmap_kind
+    if orientation_heatmap_quantity is not None:
+        if heatmap_quantity is not None and heatmap_quantity != orientation_heatmap_quantity:
+            raise ValueError("Conflicting orientation heatmap quantities.")
+        heatmap_quantity = orientation_heatmap_quantity
     normalized_component = _normalize_orientation_component(component)
+    if heatmap_kind is not None or heatmap_quantity is not None:
+        normalized_component = "heatmap"
     normalized_angle = _normalize_orientation_angle(angle)
     normalized_line_x_axis = _normalize_orientation_line_x_axis(line_x_axis)
     if normalized_component == "heatmap":
+        if heatmap_kind not in {None, "distribution", "spatial"}:
+            raise ValueError("Orientation heatmap kind must be distribution or spatial.")
+        if heatmap_quantity not in {None, "average", "density", "density-weighted"}:
+            raise ValueError(
+                "Orientation heatmap quantity must be average, density, or density-weighted."
+            )
+        if heatmap_kind == "distribution" and heatmap_quantity not in {None, "average"}:
+            raise ValueError("Density color quantities require a spatial orientation map.")
+        spatial = heatmap_kind == "spatial" or (
+            heatmap_kind is None
+            and (
+                heatmap_x_axis is not None
+                or heatmap_y_axis is not None
+                or heatmap_quantity is not None
+            )
+        )
         fixed_values: dict[str, str] = {}
-        if heatmap_x_axis is not None or heatmap_y_axis is not None:
+        if heatmap_kind is not None or heatmap_quantity is not None:
+            fixed_values["orientation_heatmap_kind"] = "spatial" if spatial else "distribution"
+            fixed_values["orientation_heatmap_quantity"] = heatmap_quantity or "average"
+        if spatial:
             normalized_heatmap_x_axis = _normalize_orientation_grid_axis(
                 heatmap_x_axis,
                 default="x",
@@ -80,16 +113,24 @@ def orientation_plot_options_to_view_mapping(
             )
             if normalized_heatmap_x_axis == normalized_heatmap_y_axis:
                 raise ValueError("Orientation 2D Heatmap axes must be different.")
-            fixed_values = {
-                "orientation_heatmap_x_axis": normalized_heatmap_x_axis,
-                "orientation_heatmap_y_axis": normalized_heatmap_y_axis,
-            }
+            fixed_values.update(
+                {
+                    "orientation_heatmap_x_axis": normalized_heatmap_x_axis,
+                    "orientation_heatmap_y_axis": normalized_heatmap_y_axis,
+                }
+            )
         return PlotViewMapping(
             view_type_id=PLOT_VIEW_2D_HEATMAP,
-            x="bin_centers_A",
-            y="heatmap_angle_bin_centers",
+            x="spatial_x_centers" if spatial else "bin_centers_A",
+            y="spatial_y_centers" if spatial else "heatmap_angle_bin_centers",
             role_assignments={
-                "z": "heatmap_polar" if normalized_angle == "polar" else "heatmap_azimuthal",
+                "z": (
+                    f"spatial_{normalized_angle}_{heatmap_quantity or 'average'}"
+                    if spatial
+                    else "heatmap_polar"
+                    if normalized_angle == "polar"
+                    else "heatmap_azimuthal"
+                ),
             },
             fixed_values=fixed_values,
         )
@@ -147,6 +188,39 @@ def orientation_view_mapping_to_plot_options(mapping: PlotViewMapping) -> dict[s
 
     if view_type_id != "heatmap_2d":
         raise ValueError("Current orientation plotting only supports 1D Line and 2D Heatmap views.")
+    if str(mapping.x or "") == "spatial_x_centers":
+        z = str(mapping.resolved_role_assignments().get("z") or "")
+        choices = {
+            f"spatial_{angle}_{quantity}": (angle, quantity)
+            for angle in ("polar", "azimuthal")
+            for quantity in ("average", "density", "density-weighted")
+        }
+        if mapping.y != "spatial_y_centers" or z not in choices:
+            raise ValueError("Invalid spatial orientation role mapping.")
+        angle, quantity = choices[z]
+        x_axis = _normalize_orientation_grid_axis(
+            mapping.fixed_values.get("orientation_heatmap_x_axis"),
+            default="x",
+            label="Spatial x-axis",
+        )
+        y_axis = _normalize_orientation_grid_axis(
+            mapping.fixed_values.get("orientation_heatmap_y_axis"),
+            default="y",
+            label="Spatial y-axis",
+        )
+        if x_axis == y_axis:
+            raise ValueError("Orientation spatial axes must be different.")
+        return {
+            "component": "heatmap",
+            "angle": angle,
+            **(
+                {"orientation_heatmap_kind": "spatial", "orientation_heatmap_quantity": quantity}
+                if "orientation_heatmap_kind" in mapping.fixed_values or quantity != "average"
+                else {}
+            ),
+            "orientation_heatmap_x_axis": x_axis,
+            "orientation_heatmap_y_axis": y_axis,
+        }
     if str(mapping.x or "").strip() != "bin_centers_A":
         raise ValueError("Orientation heatmap mappings must place bin_centers_A on the x role.")
     if (
@@ -166,6 +240,11 @@ def orientation_view_mapping_to_plot_options(mapping: PlotViewMapping) -> dict[s
             "Orientation heatmap mappings must use heatmap_polar or heatmap_azimuthal on the z role."
         )
     return {
+        **(
+            {"orientation_heatmap_kind": "distribution", "orientation_heatmap_quantity": "average"}
+            if "orientation_heatmap_kind" in mapping.fixed_values
+            else {}
+        ),
         "component": "heatmap",
         "angle": normalized_angle,
         "orientation_heatmap_x_axis": _normalize_orientation_grid_axis(
@@ -191,6 +270,10 @@ def resolve_orientation_plot_mapping(
     line_x_axis: str | None = None,
     heatmap_x_axis: str | None = None,
     heatmap_y_axis: str | None = None,
+    heatmap_kind: str | None = None,
+    heatmap_quantity: str | None = None,
+    orientation_heatmap_kind: str | None = None,
+    orientation_heatmap_quantity: str | None = None,
 ) -> ResolvedOrientationPlotMapping:
     """Resolve orientation options or a mapping into one runtime mapping."""
 
@@ -203,8 +286,18 @@ def resolve_orientation_plot_mapping(
             line_x_axis=line_x_axis,
             heatmap_x_axis=heatmap_x_axis,
             heatmap_y_axis=heatmap_y_axis,
+            heatmap_kind=heatmap_kind,
+            heatmap_quantity=heatmap_quantity,
+            orientation_heatmap_kind=orientation_heatmap_kind,
+            orientation_heatmap_quantity=orientation_heatmap_quantity,
         )
     )
+    if (
+        profile is not None
+        and profile.sparse_grid is None
+        and resolved_mapping.x == "spatial_x_centers"
+    ):
+        raise ValueError("Spatial maps require an orientation sparse grid. Recompute orientation.")
     resolved_contract = contract
     if resolved_contract is None:
         if _orientation_legacy_view_type_id(resolved_mapping.view_type_id) == "heatmap_2d":

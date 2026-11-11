@@ -21,13 +21,29 @@ species selections, for example `--species 'atoms[0,2..4]' Pt`. The separate
 `--atoms-a`/`--atoms-b` options remain available for an atom-index pair and cannot
 be combined with `--species`.
 
-RDF currently does **not** classify free H or OH dynamically. The `mol:H` and
-`mol:OH` selectors available in density/position are unsupported here. If the
-trajectory already stores suitable per-atom labels, use
-`--species species:freeH Pt` or `--species species:OH element:O`. These select
-stored labels, not molecular centers of mass or newly detected molecules.
-`--species H Pt` includes every hydrogen, including bound hydrogen. Fixed atom
-indices keep selecting those atoms even if their bonding changes.
+Molecular selectors `mol:H`, `mol:O`, `mol:OH`, `mol:H2O`, and `mol:H3O`
+select entities dynamically in every frame. Aliases `OH`, `HO`, `H2O`, `H3O`,
+and `mol:HO` are accepted. Unprefixed `H` and `O` still select all atoms of
+those elements; `mol:H` and `mol:O` select only free H and O.
+
+```bash
+linak compute rdf trajectory.traj.h5 --species Na mol:OH
+linak compute rdf trajectory.traj.h5 --species Na mol:H2O --oh-cutoff 1.27
+```
+
+Distances use mass-weighted molecular centers of mass, unwrapped relative to
+the anchor atom before applying minimum-image distances. `--oh-cutoff` controls
+classification (default 1.27 Angstrom); `--oh-topology-backend auto|ckdtree|ase` selects
+the existing exact per-frame classifier backend. There is no lifetime filter.
+Pairs sharing any member atom are excluded from both observed counts and
+ideal-gas normalization, including a molecule paired with its own O or H.
+
+Frames without selected entities or eligible pairs contribute zero observed
+and expected counts and do not contribute per-frame statistical samples.
+The calculation fails if no eligible pairs exist anywhere in the trajectory.
+Molecular selections can be mixed with elements, raw labels, `all`, or fixed
+atom indices. `species:OH` selects a stored atom label rather than detected OH.
+Default pair enumeration still covers elements and stored raw labels only.
 
 ## What Is Being Computed
 

@@ -14,7 +14,6 @@ from typing import Any
 from ase.cell import Cell
 from ase.geometry import find_mic
 import numpy as np
-from scipy.spatial import ConvexHull
 
 from .cache import PREVIEW_CACHE
 
@@ -463,6 +462,8 @@ def _intersection_volume_impl(
     points = np.unique(np.round(np.concatenate(faces), 12), axis=0)
     if len(points) < 4 or np.linalg.matrix_rank(points - points[0], tol=tolerance) < 3:
         return 0.0
+    from scipy.spatial import ConvexHull
+
     return float(ConvexHull(points).volume)
 
 
@@ -485,6 +486,26 @@ def intersection_volume(cell: Any, bounds: Any, origin: Any = None) -> float:
     offset = np.zeros(3) if origin is None else np.asarray(origin, dtype=float).reshape(3)
     limits = np.asarray(bounds, dtype=float).reshape(3, 2)
     return _intersection_volume(tuple(matrix.ravel()), tuple(offset), tuple(limits.ravel()))
+
+
+def bin_volumes_for_frames(frames, edges, axis, *, shifts=None):
+    """Exact per-frame volumes, reusing identical complete geometric inputs."""
+    cache = {}
+    result = []
+    for index, frame in enumerate(frames):
+        matrix = np.asarray(frame.cell, dtype=float)
+        origin = frame_origin(frame)
+        shift = 0.0 if shifts is None else float(shifts[index])
+        key = (matrix.tobytes(), origin.tobytes(), shift)
+        value = cache.get(key)
+        if value is None:
+            value = bin_volumes(matrix, edges, axis, origin=origin, shift=shift)
+            # Per-call cache: edges and axis are invariant. Bound varying cells.
+            if len(cache) >= 128:
+                cache.clear()
+            cache[key] = value
+        result.append(value)
+    return np.asarray(result)
 
 
 def bin_volumes(

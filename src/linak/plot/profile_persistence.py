@@ -13,6 +13,7 @@ from copy import deepcopy
 from typing import Any
 
 from .data_contract import PlotViewMapping, canonical_plot_view_id
+from .setting_keys import copy_settings
 from .settings_validation import validate_current_plot_settings
 
 _PLOT_PROFILE_DENSITY = "plot:density"
@@ -132,6 +133,7 @@ def build_plot_profile_payload(profile_key: str, settings: dict[str, Any]) -> di
 
     if not isinstance(settings, dict):
         raise ValueError("Plot profile settings must be an object.")
+    settings = copy_settings(settings)
     validate_current_plot_settings(settings)
     source_fields = _SOURCE_SELECTION_FIELDS_BY_PROFILE_KEY.get(str(profile_key), ())
     mapping_fields = _LEGACY_MAPPING_FIELDS_BY_PROFILE_KEY.get(str(profile_key), ())
@@ -382,7 +384,7 @@ def _canonicalize_plot_view_state_style(style: dict[str, Any]) -> dict[str, Any]
     store canonical ids in active-view fields and in nested per-view state maps.
     """
 
-    canonical_style = deepcopy(style)
+    canonical_style = copy_settings(style)
     for key, value in list(canonical_style.items()):
         key_text = str(key)
         if key_text.endswith("_active_view_type") and value is not None:

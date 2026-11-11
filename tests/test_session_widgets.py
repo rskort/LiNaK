@@ -189,6 +189,81 @@ def test_fast_render_never_displays_overlay(app):
     target.close()
 
 
+@pytest.mark.parametrize("width", [200, 320, 620])
+def test_activity_caption_and_spinner_do_not_overlap_or_jump(app, width):
+    from linak.plot.gui_session import PlotProgress
+
+    target = QWidget()
+    target.resize(width, 340)
+    target.show()
+    overlay = PreviewLoadingOverlay(target)
+    try:
+        overlay.set_active(True)
+        overlay.delay.stop()
+        overlay._show_loading()
+        app.processEvents()
+        card = overlay.indicator
+        for stage in (
+            "Rendering preview",
+            "Checking files",
+            "Aligning interfaces",
+            "Preparing controls",
+        ):
+            overlay.set_progress(PlotProgress(stage, "/results/" + "long_name_" * 20 + ".h5", 2, 3))
+            app.processEvents()
+            assert card.title_label.text() == PlotProgress(stage).title
+            assert card.spinner.geometry().bottom() < card.title_label.geometry().top()
+            assert card.title_label.geometry().bottom() < card.detail_label.geometry().top()
+            assert card.detail_label.geometry().bottom() < card.height()
+            assert card.geometry().left() >= 0
+            assert card.geometry().right() < overlay.width()
+            assert "2 of 3" in card.detail_label.text()
+            assert "/results/" in card.toolTip()
+            assert len(overlay.findChildren(QLabel)) == 2
+        geometry = card.geometry()
+        overlay.set_progress(PlotProgress("Rendering preview"))
+        app.processEvents()
+        assert card.geometry().width() == geometry.width()
+        assert not overlay.grab().isNull()
+    finally:
+        overlay.shutdown()
+        target.close()
+        target.deleteLater()
+
+
+def test_activity_details_keep_short_operations_quiet_and_stop_when_hidden(app):
+    from linak.plot.gui_session import PlotProgress
+
+    target = QWidget()
+    target.resize(500, 300)
+    target.show()
+    overlay = PreviewLoadingOverlay(target)
+    try:
+        overlay.set_active(True)
+        overlay.delay.stop()
+        overlay._show_loading()
+        overlay.set_progress(PlotProgress("Rendering preview"))
+        app.processEvents()
+        card = overlay.indicator
+        assert card.detail_label.text() == ""
+        card._started -= 12
+        card._tick()
+        assert card.detail_label.text() == "12 s"
+        title = card.title_label.text()
+        card._tick()
+        assert card.title_label.text() == title  # Elapsed time never invents a new work phase.
+        target.hide()
+        app.processEvents()
+        assert not overlay.animation.isActive()
+        target.show()
+        app.processEvents()
+        assert overlay.isVisible() and overlay.animation.isActive()
+    finally:
+        overlay.shutdown()
+        target.close()
+        target.deleteLater()
+
+
 @pytest.mark.parametrize("fail_latest", [False, True])
 def test_setting_change_supersedes_render_and_stale_callbacks_preserve_latest(
     app, monkeypatch, fail_latest
@@ -371,6 +446,12 @@ def test_plot_window_logs_navigation_queued_render_detach_and_failure(app, monke
             QTest.qWait(180)
             overlay = window._active_preview_pane.loading_overlay
             assert overlay.isVisible()
+            assert window._preview_label.text() == ""
+            from linak.plot.gui_session import PlotProgress
+            current_title = overlay.indicator.title_label.text()
+            window._handle_preview_progress(-1, PlotProgress("Checking files", "obsolete.h5"))
+            assert overlay.indicator.title_label.text() == current_title
+
             assert window.grab().save(str(tmp_path / "loading.png"))
             # A stale finished render hands off to the queued replacement without
             # restarting the overlay's delay or stopping the spinner.

@@ -51,7 +51,7 @@ def configure_native_thread_env(
 
     The configuration is only applied when:
     - LiNaK-specific disabling is not requested
-    - none of the known backend thread-count environment variables are already set
+    Explicit backend values are preserved; unspecified backends get safe defaults.
 
     Parameters
     ----------
@@ -66,8 +66,7 @@ def configure_native_thread_env(
     if disable_token in _DISABLE_TRUE_VALUES:
         return NativeThreadEnvConfiguration(applied={}, skipped_reason="disabled")
 
-    if any(str(env.get(key, "")).strip() for key in _BACKEND_THREAD_ENV_VARS):
-        return NativeThreadEnvConfiguration(applied={}, skipped_reason="preconfigured")
+    preconfigured = any(str(env.get(key, "")).strip() for key in _BACKEND_THREAD_ENV_VARS)
 
     requested_raw = str(env.get("LINAK_NUM_THREADS", "")).strip()
     if requested_raw:
@@ -81,11 +80,16 @@ def configure_native_thread_env(
     else:
         requested_threads = 1
 
-    applied = {key: str(requested_threads) for key in _BACKEND_THREAD_ENV_VARS}
+    applied = {
+        key: str(requested_threads)
+        for key in _BACKEND_THREAD_ENV_VARS
+        if not str(env.get(key, "")).strip()
+    }
     env.update(applied)
     return NativeThreadEnvConfiguration(
         applied=applied,
         requested_threads=requested_threads,
+        skipped_reason="preconfigured" if preconfigured else None,
     )
 
 

@@ -10,6 +10,7 @@ from typing import Any
 import numpy as np
 
 from ..runtime_resources import MIB, resolve_resource_policy
+from ..parallel import timed_stage
 
 
 def row_dtype(channels: int) -> np.dtype:
@@ -260,6 +261,7 @@ class SparseReducer:
                 self.workspace.metrics["peak_pending_bytes"], self.workspace.pending_bytes
             )
 
+    @timed_stage("reduction")
     def flush(self) -> None:
         pending, self.pending = self.pending, []
         block_rows = max(1, self.workspace.block_bytes // self.dtype.itemsize)
@@ -362,6 +364,7 @@ class SparseReducer:
             output = output[:count].copy() if count != capacity else output
         return _Run(workspace, output, self.dtype, count, path)
 
+    @timed_stage("reduction")
     def finish(self) -> _Run:
         self.flush()
         runs = [self.levels[level] for level in sorted(self.levels)]

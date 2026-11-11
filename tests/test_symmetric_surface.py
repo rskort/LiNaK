@@ -92,6 +92,114 @@ def _single_top_boundary_frame() -> Atoms:
     return Atoms(symbols, positions=positions, cell=[10.0, 10.0, 20.0], pbc=True)
 
 
+@pytest.mark.parametrize("layout", ["symmetric", "single-top"])
+@pytest.mark.parametrize("view", ["folded", "top", "bottom", "all", "full"])
+def test_coordination_plot_selective_load_preserves_surface_reference(tmp_path, layout, view):
+    from types import SimpleNamespace
+
+    from linak import cli
+    from linak.analysis.coordination import (
+        CoordinationCutoffResolution,
+        compute_coordination_profiles,
+        load_coordination_profiles_by_index,
+        save_coordination_profiles,
+    )
+
+    frames = [_symmetric_frame(), _symmetric_frame()]
+    frames[1].positions[:, 2] += 0.1
+    pairs = [("O", "H"), ("H", "O")]
+    profiles = compute_coordination_profiles(
+        frames,
+        ordered_pairs=pairs,
+        cutoff_resolutions=dict.fromkeys(pairs, CoordinationCutoffResolution(1.5, 0.5, "direct")),
+        surface_elements=["Pt"],
+        surface_layout=layout,
+    )
+    output = tmp_path / "symmetric.coordination.h5"
+    save_coordination_profiles(profiles, output)
+    names = cli._coordination_plot_dataset_names(SimpleNamespace(interface_view=view))
+    selected = load_coordination_profiles_by_index(output, [0, 1], dataset_names=names)
+    assert len(selected) == 2
+    for original, loaded in zip(profiles, selected):
+        assert loaded.surface_reference.resolved_layout == layout
+        for side in ("top", "bottom"):
+            original_side = getattr(original.surface_reference, side)
+            loaded_side = getattr(loaded.surface_reference, side)
+            if original_side is not None:
+                np.testing.assert_allclose(loaded_side.frame_values, original_side.frame_values)
+        for field in (
+            "axis_cut_per_frame_A",
+            "axis_lower_per_frame_A",
+            "axis_period_per_frame_A",
+            "top_population_per_frame",
+            "bottom_population_per_frame",
+            "slab_thickness_per_frame_A",
+        ):
+            np.testing.assert_allclose(
+                getattr(loaded.surface_reference, field), getattr(original.surface_reference, field)
+            )
+        np.testing.assert_allclose(loaded.coordination_number, original.coordination_number)
+    # Surface vectors must not cause unrelated large matrices to be read.
+    assert ("axis_coordinate_A" in names) == (view == "full")
+    assert ("distance_to_top_surface_A" in names) == (view in {"top", "all"})
+    assert ("distance_to_bottom_surface_A" in names) == (view in {"bottom", "all"})
+
+    if layout == "symmetric":
+        image = tmp_path / f"{view}.png"
+        assert (
+            cli.main(
+                [
+                    "plot",
+                    str(output),
+                    "--no-gui",
+                    "--no-show",
+                    "--interface-view",
+                    view,
+                    "--output",
+                    str(image),
+                ]
+            )
+            == 0
+        )
+        assert image.exists()
+
+
+def test_coordination_selective_load_rejects_missing_symmetric_estimate(tmp_path):
+    from types import SimpleNamespace
+
+    import h5py
+    from linak import cli
+    from linak.analysis.coordination import (
+        CoordinationCutoffResolution,
+        compute_coordination_profile,
+        load_coordination_profiles_by_index,
+        save_coordination_profile,
+    )
+
+    profile = compute_coordination_profile(
+        [_symmetric_frame()],
+        species_a="O",
+        species_b="H",
+        surface_layout="symmetric",
+        surface_elements=["Pt"],
+        cutoff_resolution=CoordinationCutoffResolution(1.5, 0.5, "direct"),
+    )
+    output = save_coordination_profile(profile, tmp_path / "incomplete.coordination.h5")
+    with h5py.File(output, "r+") as handle:
+        paths = []
+        handle.visit(
+            lambda name: (
+                paths.append(name) if name.endswith("surface_bottom_position_per_frame_A") else None
+            )
+        )
+        assert paths
+        for path in paths:
+            del handle[path]
+    names = cli._coordination_plot_dataset_names(SimpleNamespace(interface_view="folded"))
+    with pytest.raises(ValueError, match="missing a top or bottom estimate"):
+        load_coordination_profiles_by_index(output, [0], dataset_names=names)
+
+
 @pytest.mark.parametrize("layout", ["auto", "single-top", "single-bottom", "symmetric"])
 def test_current_surface_cache_round_trip_returns_reference(tmp_path, layout):
     from linak.trajectory.io import (

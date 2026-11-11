@@ -55,7 +55,8 @@ def storage_dtype(*, analysis: str, name: str, dtype: Any) -> np.dtype[Any]:
     analysis_key = str(analysis).strip().lower()
     dataset_key = str(name).strip().lower()
     keep_float64 = (
-        analysis_key in _FLOAT64_ANALYSES
+        "_resampling_" in dataset_key
+        or analysis_key in _FLOAT64_ANALYSES
         or any(part in dataset_key for part in _FLOAT64_NAME_PARTS)
         or dataset_key.endswith(_FLOAT64_NAME_SUFFIXES)
     )

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from ..parallel import bounded_map, current_execution, stage_workers, timed_stage
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import json
@@ -41,29 +41,27 @@ from ..storage.hdf5_utils import (
 )
 from ..storage.policies import STORAGE_PRECISION_POLICY, normalize_compression_profile
 from ..progress import ProgressBar
-from ..runtime_resources import MIB, resolve_resource_policy, resolve_worker_count
-from .surface import (
-    canonical_surface_axis_values,
-    estimate_surface_layout_reference,
-    surface_distance_components,
+from ..runtime_resources import MIB
+from .potential_reference import (
+    PotentialConfig, build_reference_plan, evaluate_reference, reference_geometry,
+    sensitivity_windows, validate_config, serialize_config,
 )
-from .water import water_molecule_triplets, water_triplet_geometry
 
 if TYPE_CHECKING:
     import h5py
 
 LOGGER = logging.getLogger(__name__)
-_POTENTIAL_SCHEMA_VERSION = 2
+_POTENTIAL_SCHEMA_VERSION = 3
 
 BOHR_TO_ANG = 0.529177210903
 HARTREE_TO_EV = 27.211386245988
 
-# DOI: 10.1063/5.0322322
-DEFAULT_CSHE_OFFSET_EV = 15.51 - 0.35 - 15.81  # = -0.65
-_DEFAULT_POTENTIAL_THREAD_CAP = 1
-_WATER_ATOMIC_NUMBERS = {1, 8}
 
 FERMI_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    (
+        re.compile(r"Fermi\s+energy\s*\[(?:a\.u\.|hartree)\]\s*:\s*([+-]?\d+(?:\.\d+)?(?:[Ee][+-]?\d+)?)", re.I),
+        "au",
+    ),
     (
         re.compile(r"Fermi\s+energy\s*:\s*([+-]?\d+(?:\.\d+)?(?:[Ee][+-]?\d+)?)"),
         "au",
@@ -80,27 +78,20 @@ FERMI_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     ),
 ]
 
-POTENTIAL_CSV_COLUMNS = [
-    "id",
-    "source",
-    "source_dir",
-    "output_out",
-    "efermi_ev",
-    "water_bulk_potential_ev",
-    "electrode_cshe_ev",
-    "water_bulk_potential_top_ev",
-    "water_bulk_potential_bottom_ev",
-    "electrode_cshe_top_ev",
-    "electrode_cshe_bottom_ev",
-    "water_bulk_window_top_min_A",
-    "water_bulk_window_top_max_A",
-    "water_bulk_window_bottom_min_A",
-    "water_bulk_window_bottom_max_A",
-    "surface_layout_requested",
-    "surface_layout_resolved",
-    "water_bulk_provenance",
-    "status",
-    "error",
+_NUMERIC_COLUMNS = {
+    "efermi_ev", "water_bulk_potential_ev", "electrode_cshe_ev", "requested_padding_ang",
+    "window_min_A", "window_max_A", "window_width_A", "window_mean_ev", "window_std_ev",
+    "window_range_ev", "window_gradient_ev_A", "water_density_A3", "cshe_offset_ev", "time_fs",
+}
+_INTEGER_COLUMNS = {"id", "reference_valid", "window_grid_points"}
+POTENTIAL_COLUMNS = [
+    "id", "source", "source_dir", "output_out", "efermi_ev", "water_bulk_potential_ev",
+    "electrode_cshe_ev", "requested_padding_ang", "window_min_A", "window_max_A",
+    "window_width_A", "window_grid_points", "window_mean_ev", "window_std_ev", "window_range_ev",
+    "window_gradient_ev_A", "water_density_A3", "surface_layout_requested", "surface_layout_resolved",
+    "reference_valid", "reference_rejection_reason", "reference_plan_json", "reference_diagnostics_json",
+    "sensitivity_json", "config_json", "fermi_provenance", "gauge_assumption", "cshe_offset_ev",
+    "time_fs", "status", "error",
 ]
 _COMBINED_POTENTIAL_SOURCES_GROUP = "combined_sources"
 _POTENTIAL_PLOT_SERIES_SPECS = (
@@ -128,18 +119,8 @@ class CubeHeader:
 
 
 @dataclass(frozen=True)
-class PotentialConfig:
-    """Configurable controls for potential analysis."""
-
-    water_padding_ang: float = 5.0
-    cshe_offset_ev: float = DEFAULT_CSHE_OFFSET_EV
-    surface_layout: str = "auto"
-    surface_mode: str = "auto"
-
-
-@dataclass(frozen=True)
 class PotentialRecord:
-    """One computed row for potential HDF5 export."""
+    """One snapshot, including rejected candidate statistics and provenance."""
 
     id: int | None
     source: str
@@ -150,30 +131,35 @@ class PotentialRecord:
     electrode_cshe_ev: float | None
     status: str
     error: str | None
-    water_bulk_potential_top_ev: float | None = None
-    water_bulk_potential_bottom_ev: float | None = None
-    electrode_cshe_top_ev: float | None = None
-    electrode_cshe_bottom_ev: float | None = None
-    water_bulk_window_top_min_A: float | None = None
-    water_bulk_window_top_max_A: float | None = None
-    water_bulk_window_bottom_min_A: float | None = None
-    water_bulk_window_bottom_max_A: float | None = None
+    requested_padding_ang: float | None = None
+    window_min_A: float | None = None
+    window_max_A: float | None = None
+    window_width_A: float | None = None
+    window_grid_points: int = 0
+    window_mean_ev: float | None = None
+    window_std_ev: float | None = None
+    window_range_ev: float | None = None
+    window_gradient_ev_A: float | None = None
+    water_density_A3: float | None = None
     surface_layout_requested: str | None = None
     surface_layout_resolved: str | None = None
-    water_bulk_provenance: str | None = None
+    reference_valid: bool = False
+    reference_rejection_reason: str | None = None
+    reference_plan_json: str | None = None
+    reference_diagnostics_json: str | None = None
+    sensitivity_json: str | None = None
+    config_json: str | None = None
+    fermi_provenance: str | None = None
+    gauge_assumption: str | None = None
+    cshe_offset_ev: float | None = None
+    time_fs: float | None = None
+    profile: dict[str, np.ndarray] | None = None
 
     def as_row_dict(self) -> dict[str, object]:
-        row: dict[str, object] = {}
-        for field in POTENTIAL_CSV_COLUMNS:
-            row[field] = getattr(self, field)
-        return row
+        return {name: getattr(self, name) for name in POTENTIAL_COLUMNS}
 
     def is_complete(self) -> bool:
-        return (
-            self.efermi_ev is not None
-            and self.water_bulk_potential_ev is not None
-            and self.electrode_cshe_ev is not None
-        )
+        return self.reference_valid and self.efermi_ev is not None and self.electrode_cshe_ev is not None
 
 
 @dataclass(frozen=True)
@@ -203,16 +189,15 @@ PotentialFailureCallback = Callable[[PotentialComputationFailure], None]
 
 
 @dataclass(frozen=True)
-class PotentialCsvWriteResult:
+class PotentialHdf5WriteResult:
     """Result metadata from an HDF5 write operation."""
 
     path: Path
     rows_written: int
     mode: str
-    used_fallback_path: bool
 
 
-class PotentialCsvAppender:
+class PotentialHdf5Appender:
     """Incremental HDF5 writer for robust long-running potential workflows."""
 
     def __init__(
@@ -225,7 +210,7 @@ class PotentialCsvAppender:
         compression_profile: str = "fast",
     ) -> None:
         self.requested_output = resolve_hdf5_output_path(output)
-        self.plan = plan_potential_csv_output(
+        self.plan = plan_potential_hdf5_output(
             self.requested_output,
             append=append,
             overwrite=overwrite,
@@ -233,7 +218,6 @@ class PotentialCsvAppender:
         self.path = self.plan.target_path
         self.mode = self.plan.mode
         self.fieldnames = list(self.plan.fieldnames)
-        self.used_fallback_path = self.plan.used_fallback_path
         self.existing_source_keys = set(self.plan.existing_source_keys)
         self.sync_on_write = sync_on_write
         self.compression_profile = normalize_compression_profile(compression_profile)
@@ -243,7 +227,7 @@ class PotentialCsvAppender:
         self.rows_written = 0
         self._next_id = 1
 
-    def __enter__(self) -> PotentialCsvAppender:
+    def __enter__(self) -> PotentialHdf5Appender:
         self._open()
         return self
 
@@ -257,41 +241,15 @@ class PotentialCsvAppender:
 
     @staticmethod
     def _dataset_dtype_for(field: str) -> Any:
-        if field == "id":
+        if field in _INTEGER_COLUMNS:
             return np.int64
-        if field in {
-            "efermi_ev",
-            "water_bulk_potential_ev",
-            "electrode_cshe_ev",
-            "water_bulk_potential_top_ev",
-            "water_bulk_potential_bottom_ev",
-            "electrode_cshe_top_ev",
-            "electrode_cshe_bottom_ev",
-            "water_bulk_window_top_min_A",
-            "water_bulk_window_top_max_A",
-            "water_bulk_window_bottom_min_A",
-            "water_bulk_window_bottom_max_A",
-        }:
-            return np.float64
-        return hdf5_string_dtype()
+        return np.float64 if field in _NUMERIC_COLUMNS else hdf5_string_dtype()
 
     @staticmethod
     def _storage_value(field: str, value: Any) -> Any:
-        if field == "id":
-            return int(value) if value is not None else -1
-        if field in {
-            "efermi_ev",
-            "water_bulk_potential_ev",
-            "electrode_cshe_ev",
-            "water_bulk_potential_top_ev",
-            "water_bulk_potential_bottom_ev",
-            "electrode_cshe_top_ev",
-            "electrode_cshe_bottom_ev",
-            "water_bulk_window_top_min_A",
-            "water_bulk_window_top_max_A",
-            "water_bulk_window_bottom_min_A",
-            "water_bulk_window_bottom_max_A",
-        }:
+        if field in _INTEGER_COLUMNS:
+            return -1 if value is None else int(value)
+        if field in _NUMERIC_COLUMNS:
             return np.nan if value is None else float(value)
         return "" if value is None else str(value)
 
@@ -302,7 +260,7 @@ class PotentialCsvAppender:
         handle = h5py.File(path, mode)
         records_group = handle.require_group("records")
         existing_rows = int(records_group["id"].shape[0]) if "id" in records_group else 0
-        for field in POTENTIAL_CSV_COLUMNS:
+        for field in POTENTIAL_COLUMNS:
             if field in records_group:
                 dataset = records_group[field]
                 if dataset.ndim != 1:
@@ -338,12 +296,21 @@ class PotentialCsvAppender:
         handle.attrs["linak_version"] = __version__
         handle.attrs["compression_profile"] = self.compression_profile
         handle.attrs["storage_precision_policy"] = STORAGE_PRECISION_POLICY
-        handle.attrs["columns_json"] = json.dumps(POTENTIAL_CSV_COLUMNS)
+        handle.attrs["columns_json"] = json.dumps(POTENTIAL_COLUMNS)
         if "metadata_json" not in handle.attrs:
             handle.attrs["metadata_json"] = json.dumps(
                 {
-                    "columns": POTENTIAL_CSV_COLUMNS,
+                    "columns": POTENTIAL_COLUMNS,
                     "analysis": "potential",
+                    "analysis_schema_version": _POTENTIAL_SCHEMA_VERSION,
+                    "potential_convention": "CP2K electron-energy convention; no sign inversion",
+                    "electrode_potential_definition": "V_water - E_F - cshe_offset_ev",
+                    "units_map": {
+                        **{name: "eV" for name in _NUMERIC_COLUMNS if name.endswith("_ev")},
+                        **{name: "Angstrom" for name in ("requested_padding_ang", "window_min_A", "window_max_A", "window_width_A")},
+                        "window_gradient_ev_A": "eV/Angstrom", "water_density_A3": "molecules/Angstrom^3",
+                        "window_grid_points": "count", "time_fs": "fs",
+                    },
                     "compression_profile": self.compression_profile,
                     "storage_precision_policy": STORAGE_PRECISION_POLICY,
                 },
@@ -363,39 +330,19 @@ class PotentialCsvAppender:
 
     def _open(self) -> None:
         target_path = self.path
-        existing_path_has_rows = target_path.exists() and bool(_read_csv_header(target_path))
+        existing_path_has_rows = target_path.exists() and bool(_read_table_columns(target_path))
         if self.mode == "a" and existing_path_has_rows:
             self._next_id = _read_max_existing_id(target_path) + 1
 
-        try:
-            target_path.parent.mkdir(parents=True, exist_ok=True)
-            open_mode = "a" if self.mode == "a" else "w"
-            self._handle = self._open_hdf5_for_write(target_path, mode=open_mode)
-        except (OSError, ValueError) as exc:
-            fallback_path = _fallback_csv_path(Path.cwd() / target_path.name)
-            if fallback_path == target_path:
-                raise
-            LOGGER.warning(
-                "Could not open HDF5 '%s' (%s); using fallback '%s'.",
-                _compact_path(target_path),
-                exc,
-                _compact_path(fallback_path),
-            )
-            LOGGER.debug("HDF5 open fallback: from %s to %s", target_path, fallback_path)
-            self.path = fallback_path
-            self.mode = "w"
-            self.fieldnames = list(POTENTIAL_CSV_COLUMNS)
-            self.used_fallback_path = True
-            self._next_id = 1
-            self._datasets = {}
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            self._handle = self._open_hdf5_for_write(self.path, mode="w")
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        self._handle = self._open_hdf5_for_write(target_path, mode=self.mode)
 
         assert self._handle is not None
         self._handle.flush()
         if self.sync_on_write:
             self._try_fsync_hdf5(self._handle)
 
+    @timed_stage("writing")
     def append_record(self, record: PotentialRecord) -> None:
         if self._handle is None or not self._datasets:
             raise RuntimeError("HDF5 appender is not open.")
@@ -404,13 +351,29 @@ class PotentialCsvAppender:
             record = replace(record, id=self._next_id)
             self._next_id += 1
 
+        if record.reference_plan_json:
+            previous = self._handle.attrs.get("reference_plan_json")
+            if previous is not None and str(previous) != record.reference_plan_json:
+                raise ValueError("Cannot append snapshots selected with a different reference plan. Use --overwrite.")
+        if record.config_json:
+            previous_config = self._handle.attrs.get("reference_config_json")
+            if previous_config is not None and str(previous_config) != record.config_json:
+                raise ValueError("Cannot append snapshots with different validation or referencing settings. Use a separate output.")
         row = record.as_row_dict()
         next_index = int(self._datasets["id"].shape[0])
-        for field in POTENTIAL_CSV_COLUMNS:
+        for field in POTENTIAL_COLUMNS:
             dataset = self._datasets[field]
             dataset.resize((next_index + 1,))
             dataset[next_index] = self._storage_value(field, row.get(field))
 
+        if record.reference_plan_json:
+            self._handle.attrs["reference_plan_json"] = record.reference_plan_json
+        if record.config_json:
+            self._handle.attrs["reference_config_json"] = record.config_json
+        if record.profile is not None:
+            group = self._handle.require_group("profiles").create_group(str(record.id))
+            for name, values in record.profile.items():
+                group.create_dataset(name, data=values, compression="lzf")
         self.rows_written += 1
         self._handle.flush()
         if self.sync_on_write:
@@ -420,6 +383,7 @@ class PotentialCsvAppender:
         for record in records:
             self.append_record(record)
 
+    @timed_stage("writing")
     def close(self) -> None:
         if self._handle is not None:
             if self.sync_on_write:
@@ -430,13 +394,12 @@ class PotentialCsvAppender:
 
 
 @dataclass(frozen=True)
-class PotentialCsvPlan:
+class PotentialHdf5Plan:
     """Pre-write planning result for potential HDF5 output handling."""
 
     target_path: Path
     mode: str
     fieldnames: list[str]
-    used_fallback_path: bool
     existing_source_keys: set[str]
 
 
@@ -472,21 +435,6 @@ def _normalize_source_key(value: str | Path) -> str:
         return str(Path(raw).expanduser().resolve())
     except Exception:
         return raw
-
-
-def validate_potential_config(config: PotentialConfig) -> None:
-    """Validate potential-analysis configuration values."""
-    if config.water_padding_ang < 0.0:
-        raise ValueError(f"water_padding_ang must be >= 0 (got {config.water_padding_ang}).")
-    if str(config.surface_layout).strip().lower() not in {
-        "auto",
-        "single-top",
-        "single-bottom",
-        "symmetric",
-    }:
-        raise ValueError("surface_layout must be auto, single-top, single-bottom, or symmetric.")
-    if str(config.surface_mode).strip().lower() not in {"auto", "layered", "rough"}:
-        raise ValueError("surface_mode must be auto, layered, or rough.")
 
 
 def validate_hartree_cube_source(path: str | Path) -> Path:
@@ -536,41 +484,19 @@ def parse_fermi_ev(path: str | Path) -> float | None:
         return None
 
     value, unit = parsed
-    if unit == "au":
-        return float(value * HARTREE_TO_EV)
-    return float(value)
+    value = float(value * HARTREE_TO_EV) if unit == "au" else float(value)
+    return value if np.isfinite(value) else None
 
 
 def find_cp2k_output_file(search_dir: str | Path) -> Path | None:
-    """Find the most likely CP2K output file in the same directory as the cube file."""
-    root = Path(search_dir).expanduser().resolve()
-    output_out = root / "output.out"
-    if output_out.exists() and output_out.is_file():
-        return output_out
-
-    out_files = sorted(path for path in root.glob("*.out") if path.is_file())
-    if not out_files:
-        return None
-
-    preferred = [
-        path
-        for path in out_files
-        if path.name.lower() != "output.out" and not path.name.lower().startswith("slurm-")
-    ]
-    ordered = preferred + [path for path in out_files if path not in preferred]
-
-    for candidate in ordered:
-        try:
-            if parse_fermi_ev(candidate) is not None:
-                LOGGER.warning(
-                    "Using fallback CP2K output '%s' (output.out not found).",
-                    _compact_path(candidate),
-                )
-                LOGGER.debug("Selected fallback CP2K output file: %s", candidate)
-                return candidate
-        except OSError:
-            continue
-    return ordered[0]
+    root = Path(search_dir)
+    preferred = root / "output.out"
+    if preferred.is_file():
+        return preferred
+    candidates = [p for p in root.glob("*.out") if not p.name.startswith("slurm-")]
+    if len(candidates) > 1:
+        raise ValueError("Ambiguous CP2K output files; provide a source-specific --fermi-map.")
+    return candidates[0] if candidates else None
 
 
 def _display_source_dir(source_path: Path) -> str:
@@ -588,271 +514,53 @@ def _display_output_out(source_dir: Path, output_out: Path | None) -> str | None
     return str(output_out)
 
 
-def _read_cube_header(path: Path) -> tuple[CubeHeader, int]:
-    with path.open("r", encoding="utf-8", errors="replace") as handle:
-        for _ in range(2):
-            if not handle.readline():
-                raise ValueError(f"Cube file ended unexpectedly while reading comments: {path}")
-
-        third = handle.readline()
-        if not third:
-            raise ValueError(f"Cube file ended unexpectedly: {path}")
-        parts = third.split()
-        if len(parts) < 4:
-            raise ValueError(f"Invalid cube header line (natoms/origin) in '{path}'.")
-
-        natoms = abs(int(parts[0]))
-        origin = np.array([float(parts[1]), float(parts[2]), float(parts[3])], dtype=float)
-
-        def read_grid_line() -> tuple[int, np.ndarray]:
-            line = handle.readline()
-            if not line:
-                raise ValueError(f"Cube file ended unexpectedly while reading grid: {path}")
-            tokens = line.split()
-            if len(tokens) < 4:
-                raise ValueError(f"Invalid cube grid line in '{path}'.")
-            count = abs(int(tokens[0]))
-            vector = np.array(
-                [float(tokens[1]), float(tokens[2]), float(tokens[3])],
-                dtype=float,
-            )
-            return count, vector
-
-        nx, vx = read_grid_line()
-        ny, vy = read_grid_line()
-        nz, vz = read_grid_line()
-
-        atom_numbers = np.empty((natoms,), dtype=int)
-        atom_z_bohr = np.empty((natoms,), dtype=float)
-        atom_positions_bohr = np.empty((natoms, 3), dtype=float)
-        for atom_index in range(natoms):
-            line = handle.readline()
-            if not line:
-                raise ValueError(f"Cube file ended unexpectedly while reading atom list: {path}")
-            tokens = line.split()
-            if len(tokens) < 5:
-                raise ValueError(f"Invalid atom line in cube file '{path}'.")
-            atom_numbers[atom_index] = int(round(float(tokens[0])))
-            atom_positions_bohr[atom_index] = np.asarray(
-                [float(tokens[2]), float(tokens[3]), float(tokens[4])],
-                dtype=float,
-            )
-            atom_z_bohr[atom_index] = float(tokens[4])
-
-    data_start_line = 2 + 1 + 3 + natoms
-    header = CubeHeader(
-        natoms=natoms,
-        origin_bohr=origin,
-        nx=nx,
-        ny=ny,
-        nz=nz,
-        vx_bohr=vx,
-        vy_bohr=vy,
-        vz_bohr=vz,
-        atom_numbers=atom_numbers,
-        atom_z_bohr=atom_z_bohr,
-        atom_positions_bohr=atom_positions_bohr,
-    )
-    return header, data_start_line
-
-
 def _cube_header_from_dataset(dataset: CubeDataset) -> CubeHeader:
     grid_counts = np.asarray(dataset.grid_counts_signed, dtype=int)
     if grid_counts.shape != (3,):
         raise ValueError("Cube dataset has invalid grid_counts_signed shape.")
+    if np.any(grid_counts == 0) or not (np.all(grid_counts > 0) or np.all(grid_counts < 0)):
+        raise ValueError("Cube grid counts must have a consistent nonzero coordinate-unit convention.")
+    # Negative cube grid counts denote Angstrom coordinates. Scalar values
+    # still carry CP2K Hartree units; do not rescale the potential here.
+    coordinate_factor = 1 / BOHR_TO_ANG if np.all(grid_counts < 0) else 1.0
     atom_positions_bohr = np.asarray(dataset.atom_positions_bohr, dtype=float)
     if atom_positions_bohr.ndim != 2 or atom_positions_bohr.shape[1] != 3:
         raise ValueError("Cube dataset has invalid atom_positions_bohr shape.")
     return CubeHeader(
         natoms=abs(int(dataset.natoms_signed)),
-        origin_bohr=np.asarray(dataset.origin_bohr, dtype=float),
+        origin_bohr=np.asarray(dataset.origin_bohr, dtype=float) * coordinate_factor,
         nx=int(abs(grid_counts[0])),
         ny=int(abs(grid_counts[1])),
         nz=int(abs(grid_counts[2])),
-        vx_bohr=np.asarray(dataset.grid_vectors_bohr[0], dtype=float),
-        vy_bohr=np.asarray(dataset.grid_vectors_bohr[1], dtype=float),
-        vz_bohr=np.asarray(dataset.grid_vectors_bohr[2], dtype=float),
+        vx_bohr=np.asarray(dataset.grid_vectors_bohr[0], dtype=float) * coordinate_factor,
+        vy_bohr=np.asarray(dataset.grid_vectors_bohr[1], dtype=float) * coordinate_factor,
+        vz_bohr=np.asarray(dataset.grid_vectors_bohr[2], dtype=float) * coordinate_factor,
         atom_numbers=np.asarray(dataset.atom_numbers, dtype=int),
-        atom_z_bohr=np.asarray(atom_positions_bohr[:, 2], dtype=float),
-        atom_positions_bohr=atom_positions_bohr,
+        atom_z_bohr=np.asarray(atom_positions_bohr[:, 2], dtype=float) * coordinate_factor,
+        atom_positions_bohr=atom_positions_bohr * coordinate_factor,
     )
-
-
-def _cube_xyavg_stream_both(
-    path: Path,
-    *,
-    data_start_line: int,
-    nx: int,
-    ny: int,
-    nz: int,
-) -> tuple[np.ndarray, np.ndarray]:
-    n_expected = nx * ny * nz
-
-    with path.open("r", encoding="utf-8", errors="replace") as handle:
-        for _ in range(data_start_line):
-            handle.readline()
-        payload = handle.read()
-
-    if "D" in payload or "d" in payload:
-        payload = payload.replace("D", "E").replace("d", "E")
-
-    values = np.fromstring(payload, sep=" ", dtype=float, count=n_expected)
-    if values.size != n_expected:
-        raise ValueError(
-            f"Cube data length mismatch in '{path}'. Expected {n_expected}, got {values.size}."
-        )
-
-    v_xfast = values.reshape((nz, ny, nx), order="C").mean(axis=(1, 2))
-    v_zfast = values.reshape((nx, ny, nz), order="C").mean(axis=(0, 1))
-    return v_xfast, v_zfast
-
-
-def _cube_xyavg_from_dataset(dataset: CubeDataset) -> tuple[np.ndarray, np.ndarray]:
-    values = np.asarray(dataset.values, dtype=float)
-    if values.ndim != 3:
-        raise ValueError("Cube dataset values must be a 3D scalar field.")
-    nz, ny, nx = values.shape[2], values.shape[1], values.shape[0]
-    v_xfast = values.reshape((nz, ny, nx), order="C").mean(axis=(1, 2))
-    v_zfast = values.reshape((nx, ny, nz), order="C").mean(axis=(0, 1))
-    return v_xfast, v_zfast
-
-
-def _profile_roughness(values: np.ndarray) -> float:
-    dv = np.diff(values)
-    if dv.size == 0:
-        return 0.0
-    second = np.diff(dv)
-    second_term = 0.25 * float(np.mean(np.abs(second))) if second.size else 0.0
-    return float(np.mean(np.abs(dv)) + second_term)
-
-
-def cube_xyavg_vs_z(path: str | Path) -> tuple[np.ndarray, np.ndarray, CubeHeader]:
-    """Read one CP2K cube file and return z-grid and xy-averaged values."""
-    cube_path = Path(path).expanduser().resolve()
-    if not cube_path.exists():
-        raise FileNotFoundError(f"Cube file not found: {cube_path}")
-
-    header, data_start_line = _read_cube_header(cube_path)
-    v_xfast, v_zfast = _cube_xyavg_stream_both(
-        cube_path,
-        data_start_line=data_start_line,
-        nx=header.nx,
-        ny=header.ny,
-        nz=header.nz,
-    )
-
-    profile = v_xfast
-    if _profile_roughness(v_zfast) < _profile_roughness(v_xfast):
-        profile = v_zfast
-
-    z_step_bohr = float(header.vz_bohr[2])
-    if np.isclose(z_step_bohr, 0.0):
-        z_step_bohr = float(np.linalg.norm(header.vz_bohr))
-        LOGGER.warning(
-            "Detected near-zero z component in cube grid vector for '%s'; using |vz|=%.6g bohr.",
-            cube_path,
-            z_step_bohr,
-        )
-    z_bohr = header.origin_bohr[2] + np.arange(header.nz, dtype=float) * z_step_bohr
-    z_ang = z_bohr * BOHR_TO_ANG
-    return z_ang, profile, header
 
 
 def cube_xyavg_vs_dataset(dataset: CubeDataset) -> tuple[np.ndarray, np.ndarray, CubeHeader]:
-    """Return z-grid and xy-averaged values from one logical cube dataset."""
-
+    """Cube ordering is X outermost, Z innermost; never select by smoothness."""
     header = _cube_header_from_dataset(dataset)
-    v_xfast, v_zfast = _cube_xyavg_from_dataset(dataset)
-
-    profile = v_xfast
-    if _profile_roughness(v_zfast) < _profile_roughness(v_xfast):
-        profile = v_zfast
-
-    z_step_bohr = float(header.vz_bohr[2])
-    if np.isclose(z_step_bohr, 0.0):
-        z_step_bohr = float(np.linalg.norm(header.vz_bohr))
-        LOGGER.warning(
-            "Detected near-zero z component in cube grid vector for '%s'; using |vz|=%.6g bohr.",
-            dataset.source_path or dataset.source_name or "cube dataset",
-            z_step_bohr,
-        )
-    z_bohr = header.origin_bohr[2] + np.arange(header.nz, dtype=float) * z_step_bohr
-    z_ang = z_bohr * BOHR_TO_ANG
-    return z_ang, profile, header
+    values = np.asarray(dataset.values, dtype=float)
+    if values.shape != (header.nx, header.ny, header.nz):
+        raise ValueError("Cube field shape does not match its grid counts.")
+    if (not np.allclose(header.vx_bohr[2], 0, atol=1e-10)
+            or not np.allclose(header.vy_bohr[2], 0, atol=1e-10)
+            or not np.allclose(header.vz_bohr[:2], 0, atol=1e-10)
+            or header.vz_bohr[2] <= 0):
+        raise ValueError("Hartree profile requires an XY grid with a decoupled positive Cartesian Z axis.")
+    z = (header.origin_bohr[2] + np.arange(header.nz) * header.vz_bohr[2]) * BOHR_TO_ANG
+    return z, values.mean(axis=(0, 1)), header
 
 
-def water_z_bounds_ang(header: CubeHeader) -> tuple[float, float] | None:
-    """Return water-like (O/H) z bounds in Angstrom from cube atom list."""
-    mask = np.isin(header.atom_numbers, tuple(_WATER_ATOMIC_NUMBERS))
-    if not np.any(mask):
-        return None
-
-    z_oh = header.atom_z_bohr[mask] * BOHR_TO_ANG
-    return float(np.min(z_oh)), float(np.max(z_oh))
-
-
-def _z_slice_edges_ang(z_ang: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    z_values = np.asarray(z_ang, dtype=float)
-    order = np.argsort(z_values)
-    z_sorted = z_values[order]
-    if z_sorted.size == 0:
-        return order, np.asarray([], dtype=float)
-    if z_sorted.size == 1:
-        return order, np.asarray([-np.inf, np.inf], dtype=float)
-
-    midpoints = 0.5 * (z_sorted[:-1] + z_sorted[1:])
-    first_half_step = 0.5 * (z_sorted[1] - z_sorted[0])
-    last_half_step = 0.5 * (z_sorted[-1] - z_sorted[-2])
-    edges = np.empty(z_sorted.size + 1, dtype=float)
-    edges[0] = z_sorted[0] - first_half_step
-    edges[1:-1] = midpoints
-    edges[-1] = z_sorted[-1] + last_half_step
-    return order, edges
-
-
-def _non_water_contaminated_z_slices(z_ang: np.ndarray, header: CubeHeader) -> np.ndarray:
-    """Return z-slice mask for slices whose bin contains at least one non-water atom."""
-    z_values = np.asarray(z_ang, dtype=float)
-    contaminated = np.zeros(z_values.shape, dtype=bool)
-    if z_values.size == 0:
-        return contaminated
-
-    non_water_mask = ~np.isin(header.atom_numbers, tuple(_WATER_ATOMIC_NUMBERS))
-    if not np.any(non_water_mask):
-        return contaminated
-
-    order, edges = _z_slice_edges_ang(z_values)
-    if edges.size == 0:
-        return contaminated
-
-    for atom_z_ang in np.asarray(header.atom_z_bohr[non_water_mask], dtype=float) * BOHR_TO_ANG:
-        if atom_z_ang < edges[0] or atom_z_ang > edges[-1]:
-            continue
-        sorted_index = int(np.searchsorted(edges, atom_z_ang, side="right") - 1)
-        sorted_index = min(max(sorted_index, 0), order.size - 1)
-        contaminated[int(order[sorted_index])] = True
-    return contaminated
-
-
-def _contaminated_slices_for_atom_mask(
-    coordinate_ang: np.ndarray,
-    atom_coordinate_ang: np.ndarray,
-    atom_mask: np.ndarray,
-) -> np.ndarray:
-    """Mark profile slices occupied by excluded/non-water atoms."""
-    values = np.asarray(coordinate_ang, dtype=float)
-    contaminated = np.zeros(values.shape, dtype=bool)
-    selected_atoms = np.asarray(atom_coordinate_ang, dtype=float)[np.asarray(atom_mask, dtype=bool)]
-    if values.size == 0 or selected_atoms.size == 0:
-        return contaminated
-    order, edges = _z_slice_edges_ang(values)
-    for atom_coordinate in selected_atoms:
-        if atom_coordinate < edges[0] or atom_coordinate > edges[-1]:
-            continue
-        sorted_index = int(np.searchsorted(edges, atom_coordinate, side="right") - 1)
-        sorted_index = min(max(sorted_index, 0), order.size - 1)
-        contaminated[int(order[sorted_index])] = True
-    return contaminated
+def cube_xyavg_vs_z(path: str | Path) -> tuple[np.ndarray, np.ndarray, CubeHeader]:
+    datasets = read_cube_sources(path)
+    if len(datasets) != 1:
+        raise ValueError("Expected exactly one cube field.")
+    return cube_xyavg_vs_dataset(datasets[0])
 
 
 def _cube_atoms(header: CubeHeader) -> Atoms | None:
@@ -881,308 +589,6 @@ def _cube_atoms(header: CubeHeader) -> Atoms | None:
     return atoms
 
 
-def _two_sided_water_bulk_potentials(
-    *,
-    header: CubeHeader,
-    z_ang: np.ndarray,
-    v_xyavg_ev: np.ndarray,
-    config: PotentialConfig,
-) -> dict[str, Any] | None:
-    """Resolve topology-aware water windows relative to paired slab surfaces."""
-    atoms = _cube_atoms(header)
-    if atoms is None:
-        return None
-    triplets = water_molecule_triplets(atoms)
-    if triplets.size == 0:
-        return None
-    try:
-        reference = estimate_surface_layout_reference(
-            [atoms],
-            axis="z",
-            surface_layout=config.surface_layout,
-            mode=config.surface_mode,
-            _log_summary=False,
-        )
-    except (ValueError, RuntimeError) as exc:
-        LOGGER.warning("Surface-aware potential windows unavailable: %s", exc)
-        reference = None
-    if reference is None or not reference.uses_distance:
-        water_indices = np.unique(np.asarray(triplets, dtype=int).reshape(-1))
-        water_coordinates = np.asarray(atoms.positions[water_indices, 2], dtype=float)
-        true_water_mask = np.zeros(len(atoms), dtype=bool)
-        true_water_mask[water_indices] = True
-        raw_axis_window = _water_bulk_potential_ev(
-            z_ang=np.asarray(z_ang, dtype=float),
-            v_xyavg_ev=np.asarray(v_xyavg_ev, dtype=float),
-            water_z_min_ang=float(np.min(water_coordinates)),
-            water_z_max_ang=float(np.max(water_coordinates)),
-            padding_ang=float(config.water_padding_ang),
-            contaminated_z_mask=_contaminated_slices_for_atom_mask(
-                np.asarray(z_ang, dtype=float),
-                np.asarray(atoms.positions[:, 2], dtype=float),
-                ~true_water_mask,
-            ),
-        )
-        explicit_symmetric = str(config.surface_layout).strip().lower() == "symmetric"
-        return {
-            "reference": reference,
-            "top": (None, None, None) if explicit_symmetric else raw_axis_window,
-            "bottom": (None, None, None),
-            "combined": None if explicit_symmetric else raw_axis_window[0],
-            "reason": (
-                "explicit symmetric surface reference fell back to raw-axis coordinates"
-                if explicit_symmetric
-                else "true H2O topology; raw-axis single-window fallback"
-            ),
-        }
-
-    grid_q = canonical_surface_axis_values(reference, np.asarray(z_ang, dtype=float), frame_index=0)
-    atom_q = canonical_surface_axis_values(
-        reference,
-        np.asarray(atoms.positions[:, 2], dtype=float),
-        frame_index=0,
-    )
-    geometry = water_triplet_geometry(atoms, triplets)
-    com_q = canonical_surface_axis_values(
-        reference,
-        np.asarray(geometry.com_positions[:, 2], dtype=float),
-        frame_index=0,
-    )
-    _folded, _top_distance, _bottom_distance, molecule_side = surface_distance_components(
-        reference,
-        np.asarray(geometry.com_positions[:, 2], dtype=float),
-        frame_index=0,
-    )
-
-    water_indices = np.unique(np.asarray(triplets, dtype=int).reshape(-1))
-    true_water_mask = np.zeros(len(atoms), dtype=bool)
-    true_water_mask[water_indices] = True
-    contaminated = _contaminated_slices_for_atom_mask(
-        grid_q,
-        atom_q,
-        ~true_water_mask,
-    )
-
-    symmetric = reference.resolved_layout == "symmetric"
-    period = float(reference.axis_period_per_frame_A[0])
-    minimum_widths: dict[str, float] = {}
-    diagnostics: list[str] = []
-    if symmetric:
-        bottom_plane = float(reference.bottom.frame_values[0])
-        top_plane = float(reference.top.frame_values[0])
-        side_limits = {"bottom": (0.0, bottom_plane), "top": (top_plane, period)}
-        # Unwrap each molecule about its COM before taking bounds. Mapping
-        # individual H/O atoms modulo the cell can otherwise give BOTH sides
-        # a min/max interval spanning almost the entire cell at the solvent cut.
-        molecule_q = atom_q[triplets]
-        molecule_q = com_q[:, None] + (
-            molecule_q - com_q[:, None] + 0.5 * period
-        ) % period - 0.5 * period
-        grid_spacing = float(np.median(np.diff(np.sort(grid_q)))) if grid_q.size > 1 else period
-        diagnostics.append(
-            f"canonical z in A: lower={reference.axis_lower_per_frame_A[0]:.8g}, "
-            f"cut={reference.axis_cut_per_frame_A[0]:.8g}, period={period:.8g}, "
-            f"slab bottom={bottom_plane:.8g}, top={top_plane:.8g}"
-        )
-
-    results: dict[str, tuple[float | None, float | None, float | None]] = {}
-    for side_name, side_value in (("top", 1), ("bottom", -1)):
-        selected_molecules = np.where(molecule_side == side_value)[0]
-        if selected_molecules.size == 0:
-            results[side_name] = (None, None, None)
-            if symmetric or reference.resolved_layout == f"single-{side_name}":
-                diagnostics.append(f"{side_name}: missing H2O region")
-                LOGGER.warning("Missing %s bulk-water region.", side_name)
-            continue
-        selected_atom_indices = np.unique(
-            np.asarray(triplets, dtype=int)[selected_molecules].reshape(-1)
-        )
-        side_coordinates = atom_q[selected_atom_indices]
-        allowed = None
-        minimum_width = 0.0
-        if symmetric:
-            lower, upper = side_limits[side_name]
-            side_coordinates = np.clip(molecule_q[selected_molecules].reshape(-1), lower, upper)
-            # The electrode interior and the opposite solvent half are never
-            # candidates, even if a molecule straddles an interface/cell cut.
-            allowed = (grid_q >= lower) & (grid_q <= upper)
-            water_span = float(np.ptp(side_coordinates))
-            minimum_width = max(2.0 * grid_spacing, 0.5 * water_span)
-            minimum_widths[side_name] = minimum_width
-        side_diagnostics: list[str] = []
-        results[side_name] = _water_bulk_potential_ev(
-            z_ang=grid_q,
-            v_xyavg_ev=np.asarray(v_xyavg_ev, dtype=float),
-            water_z_min_ang=float(np.min(side_coordinates)),
-            water_z_max_ang=float(np.max(side_coordinates)),
-            padding_ang=float(config.water_padding_ang),
-            contaminated_z_mask=contaminated,
-            allowed_z_mask=allowed,
-            minimum_width_ang=minimum_width,
-            diagnostics=side_diagnostics,
-        )
-        diagnostics.extend(f"{side_name}: {note}" for note in side_diagnostics)
-    if symmetric:
-        diagnostics.extend(
-            _validate_symmetric_water_windows(
-                results, side_limits=side_limits, minimum_widths=minimum_widths
-            )
-        )
-    return {
-        "reference": reference,
-        "top": results["top"],
-        "bottom": results["bottom"],
-        "reason": "; ".join(
-            ["true H2O topology; non-water atoms excluded from clean windows", *diagnostics]
-        ),
-        "combined": None,
-        "water_molecule_count": int(triplets.shape[0]),
-        "water_com_coordinate_A": com_q.tolist(),
-    }
-
-
-def _validate_symmetric_water_windows(
-    windows: dict[str, tuple[float | None, float | None, float | None]],
-    *,
-    side_limits: dict[str, tuple[float, float]],
-    minimum_widths: dict[str, float],
-) -> list[str]:
-    """Reject invalid pairs in the common, contiguous slab coordinate frame."""
-    problems: dict[str, str] = {}
-    for side, (value, lo, hi) in windows.items():
-        if value is None or lo is None or hi is None:
-            problems[side] = "missing clean bulk-water window"
-            continue
-        if (
-            not np.all(np.isfinite([value, lo, hi]))
-            or hi - lo + 1.0e-8 < minimum_widths.get(side, 0.0)
-        ):
-            problems[side] = "nonfinite or unexpectedly narrow bulk-water window"
-        elif lo < side_limits[side][0] - 1.0e-8 or hi > side_limits[side][1] + 1.0e-8:
-            problems[side] = "bulk-water window lies outside its slab side"
-    _, top_lo, top_hi = windows["top"]
-    _, bottom_lo, bottom_hi = windows["bottom"]
-    if all(v is not None for v in (top_lo, top_hi, bottom_lo, bottom_hi)):
-        if max(top_lo, bottom_lo) <= min(top_hi, bottom_hi):
-            problems.update({side: "overlapping bulk-water windows" for side in windows})
-    for side, problem in problems.items():
-        windows[side] = (None, None, None)
-        LOGGER.warning("Invalid %s potential reference: %s.", side, problem)
-    return [f"{side}: {problem}" for side, problem in problems.items()]
-
-
-def _widest_clean_run_mask(
-    *,
-    z_ang: np.ndarray,
-    candidate_mask: np.ndarray,
-    midpoint_ang: float,
-) -> np.ndarray | None:
-    order = np.argsort(np.asarray(z_ang, dtype=float))
-    sorted_clean = np.asarray(candidate_mask, dtype=bool)[order]
-    best: tuple[float, float, int, int] | None = None
-
-    run_start: int | None = None
-    for index, is_clean in enumerate(sorted_clean.tolist() + [False]):
-        if is_clean and run_start is None:
-            run_start = index
-            continue
-        if is_clean or run_start is None:
-            continue
-
-        run_stop = index
-        run_indices = order[run_start:run_stop]
-        run_z = np.asarray(z_ang, dtype=float)[run_indices]
-        span = float(np.max(run_z) - np.min(run_z)) if run_z.size > 1 else 0.0
-        center_distance = abs(float(np.mean([np.min(run_z), np.max(run_z)])) - midpoint_ang)
-        candidate = (span, -center_distance, -run_start, run_stop)
-        if best is None or candidate > best:
-            best = candidate
-        run_start = None
-
-    if best is None:
-        return None
-
-    _span, _negative_distance, negative_start, stop = best
-    start = -negative_start
-    selected = np.zeros(np.asarray(candidate_mask, dtype=bool).shape, dtype=bool)
-    selected[order[start:stop]] = True
-    return selected
-
-
-def _water_bulk_potential_ev(
-    *,
-    z_ang: np.ndarray,
-    v_xyavg_ev: np.ndarray,
-    water_z_min_ang: float,
-    water_z_max_ang: float,
-    padding_ang: float,
-    contaminated_z_mask: np.ndarray | None = None,
-    allowed_z_mask: np.ndarray | None = None,
-    minimum_width_ang: float = 0.0,
-    diagnostics: list[str] | None = None,
-) -> tuple[float | None, float | None, float | None]:
-    if water_z_min_ang > water_z_max_ang:
-        water_z_min_ang, water_z_max_ang = water_z_max_ang, water_z_min_ang
-
-    z_values = np.asarray(z_ang, dtype=float)
-    v_values = np.asarray(v_xyavg_ev, dtype=float)
-    if contaminated_z_mask is None:
-        contaminated = np.zeros(z_values.shape, dtype=bool)
-    else:
-        contaminated = np.asarray(contaminated_z_mask, dtype=bool)
-        if contaminated.shape != z_values.shape:
-            raise ValueError("contaminated_z_mask must have the same shape as z_ang.")
-
-    midpoint = 0.5 * (water_z_min_ang + water_z_max_ang)
-    paddings = [float(padding_ang)]
-    if padding_ang > 0.0:
-        paddings.extend([float(padding_ang * 0.5), float(padding_ang * 0.25), 0.0])
-
-    seen: set[float] = set()
-    for pad in paddings:
-        key = round(pad, 12)
-        if key in seen:
-            continue
-        seen.add(key)
-
-        z_min = water_z_min_ang + pad
-        z_max = water_z_max_ang - pad
-        if z_min >= z_max:
-            continue
-
-        candidate_mask = (z_values >= z_min) & (z_values <= z_max) & ~contaminated
-        if allowed_z_mask is not None:
-            candidate_mask &= np.asarray(allowed_z_mask, dtype=bool)
-        selected_mask = _widest_clean_run_mask(
-            z_ang=z_values,
-            candidate_mask=candidate_mask,
-            midpoint_ang=midpoint,
-        )
-        if selected_mask is not None and np.any(selected_mask):
-            selected_z = z_values[selected_mask]
-            if float(np.ptp(selected_z)) + 1.0e-8 < minimum_width_ang:
-                continue
-            if pad != padding_ang:
-                note = (
-                    f"padding relaxed from {padding_ang:g} to {pad:g} A "
-                    "to avoid an empty or unexpectedly narrow clean window"
-                )
-                LOGGER.debug(note)
-                if diagnostics is not None:
-                    diagnostics.append(note)
-            return (
-                float(np.mean(v_values[selected_mask])),
-                float(np.min(selected_z)),
-                float(np.max(selected_z)),
-            )
-
-    LOGGER.warning(
-        "Could not resolve a sufficiently wide clean water-bulk averaging window "
-        "without non-water atoms (minimum width %.3f A).", minimum_width_ang
-    )
-    return None, None, None
-
-
 def _resolve_cube_dataset_provenance(dataset: CubeDataset) -> Path:
     if dataset.source_path:
         return Path(dataset.source_path).expanduser().resolve()
@@ -1196,142 +602,128 @@ def expand_hartree_cube_sources(source: str | Path) -> list[CubeDataset]:
     return read_cube_sources(source)
 
 
-def compute_potential_record(
-    source: str | Path | CubeDataset,
-    *,
-    config: PotentialConfig,
-) -> PotentialRecord:
-    """Compute cSHE-related quantities for one Hartree cube file."""
-    validate_potential_config(config)
-    if isinstance(source, CubeDataset):
-        dataset = source
-    else:
-        source_path = validate_hartree_cube_source(source)
-        expanded = read_cube_sources(source_path)
-        if len(expanded) != 1:
-            raise ValueError(
-                "Potential compute expected one cube field but the source expands to multiple entries."
-            )
-        dataset = expanded[0]
-    source_path = _resolve_cube_dataset_provenance(dataset)
+@dataclass
+class _PreparedPotential:
+    source: str
+    path: Path
+    z: np.ndarray
+    values: np.ndarray
+    geometry: Any
+    geometry_error: str | None
+    input_metadata: dict
 
-    source_dir = source_path.parent
-    z_ang, v_xyavg_hartree, header = cube_xyavg_vs_dataset(dataset)
-    if z_ang.size == 0:
-        raise ValueError("Potential profile is empty.")
 
-    v_xyavg_ev = np.asarray(v_xyavg_hartree, dtype=float) * HARTREE_TO_EV
-    water_bulk_potential_ev: float | None = None
-    water_bulk_potential_top_ev: float | None = None
-    water_bulk_potential_bottom_ev: float | None = None
-    top_window_min: float | None = None
-    top_window_max: float | None = None
-    bottom_window_min: float | None = None
-    bottom_window_max: float | None = None
-    layout_requested = str(config.surface_layout).strip().lower() or "auto"
-    layout_resolved: str | None = None
-    water_bulk_provenance: str | None = None
+def _prepare_potential(source, config: PotentialConfig) -> _PreparedPotential:
+    dataset = source if isinstance(source, CubeDataset) else timed_stage("loading")(read_cube_sources)(validate_hartree_cube_source(source))[0]
+    path = _resolve_cube_dataset_provenance(dataset)
+    key = str(path)
+    if dataset.source_profile_index:
+        key += f"::profile:{dataset.source_profile_index}"
+    description = f"{dataset.comment_1} {dataset.comment_2}".lower()
+    if "density" in description and "hartree" not in description:
+        raise ValueError("A density cube is not a CP2K V_HARTREE reference.")
+    z, values, header = cube_xyavg_vs_dataset(dataset)
+    atoms = _cube_atoms(header)
+    geometry, reason = None, None
+    try:
+        if atoms is None:
+            raise ValueError("Cube lacks complete atomic coordinates.")
+        geometry = reference_geometry(atoms, config)
+    except (ValueError, RuntimeError) as exc:
+        reason = str(exc)
+    return _PreparedPotential(key, path, z, values * HARTREE_TO_EV, geometry, reason, {
+        "input_coordinate_unit": "Angstrom" if np.all(dataset.grid_counts_signed < 0) else "Bohr",
+        "input_scalar_unit": "Hartree", "cube_grid_order": "X outermost; Z innermost",
+        "cube_shape": list(dataset.values.shape), "stored_profile_unit": "eV",
+    })
 
-    topology_result = _two_sided_water_bulk_potentials(
-        header=header,
-        z_ang=z_ang,
-        v_xyavg_ev=v_xyavg_ev,
-        config=config,
+
+def _snapshot_fermi(item: _PreparedPotential, config: PotentialConfig, shared_output: bool):
+    if config.fermi_map is not None:
+        value = config.fermi_map.get(item.source)
+        if value is None or not np.isfinite(value):
+            return None, None, "Missing finite source-specific Fermi energy in --fermi-map."
+        return float(value), None, "explicit source-specific Fermi map (user asserts matching CP2K gauge)"
+    try:
+        output = find_cp2k_output_file(item.path.parent)
+    except ValueError as exc:
+        return None, None, str(exc)
+    if output is None:
+        return None, None, "No matching CP2K output found."
+    if shared_output:
+        return None, output, "Multiple snapshots share one output; provide --fermi-map instead of reusing its last Fermi energy."
+    text = output.read_text(encoding="utf-8", errors="replace")
+    steps = re.findall(r"MD\|\s*Step number\s+(\d+)", text)
+    if len(set(steps)) > 1:
+        return None, output, "Multi-step CP2K output has ambiguous snapshot association; provide --fermi-map."
+    convergence = re.findall(r"SCF run[^\n]*", text, re.I)
+    if convergence and re.search(r"NOT\s+converged", convergence[-1], re.I):
+        return None, output, "The final CP2K SCF run did not converge; its Fermi energy is not a valid reference."
+    value = parse_fermi_ev(output)
+    note = "last Fermi entry in source-specific CP2K output; " + (
+        "SCF convergence declared" if convergence else "SCF convergence marker not available"
     )
-    if topology_result is None:
-        LOGGER.warning(
-            "No topologically valid H2O molecules found in cube header for '%s'; "
-            "side-resolved water-bulk potentials are unavailable.",
-            _compact_path(source_path),
-        )
-        water_bulk_provenance = "unavailable: no complete H2O topology"
-    else:
-        reference = topology_result["reference"]
-        if reference is not None:
-            layout_requested = reference.requested_layout
-            layout_resolved = reference.resolved_layout
-        water_bulk_provenance = str(topology_result["reason"])
-        (
-            water_bulk_potential_top_ev,
-            top_window_min,
-            top_window_max,
-        ) = topology_result["top"]
-        (
-            water_bulk_potential_bottom_ev,
-            bottom_window_min,
-            bottom_window_max,
-        ) = topology_result["bottom"]
-        if layout_resolved == "symmetric":
-            if (
-                water_bulk_potential_top_ev is not None
-                and water_bulk_potential_bottom_ev is not None
-            ):
-                water_bulk_potential_ev = 0.5 * (
-                    water_bulk_potential_top_ev + water_bulk_potential_bottom_ev
-                )
-        elif layout_resolved == "single-bottom":
-            water_bulk_potential_ev = water_bulk_potential_bottom_ev
-        elif layout_resolved == "single-top":
-            water_bulk_potential_ev = water_bulk_potential_top_ev
-        elif topology_result.get("combined") is not None:
-            water_bulk_potential_ev = float(topology_result["combined"])
+    return value, output, note if value is not None else "No finite Fermi energy parsed."
 
-    output_out = find_cp2k_output_file(source_dir)
-    efermi_ev = parse_fermi_ev(output_out) if output_out is not None else None
 
-    electrode_cshe_ev = None
-    electrode_cshe_top_ev = None
-    electrode_cshe_bottom_ev = None
-    if efermi_ev is not None and water_bulk_potential_top_ev is not None:
-        electrode_cshe_top_ev = (
-            water_bulk_potential_top_ev - efermi_ev + float(config.cshe_offset_ev)
-        )
-    if efermi_ev is not None and water_bulk_potential_bottom_ev is not None:
-        electrode_cshe_bottom_ev = (
-            water_bulk_potential_bottom_ev - efermi_ev + float(config.cshe_offset_ev)
-        )
-    if efermi_ev is not None and water_bulk_potential_ev is not None:
-        electrode_cshe_ev = water_bulk_potential_ev - efermi_ev + float(config.cshe_offset_ev)
-
-    status = "ok" if electrode_cshe_ev is not None else "incomplete"
-    if efermi_ev is None:
-        LOGGER.warning(
-            "Could not parse Fermi energy for '%s'; electrode cSHE remains unavailable.",
-            _compact_path(source_path),
-        )
-        LOGGER.debug("Fermi parsing failed for source: %s", source_path)
-    if water_bulk_potential_ev is None:
-        LOGGER.warning(
-            "Could not resolve water-bulk potential for '%s'; electrode cSHE remains unavailable.",
-            _compact_path(source_path),
-        )
-        LOGGER.debug("Water-bulk resolution failed for source: %s", source_path)
-
+def _record_from_prepared(item, config, plan, *, shared_output=False, index=0):
+    efermi, output, fermi_note = _snapshot_fermi(item, config, shared_output)
+    diagnostics = {"valid": False, "reasons": [item.geometry_error], "grid_points": 0}
+    selected = np.zeros(len(item.z), dtype=bool)
+    sensitivity = {}
+    profile = {"z_A": item.z, "hartree_ev": item.values, "selected": selected.astype(np.int8)}
+    if item.geometry is not None:
+        diagnostics, weights = evaluate_reference(item.z, item.values, item.geometry, plan, config)
+        selected = weights > 1e-14
+        sensitivity = sensitivity_windows(item.z, item.values, item.geometry, plan, config)
+        g = item.geometry
+        profile.update(solvent_s_A=g.coordinate(item.z), gap_A=np.asarray([g.length]),
+                       water_s_A=g.water_s, area_A2=np.asarray([g.area]), selected=selected.astype(np.int8),
+                       averaging_weights=weights)
+        diagnostics.update(slab_bottom_z_A=g.slab_bottom, slab_top_z_A=g.slab_top,
+                           solvent_start_z_A=g.start, solvent_gap_A=g.length,
+                           cell_origin_z_A=g.origin, cell_period_A=g.period)
+    diagnostics.update(item.input_metadata)
+    valid = bool(diagnostics["valid"])
+    water = diagnostics.get("mean_ev") if valid else None
+    cshe = water - efermi - config.cshe_offset_ev if water is not None and efermi is not None else None
+    reasons = [str(reason) for reason in diagnostics["reasons"] if reason]
+    status = "ok" if cshe is not None else "incomplete" if valid else "invalid"
+    if status != "ok":
+        LOGGER.warning("Potential reference %s for '%s': %s", status, _compact_path(item.source),
+                       "; ".join(reasons) if reasons else fermi_note)
     return PotentialRecord(
-        id=None,
-        source=str(source_path),
-        source_dir=_display_source_dir(source_path),
-        output_out=_display_output_out(source_dir, output_out),
-        efermi_ev=efermi_ev,
-        water_bulk_potential_ev=water_bulk_potential_ev,
-        electrode_cshe_ev=electrode_cshe_ev,
-        status=status,
-        error=None,
-        water_bulk_potential_top_ev=water_bulk_potential_top_ev,
-        water_bulk_potential_bottom_ev=water_bulk_potential_bottom_ev,
-        electrode_cshe_top_ev=electrode_cshe_top_ev,
-        electrode_cshe_bottom_ev=electrode_cshe_bottom_ev,
-        water_bulk_window_top_min_A=top_window_min,
-        water_bulk_window_top_max_A=top_window_max,
-        water_bulk_window_bottom_min_A=bottom_window_min,
-        water_bulk_window_bottom_max_A=bottom_window_max,
-        surface_layout_requested=layout_requested,
-        surface_layout_resolved=layout_resolved,
-        water_bulk_provenance=water_bulk_provenance,
+        id=None, source=item.source, source_dir=_display_source_dir(item.path),
+        output_out=None if output is None else _display_output_out(item.path.parent, output),
+        efermi_ev=efermi, water_bulk_potential_ev=water, electrode_cshe_ev=cshe,
+        status=status, error=None if cshe is not None else "; ".join([*reasons, *([] if efermi is not None else [fermi_note])]),
+        requested_padding_ang=config.water_padding_ang,
+        window_min_A=diagnostics.get("min_A"), window_max_A=diagnostics.get("max_A"),
+        window_width_A=diagnostics.get("width_A"), window_grid_points=diagnostics["grid_points"],
+        window_mean_ev=diagnostics.get("mean_ev"), window_std_ev=diagnostics.get("std_ev"),
+        window_range_ev=diagnostics.get("range_ev"), window_gradient_ev_A=diagnostics.get("gradient_ev_A"),
+        water_density_A3=diagnostics.get("water_density_A3"),
+        surface_layout_requested=config.surface_layout,
+        surface_layout_resolved=None if item.geometry is None else item.geometry.layout,
+        reference_valid=valid, reference_rejection_reason="; ".join(reasons) or None,
+        reference_plan_json=json.dumps(plan, sort_keys=True),
+        reference_diagnostics_json=json.dumps(diagnostics, sort_keys=True),
+        sensitivity_json=json.dumps(sensitivity, sort_keys=True), config_json=serialize_config(config),
+        fermi_provenance=fermi_note, cshe_offset_ev=config.cshe_offset_ev,
+        gauge_assumption="CP2K electron-energy convention; V_HARTREE and E_F must be from the same SCF gauge. No per-frame recentering applied.",
+        time_fs=None if config.snapshot_interval_fs is None else index * config.snapshot_interval_fs,
+        profile=profile,
     )
 
 
-def error_record_for_source(source: str | Path, error: str) -> PotentialRecord:
+def compute_potential_record(source, *, config: PotentialConfig) -> PotentialRecord:
+    validate_config(config)
+    item = _prepare_potential(source, config)
+    plan = build_reference_plan([] if item.geometry is None else [item.geometry], config)
+    return _record_from_prepared(item, config, plan)
+
+
+def error_record_for_source(source: str | Path, error: str, config: PotentialConfig | None = None) -> PotentialRecord:
     """Create a failure record suitable for HDF5 persistence."""
     source_path = Path(source).expanduser()
     try:
@@ -1348,6 +740,9 @@ def error_record_for_source(source: str | Path, error: str) -> PotentialRecord:
         electrode_cshe_ev=None,
         status="error",
         error=error,
+        reference_rejection_reason=error,
+        requested_padding_ang=None if config is None else config.water_padding_ang,
+        cshe_offset_ev=None if config is None else config.cshe_offset_ev,
     )
 
 
@@ -1388,115 +783,64 @@ def _resolve_worker_count(
 
     if threads is not None and threads < 1:
         raise ValueError("Potential threads must be >= 1.")
-    return resolve_worker_count(
-        task_count=n_sources,
-        estimated_bytes_per_worker=estimated_bytes_per_worker,
-        requested_threads=threads,
-        policy=resolve_resource_policy(memory_budget_mib),
-        cpu_count=min(_DEFAULT_POTENTIAL_THREAD_CAP, os.cpu_count() or 1),
-        logger=LOGGER,
-        context="Potential analysis",
+    return stage_workers('potential.files', n_sources,
+        bytes_per_task=max(MIB, estimated_bytes_per_worker // 4), memory_budget_mib=memory_budget_mib,
+        requested_threads=threads, use_requested=threads is not None or current_execution() is None,
     )
 
 
+@timed_stage("calculation")
 def compute_potential_records(
-    sources: Sequence[str | Path | CubeDataset],
-    *,
-    config: PotentialConfig,
-    threads: int | None = None,
-    memory_budget_mib: float | None = None,
+    sources: list[str | Path | CubeDataset], *, config: PotentialConfig,
+    threads: int | None = None, memory_budget_mib: float | None = None,
     on_record: PotentialRecordCallback | None = None,
     on_failure: PotentialFailureCallback | None = None,
+    start_index: int = 0,
+    previous_sources: Sequence[str] = (),
 ) -> tuple[list[PotentialRecord], list[PotentialComputationFailure]]:
-    """Compute potential records for one or many Hartree cube files.
-
-    Parameters
-    ----------
-    sources
-        Input Hartree cube files.
-    config
-        Potential-analysis configuration.
-    threads
-        Optional worker count. If ``None``, LiNaK derives a bounded default.
-    on_record
-        Optional callback invoked for every successful record.
-    on_failure
-        Optional callback invoked for every failed source.
-
-    Returns
-    -------
-    tuple[list[PotentialRecord], list[PotentialComputationFailure]]
-        Ordered successful records and ordered failures.
-    """
+    """Plan from all structures, then evaluate a fixed plan in source order."""
+    validate_config(config)
     if not sources:
-        raise ValueError("At least one source path is required.")
-
-    worker_count = _resolve_worker_count(
-        threads,
-        len(sources),
-        estimated_bytes_per_worker=max(_estimate_cube_worker_bytes(source) for source in sources),
-        memory_budget_mib=memory_budget_mib,
-    )
-    records_by_index: dict[int, PotentialRecord] = {}
-    failures_by_index: dict[int, PotentialComputationFailure] = {}
-
-    def _compute_one(
-        index: int,
-        source_item: str | Path | CubeDataset,
-    ) -> tuple[int, PotentialRecord | None, PotentialComputationFailure | None]:
+        raise ValueError("At least one source is required.")
+    if not isinstance(start_index, int) or start_index < 0:
+        raise ValueError("start_index must be a nonnegative snapshot index.")
+    workers = _resolve_worker_count(threads, len(sources), memory_budget_mib=memory_budget_mib,
+        estimated_bytes_per_worker=max(_estimate_cube_worker_bytes(source) for source in sources))
+    prepared = {}
+    failures = {}
+    def prepare(index, source):
         try:
-            record = compute_potential_record(source_item, config=config)
-            return index, record, None
+            return index, _prepare_potential(source, config), None
         except Exception as exc:
-            failure_source = (
-                str(_resolve_cube_dataset_provenance(source_item))
-                if isinstance(source_item, CubeDataset)
-                else str(source_item)
-            )
-            failure = PotentialComputationFailure(source=failure_source, error=str(exc))
-            return index, None, failure
-
-    if worker_count > 1:
-        LOGGER.info(
-            "Using %d thread(s) for potential computation across %d file(s).",
-            worker_count,
-            len(sources),
-        )
-
+            name = str(_resolve_cube_dataset_provenance(source)) if isinstance(source, CubeDataset) else str(source)
+            return index, None, PotentialComputationFailure(name, str(exc))
+    with ProgressBar(desc="Planning potential references", total=len(sources), unit="file") as progress:
+        for index, item, failure in bounded_map(
+            lambda pair: prepare(*pair), enumerate(sources), workers=workers, stage='potential.files',
+        ):
+            if item is not None:
+                prepared[index] = item
+            if failure is not None:
+                failures[index] = failure
+            progress.update()
+    plan = build_reference_plan([item.geometry for item in prepared.values() if item.geometry is not None], config)
+    from collections import Counter
+    directories = Counter(str(item.path.parent) for item in prepared.values())
+    directories.update(str(Path(source.split("::profile:")[0]).parent) for source in previous_sources)
+    records = []
     with ProgressBar(desc="Computing potentials", total=len(sources), unit="file") as progress:
-        if worker_count == 1:
-            for index, source in enumerate(sources):
-                idx, record, failure = _compute_one(index, source)
-                if record is not None:
-                    records_by_index[idx] = record
-                    if on_record is not None:
-                        on_record(record)
-                if failure is not None:
-                    failures_by_index[idx] = failure
-                    if on_failure is not None:
-                        on_failure(failure)
-                progress.update()
-        else:
-            with ThreadPoolExecutor(max_workers=worker_count) as executor:
-                futures = {
-                    executor.submit(_compute_one, index, source): index
-                    for index, source in enumerate(sources)
-                }
-                for future in as_completed(futures):
-                    idx, record, failure = future.result()
-                    if record is not None:
-                        records_by_index[idx] = record
-                        if on_record is not None:
-                            on_record(record)
-                    if failure is not None:
-                        failures_by_index[idx] = failure
-                        if on_failure is not None:
-                            on_failure(failure)
-                    progress.update()
-
-    ordered_records = [records_by_index[index] for index in sorted(records_by_index)]
-    ordered_failures = [failures_by_index[index] for index in sorted(failures_by_index)]
-    return ordered_records, ordered_failures
+        for index in range(len(sources)):
+            if index in prepared:
+                item = prepared.pop(index)
+                record = _record_from_prepared(item, config, plan,
+                    shared_output=directories[str(item.path.parent)] > 1, index=start_index + index)
+                records.append(record)
+                if on_record is not None:
+                    on_record(record)
+            elif on_failure is not None:
+                on_failure(failures[index])
+            progress.update()
+    return records, [failures[index] for index in sorted(failures)]
 
 
 def _mean_std(values: list[float | None]) -> tuple[float | None, float | None, int]:
@@ -1538,7 +882,7 @@ def _validate_potential_table(handle: h5py.File, *, path: Path) -> None:
         raise ValueError(f"Potential HDF5 '{path}' is missing '/records'. Recompute this analysis.")
     missing = [
         column
-        for column in POTENTIAL_CSV_COLUMNS
+        for column in POTENTIAL_COLUMNS
         if not isinstance(records.get(column), h5py.Dataset)
     ]
     if missing:
@@ -1548,7 +892,7 @@ def _validate_potential_table(handle: h5py.File, *, path: Path) -> None:
         )
     row_shape = records["id"].shape
     if len(row_shape) != 1 or any(
-        records[column].shape != row_shape for column in POTENTIAL_CSV_COLUMNS
+        records[column].shape != row_shape for column in POTENTIAL_COLUMNS
     ):
         raise ValueError(
             f"Potential HDF5 '{path}' requires aligned one-dimensional record columns. "
@@ -1556,117 +900,32 @@ def _validate_potential_table(handle: h5py.File, *, path: Path) -> None:
         )
 
 
-def load_potential_records(source: str | Path) -> list[PotentialRecord]:
-    """Load the raw potential-record rows from one LiNaK potential HDF5 file."""
+def load_potential_records(source: str | Path, *, include_profiles: bool = False) -> list[PotentialRecord]:
     require_h5py()
     import h5py
-
-    source_path = Path(source).expanduser().resolve()
-    if not source_path.exists():
-        raise FileNotFoundError(f"HDF5 file not found: {source_path}")
-
-    with h5py.File(source_path, "r") as handle:
-        _validate_potential_table(handle, path=source_path)
-        records_group = handle["records"]
-        row_count = int(records_group["id"].shape[0])
-        ids = np.asarray(records_group["id"], dtype=np.int64)
-        sources = np.asarray(records_group["source"].asstr()[...], dtype=object)
-        source_dirs = np.asarray(records_group["source_dir"].asstr()[...], dtype=object)
-        output_out = np.asarray(records_group["output_out"].asstr()[...], dtype=object)
-        statuses = np.asarray(records_group["status"].asstr()[...], dtype=object)
-        errors = np.asarray(records_group["error"].asstr()[...], dtype=object)
-        efermi = np.asarray(records_group["efermi_ev"], dtype=float)
-        water_bulk = np.asarray(records_group["water_bulk_potential_ev"], dtype=float)
-        cshe = np.asarray(records_group["electrode_cshe_ev"], dtype=float)
-        side_numeric = {
-            name: (np.asarray(records_group[name], dtype=float))
-            for name in (
-                "water_bulk_potential_top_ev",
-                "water_bulk_potential_bottom_ev",
-                "electrode_cshe_top_ev",
-                "electrode_cshe_bottom_ev",
-                "water_bulk_window_top_min_A",
-                "water_bulk_window_top_max_A",
-                "water_bulk_window_bottom_min_A",
-                "water_bulk_window_bottom_max_A",
-            )
+    path = Path(source).expanduser().resolve()
+    with h5py.File(path, "r") as handle:
+        _validate_potential_table(handle, path=path)
+        group = handle["records"]
+        columns = {
+            name: (group[name][...] if name in _NUMERIC_COLUMNS | _INTEGER_COLUMNS else group[name].asstr()[...])
+            for name in POTENTIAL_COLUMNS
         }
-        layout_text = {
-            name: (np.asarray(records_group[name].asstr()[...], dtype=object))
-            for name in (
-                "surface_layout_requested",
-                "surface_layout_resolved",
-                "water_bulk_provenance",
-            )
-        }
-
-    loaded: list[PotentialRecord] = []
-    for index in range(row_count):
-        loaded.append(
-            PotentialRecord(
-                id=None if int(ids[index]) < 0 else int(ids[index]),
-                source=str(sources[index]),
-                source_dir=str(source_dirs[index]),
-                output_out=(str(output_out[index]).strip() or None),
-                efermi_ev=None if not np.isfinite(efermi[index]) else float(efermi[index]),
-                water_bulk_potential_ev=(
-                    None if not np.isfinite(water_bulk[index]) else float(water_bulk[index])
-                ),
-                electrode_cshe_ev=None if not np.isfinite(cshe[index]) else float(cshe[index]),
-                status=str(statuses[index]),
-                error=(str(errors[index]).strip() or None),
-                water_bulk_potential_top_ev=(
-                    None
-                    if not np.isfinite(side_numeric["water_bulk_potential_top_ev"][index])
-                    else float(side_numeric["water_bulk_potential_top_ev"][index])
-                ),
-                water_bulk_potential_bottom_ev=(
-                    None
-                    if not np.isfinite(side_numeric["water_bulk_potential_bottom_ev"][index])
-                    else float(side_numeric["water_bulk_potential_bottom_ev"][index])
-                ),
-                electrode_cshe_top_ev=(
-                    None
-                    if not np.isfinite(side_numeric["electrode_cshe_top_ev"][index])
-                    else float(side_numeric["electrode_cshe_top_ev"][index])
-                ),
-                electrode_cshe_bottom_ev=(
-                    None
-                    if not np.isfinite(side_numeric["electrode_cshe_bottom_ev"][index])
-                    else float(side_numeric["electrode_cshe_bottom_ev"][index])
-                ),
-                water_bulk_window_top_min_A=(
-                    None
-                    if not np.isfinite(side_numeric["water_bulk_window_top_min_A"][index])
-                    else float(side_numeric["water_bulk_window_top_min_A"][index])
-                ),
-                water_bulk_window_top_max_A=(
-                    None
-                    if not np.isfinite(side_numeric["water_bulk_window_top_max_A"][index])
-                    else float(side_numeric["water_bulk_window_top_max_A"][index])
-                ),
-                water_bulk_window_bottom_min_A=(
-                    None
-                    if not np.isfinite(side_numeric["water_bulk_window_bottom_min_A"][index])
-                    else float(side_numeric["water_bulk_window_bottom_min_A"][index])
-                ),
-                water_bulk_window_bottom_max_A=(
-                    None
-                    if not np.isfinite(side_numeric["water_bulk_window_bottom_max_A"][index])
-                    else float(side_numeric["water_bulk_window_bottom_max_A"][index])
-                ),
-                surface_layout_requested=(
-                    str(layout_text["surface_layout_requested"][index]).strip() or None
-                ),
-                surface_layout_resolved=(
-                    str(layout_text["surface_layout_resolved"][index]).strip() or None
-                ),
-                water_bulk_provenance=(
-                    str(layout_text["water_bulk_provenance"][index]).strip() or None
-                ),
-            )
-        )
-    return loaded
+        rows = []
+        for index in range(len(columns["id"])):
+            row = {}
+            for name, values in columns.items():
+                value = values[index]
+                if name in _NUMERIC_COLUMNS:
+                    row[name] = float(value) if np.isfinite(value) else None
+                elif name in _INTEGER_COLUMNS:
+                    row[name] = bool(value) if name == "reference_valid" else None if value < 0 else int(value)
+                else:
+                    row[name] = str(value) or None
+            if include_profiles and "profiles" in handle and str(row["id"]) in handle["profiles"]:
+                row["profile"] = {name: data[...] for name, data in handle["profiles"][str(row["id"])].items()}
+            rows.append(PotentialRecord(**row))
+        return rows
 
 
 def combine_potential_hdf5_sources(
@@ -1675,20 +934,35 @@ def combine_potential_hdf5_sources(
     output: str | Path,
 ) -> Path:
     """Write a combined potential HDF5 that contains rows from every source file."""
+    from ..plot.gui_session import report_progress, own_preparation_output
+    from ..cancellation import check_cancelled
+
+    report_progress("Preparing combined results")
+    existed = Path(output).expanduser().resolve().exists()
     records: list[PotentialRecord] = []
     source_segments: list[tuple[Path, int, int]] = []
-    for source in sources:
+    for index, source in enumerate(sources, 1):
+        report_progress("Preparing combined results", Path(source).name, index, len(sources))
         source_path = Path(source).expanduser().resolve()
-        source_records = load_potential_records(source_path)
+        source_records = load_potential_records(source_path, include_profiles=True)
         row_start = len(records)
         records.extend(source_records)
         if source_records:
             source_segments.append((source_path, row_start, len(source_records)))
     if not records:
         raise ValueError("No potential rows were available to combine.")
-    result = write_potential_records_csv(records, output=output, append=False, overwrite=True)
-    _write_combined_potential_source_metadata(result.path, source_segments)
-    return result.path
+    from ..storage.hdf5_utils import _atomic_hdf5_target
+
+    target = Path(output).expanduser().resolve()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with _atomic_hdf5_target(target) as temporary:
+        result = write_potential_records(records, output=temporary, append=False, overwrite=True)
+        _write_combined_potential_source_metadata(result.path, source_segments)
+        check_cancelled()
+    if not existed:
+        own_preparation_output(target)
+    check_cancelled()
+    return target
 
 
 def _write_combined_potential_source_metadata(
@@ -1780,6 +1054,8 @@ def _potential_plot_order_for_rows(
 
 def load_potential_plot_profiles(
     source: str | Path,
+    *,
+    _metadata_only: bool = False,
 ) -> tuple[list[PotentialPlotSeries], dict[str, Any]]:
     """Load a potential HDF5 file into fixed plotting series."""
     require_h5py()
@@ -1794,12 +1070,17 @@ def load_potential_plot_profiles(
         records = handle["records"]
 
         total_rows = int(records["id"].shape[0])
-        raw_ids = np.asarray(records["id"], dtype=np.int64)
-        values_by_column = {
-            column: np.asarray(records[column], dtype=float)
-            for column, _label in _POTENTIAL_PLOT_SERIES_SPECS
-        }
-        status_values = np.asarray(records["status"].asstr()[...], dtype=object)
+        if _metadata_only:
+            raw_ids = np.empty(0, dtype=np.int64)
+            values_by_column = {}
+            status_values = np.empty(0, dtype=object)
+        else:
+            raw_ids = np.asarray(records["id"], dtype=np.int64)
+            values_by_column = {
+                column: np.asarray(records[column], dtype=float)
+                for column, _label in _POTENTIAL_PLOT_SERIES_SPECS
+            }
+            status_values = np.asarray(records["status"].asstr()[...], dtype=object)
         combined_segments = _read_combined_potential_source_metadata(
             handle,
             total_rows=total_rows,
@@ -1811,14 +1092,19 @@ def load_potential_plot_profiles(
     profiles: list[PotentialPlotSeries] = []
     total_complete_rows = 0
     for segment_source_path, row_start, row_count in combined_segments:
-        order, x_values = _potential_plot_order_for_rows(
-            raw_ids,
-            row_start=row_start,
-            row_count=row_count,
-        )
-        ordered_status = [str(status_values[index]).strip().lower() for index in order]
-        complete_rows = sum(1 for value in ordered_status if value == "ok")
-        incomplete_rows = row_count - complete_rows
+        if _metadata_only:
+            order = np.empty(0, dtype=np.int64)
+            x_values = np.empty(0)
+            complete_rows = incomplete_rows = 0
+        else:
+            order, x_values = _potential_plot_order_for_rows(
+                raw_ids,
+                row_start=row_start,
+                row_count=row_count,
+            )
+            ordered_status = [str(status_values[index]).strip().lower() for index in order]
+            complete_rows = sum(1 for value in ordered_status if value == "ok")
+            incomplete_rows = row_count - complete_rows
         total_complete_rows += complete_rows
         is_combined_segment = segment_source_path != source_path
         label_prefix = (
@@ -1836,7 +1122,11 @@ def load_potential_plot_profiles(
                     series_id=rendered_series_id,
                     default_label=rendered_label,
                     x_values=np.asarray(x_values, dtype=float),
-                    y_values=np.asarray(values_by_column[series_id][order], dtype=float),
+                    y_values=(
+                        np.empty(0)
+                        if _metadata_only
+                        else np.asarray(values_by_column[series_id][order], dtype=float)
+                    ),
                     source_path=str(segment_source_path),
                     total_rows=row_count,
                     complete_rows=complete_rows,
@@ -2029,33 +1319,20 @@ def plot_potential_profiles(
     return output_path
 
 
-def _read_csv_header(path: Path) -> list[str]:
+def _read_table_columns(path: Path) -> list[str]:
     require_h5py()
     import h5py
 
     try:
         with h5py.File(path, "r") as handle:
             _validate_potential_table(handle, path=path)
-            return list(POTENTIAL_CSV_COLUMNS)
+            return list(POTENTIAL_COLUMNS)
     except (OSError, ValueError, json.JSONDecodeError):
         return []
 
 
-def _can_append_to_header(header: list[str]) -> bool:
-    if not header:
-        return True
-    return all(column in header for column in POTENTIAL_CSV_COLUMNS)
-
-
-def _is_compatible_potential_hdf5(path: Path) -> bool:
-    header = _read_csv_header(path)
-    if not header:
-        return False
-    return _can_append_to_header(header)
-
-
 def _read_existing_source_keys(path: Path, *, header: list[str] | None = None) -> set[str]:
-    columns = header if header is not None else _read_csv_header(path)
+    columns = header if header is not None else _read_table_columns(path)
     if "source" not in columns:
         return set()
 
@@ -2077,7 +1354,7 @@ def _read_existing_source_keys(path: Path, *, header: list[str] | None = None) -
 
 
 def _read_max_existing_id(path: Path) -> int:
-    columns = _read_csv_header(path)
+    columns = _read_table_columns(path)
     if "id" not in columns:
         return 0
 
@@ -2097,81 +1374,31 @@ def _read_max_existing_id(path: Path) -> int:
     return int(np.max(positive))
 
 
-def _fallback_csv_path(path: Path) -> Path:
-    from .output_naming import unique_output_path
-
-    return unique_output_path(path)
-
-
-def plan_potential_csv_output(
-    output: str | Path,
-    *,
-    append: bool = True,
-    overwrite: bool = False,
-) -> PotentialCsvPlan:
-    """Plan HDF5 output strategy and collect existing source keys when appendable."""
-    output_path = resolve_hdf5_output_path(output)
-    target_path = output_path
-    mode = "w"
-    fieldnames = POTENTIAL_CSV_COLUMNS
-    used_fallback = False
-    existing_sources: set[str] = set()
-
-    if overwrite:
-        return PotentialCsvPlan(
-            target_path=target_path,
-            mode=mode,
-            fieldnames=fieldnames,
-            used_fallback_path=False,
-            existing_source_keys=set(),
-        )
-
-    if not output_path.exists():
-        return PotentialCsvPlan(
-            target_path=target_path,
-            mode=mode,
-            fieldnames=fieldnames,
-            used_fallback_path=False,
-            existing_source_keys=set(),
-        )
-
-    if append:
-        if _is_compatible_potential_hdf5(output_path):
-            header = _read_csv_header(output_path)
-            mode = "a"
-            fieldnames = header if header else POTENTIAL_CSV_COLUMNS
-            existing_sources = _read_existing_source_keys(output_path, header=header)
-            return PotentialCsvPlan(
-                target_path=target_path,
-                mode=mode,
-                fieldnames=fieldnames,
-                used_fallback_path=False,
-                existing_source_keys=existing_sources,
-            )
-
-    target_path = _fallback_csv_path(output_path)
-    used_fallback = True
-    return PotentialCsvPlan(
-        target_path=target_path,
-        mode="w",
-        fieldnames=POTENTIAL_CSV_COLUMNS,
-        used_fallback_path=used_fallback,
-        existing_source_keys=set(),
-    )
+def plan_potential_hdf5_output(output: str | Path, *, append: bool = True, overwrite: bool = False) -> PotentialHdf5Plan:
+    path = resolve_hdf5_output_path(output)
+    if path.exists() and not overwrite:
+        if not append:
+            raise FileExistsError(f"Output exists: {path}. Use --overwrite or --append.")
+        import h5py
+        with h5py.File(path, "r") as handle:
+            _validate_potential_table(handle, path=path)
+        return PotentialHdf5Plan(path, "a", list(POTENTIAL_COLUMNS), _read_existing_source_keys(path))
+    return PotentialHdf5Plan(path, "w", list(POTENTIAL_COLUMNS), set())
 
 
-def write_potential_records_csv(
+@timed_stage("writing")
+def write_potential_records(
     records: list[PotentialRecord],
     output: str | Path,
     *,
     append: bool = True,
     overwrite: bool = False,
-) -> PotentialCsvWriteResult:
-    """Write potential records to HDF5 with schema-aware append/fallback behavior."""
+) -> PotentialHdf5WriteResult:
+    """Write potential records to HDF5 with explicit schema validation and append behavior."""
     if not records:
         raise ValueError("At least one potential record is required for HDF5 export.")
 
-    with PotentialCsvAppender(
+    with PotentialHdf5Appender(
         output=output,
         append=append,
         overwrite=overwrite,
@@ -2180,14 +1407,12 @@ def write_potential_records_csv(
         appender.append_records(records)
         target_path = appender.path
         mode = appender.mode
-        used_fallback = appender.used_fallback_path
         rows_written = appender.rows_written
 
     LOGGER.info("Saved %d potential row(s) to '%s'.", rows_written, _compact_path(target_path))
     LOGGER.debug("Potential HDF5 path: %s", target_path)
-    return PotentialCsvWriteResult(
+    return PotentialHdf5WriteResult(
         path=target_path,
         rows_written=rows_written,
         mode=mode,
-        used_fallback_path=used_fallback,
     )

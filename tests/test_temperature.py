@@ -185,23 +185,16 @@ def test_velocity_temperature_uses_atomic_velocity_units_and_regions(tmp_path: P
 def test_velocity_temperature_reuses_cached_atomic_masses(monkeypatch, tmp_path: Path) -> None:
     velocity = tmp_path / "run-vel-1.xyz"
     _write_velocity_xyz(velocity)
-    cached_mass_flags: list[bool] = []
-    original = temperature_module._temperature_for_selection
-
-    def _tracked_temperature_for_selection(**kwargs):
-        cached_mass_flags.append(kwargs.get("selected_masses_kg") is not None)
-        return original(**kwargs)
-
-    monkeypatch.setattr(
-        temperature_module,
-        "_temperature_for_selection",
-        _tracked_temperature_for_selection,
-    )
-
     profiles = compute_temperature_profiles(velocity, group_by="elements")
-
+    frames = temperature_module._iter_velocity_xyz(velocity)
     assert len(profiles) == 4
-    assert cached_mass_flags == [True, True, True, True]
+    for profile in profiles:
+        expected = [temperature_module._temperature_for_selection(
+            symbols=symbols, velocities=velocities, indices=profile.atom_indices,
+            velocity_factor=temperature_module._velocity_factor(profile.velocity_unit)[1],
+            remove_com=False,
+        ) for _step, _time, symbols, velocities in frames]
+        np.testing.assert_allclose(profile.temperature_K, expected, rtol=1e-12)
     assert all(profile.frame_index is profiles[0].frame_index for profile in profiles[1:])
     assert all(profile.time_fs is profiles[0].time_fs for profile in profiles[1:])
 

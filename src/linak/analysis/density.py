@@ -6,6 +6,7 @@ from collections.abc import Sequence
 
 from ..cell_geometry import (
     bin_volumes,
+    bin_volumes_for_frames,
     cartesian_bounds,
     cell_matrix,
     frame_origin,
@@ -21,6 +22,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass, replace
 import logging
 import math
+from ..parallel import analysis_execution, batches, bounded_map, frame_batch_size, stage_workers, timed_stage
 from ..cancellation import check_cancelled
 from pathlib import Path
 import re
@@ -121,6 +123,9 @@ from .water import (
     water_axis_values_per_frame as _water_axis_values_per_frame_impl,
 )
 
+from .interface_alignment import (InterfaceReference, InterfaceReferenceCollector, alignment_metadata)
+from .uncertainty import BlockData, combine_side_statistics, scale_blocks
+
 LOGGER = logging.getLogger(__name__)
 H2O_VALIDATION_STRIDE = 100
 H2O_OH_CUTOFF_A = 1.27
@@ -174,6 +179,8 @@ class DensityProfile:
     min_molecule_frames: int | None = None
 
     spatial_filters: dict[str, tuple[float | None, float | None]] | None = None
+    interface_reference: InterfaceReference | None = None
+    interface_alignment_metadata: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         _finalize_distribution_units(self)
@@ -210,6 +217,8 @@ class DensityHeatmapProfile:
     surface_metadata: dict[str, Any] | None = None
 
     spatial_filters: dict[str, tuple[float | None, float | None]] | None = None
+    interface_reference: InterfaceReference | None = None
+    interface_alignment_metadata: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         _finalize_distribution_units(self)
@@ -246,6 +255,8 @@ class DensityGridProfile:
     min_molecule_frames: int | None = None
 
     geometry_groups: list[dict[str, Any]] | None = None
+    interface_reference: InterfaceReference | None = None
+    interface_alignment_metadata: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if _is_nearest_distribution(self):
@@ -296,6 +307,7 @@ def _finalize_distribution_units(profile: Any) -> None:
                 name: None if getattr(stats, name) is None else getattr(stats, name) / AMU_TO_G
                 for name in ("sample_std", "sample_sem", "block_std", "block_sem")
             }
+            changes["resampling"] = scale_blocks(stats.resampling, 1 / AMU_TO_G)
             object.__setattr__(
                 profile, "series_statistics", {**statistics, "density": replace(stats, **changes)}
             )
@@ -413,6 +425,7 @@ class _DensityStatisticsMoments:
     sample_sumsq: np.ndarray
     block_sum: np.ndarray | None = None
     block_n: np.ndarray | None = None
+    block_frames: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -664,6 +677,7 @@ class _DensityLineAccumulator:
     entity_histogram_sum: np.ndarray | None = None
     framewise_mass_density_sum: np.ndarray | None = None
     framewise_entity_density_sum: np.ndarray | None = None
+    volume_cache: dict | None = None
 
     def __post_init__(self) -> None:
         n_bins = int(np.asarray(self.bin_edges, dtype=float).size - 1)
@@ -681,23 +695,19 @@ class _DensityLineAccumulator:
             )
         if self.normalization_cache.frames is not None and self.surface_reference is None:
             frames = self.normalization_cache.frames
-            volumes = np.asarray(
-                [
-                    bin_volumes(
-                        frame.cell,
-                        self.bin_edges,
-                        self.normalization_cache.axis_index,
-                        origin=frame_origin(frame),
-                        shift=(
-                            float(self.surface_estimate.frame_values[i])
-                            if self.coordinate_mode == "distance"
-                            and self.surface_estimate is not None
-                            else 0.0
-                        ),
-                    )
-                    for i, frame in enumerate(frames)
-                ]
-            )
+            key = (self.normalization_cache.axis_index, self.bin_edges.tobytes(),
+                   self.coordinate_mode,
+                   None if self.surface_estimate is None else self.surface_estimate.frame_values.tobytes())
+            volumes = None if self.volume_cache is None else self.volume_cache.get(key)
+            if volumes is None:
+                volumes = bin_volumes_for_frames(
+                    frames, self.bin_edges, self.normalization_cache.axis_index,
+                    shifts=(self.surface_estimate.frame_values
+                            if self.coordinate_mode == "distance" and self.surface_estimate is not None
+                            else None),
+                )
+                if self.volume_cache is not None:
+                    self.volume_cache[key] = volumes
             self.normalization_cache = replace(
                 self.normalization_cache, slice_volumes=volumes, framewise_normalization=True
             )
@@ -729,6 +739,7 @@ class _DensityLineAccumulator:
     def bin_end(self) -> float:
         return float(self.bin_edges[-1])
 
+    @timed_stage("reduction")
     def update(
         self,
         *,
@@ -738,16 +749,20 @@ class _DensityLineAccumulator:
         validation_plan: _DensityValidationPlan,
         block_index_by_frame: np.ndarray | None,
         entity_weights: np.ndarray | None = None,
+        histograms: tuple[np.ndarray, np.ndarray] | None = None,
     ) -> None:
-        per_frame_mass_histogram, per_frame_entity_histogram = _bincount_1d_histograms(
-            values=axis_values,
-            masses=masses,
-            bin_start=self.bin_start,
-            bin_width=self.bin_width,
-            n_bins=self.n_bins,
-            bin_end=self.bin_end,
-            entity_weights=entity_weights,
-        )
+        if histograms is None:
+            per_frame_mass_histogram, per_frame_entity_histogram = _bincount_1d_histograms(
+                values=axis_values,
+                masses=masses,
+                bin_start=self.bin_start,
+                bin_width=self.bin_width,
+                n_bins=self.n_bins,
+                bin_end=self.bin_end,
+                entity_weights=entity_weights,
+            )
+        else:
+            per_frame_mass_histogram, per_frame_entity_histogram = histograms
         if validation_plan.strict or frame_index in validation_plan.frame_indices:
             _validate_binned_frame_conservation(
                 frame_index=frame_index,
@@ -796,6 +811,7 @@ class _DensityLineAccumulator:
             block_index_by_frame=block_index_by_frame,
         )
 
+    @timed_stage("reduction")
     def finalize(self, *, n_frames: int) -> DensityProfile:
         assert self.mass_histogram_sum is not None
         assert self.entity_histogram_sum is not None
@@ -908,7 +924,7 @@ def _fold_symmetric_density_profiles(
         bottom_number_density=bottom.number_density,
         top_counts_per_frame=np.asarray(top.counts_per_frame),
         bottom_counts_per_frame=np.asarray(bottom.counts_per_frame),
-        series_statistics=None,
+        series_statistics=combine_side_statistics(top.series_statistics, bottom.series_statistics),
         visible_x_min_A=visible_x_min_A,
         visible_x_max_A=visible_x_max_A,
     )
@@ -960,6 +976,7 @@ class _DensityHeatmapAccumulator:
     def y_bin_count(self) -> int:
         return int(self.y_bin_edges.size - 1)
 
+    @timed_stage("reduction")
     def update(
         self,
         *,
@@ -1032,6 +1049,7 @@ class _DensityHeatmapAccumulator:
             self.framewise_mass_density_sum += per_frame_mass_histogram / frame_volume
             self.framewise_entity_density_sum += per_frame_entity_histogram / frame_volume
 
+    @timed_stage("reduction")
     def finalize(self, *, n_frames: int) -> DensityHeatmapProfile:
         assert self.mass_histogram_sum is not None
         assert self.entity_histogram_sum is not None
@@ -1304,7 +1322,7 @@ class _DensitySparseGridAccumulator:
             result *= size
         return result
 
-    def update(
+    def prepare_rows(
         self,
         *,
         positions: np.ndarray,
@@ -1313,12 +1331,12 @@ class _DensitySparseGridAccumulator:
         frame_index: int,
         validation_plan: _DensityValidationPlan,
         interface_side: np.ndarray | None = None,
-    ) -> None:
+    ) -> np.ndarray:
         positions = np.asarray(positions, dtype=float)
         masses = np.asarray(masses, dtype=float)
         distances = np.asarray(distance_values, dtype=float)
         if positions.size == 0:
-            return
+            return np.zeros(0, dtype=self._dtype)
         if positions.ndim != 2 or positions.shape[1] != 3:
             raise ValueError("Density grid positions must have shape (n_entities, 3).")
         if masses.shape != (len(positions),) or distances.shape != (len(positions),):
@@ -1369,12 +1387,23 @@ class _DensitySparseGridAccumulator:
                     "Sparse density grid does not conserve selected entity count in frame "
                     f"{frame_index}: grid={rows.size}, selected={len(positions)}."
                 )
+        return rows
+
+    def add_rows(self, rows, frame_index):
         if rows.size:
             self._total.add(rows)
             if self._geometry is not None:
                 assert self.geometry_table is not None
                 rows["group"] = self.geometry_table[1][frame_index]
                 self._geometry.add(rows)
+
+    @timed_stage("reduction")
+    def update(self, *, positions, distance_values, masses, frame_index, validation_plan,
+               interface_side=None):
+        rows = self.prepare_rows(positions=positions, distance_values=distance_values,
+                                 masses=masses, frame_index=frame_index,
+                                 validation_plan=validation_plan, interface_side=interface_side)
+        self.add_rows(rows, frame_index)
 
     def _finish_geometry(self) -> list[dict[str, Any]] | None:
         if self._geometry is None:
@@ -1419,6 +1448,7 @@ class _DensitySparseGridAccumulator:
             result.append(group)
         return result
 
+    @timed_stage("reduction")
     def finalize(self, *, n_frames: int) -> DensityGridProfile:
         try:
             run = self._total.finish()
@@ -1758,6 +1788,7 @@ def _empty_density_statistics_moments(
         sample_sumsq=np.zeros(int(n_bins), dtype=float),
         block_sum=None if block_shape is None else np.zeros(block_shape, dtype=float),
         block_n=None if block_shape is None else np.zeros(block_shape, dtype=int),
+        block_frames=None if n_blocks is None else np.zeros(n_blocks, dtype=int),
     )
 
 
@@ -1769,6 +1800,10 @@ def _update_density_statistics_moments(
     frame_index: int,
     block_index_by_frame: np.ndarray | None,
 ) -> None:
+    if block_index_by_frame is not None and moments.block_frames is not None:
+        block_id = int(block_index_by_frame[frame_index])
+        if block_id >= 0:
+            moments.block_frames[block_id] += 1
     histogram_array = np.asarray(histogram, dtype=float)
     density_array = np.asarray(density_values, dtype=float)
     finite = np.isfinite(density_array)
@@ -1812,6 +1847,15 @@ def _finalize_density_statistics_moments(
         sample_n=moments.sample_n,
         sample_sum=moments.sample_sum,
         sample_sumsq=moments.sample_sumsq,
+        resampling=(
+            None
+            if moments.block_frames is None
+            else BlockData(
+                moments.block_sum[..., None],
+                moments.block_n[..., None],
+                moments.block_frames,
+            )
+        ),
         block_values=_block_mean_matrix_from_density_moments(moments),
     )
 
@@ -2156,6 +2200,8 @@ class _DensityElementSelector:
         validation_stride: int = H2O_VALIDATION_STRIDE,
     ) -> None:
         self.element_labels = tuple(element_labels)
+        # Retain the constructor option for compatibility; identity validation
+        # must never depend on sampling stride or on parallel batch boundaries.
         self.validation_stride = max(1, int(validation_stride))
         self._reference_symbols: np.ndarray | None = None
         self._masks_by_label: dict[str, np.ndarray] = {}
@@ -2174,13 +2220,12 @@ class _DensityElementSelector:
 
         if self._stable:
             reference = self._reference_symbols
-            needs_validation = int(frame_index) % self.validation_stride == 0
             if symbols.shape != reference.shape:
                 self._stable = False
                 LOGGER.info(
                     "Density element selection detected atom-count changes; using dynamic element grouping."
                 )
-            elif needs_validation and not np.array_equal(symbols, reference):
+            elif not np.array_equal(symbols, reference):
                 self._stable = False
                 LOGGER.info(
                     "Density element selection detected atom-order changes; using dynamic element grouping."
@@ -3261,6 +3306,7 @@ def compute_density_profile(
     count_label = "molecules" if selection_mode == "molecule" else "atoms"
     LOGGER.debug("Selection mode: %s (label=%s).", selection_mode, species_label)
 
+    reference_collector = InterfaceReferenceCollector(surface_reference, len(frames))
     selected_per_frame: list[np.ndarray] = []
     selected_masses_per_frame: list[np.ndarray] = []
     if selection_mode == "molecule":
@@ -3308,15 +3354,17 @@ def compute_density_profile(
         for frame_index, (values, masses) in enumerate(
             zip(selected_per_frame, selected_masses_per_frame)
         ):
+            frame = frames[frame_index]
+            reference_collector.observe(frame_index, frame)
             folded, top_distance, bottom_distance, side = surface_distance_components(
                 surface_reference,
                 np.asarray(values, dtype=float),
                 frame_index=frame_index,
                 substrate_mask=_density_substrate_mask(
-                    surface_reference, frames[frame_index], species_label
+                    surface_reference, frame, species_label
                 ),
                 target_positions=_nearest_density_targets(
-                    surface_reference, frames[frame_index], species_label, oh_cutoff
+                    surface_reference, frame, species_label, oh_cutoff
                 ),
             )
             selected_for_binning.append(folded)
@@ -3426,6 +3474,7 @@ def compute_density_profile(
         oh_cutoff_A=oh_cutoff if selection_mode == "molecule" else None,
         min_molecule_frames=min_molecule_frames if selection_mode == "molecule" else None,
     )
+    profile = replace(profile, interface_reference=reference_collector.finish())
     if (
         surface_reference is None
         or not surface_reference.is_symmetric
@@ -3501,7 +3550,9 @@ def compute_density_profile(
         bottom_number_density=bottom_profile.number_density,
         top_counts_per_frame=top_profile.counts_per_frame,
         bottom_counts_per_frame=bottom_profile.counts_per_frame,
-        series_statistics=None,
+        series_statistics=combine_side_statistics(
+            top_profile.series_statistics, bottom_profile.series_statistics
+        ),
     )
 
 
@@ -4000,6 +4051,7 @@ def _compute_all_density_profiles_streaming(
             logger=LOGGER,
         )
         surface_estimate = surface_reference.primary
+    reference_collector = InterfaceReferenceCollector(surface_reference, len(frames))
     surface_position = None if surface_estimate is None else surface_estimate.position
     surface_position_std = None if surface_estimate is None else surface_estimate.std
     if (
@@ -4140,51 +4192,61 @@ def _compute_all_density_profiles_streaming(
         element_selector = _DensityElementSelector(
             [target.species_label for target in target_specs if target.selection_kind == "element"]
         )
-        with ProgressBar(
-            desc="Preparing density bins", total=len(frames), unit="frame"
-        ) as progress:
-            for frame_index, frame in enumerate(frames):
-                frame_selections = _select_density_targets_in_frame(
-                    frame,
-                    frame_index=frame_index,
-                    target_specs=target_specs,
-                    topology_cache=run_topology_cache,
-                    element_selector=element_selector,
-                    wrap_positions_to_cell=wrap_positions_to_cell,
-                )
-                shared_components = _nearest_selection_components(
-                    surface_reference, frame_selections, frame_index
-                )
-                for target in target_specs:
-                    selection = frame_selections.get(target.species_label)
-                    if selection is None:
-                        continue
-                    positions, _masses = selection
-                    bounds = observed_bounds_by_target[target.species_label]
-                    bounds.mark_frame_active(frame_index)
-                    for ax in raw_axes:
-                        bounds.update_axis(ax, positions[:, axis_indices[ax]])
-                    raw_distance_axis = np.asarray(positions[:, surface_axis_index], dtype=float)
-                    if target.species_label in shared_components:
-                        distance_values = shared_components[target.species_label][0]
-                    elif surface_reference is not None and surface_reference.uses_distance:
-                        distance_values = surface_distance_components(
-                            surface_reference,
-                            raw_distance_axis,
-                            frame_index=frame_index,
-                            substrate_mask=_density_substrate_mask(
-                                surface_reference, frame, target.species_label
-                            ),
-                            target_positions=positions,
-                        )[0]
-                    else:
-                        distance_values = (
-                            raw_distance_axis
-                            if per_frame_surface is None
-                            else raw_distance_axis - float(per_frame_surface[frame_index])
-                        )
-                    bounds.update_axis("distance", distance_values)
-                progress.update()
+        selection_chunk_size = frame_batch_size(len(frames[0]) * len(target_specs) * 128)
+        selection_workers = stage_workers('density.selection',
+            (len(frames) + selection_chunk_size - 1) // selection_chunk_size,
+            bytes_per_task=max(8 * 1024 * 1024, len(frames[0]) * selection_chunk_size * len(target_specs) * 128),
+            serial_reason='nearest-surface provider is coordinated'
+            if surface_reference is not None and surface_reference.distance_mode == 'nearest-atom' else None)
+        if selection_workers > 1 and any(target.selection_kind == 'molecule' for target in target_specs):
+            run_topology_cache.select(frames[0], frame_index=0)
+        def select_batch(chunk):
+            topology = OHTopologyCache(oh_cutoff=oh_cutoff, backend=oh_topology_backend)
+            selector = _DensityElementSelector([target.species_label for target in target_specs
+                                                if target.selection_kind == 'element'])
+            result = []
+            for frame_index, frame in chunk:
+                selections = _select_density_targets_in_frame(frame, frame_index=frame_index,
+                    target_specs=target_specs, topology_cache=topology, element_selector=selector,
+                    wrap_positions_to_cell=wrap_positions_to_cell)
+                components = _nearest_selection_components(surface_reference, selections, frame_index)
+                result.append((frame_index, frame, selections, components))
+            return result
+
+        with ProgressBar(desc="Preparing density bins", total=len(frames), unit="frame") as progress:
+            results = bounded_map(select_batch, batches(enumerate(frames), selection_chunk_size), workers=selection_workers, stage='density.selection')
+            for chunk in results:
+                for frame_index, frame, frame_selections, shared_components in chunk:
+                    for target in target_specs:
+                        selection = frame_selections.get(target.species_label)
+                        if selection is None:
+                            continue
+                        positions, _masses = selection
+                        bounds = observed_bounds_by_target[target.species_label]
+                        bounds.mark_frame_active(frame_index)
+                        for ax in raw_axes:
+                            bounds.update_axis(ax, positions[:, axis_indices[ax]])
+                        raw_distance_axis = np.asarray(positions[:, surface_axis_index], dtype=float)
+                        if target.species_label in shared_components:
+                            distance_values = shared_components[target.species_label][0]
+                        elif surface_reference is not None and surface_reference.uses_distance:
+                            distance_values = surface_distance_components(
+                                surface_reference,
+                                raw_distance_axis,
+                                frame_index=frame_index,
+                                substrate_mask=_density_substrate_mask(
+                                    surface_reference, frame, target.species_label
+                                ),
+                                target_positions=positions,
+                            )[0]
+                        else:
+                            distance_values = (
+                                raw_distance_axis
+                                if per_frame_surface is None
+                                else raw_distance_axis - float(per_frame_surface[frame_index])
+                            )
+                        bounds.update_axis("distance", distance_values)
+                    progress.update()
 
         active_targets = []
         for target in target_specs:
@@ -4306,6 +4368,7 @@ def _compute_all_density_profiles_streaming(
             str, list[tuple[tuple[str, str], _DensityHeatmapAccumulator]]
         ] = {}
         grid_accumulator_by_target: dict[str, _DensitySparseGridAccumulator] = {}
+        normalization_volumes: dict[tuple[Any, ...], np.ndarray] = {}
         for target in active_targets:
             species_lbl = target.species_label
             observed_bounds = observed_bounds_by_target[species_lbl]
@@ -4341,6 +4404,7 @@ def _compute_all_density_profiles_streaming(
                                 bin_width=bin_width,
                                 coordinate_mode="axis",
                                 normalization_cache=line_normalization_by_axis[ax],
+                                volume_cache=normalization_volumes,
                                 density_moments=_empty_density_statistics_moments(
                                     n_bins=bin_edges.size - 1,
                                     n_blocks=n_blocks,
@@ -4403,6 +4467,7 @@ def _compute_all_density_profiles_streaming(
                                 bin_width=bin_width,
                                 coordinate_mode=distance_coordinate_mode,
                                 normalization_cache=line_normalization_by_axis[surface_axis],
+                                volume_cache=normalization_volumes,
                                 density_moments=_empty_density_statistics_moments(
                                     n_bins=distance_bin_edges.size - 1,
                                     n_blocks=n_blocks,
@@ -4528,24 +4593,34 @@ def _compute_all_density_profiles_streaming(
                 )
 
         profiles: list[DensityProfile | DensityHeatmapProfile | DensityGridProfile] = []
-        accumulation_element_selector = _DensityElementSelector(
-            [
-                target.species_label
-                for target in active_targets
-                if target.selection_kind == "element"
-            ]
+        frame_payload_bytes = (
+            len(frames[0]) * len(active_targets) * 256
+            + sum(accumulator.n_bins * 16 for values in line_accumulators_by_target.values()
+                  for _axis, accumulator in values)
         )
-        with (
-            progress_stage(LOGGER, "Binning density frames"),
-            ProgressBar(desc="Binning density frames", total=len(frames), unit="frame") as progress,
-        ):
-            for frame_index, frame in enumerate(frames):
+        chunk_size = frame_batch_size(frame_payload_bytes)
+        worker_count = stage_workers(
+            'density.frames', (len(frames) + chunk_size - 1) // chunk_size,
+            bytes_per_task=max(8 * 1024 * 1024, frame_payload_bytes * chunk_size),
+            serial_reason='nearest-surface provider is coordinated' if nearest_distance else None,
+        )
+        if worker_count > 1 and any(target.selection_kind == 'molecule' for target in active_targets):
+            run_topology_cache.select(frames[0], frame_index=0)
+
+        def prepare_batch(chunk):
+            local_topology = OHTopologyCache(oh_cutoff=oh_cutoff, backend=oh_topology_backend)
+            local_selector = _DensityElementSelector([
+                target.species_label for target in active_targets if target.selection_kind == 'element'
+            ])
+            result = []
+            for frame_index, frame in chunk:
+                line_updates, heatmap_updates, grid_updates = [], [], []
                 frame_selections = _select_density_targets_in_frame(
                     frame,
                     frame_index=frame_index,
                     target_specs=active_targets,
-                    topology_cache=run_topology_cache,
-                    element_selector=accumulation_element_selector,
+                    topology_cache=local_topology,
+                    element_selector=local_selector,
                     wrap_positions_to_cell=wrap_positions_to_cell,
                 )
                 shared_components = _nearest_selection_components(
@@ -4610,18 +4685,24 @@ def _compute_all_density_profiles_streaming(
                             axis_values = np.asarray(
                                 positions[:, axis_indices[axis_key]], dtype=float
                             )
-                        accumulator.update(
+                        histograms = _bincount_1d_histograms(
+                            values=axis_values, masses=accumulator_masses,
+                            bin_start=accumulator.bin_start, bin_width=accumulator.bin_width,
+                            n_bins=accumulator.n_bins, bin_end=accumulator.bin_end,
+                            entity_weights=entity_weights,
+                        )
+                        line_updates.append((accumulator, dict(
                             axis_values=axis_values,
                             masses=accumulator_masses,
                             frame_index=frame_index,
                             validation_plan=validation_plan,
                             block_index_by_frame=block_index_by_frame,
-                            entity_weights=entity_weights,
-                        )
+                            entity_weights=entity_weights, histograms=histograms,
+                        )))
                     for plane_axes, heatmap_accumulator in heatmap_accumulators_by_target[
                         target.species_label
                     ]:
-                        heatmap_accumulator.update(
+                        heatmap_updates.append((heatmap_accumulator, dict(
                             x_values=np.asarray(
                                 positions[:, axis_indices[plane_axes[0]]], dtype=float
                             ),
@@ -4632,7 +4713,7 @@ def _compute_all_density_profiles_streaming(
                             frame_index=frame_index,
                             validation_plan=validation_plan,
                             frame=frame,
-                        )
+                        )))
                     grid_accumulator = grid_accumulator_by_target.get(target.species_label)
                     if grid_accumulator is not None:
                         grid_interface_side = None
@@ -4645,7 +4726,7 @@ def _compute_all_density_profiles_streaming(
                                 if per_frame_surface is None
                                 else raw_surface_axis_values - float(per_frame_surface[frame_index])
                             )
-                        grid_accumulator.update(
+                        rows = grid_accumulator.prepare_rows(
                             positions=positions,
                             distance_values=grid_distance_values,
                             masses=mass_array,
@@ -4653,7 +4734,25 @@ def _compute_all_density_profiles_streaming(
                             validation_plan=validation_plan,
                             interface_side=grid_interface_side,
                         )
-                progress.update()
+                        grid_updates.append((grid_accumulator, rows))
+                result.append((frame_index, frame, line_updates, heatmap_updates, grid_updates))
+            return result
+
+        with (
+            progress_stage(LOGGER, "Binning density frames"),
+            ProgressBar(desc="Binning density frames", total=len(frames), unit="frame") as progress,
+        ):
+            chunks = batches(enumerate(frames), chunk_size)
+            for results in bounded_map(prepare_batch, chunks, workers=worker_count, stage='density.frames'):
+                for frame_index, frame, lines, heatmaps, grids in results:
+                    reference_collector.observe(frame_index, frame)
+                    for accumulator, arguments in lines:
+                        accumulator.update(**arguments)
+                    for accumulator, arguments in heatmaps:
+                        accumulator.update(**arguments)
+                    for accumulator, rows in grids:
+                        accumulator.add_rows(rows, frame_index)
+                    progress.update()
 
         with (
             progress_stage(LOGGER, "Finalize density grids")
@@ -4705,9 +4804,11 @@ def _compute_all_density_profiles_streaming(
             len(frames),
             "+block" if block_index_by_frame is not None else "",
         )
-        return profiles
+        interface_reference = reference_collector.finish()
+        return [replace(p, interface_reference=interface_reference) for p in profiles]
 
 
+@analysis_execution
 def compute_all_density_profiles(
     frames: Sequence[Atoms],
     species: str | None = "all",
@@ -4727,6 +4828,8 @@ def compute_all_density_profiles(
     oh_cutoff: float = H2O_OH_CUTOFF_A,
     min_molecule_frames: int = DEFAULT_MIN_MOLECULE_FRAMES,
     oh_topology_backend: str = "auto",
+    threads: int | None = 1,
+    memory_budget_mib: float | None = None,
 ) -> list[DensityProfile | DensityHeatmapProfile | DensityGridProfile]:
     return _compute_all_density_profiles_streaming(
         frames=frames,
@@ -4865,7 +4968,9 @@ def _density_profile_hdf5_payload(profile: DensityProfile) -> dict[str, Any]:
         ),
         **_surface_reference_datasets(profile.surface_reference),
     }
+    metadata.update(alignment_metadata(profile.interface_reference))
     return {
+        "interface_reference": profile.interface_reference,
         "datasets": datasets,
         "metadata": metadata,
     }
@@ -4937,7 +5042,9 @@ def _density_heatmap_profile_hdf5_payload(profile: DensityHeatmapProfile) -> dic
         },
         units_map=units_map,
     )
+    metadata.update(alignment_metadata(profile.interface_reference))
     return {
+        "interface_reference": profile.interface_reference,
         "datasets": {
             "x_bin_centers_A": np.asarray(profile.x_bin_centers, dtype=float),
             "y_bin_centers_A": np.asarray(profile.y_bin_centers, dtype=float),
@@ -5062,7 +5169,9 @@ def _density_grid_profile_hdf5_payload(profile: DensityGridProfile) -> dict[str,
             "entity_sum": "entity",
         },
     )
+    metadata.update(alignment_metadata(profile.interface_reference))
     return {
+        "interface_reference": profile.interface_reference,
         "datasets": {
             "x_bin_edges_A": x_edges,
             "y_bin_edges_A": y_edges,
@@ -5104,6 +5213,7 @@ def save_density_profile(
         output,
         analysis="density",
         datasets=payload["datasets"],
+        interface_references=[payload.get("interface_reference")],
         metadata=metadata,
         compression_profile=compression_profile,
     )
@@ -5111,6 +5221,7 @@ def save_density_profile(
     return output_path
 
 
+@timed_stage("writing")
 def save_density_profiles(
     profiles: Sequence[DensityProfile | DensityHeatmapProfile | DensityGridProfile],
     output: str | Path,
@@ -5142,6 +5253,7 @@ def save_density_profiles(
             output,
             analysis="density",
             datasets=payload["datasets"],
+            interface_references=[payload.get("interface_reference")],
             metadata=metadata,
             compression_profile=compression_profile,
         )
@@ -5322,7 +5434,14 @@ def _load_density_profiles_from_payloads(
             coordinate_mode = "axis"
         series_statistics = statistics_series_map_from_datasets(
             datasets,
-            dataset_names=("density", "number_density"),
+            dataset_names=(
+                "density",
+                "number_density",
+                "top_density",
+                "bottom_density",
+                "top_number_density",
+                "bottom_number_density",
+            ),
         )
 
         surface_metadata = _surface_metadata_view(metadata)
@@ -5397,6 +5516,7 @@ def _load_density_profiles_from_payloads(
 
         profiles.append(
             DensityProfile(
+                interface_reference=InterfaceReference.from_metadata(metadata, source_path),
                 axis=axis_label,
                 species=species_label,
                 bin_edges=bin_edges,
@@ -5514,6 +5634,7 @@ def _load_density_heatmap_profiles_from_payloads(
 
         profiles.append(
             DensityHeatmapProfile(
+                interface_reference=InterfaceReference.from_metadata(metadata, source_path),
                 plane=plane_token,
                 distance_mode=str(metadata.get("surface_distance_mode", "plane")),
                 spatial_filters=metadata.get("spatial_filters"),
@@ -5632,6 +5753,7 @@ def _load_density_grid_profiles_from_payloads(
         }
         profiles.append(
             DensityGridProfile(
+                interface_reference=InterfaceReference.from_metadata(metadata, source_path),
                 geometry_groups=_load_geometry_groups(datasets),
                 species=species_label,
                 x_bin_edges=grid_edges["x"],
@@ -5963,6 +6085,9 @@ def _density_grid_target_indices(
 ) -> np.ndarray:
     centers = _density_grid_axis_centers(profile, axis_id)
     center_values = centers[np.asarray(source_indices, dtype=int)]
+    if not np.allclose(np.diff(target_edges), target_bin_width, rtol=1e-10, atol=1e-12):
+        return np.clip(np.searchsorted(target_edges, center_values, side="right") - 1,
+                       0, len(target_edges) - 2)
     return _uniform_bin_indices(
         center_values,
         bin_start=float(target_edges[0]),
@@ -6096,6 +6221,8 @@ def _nearest_grid_heatmap(
         else (None, None)
     )
     return DensityHeatmapProfile(
+        interface_reference=profile.interface_reference,
+        interface_alignment_metadata=profile.interface_alignment_metadata,
         plane="".join(axes),
         plane_axes=axes,
         species=profile.species,
@@ -6323,6 +6450,21 @@ def density_grid_to_line_profile(
     )
 
 
+def _aligned_density_grids(profiles, axes, interface_alignments):
+    from .interface_alignment import alignment_for_reference
+    from .interface_density import align_density_grid
+
+    result = []
+    for profile in profiles:
+        alignment = alignment_for_reference(profile.interface_reference, interface_alignments)
+        if alignment is not None:
+            if profile.surface_axis in tuple(str(axis).strip().lower() for axis in axes):
+                raise ValueError("Choose Distance for the interface-normal axis when using interface alignment.")
+            profile = align_density_grid(profile, alignment)
+        result.append(profile)
+    return result
+
+
 def density_grid_to_heatmap_profile(
     profile: DensityGridProfile,
     *,
@@ -6331,9 +6473,11 @@ def density_grid_to_heatmap_profile(
     filters: Mapping[str, tuple[float | None, float | None] | None] | None = None,
     x_bin_width: float | None = None,
     y_bin_width: float | None = None,
+    interface_alignments: Mapping[str, Any] | None = None,
 ) -> DensityHeatmapProfile:
     """Derive one display-only 2D density map from a sparse density grid."""
 
+    profile = _aligned_density_grids([profile], (x_axis, y_axis), interface_alignments)[0]
     x_key = str(x_axis).strip().lower()
     y_key = str(y_axis).strip().lower()
     if (x_key, y_key) not in DENSITY_GRID_2D_ALLOWED_PAIRS:
@@ -6350,7 +6494,7 @@ def density_grid_to_heatmap_profile(
         profile.surface_reference is not None and profile.surface_reference.is_symmetric
     )
     paired_symmetric = symmetric and _density_grid_has_paired_geometry(profile)
-    distance_relevant = "distance" in {x_key, y_key} or "distance" in normalized_filters
+    distance_relevant = "distance" in {x_key, y_key} or "distance" in normalized_filters or bool(profile.interface_alignment_metadata)
     if symmetric and distance_relevant and not paired_symmetric:
         raise ValueError(
             "This symmetric density grid predates paired per-geometry normalization data. "
@@ -6484,6 +6628,8 @@ def density_grid_to_heatmap_profile(
         )
     )
     return DensityHeatmapProfile(
+        interface_reference=profile.interface_reference,
+        interface_alignment_metadata=profile.interface_alignment_metadata,
         plane=f"{x_key}{y_key}",
         plane_axes=(x_key, y_key),
         species=profile.species,
@@ -6553,9 +6699,11 @@ def density_grids_to_averaged_heatmap_profile(
     x_bin_width: float | None = None,
     y_bin_width: float | None = None,
     species: str | None = None,
+    interface_alignments: Mapping[str, Any] | None = None,
 ) -> DensityHeatmapProfile:
     """Derive one frame-weighted 2D density map from active sparse grids."""
 
+    profiles = _aligned_density_grids(profiles, (x_axis, y_axis), interface_alignments)
     if not profiles:
         raise ValueError("No active density 2D source series are enabled.")
     x_key = str(x_axis).strip().lower()
@@ -6608,6 +6756,8 @@ def density_grids_to_averaged_heatmap_profile(
                 side_values[f"{side}_number_density"] = sum(w * v[1] for w, v in zip(weights, sv))
         return replace(
             template,
+            interface_alignment_metadata={p.interface_reference.reference_id: p.interface_alignment_metadata
+                for p in profiles if p.interface_alignment_metadata and p.interface_reference} or None,
             units="g/Angstrom^2",
             x_bin_edges=x_edges,
             y_bin_edges=y_edges,
@@ -6640,7 +6790,7 @@ def density_grids_to_averaged_heatmap_profile(
     all_paired_symmetric = all_symmetric and all(
         _density_grid_has_paired_geometry(profile) for profile in profiles
     )
-    distance_relevant = "distance" in {x_key, y_key} or "distance" in normalized_filters
+    distance_relevant = "distance" in {x_key, y_key} or "distance" in normalized_filters or any(p.interface_alignment_metadata for p in profiles)
     top_mass_sum_total = np.zeros(total_bins, dtype=float) if all_paired_symmetric else None
     bottom_mass_sum_total = np.zeros(total_bins, dtype=float) if all_paired_symmetric else None
     top_entity_sum_total = np.zeros(total_bins, dtype=float) if all_paired_symmetric else None
@@ -6873,6 +7023,8 @@ def density_grids_to_averaged_heatmap_profile(
     )
     display_species = species or profiles[0].species
     return DensityHeatmapProfile(
+        interface_alignment_metadata={p.interface_reference.reference_id: p.interface_alignment_metadata
+            for p in profiles if p.interface_alignment_metadata and p.interface_reference} or None,
         plane=f"{x_key}{y_key}",
         plane_axes=(x_key, y_key),
         species=f"{display_species} averaged {x_key.upper()}/{y_key.upper()}",
@@ -7319,6 +7471,17 @@ def _has_active_normalization_overrides(
     return False
 
 
+def _density_statistics_for_view(profile, key):
+    if profile.series_statistics is None:
+        return None
+    view = str(profile.interface_view)
+    if view in {"top", "bottom"} and (
+        profile.top_density is not None or profile.bottom_density is not None
+    ):
+        return profile.series_statistics.get(f"{view}_{key}")
+    return profile.series_statistics.get(key)
+
+
 def plot_density_profile(
     profile: DensityProfile | DensityHeatmapProfile,
     output: str | Path | None = None,
@@ -7580,6 +7743,7 @@ def plot_density_profile(
             capture_state_extra={
                 "heatmap_quantity_label": f"{z_label_prefix} ({units})",
                 "heatmap_plane": profile.plane,
+                "interface_alignments": profile.interface_alignment_metadata,
             },
         )
     if not isinstance(profile, DensityProfile):
@@ -7668,7 +7832,7 @@ def plot_density_profile(
         cumulative_config=cumulative_config,
         series_statistics=None
         if profile.series_statistics is None
-        else profile.series_statistics.get(stats_key),
+        else _density_statistics_for_view(profile, stats_key),
         error_config=error_config,
         normalization_mode=single_series.normalization_mode,
         normalization_value=single_series.normalization_value,
@@ -8347,7 +8511,9 @@ def plot_density_profiles(
         series_cumulative_configs=series_cumulative_configs,
         series_error_configs=series_error_configs,
         series_statistics_data=[
-            None if profile.series_statistics is None else profile.series_statistics.get(stats_key)
+            None
+            if profile.series_statistics is None
+            else _density_statistics_for_view(profile, stats_key)
             for profile in line_profiles
         ],
         series_normalization_modes=series_normalization_modes,
@@ -8850,7 +9016,7 @@ def _prismatic_geometry_volume_factors(
     edges: tuple[np.ndarray, ...],
     filters: Mapping[str, tuple[float | None, float | None]],
     *,
-    area_cache: dict[tuple[float, ...], np.ndarray],
+    area_cache: dict[tuple[Any, ...], np.ndarray],
     distance_side: str = "top",
 ) -> tuple[np.ndarray, np.ndarray] | None:
     """Return in-plane area and normal overlap without expanding their product."""
@@ -8884,57 +9050,114 @@ def _prismatic_geometry_volume_factors(
     area_shape = tuple(
         1 if dimension in normal_dimensions else size for dimension, size in enumerate(shape)
     )
-    area_key = tuple(matrix.ravel()) + tuple(origin) + tuple(float(value) for value in area_shape)
+    from ..cache import PREVIEW_CACHE
+
+    in_plane_indices = [index for index in range(3) if index != normal_index]
+    vector_a = matrix[in_plane_indices[0], in_plane_indices]
+    vector_b = matrix[in_plane_indices[1], in_plane_indices]
+    origin_2d = origin[in_plane_indices]
+    plane = np.asarray([vector_a, vector_b])
+    area_key = (
+        normal_index,
+        plane.tobytes(),
+        origin_2d.tobytes(),
+        axes,
+        tuple(np.asarray(edge, dtype=float).tobytes() for edge in edges),
+        tuple(
+            sorted(
+                (axis, tuple(bounds))
+                for axis, bounds in filters.items()
+                if axis not in {normal_axis, "distance"}
+            )
+        ),
+    )
     area = area_cache.get(area_key)
     if area is None:
-        area = np.zeros(area_shape, dtype=float)
-        in_plane_indices = [index for index in range(3) if index != normal_index]
-        vector_a = matrix[in_plane_indices[0], in_plane_indices]
-        vector_b = matrix[in_plane_indices[1], in_plane_indices]
-        origin_2d = origin[in_plane_indices]
-        footprint = np.asarray(
-            [
-                origin_2d,
-                origin_2d + vector_a,
-                origin_2d + vector_a + vector_b,
-                origin_2d + vector_b,
-            ],
-            dtype=float,
-        )
-        for index in np.ndindex(area_shape):
+        area = PREVIEW_CACHE.get("interface.coverage_area", area_key)
+        if area is None:
+            footprint = np.asarray(
+                [
+                    origin_2d,
+                    origin_2d + vector_a,
+                    origin_2d + vector_a + vector_b,
+                    origin_2d + vector_b,
+                ],
+                dtype=float,
+            )
+            rectangular = bool(
+                np.all(np.count_nonzero(plane, axis=0) == 1)
+                and np.all(np.count_nonzero(plane, axis=1) == 1)
+            )
+            if rectangular:
+                # Exact rectangle intersections are separable, even with clipping
+                # filters, nonuniform target bins and nonzero origins.
+                area = np.ones(area_shape, dtype=float)
+                for plane_index, coordinate_index in enumerate(in_plane_indices):
+                    coordinate = ("x", "y", "z")[coordinate_index]
+                    lower, upper = (
+                        float(footprint[:, plane_index].min()),
+                        float(footprint[:, plane_index].max()),
+                    )
+                    lower, upper = _merge_bound(lower, upper, filters.get(coordinate, (None, None)))
+                    if coordinate in axes:
+                        dimension = axes.index(coordinate)
+                        edge = edges[dimension]
+                        widths = np.maximum(
+                            0.0, np.minimum(edge[1:], upper) - np.maximum(edge[:-1], lower)
+                        )
+                        reshape = [1] * len(axes)
+                        reshape[dimension] = len(widths)
+                        area *= widths.reshape(reshape)
+                    else:
+                        area *= max(0.0, upper - lower)
+            else:
+                area = np.zeros(area_shape, dtype=float)
+                for index in np.ndindex(area_shape):
+                    check_cancelled()
+                    bounds = np.asarray([[-np.inf, np.inf]] * 2, dtype=float)
+                    for axis, limits in filters.items():
+                        if axis == "distance" or axis == normal_axis:
+                            continue
+                        coordinate_index = ("x", "y", "z").index(axis)
+                        plane_index = in_plane_indices.index(coordinate_index)
+                        bounds[plane_index] = _merge_bound(
+                            float(bounds[plane_index, 0]),
+                            float(bounds[plane_index, 1]),
+                            limits,
+                        )
+                    for dimension, (axis, edge) in enumerate(zip(axes, edges)):
+                        if dimension in normal_dimensions:
+                            continue
+                        coordinate_index = ("x", "y", "z").index(axis)
+                        plane_index = in_plane_indices.index(coordinate_index)
+                        bounds[plane_index] = _merge_bound(
+                            float(bounds[plane_index, 0]),
+                            float(bounds[plane_index, 1]),
+                            (float(edge[index[dimension]]), float(edge[index[dimension] + 1])),
+                        )
+                    area[index] = _polygon_rectangle_intersection_area(footprint, bounds)
             check_cancelled()
-            bounds = np.asarray([[-np.inf, np.inf]] * 2, dtype=float)
-            for axis, limits in filters.items():
-                if axis == "distance" or axis == normal_axis:
-                    continue
-                coordinate_index = ("x", "y", "z").index(axis)
-                plane_index = in_plane_indices.index(coordinate_index)
-                bounds[plane_index] = _merge_bound(
-                    float(bounds[plane_index, 0]),
-                    float(bounds[plane_index, 1]),
-                    limits,
-                )
-            for dimension, (axis, edge) in enumerate(zip(axes, edges)):
-                if dimension in normal_dimensions:
-                    continue
-                coordinate_index = ("x", "y", "z").index(axis)
-                plane_index = in_plane_indices.index(coordinate_index)
-                bounds[plane_index] = _merge_bound(
-                    float(bounds[plane_index, 0]),
-                    float(bounds[plane_index, 1]),
-                    (float(edge[index[dimension]]), float(edge[index[dimension] + 1])),
-                )
-            area[index] = _polygon_rectangle_intersection_area(footprint, bounds)
-        area_cache[area_key] = area
+            area.setflags(write=False)
+            PREVIEW_CACHE.put("interface.coverage_area", area_key, area)
+        # The local cache must not pin one dense area map per changing cell.
+        area_limit = min(16 * 1024 * 1024, PREVIEW_CACHE.budget_bytes)
+        if len(area_cache) >= max(1, area_limit // max(1, area.nbytes)):
+            area_cache.clear()
+        if area.nbytes <= area_limit:
+            area_cache[area_key] = area
 
     canonical_geometry = all(
         group.get(name) is not None
         for name in ("canonical_cut", "canonical_lower", "canonical_period")
     )
-    distance_relevant = "distance" in axes or "distance" in filters
+    distance_relevant = (
+        "distance" in axes or "distance" in filters or bool(profile.interface_alignment_metadata)
+    )
     if canonical_geometry and distance_relevant:
         raw_filter = filters.get(normal_axis, (None, None))
         distance_filter = filters.get("distance")
+        if distance_filter is None and profile.interface_alignment_metadata:
+            distance_filter = (None, None)
         if not normal_dimensions:
             overlap = _canonical_normal_overlap(
                 profile,
@@ -9173,13 +9396,15 @@ def _geometry_project_density(
     _area_cache: dict[tuple[float, ...], np.ndarray] | None = None,
     _volume_cache: dict[tuple[object, ...], np.ndarray] | None = None,
 ):
+    from ..plot.gui_session import report_progress
+    report_progress("Calculating density")
     shape = tuple(len(e) - 1 for e in edges)
     normalized_axes = tuple(str(axis).strip().lower() for axis in axes)
     normalized_edges = tuple(np.asarray(edge, dtype=float) for edge in edges)
     normalized_view = str(interface_view).strip().lower() or "folded"
     if normalized_view not in {"full", "folded", "top", "bottom", "all"}:
         raise ValueError("interface_view must be full, folded, top, bottom, or all.")
-    distance_relevant = "distance" in normalized_axes or "distance" in filters
+    distance_relevant = "distance" in normalized_axes or "distance" in filters or bool(profile.interface_alignment_metadata)
     symmetric = bool(
         profile.surface_reference is not None and profile.surface_reference.is_symmetric
     )

@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+from .setting_keys import copy_settings
+from .gui_session import PlotGuiSession, PlotProgress, progress_scope
+
 from .settings_validation import validate_current_plot_settings, validate_source_descriptor
+from .rendering import preview_canvas_geometry
 
 import json
 import logging
@@ -15,6 +19,8 @@ from pathlib import Path
 import re
 import tempfile
 import threading
+from time import perf_counter
+from functools import wraps
 from collections.abc import Sequence
 from typing import Any, Callable
 from uuid import uuid4
@@ -149,12 +155,13 @@ _MARKER_TYPES = (
     "_",
 )
 _FIT_TYPES = supported_fit_types()
-_ERROR_STATS = ("sample_sem", "sample_std", "block_sem", "block_std")
+_ERROR_STATS = ("block_ci", "sample_std", "sample_sem", "block_sem", "block_std")
 _ERROR_STAT_DISPLAY: dict[str, str] = {
-    "sample_sem": "Sample SEM",
-    "sample_std": "Sample Std. Dev.",
-    "block_sem": "Block SEM",
-    "block_std": "Block Std. Dev.",
+    "block_ci": "Uncertainty of estimate (block CI)",
+    "sample_sem": "Advanced: SEM (independent observations)",
+    "sample_std": "Variability (standard deviation)",
+    "block_sem": "Advanced: block SEM",
+    "block_std": "Advanced: block standard deviation",
 }
 _ERROR_STAT_INTERNAL: dict[str, str] = {v: k for k, v in _ERROR_STAT_DISPLAY.items()}
 _ERROR_STYLES = ("band", "whiskers")
@@ -279,6 +286,41 @@ _COORDINATION_LINE_X_QUANTITY_BACKEND_BY_LABEL = {
 }
 _ORIENTATION_VIEW_TYPE_LABEL_BY_ID = _plot_view_label_by_id(include_heatmap=True)
 _ORIENTATION_VIEW_TYPE_ID_BY_LABEL = _plot_view_id_by_label(include_heatmap=True)
+_ORIENTATION_HEATMAP_KIND_LABELS = {
+    "distribution": "Orientation distribution",
+    "spatial": "Spatial map",
+}
+_ORIENTATION_SPATIAL_QUANTITY_LABELS = {
+    "average": "Mean orientation",
+    "density": "Water density",
+    "density-weighted": "Density-weighted orientation",
+}
+_ORIENTATION_HEATMAP_STATE_KEYS = (
+    "angle",
+    "orientation_heatmap_x_axis",
+    "orientation_heatmap_y_axis",
+    "orientation_heatmap_quantity",
+    "orientation_filter_x_min",
+    "orientation_filter_x_max",
+    "orientation_filter_y_min",
+    "orientation_filter_y_max",
+    "orientation_filter_z_min",
+    "orientation_filter_z_max",
+    "orientation_filter_distance_min",
+    "orientation_filter_distance_max",
+    "heatmap_value_mode",
+    "heatmap_bulk_reference_mode",
+    "heatmap_bulk_min",
+    "heatmap_bulk_max",
+    "x_bin_width",
+    "y_bin_width",
+    "heatmap_vmin",
+    "heatmap_vmax",
+    "heatmap_cmap",
+    "heatmap_log_scale",
+    "heatmap_colorbar_label",
+)
+
 _ORIENTATION_LINE_QUANTITY_LABEL_BY_BACKEND = {
     "average": "Mean orientation",
     "density": "H2O density",
@@ -821,7 +863,7 @@ def _current_error_statistics_mode(
     if not error_supported:
         return None
     normalized = str(analysis_name or "").strip().lower()
-    if normalized in {"position", "coordination", "potential"}:
+    if normalized in {"position", "coordination", "potential", "temperature"}:
         return "raw_grouped"
     if x_bin_width_active:
         return "saved_rebinned_sample"
@@ -834,16 +876,8 @@ def _inferred_available_error_stats(
     error_supported: bool,
     x_bin_width_active: bool,
 ) -> list[str]:
-    statistics_mode = _current_error_statistics_mode(
-        analysis_name=analysis_name,
-        error_supported=error_supported,
-        x_bin_width_active=x_bin_width_active,
-    )
-    if statistics_mode is None:
-        return []
-    if statistics_mode in {"raw_grouped", "saved_rebinned_sample"}:
-        return ["sample_std", "sample_sem"]
-    return ["sample_std", "sample_sem", "block_std", "block_sem"]
+    # Capabilities come from loaded data/preview results, not an analysis-name guess.
+    return []
 
 
 def _coerce_annotation_for_gui(value: Any, *, index: int) -> dict[str, Any]:
@@ -1223,7 +1257,12 @@ def _coerce_series_fit_config(value: Any) -> dict[str, Any]:
 def _error_defaults_for_gui() -> dict[str, Any]:
     return {
         "enabled": False,
-        "stat": "block_sem",
+        "stat": "block_ci",
+        "confidence": 0.95,
+        "resamples": 1000,
+        "seed": 0,
+        "block_merge": 1,
+        "sampling": "auto",
         "style": "band",
         "color": None,
         "label_override": None,
@@ -1235,6 +1274,9 @@ def _coerce_series_error_config(value: Any) -> dict[str, Any]:
     config = _error_defaults_for_gui()
     if not isinstance(value, dict):
         return config
+    for key in ("confidence", "resamples", "seed", "block_merge", "sampling"):
+        if key in value:
+            config[key] = value[key]
     if "enabled" in value:
         config["enabled"] = bool(value.get("enabled"))
     stat = str(value.get("stat") or "").strip().lower()
@@ -1258,21 +1300,7 @@ def _resolve_error_stat_for_available(
 ) -> str:
     """Return the effective error statistic for one series and available-stat set."""
     configured = str(configured_stat or "").strip().lower()
-    available = [
-        token
-        for token in (str(value).strip().lower() for value in (available_stats or ()))
-        if token in _ERROR_STATS
-    ]
-    if available:
-        if configured in available:
-            return configured
-        for candidate in ("block_sem", "sample_sem", "block_std", "sample_std"):
-            if candidate in available:
-                return candidate
-        return available[0]
-    if configured in _ERROR_STATS:
-        return configured
-    return "sample_sem"
+    return configured if configured in _ERROR_STATS else "block_ci"
 
 
 def _default_error_series_label(base_label: str, stat: str) -> str:
@@ -1280,7 +1308,7 @@ def _default_error_series_label(base_label: str, stat: str) -> str:
     resolved_label = str(base_label).strip() or "Series"
     resolved_stat = _resolve_error_stat_for_available(stat, None)
     friendly = _ERROR_STAT_DISPLAY.get(resolved_stat, resolved_stat)
-    return f"{resolved_label} \u00b1{friendly}"
+    return f"{resolved_label}: {friendly}"
 
 
 def _error_supported_for_view(
@@ -1795,6 +1823,30 @@ def _extract_figsize_dimension(
     return str(fallback)
 
 
+def _batch_population(method):
+    @wraps(method)
+    def populate(self, settings):
+        previous_depth = getattr(self, "_settings_population_depth", 0)
+        self._settings_population_depth = previous_depth + 1
+        widgets = self.findChildren(self._population_widget_type)
+        blocked = [(widget, widget.blockSignals(True)) for widget in widgets]
+        previous_updates = self.updatesEnabled()
+        self.setUpdatesEnabled(False)
+        try:
+            return method(self, copy_settings(settings, gui=True))
+        finally:
+            for widget, previous in reversed(blocked):
+                widget.blockSignals(previous)
+            self._settings_population_depth = previous_depth
+            self.setUpdatesEnabled(previous_updates)
+            if not previous_depth:
+                for editor in getattr(self, "_advanced_option_editors", {}).values():
+                    editor.validate()
+                self._refresh_widget_states()
+
+    return populate
+
+
 def launch_plot_settings_panel(
     *,
     title: str,
@@ -1817,8 +1869,13 @@ def launch_plot_settings_panel(
     on_delete_profile: Callable[[str], tuple[str | None, str]] | None = None,
     on_set_active_profile: Callable[[str], str] | None = None,
     allow_named_profiles: bool = True,
-) -> None:
+    session_loader: Callable[[], PlotGuiSession] | None = None,
+    startup_sources: Sequence[str] = (),
+) -> int:
     """Open a PySide6 panel that previews and persists plot settings."""
+    initial_settings = copy_settings(initial_settings, gui=True)
+    if default_profile_settings is not None:
+        default_profile_settings = copy_settings(default_profile_settings, gui=True)
     try:
         from PySide6.QtCore import (
             QAbstractListModel,
@@ -1890,6 +1947,7 @@ def launch_plot_settings_panel(
                 FigureCanvasQTAgg as FigureCanvas,
                 NavigationToolbar2QT,
             )
+            from .preview_canvas import PlotPreviewCanvas
         except Exception:  # pragma: no cover - matplotlib Qt backend availability
             FigureCanvas = None
             NavigationToolbar2QT = None
@@ -1901,6 +1959,7 @@ def launch_plot_settings_panel(
 
     from .session_log import SessionLog
     from .session_widgets import JsonOptionsEditor, PreviewLoadingOverlay, SessionDiagnostics
+    from .loading_widgets import StudioActivityIndicator
 
     navigation_toolbar_type = None
     if NavigationToolbar2QT is not None:
@@ -2636,7 +2695,7 @@ def launch_plot_settings_panel(
             self.preview_scroll.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self.preview_scroll.viewport().installEventFilter(event_filter_owner)
 
-            self.preview_label = QLabel("Loading...")
+            self.preview_label = QLabel("")
             self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self.preview_label.setWordWrap(True)
             self.preview_label.setMinimumSize(3, 3)
@@ -2656,6 +2715,7 @@ def launch_plot_settings_panel(
     class _PreviewWorkerBridge(QObject):
         finished = Signal(int, object)
         failed = Signal(int, object)
+        progress = Signal(int, object)
 
     class _CollapsibleSection(QFrame):
         def __init__(
@@ -2880,13 +2940,38 @@ def launch_plot_settings_panel(
             event.ignore()
             QTimer.singleShot(0, self._on_dock_requested)
 
+    class _StartupBridge(QObject):
+        ready = Signal(int, object)
+        failed = Signal(int, object)
+        progress = Signal(int, object)
+
     class _PlotSettingsWindow(QMainWindow):
         def __init__(self) -> None:
             super().__init__()
+            self._session_ready = False
+            self._closing = False
+            self._startup_failed = False
+            self._startup_generation = 0
+            self._startup_started = False
+            self._startup_cancel = threading.Event()
+            self._startup_pending_session: PlotGuiSession | None = None
+            self._shell_settings_snapshot: tuple[dict[str, Any] | None, str | None] | None = None
+            self._startup_bridge = _StartupBridge(self)
+            self._startup_bridge.ready.connect(self._install_prepared_session)
+            self._startup_bridge.failed.connect(self._startup_failure)
+            self._startup_bridge.progress.connect(self._startup_progress)
+            if session_loader is None:
+                self._initialize_workspace()
+                self._session_ready = True
+            else:
+                self._build_startup_ui()
+
+        def _initialize_workspace(self) -> None:
             apply_light_palette(self)
             self.setWindowTitle(title)
             self.resize(980, 760)
             self.setAttribute(Qt.WidgetAttribute.WA_AlwaysShowToolTips, True)
+            self._population_widget_type = QWidget
             self._analysis_name = (analysis_name or "").strip().lower() or None
             self._allow_named_profiles = bool(allow_named_profiles)
             self._on_resolve_series_defaults = on_resolve_series_defaults
@@ -3048,6 +3133,7 @@ def launch_plot_settings_panel(
             self._series_alpha_data: list[str] = []
             self._series_error_enabled_data: list[bool] = []
             self._series_error_stats_data: list[str] = []
+            self._series_error_options_by_id: dict[str, dict] = {}
             self._series_error_styles_data: list[str] = []
             self._series_error_colors_data: list[str] = []
             self._series_error_label_overrides_data: list[str] = []
@@ -3106,6 +3192,9 @@ def launch_plot_settings_panel(
             self._orientation_active_view_type = PLOT_VIEW_1D_LINE
             self._orientation_view_states: dict[str, dict[str, Any]] = {}
             self._orientation_view_state_switching = False
+            self._orientation_heatmap_states: dict[str, dict[str, Any]] = {}
+            self._orientation_heatmap_active_kind = "distribution"
+            self._orientation_heatmap_kind_row: tuple[QFormLayout, QWidget] | None = None
             self._collapsible_section_state: dict[str, bool] = {}
             self._advanced_json_syncing = False
             self._suspend_preview_events = False
@@ -3128,6 +3217,7 @@ def launch_plot_settings_panel(
             self._preview_label: QLabel | None = None
             self._preview_canvas_container: QWidget | None = None
             self._preview_canvas_layout: QVBoxLayout | None = None
+            self._interface_alignments: dict[str, Any] = {}
             self._preview_canvas_scroll: QScrollArea | None = None
             self._preview_status: QLabel | None = None
             self._preview_button: QPushButton | None = None
@@ -3248,6 +3338,7 @@ def launch_plot_settings_panel(
             self._preview_worker_bridge = _PreviewWorkerBridge(self)
             self._preview_worker_bridge.finished.connect(self._handle_preview_worker_finished)
             self._preview_worker_bridge.failed.connect(self._handle_preview_worker_failed)
+            self._preview_worker_bridge.progress.connect(self._handle_preview_progress)
             self._closing = False
             self._preview_timer = QTimer(self)
             self._preview_timer.setSingleShot(True)
@@ -3257,6 +3348,7 @@ def launch_plot_settings_panel(
             self._preview_layout_timer.setInterval(40)
             self._preview_layout_timer.timeout.connect(self._resize_preview_canvas_to_figure)
             self._preview_loading = False
+            self._preview_activity_progress = PlotProgress("Loading plot data")
             self._preview_error: str | None = None
             self._session_diagnostics = SessionDiagnostics(session_messages, self)
             self._status_label = self._session_diagnostics.footer
@@ -3276,7 +3368,6 @@ def launch_plot_settings_panel(
                 self._series_syncing = _previous_series_syncing
                 self._annotation_syncing = _previous_annotation_syncing
                 self._suspend_preview_events = False
-            self._refresh_widget_states()
             self._bind_live_preview_signals()
             try:
                 self._saved_signature = self._signature(self._collect_settings())
@@ -3287,6 +3378,214 @@ def launch_plot_settings_panel(
             # Start the first render after the maximized window has entered the
             # event loop.  Rendering during construction contends with Qt's
             # initial layout and can leave the window looking unresponsive.
+
+        def _build_startup_ui(self) -> None:
+            apply_light_palette(self)
+            self.setWindowTitle("LiNaK Studio")
+            self.resize(980, 760)
+            root = QWidget(self)
+            self.setCentralWidget(root)
+            layout = QVBoxLayout(root)
+            layout.setContentsMargins(28, 24, 28, 24)
+            header = QLabel("LiNaK Studio", root)
+            header.setStyleSheet("font-size: 24px; font-weight: 600; color: #142033;")
+            layout.addWidget(header)
+            source_names = [Path(value).name for value in startup_sources[:4]]
+            if len(startup_sources) > 4:
+                source_names.append(f"... and {len(startup_sources) - 4} more files")
+            sources = QLabel("\n".join(source_names), root)
+            sources.setTextFormat(Qt.TextFormat.PlainText)
+            sources.setWordWrap(True)
+            sources.setToolTip("\n".join(startup_sources))
+            layout.addWidget(sources)
+            layout.addStretch()
+            self._startup_activity = StudioActivityIndicator(root)
+            self._startup_activity.set_progress(PlotProgress("Checking files"))
+            self._startup_activity.set_active(True)
+            self._startup_label = self._startup_activity.title_label
+            layout.addWidget(self._startup_activity, alignment=Qt.AlignmentFlag.AlignCenter)
+            self._startup_details = QPlainTextEdit(root)
+            self._startup_details.setReadOnly(True)
+            self._startup_details.setPlainText("\n".join(startup_sources))
+            self._startup_details.hide()
+            layout.addWidget(self._startup_details)
+            buttons = QHBoxLayout()
+            self._startup_retry = QPushButton("Retry", root)
+            self._startup_retry.hide()
+            self._startup_retry.clicked.connect(self._start_preparation)
+            details = QPushButton("Details", root)
+            details.clicked.connect(
+                lambda: self._startup_details.setVisible(not self._startup_details.isVisible())
+            )
+            close = QPushButton("Cancel", root)
+            close.clicked.connect(self.close)
+            self._startup_close = close
+            buttons.addWidget(self._startup_retry)
+            buttons.addWidget(details)
+            buttons.addStretch()
+            buttons.addWidget(close)
+            layout.addLayout(buttons)
+            layout.addStretch()
+            self._startup_time = perf_counter()
+
+        def _start_preparation(self) -> None:
+            if self._closing or session_loader is None:
+                return
+            self._startup_cancel.set()
+            self._startup_cancel = threading.Event()
+            cancel = self._startup_cancel
+            self._startup_generation += 1
+            generation = self._startup_generation
+            self._startup_failed = False
+            self._startup_retry.hide()
+            self._startup_close.setText("Cancel")
+            self._startup_activity.set_active(True)
+            self._startup_activity.set_progress(PlotProgress("Checking files"))
+            self._startup_time = perf_counter()
+
+            def progress(update):
+                if not cancel.is_set():
+                    try:
+                        self._startup_bridge.progress.emit(generation, update)
+                    except RuntimeError:
+                        cancel.set()
+
+            def prepare():
+                session = None
+                try:
+                    with cancellation_scope(cancel.is_set), progress_scope(progress):
+                        session = session_loader()
+                        self._startup_pending_session = session
+                        if cancel.is_set():
+                            raise ComputationCancelled()
+                        self._startup_bridge.ready.emit(generation, session)
+                except ComputationCancelled:
+                    if session is not None:
+                        session.discard()
+                        self._startup_pending_session = None
+                except Exception as exc:
+                    if session is not None:
+                        session.discard()
+                    if not cancel.is_set():
+                        try:
+                            self._startup_bridge.failed.emit(generation, exc)
+                        except RuntimeError:
+                            pass
+
+            threading.Thread(target=prepare, name="linak-studio-preparation", daemon=True).start()
+
+        def _startup_progress(self, generation, update) -> None:
+            if generation != self._startup_generation or self._closing or self._session_ready:
+                return
+            self._startup_activity.set_progress(update)
+            self._startup_details.appendPlainText(update.message)
+
+        def _startup_failure(self, generation, error) -> None:
+            if generation != self._startup_generation or self._closing or self._session_ready:
+                return
+            import traceback
+
+            self._startup_failed = True
+            self._startup_activity.set_active(False)
+            self._startup_retry.show()
+            self._startup_close.setText("Close")
+            self._startup_label.setText(f"Could not open results: {error}")
+            self._startup_details.appendPlainText(
+                "".join(traceback.format_exception(type(error), error, error.__traceback__))
+            )
+            session_messages.publish(str(error), level=logging.ERROR, source="Studio startup")
+
+        def _install_prepared_session(self, generation, session) -> None:
+            nonlocal \
+                title, \
+                initial_settings, \
+                on_preview, \
+                on_save, \
+                on_preview_figure, \
+                on_save_figure, \
+                on_save_data, \
+                on_import_hdf5, \
+                on_list_import_hdf5_profiles, \
+                analysis_name, \
+                on_resolve_series_defaults, \
+                initial_profile_name, \
+                available_profile_names, \
+                default_profile_settings, \
+                on_load_profile, \
+                on_rename_profile, \
+                on_duplicate_profile, \
+                on_delete_profile, \
+                on_set_active_profile, \
+                allow_named_profiles
+            if generation != self._startup_generation or self._closing:
+                session.discard()
+                return
+            values = session.parameters()
+            title = values.get("title", title)
+            initial_settings = values.get("initial_settings", initial_settings)
+            on_preview = values.get("on_preview", on_preview)
+            on_save = values.get("on_save", on_save)
+            on_preview_figure = values.get("on_preview_figure", on_preview_figure)
+            on_save_figure = values.get("on_save_figure", on_save_figure)
+            on_save_data = values.get("on_save_data", on_save_data)
+            on_import_hdf5 = values.get("on_import_hdf5", on_import_hdf5)
+            on_list_import_hdf5_profiles = values.get(
+                "on_list_import_hdf5_profiles", on_list_import_hdf5_profiles
+            )
+            analysis_name = values.get("analysis_name", analysis_name)
+            on_resolve_series_defaults = values.get(
+                "on_resolve_series_defaults", on_resolve_series_defaults
+            )
+            initial_profile_name = values.get("initial_profile_name", initial_profile_name)
+            available_profile_names = values.get("available_profile_names", available_profile_names)
+            default_profile_settings = values.get("default_profile_settings", default_profile_settings)
+            on_load_profile = values.get("on_load_profile", on_load_profile)
+            on_rename_profile = values.get("on_rename_profile", on_rename_profile)
+            on_duplicate_profile = values.get("on_duplicate_profile", on_duplicate_profile)
+            on_delete_profile = values.get("on_delete_profile", on_delete_profile)
+            on_set_active_profile = values.get("on_set_active_profile", on_set_active_profile)
+            allow_named_profiles = values.get("allow_named_profiles", allow_named_profiles)
+            initial_settings = copy_settings(initial_settings, gui=True)
+            default_profile_settings = copy_settings(default_profile_settings or {}, gui=True)
+            self._startup_activity.set_progress(PlotProgress("Preparing controls"))
+            self._startup_activity.set_active(False)
+            started = perf_counter()
+            startup_root = self.takeCentralWidget()
+            try:
+                self._initialize_workspace()
+            except Exception as exc:
+                partial_root = self.takeCentralWidget()
+                if partial_root is not None:
+                    partial_root.deleteLater()
+                self.setCentralWidget(startup_root)
+                if hasattr(self, "_session_diagnostics"):
+                    self._session_diagnostics.shutdown()
+                for name in ("_preview_timer", "_preview_layout_timer"):
+                    if hasattr(self, name):
+                        getattr(self, name).stop()
+                session.discard()
+                self._startup_pending_session = None
+                self._startup_failure(generation, exc)
+                return
+            if startup_root is not None:
+                startup_root.deleteLater()
+            self._startup_pending_session = None
+            self._session_ready = True
+            self._startup_failed = False
+            logging.getLogger("linak").debug(
+                "Studio workspace construction seconds=%.6f", perf_counter() - started
+            )
+            self._status_label.setText("Loading plot data...")
+            QTimer.singleShot(0, self._refresh_preview_after_layout)
+
+        def paintEvent(self, event) -> None:
+            super().paintEvent(event)
+            if not self._startup_started and not self._session_ready:
+                self._startup_started = True
+                logging.getLogger("linak").debug(
+                    "Studio first paint seconds=%.6f", perf_counter() - self._startup_time
+                )
+                QTimer.singleShot(0, self._start_preparation)
 
         def _signature(self, settings: dict[str, Any]) -> str:
             return json.dumps(settings, sort_keys=True, separators=(",", ":"), default=str)
@@ -4055,6 +4354,8 @@ def launch_plot_settings_panel(
             if (
                 fig_width is not None
                 and fig_height is not None
+                and np.isfinite(fig_width)
+                and np.isfinite(fig_height)
                 and fig_width > 0.0
                 and fig_height > 0.0
             ):
@@ -4068,7 +4369,12 @@ def launch_plot_settings_panel(
                 except (TypeError, ValueError):
                     state_width = 0.0
                     state_height = 0.0
-                if state_width > 0.0 and state_height > 0.0:
+                if (
+                    np.isfinite(state_width)
+                    and np.isfinite(state_height)
+                    and state_width > 0.0
+                    and state_height > 0.0
+                ):
                     return state_width, state_height
 
             if self._preview_figure is not None:
@@ -4079,7 +4385,12 @@ def launch_plot_settings_panel(
                 except Exception:
                     current_width = 0.0
                     current_height = 0.0
-                if current_width > 0.0 and current_height > 0.0:
+                if (
+                    np.isfinite(current_width)
+                    and np.isfinite(current_height)
+                    and current_width > 0.0
+                    and current_height > 0.0
+                ):
                     return current_width, current_height
 
             width, height = DEFAULT_PLOT_STYLE.figure_size
@@ -4108,18 +4419,10 @@ def launch_plot_settings_panel(
             available_width = max(1, available_width)
             available_height = max(1, available_height)
             export_width, export_height = self._preview_export_figsize()
-            export_aspect = max(1.0e-9, export_width / export_height)
-            available_aspect = available_width / available_height
-            if available_aspect > export_aspect:
-                target_height = available_height
-                target_width = int(round(target_height * export_aspect))
-            else:
-                target_width = available_width
-                target_height = int(round(target_width / export_aspect))
-            target_width = max(1, min(available_width, target_width))
-            target_height = max(1, min(available_height, target_height))
             try:
-                preview_dpi = max(target_width / export_width, target_height / export_height, 1.0)
+                target_width, target_height, preview_dpi = preview_canvas_geometry(
+                    (export_width, export_height), (available_width, available_height)
+                )
                 # Qt sizes are logical pixels; Matplotlib renders in physical
                 # pixels. Keep its base DPI current for later screen changes,
                 # then scale the renderer by the canvas device-pixel ratio.
@@ -4128,8 +4431,9 @@ def launch_plot_settings_panel(
                 self._preview_figure._original_dpi = preview_dpi
                 self._preview_figure.set_dpi(preview_dpi * self._preview_canvas.device_pixel_ratio)
                 self._preview_figure.set_size_inches(export_width, export_height, forward=False)
-            except Exception:
-                pass
+            except (ValueError, OverflowError) as exc:
+                self._set_preview_failure(exc)
+                return
             self._preview_canvas.setFixedSize(QSize(target_width, target_height))
             self._preview_canvas.resize(target_width, target_height)
             if self._preview_canvas_scroll is not None:
@@ -5768,6 +6072,9 @@ def launch_plot_settings_panel(
             return str(self._analysis_name).replace("-", " ").strip().title() or "Generic"
 
         def _safe_collect_settings(self) -> tuple[dict[str, Any] | None, str | None]:
+            snapshot = getattr(self, "_shell_settings_snapshot", None)
+            if snapshot is not None:
+                return snapshot
             try:
                 return self._collect_settings(), None
             except Exception as exc:
@@ -6053,13 +6360,20 @@ def launch_plot_settings_panel(
                 self._apply_widget_tooltip(self._redo_button, disabled_reason=redo_reason)
 
         def _refresh_shell_state(self) -> None:
-            self._update_header_state()
-            self._update_status_strip()
-            self._update_warning_panel()
-            profiles_label = getattr(self, "_profiles_current_label", None)
-            if profiles_label is not None:
-                profiles_label.setText(self._current_profile_name)
-            self._refresh_disabled_tooltips()
+            if getattr(self, "_settings_population_depth", 0):
+                return
+            previous = getattr(self, "_shell_settings_snapshot", None)
+            self._shell_settings_snapshot = self._safe_collect_settings()
+            try:
+                self._update_header_state()
+                self._update_status_strip()
+                self._update_warning_panel()
+                profiles_label = getattr(self, "_profiles_current_label", None)
+                if profiles_label is not None:
+                    profiles_label.setText(self._current_profile_name)
+                self._refresh_disabled_tooltips()
+            finally:
+                self._shell_settings_snapshot = previous
 
         def _update_header_state(self) -> None:
             if not hasattr(self, "_save_button") or self._save_button is None:
@@ -6225,6 +6539,10 @@ def launch_plot_settings_panel(
             if auto_update_checked is None:
                 auto_update_checked = on_save_figure is not None
 
+            previous_pane = self._active_preview_pane
+            handoff_loading = previous_pane is not None and previous_pane.loading_overlay.isVisible()
+            if previous_pane is not None and previous_pane is not pane:
+                previous_pane.loading_overlay.set_active(False)
             self._active_preview_pane = pane
             self._preview_frame = pane.preview_frame
             self._preview_scroll = pane.preview_scroll
@@ -6251,6 +6569,9 @@ def launch_plot_settings_panel(
             if self._data_export_button is not None:
                 self._data_export_button.setEnabled(on_save_data is not None)
             self._set_preview_loading(self._preview_loading)
+            if handoff_loading and self._preview_loading:
+                pane.loading_overlay.delay.stop()
+                pane.loading_overlay._show_loading()
             if self._preview_figure is not None:
                 self._install_preview_figure(self._preview_figure, close_previous=False)
             else:
@@ -7803,7 +8124,7 @@ def launch_plot_settings_panel(
                 error_group = QGroupBox("Uncertainty")
                 error_layout = QVBoxLayout(error_group)
                 error_note = QLabel(
-                    "Uncertainty overlays are tied to the base series. Leave the color field blank to match the series color automatically."
+                    "Choose variability (spread) or uncertainty of the mean (block confidence interval). Advanced SEM options require explicit assumptions. Missing statistics are reported; the estimator is never switched automatically."
                 )
                 error_note.setWordWrap(True)
                 error_layout.addWidget(error_note)
@@ -7824,10 +8145,43 @@ def launch_plot_settings_panel(
                 self._series_error_stat.currentTextChanged.connect(self._on_series_editor_changed)
                 self._add_form_row(
                     error_form,
-                    "Statistic",
+                    "Meaning / advanced estimator",
                     self._series_error_stat,
                     tooltip_id="series.error_stat",
                 )
+                self._uncertainty_form = error_form
+                self._uncertainty_inputs = {}
+                for key, caption, default in (
+                    ("confidence", "Confidence (0-1)", "0.95"),
+                    ("resamples", "Resamples", "1000"),
+                    ("seed", "Random seed", "0"),
+                    ("block_merge", "Merge consecutive blocks", "1"),
+                ):
+                    field = self._line()
+                    field.setText(default)
+                    field.setValidator(
+                        QDoubleValidator(0.0, 1.0, 6, field)
+                        if key == "confidence"
+                        else QIntValidator(
+                            100 if key == "resamples" else 1 if key == "block_merge" else 0,
+                            2147483647,
+                            field,
+                        )
+                    )
+                    field.textChanged.connect(self._on_series_editor_changed)
+                    field.setToolTip(
+                        "Bootstrap settings. Block sizes and valid observations are reported below; independence is not assumed verified."
+                    )
+                    self._uncertainty_inputs[key] = field
+                    error_form.addRow(caption, field)
+                self._uncertainty_sampling = self._combo(("auto", "temporal", "independent"))
+                self._uncertainty_sampling.setToolTip(
+                    "Auto uses trajectory frames for position, coordination and temperature. Potential records require an explicit temporal or independent sampling assumption."
+                )
+                self._uncertainty_sampling.currentTextChanged.connect(
+                    self._on_series_editor_changed
+                )
+                error_form.addRow("Record sampling assumption", self._uncertainty_sampling)
                 self._series_error_style = self._combo(
                     tuple(_ERROR_STYLE_DISPLAY[s] for s in _ERROR_STYLES)
                 )
@@ -9112,6 +9466,7 @@ def launch_plot_settings_panel(
         def _handle_interface_view_change(self, *_unused: object) -> None:
             view = self._selected_interface_view()
             self._refresh_interface_view_control(view)
+            self._refresh_interface_alignment()
             axis_label = self._interface_surface_axis().upper()
             if self._analysis_name == "density" and hasattr(self, "density_x_mode"):
                 if self._density_symmetric_1d_coordinate_locked():
@@ -9227,6 +9582,76 @@ def launch_plot_settings_panel(
             self._record_history_after_non_text_change()
             self._handle_series_identity_change()
 
+        def _refresh_interface_alignment(self) -> None:
+            if not hasattr(self, "interface_alignment_button"):
+                return
+            from ..analysis.interface_alignment import RECOMPUTE_MESSAGE
+
+            if self._analysis_name == "orientation":
+                from ..analysis.orientation_spatial import ALIGNMENT_RECOMPUTE
+                recompute_message = ALIGNMENT_RECOMPUTE
+            else:
+                recompute_message = RECOMPUTE_MESSAGE
+            references = self._profile_filter_options.get("interface_references") or []
+            usable = [item for item in references if item.get("can_align") and not item.get("unavailable_reason")]
+            self.interface_alignment_button.setEnabled(bool(usable))
+            available_ids = {item["metadata"]["interface_reference"]["reference_id"] for item in usable}
+            active = [value for key, value in self._interface_alignments.items() if key in available_ids]
+            if self._analysis_name == "orientation" and hasattr(self, "orientation_line_x_axis"):
+                registered = bool(active) and self._selected_interface_view() not in {"full", "top"}
+                axis = self._interface_surface_axis()
+                for index in range(self.orientation_line_x_axis.count()):
+                    item = self.orientation_line_x_axis.model().item(index)
+                    allowed = not (registered and item.text().strip().lower() == axis)
+                    item.setEnabled(allowed)
+                    if not allowed:
+                        item.setToolTip("Choose Distance for aligned interface-normal cross-sections.")
+                if registered and self.orientation_line_x_axis.currentText().strip().lower() == axis:
+                    self.orientation_line_x_axis.blockSignals(True)
+                    self._set_combo_value(self.orientation_line_x_axis, "Distance")
+                    self.orientation_line_x_axis.blockSignals(False)
+            mismatches = any(value.get("allow_mismatches") and not (value.get("diagnostics") or {}).get("good_match") for value in active)
+            status = "Applied with mismatches" if mismatches else "Applied" if active else "Off"
+            self.interface_alignment_status.setText(status)
+            if not usable:
+                reason = next((item.get("unavailable_reason") for item in references if item.get("unavailable_reason")), None)
+                self.interface_alignment_note.setText(reason or (recompute_message if self._analysis_name == "orientation" or not references else "Recompute density with a side-resolved sparse grid to enable interface alignment."))
+            elif self._selected_interface_view() == "full" and active:
+                self.interface_alignment_note.setText("Alignment is saved; full-cell coordinates are displayed in this view.")
+            elif self._analysis_name == "orientation":
+                self.interface_alignment_note.setText(
+                    "Registers negative-interface sample locations for lateral spatial axes and filters. "
+                    "Stored polar/azimuthal angle definitions are preserved. "
+                    "Distance-only profiles and orientation distributions are unaffected.")
+            else:
+                self.interface_alignment_note.setText("Maps the negative interface into positive-interface lateral coordinates for spatial views." if active else "Optional registration for mirrored steps and shifted surface lattices.")
+
+        def _open_interface_alignment(self) -> None:
+            from ..analysis.interface_alignment import InterfaceReference
+            from .interface_alignment_dialog import InterfaceAlignmentDialog
+
+            references = []
+            for item in self._profile_filter_options.get("interface_references") or []:
+                if not item.get("can_align") or item.get("unavailable_reason"):
+                    continue
+                reference = InterfaceReference.from_metadata(item["metadata"], item["source_path"])
+                if reference is not None:
+                    references.append({**item, "reference": reference})
+            if not references:
+                return
+            try:
+                dialog = InterfaceAlignmentDialog(references, self._interface_alignments, self)
+            except ValueError as exc:
+                self._report_error("Interface alignment unavailable", exc)
+                return
+            if dialog.exec() == dialog.DialogCode.Accepted:
+                self._interface_alignments = deepcopy(dialog.result_alignments)
+                self._refresh_interface_alignment()
+                self._refresh_widget_states()
+                self._record_history_after_non_text_change()
+                self._schedule_preview_update()
+            dialog.deleteLater()
+
         def _build_analysis_data_sections(self, layout: QVBoxLayout) -> None:
             analysis = self._analysis_name
             if analysis is None:
@@ -9251,6 +9676,9 @@ def launch_plot_settings_panel(
                 self.interface_view_combo = self._combo(
                     tuple(self._interface_view_labels().values())
                 )
+                self._set_combo_value(
+                    self.interface_view_combo, self._interface_view_labels()["folded"]
+                )
                 self.interface_view_combo.currentTextChanged.connect(
                     self._handle_interface_view_change
                 )
@@ -9264,6 +9692,20 @@ def launch_plot_settings_panel(
                 self._interface_view_note.setObjectName("sectionNote")
                 self._interface_view_note.setWordWrap(True)
                 surface_form.addRow(self._interface_view_note)
+                if analysis in {"density", "position", "orientation"}:
+                    alignment_row = QHBoxLayout()
+                    self.interface_alignment_button = QPushButton("Align interfaces…")
+                    self.interface_alignment_button.clicked.connect(self._open_interface_alignment)
+                    self.interface_alignment_status = QLabel("Off")
+                    alignment_row.addWidget(self.interface_alignment_button)
+                    alignment_row.addWidget(self.interface_alignment_status)
+                    surface_form.addRow("Lateral alignment", alignment_row)
+                    self.interface_alignment_note = QLabel("")
+                    self.interface_alignment_note.setWordWrap(True)
+                    self.interface_alignment_note.setObjectName("sectionNote")
+                    surface_form.addRow(self.interface_alignment_note)
+                    self._refresh_interface_alignment()
+
                 layout.addWidget(
                     self._make_collapsible_section(
                         title="Surface representation",
@@ -9658,6 +10100,10 @@ def launch_plot_settings_panel(
                 self.orientation_angle.currentTextChanged.connect(
                     self._handle_orientation_mapping_change
                 )
+                self.orientation_heatmap_kind = self._combo(tuple(_ORIENTATION_HEATMAP_KIND_LABELS.values()))
+                self.orientation_heatmap_kind.currentTextChanged.connect(self._handle_orientation_heatmap_kind_change)
+                self.orientation_heatmap_quantity = self._combo(tuple(_ORIENTATION_SPATIAL_QUANTITY_LABELS.values()))
+                self.orientation_heatmap_quantity.currentTextChanged.connect(self._handle_orientation_mapping_change)
                 self.orientation_heatmap_x_axis = self._combo(_DENSITY_X_MODE_LABELS)
                 self.orientation_heatmap_y_axis = self._combo(("Y", "X", "Z", "Distance"))
                 self._set_combo_value(self.orientation_heatmap_x_axis, "X")
@@ -9681,6 +10127,19 @@ def launch_plot_settings_panel(
                     tooltip_id="data.orientation.y_quantity",
                 )
                 self._orientation_line_quantity_row = (view_form, self.orientation_component)
+                self._add_form_row(view_form, "2D representation", self.orientation_heatmap_kind, tooltip_id="data.orientation.view_type")
+                self._orientation_heatmap_kind_row = (view_form, self.orientation_heatmap_kind)
+                self._add_form_row(view_form, "Color quantity", self.orientation_heatmap_quantity, tooltip_id="data.orientation.y_quantity")
+                self._orientation_mapping_2d_rows.append((view_form, self.orientation_heatmap_quantity))
+                self.orientation_spatial_note = QLabel("")
+                self.orientation_spatial_note.setWordWrap(True)
+                self.orientation_spatial_note.setObjectName("sectionNote")
+                view_form.addRow(self.orientation_spatial_note)
+                self._orientation_mapping_2d_rows.append((view_form, self.orientation_spatial_note))
+                self.orientation_swap_axes = QPushButton("Swap spatial axes")
+                self.orientation_swap_axes.clicked.connect(self._swap_orientation_spatial_axes)
+                view_form.addRow(self.orientation_swap_axes)
+                self._orientation_mapping_2d_rows.append((view_form, self.orientation_swap_axes))
                 self._add_form_row(
                     view_form,
                     "X-axis quantity",
@@ -10723,7 +11182,11 @@ def launch_plot_settings_panel(
             return PLOT_VIEW_1D_LINE
 
         def _clean_density_view_state(self, state: dict[str, Any]) -> dict[str, Any]:
-            cleaned = deepcopy(state)
+            cleaned = copy_settings(state, gui=True, exclude=(
+                "_profile_filter_options", "data_contract", "source_selection", "style",
+                "density_view_states", "position_view_states", "orientation_view_states",
+                "orientation_heatmap_states",
+            ))
             for key in (
                 "_profile_filter_options",
                 "data_contract",
@@ -10735,7 +11198,7 @@ def launch_plot_settings_panel(
             return cleaned
 
         def _default_density_view_state(self, view_type: str) -> dict[str, Any]:
-            defaults = self._clean_density_view_state(deepcopy(self._default_profile_settings))
+            defaults = self._clean_density_view_state(self._default_profile_settings)
             defaults["_density_view_state_initialized"] = True
             normalized = self._normalize_density_view_type_id(view_type)
             if normalized == PLOT_VIEW_2D_HEATMAP:
@@ -10888,7 +11351,7 @@ def launch_plot_settings_panel(
                 return settings
             active = self._density_active_view_type_id()
             states = deepcopy(self._density_view_states)
-            active_state = self._clean_density_view_state(deepcopy(settings))
+            active_state = self._clean_density_view_state(settings)
             active_state["_density_view_state_initialized"] = True
             active_state["density_active_view_type"] = active
             states[active] = active_state
@@ -10920,7 +11383,11 @@ def launch_plot_settings_panel(
             return self._normalize_position_view_type_id(self._position_view_type_id())
 
         def _clean_position_view_state(self, state: dict[str, Any]) -> dict[str, Any]:
-            cleaned = deepcopy(state)
+            cleaned = copy_settings(state, gui=True, exclude=(
+                "_profile_filter_options", "data_contract", "source_selection", "style",
+                "density_view_states", "position_view_states", "orientation_view_states",
+                "orientation_heatmap_states",
+            ))
             for key in (
                 "_profile_filter_options",
                 "data_contract",
@@ -10932,7 +11399,7 @@ def launch_plot_settings_panel(
             return cleaned
 
         def _default_position_view_state(self, view_type: str) -> dict[str, Any]:
-            defaults = self._clean_position_view_state(deepcopy(self._default_profile_settings))
+            defaults = self._clean_position_view_state(self._default_profile_settings)
             normalized = self._normalize_position_view_type_id(view_type)
             defaults["_position_view_state_initialized"] = True
             defaults["position_active_view_type"] = normalized
@@ -11047,7 +11514,7 @@ def launch_plot_settings_panel(
                 return settings
             active = self._position_active_view_type_id()
             states = deepcopy(self._position_view_states)
-            active_state = self._clean_position_view_state(deepcopy(settings))
+            active_state = self._clean_position_view_state(settings)
             active_state["_position_view_state_initialized"] = True
             active_state["position_active_view_type"] = active
             states[active] = active_state
@@ -11075,19 +11542,25 @@ def launch_plot_settings_panel(
             return self._orientation_active_view_type
 
         def _clean_orientation_view_state(self, state: dict[str, Any]) -> dict[str, Any]:
-            cleaned = deepcopy(state)
+            cleaned = copy_settings(state, gui=True, exclude=(
+                "_profile_filter_options", "data_contract", "source_selection", "style",
+                "density_view_states", "position_view_states", "orientation_view_states",
+                "orientation_heatmap_states",
+            ))
             for key in (
                 "_profile_filter_options",
                 "data_contract",
                 "source_selection",
                 "style",
                 "orientation_view_states",
+                "orientation_heatmap_states",
+                "interface_alignments",
             ):
                 cleaned.pop(key, None)
             return cleaned
 
         def _default_orientation_view_state(self, view_type: str) -> dict[str, Any]:
-            defaults = self._clean_orientation_view_state(deepcopy(self._default_profile_settings))
+            defaults = self._clean_orientation_view_state(self._default_profile_settings)
             normalized = self._normalize_orientation_view_type_id(view_type)
             defaults["_orientation_view_state_initialized"] = True
             defaults["orientation_active_view_type"] = normalized
@@ -11123,6 +11596,8 @@ def launch_plot_settings_panel(
                         "x_bin_reducer": None,
                         "y_bin_reducer": None,
                         "heatmap_value_mode": "raw_counts",
+                        "orientation_heatmap_kind": "distribution",
+                        "orientation_heatmap_quantity": "average",
                         "heatmap_bulk_reference_mode": "auto",
                         "heatmap_bulk_min": None,
                         "heatmap_bulk_max": None,
@@ -11187,13 +11662,31 @@ def launch_plot_settings_panel(
         ) -> dict[str, Any]:
             merged = dict(settings)
             merged.update(deepcopy(state))
+            if "interface_alignments" in settings:
+                merged["interface_alignments"] = deepcopy(settings["interface_alignments"])
             normalized = self._normalize_orientation_view_type_id(view_type)
             merged["orientation_active_view_type"] = normalized
             if normalized == PLOT_VIEW_2D_HEATMAP:
+                previous_mapping = self._coerce_settings_view_mapping(state)
+                if previous_mapping is not None and "orientation_heatmap_kind" not in state:
+                    try:
+                        previous_options = orientation_view_mapping_to_plot_options(previous_mapping)
+                    except ValueError:
+                        previous_options = {}
+                    if previous_options.get("component") == "heatmap":
+                        explicit_axes = any(key in previous_mapping.fixed_values for key in
+                                            ("orientation_heatmap_x_axis", "orientation_heatmap_y_axis"))
+                        merged.update(previous_options)
+                        merged["orientation_heatmap_kind"] = previous_options.get("orientation_heatmap_kind") or ("spatial" if explicit_axes else "distribution")
+                        merged["orientation_heatmap_quantity"] = previous_options.get("orientation_heatmap_quantity") or "average"
                 merged["view_mapping"] = serialize_plot_view_mapping(
                     orientation_plot_options_to_view_mapping(
                         component="heatmap",
                         angle=str(merged.get("angle") or "polar"),
+                        heatmap_kind=merged.get("orientation_heatmap_kind"),
+                        heatmap_quantity=merged.get("orientation_heatmap_quantity"),
+                        heatmap_x_axis=merged.get("orientation_heatmap_x_axis"),
+                        heatmap_y_axis=merged.get("orientation_heatmap_y_axis"),
                     )
                 )
             else:
@@ -11244,7 +11737,7 @@ def launch_plot_settings_panel(
                 return settings
             active = self._orientation_active_view_type_id()
             states = deepcopy(self._orientation_view_states)
-            active_state = self._clean_orientation_view_state(deepcopy(settings))
+            active_state = self._clean_orientation_view_state(settings)
             active_state["_orientation_view_state_initialized"] = True
             active_state["orientation_active_view_type"] = active
             states[active] = active_state
@@ -11531,6 +12024,245 @@ def launch_plot_settings_panel(
                 time_axis=time_x_role,
             )
 
+        def _selected_orientation_heatmap_kind(self) -> str:
+            if not hasattr(self, "orientation_heatmap_kind"):
+                return "distribution"
+            return next(
+                (
+                    key
+                    for key, label in _ORIENTATION_HEATMAP_KIND_LABELS.items()
+                    if label == self.orientation_heatmap_kind.currentText()
+                ),
+                "distribution",
+            )
+
+        def _selected_orientation_heatmap_quantity(self) -> str:
+            if not hasattr(self, "orientation_heatmap_quantity"):
+                return "average"
+            return next(
+                (
+                    key
+                    for key, label in _ORIENTATION_SPATIAL_QUANTITY_LABELS.items()
+                    if label == self.orientation_heatmap_quantity.currentText()
+                ),
+                "average",
+            )
+
+        def _orientation_spatial_mode(self) -> bool:
+            return (
+                self._analysis_name == "orientation"
+                and self._selected_orientation_heatmap_kind() == "spatial"
+            )
+
+        def _handle_orientation_heatmap_kind_change(self, *_unused: object) -> None:
+            if self._orientation_view_state_switching or self._suspend_preview_events:
+                return
+            target = self._selected_orientation_heatmap_kind()
+            previous = self._orientation_heatmap_active_kind
+            if target == previous:
+                return
+            self.orientation_heatmap_kind.blockSignals(True)
+            try:
+                self._set_combo_value(
+                    self.orientation_heatmap_kind, _ORIENTATION_HEATMAP_KIND_LABELS[previous]
+                )
+                snapshot = self._collect_settings()
+                snapshot["angle"] = self.orientation_angle.currentText().strip().lower()
+                self._set_combo_value(
+                    self.orientation_heatmap_kind, _ORIENTATION_HEATMAP_KIND_LABELS[target]
+                )
+            finally:
+                self.orientation_heatmap_kind.blockSignals(False)
+            self._orientation_heatmap_states[previous] = {
+                key: deepcopy(snapshot.get(key)) for key in _ORIENTATION_HEATMAP_STATE_KEYS
+            }
+            state = self._orientation_heatmap_states.get(target)
+            if state is None:
+                state = {key: None for key in _ORIENTATION_HEATMAP_STATE_KEYS}
+                state.update(
+                    angle=str(snapshot.get("angle") or "polar"),
+                    orientation_heatmap_x_axis="x" if target == "spatial" else None,
+                    orientation_heatmap_y_axis="y" if target == "spatial" else None,
+                    orientation_heatmap_quantity="average",
+                    heatmap_value_mode="raw_counts",
+                    heatmap_bulk_reference_mode="auto",
+                    heatmap_log_scale=False,
+                )
+            restored = {
+                **snapshot,
+                **deepcopy(state),
+                "orientation_heatmap_kind": target,
+                "orientation_heatmap_states": deepcopy(self._orientation_heatmap_states),
+            }
+            restored["view_mapping"] = serialize_plot_view_mapping(
+                orientation_plot_options_to_view_mapping(
+                    component="heatmap",
+                    angle=str(state.get("angle") or snapshot.get("angle") or "polar"),
+                    heatmap_kind=target,
+                    heatmap_quantity=str(state.get("orientation_heatmap_quantity") or "average"),
+                    heatmap_x_axis=state.get("orientation_heatmap_x_axis"),
+                    heatmap_y_axis=state.get("orientation_heatmap_y_axis"),
+                )
+            )
+            restored["orientation_view_states"] = deepcopy(self._orientation_view_states)
+            active_state = self._clean_orientation_view_state(restored)
+            active_state["_orientation_view_state_initialized"] = True
+            restored["orientation_view_states"][PLOT_VIEW_2D_HEATMAP] = active_state
+            self._orientation_view_state_switching = True
+            self._suspend_preview_events = True
+            try:
+                self._populate(restored)
+                self._orientation_heatmap_active_kind = target
+            finally:
+                self._orientation_view_state_switching = False
+                self._suspend_preview_events = False
+            self._refresh_widget_states()
+            self._record_history_after_non_text_change()
+            self._schedule_preview_update()
+
+        def _refresh_orientation_spatial_capabilities(self) -> None:
+            if not hasattr(self, "orientation_heatmap_kind"):
+                return
+            sparse = bool(
+                self._profile_filter_options.get(
+                    "orientation_sparse_grid_available",
+                    self._profile_filter_options.get("orientation_axis_ranges"),
+                )
+            )
+            source_capabilities = self._profile_filter_options.get(
+                "orientation_spatial_source_capabilities"
+            )
+            selected_capabilities = None
+            if isinstance(source_capabilities, dict) and source_capabilities:
+                selected_ids = {
+                    str(descriptor.get("source_series_id") or descriptor.get("series_id") or "")
+                    for index, descriptor in enumerate(self._series_descriptors_data)
+                    if index >= len(self._series_enabled_data) or self._series_enabled_data[index]
+                }
+                selected_capabilities = [
+                    source_capabilities[identifier]
+                    for identifier in selected_ids
+                    if identifier in source_capabilities
+                ]
+                sparse = bool(selected_capabilities) and all(
+                    item["sparse"] for item in selected_capabilities
+                )
+            self.orientation_heatmap_kind.model().item(1).setEnabled(sparse)
+            if not self._orientation_spatial_mode():
+                return
+            view = self._selected_interface_view()
+            axis = self._interface_surface_axis()
+            references = self._profile_filter_options.get("interface_references") or []
+            registered = view not in {"full", "top"} and any(
+                item.get("can_align") and (item.get("metadata") or {}).get("interface_reference", {}).get("reference_id") in self._interface_alignments
+                for item in references)
+            if registered:
+                for widget in (self.orientation_heatmap_x_axis, self.orientation_heatmap_y_axis):
+                    if widget.currentText().strip().lower() == axis:
+                        widget.blockSignals(True)
+                        self._set_combo_value(widget, "Distance")
+                        widget.blockSignals(False)
+            x = self.orientation_heatmap_x_axis.currentText().strip().lower()
+            y = self.orientation_heatmap_y_axis.currentText().strip().lower()
+            if view == "full" and "distance" in (x, y):
+                for widget, other in (
+                    (self.orientation_heatmap_x_axis, y),
+                    (self.orientation_heatmap_y_axis, x),
+                ):
+                    if widget.currentText().strip().lower() == "distance":
+                        replacement = next(a for a in (axis, "x", "y", "z") if a != other)
+                        widget.blockSignals(True)
+                        self._set_combo_value(widget, replacement.upper())
+                        widget.blockSignals(False)
+                x = self.orientation_heatmap_x_axis.currentText().strip().lower()
+                y = self.orientation_heatmap_y_axis.currentText().strip().lower()
+            for widget, other in (
+                (self.orientation_heatmap_x_axis, y),
+                (self.orientation_heatmap_y_axis, x),
+            ):
+                for index in range(widget.count()):
+                    candidate = widget.itemText(index).strip().lower()
+                    allowed = candidate != other and not ({candidate, other} == {axis, "distance"})
+                    allowed &= not (view == "full" and candidate == "distance")
+                    allowed &= not (registered and candidate == axis)
+                    item = widget.model().item(index)
+                    item.setEnabled(allowed)
+                    item.setToolTip(
+                        ""
+                        if allowed
+                        else "Choose independent spatial coordinates; Full cell uses Cartesian coordinates."
+                    )
+            available = bool(
+                self._profile_filter_options.get("orientation_spatial_density_available")
+            )
+            reason = str(
+                self._profile_filter_options.get("orientation_spatial_density_reason")
+                or "Recompute orientation to enable density and density-weighted spatial maps."
+            )
+            if selected_capabilities is not None:
+                available = bool(selected_capabilities) and all(
+                    item["density"] for item in selected_capabilities
+                )
+                reason = next(
+                    (str(item["reason"]) for item in selected_capabilities if not item["density"]),
+                    "Enable at least one source to plot a spatial map.",
+                )
+            if view == "folded" and self._has_symmetric_interface_views() and axis in (x, y):
+                available = False
+                reason = "Use Distance for a folded interface cross-section, or choose Full cell for Cartesian planes."
+            for index in (1, 2):
+                item = self.orientation_heatmap_quantity.model().item(index)
+                item.setEnabled(available)
+                item.setToolTip("" if available else reason)
+            self.orientation_spatial_note.setText(
+                "Mean orientation is dimensionless. Density and density-weighted orientation use molecules/Å³."
+                if available
+                else reason
+            )
+            warning = getattr(self, "_orientation_spatial_axes_warning", "")
+            if warning:
+                self.orientation_spatial_note.setText("Warning: " + warning)
+
+
+        def _swap_orientation_spatial_axes(self) -> None:
+            x, y = (
+                self.orientation_heatmap_x_axis.currentText(),
+                self.orientation_heatmap_y_axis.currentText(),
+            )
+            self.orientation_heatmap_x_axis.blockSignals(True)
+            self.orientation_heatmap_y_axis.blockSignals(True)
+            self._set_combo_value(self.orientation_heatmap_x_axis, y)
+            self._set_combo_value(self.orientation_heatmap_y_axis, x)
+            self.orientation_heatmap_x_axis.blockSignals(False)
+            self.orientation_heatmap_y_axis.blockSignals(False)
+            self._handle_orientation_mapping_change()
+
+        def _orientation_spatial_axes(self) -> tuple[str, str, bool]:
+            """Keep an incomplete axis edit out of rendering and saved settings."""
+            x = self.orientation_heatmap_x_axis.currentText().strip().lower()
+            y = self.orientation_heatmap_y_axis.currentText().strip().lower()
+            if x != y:
+                self._orientation_last_valid_spatial_axes = (x, y)
+                return x, y, True
+            previous = getattr(self, "_orientation_last_valid_spatial_axes", ("x", "y"))
+            if not self._suspend_preview_events:
+                for widget, value in zip(
+                    (self.orientation_heatmap_x_axis, self.orientation_heatmap_y_axis), previous
+                ):
+                    blocked = widget.blockSignals(True)
+                    try:
+                        self._set_combo_value(widget, value.capitalize())
+                    finally:
+                        widget.blockSignals(blocked)
+                self._orientation_spatial_axes_warning = (
+                    "X and Y axes must be different. "
+                    f"Kept {previous[0].capitalize()} / {previous[1].capitalize()}."
+                )
+                self.orientation_spatial_note.setText(
+                    "Warning: " + self._orientation_spatial_axes_warning
+                )
+            return previous[0], previous[1], False
+
         def _current_orientation_mapping(self) -> PlotViewMapping:
             view_type = (
                 _ORIENTATION_VIEW_TYPE_ID_BY_LABEL.get(
@@ -11557,9 +12289,15 @@ def launch_plot_settings_panel(
                 if hasattr(self, "orientation_angle")
                 else "polar"
             )
+            spatial = component == "heatmap" and self._orientation_spatial_mode()
+            x_axis, y_axis = self._orientation_spatial_axes()[:2] if spatial else (None, None)
             return orientation_plot_options_to_view_mapping(
                 component=component,
                 angle=angle_role,
+                heatmap_kind=self._selected_orientation_heatmap_kind() if component == "heatmap" else None,
+                heatmap_quantity=self._selected_orientation_heatmap_quantity() if component == "heatmap" and self._orientation_spatial_mode() else None,
+                heatmap_x_axis=x_axis,
+                heatmap_y_axis=y_axis,
                 line_x_axis=(
                     _DENSITY_X_MODE_BY_LABEL.get(
                         self.orientation_line_x_axis.currentText().strip().lower(),
@@ -11859,6 +12597,8 @@ def launch_plot_settings_panel(
             self._handle_series_identity_change()
 
         def _handle_orientation_mapping_change(self, *_unused: object) -> None:
+            if self._suspend_preview_events or self._orientation_view_state_switching:
+                return
             if self._analysis_name == "orientation" and not self._orientation_view_state_switching:
                 previous_view = self._orientation_active_view_type
                 next_view = self._orientation_active_view_type_id()
@@ -11872,6 +12612,11 @@ def launch_plot_settings_panel(
                     self._apply_orientation_view_state(next_view, target_state)
                     self._handle_series_identity_change()
                     return
+            if self._is_orientation_heatmap_mode() and self._orientation_spatial_mode():
+                if not self._orientation_spatial_axes()[2]:
+                    self._preview_timer.stop()
+                    return
+                self._orientation_spatial_axes_warning = ""
             self._refresh_widget_states()
             self._update_orientation_contract_summary()
             self._handle_series_identity_change()
@@ -12636,7 +13381,7 @@ def launch_plot_settings_panel(
 
         def _default_error_stat_for_series(self, index: int) -> str:
             availability = self._error_availability_for_series(index)
-            return str(availability.default_stat or "sample_sem")
+            return str(availability.default_stat or "block_ci")
 
         def _resolved_error_stat_for_series(self, index: int) -> str:
             configured = (
@@ -12673,6 +13418,11 @@ def launch_plot_settings_panel(
                 )
             if 0 <= index < len(self._series_error_show_in_legend_data):
                 config["show_in_legend"] = bool(self._series_error_show_in_legend_data[index])
+            config.update(
+                self._series_error_options_by_id.get(
+                    str(self._series_descriptor(index).get("series_id")), {}
+                )
+            )
             return config
 
         def _error_effective_label(self, index: int) -> str:
@@ -12824,7 +13574,7 @@ def launch_plot_settings_panel(
                 (self._series_show_in_legend_data, self._series_show_in_legend_data[index]),
                 (self._series_alpha_data, self._series_alpha_data[index]),
                 (self._series_error_enabled_data, False),
-                (self._series_error_stats_data, "block_sem"),
+                (self._series_error_stats_data, "block_ci"),
                 (self._series_error_styles_data, "band"),
                 (self._series_error_colors_data, ""),
                 (self._series_error_label_overrides_data, ""),
@@ -14149,11 +14899,15 @@ def launch_plot_settings_panel(
                 error_config = _error_defaults_for_gui()
                 if isinstance(series_override, dict):
                     error_config = _coerce_series_error_config(series_override.get("error"))
+                self._series_error_options_by_id[str(descriptor["series_id"])] = {
+                    key: error_config[key]
+                    for key in ("confidence", "resamples", "seed", "block_merge", "sampling")
+                }
                 self._series_error_enabled_data.append(
                     bool(error_config.get("enabled", False)) and enabled
                 )
                 self._series_error_stats_data.append(
-                    str(error_config.get("stat") or "block_sem").strip() or "block_sem"
+                    str(error_config.get("stat") or "block_ci").strip() or "block_ci"
                 )
                 self._series_error_styles_data.append(
                     str(error_config.get("style") or "band").strip() or "band"
@@ -14596,15 +15350,18 @@ def launch_plot_settings_panel(
         def _refresh_error_stat_choices(self, index: int) -> None:
             if not hasattr(self, "_series_error_stat"):
                 return
-            availability = self._error_availability_for_series(index)
-            available = list(availability.available_stats)
-            if not available:
-                available = [self._default_error_stat_for_series(index)]
+            available = list(_ERROR_STATS)
             current = self._resolved_error_stat_for_series(index)
-            if current not in available:
-                current = available[0]
-            if 0 <= index < len(self._series_error_stats_data):
-                self._series_error_stats_data[index] = current
+            options = self._series_error_options_by_id.get(
+                str(self._series_descriptor(index).get("series_id")), {}
+            )
+            for key, widget in self._uncertainty_inputs.items():
+                widget.blockSignals(True)
+                widget.setText(str(options.get(key, _error_defaults_for_gui()[key])))
+                widget.blockSignals(False)
+            self._uncertainty_sampling.blockSignals(True)
+            self._set_combo_value(self._uncertainty_sampling, str(options.get("sampling", "auto")))
+            self._uncertainty_sampling.blockSignals(False)
             display_available = tuple(_ERROR_STAT_DISPLAY.get(s, s) for s in available)
             display_current = _ERROR_STAT_DISPLAY.get(current, current)
             self._series_error_stat.blockSignals(True)
@@ -14917,6 +15674,18 @@ def launch_plot_settings_panel(
                 self._series_error_stats_data[index] = (
                     token if token in _ERROR_STATS else self._default_error_stat_for_series(index)
                 )
+            if hasattr(self, "_uncertainty_inputs"):
+                extra = self._series_error_options_by_id.setdefault(
+                    str(self._series_descriptor(index).get("series_id")), {}
+                )
+                for key, widget in self._uncertainty_inputs.items():
+                    try:
+                        extra[key] = (
+                            float(widget.text()) if key == "confidence" else int(widget.text())
+                        )
+                    except ValueError:
+                        pass  # Keep the last valid setting while the user edits a number.
+                extra["sampling"] = self._uncertainty_sampling.currentText()
             if hasattr(self, "_series_error_style"):
                 display_text = self._series_error_style.currentText().strip()
                 token = _ERROR_STYLE_INTERNAL.get(display_text, display_text).lower()
@@ -15745,6 +16514,27 @@ def launch_plot_settings_panel(
                     f"Source: {statistics_mode_text}",
                     f"Visible bins: {summary.get('point_count') if summary.get('point_count') is not None else 'n/a'}",
                 ]
+                details = summary.get("details") or {}
+                if details:
+
+                    def count_range(values):
+                        values = [
+                            value for value in (values or []) if isinstance(value, (int, float))
+                        ]
+                        return f"{min(values)} to {max(values)}" if values else "not recorded"
+
+                    lines.extend(
+                        [
+                            f"Observations: {details.get('sampling_unit', 'unknown')}",
+                            f"Valid observations per bin: {count_range(details.get('sample_n', []))}",
+                            f"Raw contributions per bin: {count_range(details.get('contributing_entities_or_pairs', []))}",
+                            f"Resampling units: {details.get('block_count', 'n/a')}; lengths ({details.get('block_length_unit', 'frames')}): {count_range(details.get('block_lengths_frames', []))}",
+                            f"Block duration (fs, profile time grid): {count_range(details.get('block_lengths_fs') or [])}",
+                            f"Block-size stability (median interval width): {[(value['block_merge'], value['median_interval_width']) for value in details.get('block_size_stability', [])]}",
+                            f"Confidence: {details.get('confidence', 'n/a')}; resamples: {details.get('resamples', 'n/a')}; seed: {details.get('seed', 'n/a')}",
+                            "Block independence has not been verified. Check block-size stability before interpretation.",
+                        ]
+                    )
                 reason = str(summary.get("reason") or "").strip()
                 if reason:
                     lines.append(reason)
@@ -16279,6 +17069,7 @@ def launch_plot_settings_panel(
                 self._active_preview_pane.loading_overlay.set_active(
                     bool(active or self._pending_preview_request is not None)
                 )
+                self._active_preview_pane.loading_overlay.set_progress(self._preview_activity_progress)
             for widget in (
                 self._preview_frame,
                 self._preview_scroll,
@@ -16412,7 +17203,11 @@ def launch_plot_settings_panel(
                     old_canvas.setParent(None)
                     old_canvas.deleteLater()
             self._preview_figure = figure
-            canvas = FigureCanvas(figure)
+            canvas = PlotPreviewCanvas(
+                figure,
+                on_error=self._set_preview_failure,
+                on_recovered=self._clear_preview_draw_failure,
+            )
             toolbar = (
                 navigation_toolbar_type(
                     canvas,
@@ -16494,7 +17289,7 @@ def launch_plot_settings_panel(
                     try:
                         with cancellation_scope(
                             partial(self._preview_worker_job_cancelled, generation)
-                        ):
+                        ), progress_scope(partial(self._preview_progress_from_worker, generation)):
                             self._run_preview_worker(
                                 generation=generation,
                                 settings=settings,
@@ -16504,6 +17299,22 @@ def launch_plot_settings_panel(
                         self._emit_cancelled_preview(generation, image_path)
                 finally:
                     self._preview_worker_queue.task_done()
+
+        def _preview_progress_from_worker(self, generation, update) -> None:
+            if not self._preview_worker_job_cancelled(generation):
+                try:
+                    self._preview_worker_bridge.progress.emit(generation, update)
+                except RuntimeError:
+                    pass
+
+        def _handle_preview_progress(self, generation, update) -> None:
+            if self._preview_worker_result_is_stale(generation):
+                return
+            if self._preview_status is not None:
+                self._preview_status.setText(update.message)
+            self._preview_activity_progress = update
+            if self._active_preview_pane is not None:
+                self._active_preview_pane.loading_overlay.set_progress(update)
 
         def _emit_cancelled_preview(self, generation: int, image_path: Path | None) -> None:
             payload = {"image_path": str(image_path) if image_path is not None else None}
@@ -16602,6 +17413,7 @@ def launch_plot_settings_panel(
                 else None
             )
             self._active_preview_generation = generation
+            self._preview_started_at = perf_counter()
             self._active_preview_signature = self._preview_request_signature(
                 settings,
                 interactive=interactive,
@@ -16617,6 +17429,7 @@ def launch_plot_settings_panel(
                 self._preview_worker_queue.task_done()
                 if previous_job is not None:
                     self._cleanup_preview_temp_path(previous_job[2])
+            self._preview_activity_progress = PlotProgress("Loading plot data")
             self._set_preview_loading(True)
             if self._preview_status is not None:
                 self._preview_status.setText("Preview updating...")
@@ -16680,6 +17493,10 @@ def launch_plot_settings_panel(
                 session_messages.exception(f"Preview failed: {message}", error)
             self._refresh_shell_state()
 
+        def _clear_preview_draw_failure(self) -> None:
+            self._preview_error = None
+            self._refresh_shell_state()
+
         def _preview_worker_job_cancelled(self, generation: int) -> bool:
             return self._closing or generation != self._active_preview_generation
 
@@ -16716,6 +17533,7 @@ def launch_plot_settings_panel(
                     self._apply_preview_series_state(render_state)
                     self._apply_preview_state_to_synced_fields(render_state)
                 if figure is not None:
+                    self._handle_preview_progress(generation, PlotProgress("Displaying plot"))
                     self._install_preview_figure(figure)
                     self._preview_pixmap = None
                     self._cleanup_preview_temp_path(self._preview_image_path)
@@ -16737,6 +17555,7 @@ def launch_plot_settings_panel(
                     self._preview_pixmap = self._preview_display_pixmap(pixmap)
                     self._refresh_preview_pixmap()
                 self._preview_error = None
+                logging.getLogger("linak").debug("Studio preview completed seconds=%.6f", perf_counter() - self._preview_started_at)
                 if self._preview_status is not None:
                     self._preview_status.setText(
                         "Preview updated."
@@ -17079,9 +17898,13 @@ def launch_plot_settings_panel(
                     preferred_value=current_axis,
                 )
             self._refresh_interface_view_control()
+            self._refresh_interface_alignment()
             self._handle_series_identity_change()
 
+        @_batch_population
         def _populate(self, settings: dict[str, Any]) -> None:
+            if self._analysis_name == "orientation":
+                self._orientation_heatmap_states = deepcopy(settings.get("orientation_heatmap_states") or {})
             validate_current_plot_settings(settings)
             if self._analysis_name == "density":
                 raw_states = settings.get("density_view_states")
@@ -17114,7 +17937,7 @@ def launch_plot_settings_panel(
                         active_state,
                     )
                 elif not self._density_view_state_switching:
-                    initial_state = deepcopy(settings)
+                    initial_state = self._clean_density_view_state(settings)
                     initial_state["_density_view_state_initialized"] = True
                     initial_state["density_active_view_type"] = active_view
                     self._density_view_states[active_view] = initial_state
@@ -17149,7 +17972,7 @@ def launch_plot_settings_panel(
                         active_state,
                     )
                 elif not self._position_view_state_switching:
-                    initial_state = deepcopy(settings)
+                    initial_state = self._clean_position_view_state(settings)
                     initial_state["_position_view_state_initialized"] = True
                     initial_state["position_active_view_type"] = active_view
                     self._position_view_states[active_view] = initial_state
@@ -17184,7 +18007,7 @@ def launch_plot_settings_panel(
                         active_state,
                     )
                 elif not self._orientation_view_state_switching:
-                    initial_state = deepcopy(settings)
+                    initial_state = self._clean_orientation_view_state(settings)
                     initial_state["_orientation_view_state_initialized"] = True
                     initial_state["orientation_active_view_type"] = active_view
                     self._orientation_view_states[active_view] = initial_state
@@ -17724,6 +18547,18 @@ def launch_plot_settings_panel(
                     )
                 finally:
                     self.orientation_component.blockSignals(False)
+            if hasattr(self, "orientation_heatmap_kind"):
+                options = orientation_options if "orientation_options" in locals() else {}
+                kind = str(options.get("orientation_heatmap_kind") or settings.get("orientation_heatmap_kind") or
+                           ("spatial" if settings.get("orientation_heatmap_x_axis") or settings.get("orientation_heatmap_y_axis") or
+                            (settings_mapping is not None and any(key in settings_mapping.fixed_values for key in
+                             ("orientation_heatmap_x_axis", "orientation_heatmap_y_axis"))) else "distribution"))
+                self.orientation_heatmap_kind.blockSignals(True)
+                self._set_combo_value(self.orientation_heatmap_kind, _ORIENTATION_HEATMAP_KIND_LABELS.get(kind, "Orientation distribution"))
+                self.orientation_heatmap_kind.blockSignals(False)
+                self._orientation_heatmap_active_kind = kind
+                quantity = str(options.get("orientation_heatmap_quantity") or settings.get("orientation_heatmap_quantity") or "average")
+                self._set_combo_value(self.orientation_heatmap_quantity, _ORIENTATION_SPATIAL_QUANTITY_LABELS.get(quantity, "Mean orientation"))
             if hasattr(self, "orientation_angle"):
                 self._set_combo_value(
                     self.orientation_angle,
@@ -17747,18 +18582,12 @@ def launch_plot_settings_panel(
             if hasattr(self, "orientation_heatmap_x_axis"):
                 self._set_combo_value(
                     self.orientation_heatmap_x_axis,
-                    self._density_x_mode_display_label(
-                        str(settings.get("orientation_heatmap_x_axis") or "x"),
-                        axis=None,
-                    ),
+                    str((orientation_options.get("orientation_heatmap_x_axis") if "orientation_options" in locals() else None) or settings.get("orientation_heatmap_x_axis") or "x").capitalize(),
                 )
             if hasattr(self, "orientation_heatmap_y_axis"):
                 self._set_combo_value(
                     self.orientation_heatmap_y_axis,
-                    self._density_x_mode_display_label(
-                        str(settings.get("orientation_heatmap_y_axis") or "y"),
-                        axis=None,
-                    ),
+                    str((orientation_options.get("orientation_heatmap_y_axis") if "orientation_options" in locals() else None) or settings.get("orientation_heatmap_y_axis") or "y").capitalize(),
                 )
             if hasattr(self, "_orientation_filter_widgets"):
                 for axis_id, widgets in self._orientation_filter_widgets.items():
@@ -17888,6 +18717,8 @@ def launch_plot_settings_panel(
             if hasattr(self, "heatmap_colorbar_aspect"):
                 raw = settings.get("heatmap_colorbar_aspect")
                 self.heatmap_colorbar_aspect.setText(str(raw) if raw is not None else "20")
+            self._interface_alignments = deepcopy(settings.get("interface_alignments") or {})
+            self._refresh_interface_alignment()
             if hasattr(self, "interface_view_combo"):
                 interface_view = str(settings.get("interface_view") or "folded").strip().lower()
                 if interface_view not in set(_INTERFACE_VIEW_ORDER):
@@ -17898,6 +18729,8 @@ def launch_plot_settings_panel(
                     if hasattr(self, "density_x_mode"):
                         self._set_combo_value(self.density_x_mode, axis_label)
                     if hasattr(self, "orientation_line_x_axis"):
+                        if not hasattr(self, "_orientation_interface_relative_x_axis"):
+                            self._orientation_interface_relative_x_axis = "Distance"
                         self._set_combo_value(self.orientation_line_x_axis, axis_label)
                     if hasattr(self, "position_mapping_y"):
                         self._set_position_mapping_combo_items()
@@ -17958,12 +18791,11 @@ def launch_plot_settings_panel(
         def _is_orientation_heatmap_mode(self) -> bool:
             if self._analysis_name != "orientation":
                 return False
-            return (
-                canonical_plot_view_id(self._current_orientation_mapping().view_type_id)
-                == PLOT_VIEW_2D_HEATMAP
-            )
+            return self._orientation_active_view_type_id() == PLOT_VIEW_2D_HEATMAP
 
         def _refresh_widget_states(self, *_unused: object) -> None:
+            if getattr(self, "_settings_population_depth", 0):
+                return
             if all(
                 hasattr(self, name)
                 for name in (
@@ -18150,9 +18982,8 @@ def launch_plot_settings_panel(
                 self._figure_lines_group.setVisible(figure_caps.show_lines)
             if self._figure_heatmap_group is not None:
                 self._figure_heatmap_group.setVisible(figure_caps.show_heatmap)
-            orientation_frequency_heatmap = (
-                self._analysis_name == "orientation" and self._is_orientation_heatmap_mode()
-            )
+            orientation_heatmap = self._analysis_name == "orientation" and self._is_orientation_heatmap_mode()
+            orientation_frequency_heatmap = orientation_heatmap and not self._orientation_spatial_mode()
             if self._heatmap_value_group is not None:
                 self._heatmap_value_group.setVisible(orientation_frequency_heatmap)
             selected_heatmap_value_mode = "raw_counts"
@@ -18402,19 +19233,24 @@ def launch_plot_settings_panel(
                                 else None
                             ),
                         )
-                self._set_rows_visible(self._orientation_mapping_2d_rows, False)
+                spatial_mode = is_heatmap and self._orientation_spatial_mode()
+                self._set_rows_visible(self._orientation_mapping_2d_rows, spatial_mode)
+                if self._orientation_heatmap_kind_row is not None:
+                    self._set_form_row_visible(*self._orientation_heatmap_kind_row, is_heatmap)
+                self._refresh_orientation_spatial_capabilities()
                 for axis_id, row in self._orientation_filter_rows.items():
                     self._set_form_row_visible(
                         row[0],
                         row[1],
-                        orientation_grid_line_controls
+                        (orientation_grid_line_controls or spatial_mode)
                         and not (interface_view == "full" and axis_id == "distance"),
                     )
                 for widget_name in ("orientation_heatmap_x_axis", "orientation_heatmap_y_axis"):
                     widget = getattr(self, widget_name, None)
                     if widget is not None:
-                        widget.setEnabled(False)
+                        widget.setEnabled(spatial_mode)
                 if hasattr(self, "orientation_angle"):
+                    self.orientation_angle.setEnabled(not (spatial_mode and self._selected_orientation_heatmap_quantity() == "density"))
                     label = None
                     try:
                         parent_layout = self.orientation_angle.parentWidget().layout()
@@ -18443,7 +19279,7 @@ def launch_plot_settings_panel(
                 self._set_form_row_visible(
                     self._y_bin_reducer_row[0],
                     self._y_bin_reducer_row[1],
-                    y_rebin_enabled and not orientation_frequency_heatmap,
+                    y_rebin_enabled and not orientation_heatmap,
                 )
                 if two_dimensional_binning:
                     self._set_form_row_enabled(
@@ -18485,7 +19321,7 @@ def launch_plot_settings_panel(
                 self._set_form_row_visible(
                     self._x_bin_reducer_row[0],
                     self._x_bin_reducer_row[1],
-                    rebin_enabled and not orientation_frequency_heatmap,
+                    rebin_enabled and not orientation_heatmap,
                 )
                 self._set_form_row_enabled(
                     self._x_bin_reducer_row[0],
@@ -18636,6 +19472,20 @@ def launch_plot_settings_panel(
                 and self._series_error_mode.currentText().strip().lower() != "off"
             )
             self._set_rows_visible(self._series_error_detail_rows, error_active)
+            if hasattr(self, "_uncertainty_inputs"):
+                ci_active = (
+                    error_active
+                    and self._resolved_error_stat_for_series(self._series_active_index)
+                    == "block_ci"
+                )
+                for widget in [*self._uncertainty_inputs.values(), self._uncertainty_sampling]:
+                    visible = ci_active and (
+                        widget is not self._uncertainty_sampling
+                        or self._analysis_name == "potential"
+                    )
+                    self._set_form_row_visible(self._uncertainty_form, widget, visible)
+                    widget.setEnabled(visible)
+
             for widget in self._series_error_detail_widgets:
                 widget.setVisible(error_active)
             if hasattr(self, "_series_error_mode"):
@@ -18652,11 +19502,7 @@ def launch_plot_settings_panel(
                     ),
                 )
             if hasattr(self, "_series_error_stat"):
-                self._series_error_stat.setEnabled(
-                    error_controls_available
-                    and error_active
-                    and error_availability.selector_enabled
-                )
+                self._series_error_stat.setEnabled(error_controls_available and error_active)
                 self._apply_widget_tooltip(
                     self._series_error_stat,
                     disabled_reason=(
@@ -19338,6 +20184,9 @@ def launch_plot_settings_panel(
                     "label_override": error_label_override_value,
                     "show_in_legend": error_show_in_legend_value,
                 }
+                error_config_payload.update(
+                    self._series_error_options_by_id.get(str(descriptor.get("series_id")), {})
+                )
                 if error_config_payload != _error_defaults_for_gui():
                     entry["error"] = error_config_payload
                 alpha_token = self._series_alpha_data[index].strip()
@@ -19802,6 +20651,8 @@ def launch_plot_settings_panel(
                 settings["axis"] = None if axis_value == "" else axis_value
             if hasattr(self, "interface_view_combo"):
                 settings["interface_view"] = self._selected_interface_view()
+                if self._analysis_name in {"density", "position", "orientation"}:
+                    settings["interface_alignments"] = deepcopy(self._interface_alignments)
             if hasattr(self, "density_x_mode") or hasattr(self, "density_quantity"):
                 resolved_view_mapping = self._current_density_mapping()
                 if (
@@ -19963,6 +20814,10 @@ def launch_plot_settings_panel(
                 orientation_grid_line_enabled = (
                     not orientation_heatmap_mode and orientation_line_component == "average"
                 )
+                spatial_mode = orientation_heatmap_mode and self._orientation_spatial_mode()
+                settings["orientation_heatmap_kind"] = self._selected_orientation_heatmap_kind()
+                settings["orientation_heatmap_quantity"] = self._selected_orientation_heatmap_quantity() if spatial_mode else "average"
+                settings["orientation_heatmap_states"] = deepcopy(self._orientation_heatmap_states)
                 if orientation_heatmap_mode:
                     settings["orientation_line_x_axis"] = (
                         _DENSITY_X_MODE_BY_LABEL.get(
@@ -19972,8 +20827,8 @@ def launch_plot_settings_panel(
                         if hasattr(self, "orientation_line_x_axis")
                         else "distance"
                     )
-                    settings["orientation_heatmap_x_axis"] = None
-                    settings["orientation_heatmap_y_axis"] = None
+                    settings["orientation_heatmap_x_axis"] = self.orientation_heatmap_x_axis.currentText().strip().lower() if spatial_mode else None
+                    settings["orientation_heatmap_y_axis"] = self.orientation_heatmap_y_axis.currentText().strip().lower() if spatial_mode else None
                 else:
                     if orientation_grid_line_enabled:
                         settings["orientation_line_x_axis"] = (
@@ -19990,7 +20845,7 @@ def launch_plot_settings_panel(
                     settings["orientation_heatmap_y_axis"] = None
                 if hasattr(self, "_orientation_filter_widgets"):
                     for axis_id, widgets in self._orientation_filter_widgets.items():
-                        if orientation_grid_line_enabled:
+                        if (orientation_grid_line_enabled or spatial_mode) and not (self._selected_interface_view() == "full" and axis_id == "distance"):
                             lower_widget, upper_widget = widgets
                             lower_value = _optional_float(
                                 lower_widget.text(),
@@ -20047,6 +20902,8 @@ def launch_plot_settings_panel(
                     value_label,
                     "raw_counts",
                 )
+                if self._orientation_spatial_mode():
+                    value_mode = "raw_counts"
                 settings["heatmap_value_mode"] = value_mode
                 bulk_reference_mode = (
                     "manual"
@@ -20116,6 +20973,7 @@ def launch_plot_settings_panel(
             settings = self._merge_density_view_state_into_settings(settings)
             settings = self._merge_position_view_state_into_settings(settings)
             settings = self._merge_orientation_view_state_into_settings(settings)
+            validate_current_plot_settings(settings)
             return settings
 
         def _report_error(self, title_text: str, exc: Exception) -> None:
@@ -20340,6 +21198,14 @@ def launch_plot_settings_panel(
 
         def _cleanup_preview_artifacts(self) -> None:
             self._closing = True
+            self._startup_cancel.set()
+            if not self._session_ready:
+                if hasattr(self, "_startup_activity"):
+                    self._startup_activity.set_active(False)
+                if self._startup_pending_session is not None:
+                    self._startup_pending_session.discard()
+                    self._startup_pending_session = None
+                return
             self._session_diagnostics.shutdown()
             for pane in (self._embedded_preview_pane, self._detached_preview_pane):
                 if pane is not None:
@@ -20376,6 +21242,8 @@ def launch_plot_settings_panel(
                 self._cleanup_preview_temp_path(path)
 
         def _refresh_preview_after_layout(self) -> None:
+            if not self._session_ready or self._closing:
+                return
             if self._preview_figure is not None and self._preview_canvas is not None:
                 try:
                     self._preview_canvas.draw_idle()
@@ -20390,15 +21258,21 @@ def launch_plot_settings_panel(
 
         def showEvent(self, event: Any) -> None:  # pragma: no cover - UI flow
             super().showEvent(event)
+            if not self._session_ready:
+                return
             QTimer.singleShot(0, self._refresh_preview_after_layout)
             self._schedule_preview_canvas_resize()
 
         def changeEvent(self, event: Any) -> None:  # pragma: no cover - UI flow
             super().changeEvent(event)
+            if not self._session_ready:
+                return
             if event.type() == QEvent.Type.WindowStateChange:
                 self._schedule_preview_canvas_resize()
 
         def eventFilter(self, watched: Any, event: Any) -> bool:  # pragma: no cover - UI flow
+            if not self._session_ready:
+                return super().eventFilter(watched, event)
             if event.type() == QEvent.Type.Wheel and isinstance(watched, QWidget):
                 content = getattr(self, "_tab_series_content", None)
                 if content is not None and (watched is content or content.isAncestorOf(watched)):
@@ -20486,11 +21360,17 @@ def launch_plot_settings_panel(
 
         def resizeEvent(self, event: Any) -> None:  # pragma: no cover - UI flow
             super().resizeEvent(event)
+            if not self._session_ready:
+                return
             self._refresh_preview_pixmap()
             self._resize_preview_canvas_to_figure()
             self._schedule_preview_canvas_resize()
 
         def closeEvent(self, event: Any) -> None:  # pragma: no cover - UI flow
+            if not self._session_ready:
+                self._cleanup_preview_artifacts()
+                event.accept()
+                return
             try:
                 settings = self._collect_settings()
                 current_signature = self._signature(settings)
@@ -20561,6 +21441,7 @@ def launch_plot_settings_panel(
                 window.move(avail.x() + 50, avail.y() + 50)
 
         app.exec()
+        return 1 if window._startup_failed else 0
     finally:
         session_messages.close()
         if window is not None and not window._closing:

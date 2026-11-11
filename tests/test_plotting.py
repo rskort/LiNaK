@@ -729,7 +729,7 @@ def test_resolve_series_error_availability_reports_single_stat_reason():
     )
 
     assert availability.available_stats == ["sample_sem"]
-    assert availability.default_stat == "sample_sem"
+    assert availability.default_stat == "block_ci"
     assert availability.selector_enabled is False
     assert availability.reason == "Only 'sample_sem' is available for this series."
 
@@ -743,7 +743,7 @@ def test_resolve_series_error_availability_keeps_rebinned_saved_sample_stats():
     )
 
     assert availability.available_stats == ["sample_std", "sample_sem"]
-    assert availability.default_stat == "sample_sem"
+    assert availability.default_stat == "block_ci"
     assert availability.selector_enabled is True
     assert (
         availability.reason
@@ -859,7 +859,7 @@ def test_plot_line_series_min_bin_points_masks_rebinned_saved_profile(tmp_path):
     assert stats["point_count"] == 1
 
 
-def test_plot_line_series_rebinned_saved_profile_falls_back_from_block_to_sample(tmp_path):
+def test_plot_line_series_rebinned_saved_profile_does_not_switch_estimators(tmp_path):
     from linak.analysis.statistics import SeriesStatistics
 
     capture_state: dict[str, object] = {}
@@ -888,10 +888,9 @@ def test_plot_line_series_rebinned_saved_profile_falls_back_from_block_to_sample
     assert result is not None
     assert isinstance(capture_state["series_error_summaries"], dict)
     error_summary = capture_state["series_error_summaries"]["series"]
-    assert error_summary["status"] == "ok"
-    assert error_summary["stat"] == "sample_sem"
+    assert error_summary["status"] == "unavailable"
+    assert "no estimator was substituted" in error_summary["reason"]
     assert error_summary["statistics_mode"] == "saved_rebinned_sample"
-    assert "Block uncertainty is unavailable after x rebinning" in error_summary["reason"]
 
 
 def test_plot_line_series_rejects_section_width_smaller_than_data_bin_width(tmp_path):

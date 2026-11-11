@@ -6,6 +6,7 @@ from collections import OrderedDict
 from collections.abc import Hashable, Mapping
 from dataclasses import fields, is_dataclass
 import os
+from pathlib import Path
 import sys
 from threading import RLock
 from typing import Any
@@ -25,6 +26,13 @@ def _cache_budget_from_environment() -> int:
     except ValueError:
         return DEFAULT_CACHE_BUDGET_BYTES
     return max(1, int(value * MIB)) if value > 0 else DEFAULT_CACHE_BUDGET_BYTES
+
+
+def source_revision(path) -> tuple[str, int, int]:
+    """Identify all file-backed cached data without reading analysis arrays."""
+    resolved = Path(path).expanduser().resolve()
+    stat = resolved.stat()
+    return str(resolved), int(stat.st_mtime_ns), int(stat.st_size)
 
 
 def estimate_object_bytes(value: Any, *, _seen: set[int] | None = None) -> int:

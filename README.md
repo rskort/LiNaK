@@ -180,6 +180,10 @@ by default. The GUI provides a live preview plus analysis-aware controls,
 allowing you to control options for analysis alongside the usual figure, axis,
 legend, series, and export settings.
 
+Studio opens before loading plot arrays or preparing combined files. Its loading
+area shows progress, elapsed time, and cancellation; preparation errors offer
+Retry and Details. See [Studio startup and diagnostics](docs/studio-startup.md).
+
 Potential HDF5 files open in the same Studio. The default potential plot shows
 the stored `Water bulk`, `Fermi`, and `cSHE` series against `Record ID`, and
 each series can optionally add a linear-fit overlay from the `Series` page.
@@ -248,7 +252,7 @@ Later `compute` commands prefer explicit CLI overrides first, then stored
 trajectory-HDF5 metadata, then explicit/auto-detected simulation inputs.
 
 LiNaK validates each analysis's current HDF5 schema: v2 for density, position,
-coordination, orientation, and potential tables; v1 for RDF and temperature. Unsupported schemas
+coordination and orientation; v3 for potential tables; v1 for RDF and temperature. Unsupported schemas
 or missing required metadata produce a recomputation error before payload
 loading. Existing files are never automatically rewritten or deleted.
 
@@ -439,17 +443,17 @@ multiple position sources) when comparing several species.
 ### Potential
 
 `linak compute potential` is CP2K-focused. For each Hartree cube file, LiNaK:
-- searches the same directory for a suitable CP2K output file (`output.out` preferred)
-- parses the Fermi level from the output file
-- computes a water-bulk potential from O/H z-bounds read from the cube header,
-  excluding z slices whose slice bin contains any non-water atom
+- associates each snapshot with its own CP2K Fermi energy or an explicit `--fermi-map`
+- selects a persistent water-reference window from substrate geometry and water density, then independently validates its gradient and spatial variation
+- never reduces requested padding; `--bulk-window` instead selects an explicit fixed Cartesian window
 - reports `electrode_cshe_ev = water_bulk_potential_ev - efermi_ev - 0.65` by default
+- records rejected candidates and saves a diagnostic figure with window sensitivity
 
 
 Output behaviour for `compute potential`:
 - appends to an existing compatible HDF5 file by default
 - skips sources already present in that HDF5 file
-- falls back to a safe new filename if the existing schema is incompatible
+- rejects incompatible schemas or changed reference definitions; use a separate output or explicit `--overwrite`
 - writes rows incrementally so partial progress is retained if a later source fails
 
 Use `--strict` when a failed or incomplete source should cause a non-zero exit code.

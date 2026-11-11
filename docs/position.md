@@ -2,6 +2,11 @@
 
 ## Symmetric Cells
 
+Studio's **Surface representation → Align interfaces…** can register the
+negative interface's lateral coordinates against the positive interface in
+spatial projections. The feature requires newly computed results and preserves
+the original coordinates. See [Interface alignment](interface-alignment.md).
+
 Position v2 keeps `distance_to_surface_A` as folded outward distance and adds
 `distance_to_top_surface_A`, `distance_to_bottom_surface_A`, and
 `interface_side` (`-1` bottom, `0` tie, `+1` top). Plotting and filtering use

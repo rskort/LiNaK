@@ -37,9 +37,16 @@ The pages in this folder describe:
 - [Orientation](orientation.md)
 - [Temperature](temperature.md)
 
+## Studio
+
+- [Opening results and startup diagnostics](studio-startup.md)
+
 ## Shared Method Guides
 
+- [Compute parallelism and benchmark requests](compute-parallelism.md)
+- [Error Bars and Uncertainty](error-bars.md)
 - [Surface Estimation](surface-estimation.md)
+- [Interface Alignment](interface-alignment.md)
 - [Water Detection And Water Geometry](water-detection.md)
 - [HDF5 Data Model And Metadata Conventions](hdf5-data-model.md)
 
@@ -63,7 +70,7 @@ LiNaK stores analysis results as HDF5 profiles. A file may contain:
 Each stored profile has its own metadata and stable `profile_uid`.
 
 Schema versions belong to individual analyses: density, position, coordination,
-orientation, and potential tables use v2; RDF and temperature use v1. A schema number is not the
+and orientation use v2; potential uses v3; RDF and temperature use v1. A schema number is not the
 LiNaK package version. Unsupported schemas or missing required data produce an
 actionable error; recompute from the source trajectory. Existing files are not
 automatically migrated, rewritten, or deleted.

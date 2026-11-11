@@ -7,12 +7,11 @@ from __future__ import annotations
 
 import logging
 import json
-import math
 import re
 from typing import Any
 
-from PySide6.QtCore import QEvent, QObject, QPointF, QSize, QTimer, Qt, Signal
-from PySide6.QtGui import QColor, QFontDatabase, QPainter, QPen, QTextCursor
+from PySide6.QtCore import QObject, QSize, Qt, Signal
+from PySide6.QtGui import QFontDatabase, QPainter, QPen, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
     QHBoxLayout,
@@ -25,6 +24,7 @@ from PySide6.QtWidgets import (
 )
 
 from .session_log import SessionLog, SessionMessage
+from .loading_widgets import PreviewLoadingOverlay as PreviewLoadingOverlay
 
 
 class JsonOptionsEditor(QWidget):
@@ -282,87 +282,3 @@ class SessionDiagnostics(QObject):
     def shutdown(self) -> None:
         self._closed = True
         self.session.close()
-
-
-class PreviewLoadingOverlay(QWidget):
-    """Dim retained content and animate a small spinner only during rendering."""
-
-    def __init__(self, target: QWidget) -> None:
-        super().__init__(target)
-        self._target = target
-        self._active = False
-        self._angle = 0
-        self.delay = QTimer(self)
-        self.delay.setSingleShot(True)
-        self.delay.setInterval(150)
-        self.delay.timeout.connect(self._show_loading)
-        self.animation = QTimer(self)
-        self.animation.setInterval(80)
-        self.animation.timeout.connect(self._tick)
-        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.setCursor(Qt.CursorShape.WaitCursor)
-        self.setAccessibleName("Updating preview")
-        target.installEventFilter(self)
-        self.hide()
-
-    def set_active(self, active: bool) -> None:
-        if active == self._active:
-            return
-        self._active = active
-        if active:
-            self.delay.start()
-        else:
-            self.delay.stop()
-            self.animation.stop()
-            self.hide()
-
-    def _show_loading(self) -> None:
-        if not self._active:
-            return
-        self.setGeometry(self._target.rect())
-        self.show()
-        self.raise_()
-        if self._target.isVisible():
-            self.animation.start()
-
-    def _tick(self) -> None:
-        self._angle = (self._angle + 1) % 12
-        self.update()
-
-    def eventFilter(self, watched: QObject, event: Any) -> bool:
-        if watched is self._target:
-            if event.type() == QEvent.Type.Resize:
-                self.setGeometry(self._target.rect())
-            elif event.type() == QEvent.Type.Hide:
-                self.animation.stop()
-            elif event.type() == QEvent.Type.Show and self._active and not self.delay.isActive():
-                self._show_loading()
-        return False
-
-    def paintEvent(self, event: Any) -> None:
-        painter = QPainter(self)
-        background = QColor("#ffffff")
-        background.setAlpha(170)
-        painter.fillRect(self.rect(), background)
-        foreground = QColor("#334155")
-        center_x, center_y = self.width() // 2, self.height() // 2 - 12
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        for index in range(12):
-            color = QColor(foreground)
-            color.setAlpha(45 + ((index - self._angle) % 12) * 18)
-            pen = QPen(color, 2.5, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
-            painter.setPen(pen)
-            angle = math.radians(index * 30)
-            painter.drawLine(
-                QPointF(center_x + 10 * math.cos(angle), center_y + 10 * math.sin(angle)),
-                QPointF(center_x + 16 * math.cos(angle), center_y + 16 * math.sin(angle)),
-            )
-        painter.setPen(foreground)
-        painter.drawText(
-            self.rect().adjusted(0, 36, 0, 0), Qt.AlignmentFlag.AlignCenter, "Updating preview…"
-        )
-        painter.end()
-
-    def shutdown(self) -> None:
-        self.set_active(False)
-        self._target.removeEventFilter(self)
